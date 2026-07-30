@@ -15,16 +15,16 @@ Abhängigkeit: `git`.
 ## Installation
 
 ```sh
-curl -sSfL https://gitlab.com/pdoering-it/minds/-/raw/main/install.sh | sh
+curl -sSfL https://raw.githubusercontent.com/munichbughunter/minds/main/install.sh | sh
 ```
 
 Legt `minds` nach `~/.local/bin`. Für ein anderes Ziel `MINDS_INSTALL_DIR` setzen, für
 eine bestimmte Version `MINDS_VERSION`. Im Air-Gap hängen dieselben Archive an jedem
-[Release](https://gitlab.com/pdoering-it/minds/-/releases) und lassen sich von Hand
+[Release](https://github.com/munichbughunter/minds/releases) und lassen sich von Hand
 auspacken.
 
-Gebaut werden macOS (Apple Silicon und Intel) und Linux x86_64 (musl, statisch). Für
-Windows und ARM-Linux gibt es noch keine fertigen Binaries — dort aus dem
+Gebaut werden macOS (Apple Silicon und Intel) und Linux (x86_64 und ARM64, jeweils
+musl und statisch). Für Windows gibt es noch kein fertiges Binary — dort aus dem
 [Quelltext bauen](#aus-dem-quelltext-bauen).
 
 ### `minds` muss im PATH liegen
@@ -104,7 +104,7 @@ aus — für Agents, nicht für Menschen.
 
 Absicht: lieber ein Agent richtig als vier halb. Welcher als nächstes vollständig
 unterstützt wird, richtet sich nach dem Bedarf der Nutzer — [sag uns, was du
-benutzt](https://gitlab.com/pdoering-it/minds/-/issues).
+benutzt](https://github.com/munichbughunter/minds/issues).
 
 ## Aus dem Quelltext bauen
 

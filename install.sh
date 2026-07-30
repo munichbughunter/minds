@@ -2,19 +2,21 @@
 #
 # Installiert `minds` nach ~/.local/bin.
 #
-#   curl -sSfL https://gitlab.com/pdoering-it/minds/-/raw/main/install.sh | sh
+#   curl -sSfL https://raw.githubusercontent.com/munichbughunter/minds/main/install.sh | sh
 #
 # Umgebungsvariablen:
 #   MINDS_VERSION       bestimmte Version statt der neuesten (z. B. 0.1.0)
 #   MINDS_INSTALL_DIR   Zielverzeichnis (Default ~/.local/bin)
-#   MINDS_TOKEN         GitLab-Token, falls das Projekt nicht öffentlich ist
+#   MINDS_TOKEN         GitHub-Token; für das öffentliche Repo nicht nötig, hilft
+#                       aber gegen das Rate-Limit der API (60 Anfragen/Stunde je IP)
 #
 # Bewusst POSIX-sh und ohne jq: Das Skript soll auch auf einer nackten Kiste
 # laufen, auf der außer curl und tar nichts installiert ist.
 
 set -eu
 
-API="https://gitlab.com/api/v4/projects/pdoering-it%2Fminds"
+REPO="munichbughunter/minds"
+API="https://api.github.com/repos/${REPO}"
 INSTALL_DIR="${MINDS_INSTALL_DIR:-$HOME/.local/bin}"
 
 say()  { printf '%s\n' "$*"; }
@@ -28,10 +30,10 @@ need() {
 need curl
 need tar
 
-# --- Authentifizierung (nur nötig, wenn das Projekt privat ist) -------------
+# --- Authentifizierung (optional, siehe MINDS_TOKEN oben) -------------------
 AUTH=""
 if [ -n "${MINDS_TOKEN:-}" ]; then
-  AUTH="PRIVATE-TOKEN: ${MINDS_TOKEN}"
+  AUTH="Authorization: Bearer ${MINDS_TOKEN}"
 fi
 
 fetch() { # fetch <url> <ziel|-]
@@ -66,8 +68,8 @@ if [ -n "${MINDS_VERSION:-}" ]; then
 else
   say "Suche die neueste Version …"
   tmp_json="$(mktemp)"
-  fetch "${API}/releases/permalink/latest" "$tmp_json" \
-    || die "Konnte die neueste Version nicht ermitteln. Ist das Projekt privat? Dann MINDS_TOKEN setzen."
+  fetch "${API}/releases/latest" "$tmp_json" \
+    || die "Konnte die neueste Version nicht ermitteln. Gibt es schon ein Release? Sonst MINDS_VERSION direkt setzen."
   version="$(sed -n 's/.*"tag_name"[ ]*:[ ]*"\([^"]*\)".*/\1/p' "$tmp_json" | head -n 1)"
   rm -f "$tmp_json"
   version="${version#v}"
@@ -75,7 +77,7 @@ else
 fi
 
 pkg="minds-${version}-${target}.tar.gz"
-base="${API}/packages/generic/minds/${version}"
+base="https://github.com/${REPO}/releases/download/v${version}"
 
 say "minds ${version} für ${target}"
 

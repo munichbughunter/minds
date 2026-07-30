@@ -6,7 +6,7 @@ members = ["crates/*", "xtask"]
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://gitlab.com/pdoering-it/minds"
+repository = "https://github.com/munichbughunter/minds"
 
 # Zentrale Verwaltung. Crates erben per `x.workspace = true`. 
 [workspace.dependencies]

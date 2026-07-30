@@ -1,0 +1,169 @@
+name: Release
+
+# Ein Tag `vX.Y.Z` baut die Archive und legt das GitHub-Release an. Der Tag ist
+# der Auslöser und die einzige Quelle für die Versionsnummer — deshalb prüft der
+# Build-Job, dass die Crate-Version dazu passt, statt sie zu erraten.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon baut auch das Intel-Archiv: Das macOS-SDK ist
+          # universal, ein eigener Intel-Runner wäre nur ein weiteres
+          # Ausfallrisiko.
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            cross: false
+          - target: x86_64-apple-darwin
+            runner: macos-latest
+            cross: false
+          # musl über `cross`: blake3 zieht `cc`, braucht also eine C-Toolchain
+          # für das Ziel. Für aarch64-musl gibt es die in apt nicht — die
+          # cross-Images bringen sie mit, für beide Ziele auf demselben Weg.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            cross: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version aus dem Tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+          # Ein Tag, der nicht zur Crate-Version passt, liefert ein Binary aus,
+          # dessen `--version` etwas anderes behauptet als der Dateiname. Das
+          # fällt sonst erst beim Nutzer auf.
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/minds-cli/Cargo.toml | head -n 1)"
+          if [ "$crate" != "$version" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} passt nicht zu crates/minds-cli Version ${crate}."
+            exit 1
+          fi
+          echo "Baue minds ${version} für ${{ matrix.target }}"
+
+      - name: Toolchain
+        run: rustup show && cargo --version
+
+      - name: Target hinzufügen
+        if: ${{ !matrix.cross }}
+        run: rustup target add ${{ matrix.target }}
+
+      - name: cross installieren
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Bauen
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --profile dist --locked --target ${{ matrix.target }} --bin minds
+          else
+            cargo build --profile dist --locked --target ${{ matrix.target }} --bin minds
+          fi
+
+      # Layout und Namensschema sind das, was `install.sh` erwartet: Das Archiv
+      # enthält ein Verzeichnis `minds-<version>-<target>/` mit dem Binary darin.
+      # Ändert sich das hier, muss der Installer mit.
+      - name: Archiv packen
+        id: pack
+        run: |
+          set -eu
+          version="${{ steps.version.outputs.version }}"
+          target="${{ matrix.target }}"
+          pkg="minds-${version}-${target}"
+
+          mkdir -p "dist/${pkg}"
+          cp "target/${target}/dist/minds" "dist/${pkg}/"
+          cp README.md CHANGELOG.md "dist/${pkg}/"
+          tar -czf "dist/${pkg}.tar.gz" -C dist "$pkg"
+          rm -rf "dist/${pkg}"
+
+          ls -l "dist/${pkg}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Release anlegen
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+
+      # Eine Prüfsummendatei über *alle* Archive — deshalb erst hier, wenn alle
+      # Build-Jobs durch sind, und nicht je Target.
+      - name: Prüfsummen
+        working-directory: dist
+        run: |
+          sha256sum ./*.tar.gz | sed 's|\./||' | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      # Die Release-Notes stehen im CHANGELOG, nicht im Workflow. Hier wird nur
+      # der Abschnitt zur Version herausgeschnitten.
+      - name: Release-Notes aus dem CHANGELOG
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found = 1; next }
+            found && /^## \[/       { exit }
+            found                   { print }
+          ' CHANGELOG.md > notes.md
+
+          if [ ! -s notes.md ]; then
+            echo "Kein CHANGELOG-Abschnitt für ${version} gefunden — nehme einen Platzhalter."
+            printf 'Siehe [CHANGELOG.md](https://github.com/%s/blob/%s/CHANGELOG.md).\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" > notes.md
+          fi
+          cat notes.md
+
+      # Bewusst *kein* --prerelease: GitHubs `releases/latest` überspringt
+      # Prereleases, und genau den Endpunkt fragt `install.sh` ab. Ein
+      # Prerelease wäre für den Installer unsichtbar.
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release existiert schon — hänge die Assets an."
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --verify-tag \
+              --title "minds $GITHUB_REF_NAME" \
+              --notes-file notes.md \
+              dist/*
+          fi

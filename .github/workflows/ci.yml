@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Ein neuer Push auf denselben Ref macht den laufenden Job überflüssig.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gates:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Kein Toolchain-Action: `rust-toolchain.toml` pinnt 1.97.1, und rustup
+      # zieht genau die nach. Ein `toolchain:`-Eingang hier wäre eine zweite
+      # Wahrheit, die wieder auseinanderläuft — genau das, was der Pin verhindern
+      # soll.
+      - name: Toolchain
+        run: rustup show && cargo --version && cargo clippy --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Tests, die committen, brauchen eine Identität. Ohne die bricht gix mit
+      # einem Fehler ab, der nach einem Testfehler aussieht, aber keiner ist.
+      - name: Git-Identität
+        run: |
+          git config --global user.name  "minds CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      # Die Gates stehen absichtlich einzeln und in dieser Reihenfolge: Das
+      # billigste zuerst, damit ein Formatfehler nicht erst nach dem Testlauf
+      # auffällt.
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --locked
