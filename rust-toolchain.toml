@@ -1,0 +1,11 @@
+# Fest gepinnt statt `stable`. Ein gleitender Kanal lässt Entwickler-Maschine
+# und CI auseinanderlaufen: Zuletzt stand lokal 1.94.1 gegen 1.97.1 in der
+# Pipeline, und zwei Clippy-Lints, die es lokal noch gar nicht gab, machten den
+# Job rot. Ein Toolchain-Sprung soll eine bewusste Entscheidung sein, kein
+# Zufall — und keine verbrannten Compute-Minuten.
+#
+# Beim Anheben mitziehen: das `image:` in .gitlab-ci.yml auf dieselbe Version,
+# sonst lädt rustup die gepinnte Toolchain in jedem Job nach.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]

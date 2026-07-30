@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crates/minds-store/src/lib.rs</title>
+<style>:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e}@media(prefers-color-scheme:dark){:root{--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5}}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}a{color:var(--accent)}.top{padding:1rem 1.25rem;border-bottom:1px solid var(--rule)}.top h1{margin:.25rem 0;font-size:1.1rem;font-family:ui-monospace,monospace;word-break:break-all}.meta{margin:0;color:var(--dim);font-size:.85rem}.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,26rem);gap:0;align-items:start}@media(max-width:820px){.split{grid-template-columns:minmax(0,1fr)}}.code{overflow-x:auto;padding:.5rem 0;font:13px/1.6 ui-monospace,monospace}.line{display:flex;gap:.75rem;padding:0 1rem;white-space:pre}.line .num{color:var(--dim);text-align:right;min-width:3.5ch;user-select:none}.line code{white-space:pre}.line.has-context{background:var(--mark);border-left:3px solid var(--accent);padding-left:calc(1rem - 3px);cursor:pointer}.line.has-context:hover,.line.has-context:focus{outline:none;filter:brightness(1.06)}.line.selected{box-shadow:inset 0 0 0 2px var(--accent)}.panel{position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:1rem 1.25rem;border-left:1px solid var(--rule)}@media(max-width:820px){.panel{position:static;max-height:none;border-left:0;border-top:1px solid var(--rule)}}.panel h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1rem 0 .35rem}.panel h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1rem 0 .25rem}.intent{margin:0;font-size:1rem}.hint{color:var(--dim);font-size:.85rem}dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:.15rem .75rem;font-size:.9rem}dt{color:var(--dim)}dd{margin:0;word-break:break-all}ul{margin:.25rem 0;padding-left:1.1rem;font-size:.9rem}code.id{font-size:.75rem;word-break:break-all}.warn{color:var(--warn)}.back{font-size:.85rem;text-decoration:none}.overview{padding:1rem 1.25rem;max-width:60rem}.overview h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1.5rem 0 .5rem}.cards{list-style:none;margin:0;padding:0;display:grid;gap:.5rem}.card{border:1px solid var(--rule);border-left:3px solid var(--accent);border-radius:.35rem;padding:0}.card-link{display:block;padding:.6rem .8rem;color:inherit;text-decoration:none}.card:has(.card-link){cursor:pointer}.card:has(.card-link):hover{background:var(--mark)}.card>.headline{padding:.6rem .8rem .2rem}.card>.sub{padding:0 .8rem .6rem}.headline{margin:0 0 .2rem;font-size:1rem}.sub{margin:0;color:var(--dim);font-size:.8rem}.files{list-style:none;margin:0;padding:0;display:grid;gap:.25rem}.files a{text-decoration:none}.files a:hover{text-decoration:underline}.empty{color:var(--dim)}.guess{color:var(--warn)}.session .guess{font-size:.8rem;margin:.25rem 0 0}</style>
+</head>
+<body>
+<header class="top">
+<a class="back" href="index.html">← Übersicht</a>
+<h1>crates/minds-store/src/lib.rs</h1>
+<p class="meta">3 von 103 Zeilen mit erfasstem Kontext</p>
+</header>
+<main class="split">
+<div class="code"><div class="line"><span class="num">1</span><code>//! Der Kontext-Store: wo Sessions liegen — und was beim Hinlegen zugesichert ist.</code></div>
+<div class="line"><span class="num">2</span><code>//!</code></div>
+<div class="line"><span class="num">3</span><code>//! „Speicher ist ein Trait, kein Ort&quot; (Architektur-Prinzip 2 im Plan). Dieses</code></div>
+<div class="line"><span class="num">4</span><code>//! Crate definiert mit [`ContextStore`] den Vertrag; die beiden Backends</code></div>
+<div class="line"><span class="num">5</span><code>//! (`InRepoStore` über `refs/minds/context`, `ChildRepoStore` über ein zweites</code></div>
+<div class="line"><span class="num">6</span><code>//! Repository) folgen in den nächsten Commits und unterscheiden sich nur im</code></div>
+<div class="line"><span class="num">7</span><code>//! Git-Handle. Deshalb steht hier bereits alles, was für beide gilt:</code></div>
+<div class="line"><span class="num">8</span><code>//! Kanonisierung, Content-Adressierung, fail-closed und die Prüfung beim Lesen.</code></div>
+<div class="line"><span class="num">9</span><code>//!</code></div>
+<div class="line"><span class="num">10</span><code>//! # Die Arbeitsteilung</code></div>
+<div class="line"><span class="num">11</span><code>//!</code></div>
+<div class="line"><span class="num">12</span><code>//! Der Trait hat zwei Schichten, und das ist der Kern seines Entwurfs:</code></div>
+<div class="line"><span class="num">13</span><code>//!</code></div>
+<div class="line"><span class="num">14</span><code>//! | Schicht | Methoden | wer implementiert sie |</code></div>
+<div class="line"><span class="num">15</span><code>//! |---|---|---|</code></div>
+<div class="line"><span class="num">16</span><code>//! | Bytes | [`put_bytes`](ContextStore::put_bytes), [`get_bytes`](ContextStore::get_bytes), [`list`](ContextStore::list) | jedes Backend |</code></div>
+<div class="line"><span class="num">17</span><code>//! | Sessions | [`put`](ContextStore::put), [`get`](ContextStore::get), [`exists`](ContextStore::exists) | der Trait selbst |</code></div>
+<div class="line"><span class="num">18</span><code>//!</code></div>
+<div class="line"><span class="num">19</span><code>//! Ein Backend sieht nur `SessionId → Bytes` und weiß von Redaction, blake3 und</code></div>
+<div class="line"><span class="num">20</span><code>//! JSON nichts. Die Zusagen liegen dagegen an *einer* Stelle und gelten für</code></div>
+<div class="line"><span class="num">21</span><code>//! jedes Backend, das je dazukommt — auch für eines, das heute niemand plant.</code></div>
+<div class="line"><span class="num">22</span><code>//! Wäre `put(&amp;RedactedSession)` eine Pflichtmethode, müsste jedes Backend die</code></div>
+<div class="line"><span class="num">23</span><code>//! Kanonisierung selbst richtig machen; das zweite Backend, das es falsch macht,</code></div>
+<div class="line"><span class="num">24</span><code>//! schreibt Sessions, deren ID niemand reproduzieren kann.</code></div>
+<div class="line"><span class="num">25</span><code>//!</code></div>
+<div class="line"><span class="num">26</span><code>//! # Fail-closed ist hier ein Typ, kein Vorsatz</code></div>
+<div class="line"><span class="num">27</span><code>//!</code></div>
+<div class="line"><span class="num">28</span><code>//! [`ContextStore::put`] nimmt ein [`RedactedSession`](minds_redact::RedactedSession)</code></div>
+<div class="line"><span class="num">29</span><code>//! entgegen, nicht eine [`Session`](minds_core::Session). Diesen Typ gibt es nur</code></div>
+<div class="line"><span class="num">30</span><code>//! aus der Redaction-Pipeline — eine ungeredactete Session zu speichern ist</code></div>
+<div class="line"><span class="num">31</span><code>//! damit kein Policy-Verstoß, sondern ein Compile-Fehler (so von `minds-redact`</code></div>
+<div class="line"><span class="num">32</span><code>//! vorgesehen, siehe dortige `session`-Modul-Doku).</code></div>
+<div class="line"><span class="num">33</span><code>//!</code></div>
+<div class="line"><span class="num">34</span><code>//! Der Preis ist eine Kante am Abhängigkeitsgraphen: `store` hängt zusätzlich an</code></div>
+<div class="line"><span class="num">35</span><code>//! `redact`. Der Plan zeichnet `core, git ← store`; daraus wird</code></div>
+<div class="line"><span class="num">36</span><code>//! `core, redact, git ← store`. Kein Zyklus (`redact` kennt nur `core`), und der</code></div>
+<div class="line"><span class="num">37</span><code>//! Tausch ist es wert: Die Alternative wäre eine Laufzeitprüfung auf</code></div>
+<div class="line"><span class="num">38</span><code>//! `redaction.applied`, die genau so lange hilft, wie sie niemand vergisst.</code></div>
+<div class="line"><span class="num">39</span><code>//!</code></div>
+<div class="line"><span class="num">40</span><code>//! Auf dem **Lese**pfad bleibt sie trotzdem stehen — der Typ überlebt die</code></div>
+<div class="line"><span class="num">41</span><code>//! Serialisierung nicht, das Flag schon. Siehe [`ContextStore::get`].</code></div>
+<div class="line"><span class="num">42</span><code>//!</code></div>
+<div class="line"><span class="num">43</span><code>//! # Zwei Backends, eine Implementierung</code></div>
+<div class="line"><span class="num">44</span><code>//!</code></div>
+<div class="line"><span class="num">45</span><code>//! [`InRepoStore`] und [`ChildRepoStore`] sind Hüllen um denselben privaten</code></div>
+<div class="line"><span class="num">46</span><code>//! `GitStore` — sie setzen nur ein anderes Repository ein. „Gleiches Layout,</code></div>
+<div class="line"><span class="num">47</span><code>//! separates Repo-Handle&quot; ist damit keine Zusage, auf die man aufpassen muss,</code></div>
+<div class="line"><span class="num">48</span><code>//! sondern eine, die sich nicht brechen lässt: Es gibt eine Stelle, die Pfade</code></div>
+<div class="line"><span class="num">49</span><code>//! baut und Refs bewegt. `both_backends_write_the_same_tree` weist nach, dass</code></div>
+<div class="line"><span class="num">50</span><code>//! zwei Repositories, die nichts voneinander wissen, bei derselben Session auf</code></div>
+<div class="line"><span class="num">51</span><code>//! denselben Baum-Hash kommen.</code></div>
+<div class="line"><span class="num">52</span><code>//!</code></div>
+<div class="line"><span class="num">53</span><code>//! Welches Backend es wird, entscheidet [`StoreConfig`] — an einer Stelle, und</code></div>
+<div class="line"><span class="num">54</span><code>//! danach sieht alles darüber nur noch `Box&lt;dyn ContextStore&gt;`. Beide Wege sind</code></div>
+<div class="line"><span class="num">55</span><code>//! erstklassig: ohne Child-Repo landet der Kontext im Repository des Codes</code></div>
+<div class="line"><span class="num">56</span><code>//! (Default, nichts einzurichten), mit Child-Repo nebenan.</code></div>
+<div class="line"><span class="num">57</span><code>//!</code></div>
+<div class="line"><span class="num">58</span><code>//! In **beiden** Fällen bleibt der Trailer im Produktions-Commit — die Nutzlast</code></div>
+<div class="line"><span class="num">59</span><code>//! zieht um, der Verweis nicht. Deshalb heißt der Zugriff auf das Repository</code></div>
+<div class="line"><span class="num">60</span><code>//! des Stores [`ChildRepoStore::context_repo`] und nicht `repo`: Es ist beim</code></div>
+<div class="line"><span class="num">61</span><code>//! Child-Backend nicht das Repo, an dessen Commits Trailer gehängt werden.</code></div>
+<div class="line"><span class="num">62</span><code>//!</code></div>
+<div class="line"><span class="num">63</span><code>//! # Was hier bewusst *nicht* steht</code></div>
+<div class="line"><span class="num">64</span><code>//!</code></div>
+<div class="line"><span class="num">65</span><code>//! - **Löschen.** Der Store ist ein Audit-Record und damit append-only</code></div>
+<div class="line"><span class="num">66</span><code>//!   (dieselbe Linie wie `minds-git`: kein `remove` auf der Objekt-Ebene).</code></div>
+<div class="line"><span class="num">67</span><code>//! - **Ein verifizierender Konstruktor für fremde Bytes.** Sollte je ein</code></div>
+<div class="line"><span class="num">68</span><code>//!   Store-zu-Store-Umzug gebraucht werden (In-Repo → Child-Repo), ist das ein</code></div>
+<div class="line"><span class="num">69</span><code>//!   additiver Nachbar zu [`SessionBytes::of`], kein Umbau.</code></div>
+<div class="line"><span class="num">70</span><code>//!</code></div>
+<div class="line"><span class="num">71</span><code>//! # Kein `Send + Sync`</code></div>
+<div class="line"><span class="num">72</span><code>//!</code></div>
+<div class="line"><span class="num">73</span><code>//! Der Trait fordert es nicht, weil `minds_git::Repo` nicht `Sync` ist (gix</code></div>
+<div class="line"><span class="num">74</span><code>//! cacht intern beim Lesen). Wer parallel arbeiten will, öffnet pro Thread einen</code></div>
+<div class="line"><span class="num">75</span><code>//! eigenen Store — dieselbe Regel wie eine Ebene tiefer.</code></div>
+<div class="line"><span class="num">76</span><code></code></div>
+<div class="line"><span class="num">77</span><code>#[cfg(test)]</code></div>
+<div class="line"><span class="num">78</span><code>mod fixture;</code></div>
+<div class="line"><span class="num">79</span><code></code></div>
+<div class="line"><span class="num">80</span><code>mod error;</code></div>
+<div class="line"><span class="num">81</span><code>pub use error::{Result, Source, StoreError};</code></div>
+<div class="line"><span class="num">82</span><code></code></div>
+<div class="line"><span class="num">83</span><code>mod bytes;</code></div>
+<div class="line"><span class="num">84</span><code>pub use bytes::SessionBytes;</code></div>
+<div class="line"><span class="num">85</span><code></code></div>
+<div class="line"><span class="num">86</span><code>mod store;</code></div>
+<div class="line"><span class="num">87</span><code>pub use store::{ContextStore, Put};</code></div>
+<div class="line"><span class="num">88</span><code></code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">89</span><code>mod index;</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">90</span><code>pub use index::{CommitIndex, IndexLink};</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">91</span><code></code></div>
+<div class="line"><span class="num">92</span><code>mod layout;</code></div>
+<div class="line"><span class="num">93</span><code></code></div>
+<div class="line"><span class="num">94</span><code>mod git_store;</code></div>
+<div class="line"><span class="num">95</span><code></code></div>
+<div class="line"><span class="num">96</span><code>mod in_repo;</code></div>
+<div class="line"><span class="num">97</span><code>pub use in_repo::InRepoStore;</code></div>
+<div class="line"><span class="num">98</span><code></code></div>
+<div class="line"><span class="num">99</span><code>mod child_repo;</code></div>
+<div class="line"><span class="num">100</span><code>pub use child_repo::ChildRepoStore;</code></div>
+<div class="line"><span class="num">101</span><code></code></div>
+<div class="line"><span class="num">102</span><code>mod config;</code></div>
+<div class="line"><span class="num">103</span><code>pub use config::{Backend, StoreConfig};</code></div>
+</div>
+<aside class="panel" id="panel">
+<p class="hint">Klick auf eine markierte Zeile zeigt die Session dahinter.</p>
+<section class="session" id="s-b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf">
+<p class="guess">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>
+<h2>Absicht</h2>
+<p class="intent">Ich möchte M5 so umbauen, dass wir es genauso machen wie entire! Mit dem Hook-Ansatz. 
+Wir bleiben erst einmal bei der Rust implementierung. Diese ist effizienter.
+
+Das ist der entscheidende Unterschied. Minds soll auch Hooks installieren im Agenten selbst: Claude Code über `.claude/settings.json`, Codex über `.codex/hooks.json`, Cursor über `.cursor/hooks.json`, Gemini über `.gemini/settings.json`, OpenCode über ein TypeScript-Plugin. Bei Codex wird zusätzlich `codex_hooks = true` in die `config.toml` geschrieben. Dazu Git-Hooks: Checkpoints entstehen, wenn du oder der Agent committen; die Session-Metadaten möchte ich entweder auf einem child-repo haben oder falls wir diese kombination nicht haben direkt im repo. 
+
+Das Verhalten soll an der Stelle absolut gleich sein. M5.0  docs: Plan.md — M5 von Transkript-Parsing auf Hooks umgestellt (ADR-0003)
+M5.1  feat(core): Lineage, Turn.parent/at, ToolCall.effect, Vec&lt;Edge&gt; (additiv)
+M5.2  feat(capture): JournalEvent + Journal (Datei pro Event, 0600, fsck-fähig)
+M5.3  feat(cli): minds hook — stdin lesen, anhängen, Exit 0, immer
+M5.4  feat(capture): Normalisierer Claude Code (SessionStart/Prompt/Tool*/Stop/Subagent*)
+M5.5  feat(capture): Secretfile-Mauer bei PreToolUse
+M5.6  feat(capture): Journal + Transkript → Vec&lt;Session&gt; (Turns, Usage, Intent)
+M5.7  feat(capture): Kanten — Subagent (Observed), Artefakt-Hash, Commit
+M5.8  feat(cli): minds enable --agent claude-code (settings.json mergen, idempotent)
+M5.9  test(capture): Fixtures — single, subagent, zwei Agents parallel</p>
+<h3>Herkunft</h3>
+<dl>
+<dt>Agent</dt><dd>claude-code 2.1.218</dd>
+<dt>Modell</dt><dd>anthropic / claude-opus-4-8</dd>
+<dt>Tokens</dt><dd>57466 ein / 1286225 aus</dd>
+<dt>Session</dt><dd><code class="id">b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf</code></dd>
+</dl>
+<h3>Berührte Dateien</h3>
+<ul>
+<li><code>Plan.md</code></li>
+<li><code>crates/minds-capture/Cargo.toml</code></li>
+<li><code>crates/minds-capture/src/adapter.rs</code></li>
+<li><code>crates/minds-capture/src/clock.rs</code></li>
+<li><code>crates/minds-capture/src/edges.rs</code></li>
+<li><code>crates/minds-capture/src/import.rs</code></li>
+<li><code>crates/minds-capture/src/lib.rs</code></li>
+<li><code>crates/minds-capture/src/match_commits.rs</code></li>
+<li><code>crates/minds-capture/src/normalize.rs</code></li>
+<li><code>crates/minds-capture/src/secretwall.rs</code></li>
+<li><code>crates/minds-capture/src/transcript.rs</code></li>
+<li><code>crates/minds-capture/tests/fixtures.rs</code></li>
+<li><code>crates/minds-cli/Cargo.toml</code></li>
+<li><code>crates/minds-cli/src/checkpoint.rs</code></li>
+<li><code>crates/minds-cli/src/config.rs</code></li>
+<li><code>crates/minds-cli/src/enable.rs</code></li>
+<li><code>crates/minds-cli/src/fsck.rs</code></li>
+<li><code>crates/minds-cli/src/hook.rs</code></li>
+<li><code>crates/minds-cli/src/import_cmd.rs</code></li>
+<li><code>crates/minds-cli/src/main.rs</code></li>
+<li><code>crates/minds-cli/src/render.rs</code></li>
+<li><code>crates/minds-cli/src/render_cmd.rs</code></li>
+<li><code>crates/minds-cli/src/show.rs</code></li>
+<li><code>crates/minds-cli/src/why.rs</code></li>
+<li><code>crates/minds-cli/tests/end_to_end.rs</code></li>
+<li><code>crates/minds-core/src/id.rs</code></li>
+<li><code>crates/minds-core/src/lib.rs</code></li>
+<li><code>crates/minds-core/src/lineage.rs</code></li>
+<li><code>crates/minds-reader/Cargo.toml</code></li>
+<li><code>crates/minds-reader/src/error.rs</code></li>
+<li><code>crates/minds-reader/src/file.rs</code></li>
+<li><code>crates/minds-reader/src/html.rs</code></li>
+<li><code>crates/minds-reader/src/index.rs</code></li>
+<li><code>crates/minds-reader/src/lib.rs</code></li>
+<li><code>crates/minds-reader/src/render.rs</code></li>
+<li><code>crates/minds-reader/src/summary.rs</code></li>
+<li><code>crates/minds-redact/src/session.rs</code></li>
+<li><code>crates/minds-redact/tests/corpus.rs</code></li>
+<li><code>crates/minds-store/Cargo.toml</code></li>
+<li><code>crates/minds-store/src/child_repo.rs</code></li>
+<li><code>crates/minds-store/src/fixture.rs</code></li>
+<li><code>crates/minds-store/src/git_store.rs</code></li>
+<li><code>crates/minds-store/src/in_repo.rs</code></li>
+<li><code>crates/minds-store/src/index.rs</code></li>
+<li><code>crates/minds-store/src/lib.rs</code></li>
+<li><code>crates/minds-store/src/store.rs</code></li>
+<li><code>docs/adr/0003-hooks-statt-transkript-parsing.md</code></li>
+<li><code>docs/adr/0004-import-und-store-index.md</code></li>
+</ul>
+</section>
+<section class="session" id="s-b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f">
+<p class="guess">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>
+<h2>Absicht</h2>
+<p class="intent">Ich möchte die Funktionalität aus Szenario 1 implementieren. 
+Und zwar so, wenn ein Nutzer erst zu einem späteren Zeitpunkt minds enable aufruft sollen die Hooks importiert und die Transkripte von allen bekannten Agenten importiert werden im hintergrund. Der Nutzer soll keinen extra Befehl dafür ausführen müssen. 
+
+Zu Szenario 2: Die Sessins müssen auf jeden Fall nach GitLab. Entweder in das Repository direkt oder wenn wir ein Parent-Repository verwenden dann in ein child repository.</p>
+<h3>Herkunft</h3>
+<dl>
+<dt>Agent</dt><dd>claude-code 2.1.218</dd>
+<dt>Modell</dt><dd>anthropic / claude-opus-4-8</dd>
+<dt>Tokens</dt><dd>107 ein / 35732 aus</dd>
+<dt>Session</dt><dd><code class="id">b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f</code></dd>
+</dl>
+<h3>Berührte Dateien</h3>
+<ul>
+<li><code>crates/minds-store/Cargo.toml</code></li>
+<li><code>crates/minds-store/src/child_repo.rs</code></li>
+<li><code>crates/minds-store/src/git_store.rs</code></li>
+<li><code>crates/minds-store/src/in_repo.rs</code></li>
+<li><code>crates/minds-store/src/index.rs</code></li>
+<li><code>crates/minds-store/src/lib.rs</code></li>
+<li><code>crates/minds-store/src/store.rs</code></li>
+</ul>
+</section>
+
+</aside>
+</main>
+
+<script>(function(){var panel=document.getElementById('panel');if(!panel)return;/* Erst hier verstecken: ohne Skript bleiben alle Panels lesbar. */panel.querySelectorAll('.session').forEach(function(s){s.hidden=true});function show(row){var ids=(row.getAttribute('data-sessions')||'').split(' ').filter(Boolean);panel.querySelectorAll('.session').forEach(function(s){s.hidden=true});ids.forEach(function(id){var el=document.getElementById('s-'+id);if(el)el.hidden=false});document.querySelectorAll('.line.selected').forEach(function(l){l.classList.remove('selected')});row.classList.add('selected');var hint=panel.querySelector('.hint');if(hint)hint.hidden=ids.length>0;}document.addEventListener('click',function(e){var row=e.target.closest('.line.has-context');if(row)show(row);});document.addEventListener('keydown',function(e){if(e.key!=='Enter'&&e.key!==' ')return;var row=e.target.closest&&e.target.closest('.line.has-context');if(row){e.preventDefault();show(row)}});/* Von der Übersicht verlinkt (#s-<id>): die erste Zeile dieser Session zeigen. */function openHash(){var h=location.hash;if(h.indexOf('#s-')!==0)return;var id=h.slice(3);var row=document.querySelector('.line.has-context[data-sessions~="'+id+'"]');if(row){show(row);row.scrollIntoView({block:'center'})}}openHash();window.addEventListener('hashchange',openHash);})();</script>
+</body>
+</html>

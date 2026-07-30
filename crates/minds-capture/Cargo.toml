@@ -1,0 +1,18 @@
+[package]
+name = "minds-capture"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minds-core = { path = "../minds-core" }
+minds-redact = { path = "../minds-redact" }
+serde_json = { workspace = true, features = ["raw_value"] }
+serde = { workspace = true, features = ["derive"] }
+blake3 = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

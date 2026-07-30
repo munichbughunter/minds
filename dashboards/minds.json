@@ -1,0 +1,167 @@
+{
+  "title": "Minds — Agent-Kontext",
+  "uid": "minds-context",
+  "tags": ["minds", "agents"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-30d", "to": "now" },
+  "refresh": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0
+      },
+      {
+        "name": "repo",
+        "label": "Repo",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(minds_sessions_total, repo)",
+        "refresh": 2,
+        "includeAll": false,
+        "multi": false,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Throughput",
+      "description": "Ø Token je Session",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "expr": "minds_throughput_tokens_per_session{repo=\"$repo\"}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Iteration",
+      "description": "Ø Tool-Calls je Session",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 1 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "expr": "minds_iteration_calls_per_session{repo=\"$repo\"}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Continuity",
+      "description": "Längste Session",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [
+        { "refId": "A", "expr": "minds_continuity_seconds{repo=\"$repo\"}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Streak",
+      "description": "Aufeinanderfolgende aktive Tage (aktuell)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        { "refId": "A", "expr": "minds_streak_current_days{repo=\"$repo\"}", "legendFormat": "aktuell", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "minds_streak_days{repo=\"$repo\"}", "legendFormat": "längster", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "gauge",
+      "title": "Kontext-Abdeckung",
+      "description": "Anteil der Commits mit auflösbarem Minds-Kontext",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "showThresholdMarkers": true },
+      "targets": [
+        { "refId": "A", "expr": "minds_context_coverage_ratio{repo=\"$repo\"}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Redaction-Treffer",
+      "description": "Entfernte Secrets und PII (fail-closed)",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" },
+      "targets": [
+        { "refId": "A", "expr": "minds_redaction_hits_total{repo=\"$repo\",kind=\"secret\"}", "legendFormat": "Secrets", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "minds_redaction_hits_total{repo=\"$repo\",kind=\"pii\"}", "legendFormat": "PII", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "piechart",
+      "title": "Tool-Calls nach Effekt",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "legend": { "displayMode": "list", "placement": "right" } },
+      "targets": [
+        { "refId": "A", "expr": "minds_tool_effects_total{repo=\"$repo\"}", "legendFormat": "{{effect}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "barchart",
+      "title": "Sessions je Agent",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "orientation": "horizontal", "legend": { "showLegend": false } },
+      "targets": [
+        { "refId": "A", "expr": "minds_sessions_by_agent{repo=\"$repo\"}", "legendFormat": "{{agent}}", "instant": true, "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Token über Zeit",
+      "description": "Summe Token (in+out) im Repo",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "refId": "A", "expr": "sum(minds_tokens_total{repo=\"$repo\"})", "legendFormat": "Token gesamt", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    }
+  ]
+}

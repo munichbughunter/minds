@@ -1,0 +1,961 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crates/minds-redact/tests/corpus.rs</title>
+<style>:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e}@media(prefers-color-scheme:dark){:root{--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5}}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}a{color:var(--accent)}.top{padding:1rem 1.25rem;border-bottom:1px solid var(--rule)}.top h1{margin:.25rem 0;font-size:1.1rem;font-family:ui-monospace,monospace;word-break:break-all}.meta{margin:0;color:var(--dim);font-size:.85rem}.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,26rem);gap:0;align-items:start}@media(max-width:820px){.split{grid-template-columns:minmax(0,1fr)}}.code{overflow-x:auto;padding:.5rem 0;font:13px/1.6 ui-monospace,monospace}.line{display:flex;gap:.75rem;padding:0 1rem;white-space:pre}.line .num{color:var(--dim);text-align:right;min-width:3.5ch;user-select:none}.line code{white-space:pre}.line.has-context{background:var(--mark);border-left:3px solid var(--accent);padding-left:calc(1rem - 3px);cursor:pointer}.line.has-context:hover,.line.has-context:focus{outline:none;filter:brightness(1.06)}.line.selected{box-shadow:inset 0 0 0 2px var(--accent)}.panel{position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:1rem 1.25rem;border-left:1px solid var(--rule)}@media(max-width:820px){.panel{position:static;max-height:none;border-left:0;border-top:1px solid var(--rule)}}.panel h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1rem 0 .35rem}.panel h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1rem 0 .25rem}.intent{margin:0;font-size:1rem}.hint{color:var(--dim);font-size:.85rem}dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:.15rem .75rem;font-size:.9rem}dt{color:var(--dim)}dd{margin:0;word-break:break-all}ul{margin:.25rem 0;padding-left:1.1rem;font-size:.9rem}code.id{font-size:.75rem;word-break:break-all}.warn{color:var(--warn)}.back{font-size:.85rem;text-decoration:none}.overview{padding:1rem 1.25rem;max-width:60rem}.overview h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1.5rem 0 .5rem}.cards{list-style:none;margin:0;padding:0;display:grid;gap:.5rem}.card{border:1px solid var(--rule);border-left:3px solid var(--accent);border-radius:.35rem;padding:0}.card-link{display:block;padding:.6rem .8rem;color:inherit;text-decoration:none}.card:has(.card-link){cursor:pointer}.card:has(.card-link):hover{background:var(--mark)}.card>.headline{padding:.6rem .8rem .2rem}.card>.sub{padding:0 .8rem .6rem}.headline{margin:0 0 .2rem;font-size:1rem}.sub{margin:0;color:var(--dim);font-size:.8rem}.files{list-style:none;margin:0;padding:0;display:grid;gap:.25rem}.files a{text-decoration:none}.files a:hover{text-decoration:underline}.empty{color:var(--dim)}.guess{color:var(--warn)}.session .guess{font-size:.8rem;margin:.25rem 0 0}</style>
+</head>
+<body>
+<header class="top">
+<a class="back" href="index.html">← Übersicht</a>
+<h1>crates/minds-redact/tests/corpus.rs</h1>
+<p class="meta">3 von 824 Zeilen mit erfasstem Kontext</p>
+</header>
+<main class="split">
+<div class="code"><div class="line"><span class="num">1</span><code>//! Korpus-Tests: die Redaction gegen realistischen Text, in beide Richtungen.</code></div>
+<div class="line"><span class="num">2</span><code>//!</code></div>
+<div class="line"><span class="num">3</span><code>//! Die Unit-Tests in den Detektor-Modulen prüfen je *ein* Muster. Dieser Korpus</code></div>
+<div class="line"><span class="num">4</span><code>//! prüft die **zusammengesetzte Default-Policy** gegen Text, wie er in</code></div>
+<div class="line"><span class="num">5</span><code>//! Agent-Transkripten tatsächlich vorkommt — und er prüft beide Fehlerrichtungen,</code></div>
+<div class="line"><span class="num">6</span><code>//! weil nur eine davon offensichtlich ist:</code></div>
+<div class="line"><span class="num">7</span><code>//!</code></div>
+<div class="line"><span class="num">8</span><code>//! - **[`MUST_REDACT`] — False Negatives.** Was hier durchrutscht, ist ein Leck.</code></div>
+<div class="line"><span class="num">9</span><code>//!   Der teure Fehler, und der, an den alle denken.</code></div>
+<div class="line"><span class="num">10</span><code>//! - **[`MUST_SURVIVE`] — False Positives.** Was hier fälschlich verschwindet,</code></div>
+<div class="line"><span class="num">11</span><code>//!   zerstört den Record. Ein Reader, der statt des Prompts eine Reihe von</code></div>
+<div class="line"><span class="num">12</span><code>//!   Platzhaltern zeigt, ist wertlos — dann kann man Minds auch weglassen. Diese</code></div>
+<div class="line"><span class="num">13</span><code>//!   Hälfte ist die schwierigere und deshalb die längere Tabelle.</code></div>
+<div class="line"><span class="num">14</span><code>//!</code></div>
+<div class="line"><span class="num">15</span><code>//! Dazu zwei Tabellen, die keine Prüfung, sondern eine **Festschreibung** sind:</code></div>
+<div class="line"><span class="num">16</span><code>//! [`ACCEPTED_OVER_REDACTION`] hält fest, wo wir bewusst zu viel schwärzen, und</code></div>
+<div class="line"><span class="num">17</span><code>//! [`DOCUMENTED_GAPS`], wo bewusst zu wenig. Beide Tabellen schlagen an, sobald</code></div>
+<div class="line"><span class="num">18</span><code>//! sich das Verhalten ändert — auch zum Besseren. Genau das ist der Zweck: Eine</code></div>
+<div class="line"><span class="num">19</span><code>//! stillschweigende Verschiebung der Trennlinie soll es nicht geben.</code></div>
+<div class="line"><span class="num">20</span><code>//!</code></div>
+<div class="line"><span class="num">21</span><code>//! # Zwei Regeln für dieses Verzeichnis</code></div>
+<div class="line"><span class="num">22</span><code>//!</code></div>
+<div class="line"><span class="num">23</span><code>//! 1. **Nie ein echtes Geheimnis als Fixture.** Alle Token hier sind</code></div>
+<div class="line"><span class="num">24</span><code>//!    synthetisch, alle Adressen liegen in `example.*`/`.test`. Die Datei liegt</code></div>
+<div class="line"><span class="num">25</span><code>//!    im Repo — dieselbe Regel wie für die Allowlist.</code></div>
+<div class="line"><span class="num">26</span><code>//! 2. **Ein Fixture, das rot wird, ist erst einmal eine Frage, keine Antwort.**</code></div>
+<div class="line"><span class="num">27</span><code>//!    Sie lautet: Ist die neue Trennlinie besser? Wenn ja, wandert der Eintrag</code></div>
+<div class="line"><span class="num">28</span><code>//!    in die andere Tabelle, statt gelöscht zu werden.</code></div>
+<div class="line"><span class="num">29</span><code>//!</code></div>
+<div class="line"><span class="num">30</span><code>//! Der Korpus prüft die *Detektoren* (Schicht 2). Die Mauer davor</code></div>
+<div class="line"><span class="num">31</span><code>//! (Zugangsdaten-Dateien, Schicht 1) und die Garantie dahinter</code></div>
+<div class="line"><span class="num">32</span><code>//! (`redact_session`, Schicht 3) haben je einen eigenen Test am Ende.</code></div>
+<div class="line"><span class="num">33</span><code></code></div>
+<div class="line"><span class="num">34</span><code>use minds_core::{Agent, Intent, Model, Role, Session, ToolCall, Turn};</code></div>
+<div class="line"><span class="num">35</span><code>use minds_redact::{</code></div>
+<div class="line"><span class="num">36</span><code>    HighEntropyConfig, KnownTokenRedactor, RedactionConfig, RedactionPipeline, is_secret_file,</code></div>
+<div class="line"><span class="num">37</span><code>};</code></div>
+<div class="line"><span class="num">38</span><code></code></div>
+<div class="line"><span class="num">39</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">40</span><code>// Synthetische Token</code></div>
+<div class="line"><span class="num">41</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">42</span><code>//</code></div>
+<div class="line"><span class="num">43</span><code>// Erfundene Werte in der jeweils gültigen Form (Präfix + exakte Länge). Wer eine</code></div>
+<div class="line"><span class="num">44</span><code>// Form ergänzt, ergänzt hier einen Wert und unten ein Fixture — sonst schlägt</code></div>
+<div class="line"><span class="num">45</span><code>// `every_known_token_format_has_a_fixture` an.</code></div>
+<div class="line"><span class="num">46</span><code></code></div>
+<div class="line"><span class="num">47</span><code>/// Der in AWS&#39; eigener Dokumentation veröffentlichte Beispiel-Key.</code></div>
+<div class="line"><span class="num">48</span><code>const AWS_KEY: &amp;str = &quot;AKIAIOSFODNN7EXAMPLE&quot;;</code></div>
+<div class="line"><span class="num">49</span><code>const GITHUB_TOKEN: &amp;str = &quot;ghp_u8jzPde0IgxLd6GncfBAepfJBd0Kh8oOOL8d&quot;;</code></div>
+<div class="line"><span class="num">50</span><code>const GITHUB_FINE_GRAINED: &amp;str = concat!(</code></div>
+<div class="line"><span class="num">51</span><code>    &quot;github_pat_KLzdocJ2isAjIhKtJ0RlgL_&quot;,</code></div>
+<div class="line"><span class="num">52</span><code>    &quot;KOmxgJTeKdNnFRIBXuDL7DxtpYlSXpfKtHF4vUCsMehGAkWvj7FAc9QeWJK&quot;</code></div>
+<div class="line"><span class="num">53</span><code>);</code></div>
+<div class="line"><span class="num">54</span><code>const GITLAB_PAT: &amp;str = &quot;glpat-ORS-6ilI8ihN5KXSc7Tv&quot;;</code></div>
+<div class="line"><span class="num">55</span><code>const SLACK_TOKEN: &amp;str = &quot;xoxb-NhFdnXsiVpzz63FfkCzJr&quot;;</code></div>
+<div class="line"><span class="num">56</span><code>const GOOGLE_API_KEY: &amp;str = &quot;AIzar3J1TWDtkwtDDb_xHKas1VOqg6YYZYn9Zhy&quot;;</code></div>
+<div class="line"><span class="num">57</span><code>const STRIPE_KEY: &amp;str = &quot;sk_live_enCkhvMdgaKjIg8xNbe3nNyj&quot;;</code></div>
+<div class="line"><span class="num">58</span><code>const NPM_TOKEN: &amp;str = &quot;npm_Oq9wMxEhh2FDEEtfjgVvVqE1SkHbn88HxjSI&quot;;</code></div>
+<div class="line"><span class="num">59</span><code>const JWT: &amp;str = concat!(</code></div>
+<div class="line"><span class="num">60</span><code>    &quot;eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.&quot;,</code></div>
+<div class="line"><span class="num">61</span><code>    &quot;eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkFubmEifQ.&quot;,</code></div>
+<div class="line"><span class="num">62</span><code>    &quot;dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk&quot;</code></div>
+<div class="line"><span class="num">63</span><code>);</code></div>
+<div class="line"><span class="num">64</span><code>const PEM_KEY: &amp;str = concat!(</code></div>
+<div class="line"><span class="num">65</span><code>    &quot;-----BEGIN RSA PRIVATE KEY-----\n&quot;,</code></div>
+<div class="line"><span class="num">66</span><code>    &quot;MIIEowIBAAKCAQEAx7Vn9pQmKtLbYcHZfWjRuEoNsAiPdGqTvXlMzBhKrCyWnUeF\n&quot;,</code></div>
+<div class="line"><span class="num">67</span><code>    &quot;gJdSaOvTpQiXmZbNlHrKcYtEuAfWdGxPjRoLsVnBqMzCyIeUkTaFhDpWvNgXlOrJ\n&quot;,</code></div>
+<div class="line"><span class="num">68</span><code>    &quot;-----END RSA PRIVATE KEY-----&quot;</code></div>
+<div class="line"><span class="num">69</span><code>);</code></div>
+<div class="line"><span class="num">70</span><code>/// Prefixloser base64-Blob, hoch genug für das Entropie-Netz (~4.6 bit/Zeichen).</code></div>
+<div class="line"><span class="num">71</span><code>const ENTROPY_BLOB: &amp;str = &quot;dMlHUvTCQCyEZDz/TddJ8HyS5SUkCnD8zRA9a9SkpXz9&quot;;</code></div>
+<div class="line"><span class="num">72</span><code>const JSON_API_KEY: &amp;str = &quot;s3rv1ce-4cc0unt-k3y-2024&quot;;</code></div>
+<div class="line"><span class="num">73</span><code></code></div>
+<div class="line"><span class="num">74</span><code>/// Die `.env`, an der form-basierte Erkennung scheitert — der Grund, warum es</code></div>
+<div class="line"><span class="num">75</span><code>/// [`KeyValueRedactor`](minds_redact::KeyValueRedactor) gibt.</code></div>
+<div class="line"><span class="num">76</span><code>const DOTENV: &amp;str = concat!(</code></div>
+<div class="line"><span class="num">77</span><code>    &quot;DB_USER=admin\n&quot;,</code></div>
+<div class="line"><span class="num">78</span><code>    &quot;DB_PASSWORD=hunter2\n&quot;,</code></div>
+<div class="line"><span class="num">79</span><code>    &quot;SMTP_PASSWORD=Sommer2024!\n&quot;,</code></div>
+<div class="line"><span class="num">80</span><code>    &quot;JWT_SECRET=abc123\n&quot;,</code></div>
+<div class="line"><span class="num">81</span><code>    &quot;DATABASE_URL=postgres://admin:s3cr3t@db.internal:5432/prod&quot;</code></div>
+<div class="line"><span class="num">82</span><code>);</code></div>
+<div class="line"><span class="num">83</span><code></code></div>
+<div class="line"><span class="num">84</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">85</span><code>// False Negatives: muss verschwinden</code></div>
+<div class="line"><span class="num">86</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">87</span><code></code></div>
+<div class="line"><span class="num">88</span><code>/// Ein Fixture, das etwas enthält, das verschwinden muss.</code></div>
+<div class="line"><span class="num">89</span><code>struct MustRedact {</code></div>
+<div class="line"><span class="num">90</span><code>    /// Stabiler Bezeichner; bei den Token-Formen **identisch** mit dem</code></div>
+<div class="line"><span class="num">91</span><code>    /// Regelnamen aus [`KnownTokenRedactor::covered_formats`].</code></div>
+<div class="line"><span class="num">92</span><code>    id: &amp;&#39;static str,</code></div>
+<div class="line"><span class="num">93</span><code>    /// Der Eingabetext.</code></div>
+<div class="line"><span class="num">94</span><code>    text: String,</code></div>
+<div class="line"><span class="num">95</span><code>    /// Zeichenketten, die in der Ausgabe **nicht** mehr vorkommen dürfen.</code></div>
+<div class="line"><span class="num">96</span><code>    gone: &amp;&#39;static [&amp;&#39;static str],</code></div>
+<div class="line"><span class="num">97</span><code>    /// Zeichenketten, die überleben müssen — Redaction darf den Kontext nicht</code></div>
+<div class="line"><span class="num">98</span><code>    /// mitnehmen. Ohne diese Spalte wäre „alles schwärzen&quot; eine bestandene</code></div>
+<div class="line"><span class="num">99</span><code>    /// Prüfung.</code></div>
+<div class="line"><span class="num">100</span><code>    kept: &amp;&#39;static [&amp;&#39;static str],</code></div>
+<div class="line"><span class="num">101</span><code>}</code></div>
+<div class="line"><span class="num">102</span><code></code></div>
+<div class="line"><span class="num">103</span><code>fn must_redact() -&gt; Vec&lt;MustRedact&gt; {</code></div>
+<div class="line"><span class="num">104</span><code>    vec![</code></div>
+<div class="line"><span class="num">105</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">106</span><code>            id: &quot;aws-access-key-id&quot;,</code></div>
+<div class="line"><span class="num">107</span><code>            text: format!(&quot;aws_access_key_id = {AWS_KEY}&quot;),</code></div>
+<div class="line"><span class="num">108</span><code>            gone: &amp;[AWS_KEY],</code></div>
+<div class="line"><span class="num">109</span><code>            kept: &amp;[&quot;aws_access_key_id&quot;],</code></div>
+<div class="line"><span class="num">110</span><code>        },</code></div>
+<div class="line"><span class="num">111</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">112</span><code>            id: &quot;aws-secret-access-key&quot;,</code></div>
+<div class="line"><span class="num">113</span><code>            text: &quot;export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY&quot;.into(),</code></div>
+<div class="line"><span class="num">114</span><code>            gone: &amp;[&quot;wJalrXUtnFEMI&quot;],</code></div>
+<div class="line"><span class="num">115</span><code>            kept: &amp;[&quot;export AWS_SECRET_ACCESS_KEY=&quot;],</code></div>
+<div class="line"><span class="num">116</span><code>        },</code></div>
+<div class="line"><span class="num">117</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">118</span><code>            // Der Klassiker: Zugangsdaten im Git-Remote. Hier greifen drei</code></div>
+<div class="line"><span class="num">119</span><code>            // Detektoren übereinander — Token-Form, URL-Struktur und der</code></div>
+<div class="line"><span class="num">120</span><code>            // `oauth`-Schlüssel. Die Pipeline führt sie zu einem Fund zusammen.</code></div>
+<div class="line"><span class="num">121</span><code>            id: &quot;github-token&quot;,</code></div>
+<div class="line"><span class="num">122</span><code>            text: format!(</code></div>
+<div class="line"><span class="num">123</span><code>                &quot;git remote set-url origin https://oauth2:{GITHUB_TOKEN}@github.com/acme/app.git&quot;</code></div>
+<div class="line"><span class="num">124</span><code>            ),</code></div>
+<div class="line"><span class="num">125</span><code>            gone: &amp;[GITHUB_TOKEN, &quot;oauth2&quot;],</code></div>
+<div class="line"><span class="num">126</span><code>            kept: &amp;[&quot;git remote set-url origin&quot;],</code></div>
+<div class="line"><span class="num">127</span><code>        },</code></div>
+<div class="line"><span class="num">128</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">129</span><code>            id: &quot;github-fine-grained-pat&quot;,</code></div>
+<div class="line"><span class="num">130</span><code>            text: format!(&quot;GH_TOKEN={GITHUB_FINE_GRAINED}&quot;),</code></div>
+<div class="line"><span class="num">131</span><code>            gone: &amp;[GITHUB_FINE_GRAINED],</code></div>
+<div class="line"><span class="num">132</span><code>            kept: &amp;[&quot;GH_TOKEN=&quot;],</code></div>
+<div class="line"><span class="num">133</span><code>        },</code></div>
+<div class="line"><span class="num">134</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">135</span><code>            id: &quot;gitlab-pat&quot;,</code></div>
+<div class="line"><span class="num">136</span><code>            text: format!(&quot;PRIVATE-TOKEN: {GITLAB_PAT}&quot;),</code></div>
+<div class="line"><span class="num">137</span><code>            gone: &amp;[GITLAB_PAT],</code></div>
+<div class="line"><span class="num">138</span><code>            kept: &amp;[&quot;PRIVATE-TOKEN:&quot;],</code></div>
+<div class="line"><span class="num">139</span><code>        },</code></div>
+<div class="line"><span class="num">140</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">141</span><code>            id: &quot;slack-token&quot;,</code></div>
+<div class="line"><span class="num">142</span><code>            text: format!(&quot;slack_bot_token = {SLACK_TOKEN}&quot;),</code></div>
+<div class="line"><span class="num">143</span><code>            gone: &amp;[SLACK_TOKEN],</code></div>
+<div class="line"><span class="num">144</span><code>            kept: &amp;[&quot;slack_bot_token&quot;],</code></div>
+<div class="line"><span class="num">145</span><code>        },</code></div>
+<div class="line"><span class="num">146</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">147</span><code>            id: &quot;google-api-key&quot;,</code></div>
+<div class="line"><span class="num">148</span><code>            text: format!(&quot;gmaps.setKey(&#39;{GOOGLE_API_KEY}&#39;)&quot;),</code></div>
+<div class="line"><span class="num">149</span><code>            gone: &amp;[GOOGLE_API_KEY],</code></div>
+<div class="line"><span class="num">150</span><code>            kept: &amp;[&quot;gmaps.setKey&quot;],</code></div>
+<div class="line"><span class="num">151</span><code>        },</code></div>
+<div class="line"><span class="num">152</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">153</span><code>            id: &quot;stripe-live-key&quot;,</code></div>
+<div class="line"><span class="num">154</span><code>            text: format!(&quot;STRIPE_KEY={STRIPE_KEY}&quot;),</code></div>
+<div class="line"><span class="num">155</span><code>            gone: &amp;[STRIPE_KEY],</code></div>
+<div class="line"><span class="num">156</span><code>            kept: &amp;[&quot;STRIPE_KEY=&quot;],</code></div>
+<div class="line"><span class="num">157</span><code>        },</code></div>
+<div class="line"><span class="num">158</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">159</span><code>            id: &quot;npm-token&quot;,</code></div>
+<div class="line"><span class="num">160</span><code>            text: format!(&quot;//registry.npmjs.org/:_authToken={NPM_TOKEN}&quot;),</code></div>
+<div class="line"><span class="num">161</span><code>            gone: &amp;[NPM_TOKEN],</code></div>
+<div class="line"><span class="num">162</span><code>            kept: &amp;[&quot;registry.npmjs.org&quot;],</code></div>
+<div class="line"><span class="num">163</span><code>        },</code></div>
+<div class="line"><span class="num">164</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">165</span><code>            // `Bearer` bleibt stehen, der Token geht: Aus dem Record soll</code></div>
+<div class="line"><span class="num">166</span><code>            // hervorgehen, *dass* authentifiziert wurde.</code></div>
+<div class="line"><span class="num">167</span><code>            id: &quot;jwt&quot;,</code></div>
+<div class="line"><span class="num">168</span><code>            text: format!(&quot;Authorization: Bearer {JWT}&quot;),</code></div>
+<div class="line"><span class="num">169</span><code>            gone: &amp;[JWT, &quot;eyJhbGci&quot;],</code></div>
+<div class="line"><span class="num">170</span><code>            kept: &amp;[&quot;Authorization:&quot;, &quot;Bearer&quot;],</code></div>
+<div class="line"><span class="num">171</span><code>        },</code></div>
+<div class="line"><span class="num">172</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">173</span><code>            id: &quot;private-key-pem&quot;,</code></div>
+<div class="line"><span class="num">174</span><code>            text: format!(&quot;cat deploy.key\n{PEM_KEY}&quot;),</code></div>
+<div class="line"><span class="num">175</span><code>            gone: &amp;[&quot;MIIEowIBAAKCAQEA&quot;, &quot;BEGIN RSA PRIVATE KEY&quot;],</code></div>
+<div class="line"><span class="num">176</span><code>            kept: &amp;[&quot;cat deploy.key&quot;],</code></div>
+<div class="line"><span class="num">177</span><code>        },</code></div>
+<div class="line"><span class="num">178</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">179</span><code>            // Fünf Zeilen, fünf Funde — keiner davon form-erkennbar.</code></div>
+<div class="line"><span class="num">180</span><code>            id: &quot;dotenv-block&quot;,</code></div>
+<div class="line"><span class="num">181</span><code>            text: DOTENV.into(),</code></div>
+<div class="line"><span class="num">182</span><code>            gone: &amp;[&quot;hunter2&quot;, &quot;Sommer2024!&quot;, &quot;abc123&quot;, &quot;s3cr3t&quot;, &quot;admin&quot;],</code></div>
+<div class="line"><span class="num">183</span><code>            kept: &amp;[&quot;DB_PASSWORD=&quot;, &quot;postgres://&quot;, &quot;:5432/prod&quot;],</code></div>
+<div class="line"><span class="num">184</span><code>        },</code></div>
+<div class="line"><span class="num">185</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">186</span><code>            id: &quot;cli-password-flag&quot;,</code></div>
+<div class="line"><span class="num">187</span><code>            text: &quot;psql --password hunter2 --host db.internal&quot;.into(),</code></div>
+<div class="line"><span class="num">188</span><code>            gone: &amp;[&quot;hunter2&quot;],</code></div>
+<div class="line"><span class="num">189</span><code>            kept: &amp;[&quot;--password&quot;, &quot;--host db.internal&quot;],</code></div>
+<div class="line"><span class="num">190</span><code>        },</code></div>
+<div class="line"><span class="num">191</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">192</span><code>            id: &quot;cli-password-equals&quot;,</code></div>
+<div class="line"><span class="num">193</span><code>            text: &quot;mysql -u root --password=Sommer2024 -h db&quot;.into(),</code></div>
+<div class="line"><span class="num">194</span><code>            gone: &amp;[&quot;Sommer2024&quot;],</code></div>
+<div class="line"><span class="num">195</span><code>            kept: &amp;[&quot;mysql -u root&quot;, &quot;-h db&quot;],</code></div>
+<div class="line"><span class="num">196</span><code>        },</code></div>
+<div class="line"><span class="num">197</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">198</span><code>            id: &quot;url-credentials&quot;,</code></div>
+<div class="line"><span class="num">199</span><code>            text: &quot;clone von https://buildbot:Sommer2024@git.internal.test/infra.git&quot;.into(),</code></div>
+<div class="line"><span class="num">200</span><code>            gone: &amp;[&quot;Sommer2024&quot;, &quot;buildbot&quot;],</code></div>
+<div class="line"><span class="num">201</span><code>            kept: &amp;[&quot;clone von&quot;, &quot;https://&quot;, &quot;/infra.git&quot;],</code></div>
+<div class="line"><span class="num">202</span><code>        },</code></div>
+<div class="line"><span class="num">203</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">204</span><code>            id: &quot;email-address&quot;,</code></div>
+<div class="line"><span class="num">205</span><code>            text: &quot;Bug gemeldet von anna.mueller@example.org, siehe #4711&quot;.into(),</code></div>
+<div class="line"><span class="num">206</span><code>            gone: &amp;[&quot;anna.mueller@example.org&quot;, &quot;anna.mueller&quot;],</code></div>
+<div class="line"><span class="num">207</span><code>            kept: &amp;[&quot;Bug gemeldet von&quot;, &quot;#4711&quot;],</code></div>
+<div class="line"><span class="num">208</span><code>        },</code></div>
+<div class="line"><span class="num">209</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">210</span><code>            id: &quot;two-emails&quot;,</code></div>
+<div class="line"><span class="num">211</span><code>            text: &quot;cc: anna@example.org, bob@example.net&quot;.into(),</code></div>
+<div class="line"><span class="num">212</span><code>            gone: &amp;[&quot;anna@example.org&quot;, &quot;bob@example.net&quot;],</code></div>
+<div class="line"><span class="num">213</span><code>            kept: &amp;[&quot;cc:&quot;],</code></div>
+<div class="line"><span class="num">214</span><code>        },</code></div>
+<div class="line"><span class="num">215</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">216</span><code>            // Ohne Präfix und ohne Schlüsselnamen — nur das Entropie-Netz.</code></div>
+<div class="line"><span class="num">217</span><code>            id: &quot;high-entropy-blob&quot;,</code></div>
+<div class="line"><span class="num">218</span><code>            text: format!(&quot;Antwort-Body: {ENTROPY_BLOB}&quot;),</code></div>
+<div class="line"><span class="num">219</span><code>            gone: &amp;[ENTROPY_BLOB],</code></div>
+<div class="line"><span class="num">220</span><code>            kept: &amp;[&quot;Antwort-Body:&quot;],</code></div>
+<div class="line"><span class="num">221</span><code>        },</code></div>
+<div class="line"><span class="num">222</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">223</span><code>            id: &quot;json-api-key&quot;,</code></div>
+<div class="line"><span class="num">224</span><code>            text: format!(r#&quot;{{&quot;api_key&quot;: &quot;{JSON_API_KEY}&quot;, &quot;region&quot;: &quot;eu-central-1&quot;}}&quot;#),</code></div>
+<div class="line"><span class="num">225</span><code>            gone: &amp;[JSON_API_KEY],</code></div>
+<div class="line"><span class="num">226</span><code>            kept: &amp;[r#&quot;&quot;api_key&quot;&quot;#, &quot;eu-central-1&quot;],</code></div>
+<div class="line"><span class="num">227</span><code>        },</code></div>
+<div class="line"><span class="num">228</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">229</span><code>            id: &quot;basic-auth-header&quot;,</code></div>
+<div class="line"><span class="num">230</span><code>            text: &quot;curl -H &#39;Authorization: Basic YWRtaW46aHVudGVyMg==&#39;&quot;.into(),</code></div>
+<div class="line"><span class="num">231</span><code>            gone: &amp;[&quot;YWRtaW46aHVudGVyMg&quot;],</code></div>
+<div class="line"><span class="num">232</span><code>            kept: &amp;[&quot;Authorization:&quot;, &quot;Basic&quot;],</code></div>
+<div class="line"><span class="num">233</span><code>        },</code></div>
+<div class="line"><span class="num">234</span><code>        MustRedact {</code></div>
+<div class="line"><span class="num">235</span><code>            id: &quot;k8s-secret-yaml&quot;,</code></div>
+<div class="line"><span class="num">236</span><code>            text: &quot;apiVersion: v1\nkind: Secret\ndata:\n  password: aHVudGVyMg==&quot;.into(),</code></div>
+<div class="line"><span class="num">237</span><code>            gone: &amp;[&quot;aHVudGVyMg&quot;],</code></div>
+<div class="line"><span class="num">238</span><code>            kept: &amp;[&quot;kind: Secret&quot;, &quot;password:&quot;],</code></div>
+<div class="line"><span class="num">239</span><code>        },</code></div>
+<div class="line"><span class="num">240</span><code>    ]</code></div>
+<div class="line"><span class="num">241</span><code>}</code></div>
+<div class="line"><span class="num">242</span><code></code></div>
+<div class="line"><span class="num">243</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">244</span><code>// False Positives: muss unverändert bleiben</code></div>
+<div class="line"><span class="num">245</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">246</span><code></code></div>
+<div class="line"><span class="num">247</span><code>/// Text aus echten Transkripten, der **Zeichen für Zeichen** überleben muss.</code></div>
+<div class="line"><span class="num">248</span><code>///</code></div>
+<div class="line"><span class="num">249</span><code>/// Jeder Eintrag ist ein Fehlalarm, der einmal plausibel war: ein Wort, das auch</code></div>
+<div class="line"><span class="num">250</span><code>/// ein Schlüsselname ist; eine Hex-Kette, die auch ein Secret sein könnte; eine</code></div>
+<div class="line"><span class="num">251</span><code>/// URL, die auch Zugangsdaten tragen könnte. Die Kommentare nennen den Detektor,</code></div>
+<div class="line"><span class="num">252</span><code>/// der hier zu Recht schweigt.</code></div>
+<div class="line"><span class="num">253</span><code>const MUST_SURVIVE: &amp;[(&amp;str, &amp;str)] = &amp;[</code></div>
+<div class="line"><span class="num">254</span><code>    // --- `token`/`secret` als Wort, nicht als Schlüssel ---------------------</code></div>
+<div class="line"><span class="num">255</span><code>    (&quot;prose-token&quot;, &quot;Der Token-Verbrauch war erstaunlich hoch.&quot;),</code></div>
+<div class="line"><span class="num">256</span><code>    (</code></div>
+<div class="line"><span class="num">257</span><code>        &quot;bearer-prose&quot;,</code></div>
+<div class="line"><span class="num">258</span><code>        &quot;Das Bearer-Token-Konzept muss noch erklaert werden.&quot;,</code></div>
+<div class="line"><span class="num">259</span><code>    ),</code></div>
+<div class="line"><span class="num">260</span><code>    (</code></div>
+<div class="line"><span class="num">261</span><code>        // Der Grund für den Shaped-Tier: Agent-Transkripte sind voll davon.</code></div>
+<div class="line"><span class="num">262</span><code>        &quot;token-counters&quot;,</code></div>
+<div class="line"><span class="num">263</span><code>        &quot;input_tokens: 45123, output_tokens: 890, Token-Limit: 4096&quot;,</code></div>
+<div class="line"><span class="num">264</span><code>    ),</code></div>
+<div class="line"><span class="num">265</span><code>    (&quot;unset-key&quot;, &quot;SECRET_KEY_BASE ist nicht gesetzt&quot;),</code></div>
+<div class="line"><span class="num">266</span><code>    (&quot;header-name&quot;, &quot;x-api-key header fehlt im Request&quot;),</code></div>
+<div class="line"><span class="num">267</span><code>    (</code></div>
+<div class="line"><span class="num">268</span><code>        &quot;login-prose&quot;,</code></div>
+<div class="line"><span class="num">269</span><code>        &quot;Login fehlgeschlagen (401) nach drei Versuchen&quot;,</code></div>
+<div class="line"><span class="num">270</span><code>    ),</code></div>
+<div class="line"><span class="num">271</span><code>    (</code></div>
+<div class="line"><span class="num">272</span><code>        &quot;session-prose&quot;,</code></div>
+<div class="line"><span class="num">273</span><code>        &quot;Die Session lief 12 Minuten und kostete 3 Cent.&quot;,</code></div>
+<div class="line"><span class="num">274</span><code>    ),</code></div>
+<div class="line"><span class="num">275</span><code>    (&quot;stoplist-value&quot;, &quot;session: localhost&quot;),</code></div>
+<div class="line"><span class="num">276</span><code>    // --- Hex-Ketten: lang genug, aber zu entropiearm ------------------------</code></div>
+<div class="line"><span class="num">277</span><code>    (</code></div>
+<div class="line"><span class="num">278</span><code>        &quot;git-sha&quot;,</code></div>
+<div class="line"><span class="num">279</span><code>        &quot;Siehe commit 356a192b7913b04c54574d18c28d46e6395428ab&quot;,</code></div>
+<div class="line"><span class="num">280</span><code>    ),</code></div>
+<div class="line"><span class="num">281</span><code>    (</code></div>
+<div class="line"><span class="num">282</span><code>        // `hash` steht bewusst nicht in der Schlüsseltabelle.</code></div>
+<div class="line"><span class="num">283</span><code>        &quot;hash-is-not-a-key&quot;,</code></div>
+<div class="line"><span class="num">284</span><code>        &quot;hash: 356a192b7913b04c54574d18c28d46e6395428ab&quot;,</code></div>
+<div class="line"><span class="num">285</span><code>    ),</code></div>
+<div class="line"><span class="num">286</span><code>    (&quot;md5&quot;, &quot;md5 e2fc714c4727ee9395f324cd2e7f331f&quot;),</code></div>
+<div class="line"><span class="num">287</span><code>    (</code></div>
+<div class="line"><span class="num">288</span><code>        &quot;docker-digest&quot;,</code></div>
+<div class="line"><span class="num">289</span><code>        &quot;sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08&quot;,</code></div>
+<div class="line"><span class="num">290</span><code>    ),</code></div>
+<div class="line"><span class="num">291</span><code>    (&quot;uuid&quot;, &quot;request_id: 550e8400-e29b-41d4-a716-446655440000&quot;),</code></div>
+<div class="line"><span class="num">292</span><code>    // --- Rollenmarken und Metadaten: der teuerste Fehlalarm ------------------</code></div>
+<div class="line"><span class="num">293</span><code>    (</code></div>
+<div class="line"><span class="num">294</span><code>        // `User:` markiert in jedem zweiten Transkript eine Nachricht. Würde die</code></div>
+<div class="line"><span class="num">295</span><code>        // Identity-Regel hier greifen, wäre der Record unlesbar.</code></div>
+<div class="line"><span class="num">296</span><code>        &quot;role-marker&quot;,</code></div>
+<div class="line"><span class="num">297</span><code>        &quot;User: Kann ich das Retry-Timeout anpassen?&quot;,</code></div>
+<div class="line"><span class="num">298</span><code>    ),</code></div>
+<div class="line"><span class="num">299</span><code>    (</code></div>
+<div class="line"><span class="num">300</span><code>        // `auth` allein ist kein Schlüssel — sonst stürbe jede Git-Log-Zeile.</code></div>
+<div class="line"><span class="num">301</span><code>        &quot;author-line&quot;,</code></div>
+<div class="line"><span class="num">302</span><code>        &quot;Author: Patrick Doering&quot;,</code></div>
+<div class="line"><span class="num">303</span><code>    ),</code></div>
+<div class="line"><span class="num">304</span><code>    // --- Werte, die nur wie Geheimnisse aussehen ----------------------------</code></div>
+<div class="line"><span class="num">305</span><code>    (</code></div>
+<div class="line"><span class="num">306</span><code>        // `key` allein steht nicht in der Tabelle.</code></div>
+<div class="line"><span class="num">307</span><code>        &quot;key-alone&quot;,</code></div>
+<div class="line"><span class="num">308</span><code>        &quot;let hotkey = monkey_keyboard.get(&amp;id);&quot;,</code></div>
+<div class="line"><span class="num">309</span><code>    ),</code></div>
+<div class="line"><span class="num">310</span><code>    (</code></div>
+<div class="line"><span class="num">311</span><code>        // Ein Pfad benennt einen Ort, kein Geheimnis.</code></div>
+<div class="line"><span class="num">312</span><code>        &quot;secret-path-not-value&quot;,</code></div>
+<div class="line"><span class="num">313</span><code>        &quot;TOKEN_FILE=/run/secrets/api-token&quot;,</code></div>
+<div class="line"><span class="num">314</span><code>    ),</code></div>
+<div class="line"><span class="num">315</span><code>    (</code></div>
+<div class="line"><span class="num">316</span><code>        // Eine Referenz auf ein Geheimnis ist nicht das Geheimnis.</code></div>
+<div class="line"><span class="num">317</span><code>        &quot;variable-reference&quot;,</code></div>
+<div class="line"><span class="num">318</span><code>        &quot;API_KEY=$MY_API_KEY&quot;,</code></div>
+<div class="line"><span class="num">319</span><code>    ),</code></div>
+<div class="line"><span class="num">320</span><code>    (&quot;percent-reference&quot;, &quot;set PASSWORD=%DEPLOY_PW%&quot;),</code></div>
+<div class="line"><span class="num">321</span><code>    // --- URLs ohne Zugangsdaten ---------------------------------------------</code></div>
+<div class="line"><span class="num">322</span><code>    (&quot;plain-repo-url&quot;, &quot;https://gitlab.com/pdoering-it/minds&quot;),</code></div>
+<div class="line"><span class="num">323</span><code>    (&quot;at-after-path&quot;, &quot;https://example.com/a@b&quot;),</code></div>
+<div class="line"><span class="num">324</span><code>    (&quot;socket-addr&quot;, &quot;lauscht auf 127.0.0.1:8080&quot;),</code></div>
+<div class="line"><span class="num">325</span><code>    // --- Knapp verfehlte Token-Formen ---------------------------------------</code></div>
+<div class="line"><span class="num">326</span><code>    (</code></div>
+<div class="line"><span class="num">327</span><code>        // Die Längen in den Token-Mustern sind exakt, nicht ungefähr.</code></div>
+<div class="line"><span class="num">328</span><code>        &quot;near-miss-aws&quot;,</code></div>
+<div class="line"><span class="num">329</span><code>        &quot;AKIA1234 ist zu kurz fuer einen echten Key&quot;,</code></div>
+<div class="line"><span class="num">330</span><code>    ),</code></div>
+<div class="line"><span class="num">331</span><code>    (&quot;near-miss-github&quot;, &quot;ghp_zutokurz taucht im Log auf&quot;),</code></div>
+<div class="line"><span class="num">332</span><code>    (</code></div>
+<div class="line"><span class="num">333</span><code>        // Der Vorfilter trifft `-----BEGIN `, die Regex verlangt PRIVATE KEY.</code></div>
+<div class="line"><span class="num">334</span><code>        &quot;certificate-header&quot;,</code></div>
+<div class="line"><span class="num">335</span><code>        &quot;-----BEGIN CERTIFICATE-----&quot;,</code></div>
+<div class="line"><span class="num">336</span><code>    ),</code></div>
+<div class="line"><span class="num">337</span><code>    // --- Gewöhnlicher Werkzeug-Output ---------------------------------------</code></div>
+<div class="line"><span class="num">338</span><code>    (&quot;content-type&quot;, &quot;Content-Type: application/json&quot;),</code></div>
+<div class="line"><span class="num">339</span><code>    (&quot;timestamp&quot;, &quot;2026-07-22T09:14:33Z INFO minds::capture&quot;),</code></div>
+<div class="line"><span class="num">340</span><code>    (</code></div>
+<div class="line"><span class="num">341</span><code>        &quot;cargo-dependency&quot;,</code></div>
+<div class="line"><span class="num">342</span><code>        r#&quot;serde = { version = &quot;1&quot;, features = [&quot;derive&quot;] }&quot;#,</code></div>
+<div class="line"><span class="num">343</span><code>    ),</code></div>
+<div class="line"><span class="num">344</span><code>    (&quot;toml-table&quot;, &quot;[high_entropy]\nenabled = true\nmin_len = 32&quot;),</code></div>
+<div class="line"><span class="num">345</span><code>    (</code></div>
+<div class="line"><span class="num">346</span><code>        &quot;env-example&quot;,</code></div>
+<div class="line"><span class="num">347</span><code>        &quot;.env.example:\nDB_HOST=localhost\nDB_PORT=5432&quot;,</code></div>
+<div class="line"><span class="num">348</span><code>    ),</code></div>
+<div class="line"><span class="num">349</span><code>    (</code></div>
+<div class="line"><span class="num">350</span><code>        &quot;cargo-invocation&quot;,</code></div>
+<div class="line"><span class="num">351</span><code>        &quot;cargo test -p minds-redact -- --nocapture&quot;,</code></div>
+<div class="line"><span class="num">352</span><code>    ),</code></div>
+<div class="line"><span class="num">353</span><code>    (</code></div>
+<div class="line"><span class="num">354</span><code>        &quot;panic-location&quot;,</code></div>
+<div class="line"><span class="num">355</span><code>        &quot;thread &#39;main&#39; panicked at crates/minds-redact/src/pipeline.rs:142&quot;,</code></div>
+<div class="line"><span class="num">356</span><code>    ),</code></div>
+<div class="line"><span class="num">357</span><code>    (</code></div>
+<div class="line"><span class="num">358</span><code>        &quot;rust-code&quot;,</code></div>
+<div class="line"><span class="num">359</span><code>        &quot;let cfg = RedactionConfig::default().pipeline()?;&quot;,</code></div>
+<div class="line"><span class="num">360</span><code>    ),</code></div>
+<div class="line"><span class="num">361</span><code>    (</code></div>
+<div class="line"><span class="num">362</span><code>        &quot;german-prose&quot;,</code></div>
+<div class="line"><span class="num">363</span><code>        &quot;Der Retry-Test flackert seit dem Umstieg auf tokio 1.35 sporadisch.&quot;,</code></div>
+<div class="line"><span class="num">364</span><code>    ),</code></div>
+<div class="line"><span class="num">365</span><code>    (&quot;semver&quot;, &quot;minds 0.1.0 (build 2026-07-22)&quot;),</code></div>
+<div class="line"><span class="num">366</span><code>];</code></div>
+<div class="line"><span class="num">367</span><code></code></div>
+<div class="line"><span class="num">368</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">369</span><code>// Festgeschriebene Kompromisse</code></div>
+<div class="line"><span class="num">370</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">371</span><code></code></div>
+<div class="line"><span class="num">372</span><code>/// Stellen, an denen die Policy **bewusst zu viel** schwärzt: `(id, ein, aus)`.</code></div>
+<div class="line"><span class="num">373</span><code>///</code></div>
+<div class="line"><span class="num">374</span><code>/// Der Preis des Strict-Tiers, offen benannt. Ein verlorenes Wort im Record ist</code></div>
+<div class="line"><span class="num">375</span><code>/// ein Schönheitsfehler, ein durchgerutschtes Passwort ein Incident — deshalb</code></div>
+<div class="line"><span class="num">376</span><code>/// gewinnt hier die grobe Regel. Wo es im Alltag stört, ist die Allowlist die</code></div>
+<div class="line"><span class="num">377</span><code>/// Antwort, nicht ein weicherer Detektor.</code></div>
+<div class="line"><span class="num">378</span><code>const ACCEPTED_OVER_REDACTION: &amp;[(&amp;str, &amp;str, &amp;str)] = &amp;[</code></div>
+<div class="line"><span class="num">379</span><code>    (</code></div>
+<div class="line"><span class="num">380</span><code>        &quot;strict-tier-eats-prose&quot;,</code></div>
+<div class="line"><span class="num">381</span><code>        &quot;Secret: der Reviewer liest hier mit&quot;,</code></div>
+<div class="line"><span class="num">382</span><code>        &quot;Secret: [redacted:secret] Reviewer liest hier mit&quot;,</code></div>
+<div class="line"><span class="num">383</span><code>    ),</code></div>
+<div class="line"><span class="num">384</span><code>    (</code></div>
+<div class="line"><span class="num">385</span><code>        // Ein Login-Name ist keine Zugangsdatei, aber er benennt eine Person.</code></div>
+<div class="line"><span class="num">386</span><code>        &quot;identity-key-is-pii&quot;,</code></div>
+<div class="line"><span class="num">387</span><code>        &quot;DB_USER=admin&quot;,</code></div>
+<div class="line"><span class="num">388</span><code>        &quot;DB_USER=[redacted:pii]&quot;,</code></div>
+<div class="line"><span class="num">389</span><code>    ),</code></div>
+<div class="line"><span class="num">390</span><code>];</code></div>
+<div class="line"><span class="num">391</span><code></code></div>
+<div class="line"><span class="num">392</span><code>/// Stellen, an denen die Policy **bewusst zu wenig** fängt: `(id, Text, Wert)`.</code></div>
+<div class="line"><span class="num">393</span><code>///</code></div>
+<div class="line"><span class="num">394</span><code>/// Beide Lücken sind strukturell, nicht Nachlässigkeit: In Prosa fehlt der</code></div>
+<div class="line"><span class="num">395</span><code>/// Zuweisungs-Kontext, und ein rein alphabetischer Wert ist von einem Wort nicht</code></div>
+<div class="line"><span class="num">396</span><code>/// zu unterscheiden. Die Antwort darauf steht nicht in einem besseren Detektor,</code></div>
+<div class="line"><span class="num">397</span><code>/// sondern in den anderen Schichten: die Mauer (`.env` wird gar nicht erst</code></div>
+<div class="line"><span class="num">398</span><code>/// gescannt) und die Config (`secret_keys` hebt `token` in den Strict-Tier).</code></div>
+<div class="line"><span class="num">399</span><code>///</code></div>
+<div class="line"><span class="num">400</span><code>/// Wird ein Eintrag hier grün, weil jemand die Lücke geschlossen hat: Eintrag</code></div>
+<div class="line"><span class="num">401</span><code>/// löschen und in [`MUST_REDACT`] aufnehmen.</code></div>
+<div class="line"><span class="num">402</span><code>const DOCUMENTED_GAPS: &amp;[(&amp;str, &amp;str, &amp;str)] = &amp;[</code></div>
+<div class="line"><span class="num">403</span><code>    (</code></div>
+<div class="line"><span class="num">404</span><code>        &quot;prose-password&quot;,</code></div>
+<div class="line"><span class="num">405</span><code>        &quot;das Passwort war uebrigens hunter2&quot;,</code></div>
+<div class="line"><span class="num">406</span><code>        &quot;hunter2&quot;,</code></div>
+<div class="line"><span class="num">407</span><code>    ),</code></div>
+<div class="line"><span class="num">408</span><code>    (</code></div>
+<div class="line"><span class="num">409</span><code>        &quot;alphabetic-shaped-token&quot;,</code></div>
+<div class="line"><span class="num">410</span><code>        &quot;TOKEN=supersecrettoken&quot;,</code></div>
+<div class="line"><span class="num">411</span><code>        &quot;supersecrettoken&quot;,</code></div>
+<div class="line"><span class="num">412</span><code>    ),</code></div>
+<div class="line"><span class="num">413</span><code>];</code></div>
+<div class="line"><span class="num">414</span><code></code></div>
+<div class="line"><span class="num">415</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">416</span><code>// Hilfen</code></div>
+<div class="line"><span class="num">417</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">418</span><code></code></div>
+<div class="line"><span class="num">419</span><code>/// Die Policy, die ein Repo ohne eigene Config bekommt.</code></div>
+<div class="line"><span class="num">420</span><code>fn policy() -&gt; RedactionPipeline {</code></div>
+<div class="line"><span class="num">421</span><code>    RedactionConfig::default()</code></div>
+<div class="line"><span class="num">422</span><code>        .pipeline()</code></div>
+<div class="line"><span class="num">423</span><code>        .expect(&quot;Default-Policy muss bauen&quot;)</code></div>
+<div class="line"><span class="num">424</span><code>}</code></div>
+<div class="line"><span class="num">425</span><code></code></div>
+<div class="line"><span class="num">426</span><code>/// Sammelt alle Beanstandungen und meldet sie **gemeinsam**.</code></div>
+<div class="line"><span class="num">427</span><code>///</code></div>
+<div class="line"><span class="num">428</span><code>/// Ein Korpus, der beim ersten Treffer abbricht, verwandelt „drei Fixtures sind</code></div>
+<div class="line"><span class="num">429</span><code>/// rot&quot; in drei Testläufe. Der Bericht am Ende zeigt das ganze Bild.</code></div>
+<div class="line"><span class="num">430</span><code>#[derive(Default)]</code></div>
+<div class="line"><span class="num">431</span><code>struct Report {</code></div>
+<div class="line"><span class="num">432</span><code>    problems: Vec&lt;String&gt;,</code></div>
+<div class="line"><span class="num">433</span><code>}</code></div>
+<div class="line"><span class="num">434</span><code></code></div>
+<div class="line"><span class="num">435</span><code>impl Report {</code></div>
+<div class="line"><span class="num">436</span><code>    fn note(&amp;mut self, problem: String) {</code></div>
+<div class="line"><span class="num">437</span><code>        self.problems.push(problem);</code></div>
+<div class="line"><span class="num">438</span><code>    }</code></div>
+<div class="line"><span class="num">439</span><code></code></div>
+<div class="line"><span class="num">440</span><code>    fn finish(self, headline: &amp;str) {</code></div>
+<div class="line"><span class="num">441</span><code>        assert!(</code></div>
+<div class="line"><span class="num">442</span><code>            self.problems.is_empty(),</code></div>
+<div class="line"><span class="num">443</span><code>            &quot;{headline} — {} Beanstandung(en):\n\n{}\n&quot;,</code></div>
+<div class="line"><span class="num">444</span><code>            self.problems.len(),</code></div>
+<div class="line"><span class="num">445</span><code>            self.problems.join(&quot;\n&quot;)</code></div>
+<div class="line"><span class="num">446</span><code>        );</code></div>
+<div class="line"><span class="num">447</span><code>    }</code></div>
+<div class="line"><span class="num">448</span><code>}</code></div>
+<div class="line"><span class="num">449</span><code></code></div>
+<div class="line"><span class="num">450</span><code>/// Der Text eines [`MUST_SURVIVE`]-Eintrags, über seinen Bezeichner.</code></div>
+<div class="line"><span class="num">451</span><code>fn survivor(id: &amp;str) -&gt; &amp;&#39;static str {</code></div>
+<div class="line"><span class="num">452</span><code>    MUST_SURVIVE</code></div>
+<div class="line"><span class="num">453</span><code>        .iter()</code></div>
+<div class="line"><span class="num">454</span><code>        .find(|(fixture, _)| *fixture == id)</code></div>
+<div class="line"><span class="num">455</span><code>        .map(|(_, text)| *text)</code></div>
+<div class="line"><span class="num">456</span><code>        .unwrap_or_else(|| panic!(&quot;kein MUST_SURVIVE-Fixture mit id {id:?}&quot;))</code></div>
+<div class="line"><span class="num">457</span><code>}</code></div>
+<div class="line"><span class="num">458</span><code></code></div>
+<div class="line"><span class="num">459</span><code>/// Setzt einen Text in eine Mehrbyte-Umgebung. Die Detektoren rechnen in Bytes;</code></div>
+<div class="line"><span class="num">460</span><code>/// ein Fund, dessen Grenzen nicht auf einer Zeichengrenze liegen, würde beim</code></div>
+<div class="line"><span class="num">461</span><code>/// Ersetzen paniken oder als Vertragsverstoß gezählt.</code></div>
+<div class="line"><span class="num">462</span><code>fn in_multibyte_context(text: &amp;str) -&gt; String {</code></div>
+<div class="line"><span class="num">463</span><code>    format!(&quot;Präfix äöü 🦀\n{text}\n🦀 Süffix&quot;)</code></div>
+<div class="line"><span class="num">464</span><code>}</code></div>
+<div class="line"><span class="num">465</span><code></code></div>
+<div class="line"><span class="num">466</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">467</span><code>// Die beiden Fehlerrichtungen</code></div>
+<div class="line"><span class="num">468</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">469</span><code></code></div>
+<div class="line"><span class="num">470</span><code>#[test]</code></div>
+<div class="line"><span class="num">471</span><code>fn no_corpus_fixture_leaks() {</code></div>
+<div class="line"><span class="num">472</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">473</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">474</span><code></code></div>
+<div class="line"><span class="num">475</span><code>    for case in must_redact() {</code></div>
+<div class="line"><span class="num">476</span><code>        let out = pipeline.redact(&amp;case.text);</code></div>
+<div class="line"><span class="num">477</span><code></code></div>
+<div class="line"><span class="num">478</span><code>        for needle in case.gone {</code></div>
+<div class="line"><span class="num">479</span><code>            if out.text.contains(needle) {</code></div>
+<div class="line"><span class="num">480</span><code>                report.note(format!(</code></div>
+<div class="line"><span class="num">481</span><code>                    &quot;{}: {needle:?} steht noch im Ergebnis:\n    {}&quot;,</code></div>
+<div class="line"><span class="num">482</span><code>                    case.id, out.text</code></div>
+<div class="line"><span class="num">483</span><code>                ));</code></div>
+<div class="line"><span class="num">484</span><code>            }</code></div>
+<div class="line"><span class="num">485</span><code>        }</code></div>
+<div class="line"><span class="num">486</span><code>        if out.counts == Default::default() {</code></div>
+<div class="line"><span class="num">487</span><code>            report.note(format!(&quot;{}: kein einziger Fund gezählt&quot;, case.id));</code></div>
+<div class="line"><span class="num">488</span><code>        }</code></div>
+<div class="line"><span class="num">489</span><code>    }</code></div>
+<div class="line"><span class="num">490</span><code></code></div>
+<div class="line"><span class="num">491</span><code>    report.finish(&quot;Der Korpus leckt&quot;);</code></div>
+<div class="line"><span class="num">492</span><code>}</code></div>
+<div class="line"><span class="num">493</span><code></code></div>
+<div class="line"><span class="num">494</span><code>#[test]</code></div>
+<div class="line"><span class="num">495</span><code>fn redaction_keeps_the_surrounding_context() {</code></div>
+<div class="line"><span class="num">496</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">497</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">498</span><code></code></div>
+<div class="line"><span class="num">499</span><code>    for case in must_redact() {</code></div>
+<div class="line"><span class="num">500</span><code>        let out = pipeline.redact(&amp;case.text);</code></div>
+<div class="line"><span class="num">501</span><code>        for needle in case.kept {</code></div>
+<div class="line"><span class="num">502</span><code>            if !out.text.contains(needle) {</code></div>
+<div class="line"><span class="num">503</span><code>                report.note(format!(</code></div>
+<div class="line"><span class="num">504</span><code>                    &quot;{}: {needle:?} wurde mit weggeschwärzt:\n    {}&quot;,</code></div>
+<div class="line"><span class="num">505</span><code>                    case.id, out.text</code></div>
+<div class="line"><span class="num">506</span><code>                ));</code></div>
+<div class="line"><span class="num">507</span><code>            }</code></div>
+<div class="line"><span class="num">508</span><code>        }</code></div>
+<div class="line"><span class="num">509</span><code>    }</code></div>
+<div class="line"><span class="num">510</span><code></code></div>
+<div class="line"><span class="num">511</span><code>    report.finish(&quot;Die Redaction nimmt zu viel Kontext mit&quot;);</code></div>
+<div class="line"><span class="num">512</span><code>}</code></div>
+<div class="line"><span class="num">513</span><code></code></div>
+<div class="line"><span class="num">514</span><code>#[test]</code></div>
+<div class="line"><span class="num">515</span><code>fn harmless_text_is_never_touched() {</code></div>
+<div class="line"><span class="num">516</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">517</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">518</span><code></code></div>
+<div class="line"><span class="num">519</span><code>    for (id, text) in MUST_SURVIVE {</code></div>
+<div class="line"><span class="num">520</span><code>        let out = pipeline.redact(text);</code></div>
+<div class="line"><span class="num">521</span><code>        if out.text != *text {</code></div>
+<div class="line"><span class="num">522</span><code>            report.note(format!(</code></div>
+<div class="line"><span class="num">523</span><code>                &quot;{id}: verändert\n    ein: {text}\n    aus: {}&quot;,</code></div>
+<div class="line"><span class="num">524</span><code>                out.text</code></div>
+<div class="line"><span class="num">525</span><code>            ));</code></div>
+<div class="line"><span class="num">526</span><code>        } else if out.counts != Default::default() {</code></div>
+<div class="line"><span class="num">527</span><code>            report.note(format!(</code></div>
+<div class="line"><span class="num">528</span><code>                &quot;{id}: unverändert, aber gezählt ({} secret, {} pii)&quot;,</code></div>
+<div class="line"><span class="num">529</span><code>                out.counts.secrets, out.counts.pii</code></div>
+<div class="line"><span class="num">530</span><code>            ));</code></div>
+<div class="line"><span class="num">531</span><code>        }</code></div>
+<div class="line"><span class="num">532</span><code>    }</code></div>
+<div class="line"><span class="num">533</span><code></code></div>
+<div class="line"><span class="num">534</span><code>    report.finish(&quot;Fehlalarme im Korpus&quot;);</code></div>
+<div class="line"><span class="num">535</span><code>}</code></div>
+<div class="line"><span class="num">536</span><code></code></div>
+<div class="line"><span class="num">537</span><code>#[test]</code></div>
+<div class="line"><span class="num">538</span><code>fn accepted_over_redaction_is_pinned() {</code></div>
+<div class="line"><span class="num">539</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">540</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">541</span><code></code></div>
+<div class="line"><span class="num">542</span><code>    for (id, input, expected) in ACCEPTED_OVER_REDACTION {</code></div>
+<div class="line"><span class="num">543</span><code>        let out = pipeline.redact(input);</code></div>
+<div class="line"><span class="num">544</span><code>        if out.text != *expected {</code></div>
+<div class="line"><span class="num">545</span><code>            report.note(format!(</code></div>
+<div class="line"><span class="num">546</span><code>                &quot;{id}: die festgeschriebene Über-Redaction hat sich verschoben\n    \</code></div>
+<div class="line"><span class="num">547</span><code>                 erwartet: {expected}\n    tatsächlich: {}&quot;,</code></div>
+<div class="line"><span class="num">548</span><code>                out.text</code></div>
+<div class="line"><span class="num">549</span><code>            ));</code></div>
+<div class="line"><span class="num">550</span><code>        }</code></div>
+<div class="line"><span class="num">551</span><code>    }</code></div>
+<div class="line"><span class="num">552</span><code></code></div>
+<div class="line"><span class="num">553</span><code>    report.finish(</code></div>
+<div class="line"><span class="num">554</span><code>        &quot;Ein bewusster Kompromiss hat sich geändert. Wenn die neue Trennlinie \</code></div>
+<div class="line"><span class="num">555</span><code>         besser ist: Eintrag anpassen oder in MUST_SURVIVE verschieben&quot;,</code></div>
+<div class="line"><span class="num">556</span><code>    );</code></div>
+<div class="line"><span class="num">557</span><code>}</code></div>
+<div class="line"><span class="num">558</span><code></code></div>
+<div class="line"><span class="num">559</span><code>#[test]</code></div>
+<div class="line"><span class="num">560</span><code>fn documented_gaps_are_pinned() {</code></div>
+<div class="line"><span class="num">561</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">562</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">563</span><code></code></div>
+<div class="line"><span class="num">564</span><code>    for (id, text, value) in DOCUMENTED_GAPS {</code></div>
+<div class="line"><span class="num">565</span><code>        let out = pipeline.redact(text);</code></div>
+<div class="line"><span class="num">566</span><code>        if !out.text.contains(value) {</code></div>
+<div class="line"><span class="num">567</span><code>            report.note(format!(</code></div>
+<div class="line"><span class="num">568</span><code>                &quot;{id}: die Lücke ist geschlossen — Ergebnis: {}&quot;,</code></div>
+<div class="line"><span class="num">569</span><code>                out.text</code></div>
+<div class="line"><span class="num">570</span><code>            ));</code></div>
+<div class="line"><span class="num">571</span><code>        }</code></div>
+<div class="line"><span class="num">572</span><code>    }</code></div>
+<div class="line"><span class="num">573</span><code></code></div>
+<div class="line"><span class="num">574</span><code>    report.finish(</code></div>
+<div class="line"><span class="num">575</span><code>        &quot;Eine dokumentierte Lücke ist geschlossen — gute Nachricht. Eintrag aus \</code></div>
+<div class="line"><span class="num">576</span><code>         DOCUMENTED_GAPS entfernen und in MUST_REDACT aufnehmen&quot;,</code></div>
+<div class="line"><span class="num">577</span><code>    );</code></div>
+<div class="line"><span class="num">578</span><code>}</code></div>
+<div class="line"><span class="num">579</span><code></code></div>
+<div class="line"><span class="num">580</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">581</span><code>// Eigenschaften über den gesamten Korpus</code></div>
+<div class="line"><span class="num">582</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">583</span><code></code></div>
+<div class="line"><span class="num">584</span><code>#[test]</code></div>
+<div class="line"><span class="num">585</span><code>fn the_whole_corpus_reaches_a_fixpoint() {</code></div>
+<div class="line"><span class="num">586</span><code>    // Bereinigter Text darf sich beim zweiten Durchlauf nicht weiter verändern.</code></div>
+<div class="line"><span class="num">587</span><code>    // Täte er es, hätte der erste Lauf etwas stehen lassen — und `redact_session`</code></div>
+<div class="line"><span class="num">588</span><code>    // würde die Session mit `RedactionError::Unstable` verwerfen. Dieser Test ist</code></div>
+<div class="line"><span class="num">589</span><code>    // die Absicherung, dass die Prüfung dort nicht auf realistischem Text</code></div>
+<div class="line"><span class="num">590</span><code>    // fehlalarmiert.</code></div>
+<div class="line"><span class="num">591</span><code>    //</code></div>
+<div class="line"><span class="num">592</span><code>    // Verglichen wird der Text, nicht der Zähler: Aus `DB_PASSWORD=hunter2` wird</code></div>
+<div class="line"><span class="num">593</span><code>    // `DB_PASSWORD=[redacted:secret]`, und der Platzhalter ist im zweiten Lauf</code></div>
+<div class="line"><span class="num">594</span><code>    // erneut ein Wert hinter `PASSWORD=`. Er wird durch sich selbst ersetzt —</code></div>
+<div class="line"><span class="num">595</span><code>    // Zähler +1, Text unverändert.</code></div>
+<div class="line"><span class="num">596</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">597</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">598</span><code></code></div>
+<div class="line"><span class="num">599</span><code>    let texts: Vec&lt;String&gt; = must_redact()</code></div>
+<div class="line"><span class="num">600</span><code>        .into_iter()</code></div>
+<div class="line"><span class="num">601</span><code>        .map(|c| c.text)</code></div>
+<div class="line"><span class="num">602</span><code>        .chain(MUST_SURVIVE.iter().map(|(_, t)| (*t).to_string()))</code></div>
+<div class="line"><span class="num">603</span><code>        .collect();</code></div>
+<div class="line"><span class="num">604</span><code></code></div>
+<div class="line"><span class="num">605</span><code>    for text in &amp;texts {</code></div>
+<div class="line"><span class="num">606</span><code>        let once = pipeline.redact(text);</code></div>
+<div class="line"><span class="num">607</span><code>        let twice = pipeline.redact(&amp;once.text);</code></div>
+<div class="line"><span class="num">608</span><code>        if twice.text != once.text {</code></div>
+<div class="line"><span class="num">609</span><code>            report.note(format!(</code></div>
+<div class="line"><span class="num">610</span><code>                &quot;kein Fixpunkt:\n    ein:  {text}\n    1x:   {}\n    2x:   {}&quot;,</code></div>
+<div class="line"><span class="num">611</span><code>                once.text, twice.text</code></div>
+<div class="line"><span class="num">612</span><code>            ));</code></div>
+<div class="line"><span class="num">613</span><code>        }</code></div>
+<div class="line"><span class="num">614</span><code>    }</code></div>
+<div class="line"><span class="num">615</span><code></code></div>
+<div class="line"><span class="num">616</span><code>    report.finish(&quot;Redaction erreicht auf dem Korpus keinen Fixpunkt&quot;);</code></div>
+<div class="line"><span class="num">617</span><code>}</code></div>
+<div class="line"><span class="num">618</span><code></code></div>
+<div class="line"><span class="num">619</span><code>#[test]</code></div>
+<div class="line"><span class="num">620</span><code>fn no_detector_violates_the_span_contract() {</code></div>
+<div class="line"><span class="num">621</span><code>    // Ein vertragswidriger Span wird verworfen — der Text bliebe ungeschwärzt.</code></div>
+<div class="line"><span class="num">622</span><code>    // Über den ganzen Korpus, roh und in Mehrbyte-Umgebung, darf das nie</code></div>
+<div class="line"><span class="num">623</span><code>    // passieren.</code></div>
+<div class="line"><span class="num">624</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">625</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">626</span><code></code></div>
+<div class="line"><span class="num">627</span><code>    let texts: Vec&lt;String&gt; = must_redact()</code></div>
+<div class="line"><span class="num">628</span><code>        .into_iter()</code></div>
+<div class="line"><span class="num">629</span><code>        .map(|c| c.text)</code></div>
+<div class="line"><span class="num">630</span><code>        .chain(MUST_SURVIVE.iter().map(|(_, t)| (*t).to_string()))</code></div>
+<div class="line"><span class="num">631</span><code>        .collect();</code></div>
+<div class="line"><span class="num">632</span><code></code></div>
+<div class="line"><span class="num">633</span><code>    for text in &amp;texts {</code></div>
+<div class="line"><span class="num">634</span><code>        for variant in [text.clone(), in_multibyte_context(text)] {</code></div>
+<div class="line"><span class="num">635</span><code>            let out = pipeline.redact(&amp;variant);</code></div>
+<div class="line"><span class="num">636</span><code>            if out.invalid_findings &gt; 0 {</code></div>
+<div class="line"><span class="num">637</span><code>                report.note(format!(</code></div>
+<div class="line"><span class="num">638</span><code>                    &quot;{} ungültige Span(s) auf:\n    {variant}&quot;,</code></div>
+<div class="line"><span class="num">639</span><code>                    out.invalid_findings</code></div>
+<div class="line"><span class="num">640</span><code>                ));</code></div>
+<div class="line"><span class="num">641</span><code>            }</code></div>
+<div class="line"><span class="num">642</span><code>        }</code></div>
+<div class="line"><span class="num">643</span><code>    }</code></div>
+<div class="line"><span class="num">644</span><code></code></div>
+<div class="line"><span class="num">645</span><code>    report.finish(&quot;Detektoren verletzen den Finding-Vertrag&quot;);</code></div>
+<div class="line"><span class="num">646</span><code>}</code></div>
+<div class="line"><span class="num">647</span><code></code></div>
+<div class="line"><span class="num">648</span><code>#[test]</code></div>
+<div class="line"><span class="num">649</span><code>fn corpus_holds_inside_multibyte_context() {</code></div>
+<div class="line"><span class="num">650</span><code>    let pipeline = policy();</code></div>
+<div class="line"><span class="num">651</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">652</span><code></code></div>
+<div class="line"><span class="num">653</span><code>    for case in must_redact() {</code></div>
+<div class="line"><span class="num">654</span><code>        let out = pipeline.redact(&amp;in_multibyte_context(&amp;case.text));</code></div>
+<div class="line"><span class="num">655</span><code>        for needle in case.gone {</code></div>
+<div class="line"><span class="num">656</span><code>            if out.text.contains(needle) {</code></div>
+<div class="line"><span class="num">657</span><code>                report.note(format!(</code></div>
+<div class="line"><span class="num">658</span><code>                    &quot;{}: {needle:?} überlebt zwischen Umlauten&quot;,</code></div>
+<div class="line"><span class="num">659</span><code>                    case.id</code></div>
+<div class="line"><span class="num">660</span><code>                ));</code></div>
+<div class="line"><span class="num">661</span><code>            }</code></div>
+<div class="line"><span class="num">662</span><code>        }</code></div>
+<div class="line"><span class="num">663</span><code>    }</code></div>
+<div class="line"><span class="num">664</span><code></code></div>
+<div class="line"><span class="num">665</span><code>    for (id, text) in MUST_SURVIVE {</code></div>
+<div class="line"><span class="num">666</span><code>        let wrapped = in_multibyte_context(text);</code></div>
+<div class="line"><span class="num">667</span><code>        let out = pipeline.redact(&amp;wrapped);</code></div>
+<div class="line"><span class="num">668</span><code>        if !out.text.contains(*text) {</code></div>
+<div class="line"><span class="num">669</span><code>            report.note(format!(</code></div>
+<div class="line"><span class="num">670</span><code>                &quot;{id}: wird zwischen Umlauten redigiert:\n    {}&quot;,</code></div>
+<div class="line"><span class="num">671</span><code>                out.text</code></div>
+<div class="line"><span class="num">672</span><code>            ));</code></div>
+<div class="line"><span class="num">673</span><code>        }</code></div>
+<div class="line"><span class="num">674</span><code>    }</code></div>
+<div class="line"><span class="num">675</span><code></code></div>
+<div class="line"><span class="num">676</span><code>    report.finish(&quot;Der Korpus verhält sich in Mehrbyte-Umgebung anders&quot;);</code></div>
+<div class="line"><span class="num">677</span><code>}</code></div>
+<div class="line"><span class="num">678</span><code></code></div>
+<div class="line"><span class="num">679</span><code>#[test]</code></div>
+<div class="line"><span class="num">680</span><code>fn every_known_token_format_has_a_fixture() {</code></div>
+<div class="line"><span class="num">681</span><code>    // Eine neue Token-Form ohne Fixture ist eine ungetestete Form. Die Fixture-Ids</code></div>
+<div class="line"><span class="num">682</span><code>    // sind deshalb identisch mit den Regelnamen.</code></div>
+<div class="line"><span class="num">683</span><code>    let ids: Vec&lt;&amp;&#39;static str&gt; = must_redact().iter().map(|c| c.id).collect();</code></div>
+<div class="line"><span class="num">684</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">685</span><code></code></div>
+<div class="line"><span class="num">686</span><code>    for format in KnownTokenRedactor::new().covered_formats() {</code></div>
+<div class="line"><span class="num">687</span><code>        if !ids.contains(&amp;format) {</code></div>
+<div class="line"><span class="num">688</span><code>            report.note(format!(&quot;Token-Form {format:?} hat kein Korpus-Fixture&quot;));</code></div>
+<div class="line"><span class="num">689</span><code>        }</code></div>
+<div class="line"><span class="num">690</span><code>    }</code></div>
+<div class="line"><span class="num">691</span><code></code></div>
+<div class="line"><span class="num">692</span><code>    report.finish(&quot;Token-Formen ohne Korpus-Abdeckung&quot;);</code></div>
+<div class="line"><span class="num">693</span><code>}</code></div>
+<div class="line"><span class="num">694</span><code></code></div>
+<div class="line"><span class="num">695</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">696</span><code>// Der Korpus durch die anderen beiden Schichten</code></div>
+<div class="line"><span class="num">697</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">698</span><code></code></div>
+<div class="line"><span class="num">699</span><code>#[test]</code></div>
+<div class="line"><span class="num">700</span><code>fn the_whole_corpus_as_one_session_is_fail_closed() {</code></div>
+<div class="line"><span class="num">701</span><code>    // Derselbe Korpus, aber durch das Envelope: jedes Fixture einmal als</code></div>
+<div class="line"><span class="num">702</span><code>    // Turn-Text und einmal als Tool-Argument. Damit ist zugleich geprüft, dass</code></div>
+<div class="line"><span class="num">703</span><code>    // `redact_session` auf realistischem Text weder abbricht noch etwas übersieht.</code></div>
+<div class="line"><span class="num">704</span><code>    let cases = must_redact();</code></div>
+<div class="line"><span class="num">705</span><code></code></div>
+<div class="line"><span class="num">706</span><code>    let mut session = Session::new(</code></div>
+<div class="line"><span class="num">707</span><code>        Agent {</code></div>
+<div class="line"><span class="num">708</span><code>            name: &quot;claude-code&quot;.into(),</code></div>
+<div class="line"><span class="num">709</span><code>            version: &quot;1.0.0&quot;.into(),</code></div>
+<div class="line"><span class="num">710</span><code>        },</code></div>
+<div class="line"><span class="num">711</span><code>        Model {</code></div>
+<div class="line"><span class="num">712</span><code>            provider: &quot;anthropic&quot;.into(),</code></div>
+<div class="line"><span class="num">713</span><code>            id: &quot;claude-opus-4&quot;.into(),</code></div>
+<div class="line"><span class="num">714</span><code>        },</code></div>
+<div class="line"><span class="num">715</span><code>        Intent {</code></div>
+<div class="line"><span class="num">716</span><code>            request: &quot;Deploy-Pipeline reparieren&quot;.into(),</code></div>
+<div class="line"><span class="num">717</span><code>            ..Intent::default()</code></div>
+<div class="line"><span class="num">718</span><code>        },</code></div>
+<div class="line"><span class="num">719</span><code>    );</code></div>
+<div class="line"><span class="num">720</span><code>    for case in &amp;cases {</code></div>
+<div class="line"><span class="num">721</span><code>        session.turns.push(Turn {</code></div>
+<div class="line"><span class="num">722</span><code>            role: Role::Assistant,</code></div>
+<div class="line"><span class="num">723</span><code>            text: case.text.clone(),</code></div>
+<div class="line"><span class="num">724</span><code>            tool_calls: vec![ToolCall {</code></div>
+<div class="line"><span class="num">725</span><code>                name: &quot;bash&quot;.into(),</code></div>
+<div class="line"><span class="num">726</span><code>                arguments: case.text.clone(),</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-aaa66bf498205b6547b89b6709d3b77425a0279c40c42a57239cdbc77145d364" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">727</span><code>                effect: None,</code></div>
+<div class="line"><span class="num">728</span><code>            }],</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-aaa66bf498205b6547b89b6709d3b77425a0279c40c42a57239cdbc77145d364" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">729</span><code>            parent: None,</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-aaa66bf498205b6547b89b6709d3b77425a0279c40c42a57239cdbc77145d364" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">730</span><code>            at: None,</code></div>
+<div class="line"><span class="num">731</span><code>        });</code></div>
+<div class="line"><span class="num">732</span><code>    }</code></div>
+<div class="line"><span class="num">733</span><code></code></div>
+<div class="line"><span class="num">734</span><code>    let redacted = policy()</code></div>
+<div class="line"><span class="num">735</span><code>        .redact_session(session)</code></div>
+<div class="line"><span class="num">736</span><code>        .expect(&quot;der Korpus muss sich als Session redigieren lassen&quot;);</code></div>
+<div class="line"><span class="num">737</span><code></code></div>
+<div class="line"><span class="num">738</span><code>    let mut haystack = String::new();</code></div>
+<div class="line"><span class="num">739</span><code>    for turn in &amp;redacted.session().turns {</code></div>
+<div class="line"><span class="num">740</span><code>        haystack.push_str(&amp;turn.text);</code></div>
+<div class="line"><span class="num">741</span><code>        for call in &amp;turn.tool_calls {</code></div>
+<div class="line"><span class="num">742</span><code>            haystack.push_str(&amp;call.arguments);</code></div>
+<div class="line"><span class="num">743</span><code>        }</code></div>
+<div class="line"><span class="num">744</span><code>    }</code></div>
+<div class="line"><span class="num">745</span><code></code></div>
+<div class="line"><span class="num">746</span><code>    let mut report = Report::default();</code></div>
+<div class="line"><span class="num">747</span><code>    for case in &amp;cases {</code></div>
+<div class="line"><span class="num">748</span><code>        for needle in case.gone {</code></div>
+<div class="line"><span class="num">749</span><code>            if haystack.contains(needle) {</code></div>
+<div class="line"><span class="num">750</span><code>                report.note(format!(&quot;{}: {needle:?} steht noch im Envelope&quot;, case.id));</code></div>
+<div class="line"><span class="num">751</span><code>            }</code></div>
+<div class="line"><span class="num">752</span><code>        }</code></div>
+<div class="line"><span class="num">753</span><code>    }</code></div>
+<div class="line"><span class="num">754</span><code>    report.finish(&quot;Der Korpus leckt durch das Session-Envelope&quot;);</code></div>
+<div class="line"><span class="num">755</span><code></code></div>
+<div class="line"><span class="num">756</span><code>    assert!(redacted.session().redaction.applied);</code></div>
+<div class="line"><span class="num">757</span><code>    assert_eq!(</code></div>
+<div class="line"><span class="num">758</span><code>        redacted.session().redaction.counts,</code></div>
+<div class="line"><span class="num">759</span><code>        redacted.audit().counts()</code></div>
+<div class="line"><span class="num">760</span><code>    );</code></div>
+<div class="line"><span class="num">761</span><code>    // Zwei Felder je Fixture (Turn-Text und Tool-Argument) müssen Funde tragen.</code></div>
+<div class="line"><span class="num">762</span><code>    assert!(redacted.audit().fields_changed() &gt;= cases.len() * 2);</code></div>
+<div class="line"><span class="num">763</span><code>}</code></div>
+<div class="line"><span class="num">764</span><code></code></div>
+<div class="line"><span class="num">765</span><code>#[test]</code></div>
+<div class="line"><span class="num">766</span><code>fn the_dotenv_fixture_would_not_even_reach_the_net() {</code></div>
+<div class="line"><span class="num">767</span><code>    // `dotenv-block` prüft das Netz (Schicht 2) an genau dem Inhalt, für den in</code></div>
+<div class="line"><span class="num">768</span><code>    // der echten Capture schon die Mauer (Schicht 1) greift: Der Inhalt einer</code></div>
+<div class="line"><span class="num">769</span><code>    // `.env` wird gar nicht erst gescannt, sondern komplett ausgelassen. Die</code></div>
+<div class="line"><span class="num">770</span><code>    // eingecheckte Vorlage daneben bleibt lesbar — und läuft durchs Netz.</code></div>
+<div class="line"><span class="num">771</span><code>    assert!(is_secret_file(&quot;/home/p/projekt/.env&quot;));</code></div>
+<div class="line"><span class="num">772</span><code>    assert!(!is_secret_file(&quot;/home/p/projekt/.env.example&quot;));</code></div>
+<div class="line"><span class="num">773</span><code>}</code></div>
+<div class="line"><span class="num">774</span><code></code></div>
+<div class="line"><span class="num">775</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">776</span><code>// Policy-Stellschrauben am Korpus</code></div>
+<div class="line"><span class="num">777</span><code>// ---------------------------------------------------------------------------</code></div>
+<div class="line"><span class="num">778</span><code></code></div>
+<div class="line"><span class="num">779</span><code>#[test]</code></div>
+<div class="line"><span class="num">780</span><code>fn allowlist_releases_a_single_corpus_finding() {</code></div>
+<div class="line"><span class="num">781</span><code>    // Der AWS-Beispielschlüssel steht in AWS&#39; eigener Dokumentation. Wer ihn im</code></div>
+<div class="line"><span class="num">782</span><code>    // Transkript behalten will, trägt ihn ein — und nur ihn.</code></div>
+<div class="line"><span class="num">783</span><code>    let pipeline = RedactionConfig {</code></div>
+<div class="line"><span class="num">784</span><code>        allow: vec![AWS_KEY.into()],</code></div>
+<div class="line"><span class="num">785</span><code>        ..RedactionConfig::default()</code></div>
+<div class="line"><span class="num">786</span><code>    }</code></div>
+<div class="line"><span class="num">787</span><code>    .pipeline()</code></div>
+<div class="line"><span class="num">788</span><code>    .expect(&quot;Policy muss bauen&quot;);</code></div>
+<div class="line"><span class="num">789</span><code></code></div>
+<div class="line"><span class="num">790</span><code>    let text = format!(&quot;aws_access_key_id = {AWS_KEY}&quot;);</code></div>
+<div class="line"><span class="num">791</span><code>    let out = pipeline.redact(&amp;text);</code></div>
+<div class="line"><span class="num">792</span><code>    assert_eq!(out.text, text);</code></div>
+<div class="line"><span class="num">793</span><code>    assert_eq!(out.counts, Default::default());</code></div>
+<div class="line"><span class="num">794</span><code></code></div>
+<div class="line"><span class="num">795</span><code>    // Ein anderer Schlüssel derselben Form bleibt geschwärzt.</code></div>
+<div class="line"><span class="num">796</span><code>    let other = &quot;aws_access_key_id = AKIA2E0A8F3B244C9986&quot;;</code></div>
+<div class="line"><span class="num">797</span><code>    assert!(!policy().redact(other).text.contains(&quot;AKIA2E0A8F3B244C9986&quot;));</code></div>
+<div class="line"><span class="num">798</span><code>}</code></div>
+<div class="line"><span class="num">799</span><code></code></div>
+<div class="line"><span class="num">800</span><code>#[test]</code></div>
+<div class="line"><span class="num">801</span><code>fn the_entropy_threshold_has_measurable_headroom() {</code></div>
+<div class="line"><span class="num">802</span><code>    // Der versprochene Feinschliff aus `secret.rs`: Wie weit ist die Schwelle von</code></div>
+<div class="line"><span class="num">803</span><code>    // den harmlosen Fällen entfernt? Ein Git-SHA liegt bei ~3.8 bit/Zeichen, die</code></div>
+<div class="line"><span class="num">804</span><code>    // Schwelle bei 4.5 — er überlebt mit Luft. Senkt man sie unter seinen Wert,</code></div>
+<div class="line"><span class="num">805</span><code>    // fällt er. Der Abstand ist also gemessen, nicht geraten.</code></div>
+<div class="line"><span class="num">806</span><code>    let sha_line = survivor(&quot;git-sha&quot;);</code></div>
+<div class="line"><span class="num">807</span><code>    assert_eq!(policy().redact(sha_line).text, sha_line);</code></div>
+<div class="line"><span class="num">808</span><code></code></div>
+<div class="line"><span class="num">809</span><code>    let jumpy = RedactionConfig {</code></div>
+<div class="line"><span class="num">810</span><code>        high_entropy: HighEntropyConfig {</code></div>
+<div class="line"><span class="num">811</span><code>            min_entropy_bits: 3.5,</code></div>
+<div class="line"><span class="num">812</span><code>            ..HighEntropyConfig::default()</code></div>
+<div class="line"><span class="num">813</span><code>        },</code></div>
+<div class="line"><span class="num">814</span><code>        ..RedactionConfig::default()</code></div>
+<div class="line"><span class="num">815</span><code>    }</code></div>
+<div class="line"><span class="num">816</span><code>    .pipeline()</code></div>
+<div class="line"><span class="num">817</span><code>    .expect(&quot;Policy muss bauen&quot;);</code></div>
+<div class="line"><span class="num">818</span><code>    assert_ne!(</code></div>
+<div class="line"><span class="num">819</span><code>        jumpy.redact(sha_line).text,</code></div>
+<div class="line"><span class="num">820</span><code>        sha_line,</code></div>
+<div class="line"><span class="num">821</span><code>        &quot;unter 3.5 bit/Zeichen müsste der Git-SHA fallen — sonst stimmt die \</code></div>
+<div class="line"><span class="num">822</span><code>         Annahme über den Abstand nicht mehr&quot;</code></div>
+<div class="line"><span class="num">823</span><code>    );</code></div>
+<div class="line"><span class="num">824</span><code>}</code></div>
+</div>
+<aside class="panel" id="panel">
+<p class="hint">Klick auf eine markierte Zeile zeigt die Session dahinter.</p>
+<section class="session" id="s-b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf">
+<p class="guess">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>
+<h2>Absicht</h2>
+<p class="intent">Ich möchte M5 so umbauen, dass wir es genauso machen wie entire! Mit dem Hook-Ansatz. 
+Wir bleiben erst einmal bei der Rust implementierung. Diese ist effizienter.
+
+Das ist der entscheidende Unterschied. Minds soll auch Hooks installieren im Agenten selbst: Claude Code über `.claude/settings.json`, Codex über `.codex/hooks.json`, Cursor über `.cursor/hooks.json`, Gemini über `.gemini/settings.json`, OpenCode über ein TypeScript-Plugin. Bei Codex wird zusätzlich `codex_hooks = true` in die `config.toml` geschrieben. Dazu Git-Hooks: Checkpoints entstehen, wenn du oder der Agent committen; die Session-Metadaten möchte ich entweder auf einem child-repo haben oder falls wir diese kombination nicht haben direkt im repo. 
+
+Das Verhalten soll an der Stelle absolut gleich sein. M5.0  docs: Plan.md — M5 von Transkript-Parsing auf Hooks umgestellt (ADR-0003)
+M5.1  feat(core): Lineage, Turn.parent/at, ToolCall.effect, Vec&lt;Edge&gt; (additiv)
+M5.2  feat(capture): JournalEvent + Journal (Datei pro Event, 0600, fsck-fähig)
+M5.3  feat(cli): minds hook — stdin lesen, anhängen, Exit 0, immer
+M5.4  feat(capture): Normalisierer Claude Code (SessionStart/Prompt/Tool*/Stop/Subagent*)
+M5.5  feat(capture): Secretfile-Mauer bei PreToolUse
+M5.6  feat(capture): Journal + Transkript → Vec&lt;Session&gt; (Turns, Usage, Intent)
+M5.7  feat(capture): Kanten — Subagent (Observed), Artefakt-Hash, Commit
+M5.8  feat(cli): minds enable --agent claude-code (settings.json mergen, idempotent)
+M5.9  test(capture): Fixtures — single, subagent, zwei Agents parallel</p>
+<h3>Herkunft</h3>
+<dl>
+<dt>Agent</dt><dd>claude-code 2.1.218</dd>
+<dt>Modell</dt><dd>anthropic / claude-opus-4-8</dd>
+<dt>Tokens</dt><dd>57466 ein / 1286225 aus</dd>
+<dt>Session</dt><dd><code class="id">b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf</code></dd>
+</dl>
+<h3>Berührte Dateien</h3>
+<ul>
+<li><code>Plan.md</code></li>
+<li><code>crates/minds-capture/Cargo.toml</code></li>
+<li><code>crates/minds-capture/src/adapter.rs</code></li>
+<li><code>crates/minds-capture/src/clock.rs</code></li>
+<li><code>crates/minds-capture/src/edges.rs</code></li>
+<li><code>crates/minds-capture/src/import.rs</code></li>
+<li><code>crates/minds-capture/src/lib.rs</code></li>
+<li><code>crates/minds-capture/src/match_commits.rs</code></li>
+<li><code>crates/minds-capture/src/normalize.rs</code></li>
+<li><code>crates/minds-capture/src/secretwall.rs</code></li>
+<li><code>crates/minds-capture/src/transcript.rs</code></li>
+<li><code>crates/minds-capture/tests/fixtures.rs</code></li>
+<li><code>crates/minds-cli/Cargo.toml</code></li>
+<li><code>crates/minds-cli/src/checkpoint.rs</code></li>
+<li><code>crates/minds-cli/src/config.rs</code></li>
+<li><code>crates/minds-cli/src/enable.rs</code></li>
+<li><code>crates/minds-cli/src/fsck.rs</code></li>
+<li><code>crates/minds-cli/src/hook.rs</code></li>
+<li><code>crates/minds-cli/src/import_cmd.rs</code></li>
+<li><code>crates/minds-cli/src/main.rs</code></li>
+<li><code>crates/minds-cli/src/render.rs</code></li>
+<li><code>crates/minds-cli/src/render_cmd.rs</code></li>
+<li><code>crates/minds-cli/src/show.rs</code></li>
+<li><code>crates/minds-cli/src/why.rs</code></li>
+<li><code>crates/minds-cli/tests/end_to_end.rs</code></li>
+<li><code>crates/minds-core/src/id.rs</code></li>
+<li><code>crates/minds-core/src/lib.rs</code></li>
+<li><code>crates/minds-core/src/lineage.rs</code></li>
+<li><code>crates/minds-reader/Cargo.toml</code></li>
+<li><code>crates/minds-reader/src/error.rs</code></li>
+<li><code>crates/minds-reader/src/file.rs</code></li>
+<li><code>crates/minds-reader/src/html.rs</code></li>
+<li><code>crates/minds-reader/src/index.rs</code></li>
+<li><code>crates/minds-reader/src/lib.rs</code></li>
+<li><code>crates/minds-reader/src/render.rs</code></li>
+<li><code>crates/minds-reader/src/summary.rs</code></li>
+<li><code>crates/minds-redact/src/session.rs</code></li>
+<li><code>crates/minds-redact/tests/corpus.rs</code></li>
+<li><code>crates/minds-store/Cargo.toml</code></li>
+<li><code>crates/minds-store/src/child_repo.rs</code></li>
+<li><code>crates/minds-store/src/fixture.rs</code></li>
+<li><code>crates/minds-store/src/git_store.rs</code></li>
+<li><code>crates/minds-store/src/in_repo.rs</code></li>
+<li><code>crates/minds-store/src/index.rs</code></li>
+<li><code>crates/minds-store/src/lib.rs</code></li>
+<li><code>crates/minds-store/src/store.rs</code></li>
+<li><code>docs/adr/0003-hooks-statt-transkript-parsing.md</code></li>
+<li><code>docs/adr/0004-import-und-store-index.md</code></li>
+</ul>
+</section>
+<section class="session" id="s-b3-aaa66bf498205b6547b89b6709d3b77425a0279c40c42a57239cdbc77145d364">
+<p class="guess">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>
+<h2>Absicht</h2>
+<p class="intent">Ich möchte M5 so umbauen, dass wir es genauso machen wie entire! Mit dem Hook-Ansatz. 
+Wir bleiben erst einmal bei der Rust implementierung. Diese ist effizienter.
+
+Das ist der entscheidende Unterschied. Minds soll auch Hooks installieren im Agenten selbst: Claude Code über `.claude/settings.json`, Codex über `.codex/hooks.json`, Cursor über `.cursor/hooks.json`, Gemini über `.gemini/settings.json`, OpenCode über ein TypeScript-Plugin. Bei Codex wird zusätzlich `codex_hooks = true` in die `config.toml` geschrieben. Dazu Git-Hooks: Checkpoints entstehen, wenn du oder der Agent committen; die Session-Metadaten möchte ich entweder auf einem child-repo haben oder falls wir diese kombination nicht haben direkt im repo. 
+
+Das Verhalten soll an der Stelle absolut gleich sein. M5.0  docs: Plan.md — M5 von Transkript-Parsing auf Hooks umgestellt (ADR-0003)
+M5.1  feat(core): Lineage, Turn.parent/at, ToolCall.effect, Vec&lt;Edge&gt; (additiv)
+M5.2  feat(capture): JournalEvent + Journal (Datei pro Event, 0600, fsck-fähig)
+M5.3  feat(cli): minds hook — stdin lesen, anhängen, Exit 0, immer
+M5.4  feat(capture): Normalisierer Claude Code (SessionStart/Prompt/Tool*/Stop/Subagent*)
+M5.5  feat(capture): Secretfile-Mauer bei PreToolUse
+M5.6  feat(capture): Journal + Transkript → Vec&lt;Session&gt; (Turns, Usage, Intent)
+M5.7  feat(capture): Kanten — Subagent (Observed), Artefakt-Hash, Commit
+M5.8  feat(cli): minds enable --agent claude-code (settings.json mergen, idempotent)
+M5.9  test(capture): Fixtures — single, subagent, zwei Agents parallel</p>
+<h3>Herkunft</h3>
+<dl>
+<dt>Agent</dt><dd>claude-code 2.1.218</dd>
+<dt>Modell</dt><dd>anthropic / claude-opus-4-8</dd>
+<dt>Tokens</dt><dd>112 ein / 40071 aus</dd>
+<dt>Session</dt><dd><code class="id">b3-aaa66bf498205b6547b89b6709d3b77425a0279c40c42a57239cdbc77145d364</code></dd>
+</dl>
+<h3>Berührte Dateien</h3>
+<ul>
+<li><code>crates/minds-core/src/id.rs</code></li>
+<li><code>crates/minds-core/src/lib.rs</code></li>
+<li><code>crates/minds-core/src/lineage.rs</code></li>
+<li><code>crates/minds-redact/src/session.rs</code></li>
+<li><code>crates/minds-redact/tests/corpus.rs</code></li>
+<li><code>crates/minds-store/src/fixture.rs</code></li>
+</ul>
+</section>
+
+</aside>
+</main>
+
+<script>(function(){var panel=document.getElementById('panel');if(!panel)return;/* Erst hier verstecken: ohne Skript bleiben alle Panels lesbar. */panel.querySelectorAll('.session').forEach(function(s){s.hidden=true});function show(row){var ids=(row.getAttribute('data-sessions')||'').split(' ').filter(Boolean);panel.querySelectorAll('.session').forEach(function(s){s.hidden=true});ids.forEach(function(id){var el=document.getElementById('s-'+id);if(el)el.hidden=false});document.querySelectorAll('.line.selected').forEach(function(l){l.classList.remove('selected')});row.classList.add('selected');var hint=panel.querySelector('.hint');if(hint)hint.hidden=ids.length>0;}document.addEventListener('click',function(e){var row=e.target.closest('.line.has-context');if(row)show(row);});document.addEventListener('keydown',function(e){if(e.key!=='Enter'&&e.key!==' ')return;var row=e.target.closest&&e.target.closest('.line.has-context');if(row){e.preventDefault();show(row)}});/* Von der Übersicht verlinkt (#s-<id>): die erste Zeile dieser Session zeigen. */function openHash(){var h=location.hash;if(h.indexOf('#s-')!==0)return;var id=h.slice(3);var row=document.querySelector('.line.has-context[data-sessions~="'+id+'"]');if(row){show(row);row.scrollIntoView({block:'center'})}}openHash();window.addEventListener('hashchange',openHash);})();</script>
+</body>
+</html>

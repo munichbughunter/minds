@@ -1,0 +1,17 @@
+[package]
+name = "minds-redact"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minds-core = { path = "../minds-core" }
+aho-corasick = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+ 
+[dev-dependencies]
+serde_json = { workspace = true }

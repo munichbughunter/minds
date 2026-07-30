@@ -1,0 +1,17 @@
+[package]
+name = "minds-reader"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minds-core = { path = "../minds-core" }
+minds-store = { path = "../minds-store" }
+minds-git = { path = "../minds-git" }
+minds-metrics = { path = "../minds-metrics" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

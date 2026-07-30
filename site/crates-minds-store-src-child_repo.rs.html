@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crates/minds-store/src/child_repo.rs</title>
+<style>:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e}@media(prefers-color-scheme:dark){:root{--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5}}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}a{color:var(--accent)}.top{padding:1rem 1.25rem;border-bottom:1px solid var(--rule)}.top h1{margin:.25rem 0;font-size:1.1rem;font-family:ui-monospace,monospace;word-break:break-all}.meta{margin:0;color:var(--dim);font-size:.85rem}.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,26rem);gap:0;align-items:start}@media(max-width:820px){.split{grid-template-columns:minmax(0,1fr)}}.code{overflow-x:auto;padding:.5rem 0;font:13px/1.6 ui-monospace,monospace}.line{display:flex;gap:.75rem;padding:0 1rem;white-space:pre}.line .num{color:var(--dim);text-align:right;min-width:3.5ch;user-select:none}.line code{white-space:pre}.line.has-context{background:var(--mark);border-left:3px solid var(--accent);padding-left:calc(1rem - 3px);cursor:pointer}.line.has-context:hover,.line.has-context:focus{outline:none;filter:brightness(1.06)}.line.selected{box-shadow:inset 0 0 0 2px var(--accent)}.panel{position:sticky;top:0;max-height:100vh;overflow-y:auto;padding:1rem 1.25rem;border-left:1px solid var(--rule)}@media(max-width:820px){.panel{position:static;max-height:none;border-left:0;border-top:1px solid var(--rule)}}.panel h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1rem 0 .35rem}.panel h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1rem 0 .25rem}.intent{margin:0;font-size:1rem}.hint{color:var(--dim);font-size:.85rem}dl{margin:0;display:grid;grid-template-columns:auto 1fr;gap:.15rem .75rem;font-size:.9rem}dt{color:var(--dim)}dd{margin:0;word-break:break-all}ul{margin:.25rem 0;padding-left:1.1rem;font-size:.9rem}code.id{font-size:.75rem;word-break:break-all}.warn{color:var(--warn)}.back{font-size:.85rem;text-decoration:none}.overview{padding:1rem 1.25rem;max-width:60rem}.overview h2{font-size:.8rem;text-transform:uppercase;letter-spacing:.06em;color:var(--dim);margin:1.5rem 0 .5rem}.cards{list-style:none;margin:0;padding:0;display:grid;gap:.5rem}.card{border:1px solid var(--rule);border-left:3px solid var(--accent);border-radius:.35rem;padding:0}.card-link{display:block;padding:.6rem .8rem;color:inherit;text-decoration:none}.card:has(.card-link){cursor:pointer}.card:has(.card-link):hover{background:var(--mark)}.card>.headline{padding:.6rem .8rem .2rem}.card>.sub{padding:0 .8rem .6rem}.headline{margin:0 0 .2rem;font-size:1rem}.sub{margin:0;color:var(--dim);font-size:.8rem}.files{list-style:none;margin:0;padding:0;display:grid;gap:.25rem}.files a{text-decoration:none}.files a:hover{text-decoration:underline}.empty{color:var(--dim)}.guess{color:var(--warn)}.session .guess{font-size:.8rem;margin:.25rem 0 0}</style>
+</head>
+<body>
+<header class="top">
+<a class="back" href="index.html">← Übersicht</a>
+<h1>crates/minds-store/src/child_repo.rs</h1>
+<p class="meta">8 von 249 Zeilen mit erfasstem Kontext</p>
+</header>
+<main class="split">
+<div class="code"><div class="line"><span class="num">1</span><code>//! [`ChildRepoStore`] — der Kontext liegt in einem **eigenen** Repository.</code></div>
+<div class="line"><span class="num">2</span><code>//!</code></div>
+<div class="line"><span class="num">3</span><code>//! Derselbe Baum, dieselben Pfade, dasselbe Ref — nur ein anderes</code></div>
+<div class="line"><span class="num">4</span><code>//! [`Repo`]-Handle. Das ist keine Beschreibung, sondern die Bauform: Beide</code></div>
+<div class="line"><span class="num">5</span><code>//! Backends sind Hüllen um denselben [`GitStore`], und</code></div>
+<div class="line"><span class="num">6</span><code>//! `both_backends_write_the_same_tree` weist nach, dass dabei bis auf den</code></div>
+<div class="line"><span class="num">7</span><code>//! Baum-Hash genau dasselbe herauskommt.</code></div>
+<div class="line"><span class="num">8</span><code>//!</code></div>
+<div class="line"><span class="num">9</span><code>//! # Wofür man das will</code></div>
+<div class="line"><span class="num">10</span><code>//!</code></div>
+<div class="line"><span class="num">11</span><code>//! - Das Produktions-Repo bleibt sauber und klont schnell — Transkripte können</code></div>
+<div class="line"><span class="num">12</span><code>//!   groß werden, und niemand will sie bei jedem CI-Klon mitziehen.</code></div>
+<div class="line"><span class="num">13</span><code>//! - Eigene Zugriffsrechte und eigene Aufbewahrungsfristen für den Kontext.</code></div>
+<div class="line"><span class="num">14</span><code>//! - Kein CI-Lärm im Parent durch Kontext-Pushes.</code></div>
+<div class="line"><span class="num">15</span><code>//!</code></div>
+<div class="line"><span class="num">16</span><code>//! Der Preis ist ein zweites Repository, das existieren, erreichbar und</code></div>
+<div class="line"><span class="num">17</span><code>//! eingerichtet sein muss. Deshalb ist das In-Repo-Backend der Default und</code></div>
+<div class="line"><span class="num">18</span><code>//! dieses hier eine Entscheidung.</code></div>
+<div class="line"><span class="num">19</span><code>//!</code></div>
+<div class="line"><span class="num">20</span><code>//! # Die eine Regel, die man nicht brechen darf</code></div>
+<div class="line"><span class="num">21</span><code>//!</code></div>
+<div class="line"><span class="num">22</span><code>//! **Der Trailer bleibt im Parent-Commit.** Die Nutzlast zieht um, der Verweis</code></div>
+<div class="line"><span class="num">23</span><code>//! nicht — sonst bricht das Bug-Retrieval, sobald jemand nur den Parent</code></div>
+<div class="line"><span class="num">24</span><code>//! ausgecheckt hat. Praktisch heißt das: [`ChildRepoStore::context_repo`] ist</code></div>
+<div class="line"><span class="num">25</span><code>//! **nicht** das Repository, an dessen Commits Trailer gehängt werden. Wer</code></div>
+<div class="line"><span class="num">26</span><code>//! beides braucht, öffnet das Code-Repo getrennt (`Repo::discover`).</code></div>
+<div class="line"><span class="num">27</span><code>//!</code></div>
+<div class="line"><span class="num">28</span><code>//! ```text</code></div>
+<div class="line"><span class="num">29</span><code>//! Parent-Repo                        Child-Repo</code></div>
+<div class="line"><span class="num">30</span><code>//! ├─ Code + Commits mit Trailer  →   └─ refs/minds/context (nur JSON)</code></div>
+<div class="line"><span class="num">31</span><code>//! ```</code></div>
+<div class="line"><span class="num">32</span><code>//!</code></div>
+<div class="line"><span class="num">33</span><code>//! # Was hier bewusst nicht passiert: anlegen</code></div>
+<div class="line"><span class="num">34</span><code>//!</code></div>
+<div class="line"><span class="num">35</span><code>//! [`ChildRepoStore::open`] öffnet ein vorhandenes Repository und meldet</code></div>
+<div class="line"><span class="num">36</span><code>//! [`StoreError::ChildRepo`], wenn dort keines ist. Es legt keines an. Ein</code></div>
+<div class="line"><span class="num">37</span><code>//! Store, der bei einem Tippfehler im Pfad stillschweigend ein zweites, leeres</code></div>
+<div class="line"><span class="num">38</span><code>//! Kontext-Repo erzeugt, verwandelt einen Konfigurationsfehler in</code></div>
+<div class="line"><span class="num">39</span><code>//! Datenverlust-mit-Ansage. Anlegen und Klonen ist Sache von `minds init` (M6)</code></div>
+<div class="line"><span class="num">40</span><code>//! — dafür braucht `minds-git` noch ein `Repo::init_bare`.</code></div>
+<div class="line"><span class="num">41</span><code>//!</code></div>
+<div class="line"><span class="num">42</span><code>//! # Die Identität wird aus dem Child-Repo gelesen</code></div>
+<div class="line"><span class="num">43</span><code>//!</code></div>
+<div class="line"><span class="num">44</span><code>//! `commit_tree_to_ref` besteht auf einer Git-Identität, und gix liest sie aus</code></div>
+<div class="line"><span class="num">45</span><code>//! der Konfiguration **des Repositories, in das geschrieben wird**. Bei einem</code></div>
+<div class="line"><span class="num">46</span><code>//! frisch angelegten, baren Child-Repo ohne lokale `user.name`/`user.email`</code></div>
+<div class="line"><span class="num">47</span><code>//! greift die globale Konfiguration des Entwicklers — und wo es die nicht gibt</code></div>
+<div class="line"><span class="num">48</span><code>//! (CI-Container, Air-Gap), scheitert der erste `put` mit</code></div>
+<div class="line"><span class="num">49</span><code>//! `GitError::Identity`. `minds init` sollte die Identität deshalb beim Anlegen</code></div>
+<div class="line"><span class="num">50</span><code>//! mitschreiben.</code></div>
+<div class="line"><span class="num">51</span><code></code></div>
+<div class="line"><span class="num">52</span><code>use std::path::Path;</code></div>
+<div class="line"><span class="num">53</span><code></code></div>
+<div class="line"><span class="num">54</span><code>use minds_core::SessionId;</code></div>
+<div class="line"><span class="num">55</span><code>use minds_git::{DEFAULT_CONTEXT_REF, Repo};</code></div>
+<div class="line"><span class="num">56</span><code></code></div>
+<div class="line"><span class="num">57</span><code>use crate::bytes::SessionBytes;</code></div>
+<div class="line"><span class="num">58</span><code>use crate::error::{Result, StoreError};</code></div>
+<div class="line"><span class="num">59</span><code>use crate::git_store::GitStore;</code></div>
+<div class="line"><span class="num">60</span><code>use crate::store::{ContextStore, Put};</code></div>
+<div class="line"><span class="num">61</span><code></code></div>
+<div class="line"><span class="num">62</span><code>/// Der Kontext-Store in einem separaten Repository.</code></div>
+<div class="line"><span class="num">63</span><code>#[derive(Debug)]</code></div>
+<div class="line"><span class="num">64</span><code>pub struct ChildRepoStore(GitStore);</code></div>
+<div class="line"><span class="num">65</span><code></code></div>
+<div class="line"><span class="num">66</span><code>impl ChildRepoStore {</code></div>
+<div class="line"><span class="num">67</span><code>    /// Öffnet das Kontext-Repository unter `path`.</code></div>
+<div class="line"><span class="num">68</span><code>    ///</code></div>
+<div class="line"><span class="num">69</span><code>    /// `path` zeigt auf das Arbeitsverzeichnis oder direkt auf das</code></div>
+<div class="line"><span class="num">70</span><code>    /// Git-Verzeichnis; ein bares Repository ist der Normalfall, weil dort</code></div>
+<div class="line"><span class="num">71</span><code>    /// niemand arbeitet. Es wird **nicht** nach oben gesucht: Ein konfigurierter</code></div>
+<div class="line"><span class="num">72</span><code>    /// Pfad soll genau das Repository treffen, das dasteht, und nicht</code></div>
+<div class="line"><span class="num">73</span><code>    /// versehentlich dessen Elternverzeichnis.</code></div>
+<div class="line"><span class="num">74</span><code>    ///</code></div>
+<div class="line"><span class="num">75</span><code>    /// # Fehler</code></div>
+<div class="line"><span class="num">76</span><code>    ///</code></div>
+<div class="line"><span class="num">77</span><code>    /// [`StoreError::ChildRepo`], wenn dort kein Repository liegt — mit dem</code></div>
+<div class="line"><span class="num">78</span><code>    /// Pfad in der Meldung, denn das ist die Information, die fehlt.</code></div>
+<div class="line"><span class="num">79</span><code>    pub fn open(path: impl AsRef&lt;Path&gt;) -&gt; Result&lt;Self&gt; {</code></div>
+<div class="line"><span class="num">80</span><code>        let path = path.as_ref();</code></div>
+<div class="line"><span class="num">81</span><code>        Repo::open(path)</code></div>
+<div class="line"><span class="num">82</span><code>            .map(Self::from_repo)</code></div>
+<div class="line"><span class="num">83</span><code>            .map_err(|err| StoreError::child_repo(path, err))</code></div>
+<div class="line"><span class="num">84</span><code>    }</code></div>
+<div class="line"><span class="num">85</span><code></code></div>
+<div class="line"><span class="num">86</span><code>    /// Nimmt ein bereits geöffnetes Kontext-Repository.</code></div>
+<div class="line"><span class="num">87</span><code>    pub fn from_repo(repo: Repo) -&gt; Self {</code></div>
+<div class="line"><span class="num">88</span><code>        Self(GitStore::new(repo, DEFAULT_CONTEXT_REF))</code></div>
+<div class="line"><span class="num">89</span><code>    }</code></div>
+<div class="line"><span class="num">90</span><code></code></div>
+<div class="line"><span class="num">91</span><code>    /// Legt den Ref fest, unter dem der Store liegt (Default:</code></div>
+<div class="line"><span class="num">92</span><code>    /// [`DEFAULT_CONTEXT_REF`]).</code></div>
+<div class="line"><span class="num">93</span><code>    ///</code></div>
+<div class="line"><span class="num">94</span><code>    /// Derselbe Name wie beim In-Repo-Backend, und das ist Absicht: Ein Umzug</code></div>
+<div class="line"><span class="num">95</span><code>    /// zwischen den Backends soll nichts am Layout ändern.</code></div>
+<div class="line"><span class="num">96</span><code>    pub fn with_ref(self, reference: impl Into&lt;String&gt;) -&gt; Self {</code></div>
+<div class="line"><span class="num">97</span><code>        Self(self.0.with_ref(reference))</code></div>
+<div class="line"><span class="num">98</span><code>    }</code></div>
+<div class="line"><span class="num">99</span><code></code></div>
+<div class="line"><span class="num">100</span><code>    /// Das Repository, in dem der Kontext liegt — **nicht** das des Codes.</code></div>
+<div class="line"><span class="num">101</span><code>    /// Siehe Modul-Doku.</code></div>
+<div class="line"><span class="num">102</span><code>    pub fn context_repo(&amp;self) -&gt; &amp;Repo {</code></div>
+<div class="line"><span class="num">103</span><code>        self.0.context_repo()</code></div>
+<div class="line"><span class="num">104</span><code>    }</code></div>
+<div class="line"><span class="num">105</span><code></code></div>
+<div class="line"><span class="num">106</span><code>    /// Der Ref, unter dem dieser Store liegt.</code></div>
+<div class="line"><span class="num">107</span><code>    pub fn reference(&amp;self) -&gt; &amp;str {</code></div>
+<div class="line"><span class="num">108</span><code>        self.0.reference()</code></div>
+<div class="line"><span class="num">109</span><code>    }</code></div>
+<div class="line"><span class="num">110</span><code>}</code></div>
+<div class="line"><span class="num">111</span><code></code></div>
+<div class="line"><span class="num">112</span><code>impl ContextStore for ChildRepoStore {</code></div>
+<div class="line"><span class="num">113</span><code>    fn put_bytes(&amp;self, session: &amp;SessionBytes) -&gt; Result&lt;Put&gt; {</code></div>
+<div class="line"><span class="num">114</span><code>        self.0.put_bytes(session)</code></div>
+<div class="line"><span class="num">115</span><code>    }</code></div>
+<div class="line"><span class="num">116</span><code></code></div>
+<div class="line"><span class="num">117</span><code>    fn get_bytes(&amp;self, id: SessionId) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt; {</code></div>
+<div class="line"><span class="num">118</span><code>        self.0.get_bytes(id)</code></div>
+<div class="line"><span class="num">119</span><code>    }</code></div>
+<div class="line"><span class="num">120</span><code></code></div>
+<div class="line"><span class="num">121</span><code>    fn list(&amp;self) -&gt; Result&lt;Vec&lt;SessionId&gt;&gt; {</code></div>
+<div class="line"><span class="num">122</span><code>        self.0.list()</code></div>
+<div class="line"><span class="num">123</span><code>    }</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">124</span><code></code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">125</span><code>    fn get_index_bytes(&amp;self) -&gt; Result&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt; {</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">126</span><code>        self.0.get_index_bytes()</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">127</span><code>    }</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">128</span><code></code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">129</span><code>    fn put_index_bytes(&amp;self, bytes: &amp;[u8]) -&gt; Result&lt;()&gt; {</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">130</span><code>        self.0.put_index_bytes(bytes)</code></div>
+<div class="line has-context" data-sessions="b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f" tabindex="0" role="button" title="2 Sessions hinter dieser Zeile anzeigen"><span class="num">131</span><code>    }</code></div>
+<div class="line"><span class="num">132</span><code>}</code></div>
+<div class="line"><span class="num">133</span><code></code></div>
+<div class="line"><span class="num">134</span><code>#[cfg(test)]</code></div>
+<div class="line"><span class="num">135</span><code>mod tests {</code></div>
+<div class="line"><span class="num">136</span><code>    use super::*;</code></div>
+<div class="line"><span class="num">137</span><code>    use crate::InRepoStore;</code></div>
+<div class="line"><span class="num">138</span><code>    use crate::fixture::{TempRepo, redacted};</code></div>
+<div class="line"><span class="num">139</span><code></code></div>
+<div class="line"><span class="num">140</span><code>    /// Ein Parent mit Code und ein bares Child daneben.</code></div>
+<div class="line"><span class="num">141</span><code>    fn parent_and_child() -&gt; (TempRepo, TempRepo, ChildRepoStore) {</code></div>
+<div class="line"><span class="num">142</span><code>        let parent = TempRepo::init();</code></div>
+<div class="line"><span class="num">143</span><code>        parent.write_file(&quot;src/lib.rs&quot;, &quot;fn main() {}\n&quot;);</code></div>
+<div class="line"><span class="num">144</span><code>        parent.commit(&quot;code&quot;);</code></div>
+<div class="line"><span class="num">145</span><code></code></div>
+<div class="line"><span class="num">146</span><code>        let child = TempRepo::init_bare();</code></div>
+<div class="line"><span class="num">147</span><code>        let store = ChildRepoStore::open(child.path()).unwrap();</code></div>
+<div class="line"><span class="num">148</span><code></code></div>
+<div class="line"><span class="num">149</span><code>        (parent, child, store)</code></div>
+<div class="line"><span class="num">150</span><code>    }</code></div>
+<div class="line"><span class="num">151</span><code></code></div>
+<div class="line"><span class="num">152</span><code>    #[test]</code></div>
+<div class="line"><span class="num">153</span><code>    fn a_bare_child_repository_holds_the_context() {</code></div>
+<div class="line"><span class="num">154</span><code>        // Bar ist der Normalfall: Im Kontext-Repo arbeitet niemand, es gibt</code></div>
+<div class="line"><span class="num">155</span><code>        // dort nichts auszuchecken.</code></div>
+<div class="line"><span class="num">156</span><code>        let (_parent, child, store) = parent_and_child();</code></div>
+<div class="line"><span class="num">157</span><code>        let session = redacted(&quot;Retry-Test reparieren&quot;);</code></div>
+<div class="line"><span class="num">158</span><code></code></div>
+<div class="line"><span class="num">159</span><code>        let id = store.put(&amp;session).unwrap().id();</code></div>
+<div class="line"><span class="num">160</span><code></code></div>
+<div class="line"><span class="num">161</span><code>        assert_eq!(store.get(id).unwrap().as_ref(), Some(session.session()));</code></div>
+<div class="line"><span class="num">162</span><code>        assert_eq!(store.list().unwrap(), vec![id]);</code></div>
+<div class="line"><span class="num">163</span><code>        assert_eq!(</code></div>
+<div class="line"><span class="num">164</span><code>            child</code></div>
+<div class="line"><span class="num">165</span><code>                .git(&amp;[&quot;for-each-ref&quot;, &quot;--format=%(refname)&quot;, &quot;refs/minds/&quot;])</code></div>
+<div class="line"><span class="num">166</span><code>                .trim(),</code></div>
+<div class="line"><span class="num">167</span><code>            DEFAULT_CONTEXT_REF</code></div>
+<div class="line"><span class="num">168</span><code>        );</code></div>
+<div class="line"><span class="num">169</span><code>    }</code></div>
+<div class="line"><span class="num">170</span><code></code></div>
+<div class="line"><span class="num">171</span><code>    #[test]</code></div>
+<div class="line"><span class="num">172</span><code>    fn both_backends_write_the_same_tree() {</code></div>
+<div class="line"><span class="num">173</span><code>        // Die zentrale Zusage des Plans: „identischer Baum, nur in einem</code></div>
+<div class="line"><span class="num">174</span><code>        // separaten Repo&quot;. Zwei Repositories, die nichts voneinander wissen,</code></div>
+<div class="line"><span class="num">175</span><code>        // kommen bei derselben Session auf denselben Baum-Hash — schärfer als</code></div>
+<div class="line"><span class="num">176</span><code>        // jeder Vergleich von Pfadlisten.</code></div>
+<div class="line"><span class="num">177</span><code>        let session = redacted(&quot;Retry-Test reparieren&quot;);</code></div>
+<div class="line"><span class="num">178</span><code></code></div>
+<div class="line"><span class="num">179</span><code>        let (_parent, child, child_store) = parent_and_child();</code></div>
+<div class="line"><span class="num">180</span><code>        child_store.put(&amp;session).unwrap();</code></div>
+<div class="line"><span class="num">181</span><code></code></div>
+<div class="line"><span class="num">182</span><code>        let alone = TempRepo::init();</code></div>
+<div class="line"><span class="num">183</span><code>        alone.write_file(&quot;src/lib.rs&quot;, &quot;fn main() {}\n&quot;);</code></div>
+<div class="line"><span class="num">184</span><code>        alone.commit(&quot;code&quot;);</code></div>
+<div class="line"><span class="num">185</span><code>        InRepoStore::open(alone.path())</code></div>
+<div class="line"><span class="num">186</span><code>            .unwrap()</code></div>
+<div class="line"><span class="num">187</span><code>            .put(&amp;session)</code></div>
+<div class="line"><span class="num">188</span><code>            .unwrap();</code></div>
+<div class="line"><span class="num">189</span><code></code></div>
+<div class="line"><span class="num">190</span><code>        assert_eq!(</code></div>
+<div class="line"><span class="num">191</span><code>            child.hash(&quot;refs/minds/context^{tree}&quot;),</code></div>
+<div class="line"><span class="num">192</span><code>            alone.hash(&quot;refs/minds/context^{tree}&quot;)</code></div>
+<div class="line"><span class="num">193</span><code>        );</code></div>
+<div class="line"><span class="num">194</span><code>    }</code></div>
+<div class="line"><span class="num">195</span><code></code></div>
+<div class="line"><span class="num">196</span><code>    #[test]</code></div>
+<div class="line"><span class="num">197</span><code>    fn the_parent_repository_never_learns_about_it() {</code></div>
+<div class="line"><span class="num">198</span><code>        // Der Grund, warum man das Backend überhaupt wählt: Das Repo des Codes</code></div>
+<div class="line"><span class="num">199</span><code>        // bleibt unberührt — kein Ref, kein Objekt, kein Klon-Ballast.</code></div>
+<div class="line"><span class="num">200</span><code>        let (parent, _child, store) = parent_and_child();</code></div>
+<div class="line"><span class="num">201</span><code>        let objects_before = parent.object_count();</code></div>
+<div class="line"><span class="num">202</span><code></code></div>
+<div class="line"><span class="num">203</span><code>        store.put(&amp;redacted(&quot;Retry-Test reparieren&quot;)).unwrap();</code></div>
+<div class="line"><span class="num">204</span><code></code></div>
+<div class="line"><span class="num">205</span><code>        assert!(</code></div>
+<div class="line"><span class="num">206</span><code>            parent</code></div>
+<div class="line"><span class="num">207</span><code>                .git(&amp;[&quot;for-each-ref&quot;, &quot;--format=%(refname)&quot;, &quot;refs/minds/&quot;])</code></div>
+<div class="line"><span class="num">208</span><code>                .trim()</code></div>
+<div class="line"><span class="num">209</span><code>                .is_empty(),</code></div>
+<div class="line"><span class="num">210</span><code>            &quot;der Parent hat einen Minds-Ref bekommen&quot;</code></div>
+<div class="line"><span class="num">211</span><code>        );</code></div>
+<div class="line"><span class="num">212</span><code>        assert_eq!(parent.object_count(), objects_before);</code></div>
+<div class="line"><span class="num">213</span><code>    }</code></div>
+<div class="line"><span class="num">214</span><code></code></div>
+<div class="line"><span class="num">215</span><code>    #[test]</code></div>
+<div class="line"><span class="num">216</span><code>    fn a_missing_child_repository_is_reported_with_its_path() {</code></div>
+<div class="line"><span class="num">217</span><code>        // Der wahrscheinlichste Konfigurationsfehler. Die Meldung muss den Pfad</code></div>
+<div class="line"><span class="num">218</span><code>        // nennen, sonst sucht man im falschen Repo.</code></div>
+<div class="line"><span class="num">219</span><code>        let empty = tempfile::tempdir().unwrap();</code></div>
+<div class="line"><span class="num">220</span><code></code></div>
+<div class="line"><span class="num">221</span><code>        let err = ChildRepoStore::open(empty.path()).unwrap_err();</code></div>
+<div class="line"><span class="num">222</span><code></code></div>
+<div class="line"><span class="num">223</span><code>        assert!(</code></div>
+<div class="line"><span class="num">224</span><code>            matches!(err, StoreError::ChildRepo { .. }),</code></div>
+<div class="line"><span class="num">225</span><code>            &quot;erwartet ChildRepo, war: {err:?}&quot;</code></div>
+<div class="line"><span class="num">226</span><code>        );</code></div>
+<div class="line"><span class="num">227</span><code>        assert!(</code></div>
+<div class="line"><span class="num">228</span><code>            err.to_string()</code></div>
+<div class="line"><span class="num">229</span><code>                .contains(&amp;empty.path().display().to_string())</code></div>
+<div class="line"><span class="num">230</span><code>        );</code></div>
+<div class="line"><span class="num">231</span><code>    }</code></div>
+<div class="line"><span class="num">232</span><code></code></div>
+<div class="line"><span class="num">233</span><code>    #[test]</code></div>
+<div class="line"><span class="num">234</span><code>    fn the_two_backends_read_each_others_layout() {</code></div>
+<div class="line"><span class="num">235</span><code>        // Ein Umzug zwischen den Backends ist ein Kopiervorgang, kein Umbau:</code></div>
+<div class="line"><span class="num">236</span><code>        // Was das eine schreibt, findet das andere unter derselben ID.</code></div>
+<div class="line"><span class="num">237</span><code>        let (_parent, child, store) = parent_and_child();</code></div>
+<div class="line"><span class="num">238</span><code>        let session = redacted(&quot;Retry-Test reparieren&quot;);</code></div>
+<div class="line"><span class="num">239</span><code>        let id = store.put(&amp;session).unwrap().id();</code></div>
+<div class="line"><span class="num">240</span><code></code></div>
+<div class="line"><span class="num">241</span><code>        // Dasselbe Repo, nur durch die andere Hülle gelesen.</code></div>
+<div class="line"><span class="num">242</span><code>        let as_in_repo = InRepoStore::open(child.path()).unwrap();</code></div>
+<div class="line"><span class="num">243</span><code></code></div>
+<div class="line"><span class="num">244</span><code>        assert_eq!(</code></div>
+<div class="line"><span class="num">245</span><code>            as_in_repo.get(id).unwrap().as_ref(),</code></div>
+<div class="line"><span class="num">246</span><code>            Some(session.session())</code></div>
+<div class="line"><span class="num">247</span><code>        );</code></div>
+<div class="line"><span class="num">248</span><code>    }</code></div>
+<div class="line"><span class="num">249</span><code>}</code></div>
+</div>
+<aside class="panel" id="panel">
+<p class="hint">Klick auf eine markierte Zeile zeigt die Session dahinter.</p>
+<section class="session" id="s-b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf">
+<p class="guess">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>
+<h2>Absicht</h2>
+<p class="intent">Ich möchte M5 so umbauen, dass wir es genauso machen wie entire! Mit dem Hook-Ansatz. 
+Wir bleiben erst einmal bei der Rust implementierung. Diese ist effizienter.
+
+Das ist der entscheidende Unterschied. Minds soll auch Hooks installieren im Agenten selbst: Claude Code über `.claude/settings.json`, Codex über `.codex/hooks.json`, Cursor über `.cursor/hooks.json`, Gemini über `.gemini/settings.json`, OpenCode über ein TypeScript-Plugin. Bei Codex wird zusätzlich `codex_hooks = true` in die `config.toml` geschrieben. Dazu Git-Hooks: Checkpoints entstehen, wenn du oder der Agent committen; die Session-Metadaten möchte ich entweder auf einem child-repo haben oder falls wir diese kombination nicht haben direkt im repo. 
+
+Das Verhalten soll an der Stelle absolut gleich sein. M5.0  docs: Plan.md — M5 von Transkript-Parsing auf Hooks umgestellt (ADR-0003)
+M5.1  feat(core): Lineage, Turn.parent/at, ToolCall.effect, Vec&lt;Edge&gt; (additiv)
+M5.2  feat(capture): JournalEvent + Journal (Datei pro Event, 0600, fsck-fähig)
+M5.3  feat(cli): minds hook — stdin lesen, anhängen, Exit 0, immer
+M5.4  feat(capture): Normalisierer Claude Code (SessionStart/Prompt/Tool*/Stop/Subagent*)
+M5.5  feat(capture): Secretfile-Mauer bei PreToolUse
+M5.6  feat(capture): Journal + Transkript → Vec&lt;Session&gt; (Turns, Usage, Intent)
+M5.7  feat(capture): Kanten — Subagent (Observed), Artefakt-Hash, Commit
+M5.8  feat(cli): minds enable --agent claude-code (settings.json mergen, idempotent)
+M5.9  test(capture): Fixtures — single, subagent, zwei Agents parallel</p>
+<h3>Herkunft</h3>
+<dl>
+<dt>Agent</dt><dd>claude-code 2.1.218</dd>
+<dt>Modell</dt><dd>anthropic / claude-opus-4-8</dd>
+<dt>Tokens</dt><dd>57466 ein / 1286225 aus</dd>
+<dt>Session</dt><dd><code class="id">b3-2f94456cf47dbd00a78157bf4283abab2d7ab1aa798c3cd17a3b9ee4942fedbf</code></dd>
+</dl>
+<h3>Berührte Dateien</h3>
+<ul>
+<li><code>Plan.md</code></li>
+<li><code>crates/minds-capture/Cargo.toml</code></li>
+<li><code>crates/minds-capture/src/adapter.rs</code></li>
+<li><code>crates/minds-capture/src/clock.rs</code></li>
+<li><code>crates/minds-capture/src/edges.rs</code></li>
+<li><code>crates/minds-capture/src/import.rs</code></li>
+<li><code>crates/minds-capture/src/lib.rs</code></li>
+<li><code>crates/minds-capture/src/match_commits.rs</code></li>
+<li><code>crates/minds-capture/src/normalize.rs</code></li>
+<li><code>crates/minds-capture/src/secretwall.rs</code></li>
+<li><code>crates/minds-capture/src/transcript.rs</code></li>
+<li><code>crates/minds-capture/tests/fixtures.rs</code></li>
+<li><code>crates/minds-cli/Cargo.toml</code></li>
+<li><code>crates/minds-cli/src/checkpoint.rs</code></li>
+<li><code>crates/minds-cli/src/config.rs</code></li>
+<li><code>crates/minds-cli/src/enable.rs</code></li>
+<li><code>crates/minds-cli/src/fsck.rs</code></li>
+<li><code>crates/minds-cli/src/hook.rs</code></li>
+<li><code>crates/minds-cli/src/import_cmd.rs</code></li>
+<li><code>crates/minds-cli/src/main.rs</code></li>
+<li><code>crates/minds-cli/src/render.rs</code></li>
+<li><code>crates/minds-cli/src/render_cmd.rs</code></li>
+<li><code>crates/minds-cli/src/show.rs</code></li>
+<li><code>crates/minds-cli/src/why.rs</code></li>
+<li><code>crates/minds-cli/tests/end_to_end.rs</code></li>
+<li><code>crates/minds-core/src/id.rs</code></li>
+<li><code>crates/minds-core/src/lib.rs</code></li>
+<li><code>crates/minds-core/src/lineage.rs</code></li>
+<li><code>crates/minds-reader/Cargo.toml</code></li>
+<li><code>crates/minds-reader/src/error.rs</code></li>
+<li><code>crates/minds-reader/src/file.rs</code></li>
+<li><code>crates/minds-reader/src/html.rs</code></li>
+<li><code>crates/minds-reader/src/index.rs</code></li>
+<li><code>crates/minds-reader/src/lib.rs</code></li>
+<li><code>crates/minds-reader/src/render.rs</code></li>
+<li><code>crates/minds-reader/src/summary.rs</code></li>
+<li><code>crates/minds-redact/src/session.rs</code></li>
+<li><code>crates/minds-redact/tests/corpus.rs</code></li>
+<li><code>crates/minds-store/Cargo.toml</code></li>
+<li><code>crates/minds-store/src/child_repo.rs</code></li>
+<li><code>crates/minds-store/src/fixture.rs</code></li>
+<li><code>crates/minds-store/src/git_store.rs</code></li>
+<li><code>crates/minds-store/src/in_repo.rs</code></li>
+<li><code>crates/minds-store/src/index.rs</code></li>
+<li><code>crates/minds-store/src/lib.rs</code></li>
+<li><code>crates/minds-store/src/store.rs</code></li>
+<li><code>docs/adr/0003-hooks-statt-transkript-parsing.md</code></li>
+<li><code>docs/adr/0004-import-und-store-index.md</code></li>
+</ul>
+</section>
+<section class="session" id="s-b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f">
+<p class="guess">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>
+<h2>Absicht</h2>
+<p class="intent">Ich möchte die Funktionalität aus Szenario 1 implementieren. 
+Und zwar so, wenn ein Nutzer erst zu einem späteren Zeitpunkt minds enable aufruft sollen die Hooks importiert und die Transkripte von allen bekannten Agenten importiert werden im hintergrund. Der Nutzer soll keinen extra Befehl dafür ausführen müssen. 
+
+Zu Szenario 2: Die Sessins müssen auf jeden Fall nach GitLab. Entweder in das Repository direkt oder wenn wir ein Parent-Repository verwenden dann in ein child repository.</p>
+<h3>Herkunft</h3>
+<dl>
+<dt>Agent</dt><dd>claude-code 2.1.218</dd>
+<dt>Modell</dt><dd>anthropic / claude-opus-4-8</dd>
+<dt>Tokens</dt><dd>107 ein / 35732 aus</dd>
+<dt>Session</dt><dd><code class="id">b3-46095cec995625d7ec505aeeb42abbf3703d0d5c1bfe563c2e670ed0e449771f</code></dd>
+</dl>
+<h3>Berührte Dateien</h3>
+<ul>
+<li><code>crates/minds-store/Cargo.toml</code></li>
+<li><code>crates/minds-store/src/child_repo.rs</code></li>
+<li><code>crates/minds-store/src/git_store.rs</code></li>
+<li><code>crates/minds-store/src/in_repo.rs</code></li>
+<li><code>crates/minds-store/src/index.rs</code></li>
+<li><code>crates/minds-store/src/lib.rs</code></li>
+<li><code>crates/minds-store/src/store.rs</code></li>
+</ul>
+</section>
+
+</aside>
+</main>
+
+<script>(function(){var panel=document.getElementById('panel');if(!panel)return;/* Erst hier verstecken: ohne Skript bleiben alle Panels lesbar. */panel.querySelectorAll('.session').forEach(function(s){s.hidden=true});function show(row){var ids=(row.getAttribute('data-sessions')||'').split(' ').filter(Boolean);panel.querySelectorAll('.session').forEach(function(s){s.hidden=true});ids.forEach(function(id){var el=document.getElementById('s-'+id);if(el)el.hidden=false});document.querySelectorAll('.line.selected').forEach(function(l){l.classList.remove('selected')});row.classList.add('selected');var hint=panel.querySelector('.hint');if(hint)hint.hidden=ids.length>0;}document.addEventListener('click',function(e){var row=e.target.closest('.line.has-context');if(row)show(row);});document.addEventListener('keydown',function(e){if(e.key!=='Enter'&&e.key!==' ')return;var row=e.target.closest&&e.target.closest('.line.has-context');if(row){e.preventDefault();show(row)}});/* Von der Übersicht verlinkt (#s-<id>): die erste Zeile dieser Session zeigen. */function openHash(){var h=location.hash;if(h.indexOf('#s-')!==0)return;var id=h.slice(3);var row=document.querySelector('.line.has-context[data-sessions~="'+id+'"]');if(row){show(row);row.scrollIntoView({block:'center'})}}openHash();window.addEventListener('hashchange',openHash);})();</script>
+</body>
+</html>

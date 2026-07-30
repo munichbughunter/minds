@@ -1,0 +1,27 @@
+[package]
+name = "minds-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minds-core = { path = "../minds-core" }
+minds-capture = { path = "../minds-capture" }
+minds-redact = { path = "../minds-redact" }
+minds-store = { path = "../minds-store" }
+minds-git = { path = "../minds-git" }
+minds-reader = { path = "../minds-reader" }
+minds-metrics = { path = "../minds-metrics" }
+minds-gitlab = { path = "../minds-gitlab" }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "minds"
+path = "src/main.rs"

@@ -1,0 +1,11 @@
+[package]
+name = "minds-metrics"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minds-core = { path = "../minds-core" }
+serde = { workspace = true }

@@ -1,0 +1,25 @@
+# Policy-Gate: kein agent-authored Change ohne Review-Approve (Schicht 3, R5).
+#
+# Die Logik steckt im Binary (`minds fsck --require-review`), nicht im YAML — ein
+# Format, das keine Logik kann, soll auch keine tragen. Der Job ruft nur auf.
+#
+# Einbinden in die .gitlab-ci.yml des Projekts:
+#
+#   include:
+#     - local: 'ci/minds-review-gate.gitlab-ci.yml'
+#
+# Voraussetzung: `minds` und `git` im Job-Image, und der Kontext-/Review-Ref muss
+# gefetcht sein (refs/minds/*). `minds enable` setzt die Fetch-Refspec dafür.
+
+stages:
+  - review-gate
+
+minds:review-gate:
+  stage: review-gate
+  rules:
+    - if: '$CI_MERGE_REQUEST_IID'   # bei jedem Merge Request
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  script:
+    # Die Minds-Refs mitziehen (Kontext + Reviews), falls das Image sie nicht hat.
+    - git fetch origin '+refs/minds/*:refs/minds/*' || true
+    - minds fsck --require-review

@@ -1,0 +1,49 @@
+# Minds-Kennzahlen in GitLab CI — opt-in, bricht nichts Bestehendes.
+#
+# Erhebt `minds metrics` und stellt sie als Prometheus-Textfile bereit: als
+# Job-Artefakt (immer) und, wenn eine Pushgateway-URL gesetzt ist, zusätzlich per
+# Push an den Gateway, den Grafana ohnehin scrapt. Grafana läuft beim Kunden —
+# hier wird nichts gehostet, nur emittiert (Plan-v0.2, Track M).
+#
+# Einbinden in die .gitlab-ci.yml des Projekts:
+#
+#   include:
+#     - local: 'ci/minds-metrics.gitlab-ci.yml'
+#
+# Optionale Variablen (CI/CD → Settings → Variables):
+#   MINDS_PUSHGATEWAY   z. B. https://pushgateway.example.com   (leer = nur Artefakt)
+#   MINDS_JOB           Prometheus-Job-Label                    (Default: minds)
+#
+# Bewusst zurückhaltend: eigener Stage, nur manuell oder per Schedule — kein Lauf
+# bei jedem Push. Der Job schlägt nie die Pipeline (|| true beim Push).
+
+stages:
+  - minds
+
+minds:metrics:
+  stage: minds
+  # Braucht nur `minds` (das Binary) und `git`. Ein Image, das beides hat, oder
+  # ein before_script, das `minds` installiert (siehe README, curl-Installer).
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+    - if: '$CI_PIPELINE_SOURCE == "web"'   # manuell über die UI ausgelöst
+      when: manual
+      allow_failure: true
+  variables:
+    MINDS_JOB: "minds"
+  script:
+    - minds metrics --format prometheus > minds-metrics.prom
+    - cat minds-metrics.prom
+    - |
+      if [ -n "$MINDS_PUSHGATEWAY" ]; then
+        echo "Push an $MINDS_PUSHGATEWAY (job=$MINDS_JOB, instance=$CI_PROJECT_PATH_SLUG)";
+        curl -sf --data-binary @minds-metrics.prom \
+          "$MINDS_PUSHGATEWAY/metrics/job/$MINDS_JOB/instance/$CI_PROJECT_PATH_SLUG" \
+          || echo "Push fehlgeschlagen — Artefakt bleibt trotzdem verfügbar";
+      else
+        echo "MINDS_PUSHGATEWAY nicht gesetzt — nur Artefakt, kein Push.";
+      fi
+  artifacts:
+    paths:
+      - minds-metrics.prom
+    expire_in: 30 days
