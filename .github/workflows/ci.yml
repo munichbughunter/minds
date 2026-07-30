@@ -18,7 +18,7 @@ jobs:
     name: fmt · clippy · test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Kein Toolchain-Action: `rust-toolchain.toml` pinnt 1.97.1, und rustup
       # zieht genau die nach. Ein `toolchain:`-Eingang hier wäre eine zweite

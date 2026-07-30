@@ -41,7 +41,7 @@ jobs:
             cross: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Version aus dem Tag
         id: version
@@ -103,7 +103,7 @@ jobs:
 
           ls -l "dist/${pkg}.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.target }}
           path: dist/*.tar.gz
@@ -115,9 +115,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           pattern: archive-*
