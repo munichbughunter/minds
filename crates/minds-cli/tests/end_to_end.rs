@@ -200,10 +200,15 @@ fn the_core_loop_closes() {
         "why zeigt den Prompt nicht:\n{why_out}"
     );
 
-    // 7. Alles auflösbar.
+    // 7. Alles auflösbar — und der ganze Durchlauf hatte nichts zu melden.
     let fsck = minds(dir, &["fsck"], None);
     assert!(fsck.status.success(), "fsck rot:\n{}", stdout(&fsck));
     assert!(stdout(&fsck).contains("in Ordnung"));
+    assert!(
+        !stdout(&fsck).contains("Log:"),
+        "der Kern-Loop schreibt keinen Log-Eintrag:\n{}",
+        stdout(&fsck)
+    );
 }
 
 /// Das Feedback aus dem Dogfooding: Eine Session, die *zwei* Dateien anfasst,
@@ -515,4 +520,366 @@ fn checkpoint_without_a_session_is_a_clean_no_op() {
 
     let fsck = minds(dir, &["fsck"], None);
     assert!(fsck.status.success());
+
+    // Der Gutfall schreibt nichts. Ohne diese Zusage bekäme jeder Nutzer
+    // dauerhaft einen `fsck`-Hinweis, sobald eine der best-effort-Stellen
+    // (etwa `put_session_branch`) auf dem Default-Backend anfinge zu melden.
+    assert!(
+        hook_log(dir).is_none(),
+        "ohne Fehler entsteht kein Log: {:?}",
+        hook_log(dir)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Der Hook-Pfad hat ein Log (#10)
+// ---------------------------------------------------------------------------
+
+/// Das Log, das die Hook-Pfade bei einem Fehler beschreiben.
+fn hook_log(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(".git/minds/hook.log")).ok()
+}
+
+/// Ruft einen installierten Hook so auf, wie Git es täte: über `sh`, aus der
+/// Repo-Wurzel, mit `minds` im Pfad und ohne fremde Git-Config.
+fn run_hook(dir: &Path, name: &str, args: &[&str]) -> Output {
+    let mut cmd = Command::new("sh");
+    cmd.arg(dir.join(".git/hooks").join(name))
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", path_with_minds());
+    without_user_config(&mut cmd)
+        .output()
+        .expect("der Hook läuft")
+}
+
+#[test]
+fn a_broken_redaction_policy_lands_in_the_log_instead_of_nowhere() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(enable.status.success(), "{}", stdout(&enable));
+
+    // Der Auslöser aus #10: ein Tippfehler in der Redaction-Policy. `checkpoint`
+    // bricht daran *fail-closed* ab — bewusst, denn lieber nichts einchecken als
+    // etwas Unredigiertes.
+    std::fs::create_dir_all(dir.join(".minds")).unwrap();
+    std::fs::write(dir.join(".minds/redact.json"), "{ das ist kein json").unwrap();
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Schreibe etwas""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    let commit = git(dir, &["commit", "-q", "-m", "feat: etwas"]);
+
+    // 1. Der Commit gelingt trotzdem. Ein Rekorder darf ihn nie scheitern lassen.
+    assert!(
+        commit.status.success(),
+        "der Commit muss durchgehen: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+
+    // 2. Und der Grund steht in der Datei, die die Doku verspricht — vor diesem
+    //    Commit war der post-commit-Pfad der einzige ohne Log.
+    let log = hook_log(dir).expect(".git/minds/hook.log muss entstanden sein");
+    assert!(
+        log.contains("checkpoint:"),
+        "der Eintrag nennt seinen Ursprung:\n{log}"
+    );
+    assert!(
+        log.contains("redact.json"),
+        "der Eintrag nennt die kaputte Datei:\n{log}"
+    );
+    assert_eq!(log.lines().count(), 1, "genau ein Eintrag:\n{log}");
+
+    // 3. Die Session ist vertagt, nicht verloren: Das Journal bleibt liegen, bis
+    //    die Policy repariert ist.
+    let fsck = stdout(&minds(dir, &["fsck"], None));
+    assert!(
+        fsck.contains("Journal: 1 Session(s) noch nicht eingecheckt"),
+        "{fsck}"
+    );
+}
+
+/// Die Annahme, auf der die Sicherheitsüberlegung zu `hook.log` steht: Keine
+/// Fehlermeldung auf dem Hook-Pfad trägt Rohmaterial mit sich.
+///
+/// Sie stimmt heute, weil keine `Display`-Implementierung in dieser Kette den
+/// Nutzlast-Text einbettet (`RedactionError` nennt Feldpfad und Anzahl,
+/// `StoreError` Ids und Hashes). Das ist aber eine Eigenschaft, die ein
+/// künftiges `#[error("… {0}")]` unbemerkt aufgäbe — deshalb hier als Test und
+/// nicht nur als Kommentar. Der Ort ist zwar derselbe wie der des rohen
+/// Journals, aber der Unterschied zählt: Das Journal wird redigiert, bevor
+/// irgendetwas es verlässt; eine Log-Zeile wird das nie.
+#[test]
+fn a_hook_error_never_carries_the_raw_transcript() {
+    let Some(repo) = scratch_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Synthetische Token — keine echten, aber in der Form, die die Redaction
+    // erkennt.
+    const TOKEN: &str = "glpat-AAAAAAAAAAAAAAAAAAAA";
+    const KEY: &str = "AKIAIOSFODNN7EXAMPLE";
+
+    event(
+        dir,
+        &format!(r#""hook_event_name":"UserPromptSubmit","prompt":"Deploy mit {TOKEN} und {KEY}""#),
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    // **Eine gültige Policy, die trotzdem scheitert.** Das ist der Punkt: Eine
+    // kaputte `redact.json` bräche schon beim Laden ab — also *bevor* das
+    // Journal gelesen ist, und dann hätte die Fehlermeldung die Nutzlast nie in
+    // der Hand. Der Test wäre grün, ohne etwas zu prüfen.
+    //
+    // Ohne einen einzigen Detektor lädt die Policy, und `redact_session`
+    // scheitert erst an der gebauten Session (`RedactionError::NoDetectors`) —
+    // im `übersprungen`-Zweig, mit den Token im Envelope.
+    std::fs::create_dir_all(dir.join(".minds")).unwrap();
+    std::fs::write(
+        dir.join(".minds/redact.json"),
+        r#"{"known_tokens":false,"email":false,"keyed_values":false,
+            "url_credentials":false,"high_entropy":{"enabled":false}}"#,
+    )
+    .unwrap();
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: etwas"]);
+
+    let log = hook_log(dir).expect("der Fehler steht im Log");
+    assert!(
+        log.contains("übersprungen"),
+        "der Fehler muss aus dem Session-Pfad kommen, sonst prüft der Test nichts:\n{log}"
+    );
+    assert!(!log.contains(TOKEN), "Token im Log:\n{log}");
+    assert!(!log.contains(KEY), "Schlüssel im Log:\n{log}");
+    assert!(!log.contains("Deploy mit"), "Prompt-Text im Log:\n{log}");
+}
+
+/// Dieselbe Frage für den Sync-Pfad, wo die Antwort anders ausfällt: Dort baut
+/// `Job::push` seinen Fehler aus dem **rohen stderr** eines fremden Prozesses,
+/// und `git` schreibt die Remote-URL hinein. Steht ein Token in der
+/// Username-Position, redigiert Git es nicht — minds muss das selbst tun.
+#[test]
+fn a_sync_error_never_carries_the_remote_credentials() {
+    let Some(repo) = scratch_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Etwas""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: etwas"]);
+
+    const TOKEN: &str = "glpat-AAAAAAAAAAAAAAAAAAAA";
+    git(
+        dir,
+        &[
+            "remote",
+            "add",
+            "kaputt",
+            &format!("https://{TOKEN}@127.0.0.1:1/x.git"),
+        ],
+    );
+
+    let hook = run_hook(
+        dir,
+        "pre-push",
+        &["kaputt", &format!("https://{TOKEN}@127.0.0.1:1/x.git")],
+    );
+    assert!(hook.status.success());
+
+    let log = hook_log(dir).expect("der Sync-Fehler steht im Log");
+    assert!(log.contains("sync:"), "{log}");
+    assert!(!log.contains(TOKEN), "Token im Log:\n{log}");
+    // Der Host bleibt — ohne ihn wäre die Diagnose wertlos.
+    assert!(log.contains("127.0.0.1"), "Host fehlt:\n{log}");
+}
+
+/// Und dasselbe mit `GIT_TRACE` in der Umgebung.
+///
+/// Der Fall ist tückischer, als er aussieht: Git protokolliert dann seinen
+/// ganzen Verkehr auf stderr — samt `Authorization: Basic …`, und das ist keine
+/// URL, die sich herausschneiden ließe. Seit dieses stderr in eine Datei geht,
+/// genügte ein `GIT_TRACE=1` in der Shell des Entwicklers, um ein Token
+/// dauerhaft auf die Platte zu legen. Der Kindprozess bekommt die Schalter
+/// deshalb gar nicht erst zu sehen.
+#[test]
+fn a_traced_git_does_not_dump_its_headers_into_the_log() {
+    let Some(repo) = scratch_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: etwas"]);
+
+    const TOKEN: &str = "glpat-CCCCCCCCCCCCCCCCCCCC";
+    let url = format!("https://{TOKEN}@127.0.0.1:1/x.git");
+    git(dir, &["remote", "add", "kaputt", &url]);
+
+    let mut cmd = Command::new("sh");
+    cmd.arg(dir.join(".git/hooks/pre-push"))
+        .args(["kaputt", &url])
+        .current_dir(dir)
+        .env("PATH", path_with_minds())
+        // Der Auslöser: gesetzt in der Umgebung, nicht von uns.
+        .env("GIT_TRACE", "1")
+        .env("GIT_CURL_VERBOSE", "1")
+        .env("GIT_TRACE_CURL", "1");
+    let hook = without_user_config(&mut cmd)
+        .output()
+        .expect("der Hook läuft");
+    assert!(hook.status.success());
+
+    let log = hook_log(dir).expect("der Sync-Fehler steht im Log");
+    assert!(!log.contains(TOKEN), "Token im Log:\n{log}");
+    assert!(!log.contains("Authorization"), "Header-Dump im Log:\n{log}");
+    // Die Diagnose bleibt trotzdem brauchbar.
+    assert!(log.contains("127.0.0.1"), "{log}");
+}
+
+/// Ein Push auf eine **URL** statt auf ein benanntes Remote darf keinen
+/// Log-Eintrag erzeugen.
+///
+/// Git ruft den pre-push-Hook dann mit der URL als `$1` auf. Daraus einen
+/// Tracking-Ref zu bauen ergibt keinen gültigen Ref-Namen — der Merge scheitert,
+/// und ohne diese Sperre entstünde bei *jedem* solchen Push eine Zeile: ein
+/// `fsck`-Hinweis, den man nur durch Löschen loswird und der sofort wiederkommt.
+#[test]
+fn pushing_to_a_url_instead_of_a_remote_writes_no_log_entry() {
+    let Some(repo) = scratch_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "chore: etwas"]);
+
+    let url = "https://example.invalid/x.git";
+    let hook = run_hook(dir, "pre-push", &[url, url]);
+
+    assert!(hook.status.success());
+    assert!(
+        hook_log(dir).is_none(),
+        "kein Eintrag ohne benanntes Remote: {:?}",
+        hook_log(dir)
+    );
+}
+
+#[test]
+fn fsck_points_at_the_log_but_does_not_quote_it() {
+    let Some(repo) = scratch_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Ein Eintrag mit einem wiedererkennbaren Wortlaut: `prepare-commit-msg` auf
+    // eine Datei, die es nicht gibt.
+    let out = minds(
+        dir,
+        &["prepare-commit-msg", "gibt-es-nicht/message.txt"],
+        None,
+    );
+    assert!(!out.status.success(), "der Aufruf scheitert");
+    let log = hook_log(dir).expect("der Fehler steht im Log");
+    assert!(log.contains("prepare-commit-msg:"), "{log}");
+
+    let fsck = minds(dir, &["fsck"], None);
+    let report = stdout(&fsck);
+
+    // Verwiesen wird: auf die Zahl und auf den Pfad.
+    assert!(report.contains("Log: 1 Eintrag"), "{report}");
+    assert!(report.contains("hook.log"), "{report}");
+    // Ein Hinweis, kein Befund — sonst hielte ein alter Eintrag das CI-Gate an.
+    assert!(report.contains("Hinweis(e)"), "{report}");
+    assert!(fsck.status.success(), "{report}");
+
+    // Zitiert wird nicht: Die Ausgabe von `fsck` landet in CI-Logs, der Wortlaut
+    // eines Hook-Fehlers kann einen Ausschnitt aus dem Rohmaterial tragen.
+    assert!(
+        !report.contains("gibt-es-nicht"),
+        "der Wortlaut darf nicht in den Bericht:\n{report}"
+    );
+}
+
+#[test]
+fn the_pre_push_hook_keeps_its_stderr_out_of_the_push_output() {
+    let Some(repo) = scratch_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Eine eingecheckte Session, damit es überhaupt etwas zu syncen gibt.
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Etwas""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: etwas"]);
+
+    // Ein Remote, das es nicht gibt — der häufigste Sync-Fehler überhaupt.
+    git(dir, &["remote", "add", "kaputt", "/gibt/es/nicht.git"]);
+
+    let hook = run_hook(dir, "pre-push", &["kaputt", "/gibt/es/nicht.git"]);
+
+    // 1. Der Push des Nutzers bleibt unbehelligt: kein Rückgabewert ≠ 0 …
+    assert!(hook.status.success(), "der Hook darf den Push nie anhalten");
+    // … und keine rohe Fehlermeldung mitten im Push-Output. Vor diesem Commit
+    // stand hier „minds sync: …" plus die vier Zeilen, die `git push` selbst
+    // ausgibt — bei jedem Push, für einen Vorgang, den niemand angestoßen hat.
+    assert!(
+        hook.stderr.is_empty(),
+        "stderr muss leer bleiben:\n{}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+
+    // … aber der Fortschritt **überlebt**. Ohne diese Zusage wäre die
+    // Umleitung ein Verschweigen: Ein `println!` → `eprintln!` in `sync.rs`
+    // machte den Push wortlos, und der Test oben bliebe grün, weil `sh` das
+    // stderr ohnehin wegwirft.
+    let visible = String::from_utf8_lossy(&hook.stdout);
+    assert!(
+        visible.contains("Ref(s)"),
+        "der Fortschritt fehlt:\n{visible}"
+    );
+    assert!(
+        visible.contains("minds fsck"),
+        "der Fehlschlag muss sichtbar bleiben und den Weg nennen:\n{visible}"
+    );
+
+    // 2. Verschwunden ist der Fehler deshalb trotzdem nicht.
+    let log = hook_log(dir).expect("der Sync-Fehler steht im Log");
+    assert!(log.contains("sync:"), "{log}");
+
+    // 3. Die mehrzeilige Meldung von `git push` bleibt *ein* Eintrag — sonst
+    //    täuschte sie vier vor.
+    assert_eq!(log.lines().count(), 1, "genau ein Eintrag:\n{log}");
+    assert!(log.contains("\\n"), "die Umbrüche sind entschärft:\n{log}");
 }

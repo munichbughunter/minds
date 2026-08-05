@@ -52,6 +52,7 @@ use minds_git::{CommitId, Repo};
 use minds_store::ContextStore;
 
 use crate::config;
+use crate::hooklog::{self, Source};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -59,10 +60,19 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// post-commit-Hook (siehe Modul-Doku); ohne ihn wird HEAD nachgerüstet, sofern
 /// vorhanden.
 pub fn run(commit: Option<&str>) -> ExitCode {
+    hooklog::guarded(Source::Checkpoint, || checkpoint_or_report(commit))
+}
+
+fn checkpoint_or_report(commit: Option<&str>) -> ExitCode {
     match checkpoint(commit) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("minds checkpoint: {err}");
+            // Zweimal, weil es zwei Leser gibt: Von Hand aufgerufen liest ein
+            // Mensch stderr; aus dem post-commit-Hook liest es niemand, weil
+            // der Hook alles nach `/dev/null` schickt. Ohne die Datei bliebe
+            // genau der Fall stumm, der am längsten unbemerkt bleibt — ein
+            // fail-closed abbrechender Checkpoint checkt nie wieder etwas ein.
+            hooklog::report(Source::Checkpoint, &err.to_string());
             ExitCode::FAILURE
         }
     }
@@ -73,8 +83,13 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
     let repo = Repo::discover(&cwd)?;
     let root = repo_root(&repo);
 
+    // Das Git-Verzeichnis steht hier fest — die Log-Aufrufe weiter unten müssen
+    // es deshalb nicht ein zweites Mal suchen. Das ist nicht nur billiger: Eine
+    // abweichende Suche (`GIT_DIR`, ungewöhnliches Layout) schriebe den Eintrag
+    // sonst in ein anderes Repo als das gerade bearbeitete.
+    let git_dir = repo.git_dir();
     let store = config::load(&root).open(&root)?;
-    let journal = Journal::open(repo.git_dir());
+    let journal = Journal::open(git_dir);
     // Redaction-Policy: der strenge Default, sofern das Repo unter
     // `.minds/redact.json` nichts anderes vorgibt (fail-closed bei Fehlern).
     let pipeline = config::load_redaction(&root)?.pipeline()?;
@@ -86,7 +101,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
             continue;
         }
 
-        match store_one(&key, &events, &root, &pipeline, store.as_ref()) {
+        match store_one(&key, &events, &root, git_dir, &pipeline, store.as_ref()) {
             Ok(id) => {
                 // Erst nach erfolgreicher Ablage verwerfen: Ein Absturz dazwischen
                 // darf Rohdaten nicht verlieren.
@@ -97,7 +112,11 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
             Err(err) => {
                 // Journal bleibt liegen — die Session ist nicht verloren, nur
                 // vertagt. fsck macht sie sichtbar.
-                eprintln!("  {}/{}: übersprungen ({err})", key.agent(), key.local_id());
+                hooklog::report_at(
+                    git_dir,
+                    Source::Checkpoint,
+                    &format!("{}/{} übersprungen: {err}", key.agent(), key.local_id()),
+                );
             }
         }
     }
@@ -143,6 +162,7 @@ fn store_one(
     key: &minds_capture::SessionKey,
     events: &[minds_capture::JournalEvent],
     root: &Path,
+    git_dir: &Path,
     pipeline: &minds_redact::RedactionPipeline,
     store: &dyn ContextStore,
 ) -> Fallible<SessionId> {
@@ -163,7 +183,11 @@ fn store_one(
     // bauen — ein Fehlschlag hier darf den Checkpoint nicht abbrechen und die
     // Session nicht ins Journal zurückwerfen.
     if let Err(err) = store.put_session_branch(&redacted) {
-        eprintln!("  Branch für {} nicht angelegt: {err}", put.id());
+        hooklog::report_at(
+            git_dir,
+            Source::Checkpoint,
+            &format!("Branch für {} nicht angelegt: {err}", put.id()),
+        );
     }
 
     Ok(put.id())
@@ -185,10 +209,13 @@ fn attach_trailers(
     if let Some(expected) = commit {
         let expected: CommitId = expected.parse()?;
         if repo.head()?.commit() != Some(expected) {
-            eprintln!(
-                "  HEAD steht nicht mehr auf {expected}; {} Session(s) gespeichert, aber nicht getrailert",
+            let note = format!(
+                "HEAD steht nicht mehr auf {expected}; {} Session(s) gespeichert, aber nicht getrailert",
                 sessions.len()
             );
+            // Die einzige Spur, die dieser Fall hinterlässt: `fsck` sieht einen
+            // Trailer ohne Session, aber nicht eine Session ohne Trailer.
+            hooklog::report_at(repo.git_dir(), Source::Checkpoint, &note);
             return Ok(None);
         }
     }

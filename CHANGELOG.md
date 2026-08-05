@@ -21,6 +21,30 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- Fehler aus dem **Hook-Pfad** verschwinden nicht mehr. `checkpoint`,
+  `prepare-commit-msg` und `sync` laufen aus Git-Hooks, die ihre Ausgabe wegwerfen —
+  ihre Fehler waren damit unsichtbar, obwohl die Doku ein Log versprach. Der
+  teuerste Fall: Ein Tippfehler in `.minds/redact.json` bricht `checkpoint`
+  *fail-closed* ab, ab da wird nie wieder eine Session eingecheckt, das Journal
+  wächst, und an keiner Stelle steht warum. Jetzt schreiben alle vier Hook-Pfade
+  ihre Fehler nach `<git-dir>/minds/hook.log` — dorthin, wo `minds hook` schon
+  immer geloggt hat. ([#10](https://github.com/munichbughunter/minds/issues/10))
+- Der `pre-push`-Hook kippt seine Fehlermeldungen nicht mehr roh in den
+  Push-Output. Als einziger der drei Hooks leitete er stderr nicht um; ein
+  unerreichbares Remote schrieb damit bei **jedem** Push fünf Zeilen zwischen die
+  Ausgabe von `git push`, für einen Vorgang, den der Nutzer gar nicht angestoßen
+  hat. Der Wortlaut steht jetzt im Log; stdout bleibt unangetastet, dort steht die
+  Erfolgsmeldung. ([#10](https://github.com/munichbughunter/minds/issues/10))
+- Ein **Panic** in `checkpoint`, `prepare-commit-msg` oder `sync` landet im Log,
+  statt mit der weggeworfenen stderr zu verschwinden. `minds hook` hatte diese
+  Klammer schon; für den kalten Pfad fehlte sie, und mit der stderr-Umleitung
+  wäre ein Absturz dort vollständig lautlos gewesen.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+
+  > **Bestehende Installationen brauchen einmal `minds enable`.** Der Rumpf eines
+  > Hooks steht in der Hook-Datei, nicht im Binary — ein Update allein ersetzt ihn
+  > nicht. `minds fsck` sagt jetzt von sich aus, wenn ein Block aus einer älteren
+  > Version stammt, statt ihn als „installiert" durchgehen zu lassen.
 - `minds enable` installiert die Git-Hooks jetzt im **effektiven** Hook-Verzeichnis.
   Repos mit `core.hooksPath` (husky, lefthook, pre-commit, globale Hooks über
   `init.templateDir`) bekamen den Hook bisher nach `.git/hooks` geschrieben — ein
@@ -39,6 +63,51 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- Fremder Text, den `minds` ausgibt oder protokolliert — Pfade aus der
+  Arbeitskopie, `core.hooksPath`, der Wortlaut fremder Fehler —, wird jetzt
+  vollständig entschärft. Bisher galt dafür `char::is_control`, und das ist nur
+  die Unicode-Kategorie `Cc`: **U+2028** (LINE SEPARATOR) und **U+2029**
+  (PARAGRAPH SEPARATOR) fielen durch. Rusts `str::lines` bricht daran nicht,
+  Browser und Pythons `splitlines()` schon — im Job-Log einer GitLab-Pipeline
+  ließ sich damit eine Zeile fälschen, etwa ein `fsck: in Ordnung`. Ebenfalls
+  durchgerutscht sind die unsichtbaren Formatzeichen (`Cf`), darunter die
+  Unicode-Tags `U+E0020`–`U+E007F`. Statt die Liste von Hand zu pflegen, wird
+  jetzt `char::escape_debug` selbst gefragt — es deckt `Cc`, `Cf`, `Zl`, `Zp` und
+  `Zs` ab, ergänzt um die unsichtbaren Variantenselektoren (`U+E0100`–`U+E01EF`
+  & Co.) und die typografischen Anführungszeichen, in die `fsck` seine Pfade
+  klammert. Ein Pfad kann damit weder eine Zeile öffnen, noch die Klammer
+  schließen, noch unsichtbaren Text tragen.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+- **Der Inhalt von `.minds/redact.json` erreicht das Log nicht.** In dieser Datei
+  stehen per Design literale Geheimnisse — `deny_secrets` für den internen
+  Hostnamen, `allow` für Werte, die fälschlich als Secret erkannt werden. Der
+  naheliegendste Tippfehler dort (vergessene Array-Klammern) ist kein Syntax-,
+  sondern ein Datenfehler, und `serde_json` zitiert dabei den Wert: `invalid
+  type: string "glpat-…", expected a sequence`. Solange das auf einer
+  weggeworfenen stderr landete, war es flüchtig; mit dem Log wäre es dauerhaft
+  geworden. Die Meldung nennt jetzt Art, Zeile und Spalte — genug zum Reparieren,
+  nichts zum Mitlesen. ([#10](https://github.com/munichbughunter/minds/issues/10))
+- **Zugangsdaten aus einer Remote-URL erreichen das Log nicht.** `git push`
+  schreibt die URL in seine Fehlermeldung, und in der **Username**-Position
+  redigiert Git ein Token nicht: Aus `https://glpat-…@gitlab.com/…` wurde so
+  `fatal: could not read Password for 'https://glpat-…@gitlab.com'` — und das
+  ging seit dem Log-Eintrag oben auf die Platte, in eine Datei, auf die `fsck`
+  verweist und die man in einen Bug-Report legt. Der Autoritätsteil wird jetzt
+  an der Quelle herausgeschnitten, bevor der Text zu einer Meldung wird; Host
+  und Pfad bleiben stehen, damit die Diagnose brauchbar bleibt.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+- Ein `git`-Kindprozess erbt **keine Trace-Schalter** mehr (`GIT_TRACE`,
+  `GIT_TRACE_CURL`, `GIT_CURL_VERBOSE` …). Mit ihnen protokolliert Git seinen
+  ganzen Verkehr auf stderr — samt `Authorization: Basic …`, und das ist keine
+  URL, die sich herausschneiden ließe. Ein `GIT_TRACE=1` in der Shell des
+  Entwicklers hätte sonst genügt, um ein Token dauerhaft ins Log zu legen. Die
+  Variablen werden **entfernt**, nicht auf `0` gesetzt: `GIT_CURL_VERBOSE` prüft
+  Git auf Existenz, ein `=0` schaltete den Dump also ein.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+- `hook.log` wird nicht durch einen Symlink hindurch beschrieben — weder wenn die
+  Datei selbst einer ist, noch wenn `<git-dir>/minds` es ist. Nach dem Öffnen
+  werden Gerät und Inode des Dateizeigers gegen den Namen geprüft; erst danach
+  werden die Rechte angefasst. ([#10](https://github.com/munichbughunter/minds/issues/10))
 - Beim Schreiben einer **Hook-Datei** folgt `minds enable` keinem Symlink mehr. Seit
   das Hook-Verzeichnis an `core.hooksPath` hängt, kann es in der Arbeitskopie liegen
   und damit **versioniert** sein — ein eingecheckter Symlink `.husky/post-commit →
@@ -69,6 +138,31 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   minds-Block stattdessen im ignorierten `.git/hooks` liegt. Ein Hinweis, kein Befund:
   Der Rückgabewert bleibt 0, denn nicht jedes Repo will Hooks.
   ([#9](https://github.com/munichbughunter/minds/issues/9))
+- `minds fsck` verweist auf `<git-dir>/minds/hook.log`, wenn dort Einträge stehen —
+  mit ihrer Zahl und dem Pfad, aber **ohne den Wortlaut**: Die Ausgabe von `fsck`
+  landet im CI-Log, ein Fehlertext aus dem Hook-Pfad kann einen Ausschnitt aus dem
+  noch nicht redigierten Mitschnitt tragen. Ein Hinweis, kein Befund — ein alter
+  Eintrag darf keine Pipeline anhalten.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+
+  Das Log begrenzt sich selbst: Bei 1 MiB wird auf `hook.log.1` umgeschichtet, mehr
+  als zwei Dateien entstehen nie. Mehrzeilige Fehlermeldungen bleiben *ein* Eintrag
+  (Steuerzeichen werden als Escape-Sequenz geschrieben), und neu angelegt wird die
+  Datei mit `0600`; eine vorhandene mit lockereren Rechten wird beim nächsten
+  Schreiben nachgezogen, und durch einen Symlink hindurch wird nie geschrieben.
+- Der `pre-push`-Hook meldet seinen **Fortschritt** jetzt auf stdout statt auf
+  stderr — sonst hätte die stderr-Umleitung von oben mit den Fehlern auch die
+  Erfolgsmeldungen verschluckt: was geschickt wurde, und vor allem, wie viele
+  fremde Review-Verdicts ein Push übernommen hat. Letzteres wiegt schwer, weil
+  genau dieser Merge den Review-Store füllt, den `minds fsck --require-review`
+  als CI-Gate liest. Scheitert er, steht das jetzt im Log statt nirgendwo.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+- `minds fsck` unterscheidet einen **veralteten** minds-Block von einem heilen: Der
+  Rumpf zwischen den Marken wird gegen den verglichen, den diese Version schreiben
+  würde. Bisher zählte das bloße Vorhandensein der Marke als „installiert" — ein
+  Hook aus einer älteren `minds` sah damit heil aus, obwohl Git ihn ausführt und er
+  nicht mehr tut, was er soll. Der Rat ist `minds enable`; ein Hinweis, kein Befund.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
 
 ## [0.1.0] — 2026-07-29
 

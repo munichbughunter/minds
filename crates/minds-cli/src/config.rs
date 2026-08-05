@@ -84,11 +84,39 @@ pub fn load(repo_root: &Path) -> StoreConfig {
 pub fn load_redaction(repo_root: &Path) -> Result<RedactionConfig, Box<dyn std::error::Error>> {
     let path = repo_root.join(REDACT_CONFIG);
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text)
-            .map_err(|err| format!("{}: ungültige Redaction-Policy: {err}", path.display()))?),
+        Ok(text) => Ok(serde_json::from_str(&text).map_err(|err| policy_error(&path, &err))?),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RedactionConfig::default()),
         Err(err) => Err(format!("{}: nicht lesbar: {err}", path.display()).into()),
     }
+}
+
+/// Die Fehlermeldung zu einer kaputten Policy — **ohne den Wert, an dem sie
+/// scheiterte.**
+///
+/// `serde_json::Error` bettet den Wert wörtlich ein: Aus einem vergessenen
+/// Klammernpaar wird `invalid type: string "glpat-…", expected a sequence`. Und
+/// genau in dieser Datei stehen literale Geheimnisse — `deny_secrets` ist laut
+/// Modul-Doku für „interner Hostname, Projekt-Codename", `allow` für Werte, die
+/// fälschlich als Secret erkannt werden.
+///
+/// Solange das nur auf stderr ging, war es flüchtig. Seit dieser Fehler in
+/// `<git-dir>/minds/hook.log` steht (#10), wäre es dauerhaft: Die Datei wird nie
+/// gelöscht, `minds fsck` verweist aktiv auf sie, und sie ist genau die, die man
+/// in einen Bug-Report legt. Ein Verweis auf Zeile und Spalte sagt dem Nutzer,
+/// wo er nachsehen muss — mehr braucht er nicht, und mehr darf hier nicht stehen.
+fn policy_error(path: &Path, err: &serde_json::Error) -> String {
+    format!(
+        "{}: ungültige Redaction-Policy — {} in Zeile {}, Spalte {}",
+        path.display(),
+        match err.classify() {
+            serde_json::error::Category::Syntax => "Syntaxfehler",
+            serde_json::error::Category::Data => "unerwarteter Wert oder unbekanntes Feld",
+            serde_json::error::Category::Eof => "unerwartetes Dateiende",
+            serde_json::error::Category::Io => "Lesefehler",
+        },
+        err.line(),
+        err.column()
+    )
 }
 
 fn set(repo_root: &Path, key: &str, value: &str) -> std::io::Result<()> {
@@ -221,5 +249,66 @@ mod tests {
         // Kein doppelter Eintrag: `git config --get` ohne `--get-all` faende
         // sonst „mehrere Werte" und schluege fehl.
         assert_eq!(load(dir.path()).reference(), "refs/minds/context");
+    }
+
+    /// Die Fehlermeldung zu einer kaputten Policy darf den Wert nicht zitieren.
+    ///
+    /// Der Weg, der das gefährlich macht: `.minds/redact.json` trägt per Design
+    /// literale Geheimnisse (`deny_secrets`, `allow`), und seit #10 landet der
+    /// Fehler nicht mehr auf einer flüchtigen stderr, sondern in einer Datei,
+    /// auf die `minds fsck` verweist und die man in einen Bug-Report legt.
+    #[test]
+    fn a_policy_error_never_quotes_its_values() {
+        // Der naheliegendste Tippfehler bei dieser Datei: die vergessenen
+        // Array-Klammern. Das ist kein Syntax-, sondern ein *Datenfehler* —
+        // und `serde_json` bettet dabei den Wert in seine Meldung ein.
+        const CASES: &[(&str, &str)] = &[
+            (
+                r#"{"deny_secrets": "glpat-AAAAAAAAAAAAAAAAAAAA"}"#,
+                "glpat-AAAAAAAAAAAAAAAAAAAA",
+            ),
+            (
+                r#"{"allow": "AKIAIOSFODNN7EXAMPLE"}"#,
+                "AKIAIOSFODNN7EXAMPLE",
+            ),
+            (
+                r#"{"secret_keys": "korrekt-pferd-batterie-klammer"}"#,
+                "korrekt-pferd-batterie-klammer",
+            ),
+            (
+                r#"{"high_entropy": {"min_len": "sk-ant-api03-XXXXXXXX"}}"#,
+                "sk-ant-api03-XXXXXXXX",
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".minds")).unwrap();
+
+        for (policy, secret) in CASES {
+            std::fs::write(dir.path().join(REDACT_CONFIG), policy).unwrap();
+            let err = load_redaction(dir.path())
+                .expect_err("eine kaputte Policy bricht ab")
+                .to_string();
+
+            assert!(!err.contains(secret), "Wert in der Meldung:\n{err}");
+            // Brauchbar bleiben muss sie trotzdem — sonst löscht jemand die
+            // Datei, statt sie zu reparieren.
+            assert!(err.contains("Zeile"), "{err}");
+            assert!(err.contains(REDACT_CONFIG), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_valid_policy_still_loads() {
+        // Die Gegenprobe zur Verschärfung oben.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".minds")).unwrap();
+        std::fs::write(
+            dir.path().join(REDACT_CONFIG),
+            r#"{"deny_secrets": ["interner-hostname"]}"#,
+        )
+        .unwrap();
+
+        assert!(load_redaction(dir.path()).is_ok());
     }
 }
