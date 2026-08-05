@@ -16,13 +16,19 @@ use std::process::{Command, Output};
 const MINDS: &str = env!("CARGO_BIN_EXE_minds");
 
 fn git(dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("PATH", path_with_minds())
-        .output()
-        .expect("git läuft")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    cmd.env("PATH", path_with_minds());
+    without_user_config(&mut cmd).output().expect("git läuft")
+}
+
+/// Schneidet die Git-Config des Entwicklers ab: Ein global gesetztes
+/// `core.hooksPath` (husky, lefthook) verschiebt seit #9 auch hier das
+/// Hook-Verzeichnis, `commit.gpgsign` verlangt eine Signatur. Beides machte den
+/// Lauf von der Maschine abhängig. `/dev/null` schaltet die Config-Ebene ab.
+fn without_user_config(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
 }
 
 /// Der `PATH` für Git-Aufrufe: vorneweg das Verzeichnis des Test-Binaries.
@@ -46,11 +52,9 @@ fn path_with_minds() -> std::ffi::OsString {
 }
 
 fn minds(dir: &Path, args: &[&str]) -> Output {
-    Command::new(MINDS)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("minds läuft")
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir).args(args);
+    without_user_config(&mut cmd).output().expect("minds läuft")
 }
 
 fn text(output: &Output) -> String {

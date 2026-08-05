@@ -19,6 +19,57 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Behoben
+
+- `minds enable` installiert die Git-Hooks jetzt im **effektiven** Hook-Verzeichnis.
+  Repos mit `core.hooksPath` (husky, lefthook, pre-commit, globale Hooks über
+  `init.templateDir`) bekamen den Hook bisher nach `.git/hooks` geschrieben — ein
+  Verzeichnis, das Git dort nie liest. `enable` meldete Erfolg, und trotzdem entstand
+  bei keinem Commit ein Checkpoint. Ist das Verzeichnis verschoben, sagt `enable` das
+  auch ohne `-v` — und nennt es anders, wenn es *außerhalb* des Repos liegt, weil ein
+  `enable` dann alle Repositories des Nutzers erfasst.
+  ([#9](https://github.com/munichbughunter/minds/issues/9))
+- `minds enable` bricht ab, statt an einen unbrauchbaren Ort zu schreiben — und zwar
+  **bevor** die erste Datei entsteht, damit kein halb eingerichtetes Repo zurückbleibt.
+  Betroffen sind ein gesetztes, aber leeres `core.hooksPath` (Git führt dann gar keine
+  Hooks aus und meldet das nicht), ein Wert, der auf die Arbeitskopie-Wurzel auflöst
+  (die Hooks lägen als ausführbare Dateien zwischen dem Quellcode), und ein
+  Verzeichnis, in dem sich nicht schreiben lässt. Die Meldung nennt jeweils den Pfad
+  und was zu tun ist. ([#9](https://github.com/munichbughunter/minds/issues/9))
+
+### Sicherheit
+
+- Beim Schreiben einer **Hook-Datei** folgt `minds enable` keinem Symlink mehr. Seit
+  das Hook-Verzeichnis an `core.hooksPath` hängt, kann es in der Arbeitskopie liegen
+  und damit **versioniert** sein — ein eingecheckter Symlink `.husky/post-commit →
+  ~/.aws/credentials` hätte bisher dazu geführt, dass `enable` den minds-Block durch
+  den Link in die private Datei schreibt und sie von `0600` auf `0755` setzt. Jetzt
+  wird ein Symlink an dieser Stelle abgelehnt; geschrieben wird über eine
+  Nachbardatei und `rename` (der Name wird ersetzt, nie durch ihn hindurch
+  geschrieben), die Rechte werden auf dem offenen Dateizeiger gesetzt, und Dateien
+  jenseits jeder Hook-Größe werden gar nicht erst eingelesen. `minds fsck` liest die
+  Hook-Dateien über denselben Weg und meldet einen abgelehnten Hook mit Grund.
+  ([#9](https://github.com/munichbughunter/minds/issues/9))
+
+  *Was das nicht abdeckt, ausdrücklich benannt:* Zeigt das **Verzeichnis** selbst
+  über einen eingecheckten Symlink woandershin, entstehen unsere Hooks dort — und
+  liegt am Ziel schon eine Datei desselben Namens, bekommt sie unseren Block und
+  `0755`. Der Weg dorthin ist eine Frage des *Ortes*, nicht des Links; er wird
+  geschlossen, wenn `enable` vor dem Schreiben außerhalb des Repos zurückfragt
+  ([#64](https://github.com/munichbughunter/minds/issues/64), Details in
+  [#66](https://github.com/munichbughunter/minds/issues/66)). Ebenfalls offen und
+  unverändert gegenüber v0.1.0: Die **Agent-Konfigurationen**
+  (`.claude/settings.json` & Co.) schreibt `enable` ohne diese Prüfung
+  ([#65](https://github.com/munichbughunter/minds/issues/65)).
+
+### Hinzugefügt
+
+- `minds fsck` prüft die Hooks vom effektiven Hook-Verzeichnis aus und meldet, wenn
+  `post-commit` oder `prepare-commit-msg` dort fehlen — samt Hinweis, wenn der
+  minds-Block stattdessen im ignorierten `.git/hooks` liegt. Ein Hinweis, kein Befund:
+  Der Rückgabewert bleibt 0, denn nicht jedes Repo will Hooks.
+  ([#9](https://github.com/munichbughunter/minds/issues/9))
+
 ## [0.1.0] — 2026-07-29
 
 Die erste veröffentlichte Version — und die erste, die über einen Installer

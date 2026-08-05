@@ -28,13 +28,27 @@ fn scratch_repo() -> Option<tempfile::TempDir> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("PATH", path_with_minds())
-        .output()
-        .expect("git läuft")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    cmd.env("PATH", path_with_minds());
+    without_user_config(&mut cmd).output().expect("git läuft")
+}
+
+/// Schneidet die Git-Config des Entwicklers ab.
+///
+/// Ein **global** gesetztes `core.hooksPath` — husky, lefthook, pre-commit —
+/// verschiebt das Hook-Verzeichnis auch in einem frisch angelegten Testrepo.
+/// Seit `enable` diesem Pfad folgt (#9), hinge sonst jede Aussage über
+/// `.git/hooks` an der Maschine, auf der der Test läuft: hier grün, dort rot,
+/// und im schlimmeren Fall grün aus dem falschen Grund. Dasselbe gilt für
+/// `commit.gpgsign` und Konsorten.
+///
+/// `/dev/null` als Config-Datei ist der dokumentierte Weg, eine Config-Ebene
+/// abzuschalten. Die von Git gestarteten Hooks erben die Variablen und rufen
+/// `minds` damit ebenfalls ohne fremde Config auf.
+fn without_user_config(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
 }
 
 /// Der `PATH` für Git-Aufrufe: vorneweg das Verzeichnis des Test-Binaries.
@@ -62,6 +76,7 @@ fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     use std::io::Write;
     let mut cmd = Command::new(MINDS);
     cmd.current_dir(dir).args(args);
+    without_user_config(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -103,6 +118,9 @@ fn the_core_loop_closes() {
     let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
     assert!(enable.status.success(), "{}", stdout(&enable));
     assert!(dir.join(".claude/settings.json").exists());
+    // `.git/hooks` ist hier das effektive Hook-Verzeichnis, weil
+    // `without_user_config` ein globales `core.hooksPath` abschneidet — den
+    // verschobenen Fall prüft `a_moved_hookspath_still_captures_on_commit`.
     assert!(dir.join(".git/hooks/post-commit").exists());
 
     // 2. Eine Session aufzeichnen — Prompt, ein Write-Tool, Stop.
@@ -203,8 +221,11 @@ fn a_session_page_shows_all_changed_files_and_the_store_has_an_index() {
     minds(dir, &["enable", "--agent", "claude-code"], None);
     // Hier soll genau *ein* Checkpoint laufen, und zwar der unten von Hand
     // aufgerufene — der Test misst, was dabei im Store landet. Der Hook würde
-    // schon beim Commit einchecken; wir nehmen ihn deshalb weg.
-    let _ = std::fs::remove_file(dir.join(".git/hooks/post-commit"));
+    // schon beim Commit einchecken; wir nehmen ihn deshalb weg. Das `unwrap`
+    // ist Absicht: Schlüge das Entfernen fehl (weil der Hook woanders liegt),
+    // liefe der Test still an seiner eigenen Voraussetzung vorbei.
+    std::fs::remove_file(dir.join(".git/hooks/post-commit"))
+        .expect("der Hook lag da, wo enable ihn hinschrieb");
 
     // Eine Session, die zwei Dateien anlegt.
     event(
@@ -286,6 +307,191 @@ fn a_session_page_shows_all_changed_files_and_the_store_has_an_index() {
         2,
         "beide Dateien sollen je einen aufklappbaren Diff haben"
     );
+}
+
+/// Die Regression aus #9, Ende zu Ende: In einem Repo mit `core.hooksPath`
+/// (husky, lefthook, pre-commit) schrieb `enable` nach `.git/hooks` — ein
+/// Verzeichnis, das Git dann **nie** liest. `enable` meldete Erfolg, und kein
+/// Commit erzeugte je einen Checkpoint.
+///
+/// Der Test geht deshalb nicht nur nach der Datei, sondern nach der Wirkung:
+/// commit → der post-commit-Hook feuert → die Session liegt im Store.
+#[test]
+fn a_moved_hookspath_still_captures_on_commit() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    git(dir, &["config", "core.hooksPath", ".husky"]);
+
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(enable.status.success(), "{}", stdout(&enable));
+    assert!(
+        dir.join(".husky/post-commit").exists(),
+        "der Hook gehört ins effektive Verzeichnis"
+    );
+    assert!(
+        !dir.join(".git/hooks/post-commit").exists(),
+        "und nicht in das, aus dem Git nichts liest"
+    );
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Schreibe eine Grußfunktion""#,
+    );
+    event(
+        dir,
+        r#""hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"greet.rs"}"#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    std::fs::write(dir.join("greet.rs"), "fn greet() {}\n").unwrap();
+    git(dir, &["add", "greet.rs"]);
+    assert!(
+        git(dir, &["commit", "-q", "-m", "feat: Grußfunktion"])
+            .status
+            .success()
+    );
+
+    // Kein manuelles `checkpoint`: Was hier ankommt, kann nur der Hook getan
+    // haben.
+    let refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        !refs.trim().is_empty(),
+        "der post-commit-Hook hat nichts eingecheckt"
+    );
+
+    let show = minds(dir, &["show"], None);
+    assert!(
+        stdout(&show).contains("Schreibe eine Grußfunktion"),
+        "die Session ist nicht über den Commit auffindbar:\n{}",
+        stdout(&show)
+    );
+}
+
+/// Ein **gesetztes, aber leeres** `core.hooksPath` schaltet die Hooks in Git
+/// ganz ab. `enable` hat dann keinen Ort — und darf sich keinen ausdenken:
+/// `rev-parse --git-path hooks` antwortet in dem Fall `./`, wer dem folgt, legt
+/// ausführbare Dateien in die Arbeitskopie des Nutzers.
+#[test]
+fn an_empty_hookspath_aborts_instead_of_littering_the_worktree() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    git(dir, &["config", "core.hooksPath", ""]);
+
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(
+        !enable.status.success(),
+        "enable darf hier keinen Erfolg melden:\n{}",
+        stdout(&enable)
+    );
+
+    for name in ["post-commit", "prepare-commit-msg", "pre-push"] {
+        assert!(
+            !dir.join(name).exists(),
+            "{name} liegt in der Arbeitskopie statt in einem Hook-Verzeichnis"
+        );
+    }
+    // Fail-closed heißt hier auch: kein halb eingerichtetes Repo.
+    assert!(
+        !dir.join(".claude/settings.json").exists(),
+        "der Abbruch muss vor dem ersten Schreibzugriff kommen"
+    );
+
+    // Und `fsck` sagt dasselbe, statt ein leeres Verzeichnis zu melden.
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(
+        stdout(&fsck).contains("core.hooksPath ist leer"),
+        "fsck benennt den Fall nicht:\n{}",
+        stdout(&fsck)
+    );
+}
+
+/// Die Zusage „nichts halb Eingerichtetes" gilt für **jede** Schranke, nicht nur
+/// für die erste. Hier scheitert der *letzte* Hook der Reihe (`pre-push`) — und
+/// zwar an etwas, das erst beim Schreiben aufgefallen wäre, wenn die Vorprüfung
+/// ihn nicht vorher ansähe. Vor dem Fix blieben `.claude/settings.json` und ein
+/// halber Hook-Satz zurück, ohne Store-Config: Der Agent journalierte, und
+/// nichts checkte je ein.
+#[cfg(unix)]
+#[test]
+fn a_broken_hook_leaves_nothing_behind_at_all() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    git(dir, &["config", "core.hooksPath", ".husky"]);
+
+    let victim = dir.join("opfer.txt");
+    std::fs::write(&victim, "PRIVAT\n").unwrap();
+    std::fs::create_dir_all(dir.join(".husky")).unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join(".husky/pre-push")).unwrap();
+
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(
+        !enable.status.success(),
+        "enable darf hier keinen Erfolg melden:\n{}",
+        stdout(&enable)
+    );
+
+    assert!(
+        !dir.join(".claude/settings.json").exists(),
+        "der Abbruch muss vor der ersten geschriebenen Datei kommen"
+    );
+    for name in ["post-commit", "prepare-commit-msg"] {
+        assert!(
+            !dir.join(".husky").join(name).exists(),
+            "{name} wurde geschrieben, obwohl pre-push nicht geht"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "PRIVAT\n",
+        "die verlinkte Datei bleibt unangetastet"
+    );
+}
+
+/// Dasselbe für ein Hook-Verzeichnis, in das sich nicht schreiben lässt: Auch
+/// dann darf keine Agent-Konfiguration zurückbleiben.
+#[cfg(unix)]
+#[test]
+fn an_unwritable_hooks_directory_leaves_nothing_behind() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let locked = dir.join("gesperrt");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    git(
+        dir,
+        &[
+            "config",
+            "core.hooksPath",
+            &locked.join("hooks").to_string_lossy(),
+        ],
+    );
+
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(!enable.status.success(), "{}", stdout(&enable));
+    assert!(
+        !dir.join(".claude/settings.json").exists(),
+        "der Abbruch muss vor der ersten geschriebenen Datei kommen"
+    );
+
+    // Damit das Tempdir wieder aufräumbar ist.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 #[test]

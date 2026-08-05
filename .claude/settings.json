@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/ci-triade.sh",
+            "timeout": 600
+          }
+        ]
+      }
+    ]
+  }
+}
