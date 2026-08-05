@@ -57,7 +57,7 @@ pub(crate) const BACKGROUND_IMPORT_FLAG: &str = "--__background-import";
 /// `fsck` erkennt an derselben Marke, ob ein Hook von uns stammt.
 pub(crate) const MARK_BEGIN: &str = "# >>> minds >>>";
 /// Ende unseres Blocks.
-const MARK_END: &str = "# <<< minds <<<";
+pub(crate) const MARK_END: &str = "# <<< minds <<<";
 
 /// Was mit einer Datei geschah — für den Bericht an den Nutzer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -610,29 +610,13 @@ fn label_for(root: &Path, path: &Path) -> String {
 /// — ausgerechnet den Hinweis, der bei einem Hook-Verzeichnis außerhalb des
 /// Repos die einzige Warnung ist.
 ///
-/// Neben den Steuerzeichen (`Cc`) sind die **Bidi-Formatzeichen** gemeint: `RLO`
-/// & Co. sind `Cf`, also nicht `is_control`, drehen die Zeile im Terminal aber
-/// optisch um. Auch damit ließe sich der Hinweis unkenntlich machen.
+/// Entschärft wird über [`crate::text::sanitize`] — dieselbe Stelle, durch die
+/// auch die Log-Zeilen gehen. Zwei Fassungen davon wären eine zu viel: Die
+/// Zeichenklassen sind subtil (Bidi-Marken sind `Cf`, also **nicht**
+/// `is_control`, drehen die Zeile im Terminal aber trotzdem um), und die eine,
+/// die man beim Nachbessern vergisst, ist die Lücke.
 pub(crate) fn display_path(path: &Path) -> String {
-    path.display()
-        .to_string()
-        .chars()
-        .flat_map(|c| {
-            if c.is_control() || is_bidi_control(c) {
-                c.escape_debug().collect::<Vec<_>>()
-            } else {
-                vec![c]
-            }
-        })
-        .collect()
-}
-
-/// Die Unicode-Zeichen, die die Leserichtung umstellen.
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
+    crate::text::sanitize_path(&path.display().to_string())
 }
 
 /// Entfernt `.` und löst `..` **textuell** auf.
@@ -1069,7 +1053,19 @@ const PREPARE_MSG_BODY: &str = "minds prepare-commit-msg \"$1\" >/dev/null 2>&1 
 /// `|| true` hält es non-blocking: Ein Sync-Fehler darf den Push des Nutzers nie
 /// verhindern. Beide Backends benutzen denselben Body — welches Repo wohin
 /// gepusht wird, entscheidet `minds sync` anhand der Store-Config.
-const PRE_PUSH_BODY: &str = "minds sync --remote \"$1\" || true";
+///
+/// # Warum stderr hier weggeht
+///
+/// Als einziger der drei Hooks schrieb dieser seine Fehler roh in den
+/// Push-Output — „minds sync: …" mitten zwischen den Zeilen von `git push`, bei
+/// jedem Push, für einen Vorgang, den der Nutzer gar nicht angestoßen hat. Seit
+/// [`crate::hooklog`] geht der Wortlaut in eine Datei, auf die `minds fsck`
+/// verweist; damit ist die Umleitung kein Verschweigen mehr, sondern die
+/// Verlagerung an einen Ort, an dem sie auch morgen noch steht.
+///
+/// **stdout bleibt**: Was `minds sync` dort meldet, ist die Erfolgsmeldung, und
+/// die gehört an den Push, zu dem sie gehört.
+const PRE_PUSH_BODY: &str = "minds sync --remote \"$1\" 2>/dev/null || true";
 
 /// **Die** Liste der Git-Hooks, die `minds` schreibt — samt ihrer Rümpfe.
 ///
@@ -1100,6 +1096,49 @@ fn push_hook() -> (&'static str, &'static str) {
 /// Alle Hook-Namen — für die Vorprüfung und für `fsck`.
 pub(crate) fn hook_names() -> impl Iterator<Item = &'static str> {
     ALL_HOOKS.iter().map(|(name, _)| *name)
+}
+
+/// Der Rumpf, den `minds enable` für diesen Hook schreibt.
+///
+/// `fsck` braucht ihn, um „unser Block liegt da" von „unser Block liegt da,
+/// aber in einer alten Fassung" zu unterscheiden. Ohne diesen Vergleich meldete
+/// `fsck` einen Hook als installiert, dessen Rumpf aus einer Version stammt, die
+/// den Fehler noch hatte — und der Nutzer erführe nie, dass ein `minds enable`
+/// fällig ist.
+pub(crate) fn expected_body(name: &str) -> Option<&'static str> {
+    ALL_HOOKS
+        .iter()
+        .find(|(hook, _)| *hook == name)
+        .map(|(_, body)| *body)
+}
+
+/// Wo unser Block in dieser Datei steht, samt Marken.
+///
+/// `MARK_END` wird **hinter** `MARK_BEGIN` gesucht, nicht global: Eine Datei mit
+/// einem Schlussmarker vor dem Anfang (von Hand zusammengestückelt) ergäbe sonst
+/// eine negative Spanne. `None`, wenn keine vollständige Klammer da ist — ein
+/// angefangener Block ohne Ende ist keiner, den wir wiedererkennen.
+///
+/// Eine Quelle für beide Leser: [`block_body`] entnimmt hier den Rumpf,
+/// [`replace_block`] ersetzt genau diese Spanne. Zwei Auffassungen davon, was
+/// „unser Block" ist, hießen: `fsck` meldet etwas, das `enable` nicht repariert.
+fn block_span(text: &str) -> Option<std::ops::Range<usize>> {
+    let start = text.find(MARK_BEGIN)?;
+    let end = text[start..].find(MARK_END)? + start + MARK_END.len();
+    Some(start..end)
+}
+
+/// Was zwischen [`MARK_BEGIN`] und [`MARK_END`] steht, ohne die Marken.
+///
+/// Zeilenenden werden abgeschnitten — auch `\r`. Sonst gälte eine Hook-Datei
+/// mit CRLF (Windows-Editor, `core.autocrlf`, ein `.gitattributes` mit
+/// `eol=crlf` auf dem `.husky`-Verzeichnis aus #9) **dauerhaft** als veraltet,
+/// auch direkt nach `minds enable` — und ein Hinweis, den man nicht loswerden
+/// kann, wird überlesen, mitsamt den echten daneben.
+pub(crate) fn block_body(text: &str) -> Option<&str> {
+    let span = block_span(text)?;
+    let inner = &text[span.start + MARK_BEGIN.len()..span.end - MARK_END.len()];
+    Some(inner.trim_matches(|c| c == '\n' || c == '\r'))
 }
 
 /// Fügt einen markierten Block in einen Git-Hook ein oder aktualisiert ihn.
@@ -1259,12 +1298,11 @@ fn with_path(path: &Path, err: std::io::Error) -> std::io::Error {
 /// Ersetzt einen vorhandenen minds-Block durch `block` oder hängt ihn an. Eine
 /// leere Datei bekommt zusätzlich den Shebang.
 fn replace_block(current: &str, block: &str) -> String {
-    if let (Some(start), Some(end)) = (current.find(MARK_BEGIN), current.find(MARK_END)) {
-        let end = end + MARK_END.len();
+    if let Some(span) = block_span(current) {
         let mut out = String::with_capacity(current.len());
-        out.push_str(&current[..start]);
+        out.push_str(&current[..span.start]);
         out.push_str(block);
-        out.push_str(&current[end..]);
+        out.push_str(&current[span.end..]);
         return out;
     }
 
@@ -1993,6 +2031,86 @@ mod tests {
         assert!(PRE_PUSH_BODY.contains("|| true"));
         // Das Remote, an das gerade gepusht wird, muss durchgereicht werden.
         assert!(PRE_PUSH_BODY.contains("\"$1\""));
+    }
+
+    #[test]
+    fn what_enable_writes_is_what_fsck_recognizes() {
+        // Die Brücke zwischen den beiden Kommandos, und der Test, ohne den die
+        // ganze `Outdated`-Erkennung wertlos wäre: Er geht über den
+        // *Produktionspfad* (`enable_git_hook` → Datei → `block_body`), statt
+        // das Blockformat im Test ein zweites Mal nachzubauen.
+        //
+        // Ohne ihn bliebe eine Änderung am Format (eine Kommentarzeile im Block,
+        // ein anderer Marker) grün — und `fsck` meldete danach in **jedem**
+        // frisch eingerichteten Repo „stammt aus einer älteren minds-Version".
+        // Falsch-rot ist hier schlimmer als der Fehler, den die Erkennung behebt.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks");
+
+        for name in hook_names() {
+            let body = expected_body(name).expect("jeder Name hat einen Rumpf");
+            enable_git_hook(&hooks, name, body).unwrap();
+
+            let written = fs::read_to_string(hooks.join(name)).unwrap();
+            assert_eq!(block_body(&written), Some(body), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_block_with_crlf_line_endings_is_still_recognized() {
+        // Seit #9 kann die Hook-Datei in der Arbeitskopie liegen — und dort
+        // schreibt ein `.gitattributes` mit `eol=crlf` sie bei jedem Checkout
+        // um. Der Block ist derselbe, nur die Zeilenenden sind es nicht.
+        let body = expected_body("pre-push").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = dir.path().join("hooks");
+        enable_git_hook(&hooks, "pre-push", body).unwrap();
+
+        let written = fs::read_to_string(hooks.join("pre-push")).unwrap();
+        let crlf = written.replace('\n', "\r\n");
+        assert_eq!(block_body(&crlf), Some(body));
+    }
+
+    #[test]
+    fn a_stray_end_marker_before_the_block_does_not_confuse_the_span() {
+        // Von Hand zusammengestückelt: Der Schlussmarker steht *vor* dem
+        // Anfang. Global gesucht ergäbe das eine Spanne, die rückwärts läuft.
+        let body = expected_body("post-commit").unwrap();
+        let text = format!("{MARK_END}\nfremd\n{MARK_BEGIN}\n{body}\n{MARK_END}\n");
+        assert_eq!(block_body(&text), Some(body));
+
+        // Und `replace_block` fasst dieselbe Spanne an — sonst meldete `fsck`
+        // etwas, das `enable` nicht repariert.
+        let replaced = replace_block(&text, &format!("{MARK_BEGIN}\nneu\n{MARK_END}"));
+        assert_eq!(block_body(&replaced), Some("neu"));
+        assert!(replaced.contains("fremd"), "Fremdes bleibt: {replaced}");
+    }
+
+    #[test]
+    fn the_pre_push_hook_redirects_its_stderr_but_keeps_stdout() {
+        // stderr geht weg, weil sie sonst roh im Push-Output landet — der
+        // Wortlaut steht seit #10 in `<git-dir>/minds/hook.log`.
+        assert!(
+            PRE_PUSH_BODY.contains("2>/dev/null"),
+            "stderr gehört ins Log, nicht in den Push-Output: {PRE_PUSH_BODY}"
+        );
+        // stdout bleibt: Dort steht die Erfolgsmeldung, und die gehört zu dem
+        // Push, bei dem sie entsteht. `>/dev/null` wäre hier ein Verlust.
+        assert!(
+            !PRE_PUSH_BODY.contains(">/dev/null 2>&1") && !PRE_PUSH_BODY.contains("1>/dev/null"),
+            "stdout darf nicht mit umgeleitet werden: {PRE_PUSH_BODY}"
+        );
+    }
+
+    #[test]
+    fn the_commit_hooks_discard_their_output_because_the_log_carries_it() {
+        // Die Umkehrung: Diese beiden dürfen still sein — sie schreiben in
+        // dieselbe Datei. Fiele die Umleitung weg, redete der Rekorder in jeden
+        // Commit hinein; fiele das Log weg, wäre die Umleitung ein Verschweigen.
+        for body in [POST_COMMIT_BODY, PREPARE_MSG_BODY] {
+            assert!(body.contains(">/dev/null 2>&1"), "{body}");
+            assert!(body.contains("|| true"), "{body}");
+        }
     }
 
     #[test]

@@ -29,8 +29,21 @@
 //! Security-Keys brauchen genau das. Ein Sync, der im Hintergrund still an der
 //! Authentifizierung scheitert, ist schlimmer als einer, der zwei Sekunden
 //! braucht und es sagt. Deshalb läuft der Push im Vordergrund, meldet seinen
-//! Fortschritt auf stderr (Git zeigt die Ausgabe des Hooks) — und tut in dem
+//! Fortschritt auf **stdout** (Git zeigt die Ausgabe des Hooks) — und tut in dem
 //! häufigen Fall, dass nichts neu ist, gar nichts.
+//!
+//! # Welche Meldung auf welchen Kanal geht
+//!
+//! Der `pre-push`-Hook wirft stderr weg, weil dort sonst rohe Git-Fehler
+//! zwischen den Zeilen von `git push` stünden (#10). Damit wird die Wahl des
+//! Kanals zur Entscheidung darüber, was der Nutzer beim Push noch sieht:
+//!
+//! - **stdout** — Fortschritt und Ergebnis: was geschickt wurde, wie viele
+//!   fremde Verdicts übernommen wurden. Das gehört zu dem Push, bei dem es
+//!   entsteht, und ist keine Fehlermeldung.
+//! - **stderr + [`crate::hooklog`]** — jeder Fehlschlag. Im Terminal für den,
+//!   der `minds sync` von Hand aufruft; in der Datei für den, dessen Hook ihn
+//!   gerade verschluckt hat.
 //!
 //! # Die Tracking-Refs
 //!
@@ -57,6 +70,7 @@ use minds_git::{MINDS_REF_NAMESPACE, Repo};
 use minds_store::{Backend, DEFAULT_REVIEW_REF, ReviewStore};
 
 use crate::config;
+use crate::hooklog::{self, Source};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -86,10 +100,19 @@ pub fn run(remote: Option<&str>, verbose: bool) -> ExitCode {
     if std::env::var_os(GUARD_ENV).is_some() {
         return ExitCode::SUCCESS;
     }
-    match sync(remote.unwrap_or(DEFAULT_REMOTE), verbose) {
+    hooklog::guarded(Source::Sync, || {
+        sync_or_report(remote.unwrap_or(DEFAULT_REMOTE), verbose)
+    })
+}
+
+fn sync_or_report(remote: &str, verbose: bool) -> ExitCode {
+    match sync(remote, verbose) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("minds sync: {err}");
+            // Seit der pre-push-Hook stderr nach `/dev/null` schickt (statt sie
+            // roh in den Push-Output zu kippen), ist die Datei hier der einzige
+            // Ort, an dem ein gescheiterter Sync noch auftaucht.
+            hooklog::report(Source::Sync, &err.to_string());
             ExitCode::FAILURE
         }
     }
@@ -109,7 +132,7 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
     // Was ein `git fetch` an fremden Verdicts mitgebracht hat, liegt im
     // Tracking-Namensraum und wird hier vereinigt — lokal, ohne Netz, idempotent.
     // Erst danach steht fest, was zu pushen ist.
-    merge_incoming(&root, remote, verbose);
+    merge_incoming(&root, &git_dir, remote, verbose);
 
     let jobs = plan(&root, &repo, remote)?;
     if jobs.iter().all(|job| job.updates.is_empty()) {
@@ -133,7 +156,29 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
         if let Err(err) = job.execute(verbose) {
             // Fail-soft: Der Push des Nutzers läuft weiter, die Refs bleiben
             // ungetrackt und werden beim nächsten Mal erneut angeboten.
-            eprintln!("minds: Kontext-Sync ({}) nicht möglich: {err}", job.label);
+            //
+            // Und genau deshalb muss es hier ins Log: Das ist der *häufige*
+            // Sync-Fehler — kein Zugriff aufs Remote —, und weil er fail-soft
+            // behandelt wird, endet `minds sync` trotzdem mit 0. Über den
+            // Rückgabewert erfährt ihn niemand, über den pre-push-Hook seit der
+            // stderr-Umleitung auch nicht.
+            let note = format!(
+                "Kontext-Sync ({}) nicht möglich: {err}",
+                display(&job.label)
+            );
+            hooklog::report_at(&git_dir, Source::Sync, &note);
+            // Und eine Zeile auf dem Kanal, der den Hook überlebt — ohne
+            // Wortlaut, aber mit dem Weg dorthin. Sonst wäre der Unterschied
+            // zwischen „fertig" und „gescheitert" für den Nutzer beim Push nur
+            // die *Abwesenheit* eines Wortes, und das sieht niemand. Hier
+            // gebündelt statt an jedem Rückweg in `execute`/`reconcile`.
+            // Über denselben panikfreien Weg wie die Fortschrittszeile: Ein
+            // geschlossenes stdout (`git push … | head`) ließe `println!`
+            // panicken, `guarded` schriebe daraufhin einen Panic-Eintrag — ein
+            // `fsck`-Hinweis aus einer völlig harmlosen Bedingung.
+            ProgressLine::write(
+                "minds: Kontext-Sync nicht möglich — `minds fsck` sagt, wo der Grund steht\n",
+            );
         }
     }
     Ok(())
@@ -187,7 +232,18 @@ struct Job {
 /// [`ReviewStore::merge_from`]). Damit konvergieren zwei Maschinen ohne
 /// Zutun: fetch bringt es her, sync führt es zusammen, der nächste Push
 /// schickt den vereinigten Stand zurück.
-fn merge_incoming(root: &Path, remote: &str, verbose: bool) {
+fn merge_incoming(root: &Path, git_dir: &Path, remote: &str, verbose: bool) {
+    // Nur für ein *benanntes* Remote. Git ruft den pre-push-Hook mit `$1 =
+    // <ort>` auf, wenn jemand `git push <url>` schreibt — dann baute
+    // `tracking_prefix` daraus `refs/minds/remotes/https://…/reviews`, und das
+    // ist kein gültiger Ref-Name. `merge_from` scheiterte, und seit der Fehler
+    // ins Log geht, entstünde bei *jedem* solchen Push ein Eintrag: ein
+    // `fsck`-Hinweis, den man nur durch Löschen loswird und der sofort
+    // wiederkommt. Genau das Rauschen, gegen das `log_report_lines` argumentiert.
+    if !has_remote(root, remote) {
+        vln(verbose, "minds sync: kein benanntes Remote — kein Merge");
+        return;
+    }
     let incoming = format!("{}reviews", tracking_prefix(remote));
     let merged = Repo::open(root)
         .map_err(|err| err.to_string())
@@ -198,8 +254,20 @@ fn merge_incoming(root: &Path, remote: &str, verbose: bool) {
         });
     match merged {
         Ok(0) => {}
-        Ok(count) => eprintln!("minds: {count} fremde(s) Verdict(s) übernommen"),
-        Err(err) => vln(verbose, &format!("minds sync: Merge übersprungen: {err}")),
+        Ok(count) => {
+            ProgressLine::write(&format!("minds: {count} fremde(s) Verdict(s) übernommen\n"))
+        }
+        Err(err) => {
+            // Nicht nur `vln`: Ein fehlender Tracking-Ref ist hier **kein**
+            // Fehler ([`ReviewStore::merge_from`] gibt dafür `Ok(0)` zurück),
+            // ein `Err` also immer einer. Und er wiegt schwer — dieser Merge
+            // füllt den Review-Store, den `fsck --require-review` als CI-Gate
+            // liest. Bliebe er beim Push still liegen, prüfte das Gate gegen
+            // einen Stand, dem fremde Verdicts fehlen.
+            let note = crate::text::without_url_credentials(&format!("Merge übersprungen: {err}"));
+            vln(verbose, &format!("minds sync: {note}"));
+            hooklog::log_at(git_dir, Source::Sync, &note);
+        }
     }
 }
 
@@ -322,22 +390,33 @@ fn tracking_ref(remote: &str, local: &str) -> String {
 
 impl Job {
     fn execute(&self, verbose: bool) -> Fallible<()> {
-        // Fortschritt auf stderr: Git zeigt die Ausgabe des Hooks. Ein Push,
-        // der zehn Sekunden schweigt, sieht aus wie ein hängender Push.
-        eprint!(
+        // Fortschritt auf **stdout**: Git zeigt die Ausgabe des Hooks, und ein
+        // Push, der zehn Sekunden schweigt, sieht aus wie ein hängender Push.
+        //
+        // Warum nicht stderr, wo das früher stand: Seit der pre-push-Hook seine
+        // stderr wegwirft (siehe `enable::PRE_PUSH_BODY`), verschwände diese
+        // Zeile mit den Fehlern zusammen — und mit ihr der einzige Hinweis
+        // darauf, dass minds beim Push überhaupt eine Verbindung aufbaut. Ein
+        // Fortschritt ist keine Fehlermeldung; er gehört ohnehin hierher.
+        let line = ProgressLine::start(&format!(
             "minds: {} Ref(s) → {} …",
             self.updates.len(),
-            display(&self.label)
-        );
+            // Auch hier entschärft: Das Label kommt aus `.git/config` bzw.
+            // `minds.childPath`, und ein `\e[2K\e[A` darin überschriebe die
+            // Zeile, die `git push` gerade ausgegeben hat.
+            crate::text::sanitize_path(display(&self.label))
+        ));
 
         match self.push(&self.updates) {
             Ok(()) => {
-                eprintln!(" fertig");
+                line.finish(" fertig");
                 self.record(&self.updates, verbose);
                 Ok(())
             }
             Err(err) => {
-                eprintln!();
+                // Die Zeile schließt sich beim Verlassen selbst; hier endet sie
+                // bewusst ohne Wort, weil der Aufrufer den Satz zu Ende bringt.
+                drop(line);
                 // Divergenz ist der eine Fehler, aus dem wir uns selbst
                 // befreien können — aber nur dort, wo der Inhalt vereinigbar
                 // ist. Für alles andere gilt: melden, nichts überschreiben.
@@ -364,7 +443,8 @@ impl Job {
                 .map(|update| format!("{}:{}", update.oid, update.destination)),
         );
 
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        let output = quiet_trace(&mut command)
             .arg("-C")
             .arg(&self.dir)
             .args(&args)
@@ -378,11 +458,18 @@ impl Job {
         if output.status.success() {
             return Ok(());
         }
-        Err(format!(
+        // Zugangsdaten raus, **hier** und nicht bei der Ausgabe: Git schreibt
+        // die Remote-URL in seine Fehlermeldung, und steht darin ein Token
+        // (`https://glpat-…@gitlab.com/…`, die Username-Position redigiert Git
+        // selbst nicht), trüge es jeder Weg weiter, der diesen Fehler anfasst —
+        // stderr, `hook.log`, und mit der Datei ein Bug-Report. An der Senke zu
+        // filtern hieße, es an jeder Senke einzeln zu tun und die nächste zu
+        // vergessen.
+        Err(crate::text::without_url_credentials(&format!(
             "{}{}",
             String::from_utf8_lossy(&output.stderr).trim(),
             String::from_utf8_lossy(&output.stdout).trim()
-        )
+        ))
         .into())
     }
 
@@ -426,9 +513,13 @@ impl Job {
             return Err("Remote ist weiter als wir — bitte `git fetch` und erneut pushen".into());
         };
 
-        eprint!("minds: Review-Log divergiert, vereinige …");
+        let line = ProgressLine::start("minds: Review-Log divergiert, vereinige …");
         let incoming = format!("{}incoming", tracking_prefix(&self.remote));
-        let fetched = Command::new("git")
+        // `output()` statt `status()`: Sonst erbte das Kind unsere stderr, und
+        // die wirft der pre-push-Hook seit #10 weg — der Grund des Fehlschlags
+        // wäre dann nirgends. So steht er in der Meldung und damit im Log.
+        let mut command = Command::new("git");
+        let fetched = quiet_trace(&mut command)
             .arg("-C")
             .arg(&self.dir)
             .args([
@@ -439,10 +530,13 @@ impl Job {
             ])
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(GUARD_ENV, "1")
-            .status()?;
-        if !fetched.success() {
-            eprintln!();
-            return Err("fremder Review-Stand nicht abrufbar".into());
+            .output()?;
+        if !fetched.status.success() {
+            return Err(crate::text::without_url_credentials(&format!(
+                "fremder Review-Stand nicht abrufbar: {}",
+                String::from_utf8_lossy(&fetched.stderr).trim()
+            ))
+            .into());
         }
 
         let repo = Repo::open(&self.dir)?;
@@ -452,7 +546,6 @@ impl Job {
         // veraltet, also neu nachsehen.
         let repo = Repo::open(&self.dir)?;
         let Some(commit) = repo.commit_at(DEFAULT_REVIEW_REF)? else {
-            eprintln!();
             return Err("Review-Ref ist nach dem Merge verschwunden".into());
         };
         let retry = vec![Update {
@@ -462,7 +555,7 @@ impl Job {
             tracking: review.tracking.clone(),
         }];
         self.push(&retry)?;
-        eprintln!(" {merged} übernommen, fertig");
+        line.finish(&format!(" {merged} übernommen, fertig"));
         self.record(&retry, verbose);
         Ok(())
     }
@@ -570,6 +663,89 @@ fn display(label: &str) -> &str {
         "Remote"
     } else {
         label
+    }
+}
+
+/// Nimmt dem `git`-Kindprozess die Trace-Schalter aus der Umgebung.
+///
+/// `GIT_TRACE` & Co. lassen Git seinen gesamten Verkehr auf stderr
+/// protokollieren — samt `Authorization: Basic …`, und das ist keine URL, die
+/// [`crate::text::without_url_credentials`] fassen könnte. Seit dieses stderr
+/// eingefangen und in eine Datei geschrieben wird (#10), genügte ein gesetztes
+/// `GIT_TRACE` in der Umgebung des Entwicklers, um ein Token dauerhaft auf die
+/// Platte zu legen.
+///
+/// **`env_remove`, nicht `env(…, "0")`.** Das ist der Unterschied, an dem der
+/// erste Versuch scheiterte: `GIT_CURL_VERBOSE` prüft Git auf *Existenz*, nicht
+/// auf den Wert — ein `=0` schaltet den Dump also **ein** statt aus (verifiziert
+/// mit Git 2.51). Nur `GIT_TRACE_REDACT` wird gesetzt: Es ist wertbasiert, `1`
+/// ist der Default, und so schlägt ein `0` von außen nicht durch.
+fn quiet_trace(cmd: &mut Command) -> &mut Command {
+    for key in [
+        "GIT_TRACE",
+        "GIT_TRACE2",
+        "GIT_TRACE2_EVENT",
+        "GIT_TRACE2_PERF",
+        "GIT_TRACE_CURL",
+        "GIT_TRACE_PACKET",
+        "GIT_CURL_VERBOSE",
+    ] {
+        cmd.env_remove(key);
+    }
+    cmd.env("GIT_TRACE_REDACT", "1")
+}
+
+/// Eine angefangene Fortschrittszeile, die sich beim Verlassen selbst schließt.
+///
+/// Zwei Dinge stecken darin, die einzeln leicht danebengehen:
+///
+/// **Der `flush`.** stdout ist am Terminal zeilengepuffert; ein `print!` ohne
+/// Umbruch stünde erst da, wenn der Push längst durch ist — also genau dann
+/// nicht, wenn er gebraucht wird. stderr brauchte das nicht, weil es
+/// ungepuffert ist; beim Umzug nach stdout kommt es dazu.
+///
+/// **Das `Drop`.** Zwischen Anfang und Ende der Zeile liegen mehrere `?`. Bliebe
+/// die Zeile bei einem davon offen, klebte die nächste Ausgabe daran — im
+/// pre-push-Hook ist das die von `git push` selbst, und der Nutzer läse einen
+/// Satz, den nie jemand beendet hat. Ein Zeilenende gehört nicht an jeden
+/// Rückweg einzeln, sondern an genau eine Stelle.
+struct ProgressLine {
+    open: bool,
+}
+
+impl ProgressLine {
+    fn start(line: &str) -> Self {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = write!(out, "{line}");
+        let _ = out.flush();
+        Self { open: true }
+    }
+
+    /// Beendet die Zeile mit ihrem Schlusswort.
+    fn finish(mut self, tail: &str) {
+        // Das Flag **vor** der Ausgabe: Bricht das Schreiben weg (`git push |
+        // head` schließt stdout), liefe sonst `Drop` im Unwind, sähe `open`
+        // noch gesetzt und panickte erneut — ein zweiter Panic während des
+        // Aufräumens ist ein `abort`, und dann käme `hooklog::guarded` nie zum
+        // Zug.
+        self.open = false;
+        Self::write(&format!("{tail}\n"));
+    }
+
+    /// Schreibt, ohne bei einem Schreibfehler zu panicken — anders als
+    /// `println!`, das genau das tut.
+    fn write(text: &str) {
+        use std::io::Write;
+        let _ = std::io::stdout().write_all(text.as_bytes());
+    }
+}
+
+impl Drop for ProgressLine {
+    fn drop(&mut self) {
+        if self.open {
+            Self::write("\n");
+        }
     }
 }
 

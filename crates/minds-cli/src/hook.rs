@@ -19,7 +19,7 @@
 //! **2. Kein Byte auf stdout.** Mehrere Agents deuten stdout des Hooks als
 //! Steuerkanal (JSON-Entscheidungen, injizierter Kontext). Was wir dort
 //! ausgäben, würde als Anweisung gelesen. Diagnose geht in eine Datei, nicht
-//! auf einen Kanal, der jemandem gehört.
+//! auf einen Kanal, der jemandem gehört — siehe [`crate::hooklog`].
 //!
 //! **3. Nichts Teures.** Kein Repository öffnen, keine Konfiguration lesen, kein
 //! Transkript parsen, keine Redaction. Der Hook sucht ein Verzeichnis, schreibt
@@ -36,11 +36,13 @@
 //! JSON-Neubau — billig genug für den heißen Pfad und die einzige Stelle, an
 //! der Weglassen wichtiger ist als Geschwindigkeit.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use minds_capture::{Journal, clock, hook_event, secretwall};
+
+use crate::hooklog::{self, Source};
 
 /// Obergrenze für stdin. Ein `PostToolUse`-Payload trägt das Tool-Ergebnis mit
 /// und kann groß sein; unbegrenzt zu lesen hieße, dass ein einzelnes `cat`
@@ -64,13 +66,13 @@ pub fn run(agent: Option<&str>, event_override: Option<&str>) -> ExitCode {
     // Nutzers nicht beenden.
     let outcome = std::panic::catch_unwind(|| match agent {
         Some(agent) => record(agent, event_override),
-        None => Err("minds hook ohne --agent aufgerufen".into()),
+        None => Err("ohne --agent aufgerufen".into()),
     });
 
     match outcome {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => log(&format!("{err:#}")),
-        Err(_) => log("Panic im Hook — Event verworfen"),
+        Ok(Err(err)) => hooklog::log(Source::Hook, &format!("{err:#}")),
+        Err(_) => hooklog::log(Source::Hook, "Panic im Hook — Event verworfen"),
     }
 
     ExitCode::SUCCESS
@@ -98,31 +100,4 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
 
     Journal::discover(&start)?.append(&parsed.key, parsed.event)?;
     Ok(())
-}
-
-/// Diagnose — best effort, in eine Datei, nie auf stdout oder stderr.
-///
-/// Schlägt auch das Loggen fehl, ist Schweigen die einzig verbleibende Option.
-/// Ein Rekorder, der lauter wird, je kaputter er ist, macht die Sitzung
-/// unbenutzbar.
-fn log(message: &str) {
-    let Ok(dir) = std::env::current_dir() else {
-        return;
-    };
-    let Ok(journal) = Journal::discover(&dir) else {
-        return;
-    };
-    let Some(base) = journal.root().parent() else {
-        return;
-    };
-    let _ = std::fs::create_dir_all(base);
-
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(base.join("hook.log"))
-    {
-        let (at, _) = clock::now();
-        let _ = writeln!(f, "{at} {message}");
-    }
 }

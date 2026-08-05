@@ -193,6 +193,13 @@ merkst dann nichts: Committen geht weiter, nur aufgezeichnet wird nichts, und `m
 show` bliebe leer. Gibt `command -v minds` nichts aus, ergänze in `~/.zshrc` oder
 `~/.bashrc` `export PATH="$HOME/.local/bin:$PATH"` und öffne die Shell neu.
 
+**Wenn doch mal nichts ankommt:** Alles, was die Hooks zu melden hatten, steht in
+`.git/minds/hook.log` — ein Tippfehler in `.minds/redact.json` etwa bricht die
+Erfassung *fail-closed* ab, und ohne die Datei bliebe das unsichtbar. `minds fsck`
+sagt dir, ob dort etwas steht, und nennt gleich mit, ob die Hooks am richtigen Ort
+liegen und ob sie noch aus einer älteren Version stammen (dann hilft ein erneutes
+`minds enable`).
+
 `minds enable` ist idempotent und lässt fremde Konfiguration in Ruhe. Willst du es
 wieder los, sag Bescheid — es sind ein paar Einträge in `.claude/settings.json` und
 `.git/config`, mehr nicht.

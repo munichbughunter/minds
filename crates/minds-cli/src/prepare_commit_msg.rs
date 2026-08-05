@@ -20,6 +20,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use minds_core::{ChangeId, Trailer};
 
+use crate::hooklog::{self, Source};
+
 /// Führt `minds prepare-commit-msg` aus. `file` ist die Message-Datei (`$1`).
 pub fn run(file: Option<&str>) -> ExitCode {
     // Ohne Datei nichts tun — der Hook reicht sie immer herein. Wie der ganze
@@ -27,10 +29,18 @@ pub fn run(file: Option<&str>) -> ExitCode {
     let Some(file) = file else {
         return ExitCode::SUCCESS;
     };
+    hooklog::guarded(Source::PrepareCommitMsg, || prepare_or_report(file))
+}
+
+fn prepare_or_report(file: &str) -> ExitCode {
     match prepare(file) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("minds prepare-commit-msg: {err}");
+            // Auch hier zwei Leser: der Mensch auf stderr, der Hook-Pfad in der
+            // Datei. Ohne Change-Id verliert eine Änderung ihre Identität über
+            // Rebase und Cherry-Pick hinweg — ein Verlust, den man erst Wochen
+            // später bemerkt, wenn `minds why` nichts mehr findet.
+            hooklog::report(Source::PrepareCommitMsg, &err.to_string());
             ExitCode::FAILURE
         }
     }

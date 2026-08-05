@@ -3,7 +3,7 @@
 //! Der heiße Pfad ist fail-open: `minds hook` darf ein Event verlieren, statt
 //! die Sitzung zu stören. Der Preis dafür sind mögliche Lücken — und Lücken, die
 //! niemand sieht, sind schlimmer als keine. `fsck` macht sie sichtbar. Es prüft
-//! zwei Zusagen:
+//! vier Zusagen:
 //!
 //! 1. **Jeder Trailer ist auflösbar.** Zu jeder `Minds-Session-Id` in der
 //!    Historie muss die Session im Store liegen. Ein Trailer, der ins Leere
@@ -17,6 +17,10 @@
 //!    (husky, lefthook) führt `.git/hooks` nie aus; ein Hook, der dort liegt,
 //!    ist kein Hook. Auch das ist eine Warnung — nicht jedes Repo *will*
 //!    Hooks —, aber eine, die den stillsten Ausfall des Produkts benennt.
+//! 4. **Was der Hook-Pfad zu melden hatte, ist nicht verloren.** Die Hooks
+//!    werfen ihre Ausgabe weg; ihre Fehler stehen deshalb in
+//!    `<git-dir>/minds/hook.log`. `fsck` sagt, dass dort etwas steht und wo —
+//!    den Wortlaut nicht, siehe [`log_report_lines`].
 //!
 //! Ehrlich lückenhaft schlägt still vollständig — diese Datei ist die Einlösung
 //! dieses Satzes aus dem ganzen Entwurf.
@@ -32,6 +36,7 @@ use minds_store::ReviewStore;
 
 use crate::config;
 use crate::enable::NoHooksDir;
+use crate::hooklog;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -60,7 +65,8 @@ fn fsck(require_review: bool) -> Fallible<bool> {
     let orphans = check_trailers(&repo, store.as_ref())?;
     let index_orphans = check_index(store.as_ref())?;
     check_journal(&repo);
-    let hints = report_hooks(&root, &hook_state(&root, repo.git_dir()));
+    let hints =
+        report_hooks(&root, &hook_state(&root, repo.git_dir())) + report_log(&root, repo.git_dir());
 
     let mut total = orphans + index_orphans;
     if require_review {
@@ -279,6 +285,11 @@ enum HookState {
         hooks_dir: PathBuf,
         /// Hooks aus [`REQUIRED_HOOKS`], die dort keinen minds-Block tragen.
         missing: Vec<&'static str>,
+        /// Hooks, deren minds-Block aus einer älteren Version stammt. Getrennt
+        /// von `missing`, weil hier etwas da ist und trotzdem nicht das, was
+        /// diese Version schreibt — der Rat (`minds enable`) ist derselbe, der
+        /// Satz muss ein anderer sein.
+        outdated: Vec<&'static str>,
         /// Hooks, die keine sind: Symlink, Verzeichnis, zu groß, kein Text.
         /// Getrennt von `missing`, weil der Rat ein anderer ist — `minds enable`
         /// würde diese Datei nicht anlegen, sondern ablehnen.
@@ -301,10 +312,16 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
     // lässt `enable` abbrechen, und ein `fsck`, das im selben Repo „in Ordnung"
     // meldet, ist genau die Divergenz, um die es in #9 geht.
     let mut missing = Vec::new();
+    let mut outdated = Vec::new();
     let mut refused = Vec::new();
     for name in crate::enable::hook_names() {
-        match inspect_hook(&hooks_dir.join(name)) {
+        match inspect_hook(name, &hooks_dir.join(name)) {
             Hook::Installed => {}
+            // Ein veralteter Block wird für **alle** Hooks gemeldet, nicht nur
+            // für die aus `REQUIRED_HOOKS`: Der Fall, der ihn eingeführt hat,
+            // ist `pre-push` — dessen Fehlen kostet nichts, dessen alter Rumpf
+            // aber schreibt bei jedem Push in den Push-Output.
+            Hook::Outdated => outdated.push(name),
             Hook::Absent if REQUIRED_HOOKS.contains(&name) => missing.push(name),
             Hook::Absent => {}
             Hook::Refused(reason) => refused.push((name, reason)),
@@ -313,14 +330,20 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
 
     let default_dir = git_dir.join("hooks");
     let stray = (!crate::enable::same_location(&hooks_dir, &default_dir)
-        && missing
-            .iter()
-            .any(|name| matches!(inspect_hook(&default_dir.join(name)), Hook::Installed)))
+        && missing.iter().any(|name| {
+            // Auch ein *veralteter* Block am falschen Ort ist der Fingerabdruck
+            // aus #9 — er erklärt, wo der Block stattdessen liegt.
+            !matches!(
+                inspect_hook(name, &default_dir.join(name)),
+                Hook::Absent | Hook::Refused(_)
+            )
+        }))
     .then_some(default_dir);
 
     HookState::Checked {
         hooks_dir,
         missing,
+        outdated,
         refused,
         stray,
     }
@@ -328,8 +351,11 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
 
 /// Was an einem Hook-Pfad liegt.
 enum Hook {
-    /// Eine Hook-Datei mit unserem Block.
+    /// Eine Hook-Datei mit unserem Block, in der Fassung dieser Version.
     Installed,
+    /// Unser Block, aber mit einem anderen Rumpf: geschrieben von einer älteren
+    /// `minds`-Version. Git führt ihn aus, er tut nur nicht mehr das Richtige.
+    Outdated,
     /// Nichts, oder ein fremder Hook ohne unseren Block.
     Absent,
     /// Etwas, das `enable` nicht ergänzen würde — mit dem Grund.
@@ -346,9 +372,25 @@ enum Hook {
 /// Der Ablehnungsgrund wird **behalten**, nicht verschluckt: „fehlt" mit dem Rat
 /// `minds enable` wäre für einen Symlink ein Rat, der garantiert scheitert.
 /// `fsck` bricht deshalb trotzdem nicht ab — es ist ein Bericht.
-fn inspect_hook(path: &Path) -> Hook {
+fn inspect_hook(name: &str, path: &Path) -> Hook {
     match crate::enable::read_existing_hook(path) {
-        Ok(Some(body)) if body.contains(crate::enable::MARK_BEGIN) => Hook::Installed,
+        Ok(Some(content)) if content.contains(crate::enable::MARK_BEGIN) => {
+            // Da liegt unser Block — aber steht darin noch, was diese Version
+            // schreibt? Ein Rumpf aus einer älteren `minds` wird von Git
+            // ausgeführt und sieht von außen wie eine heile Installation aus.
+            // Genau daran hing der `pre-push`-Hook, der seine Fehler roh in den
+            // Push-Output kippte: Ein Update des Binaries allein heilt ihn nicht.
+            let expected = crate::enable::expected_body(name);
+            // Ein Name, den `enable` gar nicht kennt, fiele sonst stillschweigend
+            // auf „veraltet" mit dem Rat `minds enable` — der dann garantiert
+            // nichts bewirkte. Heute unerreichbar (alle Aufrufer kommen aus
+            // `hook_names()`), aber die Signatur lädt dazu ein.
+            debug_assert!(expected.is_some(), "unbekannter Hook-Name: {name}");
+            match crate::enable::block_body(&content) {
+                Some(body) if Some(body) == expected => Hook::Installed,
+                _ => Hook::Outdated,
+            }
+        }
         Ok(_) => Hook::Absent,
         Err(err) => Hook::Refused(err.to_string()),
     }
@@ -364,7 +406,7 @@ fn inspect_hook(path: &Path) -> Hook {
 /// Anführungszeichen: Ein Pfad mit Leerzeichen ist sonst nicht als einer zu
 /// erkennen, und ein leerer Pfad ließe den Satz mitten im Nichts enden.
 fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
-    let (hooks_dir, missing, refused, stray) = match state {
+    let (hooks_dir, missing, outdated, refused, stray) = match state {
         HookState::Unusable(why) => {
             let first = match why {
                 NoHooksDir::Empty => {
@@ -385,13 +427,14 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
         HookState::Checked {
             hooks_dir,
             missing,
+            outdated,
             refused,
             stray,
-        } => (hooks_dir, missing, refused, stray),
+        } => (hooks_dir, missing, outdated, refused, stray),
     };
 
     let dir = short(root, hooks_dir);
-    if missing.is_empty() && refused.is_empty() {
+    if missing.is_empty() && outdated.is_empty() && refused.is_empty() {
         return vec![format!("Hooks: installiert in „{dir}“")];
     }
 
@@ -415,6 +458,22 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
         lines.push(format!("  `minds enable` installiert {object} (neu)"));
     }
 
+    // Veraltet heißt: Git führt den Hook aus, er tut nur nicht mehr das, was
+    // diese Version von ihm erwartet. Ein Update des Binaries heilt das nicht —
+    // der Rumpf steht in der Hook-Datei, nicht im Binary.
+    if !outdated.is_empty() {
+        let verb = if outdated.len() == 1 {
+            "stammt"
+        } else {
+            "stammen"
+        };
+        lines.push(format!(
+            "Hooks: {} in „{dir}“ {verb} aus einer älteren minds-Version",
+            outdated.join(", ")
+        ));
+        lines.push("  `minds enable` bringt den Block auf den Stand".to_owned());
+    }
+
     // Abgelehnte Hooks bekommen den Grund statt des Rats: `minds enable` würde
     // hier nicht installieren, sondern mit derselben Begründung abbrechen.
     for (name, reason) in refused {
@@ -434,8 +493,90 @@ fn report_hooks(root: &Path, state: &HookState) -> usize {
     }
     usize::from(!matches!(
         state,
-        HookState::Checked { missing, refused, .. } if missing.is_empty() && refused.is_empty()
+        HookState::Checked { missing, outdated, refused, .. }
+            if missing.is_empty() && outdated.is_empty() && refused.is_empty()
     ))
+}
+
+/// Der Log-Abschnitt des Berichts, Zeile für Zeile — leer, wenn es kein Log
+/// gibt, und das ist der Normalfall.
+///
+/// **Der Wortlaut bleibt in der Datei.** `fsck` läuft im CI-Gate, seine Ausgabe
+/// landet also in Pipeline-Logs, die viel mehr Leute sehen als das Repo eines
+/// Entwicklers. Ein Fehlertext aus dem Hook-Pfad kann einen Ausschnitt aus dem
+/// mitgeschnittenen Rohmaterial tragen; neben dem Journal ist er damit am
+/// richtigen Ort, in einem Pipeline-Log nicht. `fsck` zeigt deshalb, **dass**
+/// etwas dasteht und **wo** — nicht was.
+fn log_report_lines(root: &Path, git_dir: &Path) -> Vec<String> {
+    let Some(summary) = hooklog::summary(git_dir) else {
+        return Vec::new();
+    };
+    let path = hooklog::path(git_dir);
+
+    let rotated_path = hooklog::rotated_path(git_dir);
+
+    // Ist die aktuelle Datei leer oder weg, ist der Vorgänger die einzige
+    // Quelle — dann muss die erste Zeile auch *ihn* nennen. „Log: 0 Einträge in
+    // „hook.log““ schickte den Leser in eine Datei, in der nichts steht.
+    let mut lines = if summary.entries == 0 {
+        vec![format!(
+            "Log: ältere Einträge aus dem Hook-Pfad in „{}“",
+            short(root, &rotated_path)
+        )]
+    } else {
+        // Auch im Singular ein richtiger Satz — der häufigste Fall ist der
+        // erste Eintrag, und „1 Einträge" liest sich wie ein Fehler im Werkzeug.
+        let noun = if summary.entries == 1 {
+            "Eintrag"
+        } else {
+            "Einträge"
+        };
+        let mut lines = vec![format!(
+            "Log: {} {noun} aus dem Hook-Pfad in „{}“",
+            summary.entries,
+            short(root, &path)
+        )];
+        if summary.rotated {
+            lines.push(format!(
+                "  ältere Einträge stehen daneben in „{}“",
+                short(root, &rotated_path)
+            ));
+        }
+        lines
+    };
+
+    // Der Ausweg gehört dazu, und zwar in *jedem* Zweig. Ohne ihn meldete `fsck`
+    // denselben Hinweis auf alle Zeit weiter, auch wenn die Ursache längst
+    // behoben ist — und ein Hinweis, den man nicht loswerden kann, wird zu
+    // Rauschen und dann überlesen, mitsamt den echten daneben. Jeder Eintrag
+    // trägt seinen Zeitstempel; wer hineinsieht, erkennt einen alten Stand.
+    //
+    // Der Satz nennt beide Dateien, wenn es beide gibt: Wer nur `hook.log`
+    // löscht, hätte den Hinweis sonst immer noch.
+    // „beide" nur, wenn es auch beide gibt: Nach dem Rat ist `hook.log` weg,
+    // und dann zeigte der Plural auf eine Datei, die nicht mehr existiert.
+    lines.push(if summary.rotated && summary.entries > 0 {
+        "  der Wortlaut steht nur dort — erledigt? beide Dateien löschen".to_owned()
+    } else {
+        "  der Wortlaut steht nur dort — erledigt? Datei löschen".to_owned()
+    });
+    lines
+}
+
+/// Meldet das Log und gibt zurück, ob das ein Hinweis war.
+///
+/// Ein Hinweis, kein Befund: Der Rückgabewert von `fsck` ist das CI-Gate (R5),
+/// und ein alter Eintrag aus einem längst behobenen Fehler dürfte keine
+/// Pipeline anhalten. Was das Log beschreibt, ist außerdem meist schon an
+/// anderer Stelle als Befund sichtbar — eine nicht eingecheckte Session steht
+/// im Journal-Abschnitt.
+fn report_log(root: &Path, git_dir: &Path) -> usize {
+    let lines = log_report_lines(root, git_dir);
+    let reported = usize::from(!lines.is_empty());
+    for line in lines {
+        println!("{line}");
+    }
+    reported
 }
 
 /// Ein Pfad, wie er im Bericht erscheint: relativ zur Repo-Wurzel, wo das geht,
@@ -454,7 +595,7 @@ fn repo_root(repo: &Repo) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enable::MARK_BEGIN;
+    use crate::enable::{MARK_BEGIN, MARK_END};
 
     /// Ein frisch initialisiertes Repo, oder `None` ohne `git` im Pfad.
     fn repo() -> Option<tempfile::TempDir> {
@@ -485,10 +626,29 @@ mod tests {
         std::fs::write(dir.join(name), body).unwrap();
     }
 
+    /// Der Block, den `minds enable` für diesen Hook schriebe — die Fixtures
+    /// bauen ihn aus derselben Quelle wie der Produktionscode, sonst prüften sie
+    /// gegen eine Fassung, die es nirgends gibt.
+    fn our_block(name: &str) -> String {
+        format!(
+            "#!/bin/sh\n{MARK_BEGIN}\n{}\n{MARK_END}\n",
+            crate::enable::expected_body(name).expect("bekannter Hook")
+        )
+    }
+
     fn install_ours(dir: &Path) {
         for name in REQUIRED_HOOKS {
-            write_hook(dir, name, &format!("#!/bin/sh\n{MARK_BEGIN}\nminds …\n"));
+            write_hook(dir, name, &our_block(name));
         }
+    }
+
+    /// Ein Block von früher: unsere Marken, ein fremder Rumpf.
+    fn install_outdated(dir: &Path, name: &str) {
+        write_hook(
+            dir,
+            name,
+            &format!("#!/bin/sh\n{MARK_BEGIN}\nminds von gestern\n{MARK_END}\n"),
+        );
     }
 
     /// Zerlegt einen `Checked`-Zustand für die Prüfung; `Unusable` ist hier ein
@@ -508,6 +668,7 @@ mod tests {
                 missing,
                 refused,
                 stray,
+                ..
             } => (hooks_dir, missing, refused, stray),
             HookState::Unusable(why) => {
                 panic!("erwartet: geprüftes Hook-Verzeichnis, nicht Unusable({why:?})")
@@ -649,6 +810,7 @@ mod tests {
         let state = HookState::Checked {
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec![],
+            outdated: vec![],
             refused: vec![("post-commit", "…/post-commit ist ein Symlink".to_owned())],
             stray: None,
         };
@@ -693,6 +855,7 @@ mod tests {
     fn golden_all_hooks_installed() {
         let state = HookState::Checked {
             refused: vec![],
+            outdated: vec![],
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec![],
             stray: None,
@@ -705,6 +868,7 @@ mod tests {
     fn golden_one_hook_missing_reads_as_singular() {
         let state = HookState::Checked {
             refused: vec![],
+            outdated: vec![],
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec!["prepare-commit-msg"],
             stray: None,
@@ -722,6 +886,7 @@ mod tests {
     fn golden_two_hooks_missing_with_a_stray_block() {
         let state = HookState::Checked {
             refused: vec![],
+            outdated: vec![],
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec!["post-commit", "prepare-commit-msg"],
             stray: Some(PathBuf::from("/repo/.git/hooks")),
@@ -788,6 +953,7 @@ mod tests {
     fn a_path_with_spaces_stays_readable() {
         let state = HookState::Checked {
             refused: vec![],
+            outdated: vec![],
             hooks_dir: PathBuf::from("/repo/mein ordner/hooks"),
             missing: vec!["post-commit"],
             stray: None,
@@ -796,5 +962,199 @@ mod tests {
             lines(&state)[0],
             "Hooks: post-commit fehlt in „mein ordner/hooks“"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Der Log-Abschnitt (#10)
+    // -----------------------------------------------------------------------
+
+    /// Ein Git-Verzeichnis unter einer Wurzel, samt Log mit `entries` Zeilen.
+    fn git_dir_with_log(entries: usize) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let log = crate::hooklog::path(&root.path().join(".git"));
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "x\n".repeat(entries)).unwrap();
+        root
+    }
+
+    // -----------------------------------------------------------------------
+    // Veraltete Blöcke (#10)
+    // -----------------------------------------------------------------------
+
+    /// Der Fall, der das eingeführt hat: `minds enable` lief einmal, dann wurde
+    /// das Binary aktualisiert. Der Hook liegt da, Git führt ihn aus — er tut
+    /// nur noch, was die alte Version wollte. Als „installiert" zu melden wäre
+    /// genau das falsche Grün, um das es in diesem Release geht.
+    #[test]
+    fn a_block_from_an_older_version_is_not_reported_as_installed() {
+        let Some(dir) = repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        install_ours(&hooks);
+        install_outdated(&hooks, "pre-push");
+
+        let state = hook_state(root, &root.join(".git"));
+        let HookState::Checked {
+            missing, outdated, ..
+        } = &state
+        else {
+            panic!("erwartet: geprüftes Verzeichnis")
+        };
+        assert!(missing.is_empty(), "der Hook fehlt nicht, er ist alt");
+        assert_eq!(outdated, &vec!["pre-push"]);
+    }
+
+    #[test]
+    fn a_current_block_is_installed_not_outdated() {
+        let Some(dir) = repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        for name in crate::enable::hook_names() {
+            write_hook(&hooks, name, &our_block(name));
+        }
+
+        let state = hook_state(root, &root.join(".git"));
+        let HookState::Checked {
+            missing, outdated, ..
+        } = &state
+        else {
+            panic!("erwartet: geprüftes Verzeichnis")
+        };
+        assert!(missing.is_empty() && outdated.is_empty(), "{state:?}");
+        assert_eq!(
+            hook_report_lines(root, &state).len(),
+            1,
+            "eine Zeile: alles gut"
+        );
+    }
+
+    #[test]
+    fn golden_an_outdated_hook_gets_the_update_advice() {
+        let state = HookState::Checked {
+            hooks_dir: PathBuf::from("/repo/.husky"),
+            missing: vec![],
+            outdated: vec!["pre-push"],
+            refused: vec![],
+            stray: None,
+        };
+        assert_eq!(
+            lines(&state),
+            [
+                "Hooks: pre-push in „.husky“ stammt aus einer älteren minds-Version",
+                "  `minds enable` bringt den Block auf den Stand",
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_two_outdated_hooks_read_as_plural() {
+        let state = HookState::Checked {
+            hooks_dir: PathBuf::from("/repo/.husky"),
+            missing: vec![],
+            outdated: vec!["post-commit", "pre-push"],
+            refused: vec![],
+            stray: None,
+        };
+        assert_eq!(
+            lines(&state)[0],
+            "Hooks: post-commit, pre-push in „.husky“ stammen aus einer älteren minds-Version"
+        );
+    }
+
+    #[test]
+    fn an_outdated_hook_is_a_hint_not_a_finding() {
+        let state = HookState::Checked {
+            hooks_dir: PathBuf::from("/repo/.husky"),
+            missing: vec![],
+            outdated: vec!["pre-push"],
+            refused: vec![],
+            stray: None,
+        };
+        // Ein Hinweis zählt, bricht aber die Integrität nicht — der
+        // Rückgabewert von `fsck` bleibt davon unberührt.
+        assert_eq!(report_hooks(Path::new("/repo"), &state), 1);
+    }
+
+    #[test]
+    fn golden_no_log_means_no_section() {
+        // Der Normalfall: Ein Repo, in dem nie etwas schiefging, bekommt keine
+        // Zeile über eine Datei, die es nicht gibt.
+        let root = tempfile::tempdir().unwrap();
+        assert!(log_report_lines(root.path(), &root.path().join(".git")).is_empty());
+    }
+
+    #[test]
+    fn golden_an_empty_log_file_means_no_section() {
+        let root = git_dir_with_log(0);
+        assert!(log_report_lines(root.path(), &root.path().join(".git")).is_empty());
+    }
+
+    #[test]
+    fn golden_one_entry_reads_as_singular() {
+        let root = git_dir_with_log(1);
+        assert_eq!(
+            log_report_lines(root.path(), &root.path().join(".git")),
+            [
+                "Log: 1 Eintrag aus dem Hook-Pfad in „.git/minds/hook.log“",
+                "  der Wortlaut steht nur dort — erledigt? Datei löschen",
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_several_entries_read_as_plural() {
+        let root = git_dir_with_log(3);
+        assert_eq!(
+            log_report_lines(root.path(), &root.path().join(".git"))[0],
+            "Log: 3 Einträge aus dem Hook-Pfad in „.git/minds/hook.log“"
+        );
+    }
+
+    #[test]
+    fn golden_a_rotated_predecessor_is_named() {
+        let root = git_dir_with_log(2);
+        let rotated = crate::hooklog::rotated_path(&root.path().join(".git"));
+        std::fs::write(rotated, "alt\n").unwrap();
+
+        assert_eq!(
+            log_report_lines(root.path(), &root.path().join(".git")),
+            [
+                "Log: 2 Einträge aus dem Hook-Pfad in „.git/minds/hook.log“",
+                "  ältere Einträge stehen daneben in „.git/minds/hook.log.1“",
+                "  der Wortlaut steht nur dort — erledigt? beide Dateien löschen",
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_only_a_rotated_predecessor_names_that_file() {
+        // Der Fall nach dem Rat: Jemand hat `hook.log` gelöscht, `hook.log.1`
+        // liegt noch da. Die erste Zeile darf dann nicht auf eine Datei zeigen,
+        // in der nichts steht — und der Ausweg muss trotzdem dastehen, sonst
+        // wird man den Hinweis nie los.
+        let root = git_dir_with_log(0);
+        let rotated = crate::hooklog::rotated_path(&root.path().join(".git"));
+        std::fs::write(rotated, "alt\n").unwrap();
+
+        assert_eq!(
+            log_report_lines(root.path(), &root.path().join(".git")),
+            [
+                "Log: ältere Einträge aus dem Hook-Pfad in „.git/minds/hook.log.1“",
+                // Singular: `hook.log` ist in diesem Fall gerade gelöscht
+                // worden — der Plural zeigte auf eine Datei, die es nicht gibt.
+                "  der Wortlaut steht nur dort — erledigt? Datei löschen",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_log_counts_as_a_hint_not_as_a_finding() {
+        // Der Rückgabewert von `fsck` ist das CI-Gate. Ein alter Eintrag aus
+        // einem längst behobenen Fehler darf keine Pipeline anhalten.
+        let root = git_dir_with_log(2);
+        assert_eq!(report_log(root.path(), &root.path().join(".git")), 1);
+
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(report_log(empty.path(), &empty.path().join(".git")), 0);
     }
 }

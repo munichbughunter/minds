@@ -24,8 +24,13 @@
 //! `--agent` die Arbeit des Nutzers stoppt, hat seinen Zweck verfehlt.
 //!
 //! Der Preis ist, dass eine kaputte Hook-Konfiguration still bleibt. Deshalb
-//! landet sie in `<git-dir>/minds/hook.log`, und deshalb wird `minds fsck` in
-//! M6 danach sehen.
+//! landet sie in `<git-dir>/minds/hook.log`, und deshalb verweist `minds fsck`
+//! darauf.
+//!
+//! Dasselbe gilt für den **kalten** Pfad: `checkpoint`, `prepare-commit-msg` und
+//! `sync` laufen aus Git-Hooks, die ihre Ausgabe wegwerfen. Auch ihre Fehler
+//! gehen deshalb in dieselbe Datei — siehe [`hooklog`]. Ohne das bräche ein
+//! Tippfehler in `.minds/redact.json` die Erfassung dauerhaft und lautlos.
 
 mod agent_help;
 mod audit;
@@ -40,6 +45,7 @@ mod forget_cmd;
 mod fsck;
 mod gitlab_cmd;
 mod hook;
+mod hooklog;
 mod import_cmd;
 mod metrics;
 mod prepare_commit_msg;
@@ -54,6 +60,7 @@ mod sign_cmd;
 mod signing;
 mod stack;
 mod sync;
+mod text;
 mod verify_cmd;
 mod why;
 
