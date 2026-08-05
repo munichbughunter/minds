@@ -23,10 +23,13 @@
 //! | Cursor      | `.cursor/hooks.json`                             |
 //! | Gemini      | `.gemini/settings.json`                          |
 //! | OpenCode    | `.opencode/plugin/minds.ts`                      |
-//! | Git         | `.git/hooks/post-commit`, `prepare-commit-msg`   |
+//! | Git         | `post-commit`, `prepare-commit-msg`, `pre-push` im **effektiven** Hook-Verzeichnis |
 //!
-//! Alles projekt-lokal, relativ zur Repo-Wurzel — der Kontext gehört zum Repo,
-//! nicht zum Benutzerkonto.
+//! Die Agent-Dateien liegen projekt-lokal, relativ zur Repo-Wurzel — der Kontext
+//! gehört zum Repo, nicht zum Benutzerkonto. Die Git-Hooks gehen dorthin, wo Git
+//! sie tatsächlich ausführt: `<git-dir>/hooks`, sofern `core.hooksPath` nichts
+//! anderes sagt. Das kann auch außerhalb des Repos liegen — siehe
+//! [`effective_hooks_dir`].
 //!
 //! # Ehrlich zu den Formaten
 //!
@@ -51,7 +54,8 @@ use crate::config;
 pub(crate) const BACKGROUND_IMPORT_FLAG: &str = "--__background-import";
 
 /// Anfang unseres Blocks in Shell-Hooks — die Marke für idempotentes Ersetzen.
-const MARK_BEGIN: &str = "# >>> minds >>>";
+/// `fsck` erkennt an derselben Marke, ob ein Hook von uns stammt.
+pub(crate) const MARK_BEGIN: &str = "# >>> minds >>>";
 /// Ende unseres Blocks.
 const MARK_END: &str = "# <<< minds <<<";
 
@@ -151,6 +155,31 @@ fn enable_agents(
     verbose: bool,
     recall: bool,
 ) -> std::io::Result<()> {
+    // Zuerst, vor jedem Schreibzugriff: Gibt es überhaupt einen Ort, aus dem
+    // Git Hooks ausführt, und lässt sich dort schreiben? Wenn nicht, soll der
+    // Nutzer nichts halb Eingerichtetes zurückbehalten — ein Repo mit
+    // Agent-Konfiguration, aber ohne Hooks und ohne Store-Config journaliert,
+    // checkt aber nie ein.
+    let hooks_dir = paths.hooks.require()?.to_path_buf();
+
+    // Der Hinweis gehört vor die erste Änderung am Dateisystem — auch vor das
+    // Anlegen des Verzeichnisses. Wer abbricht, soll wissen, wohin es gegangen
+    // wäre, und nicht ein leeres Verzeichnis an fremder Stelle zurücklassen.
+    if let Some(note) = moved_hooks_note(&paths.root, &paths.git_dir, &hooks_dir) {
+        println!("{note}");
+    }
+
+    // Die Hooks selbst einmal ansehen, bevor irgendetwas entsteht — auch vor
+    // dem Anlegen des Verzeichnisses: Liegt dort ein Symlink oder eine Datei,
+    // die keine ist, scheiterte der Schreibvorgang sonst mitten in der Reihe,
+    // mit Agent-Konfiguration und erstem Hook auf der Platte, aber ohne
+    // Store-Config. Der Agent journalierte dann, und nichts checkte je ein.
+    // (`read_existing_hook` verträgt ein fehlendes Elternverzeichnis.)
+    for name in hook_names() {
+        read_existing_hook(&hooks_dir.join(name))?;
+    }
+    ensure_writable(&hooks_dir)?;
+
     for &agent in agents {
         let change = match agent {
             Which::ClaudeCode => claude_style(&paths.root, ".claude/settings.json", "claude-code")?,
@@ -170,15 +199,19 @@ fn enable_agents(
         report(verbose, ".claude/settings.json (recall)", change);
     }
 
-    let post = enable_git_hook(&paths.git_dir, "post-commit", POST_COMMIT_BODY)?;
-    report(verbose, ".git/hooks/post-commit", post);
-    let prepare = enable_git_hook(&paths.git_dir, "prepare-commit-msg", PREPARE_MSG_BODY)?;
-    report(verbose, ".git/hooks/prepare-commit-msg", prepare);
+    for &(name, body) in commit_hooks() {
+        let change = enable_git_hook(&hooks_dir, name, body)?;
+        report(
+            verbose,
+            &label_for(&paths.root, &hooks_dir.join(name)),
+            change,
+        );
+    }
 
     // Der Kontext soll mit dem Code reisen — aber *woher* er reist, hängt am
     // Backend. In-Repo liegt er im selben Repo; beim Child-Repo in einem
     // separaten, das erst angelegt (oder geklont) werden muss.
-    configure_sync(paths, store, child_remote, verbose)?;
+    configure_sync(paths, &hooks_dir, store, child_remote, verbose)?;
 
     // Die Store-Config gehört zum Setup: Ohne sie wüssten checkpoint/show/why
     // nicht, wo der Kontext liegt. `git config` setzt idempotent.
@@ -313,6 +346,32 @@ fn git_output(root: &Path, args: &[&str]) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Der Wert eines Config-Schlüssels — `None`, wenn er **nicht gesetzt** ist.
+///
+/// Der Unterschied zwischen „nicht gesetzt" und „gesetzt, aber leer" lässt sich
+/// an der Ausgabe allein nicht ablesen: Beides ist eine leere Zeile. Erst der
+/// Exit-Status trennt sie — `git config --get` endet mit 1, wenn der Schlüssel
+/// fehlt. Für `core.hooksPath` ist das keine Feinheit, sondern der ganze
+/// Unterschied: leer heißt, dass Git **gar keine** Hooks ausführt (siehe
+/// [`effective_hooks_dir`]). Deshalb hier ein eigener Aufruf statt
+/// [`git_output`], das den Status wegwirft.
+fn git_config_value(root: &Path, key: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Nur den Zeilenumbruch von `git config` abschneiden, nicht den Wert
+    // trimmen: `core.hooksPath = "  "` ist ein zulässiger Verzeichnisname, und
+    // wer ihn gesetzt hat, soll nicht das Verhalten von „leer" bekommen.
+    let value = String::from_utf8_lossy(&out.stdout);
+    Some(value.trim_end_matches(['\n', '\r']).to_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Sync des Kontext-Refs — je Backend anders
 // ---------------------------------------------------------------------------
@@ -321,14 +380,20 @@ fn git_output(root: &Path, args: &[&str]) -> std::io::Result<String> {
 /// Repository, für das Child-Repo im separaten, das dafür erst existieren muss.
 fn configure_sync(
     paths: &RepoPaths,
+    hooks_dir: &Path,
     store: &StoreConfig,
     child_remote: Option<&str>,
     verbose: bool,
 ) -> std::io::Result<()> {
     // Der Hook ist für beide Backends derselbe; die Unterscheidung trifft
     // `minds sync` anhand der Store-Config.
-    let pre_push = enable_git_hook(&paths.git_dir, "pre-push", PRE_PUSH_BODY)?;
-    report(verbose, ".git/hooks/pre-push", pre_push);
+    let (name, body) = push_hook();
+    let pre_push = enable_git_hook(hooks_dir, name, body)?;
+    report(
+        verbose,
+        &label_for(&paths.root, &hooks_dir.join(name)),
+        pre_push,
+    );
 
     if let Backend::ChildRepo { path } = store.backend() {
         let child = resolve_against(&paths.root, path);
@@ -486,6 +551,236 @@ fn agent_label(agent: Which) -> &'static str {
 
 fn report(verbose: bool, label: &str, change: Change) {
     vln(verbose, &format!("  {label}: {}", change.word()));
+}
+
+/// Der Hinweis auf ein verschobenes Hook-Verzeichnis — `None`, wenn die Hooks
+/// im üblichen `<git-dir>/hooks` liegen und es nichts zu sagen gibt.
+///
+/// Zwei Fälle, zwei Nachrichten, weil die Folgen verschieden sind: Liegt das
+/// Verzeichnis **im Repo** (husky, lefthook), teilt es das Schicksal der
+/// Arbeitskopie — je nachdem, ob es eingecheckt oder ignoriert ist, reist unser
+/// Block zu den Kollegen oder verschwindet beim nächsten Aufräumen. Liegt es
+/// **außerhalb** (global gesetztes `core.hooksPath`, `init.templateDir`),
+/// schaltet ein `enable` in *einem* Repo die Erfassung für **alle** Repos des
+/// Nutzers ein. Das ist die Nachricht, die niemand aus einem Pfad allein liest.
+///
+/// Bewusst offen gelassen: ob das Verzeichnis versioniert ist. `husky` ≥ 9 setzt
+/// `core.hooksPath` auf `.husky/_`, und das ist per `.gitignore` ausgenommen und
+/// wird bei jedem `husky install` neu erzeugt — unser Block wäre dort nach dem
+/// nächsten `npm install` weg. Diese Unterscheidung braucht `git check-ignore`
+/// und einen eigenen Satz; sie steht als Folgearbeit im Issue-Tracker, und
+/// solange behauptet der Hinweis nichts, was er nicht weiß.
+fn moved_hooks_note(root: &Path, git_dir: &Path, hooks_dir: &Path) -> Option<String> {
+    if same_location(hooks_dir, &git_dir.join("hooks")) {
+        return None;
+    }
+    let resolved = canonical_prefix(hooks_dir);
+    let inside = resolved.starts_with(canonical_prefix(root));
+
+    // Normalerweise steht der Pfad da, den der Nutzer gesetzt hat — der
+    // aufgelöste wäre nur Lärm (auf macOS wird aus `/home/anna` schnell
+    // `/System/Volumes/Data/home/anna`). Nur wenn der Pfad *im Repo* aussieht,
+    // aber woandershin auflöst, muss das Ziel dastehen: Sonst stünde „zeigt aus
+    // dem Repo heraus" neben einem harmlosen `.husky`, und der Satz widerspräche
+    // dem Pfad, den er erklärt.
+    let misleading = !inside && hooks_dir.starts_with(root);
+    let where_ = label_for(root, if misleading { &resolved } else { hooks_dir });
+
+    Some(if inside {
+        format!("Hinweis: core.hooksPath ist gesetzt — die Git-Hooks gehen nach „{where_}“")
+    } else {
+        format!(
+            "Hinweis: core.hooksPath zeigt aus dem Repo heraus („{where_}“) — \
+                 die Hooks gelten damit für alle deine Repositories"
+        )
+    })
+}
+
+/// Ein Pfad, wie er im Bericht erscheint: relativ zur Repo-Wurzel, damit die
+/// Ausgabe kurz bleibt und trotzdem den *tatsächlichen* Ort nennt statt eines
+/// fest verdrahteten `.git/hooks/…`.
+fn label_for(root: &Path, path: &Path) -> String {
+    display_path(path.strip_prefix(root).unwrap_or(path))
+}
+
+/// Ein Pfad für die Ausgabe, mit entschärften Steuerzeichen.
+///
+/// `git config` speichert beliebige Bytes. Ein `core.hooksPath` mit
+/// ANSI-Sequenzen (`\e[2K\e[A`) könnte sonst Zeilen des Berichts überschreiben
+/// — ausgerechnet den Hinweis, der bei einem Hook-Verzeichnis außerhalb des
+/// Repos die einzige Warnung ist.
+///
+/// Neben den Steuerzeichen (`Cc`) sind die **Bidi-Formatzeichen** gemeint: `RLO`
+/// & Co. sind `Cf`, also nicht `is_control`, drehen die Zeile im Terminal aber
+/// optisch um. Auch damit ließe sich der Hinweis unkenntlich machen.
+pub(crate) fn display_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .chars()
+        .flat_map(|c| {
+            if c.is_control() || is_bidi_control(c) {
+                c.escape_debug().collect::<Vec<_>>()
+            } else {
+                vec![c]
+            }
+        })
+        .collect()
+}
+
+/// Die Unicode-Zeichen, die die Leserichtung umstellen.
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Entfernt `.` und löst `..` **textuell** auf.
+///
+/// Nur für Entscheidungen, nie für einen Schreibpfad: Führt eine Komponente vor
+/// dem `..` über einen Symlink, weicht das Ergebnis vom Dateisystem ab — und
+/// damit von dem, was Git tut. Für die Frage „ist das die Arbeitskopie-Wurzel?"
+/// braucht es die Antwort aber auch dann, wenn Teile des Pfades noch gar nicht
+/// existieren und [`fs::canonicalize`] deshalb schweigt.
+fn lexically_normalized(path: PathBuf) -> PathBuf {
+    use std::path::Component;
+
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            // Ein `..` hebt die vorige Komponente auf — außer am Anfang eines
+            // relativen Pfades, wo es nichts aufzuheben gibt.
+            Component::ParentDir
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Meinen zwei Pfade denselben Ort?
+///
+/// Ein reiner Textvergleich reicht nicht: Auf macOS ist `/tmp` ein Symlink auf
+/// `/private/tmp`, unter Linux tun Bind-Mounts und ein verlinktes `$HOME`
+/// dasselbe. Wer `core.hooksPath` über einen solchen Alias auf die Repo-Wurzel
+/// setzt, käme sonst an der Prüfung vorbei, die genau das verhindern soll.
+///
+/// [`fs::canonicalize`] antwortet nur für existierende Pfade; für alles andere
+/// bleibt der Textvergleich das Beste, was wir haben.
+pub(crate) fn same_location(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    matches!(
+        (fs::canonicalize(a), fs::canonicalize(b)),
+        (Ok(left), Ok(right)) if left == right
+    )
+}
+
+/// Kanonisiert so viel vom Pfad, wie es auf der Platte schon gibt, und hängt den
+/// Rest unverändert an.
+///
+/// Nötig, weil das Hook-Verzeichnis oft noch nicht existiert — `enable` legt es
+/// erst an —, die Frage „liegt es innerhalb des Repos?" aber jetzt schon
+/// beantwortet werden muss, und zwar über Symlinks hinweg.
+fn canonical_prefix(path: &Path) -> PathBuf {
+    let mut trailing = Vec::new();
+    let mut head = path;
+    loop {
+        if let Ok(real) = fs::canonicalize(head) {
+            let mut out = real;
+            out.extend(trailing.iter().rev());
+            return out;
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(parent), Some(name)) => {
+                trailing.push(name.to_owned());
+                head = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+/// Legt das Hook-Verzeichnis an und prüft, dass sich dort schreiben lässt —
+/// **bevor** `enable` irgendetwas anderes anfasst.
+///
+/// Ohne diese Probe scheitert erst der Hook-Schreibvorgang, und zwar nachdem die
+/// Agent-Konfigurationen schon geschrieben sind und bevor die Store-Config
+/// geschrieben wird: Der Agent journaliert dann, aber kein Commit checkt je ein.
+/// Ein Verzeichnis ohne Schreibrecht oder ein `core.hooksPath`, das auf eine
+/// Datei zeigt, sind keine exotischen Fälle — sie liegen einen Tippfehler
+/// entfernt.
+///
+/// # Warum hier kein Symlink geprüft wird
+///
+/// Naheliegend wäre, ein Hook-**Verzeichnis**, das über einen eingecheckten
+/// Symlink woandershin zeigt, abzulehnen. Ein Versuch dazu stand hier und ist
+/// wieder entfernt worden: Pfad-für-Pfad-Prüfungen lassen sich zu leicht
+/// umgehen — ein nachgestellter Schrägstrich genügt, weil POSIX `lstat("link/")`
+/// dem Link folgen lässt, und ein Pfad-Alias führt an der Zuständigkeitsgrenze
+/// vorbei. Umgekehrt lehnte die Prüfung legitime Setups ab (ein symlinktes
+/// `.git` oder ein geteiltes `.git/hooks`, beides von Git unterstützt).
+///
+/// Was gegen den eingecheckten Symlink trägt, sitzt eine Ebene tiefer und ist
+/// nicht von Schreibweisen abhängig: [`read_existing_hook`] und [`write_hook`]
+/// arbeiten am Blatt und schreiben nie durch einen Link hindurch. Offen bleibt,
+/// dass ein umgelenktes Verzeichnis unsere Dateien woanders entstehen lässt —
+/// das ist eine Frage des *Ortes*, nicht des Links, und wird dort beantwortet,
+/// wo `enable` künftig vor dem Schreiben außerhalb des Repos zurückfragt.
+fn ensure_writable(hooks_dir: &Path) -> std::io::Result<()> {
+    let explain = |err: std::io::Error| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "das Hook-Verzeichnis {} lässt sich nicht anlegen oder beschreiben \
+                 (core.hooksPath): {err}",
+                display_path(hooks_dir)
+            ),
+        )
+    };
+
+    // Das Verzeichnis bleibt stehen, wenn ein späterer Schritt scheitert. Es
+    // wieder abzuräumen hieße zu wissen, ob es vorher schon da war — und ein
+    // leeres Hook-Verzeichnis schadet niemandem.
+    fs::create_dir_all(hooks_dir).map_err(explain)?;
+    let probe = temp_name(hooks_dir, "schreibprobe");
+    create_new_file(&probe).map_err(explain)?;
+    let _ = fs::remove_file(&probe);
+    Ok(())
+}
+
+/// Ein Name für eine kurzlebige Nachbardatei, kollisionsarm über PID und Zeit.
+///
+/// Ausdrücklich **kein Zufall** und keine Sicherheitszusage — die trägt allein
+/// [`create_new_file`]. PID und Nanosekunden verhindern, dass ein Rest aus einem
+/// abgestürzten Lauf den nächsten blockiert; mehr sollen sie nicht.
+fn temp_name(dir: &Path, purpose: &str) -> PathBuf {
+    // Der volle Nanosekunden-Wert, nicht nur der Bruchteil: Nach einer
+    // wiederverwendeten PID kollidierte der Name sonst mit einem Rest aus einem
+    // abgestürzten Lauf, und `create_new` ließe den neuen Lauf scheitern.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    dir.join(format!(".minds-{purpose}-{}-{nanos}", std::process::id()))
+}
+
+/// Legt eine Datei an, die es vorher **nicht** gab.
+///
+/// `create_new` bedeutet `O_CREAT | O_EXCL`; das scheitert an einem bestehenden
+/// Namen *einschließlich* eines Symlinks — auch eines, dessen Ziel gar nicht
+/// existiert. Ein `fs::write` folgte dem Link stattdessen und schriebe in die
+/// fremde Datei. Fail-closed ohne `O_NOFOLLOW` und damit ohne neue Dependency.
+fn create_new_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 // ---------------------------------------------------------------------------
@@ -776,19 +1071,50 @@ const PREPARE_MSG_BODY: &str = "minds prepare-commit-msg \"$1\" >/dev/null 2>&1 
 /// gepusht wird, entscheidet `minds sync` anhand der Store-Config.
 const PRE_PUSH_BODY: &str = "minds sync --remote \"$1\" || true";
 
+/// **Die** Liste der Git-Hooks, die `minds` schreibt — samt ihrer Rümpfe.
+///
+/// Eine Quelle, aus der sich alles andere ableitet: `enable_agents` schreibt die
+/// Commit-Hooks, `configure_sync` den letzten, und die Vorprüfung läuft über
+/// alle Namen. Wer hier einen Hook ergänzt, bekommt die Vorprüfung geschenkt —
+/// zählte man die Namen an zwei Stellen auf, fiele der neue Hook still aus ihr
+/// heraus, und genau dann bräche die Zusage „nichts halb Eingerichtetes".
+///
+/// **`pre-push` steht zuletzt**; darauf verlässt sich [`push_hook`], und ein
+/// Test hält es fest.
+const ALL_HOOKS: [(&str, &str); 3] = [
+    ("post-commit", POST_COMMIT_BODY),
+    ("prepare-commit-msg", PREPARE_MSG_BODY),
+    ("pre-push", PRE_PUSH_BODY),
+];
+
+/// Die Hooks, die [`enable_agents`] selbst schreibt.
+fn commit_hooks() -> &'static [(&'static str, &'static str)] {
+    &ALL_HOOKS[..ALL_HOOKS.len() - 1]
+}
+
+/// Der Hook, den [`configure_sync`] schreibt.
+fn push_hook() -> (&'static str, &'static str) {
+    ALL_HOOKS[ALL_HOOKS.len() - 1]
+}
+
+/// Alle Hook-Namen — für die Vorprüfung und für `fsck`.
+pub(crate) fn hook_names() -> impl Iterator<Item = &'static str> {
+    ALL_HOOKS.iter().map(|(name, _)| *name)
+}
+
 /// Fügt einen markierten Block in einen Git-Hook ein oder aktualisiert ihn.
+///
+/// `hooks_dir` ist das **effektive** Hook-Verzeichnis (siehe
+/// [`effective_hooks_dir`]), nicht blind `<git-dir>/hooks`.
 ///
 /// Fremde Zeilen in derselben Datei (die eigenen Hooks des Nutzers) bleiben; nur
 /// der Block zwischen [`MARK_BEGIN`] und [`MARK_END`] gehört uns und wird
 /// ersetzt. Eine neue Datei bekommt eine `#!/bin/sh`-Zeile und `chmod +x`.
-fn enable_git_hook(git_dir: &Path, name: &str, body: &str) -> std::io::Result<Change> {
-    let path = git_dir.join("hooks").join(name);
-    let existed = path.exists();
-    let current = if existed {
-        fs::read_to_string(&path)?
-    } else {
-        String::new()
-    };
+fn enable_git_hook(hooks_dir: &Path, name: &str, body: &str) -> std::io::Result<Change> {
+    let path = hooks_dir.join(name);
+    let current = read_existing_hook(&path)?;
+    let existed = current.is_some();
+    let current = current.unwrap_or_default();
 
     let block = format!("{MARK_BEGIN}\n{body}\n{MARK_END}");
     let next = replace_block(&current, &block);
@@ -797,13 +1123,137 @@ fn enable_git_hook(git_dir: &Path, name: &str, body: &str) -> std::io::Result<Ch
     }
 
     create_parent(&path)?;
-    fs::write(&path, &next)?;
-    make_executable(&path)?;
+    write_hook(&path, &next)?;
     Ok(if existed {
         Change::Updated
     } else {
         Change::Created
     })
+}
+
+/// Größter Hook, den wir noch einlesen. Alles darüber ist keiner.
+///
+/// Seit das Zielverzeichnis am `core.hooksPath` hängt, kann es in der
+/// Arbeitskopie liegen — und ist damit **versioniert und fremdbestückbar**.
+/// Symlinks und Gerätedateien fängt [`read_existing_hook`] schon vorher ab;
+/// diese Grenze gilt der schlichten **großen regulären Datei**, die jemand unter
+/// dem Namen `post-commit` eincheckt. Ohne sie zöge ein `read_to_string` sie
+/// vollständig in den Speicher. Ein echter Hook ist ein Shell-Skript.
+pub(crate) const MAX_HOOK_BYTES: u64 = 1024 * 1024;
+
+/// Liest einen vorhandenen Hook — oder `None`, wenn dort keiner liegt.
+///
+/// # Warum das nicht `fs::read_to_string` ist
+///
+/// Vor dieser Änderung war das Ziel immer `<git-dir>/hooks/…`, ein Verzeichnis,
+/// in das ein Checkout nichts legen kann. Mit `core.hooksPath = .husky` liegt es
+/// **in der Arbeitskopie** — ein gemergter PR kann dort also eine Datei
+/// platzieren, und im Diff sieht man davon nur einen Moduswechsel.
+///
+/// Ist diese Datei ein **Symlink**, würde `read_to_string` das Ziel lesen,
+/// `fs::write` durch den Link hindurchschreiben und `set_permissions` dessen
+/// Rechte ändern — aus `~/.aws/credentials` mit `0600` würde eine Datei mit
+/// `0755` und angehängtem minds-Block. Git *liest* Hooks nur; die Schreib- und
+/// die chmod-Primitive entstehen erst hier. Deshalb fail-closed: Ein Hook, der
+/// ein Symlink ist, ist nichts, was wir ergänzen.
+///
+/// **Was offen bleibt:** Zwischen diesem `symlink_metadata` und dem Lesen liegt
+/// ein Zeitfenster, und ein **Hardlink** ist von einer regulären Datei nicht zu
+/// unterscheiden. Beides setzt einen Angreifer mit Schreibrechten im
+/// Hook-Verzeichnis unter derselben Kennung voraus — der könnte die Datei
+/// ohnehin lesen und schreiben. Gegen den eingecheckten Symlink, der aus einem
+/// PR kommt, trägt die Prüfung; mehr behauptet sie nicht.
+pub(crate) fn read_existing_hook(path: &Path) -> std::io::Result<Option<String>> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(with_path(path, err)),
+    };
+
+    if meta.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{} ist ein Symlink — minds ergänzt keinen Hook, der woandershin zeigt. \
+             Entferne den Link oder wähle ein anderes core.hooksPath",
+            display_path(path)
+        )));
+    }
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} ist keine reguläre Datei",
+            display_path(path)
+        )));
+    }
+    if meta.len() > MAX_HOOK_BYTES {
+        return Err(std::io::Error::other(format!(
+            "{} ist {} Bytes groß — das ist kein Hook-Skript",
+            display_path(path),
+            meta.len()
+        )));
+    }
+
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            Err(std::io::Error::other(format!(
+                "{} ist kein Text — minds ergänzt nur Shell-Hooks",
+                display_path(path)
+            )))
+        }
+        Err(err) => Err(with_path(path, err)),
+    }
+}
+
+/// Schreibt den Hook **ohne** einem Symlink zu folgen: erst eine Nachbardatei,
+/// dann [`fs::rename`] darüber.
+///
+/// `rename` ersetzt den *Namen* im Verzeichnis; selbst wenn zwischen Prüfung und
+/// Schreiben jemand einen Symlink an diese Stelle legt, wird der Link ersetzt
+/// statt durch ihn hindurchgeschrieben. Zusammen mit `create_new` (also
+/// `O_CREAT | O_EXCL`) für die Nachbardatei braucht es dafür kein `O_NOFOLLOW`
+/// und damit keine neue Dependency für das statische Binary.
+///
+/// **Was offen bleibt:** Wird das *Verzeichnis* zwischen Prüfung und Schreiben
+/// gegen einen Symlink getauscht, landet auch dieses `rename` am neuen Ziel.
+/// Lückenlos wäre das nur mit einem offenen Verzeichnis-Deskriptor und
+/// `openat`/`renameat`, also mit `libc`. Wer das ausnutzen will, braucht
+/// Schreibrechte im Hook-Verzeichnis unter derselben Kennung — und könnte den
+/// Hook dann ohnehin selbst schreiben. Keine Vertrauensgrenze wird überschritten;
+/// gegen den eingecheckten Symlink, um den es hier geht, trägt die Prüfung.
+///
+/// Die Rechte werden auf der Temp-Datei gesetzt, nicht über den Zielpfad: Ein
+/// `chmod` auf einen Pfad folgte wieder dem Link.
+fn write_hook(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().unwrap_or(Path::new("."));
+    let temp = temp_name(dir, "hook");
+
+    // Erst anlegen, dann der Rest — damit das Aufräumen unten nur Dateien
+    // trifft, die von uns stammen. Scheitert `create_new_file` (etwa an einem
+    // Symlink, der schon so heißt), gehört uns dieser Name nicht, und wir
+    // löschen ihn auch nicht.
+    let mut file = create_new_file(&temp).map_err(|err| with_path(&temp, err))?;
+
+    let result = (|| {
+        file.write_all(content.as_bytes())
+            .map_err(|err| with_path(&temp, err))?;
+        // Die Rechte über das offene Handle, nicht über den Pfad: Ein `chmod`
+        // auf einen Pfad folgte einem Link, der inzwischen dort liegen könnte.
+        make_executable(&file).map_err(|err| with_path(&temp, err))?;
+        fs::rename(&temp, path).map_err(|err| with_path(path, err))
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Hängt den Pfad an einen I/O-Fehler. „Permission denied (os error 13)" allein
+/// lässt den Nutzer raten, welche Datei gemeint ist — und bei einem Ziel aus
+/// `core.hooksPath` ist genau das die Frage.
+fn with_path(path: &Path, err: std::io::Error) -> std::io::Error {
+    std::io::Error::new(err.kind(), format!("{}: {err}", display_path(path)))
 }
 
 /// Ersetzt einen vorhandenen minds-Block durch `block` oder hängt ihn an. Eine
@@ -833,15 +1283,13 @@ fn replace_block(current: &str, block: &str) -> String {
 }
 
 #[cfg(unix)]
-fn make_executable(path: &Path) -> std::io::Result<()> {
+fn make_executable(file: &fs::File) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms)
+    file.set_permissions(fs::Permissions::from_mode(0o755))
 }
 
 #[cfg(not(unix))]
-fn make_executable(_path: &Path) -> std::io::Result<()> {
+fn make_executable(_file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -855,10 +1303,150 @@ struct RepoPaths {
     root: PathBuf,
     /// Das Git-Verzeichnis selbst.
     git_dir: PathBuf,
+    /// Woher Git die Hooks **tatsächlich** ausführt — oder dass es das nicht tut.
+    hooks: HooksDir,
+}
+
+/// Das Verzeichnis, aus dem Git die Hooks dieses Repositories ausführt.
+///
+/// Normalerweise `<git-dir>/hooks` — aber `core.hooksPath` verschiebt es, und
+/// zwar aus *jeder* Config-Ebene: husky setzt es lokal auf `.husky`, lefthook
+/// und pre-commit tun Ähnliches, über `init.templateDir` kann es global gesetzt
+/// sein. Schrieben wir dann nach `<git-dir>/hooks`, meldete `enable` Erfolg und
+/// Git läse die Datei **nie** — der stillste denkbare Ausfall, und er trifft
+/// genau die JS-Monorepos, in denen Agent-Teams arbeiten.
+///
+/// Deshalb fragen wir Git selbst, statt die Config-Ebenen nachzubauen:
+/// `rev-parse --git-path hooks` löst `core.hooksPath` mit auf. Die Ausgabe ist
+/// entweder relativ zum Arbeitsverzeichnis des Aufrufs — das ist hier `root` —
+/// oder absolut; `join` behandelt beides richtig. Antwortet Git nicht (kein
+/// `git` im Pfad, kaputte Config), bleibt es beim bisherigen Verhalten.
+///
+/// # Der leere Wert
+///
+/// Ein **gesetztes, aber leeres** `core.hooksPath` schaltet die Hook-Ausführung
+/// ganz ab; gemessen mit git 2.51:
+///
+/// | `core.hooksPath` | `rev-parse --git-path hooks` | beim Commit |
+/// |---|---|---|
+/// | ungesetzt | `.git/hooks` | Hook feuert |
+/// | `""` | `./` | **kein Hook, keine Meldung** |
+/// | `.` | `.` | `error: cannot run post-commit: …` |
+/// | absoluter Pfad | absolut | Hook feuert |
+///
+/// Die `rev-parse`-Antwort taugt hier nicht als Unterscheidung — `./` und `.`
+/// liegen einen Schrägstrich auseinander und meinen Verschiedenes. Deshalb
+/// fragen wir zusätzlich den Config-Wert selbst ab. Ohne diese Abfrage würden
+/// wir bei leerem Wert nach `<root>/.` schreiben, also **ausführbare Dateien in
+/// die Arbeitskopie** legen, die Git nie liest.
+pub(crate) fn effective_hooks_dir(root: &Path, git_dir: &Path) -> HooksDir {
+    let configured = git_config_value(root, "core.hooksPath");
+    if configured.as_ref().is_some_and(|value| value.is_empty()) {
+        return HooksDir::Unusable(NoHooksDir::Empty);
+    }
+
+    let default = git_dir.join("hooks");
+    let answer = git_output(root, &["rev-parse", "--git-path", "hooks"]).unwrap_or_default();
+    // Nur den Zeilenumbruch abschneiden. Ein `trim()` fräße Pfadbestandteile:
+    // `core.hooksPath = ".husky "` ist zulässig, Git bewahrt das Leerzeichen und
+    // führt die Hooks aus `.husky ` aus. Wer hier trimmt, schreibt nach `.husky`
+    // und meldet Erfolg — der Ausfall aus #9, nur eine Ecke weiter.
+    let answer = answer.trim_end_matches(['\n', '\r']);
+    let dir = if answer.is_empty() {
+        // Schweigt `rev-parse`, obwohl `core.hooksPath` gesetzt ist, wäre der
+        // Rückfall auf `<git-dir>/hooks` geraten — und zwar in die Richtung, die
+        // #9 gerade geschlossen hat: schreiben, wo Git nie liest. Lieber
+        // abbrechen und den Nutzer nachsehen lassen.
+        if configured.is_some() {
+            return HooksDir::Unusable(NoHooksDir::Unanswered);
+        }
+        default
+    } else {
+        // **Unnormalisiert.** Git löst `..` physisch auf, nicht textuell: Führt
+        // eine Komponente davor über einen Symlink, meint `links/../hooks`
+        // etwas anderes als die textuelle Vereinfachung `hooks`. Geschrieben
+        // wird deshalb über genau den Pfad, den Git genannt hat — das Auflösen
+        // überlassen wir demselben Betriebssystem, das auch Git antwortet.
+        root.join(answer)
+    };
+
+    // Für die *Entscheidung* zusätzlich textuell normalisieren: `canonicalize`
+    // antwortet nur für existierende Pfade, und `gibtsnicht/..` zeigt auf die
+    // Wurzel, ohne dass es `gibtsnicht` gäbe. Ohne diesen Schritt liefe der
+    // Riegel ins Leere und drei ausführbare Dateien landeten im Quellcode.
+    //
+    // Geschrieben wird weiter über `dir`, den **unnormalisierten** Pfad: Git
+    // löst `..` physisch auf, und über einen Symlink meint `links/../hooks`
+    // etwas anderes als die textuelle Vereinfachung.
+    if same_location(&dir, root) || same_location(&lexically_normalized(dir.clone()), root) {
+        return HooksDir::Unusable(NoHooksDir::WorktreeRoot);
+    }
+    HooksDir::At(dir)
+}
+
+/// Wohin Git die Hooks dieses Repositories legt — oder dass es keine ausführt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum HooksDir {
+    /// Aus diesem Verzeichnis führt Git die Hooks aus.
+    At(PathBuf),
+    /// Es gibt keinen Ort, an dem ein Hook etwas bewirken würde.
+    Unusable(NoHooksDir),
+}
+
+/// Warum `core.hooksPath` auf kein brauchbares Hook-Verzeichnis führt.
+///
+/// Beide Fälle enden gleich — wir schreiben nichts —, aber aus verschiedenen
+/// Gründen, und der Nutzer braucht den Grund, um es zu beheben.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NoHooksDir {
+    /// `core.hooksPath` ist gesetzt, aber leer: Git führt **keine** Hooks aus.
+    /// Jede Datei, die wir schrieben, wäre tot.
+    Empty,
+    /// `core.hooksPath` ist gesetzt, aber `git rev-parse --git-path hooks` gibt
+    /// keine Antwort (defekte Config, sehr altes Git). Dann wüssten wir nicht,
+    /// wohin — und zu raten hieße, womöglich dorthin zu schreiben, wo Git nie
+    /// liest.
+    Unanswered,
+    /// Das effektive Verzeichnis ist die Arbeitskopie selbst — so kommt es bei
+    /// `core.hooksPath = .` zustande.
+    ///
+    /// Git selbst kommt damit nicht zurecht (gemessen mit git 2.51: `error:
+    /// cannot run post-commit: No such file or directory`, weil es den nackten
+    /// Namen ohne `./` auszuführen versucht). Selbst wenn es liefe, wäre das
+    /// Ergebnis falsch: Drei ausführbare, unversionierte Dateien lägen zwischen
+    /// dem Quellcode des Nutzers — und `git add -A` nähme sie mit.
+    WorktreeRoot,
+}
+
+impl HooksDir {
+    /// Das Verzeichnis, oder ein Fehler, der den Grund benennt.
+    ///
+    /// Fail-closed: Lieber ein Abbruch mit Begründung als ein `enable`, das
+    /// Erfolg meldet und nichts bewirkt — das ist derselbe stille Ausfall, den
+    /// dieses Modul gerade erst geschlossen hat.
+    pub(crate) fn require(&self) -> std::io::Result<&Path> {
+        match self {
+            Self::At(dir) => Ok(dir),
+            Self::Unusable(NoHooksDir::Empty) => Err(std::io::Error::other(
+                "core.hooksPath ist gesetzt, aber leer — Git führt dann gar keine Hooks aus. \
+                 Setze einen Pfad oder entferne den Schlüssel: git config --unset core.hooksPath",
+            )),
+            Self::Unusable(NoHooksDir::Unanswered) => Err(std::io::Error::other(
+                "core.hooksPath ist gesetzt, aber `git rev-parse --git-path hooks` antwortet \
+                 nicht — dann lässt sich nicht sagen, aus welchem Verzeichnis Git die Hooks \
+                 ausführt. Prüfe die Git-Konfiguration",
+            )),
+            Self::Unusable(NoHooksDir::WorktreeRoot) => Err(std::io::Error::other(
+                "core.hooksPath zeigt auf die Repo-Wurzel — dort würden die Hooks als \
+                 ausführbare Dateien zwischen deinem Quellcode liegen, und Git führt sie von \
+                 dort nicht aus. Setze core.hooksPath auf ein eigenes Verzeichnis, etwa .husky",
+            )),
+        }
+    }
 }
 
 /// Sucht von der aktuellen Position aufwärts das Repository. Eigene, dumme
-/// Suche wie im Journal — `enable` braucht kein `minds-git`, nur zwei
+/// Suche wie im Journal — `enable` braucht kein `minds-git`, nur die
 /// Verzeichnisse.
 fn locate() -> std::io::Result<RepoPaths> {
     let start = std::env::current_dir()?;
@@ -866,9 +1454,11 @@ fn locate() -> std::io::Result<RepoPaths> {
         let candidate = dir.join(".git");
         match fs::metadata(&candidate) {
             Ok(m) if m.is_dir() => {
+                let hooks = effective_hooks_dir(dir, &candidate);
                 return Ok(RepoPaths {
                     root: dir.to_path_buf(),
                     git_dir: candidate,
+                    hooks,
                 });
             }
             // `.git` als Datei (verlinkte Worktrees) wird hier bewusst nicht
@@ -933,6 +1523,431 @@ mod tests {
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    /// Ein frisch initialisiertes Repository. `None`, wenn kein `git` im Pfad
+    /// liegt — dort soll der Test nicht falsch-rot werden.
+    fn init_repo() -> Option<tempfile::TempDir> {
+        let dir = tmp();
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "--quiet"])
+            .status()
+            .ok()?
+            .success();
+        ok.then_some(dir)
+    }
+
+    fn git_config(root: &Path, key: &str, value: &str) {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["config", "--local", key, value])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "`git config {key}` schlug fehl");
+    }
+
+    /// Die Regression aus #9: In einem Repo mit `core.hooksPath` (husky,
+    /// lefthook, pre-commit) las Git unsere Hooks **nie** — `enable` meldete
+    /// trotzdem Erfolg. Vorher landete der Block in `.git/hooks`, hier liegt er
+    /// da, wo Git ihn tatsächlich ausführt.
+    #[test]
+    fn git_hooks_follow_a_relative_core_hookspath() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        git_config(root, "core.hooksPath", ".husky");
+
+        let hooks = effective_hooks_dir(root, &root.join(".git"));
+        assert_eq!(hooks, HooksDir::At(root.join(".husky")));
+        let hooks = hooks.require().unwrap().to_path_buf();
+
+        let change = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap();
+        assert_eq!(change, Change::Created);
+
+        let written = fs::read_to_string(root.join(".husky/post-commit")).unwrap();
+        assert!(written.contains(MARK_BEGIN), "unser Block fehlt: {written}");
+        assert!(written.contains("minds checkpoint"));
+        assert!(
+            !root.join(".git/hooks/post-commit").exists(),
+            "der Hook darf nicht im ignorierten Verzeichnis landen"
+        );
+    }
+
+    /// `core.hooksPath` darf auch absolut sein — dann ist die Repo-Wurzel als
+    /// Basis gerade nicht gemeint.
+    #[test]
+    fn git_hooks_follow_an_absolute_core_hookspath() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        let elsewhere = root.join("anderswo");
+        git_config(root, "core.hooksPath", &elsewhere.display().to_string());
+
+        assert_eq!(
+            effective_hooks_dir(root, &root.join(".git")),
+            HooksDir::At(elsewhere),
+            "ein absoluter Pfad darf nicht an die Wurzel gehängt werden"
+        );
+    }
+
+    /// Ohne `core.hooksPath` bleibt alles wie bisher.
+    #[test]
+    fn without_core_hookspath_the_hooks_stay_in_the_git_dir() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        // Ein global gesetztes core.hooksPath in der Entwickler-Umgebung würde
+        // diesen Fall verfälschen; dann sagt der Test nichts aus. Der Skip wird
+        // gemeldet, sonst wäre er ausgerechnet auf den Maschinen unsichtbar, für
+        // die dieses Feature gebaut ist. (Die Integrationstests decken den Fall
+        // hermetisch ab — dort lässt sich die Config der Kindprozesse setzen.)
+        if git_config_value(root, "core.hooksPath").is_some() {
+            eprintln!("global gesetztes core.hooksPath — Test übersprungen");
+            return;
+        }
+
+        let git_dir = root.join(".git");
+        assert_eq!(
+            effective_hooks_dir(root, &git_dir),
+            HooksDir::At(git_dir.join("hooks"))
+        );
+    }
+
+    /// Der Fall, der `enable` dazu brachte, ausführbare Dateien in die
+    /// Arbeitskopie zu legen: `core.hooksPath` ist **gesetzt, aber leer**.
+    ///
+    /// Git führt dann gar keine Hooks aus und meldet dabei nichts —
+    /// `rev-parse --git-path hooks` antwortet trotzdem mit `./`. Wer dieser
+    /// Antwort folgt, schreibt `post-commit` & Co. in die Repo-Wurzel, wo sie
+    /// als unversionierte Dateien liegen bleiben und nie laufen.
+    #[test]
+    fn an_empty_core_hookspath_disables_hooks_instead_of_moving_them() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        git_config(root, "core.hooksPath", "");
+
+        assert_eq!(
+            effective_hooks_dir(root, &root.join(".git")),
+            HooksDir::Unusable(NoHooksDir::Empty),
+            "ein leerer Wert ist kein Verzeichnis"
+        );
+    }
+
+    /// Der zweite Weg in dieselbe Sackgasse: `core.hooksPath = .` löst auf die
+    /// Arbeitskopie selbst auf.
+    ///
+    /// Er kommt anders zustande als der leere Wert — der Wert *ist* gesetzt und
+    /// *ist* nicht leer, erst die Auflösung landet auf der Wurzel —, und er
+    /// endet gleich: Dort würden drei ausführbare, unversionierte Dateien
+    /// zwischen dem Quellcode liegen, und Git führt sie von dort nicht aus.
+    #[test]
+    fn a_hookspath_that_resolves_to_the_worktree_root_is_refused() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        git_config(root, "core.hooksPath", ".");
+
+        assert_eq!(
+            effective_hooks_dir(root, &root.join(".git")),
+            HooksDir::Unusable(NoHooksDir::WorktreeRoot)
+        );
+    }
+
+    /// Und die Folge davon: `enable` bricht ab, statt Erfolg zu melden — mit
+    /// einer Begründung, die den Schlüssel nennt und sagt, was zu tun ist.
+    #[test]
+    fn an_unusable_hooks_dir_is_an_error_that_names_the_key() {
+        let empty = HooksDir::Unusable(NoHooksDir::Empty)
+            .require()
+            .unwrap_err()
+            .to_string();
+        assert!(empty.contains("core.hooksPath"), "{empty}");
+        assert!(empty.contains("keine Hooks"), "{empty}");
+        assert!(empty.contains("--unset"), "die Abhilfe fehlt: {empty}");
+
+        let root = HooksDir::Unusable(NoHooksDir::WorktreeRoot)
+            .require()
+            .unwrap_err()
+            .to_string();
+        assert!(root.contains("core.hooksPath"), "{root}");
+        assert!(root.contains("Repo-Wurzel"), "{root}");
+        assert!(root.contains(".husky"), "die Abhilfe fehlt: {root}");
+    }
+
+    /// „Nicht gesetzt" und „gesetzt, aber leer" sehen in der Ausgabe gleich aus
+    /// — der Exit-Status trennt sie. Genau darauf steht die Fallunterscheidung.
+    #[test]
+    fn an_unset_key_and_an_empty_value_are_told_apart() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        if git_config_value(root, "core.hooksPath").is_some() {
+            // Global gesetzt — „nicht gesetzt" lässt sich hier nicht herstellen.
+            eprintln!("global gesetztes core.hooksPath — Test übersprungen");
+            return;
+        }
+
+        assert_eq!(git_config_value(root, "core.hooksPath"), None);
+        git_config(root, "core.hooksPath", "");
+        assert_eq!(
+            git_config_value(root, "core.hooksPath"),
+            Some(String::new())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Golden: der Wortlaut des Hinweises auf ein verschobenes Verzeichnis
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn golden_no_note_for_the_default_directory() {
+        let root = Path::new("/repo");
+        let git_dir = Path::new("/repo/.git");
+        assert_eq!(
+            moved_hooks_note(root, git_dir, &git_dir.join("hooks")),
+            None
+        );
+    }
+
+    #[test]
+    fn golden_note_for_a_directory_inside_the_repo() {
+        assert_eq!(
+            moved_hooks_note(
+                Path::new("/repo"),
+                Path::new("/repo/.git"),
+                Path::new("/repo/.husky")
+            ),
+            Some(
+                "Hinweis: core.hooksPath ist gesetzt — die Git-Hooks gehen nach „.husky“"
+                    .to_owned()
+            )
+        );
+    }
+
+    /// Der Angriff, gegen den [`read_existing_hook`] fail-closed ist: Ein
+    /// eingecheckter Symlink im Hook-Verzeichnis (bei `core.hooksPath = .husky`
+    /// ist das die Arbeitskopie) zeigt auf eine private Datei. Ohne die Prüfung
+    /// schriebe `fs::write` durch den Link und `chmod` machte `0600` zu `0755`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_hook_is_refused_instead_of_followed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let victim = dir.path().join("credentials");
+        fs::write(&victim, "AWS_SECRET_ACCESS_KEY=geheim\n").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let hooks = dir.path().join(".husky");
+        fs::create_dir_all(&hooks).unwrap();
+        std::os::unix::fs::symlink(&victim, hooks.join("post-commit")).unwrap();
+
+        let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+
+        // Und das Opfer ist unangetastet — Inhalt wie Rechte.
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "AWS_SECRET_ACCESS_KEY=geheim\n"
+        );
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    /// Die Kehrseite der entfernten Verzeichnis-Sperre, als Regressionsschutz:
+    /// Ein symlinktes `.git` (oder ein geteiltes `.git/hooks`) ist ein Setup,
+    /// das Git unterstützt — `enable` darf daran nicht scheitern. Ein Versuch,
+    /// Symlinks auf dem Weg abzulehnen, hat genau das getan.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_hooks_directory_is_not_refused() {
+        let dir = tmp();
+        let real = dir.path().join("wirklich-hier");
+        fs::create_dir_all(&real).unwrap();
+        let hooks = dir.path().join("verlinkt");
+        std::os::unix::fs::symlink(&real, &hooks).unwrap();
+
+        assert!(ensure_writable(&hooks).is_ok());
+        assert_eq!(
+            enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap(),
+            Change::Created
+        );
+        // Geschrieben wird am Ziel — das ist die bewusst getragene Folge.
+        assert!(real.join("post-commit").is_file());
+    }
+
+    /// Die Nachbardatei darf keinem vorgelegten Symlink folgen. Der Name ist
+    /// zwar zufällig, aber `create_new` ist die Zusage — hier direkt geprüft,
+    /// indem der Name vorher belegt wird.
+    #[cfg(unix)]
+    #[test]
+    fn a_taken_temp_name_is_refused_instead_of_followed() {
+        let dir = tmp();
+        let victim = dir.path().join("opfer.txt");
+        fs::write(&victim, "unberührt\n").unwrap();
+
+        let taken = dir.path().join("belegt");
+        std::os::unix::fs::symlink(&victim, &taken).unwrap();
+
+        let err = create_new_file(&taken).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "unberührt\n");
+    }
+
+    /// Der Ersatz für den Symlink beim Schreiben: Selbst wenn zwischen Prüfung
+    /// und Schreibzugriff ein Link an die Stelle käme, ersetzt `rename` den
+    /// Namen. Hier direkt geprüft — ein bestehender Hook wird ersetzt, ohne dass
+    /// eine Temp-Datei zurückbleibt.
+    #[test]
+    fn writing_a_hook_leaves_no_temp_file_behind() {
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap();
+        enable_git_hook(&hooks, "post-commit", "minds etwas-anderes").unwrap();
+
+        let leftovers: Vec<_> = fs::read_dir(&hooks)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "post-commit")
+            .collect();
+        assert!(leftovers.is_empty(), "übrig geblieben: {leftovers:?}");
+    }
+
+    /// Eine Datei jenseits jeder Hook-Größe wird nicht eingelesen. Ohne die
+    /// Grenze liefe ein eingecheckter Symlink auf `/dev/zero` bis zum
+    /// Speicherende.
+    #[test]
+    fn an_oversized_file_is_refused_before_it_is_read() {
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        fs::write(
+            hooks.join("post-commit"),
+            vec![b'x'; MAX_HOOK_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
+        assert!(err.to_string().contains("kein Hook-Skript"), "{err}");
+    }
+
+    /// Steuerzeichen aus der Config dürfen die Ausgabe nicht umschreiben.
+    #[test]
+    fn control_characters_in_a_path_are_defused() {
+        let shown = display_path(Path::new("\u{1b}[2K\u{1b}[Aböse"));
+        assert!(
+            !shown.contains('\u{1b}'),
+            "roher Escape blieb stehen: {shown}"
+        );
+        assert!(shown.contains("böse"), "{shown}");
+    }
+
+    /// Ein Wert mit Leerzeichen ist ein zulässiger Verzeichnisname, und Git
+    /// führt die Hooks von dort aus. Wer die `rev-parse`-Antwort trimmt,
+    /// schreibt nach `.git/hooks` und meldet Erfolg — der Ausfall aus #9, nur
+    /// eine Ecke weiter.
+    #[test]
+    fn a_hookspath_with_trailing_space_keeps_its_space() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        git_config(root, "core.hooksPath", ".husky ");
+
+        assert_eq!(
+            effective_hooks_dir(root, &root.join(".git")),
+            HooksDir::At(root.join(".husky "))
+        );
+    }
+
+    /// `gibtsnicht/..` zeigt auf die Arbeitskopie-Wurzel — auch wenn es
+    /// `gibtsnicht` nicht gibt. `canonicalize` schweigt dann, der Riegel muss
+    /// trotzdem greifen; sonst landen drei ausführbare Dateien im Quellcode.
+    #[test]
+    fn a_parent_hop_to_the_root_is_refused_even_if_the_hop_does_not_exist() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        git_config(root, "core.hooksPath", "gibtsnicht/..");
+
+        assert_eq!(
+            effective_hooks_dir(root, &root.join(".git")),
+            HooksDir::Unusable(NoHooksDir::WorktreeRoot)
+        );
+    }
+
+    /// Und der reine Whitespace-Pfad ist nicht „leer": Git legt die Hooks in ein
+    /// Verzeichnis, das so heißt, und führt sie von dort aus.
+    #[test]
+    fn a_whitespace_hookspath_is_a_directory_not_an_empty_value() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        git_config(root, "core.hooksPath", "  ");
+
+        assert_eq!(
+            effective_hooks_dir(root, &root.join(".git")),
+            HooksDir::At(root.join("  "))
+        );
+    }
+
+    /// `..` im Pfad darf die Einordnung „innen oder außen" nicht kippen —
+    /// lexikalisch verglichen sähe `<root>/../global-hooks` wie ein Pfad
+    /// *innerhalb* der Wurzel aus.
+    #[test]
+    fn a_parent_dir_hop_leaves_the_repo() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        // Die Erwartung selbst kanonisieren: Das Temp-Verzeichnis liegt auf
+        // macOS hinter `/var -> /private/var`, sonst verglichen wir zwei
+        // Schreibweisen desselben Ortes.
+        let outside = canonical_prefix(&dir.path().join("global-hooks"));
+
+        // `<root>/../global-hooks` ist derselbe Ort wie `<tmp>/global-hooks` —
+        // und liegt außerhalb. Ein Vergleich Komponente für Komponente hielte
+        // ihn für einen Pfad *innerhalb* von `<root>`.
+        assert_eq!(canonical_prefix(&root.join("../global-hooks")), outside);
+
+        assert!(
+            moved_hooks_note(&root, &root.join(".git"), &root.join("../global-hooks"))
+                .is_some_and(|note| note.contains("aus dem Repo heraus")),
+            "ein Pfad über `..` liegt außerhalb"
+        );
+        // Und innerhalb bleibt innerhalb.
+        assert!(
+            moved_hooks_note(&root, &root.join(".git"), &root.join(".husky"))
+                .is_some_and(|note| !note.contains("aus dem Repo heraus")),
+            ".husky liegt im Repo"
+        );
+    }
+
+    /// `canonical_prefix` muss auch dann antworten, wenn das Verzeichnis noch
+    /// gar nicht existiert — `enable` legt es erst an, die Einordnung braucht
+    /// aber vorher eine Aussage.
+    #[test]
+    fn canonical_prefix_resolves_what_exists_and_keeps_the_rest() {
+        let dir = tmp();
+        let real = fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(
+            canonical_prefix(&dir.path().join("gibt/es/noch/nicht")),
+            real.join("gibt/es/noch/nicht")
+        );
+    }
+
+    /// Außerhalb des Repos ist die Folge eine andere — und die muss dastehen:
+    /// Ein `enable` in *einem* Repo schaltet dann alle Repos scharf.
+    #[test]
+    fn golden_note_for_a_directory_outside_the_repo() {
+        assert_eq!(
+            moved_hooks_note(
+                Path::new("/repo"),
+                Path::new("/repo/.git"),
+                Path::new("/home/anna/git-hooks")
+            ),
+            Some(
+                "Hinweis: core.hooksPath zeigt aus dem Repo heraus („/home/anna/git-hooks“) — \
+                 die Hooks gelten damit für alle deine Repositories"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]
@@ -1130,13 +2145,15 @@ mod tests {
     #[test]
     fn git_hook_is_created_marked_and_executable() {
         let dir = tmp();
-        let git_dir = dir.path().join(".git");
-        fs::create_dir_all(&git_dir).unwrap();
+        let hooks_dir = dir.path().join(".git/hooks");
 
-        let change = enable_git_hook(&git_dir, "post-commit", POST_COMMIT_BODY).unwrap();
+        // Das Verzeichnis gibt es absichtlich noch nicht: Ein verschobenes
+        // `core.hooksPath` zeigt oft auf ein Verzeichnis, das erst entstehen
+        // muss.
+        let change = enable_git_hook(&hooks_dir, "post-commit", POST_COMMIT_BODY).unwrap();
         assert_eq!(change, Change::Created);
 
-        let path = git_dir.join("hooks/post-commit");
+        let path = hooks_dir.join("post-commit");
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.starts_with("#!/bin/sh"));
         assert!(body.contains(MARK_BEGIN) && body.contains(MARK_END));
@@ -1150,7 +2167,7 @@ mod tests {
         }
 
         assert_eq!(
-            enable_git_hook(&git_dir, "post-commit", POST_COMMIT_BODY).unwrap(),
+            enable_git_hook(&hooks_dir, "post-commit", POST_COMMIT_BODY).unwrap(),
             Change::Unchanged
         );
     }
@@ -1158,12 +2175,12 @@ mod tests {
     #[test]
     fn git_hook_preserves_the_users_own_lines() {
         let dir = tmp();
-        let git_dir = dir.path().join(".git");
-        fs::create_dir_all(git_dir.join("hooks")).unwrap();
-        let path = git_dir.join("hooks/post-commit");
+        let hooks_dir = dir.path().join(".git/hooks");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let path = hooks_dir.join("post-commit");
         fs::write(&path, "#!/bin/sh\necho meins\n").unwrap();
 
-        enable_git_hook(&git_dir, "post-commit", POST_COMMIT_BODY).unwrap();
+        enable_git_hook(&hooks_dir, "post-commit", POST_COMMIT_BODY).unwrap();
         let body = fs::read_to_string(&path).unwrap();
         assert!(body.contains("echo meins"), "fremde Zeile bleibt");
         assert!(body.contains(MARK_BEGIN));

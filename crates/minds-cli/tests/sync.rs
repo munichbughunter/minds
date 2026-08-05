@@ -55,20 +55,24 @@ fn repo_with_remote() -> Option<(tempfile::TempDir, std::path::PathBuf)> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Output {
-    Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .expect("git läuft")
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    without_user_config(&mut cmd).output().expect("git läuft")
+}
+
+/// Schneidet die Git-Config des Entwicklers ab: Ein global gesetztes
+/// `core.hooksPath` (husky, lefthook) verschiebt seit #9 auch hier das
+/// Hook-Verzeichnis, `commit.gpgsign` verlangt eine Signatur. Beides machte den
+/// Lauf von der Maschine abhängig. `/dev/null` schaltet die Config-Ebene ab.
+fn without_user_config(cmd: &mut Command) -> &mut Command {
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
 }
 
 fn minds(dir: &Path, args: &[&str]) -> Output {
-    Command::new(MINDS)
-        .current_dir(dir)
-        .args(args)
-        .output()
-        .expect("minds läuft")
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir).args(args);
+    without_user_config(&mut cmd).output().expect("minds läuft")
 }
 
 fn text(output: &Output) -> String {
