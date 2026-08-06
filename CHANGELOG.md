@@ -21,6 +21,22 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- `minds enable` schreibt nicht mehr ungefragt in ein Hook-Verzeichnis
+  **außerhalb des Repos** — und ein eingecheckter Symlink kann es nicht mehr
+  unbemerkt dorthin umlenken. Entschieden wird über den **aufgelösten Ort**,
+  nicht über Schreibweisen: Ob `core.hooksPath` direkt nach draußen zeigt
+  (global gesetzt, `init.templateDir`) oder ein Symlink in der Arbeitskopie
+  (`.husky` → anderswo, auch mit nachgestelltem Schrägstrich, Pfad-Alias oder
+  Link im Vorfahren) — liegt das Ziel außerhalb von Arbeitskopie und
+  Git-Verzeichnis, fragt `enable` nach, denn Hooks dort gelten für **alle**
+  Repositories, die das Verzeichnis benutzen. Interaktiv als Rückfrage
+  (Default: Nein), in Skripten per `--global-hooks`; ohne Zustimmung bricht
+  `enable` ab, **bevor** irgendetwas geschrieben ist. Ein symlinktes `.git`
+  und ein geteiltes `.git/hooks` bleiben dagegen ohne Rückfrage — dorthin
+  kann ein Checkout nichts legen. `minds fsck` benennt ein Verzeichnis
+  außerhalb des Repos jetzt ebenfalls.
+  ([#66](https://github.com/munichbughunter/minds/issues/66),
+  [#64](https://github.com/munichbughunter/minds/issues/64))
 - Der Argument-Parser ist **strikt** geworden. Ein unbekanntes Flag war bisher
   Rauschen: `minds fsck --require-reviews` (Tippfehler) lief als nacktes `fsck`
   durch und lieferte Exit 0 — das CI-Policy-Gate war damit lautlos

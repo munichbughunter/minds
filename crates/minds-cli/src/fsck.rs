@@ -299,6 +299,12 @@ enum HookState {
         /// Wo unser Block stattdessen liegt: das ignorierte `<git-dir>/hooks` —
         /// der Fingerabdruck eines `enable` aus der Zeit vor #9.
         stray: Option<PathBuf>,
+        /// Liegt das Verzeichnis außerhalb von Arbeitskopie und
+        /// Git-Verzeichnis (#66)? Dann gelten die Hooks für **alle**
+        /// Repositories, die es benutzen — `enable` schreibt dorthin nur mit
+        /// Zustimmung, und `fsck` sagt es dazu, statt den Ort wie einen
+        /// gewöhnlichen zu behandeln.
+        outside: bool,
     },
 }
 
@@ -342,13 +348,58 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
         }))
     .then_some(default_dir);
 
+    // In einem Linked Worktree (`git worktree add`) liegt das effektive
+    // Hook-Verzeichnis im *common dir* des Haupt-Repos — kanonisch außerhalb
+    // von allem, was dieser Worktree als root/git_dir kennt. Das ist ein von
+    // Git verwaltetes Verzeichnis, kein fremder Ort: „gilt für alle
+    // Repositories" wäre dort schlicht falsch. Deshalb zählt Outside erst,
+    // wenn der Ort auch unter dem common dir **nicht** liegt.
+    let mut outside =
+        crate::enable::hooks_scope(root, git_dir, &hooks_dir) == crate::enable::HooksScope::Outside;
+    if outside {
+        if let Some(common) = common_git_dir(git_dir) {
+            outside = crate::enable::hooks_scope(root, &common, &hooks_dir)
+                == crate::enable::HooksScope::Outside;
+        }
+    }
+
     HookState::Checked {
         hooks_dir,
         missing,
         outdated,
         refused,
         stray,
+        outside,
     }
+}
+
+/// Das *common dir* zu einem Git-Verzeichnis — bei Linked Worktrees das
+/// `.git` des Haupt-Repos, sonst das Verzeichnis selbst. `None`, wenn Git
+/// nicht antwortet; der Aufrufer bleibt dann bei seiner ersten Einordnung.
+fn common_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    let out = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let answer = String::from_utf8_lossy(&out.stdout);
+    let answer = answer.trim_end_matches(['\n', '\r']);
+    if answer.is_empty() {
+        return None;
+    }
+    // Eine relative Antwort ist relativ zum Arbeitsverzeichnis des Aufrufs —
+    // im Zweifel gegen das Git-Verzeichnis aufgelöst, damit der Vergleich
+    // nicht an der Schreibweise hängt.
+    let path = Path::new(answer);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        git_dir.join(path)
+    })
 }
 
 /// Was an einem Hook-Pfad liegt.
@@ -408,7 +459,7 @@ fn inspect_hook(name: &str, path: &Path) -> Hook {
 /// Anführungszeichen: Ein Pfad mit Leerzeichen ist sonst nicht als einer zu
 /// erkennen, und ein leerer Pfad ließe den Satz mitten im Nichts enden.
 fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
-    let (hooks_dir, missing, outdated, refused, stray) = match state {
+    let (hooks_dir, missing, outdated, refused, stray, outside) = match state {
         HookState::Unusable(why) => {
             let first = match why {
                 NoHooksDir::Empty => {
@@ -432,12 +483,29 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
             outdated,
             refused,
             stray,
-        } => (hooks_dir, missing, outdated, refused, stray),
+            outside,
+        } => (hooks_dir, missing, outdated, refused, stray, *outside),
     };
 
     let dir = short(root, hooks_dir);
+    // Ein Verzeichnis außerhalb des Repos ist kein gewöhnlicher Ort — die
+    // Hooks dort gelten für alle Repositories, die es benutzen (#66). Das
+    // steht in jeder Fassung des Berichts dazu, damit `enable` (das dort nur
+    // mit Zustimmung schreibt) und `fsck` dieselbe Sprache sprechen. Und der
+    // Rat muss dann `--global-hooks` nennen: Ein nacktes `minds enable` liefe
+    // nicht-interaktiv genau in den Abbruch, vor dem der Rat stehen soll.
+    let scope_note = outside.then(|| {
+        format!("  „{dir}“ liegt außerhalb des Repos — Hooks dort gelten für alle Repositories")
+    });
+    let enable_cmd = if outside {
+        "`minds enable --global-hooks`"
+    } else {
+        "`minds enable`"
+    };
     if missing.is_empty() && outdated.is_empty() && refused.is_empty() {
-        return vec![format!("Hooks: installiert in „{dir}“")];
+        let mut lines = vec![format!("Hooks: installiert in „{dir}“")];
+        lines.extend(scope_note);
+        return lines;
     }
 
     let mut lines = Vec::new();
@@ -457,7 +525,7 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
                 short(root, stray)
             ));
         }
-        lines.push(format!("  `minds enable` installiert {object} (neu)"));
+        lines.push(format!("  {enable_cmd} installiert {object} (neu)"));
     }
 
     // Veraltet heißt: Git führt den Hook aus, er tut nur nicht mehr das, was
@@ -473,7 +541,7 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
             "Hooks: {} in „{dir}“ {verb} aus einer älteren minds-Version",
             outdated.join(", ")
         ));
-        lines.push("  `minds enable` bringt den Block auf den Stand".to_owned());
+        lines.push(format!("  {enable_cmd} bringt den Block auf den Stand"));
     }
 
     // Abgelehnte Hooks bekommen den Grund statt des Rats: `minds enable` würde
@@ -483,6 +551,13 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
             "Hooks: {name} in „{dir}“ ist kein Hook, den minds ergänzt"
         ));
         lines.push(format!("  {reason}"));
+    }
+
+    // Die Ortszeile kommt **nach** der ersten `Hooks:`-Zeile — die erste Zeile
+    // fasst zusammen, weitere erklären; eine Einrückung ohne Satz davor läse
+    // sich wie ein verrutschter Rest.
+    if let Some(note) = scope_note {
+        lines.insert(1.min(lines.len()), note);
     }
     lines
 }
@@ -878,6 +953,7 @@ mod tests {
             outdated: vec![],
             refused: vec![("post-commit", "…/post-commit ist ein Symlink".to_owned())],
             stray: None,
+            outside: false,
         };
         assert_eq!(
             lines(&state),
@@ -924,8 +1000,55 @@ mod tests {
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec![],
             stray: None,
+            outside: false,
         };
         assert_eq!(lines(&state), ["Hooks: installiert in „.husky“"]);
+    }
+
+    /// Ein Verzeichnis außerhalb des Repos (#66): Die Ortszeile steht **nach**
+    /// der ersten `Hooks:`-Zeile — die erste Zeile fasst zusammen, weitere
+    /// erklären —, und der Rat nennt `--global-hooks`, weil ein nacktes
+    /// `minds enable` nicht-interaktiv genau in den Abbruch liefe.
+    #[test]
+    fn golden_an_outside_dir_is_named_after_the_summary_line() {
+        let state = HookState::Checked {
+            refused: vec![],
+            outdated: vec![],
+            hooks_dir: PathBuf::from("/woanders/hooks"),
+            missing: vec!["post-commit"],
+            stray: None,
+            outside: true,
+        };
+        assert_eq!(
+            lines(&state),
+            [
+                "Hooks: post-commit fehlt in „/woanders/hooks“",
+                "  „/woanders/hooks“ liegt außerhalb des Repos — Hooks dort gelten für alle \
+                 Repositories",
+                "  `minds enable --global-hooks` installiert ihn (neu)",
+            ]
+        );
+    }
+
+    /// Und im sauberen Zustand hängt die Ortszeile an der Installiert-Zeile.
+    #[test]
+    fn golden_an_installed_outside_dir_still_carries_the_note() {
+        let state = HookState::Checked {
+            refused: vec![],
+            outdated: vec![],
+            hooks_dir: PathBuf::from("/woanders/hooks"),
+            missing: vec![],
+            stray: None,
+            outside: true,
+        };
+        assert_eq!(
+            lines(&state),
+            [
+                "Hooks: installiert in „/woanders/hooks“",
+                "  „/woanders/hooks“ liegt außerhalb des Repos — Hooks dort gelten für alle \
+                 Repositories",
+            ]
+        );
     }
 
     /// Genau ein fehlender Hook — der Satz muss im Singular stimmen.
@@ -937,6 +1060,7 @@ mod tests {
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec!["prepare-commit-msg"],
             stray: None,
+            outside: false,
         };
         assert_eq!(
             lines(&state),
@@ -955,6 +1079,7 @@ mod tests {
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec!["post-commit", "prepare-commit-msg"],
             stray: Some(PathBuf::from("/repo/.git/hooks")),
+            outside: false,
         };
         assert_eq!(
             lines(&state),
@@ -1022,6 +1147,7 @@ mod tests {
             hooks_dir: PathBuf::from("/repo/mein ordner/hooks"),
             missing: vec!["post-commit"],
             stray: None,
+            outside: false,
         };
         assert_eq!(
             lines(&state)[0],
@@ -1101,6 +1227,7 @@ mod tests {
             outdated: vec!["pre-push"],
             refused: vec![],
             stray: None,
+            outside: false,
         };
         assert_eq!(
             lines(&state),
@@ -1119,6 +1246,7 @@ mod tests {
             outdated: vec!["post-commit", "pre-push"],
             refused: vec![],
             stray: None,
+            outside: false,
         };
         assert_eq!(
             lines(&state)[0],
@@ -1134,6 +1262,7 @@ mod tests {
             outdated: vec!["pre-push"],
             refused: vec![],
             stray: None,
+            outside: false,
         };
         // Ein Hinweis zählt, bricht aber die Integrität nicht — der
         // Rückgabewert von `fsck` bleibt davon unberührt.

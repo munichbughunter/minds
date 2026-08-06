@@ -86,6 +86,9 @@ Verwendung:
         es wird angelegt (bare) oder von --child-remote geklont.
         --recall (Claude Code): SessionStart-Hook, der den Kontext-Brief der
         vorigen Sessions der neuen Session voranstellt. Opt-in (kostet Tokens).
+        --global-hooks: bestätigt ein Hook-Verzeichnis außerhalb des Repos
+        (z. B. global gesetztes core.hooksPath) — Hooks dort gelten für alle
+        Repositories. Ohne das Flag fragt enable nach bzw. bricht ab.
 
   minds hook --agent <name> [--event <name>]
         Nimmt ein Agent-Hook-Event auf stdin entgegen und legt es im
@@ -247,7 +250,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "enable",
         value_flags: &["--agent", "--child-repo", "--child-remote", "--ref"],
-        bool_flags: &["-v", "--verbose", "--recall"],
+        bool_flags: &["-v", "--verbose", "--recall", "--global-hooks"],
         hidden_flags: &[enable::BACKGROUND_IMPORT_FLAG],
         positionals: 0,
     },
@@ -544,6 +547,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                     parsed.value("--child-remote"),
                     parsed.has("-v") || parsed.has("--verbose"),
                     parsed.has("--recall"),
+                    parsed.has("--global-hooks"),
                 )
             }
         }
