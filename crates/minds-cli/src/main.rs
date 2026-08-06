@@ -3,33 +3,36 @@
 //! Die Kommandos: [`enable`] (Setup — Hooks + Store-Config), [`hook`] (heißer
 //! Pfad), `checkpoint`/`show`/`why`/`fsck` (kalter Pfad, M6).
 //!
-//! # Warum hier kein clap steht
+//! # Warum hier kein clap steht — und der Parser trotzdem strikt ist
 //!
-//! Ein Argument-Parser ist eine Aussage über die Kommandostruktur. Die
-//! Kommandostruktur von Minds ist noch nicht entworfen; sie jetzt an einem
-//! einzigen Unterkommando auszurichten hieße, sie in M6 wieder umzubauen. Der
-//! Parser unten ist deshalb absichtlich zu dumm, um zu bleiben: kein
-//! Subkommando-Baum, keine Kurzformen, keine Gruppierung.
+//! Der Parser unten ist handgerollt, aber seit #11 nicht mehr dumm: [`SPECS`]
+//! sagt für jedes Unterkommando, welche Flags es kennt, und alles andere ist
+//! ein Fehler. Vorher war ein unbekanntes Flag Rauschen — `minds fsck
+//! --require-reviews` (Tippfehler) lief als nacktes `fsck` durch, Exit 0, und
+//! das CI-Gate war lautlos abgeschaltet. Für ein Werkzeug, dessen Nutzer
+//! Flags generieren (Agents!), ist still-falsch die schlimmste Fehlerklasse.
 //!
-//! Der zweite Grund ist der heiße Pfad. `minds hook` startet bei jedem
-//! Tool-Call des Agenten neu — der Prozess soll stdin lesen, eine Datei
-//! schreiben und enden.
+//! clap bleibt trotzdem draußen, aus zwei Gründen: Das zentrale
+//! Kommando-Gerüst (#22) ist der Moment, an dem sich ein Umbau lohnt — dann
+//! wandern USAGE, `--help` je Subkommando und `agent-help` in eine Quelle.
+//! Und der heiße Pfad: `minds hook` startet bei jedem Tool-Call des Agenten
+//! neu — der Prozess soll stdin lesen, eine Datei schreiben und enden.
+//! [`SPECS`] ist so gebaut, dass ein clap-Derive es später ersetzen kann,
+//! ohne dass die `run()`-Signaturen sich ändern.
 //!
 //! # Die Ausnahme bei den Rückgabewerten
 //!
-//! Alle künftigen Unterkommandos melden Fehler über den Rückgabewert, wie es
-//! sich gehört. `hook` nicht: Es endet **immer** mit 0, auch bei falschen
-//! Argumenten. Der Grund steht in [`hook`] — bei Claude Code bedeutet Exit 2
-//! „blockiere diese Aktion", und ein Rekorder, der wegen eines fehlenden
-//! `--agent` die Arbeit des Nutzers stoppt, hat seinen Zweck verfehlt.
+//! Alle Unterkommandos melden Fehler über den Rückgabewert, wie es sich
+//! gehört — auch Parse-Fehler. `hook` nicht: Es endet **immer** mit 0, selbst
+//! bei falschen Argumenten. Der Grund steht in [`hook`] — bei Claude Code
+//! bedeutet Exit 2 „blockiere diese Aktion", und ein Rekorder, der wegen eines
+//! fehlenden `--agent` die Arbeit des Nutzers stoppt, hat seinen Zweck
+//! verfehlt. Ein Parse-Fehler im `hook`-Pfad geht deshalb in
+//! `<git-dir>/minds/hook.log`, und der Lauf macht mit dem Verwertbaren weiter.
 //!
-//! Der Preis ist, dass eine kaputte Hook-Konfiguration still bleibt. Deshalb
-//! landet sie in `<git-dir>/minds/hook.log`, und deshalb verweist `minds fsck`
-//! darauf.
-//!
-//! Dasselbe gilt für den **kalten** Pfad: `checkpoint`, `prepare-commit-msg` und
-//! `sync` laufen aus Git-Hooks, die ihre Ausgabe wegwerfen. Auch ihre Fehler
-//! gehen deshalb in dieselbe Datei — siehe [`hooklog`]. Ohne das bräche ein
+//! Dasselbe gilt für den **kalten** Pfad: `checkpoint`, `prepare-commit-msg`
+//! und `sync` laufen aus Git-Hooks, die ihre Ausgabe wegwerfen. Auch ihre
+//! Fehler gehen in dieselbe Datei — siehe [`hooklog`]. Ohne das bräche ein
 //! Tippfehler in `.minds/redact.json` die Erfassung dauerhaft und lautlos.
 
 mod agent_help;
@@ -197,240 +200,461 @@ Verwendung:
   minds --help
 ";
 
+/// Was ein Unterkommando an Argumenten kennt — die eine Quelle für den Parser.
+struct Spec {
+    /// Der Name des Unterkommandos.
+    name: &'static str,
+    /// Flags, auf die ein Wert folgt (`--name wert`).
+    value_flags: &'static [&'static str],
+    /// Flags ohne Wert.
+    bool_flags: &'static [&'static str],
+    /// Akzeptiert, aber in keiner Fehlermeldung genannt — interne Flags, die
+    /// bewusst nicht in USAGE stehen.
+    hidden_flags: &'static [&'static str],
+    /// Wie viele positionale Argumente das Kommando höchstens nimmt. Auch
+    /// Überzählige sind ein Fehler, keine Deko: `minds fsck require-review`
+    /// (Bindestriche vergessen) lief sonst als nacktes `fsck` durch — dieselbe
+    /// stille Abschaltung wie beim Flag-Tippfehler, nur ohne Bindestriche.
+    positionals: usize,
+}
+
+const fn spec(
+    name: &'static str,
+    value_flags: &'static [&'static str],
+    bool_flags: &'static [&'static str],
+    positionals: usize,
+) -> Spec {
+    Spec {
+        name,
+        value_flags,
+        bool_flags,
+        hidden_flags: &[],
+        positionals,
+    }
+}
+
+/// Die Kommando-Tabelle — der Parser prüft strikt dagegen (#11).
+///
+/// Ein Flag, das hier nicht steht, ist ein **Fehler**, kein Rauschen: `minds
+/// fsck --require-reviews` (Tippfehler) lief vorher als nacktes `fsck` durch
+/// und lieferte Exit 0 — das CI-Gate war lautlos abgeschaltet. Und ein
+/// Wert-Flag, dem versehentlich ein weiteres Flag folgt (`--summary --sign`),
+/// fraß dieses als Wert — das Review entstand unsigniert, mit Erfolgsmeldung.
+///
+/// Ein Test hält [`agent_help`] mit dieser Tabelle im Gleichschritt; wer hier
+/// ein Kommando ergänzt, bekommt den Zwang zur Karte geschenkt.
+const SPECS: &[Spec] = &[
+    Spec {
+        name: "enable",
+        value_flags: &["--agent", "--child-repo", "--child-remote", "--ref"],
+        bool_flags: &["-v", "--verbose", "--recall"],
+        hidden_flags: &[enable::BACKGROUND_IMPORT_FLAG],
+        positionals: 0,
+    },
+    spec("hook", &["--agent", "--event"], &[], 0),
+    spec("checkpoint", &["--commit"], &[], 0),
+    spec("show", &[], &["--full"], 1),
+    spec("why", &[], &["--full"], 1),
+    spec("blame", &[], &[], 1),
+    spec("recall", &[], &[], 1),
+    spec("distill", &["--path", "--out"], &[], 0),
+    spec("brief", &[], &["--hook"], usize::MAX),
+    spec("recap", &["--limit"], &["--all"], 0),
+    spec("search", &[], &[], 1),
+    spec("agent-help", &[], &[], 0),
+    spec("metrics", &["--format"], &[], 0),
+    spec("fsck", &[], &["--require-review"], 0),
+    spec("forget", &["--reason"], &[], 1),
+    spec("sign", &["--key"], &[], 1),
+    spec("verify", &["--sig", "--signers", "--identity"], &[], 1),
+    spec(
+        "review",
+        &["--summary", "--key"],
+        &["--approve", "--reject", "--needs-work", "--sign"],
+        1,
+    ),
+    spec("reviews", &["--signers", "--identity"], &[], 1),
+    spec("comment", &["--on"], &[], 2),
+    spec("sync", &["--remote"], &["-v", "--verbose"], 0),
+    spec("stack", &["--base"], &[], 0),
+    spec(
+        "gitlab",
+        &["--mr", "--url", "--project", "--token-env"],
+        &["--approve", "--write"],
+        2,
+    ),
+    spec("audit", &["--out", "--base"], &["--export"], 0),
+    spec("render", &["--out"], &[], 0),
+    spec("prepare-commit-msg", &[], &[], 1),
+];
+
+/// Kommandos, die in USAGE fehlen, weil sie kein Nutzer aufruft.
+#[cfg(test)]
+const INTERNAL: &[&str] = &["prepare-commit-msg"];
+
+/// Die Namen der öffentlichen Kommandos — der Maßstab, gegen den
+/// [`agent_help`] getestet wird. Nur im Test gebraucht: Zur Laufzeit fragt
+/// niemand die Tabelle nach Öffentlichkeit, nur der Drift-Test tut es.
+#[cfg(test)]
+pub(crate) fn public_commands() -> impl Iterator<Item = &'static str> {
+    SPECS
+        .iter()
+        .map(|spec| spec.name)
+        .filter(|name| !INTERNAL.contains(name))
+}
+
+/// Das Ergebnis eines strikten Parse-Laufs.
+#[derive(Debug)]
+struct Parsed {
+    values: Vec<(&'static str, String)>,
+    bools: Vec<&'static str>,
+    positionals: Vec<String>,
+}
+
+impl Parsed {
+    fn value(&self, name: &str) -> Option<&str> {
+        self.values
+            .iter()
+            .find(|(flag, _)| *flag == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn has(&self, name: &str) -> bool {
+        self.bools.contains(&name)
+    }
+
+    fn positional(&self, index: usize) -> Option<&str> {
+        self.positionals.get(index).map(String::as_str)
+    }
+}
+
+/// Parst die Argumente **nach** dem Unterkommando strikt gegen dessen [`Spec`].
+///
+/// Die Regeln, jede gegen eine reale Fehlklasse (#11):
+///
+/// - Ein `-`-Argument, das die Tabelle nicht kennt, ist ein Fehler — nicht
+///   Rauschen. Sonst schaltet ein Tippfehler das CI-Gate ab, bei Exit 0.
+/// - Auf ein Wert-Flag darf kein weiteres Flag folgen. Sonst wird aus
+///   `--summary --sign` eine Zusammenfassung namens „--sign", und das Review
+///   entsteht unsigniert.
+/// - Ein Wert-Flag darf nicht zweimal stehen — sonst gewönne still das erste,
+///   und der Aufrufer glaubte, das zweite gelte.
+/// - Überzählige Positionale sind derselbe Fehler ohne Bindestriche:
+///   `minds fsck require-review` lief sonst als nacktes `fsck` durch, und
+///   `minds forget a b` vergäße nur `a` — mit Erfolgsmeldung.
+/// - Positionale und Flags sind reihenfolgeunabhängig: `verify --sig s.sig
+///   b3-…` findet das Subjekt hinter dem Flag-Wert, nicht die Datei.
+/// - `--` beendet die Flag-Deutung: Danach ist alles positional — der einzige
+///   Weg, ein Argument auszusprechen, das mit `-` beginnt
+///   (`minds comment I… -- "-1 zu diesem Ansatz"`).
+fn parse(spec: &Spec, args: &[String]) -> Result<Parsed, String> {
+    let mut parsed = Parsed {
+        values: Vec::new(),
+        bools: Vec::new(),
+        positionals: Vec::new(),
+    };
+
+    let mut literal = false;
+    let mut i = 0;
+    while let Some(arg) = args.get(i) {
+        if !literal {
+            if arg == "--" {
+                literal = true;
+                i += 1;
+                continue;
+            }
+            if let Some(&name) = spec.value_flags.iter().find(|&&flag| flag == arg) {
+                if parsed.value(name).is_some() {
+                    return Err(format!("das Flag {name} steht zweimal"));
+                }
+                match args.get(i + 1) {
+                    Some(value) if !value.starts_with('-') => {
+                        parsed.values.push((name, value.clone()));
+                        i += 2;
+                    }
+                    Some(value) => {
+                        return Err(format!(
+                            "das Flag {name} braucht einen Wert — darauf folgt „{}“",
+                            text::sanitize(value)
+                        ));
+                    }
+                    None => return Err(format!("das Flag {name} braucht einen Wert")),
+                }
+                continue;
+            }
+            if let Some(&name) = spec
+                .bool_flags
+                .iter()
+                .chain(spec.hidden_flags)
+                .find(|&&flag| flag == arg)
+            {
+                parsed.bools.push(name);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') {
+                return Err(unknown_flag(spec, arg));
+            }
+        }
+
+        if parsed.positionals.len() >= spec.positionals {
+            return Err(unexpected_positional(spec, arg));
+        }
+        parsed.positionals.push(arg.clone());
+        i += 1;
+    }
+
+    Ok(parsed)
+}
+
+/// Die Meldung zu einem überzähligen positionalen Argument.
+fn unexpected_positional(spec: &Spec, arg: &str) -> String {
+    let arg = text::sanitize(arg);
+    match spec.positionals {
+        0 => format!(
+            "unerwartetes Argument „{arg}“ — `minds {}` nimmt keine positionalen Argumente",
+            spec.name
+        ),
+        1 => format!(
+            "unerwartetes Argument „{arg}“ — `minds {}` nimmt höchstens ein positionales Argument",
+            spec.name
+        ),
+        n => format!(
+            "unerwartetes Argument „{arg}“ — `minds {}` nimmt höchstens {n} positionale Argumente",
+            spec.name
+        ),
+    }
+}
+
+/// Die Meldung zu einem unbekannten Flag — nennt, was das Kommando kennt,
+/// damit der Tippfehler ohne Blick in die Doku auffindbar ist. Versteckte
+/// Flags bleiben versteckt.
+fn unknown_flag(spec: &Spec, arg: &str) -> String {
+    let known: Vec<&str> = spec
+        .value_flags
+        .iter()
+        .chain(spec.bool_flags)
+        .copied()
+        .collect();
+    let arg = text::sanitize(arg);
+    if known.is_empty() {
+        format!(
+            "unbekanntes Flag {arg} — `minds {}` kennt keine Flags",
+            spec.name
+        )
+    } else {
+        format!(
+            "unbekanntes Flag {arg}\nbekannt für `minds {}`: {}",
+            spec.name,
+            known.join(", ")
+        )
+    }
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    match args.first().map(String::as_str) {
-        Some("enable") => {
+    let Some(command) = args.first().map(String::as_str) else {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    };
+
+    match command {
+        "--version" | "-V" => {
+            println!("minds {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        "--help" | "-h" => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+
+    let Some(spec) = SPECS.iter().find(|spec| spec.name == command) else {
+        eprintln!("unbekanntes Unterkommando: {}\n", text::sanitize(command));
+        eprint!("{USAGE}");
+        return ExitCode::FAILURE;
+    };
+
+    let rest = &args[1..];
+
+    // `minds fsck --help` soll die Hilfe zeigen, nicht „unbekanntes Flag" —
+    // aber nur als **erstes** Argument. Ein `--help` irgendwo dahinter wäre
+    // eine Hintertür: `minds fsck --require-reviews --help` endete sonst mit
+    // Exit 0, und der Tippfehler bliebe unsichtbar — genau die Klasse, die
+    // dieser Parser schließt. Und `hook` bleibt ganz draußen: Es darf kein
+    // Byte auf stdout schreiben (stdout ist beim Agenten Steuerkanal).
+    if spec.name != "hook" && rest.first().is_some_and(|a| a == "--help" || a == "-h") {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
+    let parsed = match parse(spec, rest) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            if spec.name == "hook" {
+                // Die Rekorder-Regel: `hook` endet immer mit 0, auch hier. Der
+                // Fehler geht ins Log, und der Lauf macht mit dem weiter, was
+                // sich aus den Argumenten noch lesen lässt — ein fremdes Flag
+                // in einer Agent-Registrierung darf keine Session kosten.
+                hooklog::log(hooklog::Source::Hook, &message);
+                return hook::run(
+                    flag(rest, "--agent").as_deref(),
+                    flag(rest, "--event").as_deref(),
+                );
+            }
+            // Die kalten Hook-Kommandos laufen aus Skripten, die stderr
+            // wegwerfen — ihr Parse-Fehler gehört zusätzlich ins Log, sonst
+            // stünde #10 eine Etage höher wieder offen: Ein Hook-Body, der
+            // gegen dieses Binary driftet, bräche die Erfassung dauerhaft
+            // und lautlos.
+            let source = match spec.name {
+                "checkpoint" => Some(hooklog::Source::Checkpoint),
+                "prepare-commit-msg" => Some(hooklog::Source::PrepareCommitMsg),
+                "sync" => Some(hooklog::Source::Sync),
+                _ => None,
+            };
+            if let Some(source) = source {
+                hooklog::log(source, &message);
+            }
+            eprintln!("minds {}: {message}", spec.name);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    run(spec.name, &parsed)
+}
+
+/// Führt das geparste Kommando aus.
+fn run(command: &str, parsed: &Parsed) -> ExitCode {
+    match command {
+        "enable" => {
             // Verstecktes internes Flag: `minds enable` startet den Backfill als
             // losgelösten Hintergrundprozess, der sich selbst hiermit aufruft.
             // Kein öffentliches `minds import` — der Nutzer sieht davon nichts
             // (steht bewusst nicht in USAGE).
-            if args.iter().any(|a| a == enable::BACKGROUND_IMPORT_FLAG) {
+            if parsed.has(enable::BACKGROUND_IMPORT_FLAG) {
                 import_cmd::run()
             } else {
-                let agent = flag(&args, "--agent");
-                let store = store_config_from(&args);
-                let child_remote = flag(&args, "--child-remote");
-                let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-                let recall = args.iter().any(|a| a == "--recall");
+                let store = store_config_from(parsed);
                 enable::run(
-                    agent.as_deref(),
+                    parsed.value("--agent"),
                     &store,
-                    child_remote.as_deref(),
-                    verbose,
-                    recall,
+                    parsed.value("--child-remote"),
+                    parsed.has("-v") || parsed.has("--verbose"),
+                    parsed.has("--recall"),
                 )
             }
         }
 
-        Some("checkpoint") => {
-            let commit = flag(&args, "--commit");
-            checkpoint::run(commit.as_deref())
-        }
+        "hook" => hook::run(parsed.value("--agent"), parsed.value("--event")),
 
-        Some("show") => {
-            let full = args.iter().any(|a| a == "--full");
-            show::run(positional(&args), full)
-        }
+        "checkpoint" => checkpoint::run(parsed.value("--commit")),
 
-        Some("why") => {
-            let full = args.iter().any(|a| a == "--full");
-            why::run(positional(&args), full)
-        }
+        "show" => show::run(parsed.positional(0), parsed.has("--full")),
 
-        Some("blame") => blame::run(positional(&args)),
+        "why" => why::run(parsed.positional(0), parsed.has("--full")),
 
-        Some("recall") => recall::run(positional(&args)),
+        "blame" => blame::run(parsed.positional(0)),
 
-        Some("distill") => {
-            let path = flag(&args, "--path");
-            let out = flag(&args, "--out");
-            distill::run(path.as_deref(), out.as_deref())
-        }
+        "recall" => recall::run(parsed.positional(0)),
 
-        Some("brief") => {
-            let paths: Vec<String> = args
-                .iter()
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .cloned()
-                .collect();
-            let hook = args.iter().any(|a| a == "--hook");
-            brief_cmd::run(&paths, hook)
-        }
+        "distill" => distill::run(parsed.value("--path"), parsed.value("--out")),
 
-        Some("recap") => {
-            let limit = flag(&args, "--limit");
-            let all = args.iter().any(|a| a == "--all");
-            recap::run(limit.as_deref(), all)
-        }
+        "brief" => brief_cmd::run(&parsed.positionals, parsed.has("--hook")),
 
-        Some("search") => search::run(positional(&args)),
+        "recap" => recap::run(parsed.value("--limit"), parsed.has("--all")),
 
-        Some("agent-help") => agent_help::run(),
+        "search" => search::run(parsed.positional(0)),
 
-        Some("metrics") => {
-            let format = flag(&args, "--format");
-            metrics::run(format.as_deref())
-        }
+        "agent-help" => agent_help::run(),
 
-        Some("review") => {
-            let decision = if args.iter().any(|a| a == "--approve") {
+        "metrics" => metrics::run(parsed.value("--format")),
+
+        "review" => {
+            let decision = if parsed.has("--approve") {
                 Some(Decision::Approve)
-            } else if args.iter().any(|a| a == "--reject") {
+            } else if parsed.has("--reject") {
                 Some(Decision::Reject)
-            } else if args.iter().any(|a| a == "--needs-work") {
+            } else if parsed.has("--needs-work") {
                 Some(Decision::NeedsWork)
             } else {
                 None
             };
-            let summary = flag(&args, "--summary");
-            let sign = args.iter().any(|a| a == "--sign");
-            let key = flag(&args, "--key");
             review_cmd::run_review(
-                positional(&args),
+                parsed.positional(0),
                 decision,
-                summary.as_deref(),
-                sign,
-                key.as_deref(),
+                parsed.value("--summary"),
+                parsed.has("--sign"),
+                parsed.value("--key"),
             )
         }
 
-        Some("audit") => {
-            let export = args.iter().any(|a| a == "--export");
-            let out = flag(&args, "--out");
-            let base = flag(&args, "--base");
-            audit::run(export, out.as_deref(), base.as_deref())
-        }
+        "audit" => audit::run(
+            parsed.has("--export"),
+            parsed.value("--out"),
+            parsed.value("--base"),
+        ),
 
-        Some("gitlab") => {
-            let sub = args
-                .get(1)
-                .map(String::as_str)
-                .filter(|a| !a.starts_with('-'));
-            let subject = args
-                .iter()
-                .skip(2)
-                .find(|a| !a.starts_with('-'))
-                .map(String::as_str);
-            gitlab_cmd::run(
-                sub,
-                gitlab_cmd::Options {
-                    subject,
-                    merge_request: flag(&args, "--mr").as_deref(),
-                    url: flag(&args, "--url").as_deref(),
-                    project: flag(&args, "--project").as_deref(),
-                    token_env: flag(&args, "--token-env").as_deref(),
-                    approve: args.iter().any(|a| a == "--approve"),
-                    write: args.iter().any(|a| a == "--write"),
-                },
-            )
-        }
+        "gitlab" => gitlab_cmd::run(
+            parsed.positional(0),
+            gitlab_cmd::Options {
+                subject: parsed.positional(1),
+                merge_request: parsed.value("--mr"),
+                url: parsed.value("--url"),
+                project: parsed.value("--project"),
+                token_env: parsed.value("--token-env"),
+                approve: parsed.has("--approve"),
+                write: parsed.has("--write"),
+            },
+        ),
 
-        Some("stack") => {
-            let base = flag(&args, "--base");
-            stack::run(base.as_deref())
-        }
+        "stack" => stack::run(parsed.value("--base")),
 
-        Some("comment") => {
-            let on = flag(&args, "--on");
-            // Der Text ist das erste positionale Argument nach dem Subjekt.
-            let body = args
-                .iter()
-                .skip(1)
-                .filter(|a| !a.starts_with('-'))
-                .filter(|a| Some(a.as_str()) != on.as_deref())
-                .nth(1)
-                .cloned();
-            review_cmd::run_comment(positional(&args), on.as_deref(), body.as_deref())
-        }
+        "comment" => review_cmd::run_comment(
+            parsed.positional(0),
+            parsed.value("--on"),
+            parsed.positional(1),
+        ),
 
-        Some("reviews") => {
-            let signers = flag(&args, "--signers");
-            let identity = flag(&args, "--identity");
-            review_cmd::run_reviews(positional(&args), signers.as_deref(), identity.as_deref())
-        }
+        "reviews" => review_cmd::run_reviews(
+            parsed.positional(0),
+            parsed.value("--signers"),
+            parsed.value("--identity"),
+        ),
 
-        Some("fsck") => {
-            let require_review = args.iter().any(|a| a == "--require-review");
-            fsck::run(require_review)
-        }
+        "fsck" => fsck::run(parsed.has("--require-review")),
 
-        Some("forget") => {
-            let reason = flag(&args, "--reason");
-            forget_cmd::run(positional(&args), reason.as_deref())
-        }
+        "forget" => forget_cmd::run(parsed.positional(0), parsed.value("--reason")),
 
-        Some("sign") => {
-            let key = flag(&args, "--key");
-            sign_cmd::run(positional(&args), key.as_deref())
-        }
+        "sign" => sign_cmd::run(parsed.positional(0), parsed.value("--key")),
 
-        Some("verify") => {
-            let sig = flag(&args, "--sig");
-            let signers = flag(&args, "--signers");
-            let identity = flag(&args, "--identity");
-            verify_cmd::run(
-                positional(&args),
-                sig.as_deref(),
-                signers.as_deref(),
-                identity.as_deref(),
-            )
-        }
+        "verify" => verify_cmd::run(
+            parsed.positional(0),
+            parsed.value("--sig"),
+            parsed.value("--signers"),
+            parsed.value("--identity"),
+        ),
 
-        Some("render") => {
-            let out = flag(&args, "--out");
-            render_cmd::run(out.as_deref())
-        }
+        "render" => render_cmd::run(parsed.value("--out")),
 
-        Some("sync") => {
-            let remote = flag(&args, "--remote");
-            let verbose = args.iter().any(|a| a == "-v" || a == "--verbose");
-            sync::run(remote.as_deref(), verbose)
-        }
-
-        Some("hook") => {
-            let agent = flag(&args, "--agent");
-            let event = flag(&args, "--event");
-            hook::run(agent.as_deref(), event.as_deref())
-        }
+        "sync" => sync::run(
+            parsed.value("--remote"),
+            parsed.has("-v") || parsed.has("--verbose"),
+        ),
 
         // Interner Git-Hook: sorgt für eine stabile Change-Id (nicht in USAGE).
-        Some("prepare-commit-msg") => prepare_commit_msg::run(positional(&args)),
+        "prepare-commit-msg" => prepare_commit_msg::run(parsed.positional(0)),
 
-        Some("--version" | "-V") => {
-            println!("minds {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-
-        Some("--help" | "-h") | None => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
-
-        Some(other) => {
-            eprintln!("unbekanntes Unterkommando: {other}\n");
-            eprint!("{USAGE}");
-            ExitCode::FAILURE
-        }
+        // `main` dispatcht nur Namen aus SPECS — jeder davon hat hier einen Arm.
+        other => unreachable!("Kommando in SPECS, aber ohne Arm: {other}"),
     }
 }
 
-/// Das erste positionale Argument nach dem Unterkommando (das erste, das nicht
-/// mit `-` beginnt). So darf `--full` vor *oder* nach dem Commit stehen.
-fn positional(args: &[String]) -> Option<&str> {
-    args.iter()
-        .skip(1)
-        .find(|a| !a.starts_with('-'))
-        .map(String::as_str)
-}
-
-/// Liest `--name wert` aus den Argumenten.
-///
-/// Bewusst ohne `--name=wert`, ohne Kurzformen und ohne Fehlermeldung bei
-/// Unbekanntem: ein absichtlich dummer Parser, solange die Kommandostruktur
-/// jung ist.
+/// Liest `--name wert` lax aus rohen Argumenten — nur noch für den
+/// `hook`-Notpfad, wenn der strikte Parser ablehnt: Der Rekorder holt sich,
+/// was lesbar ist, statt eine Session zu verlieren.
 fn flag(args: &[String], name: &str) -> Option<String> {
     args.iter()
         .position(|a| a == name)
@@ -440,13 +664,176 @@ fn flag(args: &[String], name: &str) -> Option<String> {
 
 /// Baut die [`StoreConfig`] aus `--child-repo`/`--ref`. Ohne Flags: In-Repo mit
 /// Default-Ref — die Einstellung, für die niemand etwas tun muss.
-fn store_config_from(args: &[String]) -> StoreConfig {
-    let base = match flag(args, "--child-repo") {
+fn store_config_from(parsed: &Parsed) -> StoreConfig {
+    let base = match parsed.value("--child-repo") {
         Some(path) => StoreConfig::child_repo(path),
         None => StoreConfig::in_repo(),
     };
-    match flag(args, "--ref") {
+    match parsed.value("--ref") {
         Some(reference) => base.with_ref(reference),
         None => base,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec_named(name: &str) -> &'static Spec {
+        SPECS
+            .iter()
+            .find(|spec| spec.name == name)
+            .expect("Kommando steht in SPECS")
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Die Regression, die #11 eröffnet hat: Ein Tippfehler im Gate-Flag lief
+    /// als nacktes `fsck` durch — Exit 0, CI-Gate lautlos abgeschaltet.
+    #[test]
+    fn a_flag_typo_is_an_error_that_names_the_alternatives() {
+        let err = parse(spec_named("fsck"), &args(&["--require-reviews"])).unwrap_err();
+        assert!(err.contains("unbekanntes Flag"), "{err}");
+        // Die Meldung nennt das richtige Flag — der Tippfehler ist ohne Blick
+        // in die Doku auffindbar.
+        assert!(err.contains("--require-review"), "{err}");
+    }
+
+    /// `minds review I… --summary --sign` legte das Review mit der
+    /// Zusammenfassung „--sign" an — unsigniert, mit Erfolgsmeldung.
+    #[test]
+    fn a_value_flag_never_eats_the_following_flag() {
+        let err = parse(
+            spec_named("review"),
+            &args(&["I0123", "--summary", "--sign"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("--summary"), "{err}");
+        assert!(err.contains("braucht einen Wert"), "{err}");
+    }
+
+    /// Ein Wert-Flag am Zeilenende ist derselbe Fehler, nur ohne Nachfolger.
+    #[test]
+    fn a_value_flag_at_the_end_is_an_error() {
+        let err = parse(spec_named("checkpoint"), &args(&["--commit"])).unwrap_err();
+        assert!(err.contains("braucht einen Wert"), "{err}");
+    }
+
+    /// Flags und Positionale dürfen in jeder Reihenfolge stehen — Agents
+    /// generieren beide Varianten.
+    #[test]
+    fn flags_and_positionals_are_order_independent() {
+        for order in [
+            &["I0123", "--summary", "gut", "--sign"][..],
+            &["--summary", "gut", "I0123", "--sign"][..],
+            &["--sign", "--summary", "gut", "I0123"][..],
+        ] {
+            let parsed = parse(spec_named("review"), &args(order)).unwrap();
+            assert_eq!(parsed.positional(0), Some("I0123"), "{order:?}");
+            assert_eq!(parsed.value("--summary"), Some("gut"), "{order:?}");
+            assert!(parsed.has("--sign"), "{order:?}");
+        }
+    }
+
+    /// `minds verify --sig s.sig b3-…`: Das Subjekt ist die Session, nicht die
+    /// Signatur-Datei — der Flag-Wert zählt nicht als Positional.
+    #[test]
+    fn the_verify_subject_is_not_the_signature_file() {
+        let parsed = parse(spec_named("verify"), &args(&["--sig", "s.sig", "b3-abc"])).unwrap();
+        assert_eq!(parsed.positional(0), Some("b3-abc"));
+        assert_eq!(parsed.value("--sig"), Some("s.sig"));
+    }
+
+    /// `minds gitlab mirror --mr 5 I…`: Das Subjekt ist die Change-Id, nicht
+    /// die MR-Nummer.
+    #[test]
+    fn the_gitlab_subject_is_not_the_mr_number() {
+        let parsed = parse(
+            spec_named("gitlab"),
+            &args(&["mirror", "--mr", "5", "I0123"]),
+        )
+        .unwrap();
+        assert_eq!(parsed.positional(0), Some("mirror"));
+        assert_eq!(parsed.positional(1), Some("I0123"));
+        assert_eq!(parsed.value("--mr"), Some("5"));
+    }
+
+    /// Das interne Backfill-Flag funktioniert, bleibt aber unerwähnt — es
+    /// steht bewusst nicht in USAGE, also auch nicht in Fehlermeldungen.
+    #[test]
+    fn hidden_flags_are_accepted_but_not_advertised() {
+        let spec = spec_named("enable");
+        let parsed = parse(spec, &args(&[enable::BACKGROUND_IMPORT_FLAG])).unwrap();
+        assert!(parsed.has(enable::BACKGROUND_IMPORT_FLAG));
+
+        let err = unknown_flag(spec, "--tippfehler");
+        assert!(
+            !err.contains("background"),
+            "internes Flag in der Meldung: {err}"
+        );
+    }
+
+    /// Zwei Kommandos mit demselben Namen wären ein stiller Dispatch-Fehler.
+    #[test]
+    fn spec_names_are_unique() {
+        let mut names: Vec<&str> = SPECS.iter().map(|spec| spec.name).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), SPECS.len());
+    }
+
+    /// Der Tippfehler ohne Bindestriche: `minds fsck require-review` lief als
+    /// nacktes `fsck` durch — dieselbe stille Gate-Abschaltung, nur positional.
+    #[test]
+    fn an_excess_positional_is_an_error_not_decoration() {
+        let err = parse(spec_named("fsck"), &args(&["require-review"])).unwrap_err();
+        assert!(err.contains("unerwartetes Argument"), "{err}");
+
+        // Und bei begrenzter Stelligkeit zählt die Grenze: `forget a b` vergäße
+        // sonst nur `a` — mit Erfolgsmeldung.
+        let err = parse(spec_named("forget"), &args(&["b3-a", "b3-b"])).unwrap_err();
+        assert!(err.contains("unerwartetes Argument"), "{err}");
+    }
+
+    /// Ein doppelt gesetztes Wert-Flag ist eine Entscheidung, die der Parser
+    /// nicht still treffen darf — vorher gewann lautlos das erste.
+    #[test]
+    fn a_duplicate_value_flag_is_an_error() {
+        let err = parse(
+            spec_named("review"),
+            &args(&["I0123", "--summary", "a", "--summary", "b"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("zweimal"), "{err}");
+    }
+
+    /// `--` beendet die Flag-Deutung — der einzige Weg, ein Argument
+    /// auszusprechen, das mit `-` beginnt.
+    #[test]
+    fn a_double_dash_makes_the_rest_positional() {
+        let parsed = parse(
+            spec_named("comment"),
+            &args(&["I0123", "--", "-1 zu diesem Ansatz"]),
+        )
+        .unwrap();
+        assert_eq!(parsed.positional(0), Some("I0123"));
+        assert_eq!(parsed.positional(1), Some("-1 zu diesem Ansatz"));
+    }
+
+    /// Ein Flag-Wert mit Steuerzeichen darf die Fehlermeldung nicht fälschen —
+    /// sie landet via hook.log auch in Dateien, die andere lesen.
+    #[test]
+    fn error_messages_sanitize_foreign_text() {
+        let err = parse(
+            spec_named("review"),
+            &args(&["--summary", "--x\u{1b}[31mrot"]),
+        )
+        .unwrap_err();
+        assert!(
+            !err.contains('\u{1b}'),
+            "rohes Escape in der Meldung: {err}"
+        );
     }
 }
