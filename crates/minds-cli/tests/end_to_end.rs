@@ -611,6 +611,135 @@ fn a_config_override_on_the_command_line_cannot_redirect_the_hooks() {
     );
 }
 
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// #11, Akzeptanzkriterium 1: Ein Tippfehler im Gate-Flag endet mit Fehler,
+/// nicht mit Exit 0 — sonst ist das CI-Policy-Gate lautlos abgeschaltet und
+/// die Pipeline grün.
+#[test]
+fn a_flag_typo_fails_loudly_instead_of_disarming_the_gate() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "chore: Grundstein"]);
+
+    // Der Tippfehler (Plural statt Singular) — bisher Exit 0, Gate aus.
+    let typo = minds(dir, &["fsck", "--require-reviews"], None);
+    assert!(
+        !typo.status.success(),
+        "der Tippfehler muss das Gate rot machen, nicht abschalten"
+    );
+    assert!(
+        stderr(&typo).contains("unbekanntes Flag"),
+        "die Meldung muss den Fehler benennen:\n{}",
+        stderr(&typo)
+    );
+
+    // Die Gegenprobe: das richtige Flag läuft weiter.
+    let ok = minds(dir, &["fsck", "--require-review"], None);
+    assert!(ok.status.success(), "{}", stdout(&ok));
+
+    // Die Hintertür, die das Review gefunden hat: Ein nachgestelltes `--help`
+    // darf den Tippfehler nicht in Exit 0 verwandeln.
+    let backdoor = minds(dir, &["fsck", "--require-reviews", "--help"], None);
+    assert!(
+        !backdoor.status.success(),
+        "--help hinter dem Tippfehler darf das Gate nicht entschärfen"
+    );
+
+    // Und die Variante ohne Bindestriche ist derselbe Fehler, nur positional.
+    let bare = minds(dir, &["fsck", "require-review"], None);
+    assert!(
+        !bare.status.success(),
+        "vergessene Bindestriche dürfen das Gate nicht abschalten"
+    );
+    assert!(
+        stderr(&bare).contains("unerwartetes Argument"),
+        "{}",
+        stderr(&bare)
+    );
+}
+
+/// Die Rekorder-Regel überlebt den strikten Parser: `minds hook` mit fremdem
+/// Flag endet mit 0, schreibt kein Byte auf stdout (Steuerkanal des Agenten)
+/// — und verliert das Event nicht.
+#[test]
+fn the_hook_swallows_a_foreign_flag_without_losing_the_event() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    let payload = format!(
+        r#"{{"session_id":"sess-e2e","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"Trotz Fremd-Flag"}}"#,
+        dir.display()
+    );
+    let out = minds(
+        dir,
+        &["hook", "--agent", "claude-code", "--help"],
+        Some(&payload),
+    );
+    assert!(out.status.success(), "hook endet immer mit 0");
+    assert!(
+        stdout(&out).is_empty(),
+        "hook darf kein Byte auf stdout schreiben:\n{}",
+        stdout(&out)
+    );
+
+    // Das Event ist trotzdem im Journal gelandet — sichtbar daran, dass der
+    // nächste Checkpoint es eincheckt.
+    let stop = format!(
+        r#"{{"session_id":"sess-e2e","cwd":"{}","hook_event_name":"Stop"}}"#,
+        dir.display()
+    );
+    minds(dir, &["hook", "--agent", "claude-code"], Some(&stop));
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: trotz Fremd-Flag"]);
+    let refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        !refs.trim().is_empty(),
+        "das Event vor dem Fremd-Flag ist verloren gegangen"
+    );
+}
+
+/// #11, Akzeptanzkriterium 3: `--summary --sign` erzeugt kein unsigniertes
+/// Review mit der Zusammenfassung „--sign" — es ist ein Fehler mit Meldung.
+#[test]
+fn a_swallowed_flag_value_is_an_error_not_an_unsigned_review() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let out = minds(
+        dir,
+        &["review", "b3-0000", "--approve", "--summary", "--sign"],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "ein verschlucktes Flag darf kein Review anlegen"
+    );
+    assert!(
+        stderr(&out).contains("braucht einen Wert"),
+        "die Meldung muss den Wert einfordern:\n{}",
+        stderr(&out)
+    );
+}
+
 /// Ein **gesetztes, aber leeres** `core.hooksPath` schaltet die Hooks in Git
 /// ganz ab. `enable` hat dann keinen Ort — und darf sich keinen ausdenken:
 /// `rev-parse --git-path hooks` antwortet in dem Fall `./`, wer dem folgt, legt

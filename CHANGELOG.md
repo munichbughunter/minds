@@ -21,6 +21,27 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- Der Argument-Parser ist **strikt** geworden. Ein unbekanntes Flag war bisher
+  Rauschen: `minds fsck --require-reviews` (Tippfehler) lief als nacktes `fsck`
+  durch und lieferte Exit 0 — das CI-Policy-Gate war damit lautlos
+  abgeschaltet, die Pipeline grün. Und ein Wert-Flag nahm blind das nächste
+  Argument: `minds review I… --summary --sign` legte das Review mit der
+  Zusammenfassung „--sign" an — **unsigniert**, mit Erfolgsmeldung. Jetzt
+  bricht jedes Unterkommando bei einem Flag ab, das es nicht kennt, und nennt
+  die bekannten; ein Wert-Flag, dem ein weiteres Flag folgt, ist ein Fehler
+  statt einer Verwechslung. Positionale Argumente und Flags sind
+  reihenfolgeunabhängig — `minds verify --sig s.sig b3-…` findet das Subjekt,
+  nicht die Signatur-Datei. `--help` funktioniert jetzt auch hinter einem
+  Unterkommando. Die Ausnahme bleibt `minds hook`: Ein Rekorder bricht nicht
+  wegen eines Konfigurationsfehlers ab — der Fehler geht in
+  `<git-dir>/minds/hook.log`, der Lauf macht mit dem Verwertbaren weiter.
+  ([#11](https://github.com/munichbughunter/minds/issues/11))
+- `minds agent-help` nennt jetzt **alle** öffentlichen Kommandos. Acht fehlten
+  (`hook`, `checkpoint`, `blame`, `metrics`, `forget`, `sign`, `verify`,
+  `gitlab`) — für eine Karte, deren einziger Zweck Vollständigkeit ist. Ein
+  Test vergleicht sie künftig mit der Kommando-Tabelle des Parsers; wer ein
+  Kommando ergänzt, ohne die Karte zu pflegen, wird rot statt still
+  unvollständig. ([#11](https://github.com/munichbughunter/minds/issues/11))
 - Die von `minds enable` geschriebenen Git-Hooks hängen nicht mehr am `PATH`.
   GUI-Clients (VS Code, Fork, Tower) und minimale CI-Shells starten Git ohne
   das Profil der Shell — `~/.local/bin` fehlt dort, der Aufruf `minds …` lief
