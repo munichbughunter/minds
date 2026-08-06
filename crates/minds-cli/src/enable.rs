@@ -202,6 +202,20 @@ fn enable_agents(
     for name in hook_names() {
         read_existing_hook(&hooks_dir.join(name))?;
     }
+
+    // Und dieselbe Vorprüfung für die Agent-Dateien (#65): Ein Symlink an
+    // einer von ihnen — oder an einem ihrer Verzeichnisse — bricht sonst
+    // *mitten* in der Reihe ab, mit den zuvor geschriebenen Konfigurationen
+    // auf der Platte und ohne Hooks. Genau der Zustand, den die Vorprüfung
+    // oben für die Hooks verhindert: Der Agent journaliert, und nichts checkt
+    // je ein.
+    for path in agent_files(&paths.root, agents) {
+        check_agent_path(&paths.root, &path)?;
+    }
+    if recall && agents.iter().any(|a| matches!(a, Which::ClaudeCode)) {
+        check_agent_path(&paths.root, &paths.root.join(".claude/settings.json"))?;
+    }
+
     ensure_writable(&hooks_dir)?;
 
     // Vor der ersten Datei: den Ort dieses Binaries festhalten, den die
@@ -1093,6 +1107,7 @@ fn enable_codex(root: &Path) -> std::io::Result<Change> {
 /// den Alltag; eine `codex_hooks` tief in einer `[table]` verschachtelt käme in
 /// echtem TOML vor, ist hier aber nicht der Fall (der Schalter ist top-level).
 fn ensure_codex_hooks_flag(path: &Path) -> std::io::Result<Change> {
+    check_agent_leaf(path)?;
     let existed = path.exists();
     let current = if existed {
         fs::read_to_string(path)?
@@ -1124,7 +1139,7 @@ fn ensure_codex_hooks_flag(path: &Path) -> std::io::Result<Change> {
     create_parent(path)?;
     let mut out = lines.join("\n");
     out.push('\n');
-    fs::write(path, out)?;
+    write_atomic_no_follow(path, &out, false)?;
     Ok(if existed {
         Change::Updated
     } else {
@@ -1157,6 +1172,7 @@ export const minds = async () => ({
 /// wir nicht selbst geschrieben haben.
 fn enable_opencode(root: &Path) -> std::io::Result<Change> {
     let path = root.join(".opencode/plugin/minds.ts");
+    check_agent_leaf(&path)?;
     if path.exists() {
         let current = fs::read_to_string(&path)?;
         if current == OPENCODE_PLUGIN {
@@ -1169,7 +1185,7 @@ fn enable_opencode(root: &Path) -> std::io::Result<Change> {
     }
     create_parent(&path)?;
     let existed = path.exists();
-    fs::write(&path, OPENCODE_PLUGIN)?;
+    write_atomic_no_follow(&path, OPENCODE_PLUGIN, false)?;
     Ok(if existed {
         Change::Updated
     } else {
@@ -1475,10 +1491,44 @@ pub(crate) fn read_existing_hook(path: &Path) -> std::io::Result<Option<String>>
 /// Die Rechte werden auf der Temp-Datei gesetzt, nicht über den Zielpfad: Ein
 /// `chmod` auf einen Pfad folgte wieder dem Link.
 fn write_hook(path: &Path, content: &str) -> std::io::Result<()> {
+    write_atomic_no_follow(path, content, true)
+}
+
+/// Der gemeinsame Schreibweg für alles, was `enable` anlegt (#65): erst eine
+/// Nachbardatei mit `create_new`, dann [`fs::rename`] — nie durch einen
+/// Symlink hindurch. `executable` setzt die Execute-Bits auf dem offenen
+/// Handle (Hooks); Konfigurationen bleiben ohne.
+///
+/// Vor #65 galt dieser Weg nur den Hooks; die Agent-Konfigurationen gingen
+/// über `fs::write` — und das folgt einem Symlink. Ein eingechecktes
+/// `.claude/settings.json` als Link (im Diff nur ein Moduswechsel auf
+/// `120000`) ließ `enable` die fremde Zieldatei überschreiben.
+fn write_atomic_no_follow(path: &Path, content: &str, executable: bool) -> std::io::Result<()> {
     use std::io::Write;
 
+    // Der Modus des bestehenden Ziels, **bevor** es ersetzt wird. `rename`
+    // tauscht den Inode und damit die Rechte: Eine `settings.json` mit `0600`
+    // (weil dort ein API-Key steht) käme sonst als `0644` zurück — auf einer
+    // Mehrbenutzer-Maschine für jeden lesbar. `fs::write` hatte dieses
+    // Problem nicht, es schrieb in die bestehende Datei.
+    let existing = fs::symlink_metadata(path).ok();
+
+    // Eine bewusst schreibgeschützte Datei bleibt geschützt. `fs::write` wäre
+    // hier an `EACCES` gescheitert; `rename` bräuchte nur das Verzeichnis und
+    // ersetzte sie stillschweigend.
+    #[cfg(unix)]
+    if let Some(meta) = &existing {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o200 == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("{}: ist schreibgeschützt", display_path(path)),
+            ));
+        }
+    }
+
     let dir = path.parent().unwrap_or(Path::new("."));
-    let temp = temp_name(dir, "hook");
+    let temp = temp_name(dir, "neu");
 
     // Erst anlegen, dann der Rest — damit das Aufräumen unten nur Dateien
     // trifft, die von uns stammen. Scheitert `create_new_file` (etwa an einem
@@ -1489,9 +1539,16 @@ fn write_hook(path: &Path, content: &str) -> std::io::Result<()> {
     let result = (|| {
         file.write_all(content.as_bytes())
             .map_err(|err| with_path(&temp, err))?;
-        // Die Rechte über das offene Handle, nicht über den Pfad: Ein `chmod`
-        // auf einen Pfad folgte einem Link, der inzwischen dort liegen könnte.
-        make_executable(&file).map_err(|err| with_path(&temp, err))?;
+        if executable {
+            // Die Rechte über das offene Handle, nicht über den Pfad: Ein
+            // `chmod` auf einen Pfad folgte einem Link, der inzwischen dort
+            // liegen könnte.
+            make_executable(&file).map_err(|err| with_path(&temp, err))?;
+        } else if let Some(meta) = &existing {
+            // Ebenfalls über das Handle, aus demselben Grund.
+            file.set_permissions(meta.permissions())
+                .map_err(|err| with_path(&temp, err))?;
+        }
         fs::rename(&temp, path).map_err(|err| with_path(path, err))
     })();
 
@@ -1499,6 +1556,100 @@ fn write_hook(path: &Path, content: &str) -> std::io::Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// Größte Agent-Konfiguration, die wir noch einlesen — dieselbe Grenze und
+/// dieselbe Begründung wie [`MAX_HOOK_BYTES`]: Diese Dateien liegen in der
+/// versionierten Arbeitskopie, ein Checkout kann dort beliebig große
+/// Nutzlasten platzieren, und `read_to_string` zöge sie vollständig in den
+/// Speicher. Eine echte Agent-Konfiguration ist ein paar Kilobyte JSON.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Prüft einen Pfad, den `enable` in der Arbeitskopie lesen oder schreiben
+/// will — **samt aller Verzeichnisse zwischen `root` und der Datei** (#65).
+///
+/// Die Agent-Dateien liegen in der versionierten Arbeitskopie: Ein gemergter
+/// PR kann dort einen Link platzieren, sichtbar nur als Moduswechsel auf
+/// `120000`. Lesen durch den Link hieße fremden Inhalt deuten, Schreiben (auch
+/// das `rename`-Ersetzen) hieße eine Datei anfassen, die der Nutzer so nie
+/// angelegt hat.
+///
+/// **Warum die Elternverzeichnisse mit müssen:** Ein Link am Blatt ist der
+/// naheliegende Angriff, aber `.claude` → `$HOME/.claude` ist der wirksamere:
+/// Das Blatt darunter ist dann eine reguläre Datei, und `enable` schriebe in
+/// die *globale* Konfiguration des Nutzers. Geprüft wird deshalb jedes Glied
+/// unterhalb von `root` — dieselbe Linie, die [`hooks_scope`] für das
+/// Hook-Verzeichnis zieht, und dieselbe, die [`crate::hooklog`] am Log-Ordner
+/// zieht.
+///
+/// Am Blatt zusätzlich: nur reguläre Dateien (ein FIFO ließe `read_to_string`
+/// unbegrenzt blockieren) und eine Größengrenze.
+///
+/// **Was offen bleibt:** Zwischen dieser Prüfung und dem Lesen liegt ein
+/// Zeitfenster; wer dort einen Link unterschiebt, braucht Schreibrechte im
+/// selben Verzeichnis unter derselben Kennung. Der *Schreib*pfad ist über
+/// [`write_atomic_no_follow`] auch dann sicher — `rename` ersetzt den Namen.
+fn check_agent_path(root: &Path, path: &Path) -> std::io::Result<()> {
+    // Von der Datei aufwärts bis zur Wurzel (ausschließlich): jedes
+    // Verzeichnis, das der Checkout gestellt haben könnte.
+    for ancestor in path.ancestors().skip(1) {
+        if ancestor == root || !ancestor.starts_with(root) {
+            break;
+        }
+        if let Ok(meta) = fs::symlink_metadata(ancestor) {
+            if meta.file_type().is_symlink() {
+                return Err(refuse_path(ancestor, "ein Symlink"));
+            }
+        }
+    }
+    check_agent_leaf(path)
+}
+
+/// Die Prüfung am Blatt allein — Tiefenverteidigung in den Schreibfunktionen,
+/// die den Repo-Wurzelpfad nicht kennen. Die Elternverzeichnisse deckt der
+/// Vorlauf in [`enable_agents`] über [`check_agent_path`] ab.
+fn check_agent_leaf(path: &Path) -> std::io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(refuse_path(path, "ein Symlink")),
+        Ok(meta) if !meta.is_file() => Err(refuse_path(path, "keine reguläre Datei")),
+        Ok(meta) if meta.len() > MAX_CONFIG_BYTES => Err(std::io::Error::other(format!(
+            "{} ist {} Bytes groß — das ist keine Agent-Konfiguration",
+            display_path(path),
+            meta.len()
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        // Unerwartete Fehler nicht schlucken: Sonst käme derselbe Fehler
+        // gleich darauf ohne Pfadangabe zurück.
+        Err(err) => Err(with_path(path, err)),
+    }
+}
+
+fn refuse_path(at: &Path, what: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{} ist {what} — minds schreibt weder durch Links noch in Sonderdateien; \
+         ersetze den Eintrag durch ein reguläres Verzeichnis bzw. eine reguläre Datei",
+        display_path(at)
+    ))
+}
+
+/// Alle Dateien, die `enable` für die gewählten Agents anfasst — die Liste,
+/// die der Vorlauf prüft, bevor die erste entsteht.
+fn agent_files(root: &Path, agents: &[Which]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for &agent in agents {
+        match agent {
+            Which::ClaudeCode => paths.push(root.join(".claude/settings.json")),
+            Which::Cursor => paths.push(root.join(".cursor/hooks.json")),
+            Which::Gemini => paths.push(root.join(".gemini/settings.json")),
+            Which::Codex => {
+                paths.push(root.join(".codex/hooks.json"));
+                paths.push(root.join(".codex/config.toml"));
+            }
+            Which::OpenCode => paths.push(root.join(".opencode/plugin/minds.ts")),
+        }
+    }
+    paths
 }
 
 /// Hängt den Pfad an einen I/O-Fehler. „Permission denied (os error 13)" allein
@@ -1728,26 +1879,30 @@ fn locate() -> std::io::Result<RepoPaths> {
 
 /// Liest eine JSON-Datei oder liefert ein leeres Objekt. Ungültiges JSON wird
 /// **nicht** stillschweigend überschrieben, sondern ist ein Fehler — sonst
-/// verlöre der Nutzer seine Konfiguration.
+/// verlöre der Nutzer seine Konfiguration. Ein Symlink ist ebenfalls ein
+/// Fehler (#65): Wer durch ihn läse, deutete fremden Inhalt — und schriebe
+/// gleich darauf an einen Ort, den der Nutzer so nie angelegt hat.
 fn read_json(path: &Path) -> std::io::Result<Value> {
+    check_agent_leaf(path)?;
     match fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(Value::Object(Map::new())),
         Ok(text) => serde_json::from_str(&text).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("{} ist kein gültiges JSON: {e}", path.display()),
+                format!("{} ist kein gültiges JSON: {e}", display_path(path)),
             )
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
-        Err(e) => Err(e),
+        Err(e) => Err(with_path(path, e)),
     }
 }
 
 fn write_json(path: &Path, value: &Value) -> std::io::Result<()> {
+    check_agent_leaf(path)?;
     create_parent(path)?;
     let mut text = serde_json::to_string_pretty(value)?;
     text.push('\n');
-    fs::write(path, text)
+    write_atomic_no_follow(path, &text, false)
 }
 
 /// Sorgt dafür, dass `value` ein Objekt ist, und gibt es aus. Ein fremder
@@ -2026,6 +2181,195 @@ mod tests {
         );
         // Geschrieben wird am Ziel — das ist die bewusst getragene Folge.
         assert!(real.join("post-commit").is_file());
+    }
+
+    // --- Symlinks auf die Agent-Konfigurationen (#65) -----------------------
+
+    /// Die vier JSON-Konfigurationen: Ein eingecheckter Symlink an ihrer
+    /// Stelle (im Diff nur ein Moduswechsel auf `120000`) ließ `enable` durch
+    /// ihn hindurch in die fremde Zieldatei schreiben. Jetzt ist der Link ein
+    /// Fehler, und das Ziel bleibt unberührt.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_json_config_is_refused_and_its_target_untouched() {
+        for (file, agent) in [
+            (".claude/settings.json", "claude-code"),
+            (".cursor/hooks.json", "cursor"),
+            (".gemini/settings.json", "gemini"),
+            (".codex/hooks.json", "codex"),
+        ] {
+            let dir = tmp();
+            let victim = dir.path().join("opfer.json");
+            fs::write(&victim, "{\"fremd\":true}\n").unwrap();
+
+            let path = dir.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+            let err = claude_style(dir.path(), file, agent).unwrap_err();
+            assert!(err.to_string().contains("Symlink"), "{file}: {err}");
+            assert_eq!(
+                fs::read_to_string(&victim).unwrap(),
+                "{\"fremd\":true}\n",
+                "{file}: das Ziel wurde angefasst"
+            );
+            assert!(
+                fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{file}: der Link selbst wurde ersetzt"
+            );
+        }
+    }
+
+    /// Der wirksamere Angriff aus dem Security-Review: nicht die Datei, das
+    /// **Verzeichnis** ist der Link (`.claude` → `$HOME/.claude`). Das Blatt
+    /// darunter ist dann eine reguläre Datei — `enable` schriebe in die
+    /// globale Konfiguration des Nutzers, außerhalb des Repos.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_agent_directory_is_refused_before_anything_is_written() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+
+        let home = dir.path().join("home-claude");
+        fs::create_dir_all(&home).unwrap();
+        let victim = home.join("settings.json");
+        fs::write(&victim, "{\"env\":{\"KEY\":\"geheim\"}}\n").unwrap();
+        std::os::unix::fs::symlink(&home, root.join(".claude")).unwrap();
+
+        let err = check_agent_path(&root, &root.join(".claude/settings.json")).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains(".claude"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "{\"env\":{\"KEY\":\"geheim\"}}\n"
+        );
+    }
+
+    /// Eine bestehende Konfiguration behält ihre Rechte. `rename` tauscht den
+    /// Inode — ohne Übertragung käme eine `0600`-Datei (dort steht ein
+    /// API-Key) als `0644` zurück, auf einer Mehrbenutzer-Maschine für jeden
+    /// lesbar. `fs::write` hatte dieses Problem nicht.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_config_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic_no_follow(&path, "{\"neu\":true}\n", false).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"neu\":true}\n");
+    }
+
+    /// Eine bewusst schreibgeschützte Datei bleibt unangetastet. `rename`
+    /// bräuchte nur Rechte am Verzeichnis und ersetzte sie stillschweigend —
+    /// `fs::write` wäre hier an `EACCES` gescheitert.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_protected_config_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, "{\"original\":true}\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let err = write_atomic_no_follow(&path, "{\"neu\":true}\n", false).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "{\"original\":true}\n",
+            "die geschützte Datei wurde ersetzt"
+        );
+    }
+
+    /// Ein FIFO an der Config-Stelle ließe `read_to_string` unbegrenzt
+    /// blockieren — `enable` hinge ohne Meldung.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_regular_file_at_a_config_path_is_refused() {
+        let dir = tmp();
+        let path = dir.path().join("settings.json");
+        // Ein Verzeichnis tut es als portable Sonderdatei genauso.
+        fs::create_dir(&path).unwrap();
+
+        let err = check_agent_leaf(&path).unwrap_err();
+        assert!(err.to_string().contains("keine reguläre Datei"), "{err}");
+    }
+
+    /// Ein hängender Symlink wird ebenfalls erkannt — `path.exists()` wäre
+    /// dort `false`, eine Existenzprüfung vor dem Symlink-Test fiele darauf
+    /// herein.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_at_a_config_path_is_refused() {
+        let dir = tmp();
+        let path = dir.path().join("settings.json");
+        std::os::unix::fs::symlink(dir.path().join("nirgendwo"), &path).unwrap();
+
+        let err = check_agent_leaf(&path).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(!dir.path().join("nirgendwo").exists());
+    }
+
+    /// Dieselbe Zusage für den Recall-Hook (liest und schreibt
+    /// `.claude/settings.json` über denselben Weg) …
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_settings_file_also_stops_the_recall_hook() {
+        let dir = tmp();
+        let victim = dir.path().join("opfer.json");
+        fs::write(&victim, "{}\n").unwrap();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let err = enable_recall_hook(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "{}\n");
+    }
+
+    /// … für den Codex-Schalter in `config.toml` …
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_codex_toml_is_refused() {
+        let dir = tmp();
+        let victim = dir.path().join("opfer.toml");
+        fs::write(&victim, "fremd = true\n").unwrap();
+        let path = dir.path().join(".codex/config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let err = ensure_codex_hooks_flag(&path).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "fremd = true\n");
+    }
+
+    /// … und für das OpenCode-Plugin.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_opencode_plugin_is_refused() {
+        let dir = tmp();
+        let victim = dir.path().join("opfer.ts");
+        fs::write(&victim, "// fremd\n").unwrap();
+        let path = dir.path().join(".opencode/plugin/minds.ts");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let err = enable_opencode(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "// fremd\n");
     }
 
     /// Die Nachbardatei darf keinem vorgelegten Symlink folgen. Der Name ist

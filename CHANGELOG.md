@@ -116,6 +116,29 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- Die **Agent-Konfigurationen** (`.claude/settings.json`, `.cursor/hooks.json`,
+  `.gemini/settings.json`, `.codex/hooks.json`, `.codex/config.toml`,
+  `.opencode/plugin/minds.ts`) schreibt `enable` nicht mehr durch einen
+  Symlink hindurch. Diese Dateien liegen in der versionierten Arbeitskopie —
+  ein gemergter PR konnte an ihrer Stelle einen Link platzieren, im Diff
+  sichtbar nur als Moduswechsel auf `120000`, und `enable` überschrieb dann
+  die fremde Zieldatei vollständig. Geprüft wird jetzt **jedes Verzeichnis
+  zwischen Repo-Wurzel und Datei**, nicht nur die Datei selbst: `.claude` als
+  Link auf `~/.claude` war der wirksamere Angriff — das Blatt darunter ist
+  eine reguläre Datei, und `enable` hätte in die *globale* Konfiguration des
+  Nutzers geschrieben. Abgelehnt werden ebenso Sonderdateien (ein FIFO ließ
+  `enable` unbegrenzt hängen) und Dateien jenseits jeder Konfigurationsgröße.
+  Geschrieben wird über denselben Weg wie bei den Hooks — Nachbardatei mit
+  `create_new`, dann `rename` —, und die Prüfung läuft **vor** der ersten
+  Änderung: Ein Link auf die dritte Konfiguration bricht nicht mehr ab,
+  nachdem die ersten beiden geschrieben sind.
+  ([#65](https://github.com/munichbughunter/minds/issues/65))
+- Eine bestehende Agent-Konfiguration **behält ihre Dateirechte**, und eine
+  schreibgeschützte wird nicht mehr ersetzt. Das Ersetzen über `rename`
+  tauscht den Inode und damit die Rechte: Eine `settings.json` mit `0600` —
+  weil dort ein API-Key steht — wäre sonst als `0644` zurückgekommen und auf
+  einer Mehrbenutzer- oder CI-Maschine für jeden lokalen Account lesbar
+  gewesen. ([#65](https://github.com/munichbughunter/minds/issues/65))
 - Fremder Text, den `minds` ausgibt oder protokolliert — Pfade aus der
   Arbeitskopie, `core.hooksPath`, der Wortlaut fremder Fehler —, wird jetzt
   vollständig entschärft. Bisher galt dafür `char::is_control`, und das ist nur
@@ -173,16 +196,13 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   Hook-Dateien über denselben Weg und meldet einen abgelehnten Hook mit Grund.
   ([#9](https://github.com/munichbughunter/minds/issues/9))
 
-  *Was das nicht abdeckt, ausdrücklich benannt:* Zeigt das **Verzeichnis** selbst
-  über einen eingecheckten Symlink woandershin, entstehen unsere Hooks dort — und
-  liegt am Ziel schon eine Datei desselben Namens, bekommt sie unseren Block und
-  `0755`. Der Weg dorthin ist eine Frage des *Ortes*, nicht des Links; er wird
-  geschlossen, wenn `enable` vor dem Schreiben außerhalb des Repos zurückfragt
-  ([#64](https://github.com/munichbughunter/minds/issues/64), Details in
-  [#66](https://github.com/munichbughunter/minds/issues/66)). Ebenfalls offen und
-  unverändert gegenüber v0.1.0: Die **Agent-Konfigurationen**
-  (`.claude/settings.json` & Co.) schreibt `enable` ohne diese Prüfung
-  ([#65](https://github.com/munichbughunter/minds/issues/65)).
+  Die beiden damals ausdrücklich benannten Lücken sind inzwischen zu: Das über
+  einen Symlink umgelenkte Hook-**Verzeichnis** beantwortet die Ortsregel
+  ([#66](https://github.com/munichbughunter/minds/issues/66),
+  [#64](https://github.com/munichbughunter/minds/issues/64), siehe *Behoben*),
+  und die **Agent-Konfigurationen** gehen seit
+  [#65](https://github.com/munichbughunter/minds/issues/65) über denselben
+  geschützten Schreibweg wie die Hooks (siehe unten).
 
 ### Hinzugefügt
 
