@@ -21,6 +21,22 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- Die von `minds enable` geschriebenen Git-Hooks hängen nicht mehr am `PATH`.
+  GUI-Clients (VS Code, Fork, Tower) und minimale CI-Shells starten Git ohne
+  das Profil der Shell — `~/.local/bin` fehlt dort, der Aufruf `minds …` lief
+  ins Leere, und `|| true` machte daraus einen **stillen Totalausfall**:
+  Committen ging, erfasst wurde nichts, dauerhaft und ohne Hinweis. `enable`
+  merkt sich jetzt den Ort des Binaries in der lokalen `.git/config`
+  (`minds.binary`); die Hooks lösen ihn zuerst auf und suchen erst dann im
+  `PATH`. Der gemerkte Ort **gewinnt** — damit kann auch eine veraltete
+  globale `minds` die Hooks nicht mehr beschatten; es läuft die Version, deren
+  `enable` die Hooks geschrieben hat. Zieht das Binary um, greift wieder die
+  PATH-Suche, und `minds fsck` sagt, dass ein `minds enable` den Eintrag
+  erneuert. Im Hook-Text selbst steht weiterhin **kein** absoluter Pfad: Seit
+  die Hook-Datei in der Arbeitskopie liegen kann, wäre ein Home-Pfad darin
+  versioniert — eingecheckt für alle, kaputt auf jeder anderen Maschine. Auch
+  hier gilt: Bestehende Installationen brauchen einmal `minds enable`.
+  ([#25](https://github.com/munichbughunter/minds/issues/25))
 - Fehler aus dem **Hook-Pfad** verschwinden nicht mehr. `checkpoint`,
   `prepare-commit-msg` und `sync` laufen aus Git-Hooks, die ihre Ausgabe wegwerfen —
   ihre Fehler waren damit unsichtbar, obwohl die Doku ein Log versprach. Der

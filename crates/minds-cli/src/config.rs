@@ -32,6 +32,7 @@ use minds_store::{Backend, StoreConfig};
 const KEY_BACKEND: &str = "minds.backend";
 const KEY_REF: &str = "minds.contextRef";
 const KEY_CHILD_PATH: &str = "minds.childPath";
+const KEY_BINARY: &str = "minds.binary";
 
 /// Optionale Redaction-Policy, relativ zur Repo-Wurzel. JSON, damit keine neue
 /// Format-Abhängigkeit nötig ist (das Envelope-Crate ist ohnehin serde-basiert).
@@ -71,6 +72,36 @@ pub fn load(repo_root: &Path) -> StoreConfig {
         }
         _ => StoreConfig::in_repo().with_ref(reference),
     }
+}
+
+/// Merkt sich den Ort des laufenden Binaries in `.git/config` (`minds.binary`).
+///
+/// Die von `enable` geschriebenen Git-Hooks lösen diesen Wert zuerst auf und
+/// suchen erst dann im `PATH` (#25): GUI-Clients (VS Code, Fork, Tower) und
+/// minimale CI-Shells starten Git ohne das Profil der Shell — `~/.local/bin`
+/// fehlt dort, der Hook liefe ins Leere, und `|| true` machte daraus einen
+/// stillen Totalausfall. Der Wert ist so maschinenlokal wie das Binary selbst;
+/// die **lokale** Config wird nie committet und reist bei keinem Clone mit —
+/// genau deshalb steht der Pfad hier und nicht im Hook-Text, der seit #9 in
+/// der versionierten Arbeitskopie liegen kann.
+///
+/// Gibt den gemerkten Pfad zurück — `None`, wenn sich der eigene Ort nicht
+/// ermitteln lässt (dann bleiben die Hooks bei der PATH-Suche, dem Stand vor
+/// #25; der Aufrufer soll das sagen, nicht verschweigen). Ein Pfad, der kein
+/// UTF-8 ist, wird verlustig geschrieben — die Hooks prüfen mit `[ -x … ]`
+/// und fallen dann ebenfalls auf den `PATH` zurück.
+pub fn record_binary(repo_root: &Path) -> std::io::Result<Option<std::path::PathBuf>> {
+    let Ok(exe) = std::env::current_exe() else {
+        return Ok(None);
+    };
+    set(repo_root, KEY_BINARY, &exe.to_string_lossy())?;
+    Ok(Some(exe))
+}
+
+/// Der bei `enable` gemerkte Binary-Ort — `None`, wenn nie einer geschrieben
+/// wurde (etwa: `enable` lief zuletzt mit einer Version vor #25).
+pub fn recorded_binary(repo_root: &Path) -> Option<std::path::PathBuf> {
+    get(repo_root, KEY_BINARY).map(std::path::PathBuf::from)
 }
 
 /// Lädt die Redaction-Policy aus `.minds/redact.json`.
@@ -200,6 +231,28 @@ mod tests {
             }
         );
         assert_eq!(cfg.reference(), DEFAULT_CONTEXT_REF);
+    }
+
+    // --- Binary-Ort (#25) -----------------------------------------------------
+
+    #[test]
+    fn record_binary_writes_the_running_binary_and_overwrites_a_stale_entry() {
+        let Some(dir) = repo() else { return };
+        // Ein alter Eintrag (Binary umgezogen) darf nicht stehen bleiben —
+        // sonst heilte ein erneutes `minds enable` genau nichts.
+        set(dir.path(), KEY_BINARY, "/umgezogen/minds").unwrap();
+
+        let exe = record_binary(dir.path())
+            .unwrap()
+            .expect("im Test gibt es immer ein current_exe");
+        assert!(exe.is_absolute(), "{}", exe.display());
+        assert_eq!(recorded_binary(dir.path()), Some(exe));
+    }
+
+    #[test]
+    fn recorded_binary_is_none_when_enable_never_wrote_one() {
+        let Some(dir) = repo() else { return };
+        assert_eq!(recorded_binary(dir.path()), None);
     }
 
     // --- Redaction-Policy -----------------------------------------------------

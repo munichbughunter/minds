@@ -180,6 +180,18 @@ fn enable_agents(
     }
     ensure_writable(&hooks_dir)?;
 
+    // Vor der ersten Datei: den Ort dieses Binaries festhalten, den die
+    // Hook-Rümpfe auflösen (#25). Ohne den Eintrag suchen die Hooks im PATH —
+    // der Stand vor #25, der in GUI-Clients still ausfällt. Deshalb ist ein
+    // Scheitern von `current_exe` hier kein stiller Fall, sondern ein Hinweis.
+    match config::record_binary(&paths.root)? {
+        Some(_) => vln(verbose, "  .git/config: minds.binary gesetzt"),
+        None => println!(
+            "Hinweis: der Ort dieses Binaries ließ sich nicht ermitteln — \
+             die Hooks suchen minds über den PATH"
+        ),
+    }
+
     for &agent in agents {
         let change = match agent {
             Which::ClaudeCode => claude_style(&paths.root, ".claude/settings.json", "claude-code")?,
@@ -1022,16 +1034,63 @@ fn enable_opencode(root: &Path) -> std::io::Result<Change> {
 // Git-Hooks
 // ---------------------------------------------------------------------------
 
+/// Die Zeilen, mit denen jeder Hook-Rumpf beginnt: erst den bei `enable`
+/// gemerkten Binary-Ort auflösen (`minds.binary`, siehe
+/// [`crate::config::record_binary`], #25), dann — wenn dort keiner (mehr)
+/// liegt — auf die PATH-Suche zurückfallen.
+///
+/// **Warum nicht das nackte `minds`:** GUI-Clients (VS Code, Fork, Tower) und
+/// minimale CI-Shells starten Git ohne das Profil der Shell. `~/.local/bin`
+/// fehlt dort im `PATH`, der Aufruf lief ins Leere, und `|| true` machte
+/// daraus einen stillen Totalausfall — committen ging, erfasst wurde nichts.
+///
+/// **Warum kein absoluter Pfad im Hook-Text:** Seit #9 kann die Hook-Datei in
+/// der Arbeitskopie liegen und ist dann **versioniert**. Ein Home-Pfad darin
+/// würde eingecheckt, bräche auf jeder anderen Maschine und machte die Datei
+/// bei jedem `enable` schmutzig. Der maschinenlokale Wert steht deshalb in der
+/// maschinenlokalen `.git/config` — der Hook-Text bleibt überall derselbe,
+/// und der `fsck`-Vergleich (exakter Rumpf-Vergleich) bleibt aussagekräftig.
+///
+/// **Der gemerkte Ort gewinnt gegen den `PATH`:** So kann eine veraltete
+/// globale `minds` die Hooks nicht mehr beschatten — es läuft die Version,
+/// deren `enable` die Hooks geschrieben hat. `[ -f … ] && [ -x … ]` fängt den
+/// umgezogenen Binary ab (und ein Verzeichnis mit x-Bit, das `[ -x ]` allein
+/// durchließe); dann greift der `PATH`, bis ein erneutes `minds enable` den
+/// Eintrag erneuert (`minds fsck` weist darauf hin).
+///
+/// **`--local`, nicht der effektive Wert:** Der Ort ist per Entwurf repo- und
+/// maschinenlokal. Ohne `--local` läse der Hook auch `~/.gitconfig`,
+/// `GIT_CONFIG_*`-Umgebung und `git -c`-Parameter (Git vererbt sie in den
+/// Hook-Prozess) — eine breitere Auflösungsfläche als dokumentiert, und
+/// [`crate::config::record_binary`] wie `fsck` fragen nur die lokale Ebene.
+/// Alle drei stellen so dieselbe Frage an dieselbe Quelle.
+///
+/// Jede Zeile ist für sich `set -e`-fest (`|| true` bzw. `|| MINDS_BIN=minds`):
+/// Der Block kann in einer fremden Hook-Datei stehen, deren Kopf `set -e`
+/// setzt. Und `"$MINDS_BIN"` ist überall gequotet — ein Pfad mit Leerzeichen
+/// bleibt ein Wort.
+macro_rules! hook_body {
+    ($command:literal) => {
+        concat!(
+            "MINDS_BIN=$(git config --local --get minds.binary 2>/dev/null) || true\n",
+            "[ -f \"$MINDS_BIN\" ] && [ -x \"$MINDS_BIN\" ] || MINDS_BIN=minds\n",
+            $command
+        )
+    };
+}
+
 /// post-commit: der Checkpoint-Auslöser. `minds checkpoint` (M6) nimmt Journal +
 /// Transkript, redigiert und legt die Session ab. Non-blocking — ein Rekorder
 /// darf einen Commit nie scheitern lassen.
-const POST_COMMIT_BODY: &str =
-    "minds checkpoint --commit \"$(git rev-parse HEAD)\" >/dev/null 2>&1 || true";
+const POST_COMMIT_BODY: &str = hook_body!(
+    "\"$MINDS_BIN\" checkpoint --commit \"$(git rev-parse HEAD)\" >/dev/null 2>&1 || true"
+);
 
 /// prepare-commit-msg: reserviert für den Trailer (M6). Heute ein sicherer
 /// No-op — der Aufruf schlägt fehl, `|| true` fängt ihn, die Nachricht bleibt
 /// unangetastet.
-const PREPARE_MSG_BODY: &str = "minds prepare-commit-msg \"$1\" >/dev/null 2>&1 || true";
+const PREPARE_MSG_BODY: &str =
+    hook_body!("\"$MINDS_BIN\" prepare-commit-msg \"$1\" >/dev/null 2>&1 || true");
 
 /// pre-push: `minds sync` schickt den Kontext beim `git push` mit — an dasselbe
 /// Remote, an das gerade gepusht wird (`$1`).
@@ -1065,7 +1124,7 @@ const PREPARE_MSG_BODY: &str = "minds prepare-commit-msg \"$1\" >/dev/null 2>&1 
 ///
 /// **stdout bleibt**: Was `minds sync` dort meldet, ist die Erfolgsmeldung, und
 /// die gehört an den Push, zu dem sie gehört.
-const PRE_PUSH_BODY: &str = "minds sync --remote \"$1\" 2>/dev/null || true";
+const PRE_PUSH_BODY: &str = hook_body!("\"$MINDS_BIN\" sync --remote \"$1\" 2>/dev/null || true");
 
 /// **Die** Liste der Git-Hooks, die `minds` schreibt — samt ihrer Rümpfe.
 ///
@@ -1130,15 +1189,22 @@ fn block_span(text: &str) -> Option<std::ops::Range<usize>> {
 
 /// Was zwischen [`MARK_BEGIN`] und [`MARK_END`] steht, ohne die Marken.
 ///
-/// Zeilenenden werden abgeschnitten — auch `\r`. Sonst gälte eine Hook-Datei
-/// mit CRLF (Windows-Editor, `core.autocrlf`, ein `.gitattributes` mit
-/// `eol=crlf` auf dem `.husky`-Verzeichnis aus #9) **dauerhaft** als veraltet,
-/// auch direkt nach `minds enable` — und ein Hinweis, den man nicht loswerden
-/// kann, wird überlesen, mitsamt den echten daneben.
-pub(crate) fn block_body(text: &str) -> Option<&str> {
+/// Zeilenenden werden normalisiert — `\r\n` wird zu `\n`, an den Rändern fällt
+/// beides weg. Sonst gälte eine Hook-Datei mit CRLF (Windows-Editor,
+/// `core.autocrlf`, ein `.gitattributes` mit `eol=crlf` auf dem
+/// `.husky`-Verzeichnis aus #9) **dauerhaft** als veraltet, auch direkt nach
+/// `minds enable` — und ein Hinweis, den man nicht loswerden kann, wird
+/// überlesen, mitsamt den echten daneben. Seit die Rümpfe mehrzeilig sind
+/// (#25), reicht das Abschneiden an den Rändern dafür nicht mehr: CRLF steht
+/// dann auch **zwischen** den Zeilen.
+pub(crate) fn block_body(text: &str) -> Option<String> {
     let span = block_span(text)?;
     let inner = &text[span.start + MARK_BEGIN.len()..span.end - MARK_END.len()];
-    Some(inner.trim_matches(|c| c == '\n' || c == '\r'))
+    Some(
+        inner
+            .trim_matches(|c| c == '\n' || c == '\r')
+            .replace("\r\n", "\n"),
+    )
 }
 
 /// Fügt einen markierten Block in einen Git-Hook ein oder aktualisiert ihn.
@@ -1607,7 +1673,7 @@ mod tests {
 
         let written = fs::read_to_string(root.join(".husky/post-commit")).unwrap();
         assert!(written.contains(MARK_BEGIN), "unser Block fehlt: {written}");
-        assert!(written.contains("minds checkpoint"));
+        assert!(written.contains(POST_COMMIT_BODY));
         assert!(
             !root.join(".git/hooks/post-commit").exists(),
             "der Hook darf nicht im ignorierten Verzeichnis landen"
@@ -2022,7 +2088,7 @@ mod tests {
         // `git push` rief, kostete *jeder* Push den vollen Verbindungsaufbau —
         // auch wenn es nichts Neues gab. Ob etwas fällig ist, kann nur das
         // Binary entscheiden (Tracking-Refs), nicht die Shell.
-        assert!(PRE_PUSH_BODY.contains("minds sync"));
+        assert!(PRE_PUSH_BODY.contains("\"$MINDS_BIN\" sync"));
         assert!(
             !PRE_PUSH_BODY.contains("git push"),
             "der Hook darf nicht selbst pushen: {PRE_PUSH_BODY}"
@@ -2052,7 +2118,7 @@ mod tests {
             enable_git_hook(&hooks, name, body).unwrap();
 
             let written = fs::read_to_string(hooks.join(name)).unwrap();
-            assert_eq!(block_body(&written), Some(body), "{name}");
+            assert_eq!(block_body(&written).as_deref(), Some(body), "{name}");
         }
     }
 
@@ -2068,7 +2134,7 @@ mod tests {
 
         let written = fs::read_to_string(hooks.join("pre-push")).unwrap();
         let crlf = written.replace('\n', "\r\n");
-        assert_eq!(block_body(&crlf), Some(body));
+        assert_eq!(block_body(&crlf).as_deref(), Some(body));
     }
 
     #[test]
@@ -2077,22 +2143,26 @@ mod tests {
         // Anfang. Global gesucht ergäbe das eine Spanne, die rückwärts läuft.
         let body = expected_body("post-commit").unwrap();
         let text = format!("{MARK_END}\nfremd\n{MARK_BEGIN}\n{body}\n{MARK_END}\n");
-        assert_eq!(block_body(&text), Some(body));
+        assert_eq!(block_body(&text).as_deref(), Some(body));
 
         // Und `replace_block` fasst dieselbe Spanne an — sonst meldete `fsck`
         // etwas, das `enable` nicht repariert.
         let replaced = replace_block(&text, &format!("{MARK_BEGIN}\nneu\n{MARK_END}"));
-        assert_eq!(block_body(&replaced), Some("neu"));
+        assert_eq!(block_body(&replaced).as_deref(), Some("neu"));
         assert!(replaced.contains("fremd"), "Fremdes bleibt: {replaced}");
     }
 
     #[test]
     fn the_pre_push_hook_redirects_its_stderr_but_keeps_stdout() {
         // stderr geht weg, weil sie sonst roh im Push-Output landet — der
-        // Wortlaut steht seit #10 in `<git-dir>/minds/hook.log`.
+        // Wortlaut steht seit #10 in `<git-dir>/minds/hook.log`. Geprüft wird
+        // die **Aufruf-Zeile** (die letzte): Seit der Prelude trägt auch die
+        // `git config`-Zeile ein `2>/dev/null` — ein `contains` über den ganzen
+        // Rumpf bliebe grün, wenn ausgerechnet der sync-Aufruf seins verlöre.
+        let call = PRE_PUSH_BODY.lines().last().unwrap();
         assert!(
-            PRE_PUSH_BODY.contains("2>/dev/null"),
-            "stderr gehört ins Log, nicht in den Push-Output: {PRE_PUSH_BODY}"
+            call.contains("2>/dev/null"),
+            "stderr gehört ins Log, nicht in den Push-Output: {call}"
         );
         // stdout bleibt: Dort steht die Erfolgsmeldung, und die gehört zu dem
         // Push, bei dem sie entsteht. `>/dev/null` wäre hier ein Verlust.
@@ -2110,6 +2180,43 @@ mod tests {
         for body in [POST_COMMIT_BODY, PREPARE_MSG_BODY] {
             assert!(body.contains(">/dev/null 2>&1"), "{body}");
             assert!(body.contains("|| true"), "{body}");
+        }
+    }
+
+    #[test]
+    fn every_hook_resolves_the_recorded_binary_before_searching_the_path() {
+        // #25: Der Commit aus VS Code, Fork oder Tower kommt ohne das Profil
+        // der Shell — `minds` nackt aufzurufen hieß dort: stiller Totalausfall.
+        // Jeder Rumpf löst deshalb zuerst `minds.binary` auf; der PATH ist nur
+        // noch die Rückfallebene für den umgezogenen Binary.
+        for (name, body) in ALL_HOOKS {
+            // `--local`: Env, `git -c` und globale Ebenen dürfen den Ort nicht
+            // stellen — Hook, `record_binary` und `fsck` fragen dieselbe Quelle.
+            assert!(
+                body.starts_with("MINDS_BIN=$(git config --local --get minds.binary"),
+                "{name} löst den gemerkten Ort nicht lokal auf: {body}"
+            );
+            // `-f` zusätzlich zu `-x`: ein Verzeichnis mit x-Bit bestünde
+            // `[ -x ]` — der Hook liefe dann gegen ein Verzeichnis statt in
+            // die PATH-Rückfallebene.
+            assert!(
+                body.contains("[ -f \"$MINDS_BIN\" ] && [ -x \"$MINDS_BIN\" ] || MINDS_BIN=minds"),
+                "{name} hat keine PATH-Rückfallebene: {body}"
+            );
+            // Der Aufruf geht über die Variable, gequotet — ein Pfad mit
+            // Leerzeichen bleibt ein Wort.
+            assert!(
+                body.contains("\"$MINDS_BIN\" "),
+                "{name} ruft nicht über die Variable auf: {body}"
+            );
+            // Der Block kann in einer fremden Hook-Datei mit `set -e` stehen —
+            // keine Zeile darf den Hook dann abbrechen.
+            for line in body.lines() {
+                assert!(
+                    line.ends_with("|| true") || line.ends_with("|| MINDS_BIN=minds"),
+                    "{name}: Zeile bricht unter set -e ab: {line}"
+                );
+            }
         }
     }
 

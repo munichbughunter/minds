@@ -65,8 +65,10 @@ fn fsck(require_review: bool) -> Fallible<bool> {
     let orphans = check_trailers(&repo, store.as_ref())?;
     let index_orphans = check_index(store.as_ref())?;
     check_journal(&repo);
-    let hints =
-        report_hooks(&root, &hook_state(&root, repo.git_dir())) + report_log(&root, repo.git_dir());
+    let hooks = hook_state(&root, repo.git_dir());
+    let hints = report_hooks(&root, &hooks)
+        + report_binary(&root, &hooks)
+        + report_log(&root, repo.git_dir());
 
     let mut total = orphans + index_orphans;
     if require_review {
@@ -387,7 +389,7 @@ fn inspect_hook(name: &str, path: &Path) -> Hook {
             // `hook_names()`), aber die Signatur lädt dazu ein.
             debug_assert!(expected.is_some(), "unbekannter Hook-Name: {name}");
             match crate::enable::block_body(&content) {
-                Some(body) if Some(body) == expected => Hook::Installed,
+                Some(body) if Some(body.as_str()) == expected => Hook::Installed,
                 _ => Hook::Outdated,
             }
         }
@@ -496,6 +498,69 @@ fn report_hooks(root: &Path, state: &HookState) -> usize {
         HookState::Checked { missing, outdated, refused, .. }
             if missing.is_empty() && outdated.is_empty() && refused.is_empty()
     ))
+}
+
+/// Meldet, wenn die Hooks wieder von der PATH-Suche abhängen (#25) — der
+/// Zustand, der in GUI-Clients still gar nichts erfasst. Zwei Wege dorthin:
+///
+/// - `minds.binary` zeigt auf einen Ort, an dem kein ausführbares Binary
+///   (mehr) liegt — das Binary ist umgezogen.
+/// - Der Schlüssel ist **nicht gesetzt**, obwohl die aktuellen Hook-Rümpfe
+///   installiert sind. Das ist der Clone-Fall: Liegt das Hook-Verzeichnis seit
+///   #9 versioniert in der Arbeitskopie, reisen die Rümpfe mit dem Clone —
+///   die lokale `.git/config` reist nie mit. Ohne diesen Zweig attestierte
+///   `fsck` genau dem Repo Gesundheit, dessen Erfassung wieder am PATH hängt.
+///
+/// Fehlen die Hooks dagegen oder sind sie veraltet, schweigt dieser Abschnitt:
+/// Diese Zustände melden ihre eigenen Abschnitte, mit demselben Rat.
+///
+/// Ein Hinweis, kein Befund: Die Hooks laufen weiter, solange der PATH `minds`
+/// kennt — nur eben wieder maschinenabhängig.
+fn report_binary(root: &Path, hooks: &HookState) -> usize {
+    match config::recorded_binary(root) {
+        Some(recorded) => {
+            if is_executable(&recorded) {
+                return 0;
+            }
+            println!(
+                "Binary: minds.binary verweist auf „{}“ — dort liegt kein ausführbares minds",
+                short(root, &recorded)
+            );
+            println!("  die Hooks suchen im PATH; `minds enable` erneuert den Eintrag");
+            1
+        }
+        None => {
+            let installed = matches!(
+                hooks,
+                HookState::Checked { missing, outdated, refused, .. }
+                    if missing.is_empty() && outdated.is_empty() && refused.is_empty()
+            );
+            if !installed {
+                return 0;
+            }
+            println!(
+                "Binary: minds.binary ist nicht gesetzt — die Hooks suchen minds über den PATH"
+            );
+            println!("  `minds enable` merkt sich den Ort des Binaries");
+            1
+        }
+    }
+}
+
+/// Ausführbar im Sinn des Hooks: dieselbe Frage, die `[ -f … ] && [ -x … ]`
+/// dort stellt — `is_file` gehört dazu, ein Verzeichnis mit x-Bit ist keins.
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Der Log-Abschnitt des Berichts, Zeile für Zeile — leer, wenn es kein Log
