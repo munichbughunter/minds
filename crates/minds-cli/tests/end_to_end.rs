@@ -53,11 +53,12 @@ fn without_user_config(cmd: &mut Command) -> &mut Command {
 
 /// Der `PATH` für Git-Aufrufe: vorneweg das Verzeichnis des Test-Binaries.
 ///
-/// Die von `minds enable` installierten Hooks rufen `minds` **ohne Pfad** auf.
-/// Ohne diesen Eintrag greift der Aufruf ins Leere und `|| true` schluckt ihn;
-/// mit einer global installierten `minds` im Pfad liefe statt des Test-Binaries
-/// eine **fremde Version** — beides macht den Lauf von der Maschine abhängig.
-/// Das Verzeichnis steht deshalb vorn und beschattet jede globale Installation.
+/// Die Hooks lösen seit #25 zuerst den bei `enable` gemerkten Ort auf
+/// (`minds.binary`) — der zeigt hier aufs Test-Binary. Dieser Eintrag hält die
+/// **Rückfallebene** deterministisch: Fiele die Auflösung aus, liefe sonst eine
+/// global installierte, womöglich veraltete `minds` — grün aus dem falschen
+/// Grund. Dass die Auflösung auch ganz ohne dieses Netz trägt, prüft
+/// `a_commit_without_minds_in_the_path_still_checkpoints`.
 fn path_with_minds() -> std::ffi::OsString {
     let bin_dir = Path::new(MINDS)
         .parent()
@@ -141,8 +142,8 @@ fn the_core_loop_closes() {
     )
     .unwrap();
     git(dir, &["add", "greet.rs"]);
-    // Der post-commit-Hook checkpointet hier bereits selbst — `path_with_minds`
-    // stellt ihm das Test-Binary in den Pfad. Schritt 4 ruft `checkpoint`
+    // Der post-commit-Hook checkpointet hier bereits selbst — er löst das
+    // Test-Binary über `minds.binary` auf. Schritt 4 ruft `checkpoint`
     // trotzdem noch einmal von Hand auf: Der Weg muss auch der sein, den ein
     // Nutzer ohne Hook geht, und ein zweiter Lauf über dieselbe Session ist ein
     // No-op (der Ref-Name *ist* der Inhalts-Hash).
@@ -375,6 +376,238 @@ fn a_moved_hookspath_still_captures_on_commit() {
         stdout(&show).contains("Schreibe eine Grußfunktion"),
         "die Session ist nicht über den Commit auffindbar:\n{}",
         stdout(&show)
+    );
+}
+
+/// Der `PATH` eines GUI-Clients: `git` ist da, `minds` nicht.
+///
+/// Hartkodiertes `/usr/bin:/bin` (wie im Repro von #25) wäre nicht überall
+/// wahr — Homebrew-git, CI-Images. Entscheidend ist nur, dass **kein**
+/// Verzeichnis mit einer `minds` darin auftaucht: genau das Verzeichnis, in
+/// dem `git` liegt, und sonst nichts.
+fn path_without_minds() -> std::ffi::OsString {
+    // Nicht das *erste* git-Verzeichnis, sondern das erste **ohne** minds
+    // daneben: Auf einer Maschine mit Homebrew-git und dorthin verlinkter
+    // minds wäre der Test sonst hart rot, obwohl `/usr/bin` als Kandidat taugt.
+    let git_dir = std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .find(|dir| dir.join("git").is_file() && !dir.join("minds").exists())
+        .expect("kein PATH-Verzeichnis mit git, aber ohne minds — dieser PATH sagt nichts aus");
+    git_dir.into_os_string()
+}
+
+/// `git` mit dem PATH eines GUI-Clients — im Unterschied zu [`git`], das das
+/// Test-Binary absichtlich in den Pfad stellt.
+fn git_without_minds(dir: &Path, args: &[&str]) -> Output {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    cmd.env("PATH", path_without_minds());
+    without_user_config(&mut cmd).output().expect("git läuft")
+}
+
+/// #25, Akzeptanzkriterium 1: Der Commit aus einem GUI-Client — `minds` ist
+/// nirgends im `PATH` — erzeugt trotzdem einen Checkpoint. Der Hook löst den
+/// bei `enable` gemerkten Ort auf, statt den `PATH` zu durchsuchen.
+#[test]
+fn a_commit_without_minds_in_the_path_still_checkpoints() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // `enable` läuft wie beim Nutzer: aus einer Shell, in der minds liegt. Es
+    // ist der **Hook**, der später ohne diese Shell auskommen muss.
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(enable.status.success(), "{}", stdout(&enable));
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Commit aus dem GUI-Client""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git_without_minds(dir, &["add", "a.txt"]);
+    assert!(
+        git_without_minds(dir, &["commit", "-q", "-m", "feat: aus dem GUI"])
+            .status
+            .success(),
+        "der Commit selbst darf nie scheitern"
+    );
+
+    // Kein manuelles `checkpoint`: Was hier ankommt, kann nur der post-commit-
+    // Hook getan haben — mit minds in keinem PATH-Verzeichnis.
+    let refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        !refs.trim().is_empty(),
+        "kein Checkpoint ohne minds im PATH — der Hook hat den gemerkten Ort nicht aufgelöst"
+    );
+}
+
+/// #25, Akzeptanzkriterium 2: Ohne `minds` im `PATH` — und mit einem gemerkten
+/// Ort, an dem nichts mehr liegt — schreibt der pre-push-Hook **nichts** auf
+/// stderr und lässt den Push nicht scheitern. Kein „command not found"
+/// zwischen den Zeilen von `git push`.
+#[test]
+fn pushing_without_minds_anywhere_stays_silent_and_green() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Der Worst Case aus #25: Binary umgezogen *und* PATH ohne minds.
+    git(dir, &["config", "minds.binary", "/umgezogen/minds"]);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "chore: etwas zum Pushen"]);
+
+    // `/bin/sh` absolut — der minimale PATH kennt nur das git-Verzeichnis, und
+    // genau so (über den Shebang, nicht über den PATH) startet Git den Hook.
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg(dir.join(".git/hooks/pre-push"))
+        .args(["origin", "https://beispiel.invalid/x.git"])
+        .current_dir(dir)
+        .env("PATH", path_without_minds());
+    let hook = without_user_config(&mut cmd)
+        .output()
+        .expect("der Hook läuft");
+
+    assert!(
+        hook.status.success(),
+        "der pre-push-Hook darf einen Push nie scheitern lassen"
+    );
+    let stderr = String::from_utf8_lossy(&hook.stderr);
+    assert!(
+        stderr.is_empty(),
+        "nichts davon gehört in den Push-Output:\n{stderr}"
+    );
+}
+
+/// Zieht das Binary um, greift die PATH-Suche — und `minds fsck` sagt, dass
+/// ein `minds enable` den Eintrag erneuert. Die Rückfallebene aus #25.
+#[test]
+fn a_stale_recorded_binary_falls_back_to_the_path_and_fsck_says_so() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Das Binary „zieht um": Der gemerkte Ort stimmt nicht mehr. `git` läuft
+    // hier mit [`path_with_minds`] — die Rückfallebene findet das Test-Binary.
+    git(dir, &["config", "minds.binary", "/umgezogen/minds"]);
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Nach dem Umzug""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    assert!(
+        git(dir, &["commit", "-q", "-m", "feat: nach dem Umzug"])
+            .status
+            .success()
+    );
+
+    let refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        !refs.trim().is_empty(),
+        "die PATH-Rückfallebene hat nicht gegriffen"
+    );
+
+    // Still weiterlaufen genügt nicht — der Zustand muss sichtbar sein, sonst
+    // hängt die Erfassung wieder unbemerkt am PATH (genau das Problem aus #25).
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(fsck.status.success(), "{}", stdout(&fsck));
+    assert!(
+        stdout(&fsck).contains("minds.binary"),
+        "fsck verschweigt den verwaisten Eintrag:\n{}",
+        stdout(&fsck)
+    );
+
+    // Der Clone-Fall: Die versionierten Hook-Rümpfe reisen mit, die lokale
+    // `.git/config` nie. Hooks aktuell, Schlüssel weg — auch das muss `fsck`
+    // sagen, sonst attestiert es Gesundheit, während die Erfassung am PATH hängt.
+    git(dir, &["config", "--unset", "minds.binary"]);
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(fsck.status.success(), "{}", stdout(&fsck));
+    assert!(
+        stdout(&fsck).contains("minds.binary ist nicht gesetzt"),
+        "fsck verschweigt den fehlenden Eintrag:\n{}",
+        stdout(&fsck)
+    );
+}
+
+/// `--local` in der Hook-Prelude: Ein `git -c minds.binary=…` (Git vererbt es
+/// über `GIT_CONFIG_PARAMETERS` in den Hook-Prozess) darf die Auflösung nicht
+/// umlenken — der Ort ist repo- und maschinenlokal, nichts, was ein Aufrufer
+/// von außen stellt.
+#[cfg(unix)]
+#[test]
+fn a_config_override_on_the_command_line_cannot_redirect_the_hooks() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let enable = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(enable.status.success(), "{}", stdout(&enable));
+
+    // Ein „minds", das nichts tut und Erfolg meldet: Würde der Hook hierhin
+    // auflösen, entstünde kein Checkpoint — und der Test würde rot.
+    let fake = dir.join("fake-minds");
+    std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Override-Versuch""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    let override_arg = format!("minds.binary={}", fake.display());
+    assert!(
+        git(
+            dir,
+            &[
+                "-c",
+                &override_arg,
+                "commit",
+                "-q",
+                "-m",
+                "feat: mit Override"
+            ]
+        )
+        .status
+        .success()
+    );
+
+    let refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        !refs.trim().is_empty(),
+        "der Hook hat den -c-Override ausgeführt statt des lokalen Eintrags"
     );
 }
 

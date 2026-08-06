@@ -27,23 +27,17 @@ Gebaut werden macOS (Apple Silicon und Intel) und Linux (x86_64 und ARM64, jewei
 musl und statisch). Für Windows gibt es noch kein fertiges Binary — dort aus dem
 [Quelltext bauen](#aus-dem-quelltext-bauen).
 
-### `minds` muss im PATH liegen
+### Einmal `minds enable` — den Ort merkt sich Minds
 
-Das ist keine Kosmetik, sondern Voraussetzung. `minds enable` schreibt Git-Hooks, die
-`minds` **ohne Pfad** aufrufen — so, wie du es im Terminal tust. Liegt das Binary nicht
-im PATH, laufen diese Hooks ins Leere. Und weil ein Rekorder niemals einen Commit
-scheitern lassen darf, tun sie das **still**: kein Fehler, keine Warnung, aber auch
-keine Change-Id am Commit und keine erfasste Session. Committen funktioniert weiter,
-nur aufgezeichnet wird nichts.
+Wo das Binary liegt, ist nach dem `enable` nicht mehr dein Problem: Es hält den Ort
+in der lokalen Git-Config fest (`minds.binary`), und die Git-Hooks rufen `minds`
+darüber auf. Sie funktionieren damit auch dort, wo kein Shell-Profil den PATH setzt
+— beim Commit aus VS Code, Fork oder Tower, in minimalen CI-Shells. Erst wenn am
+gemerkten Ort kein Binary mehr liegt (etwa nach einem Umzug), suchen die Hooks im
+PATH; ein erneutes `minds enable` erneuert den Eintrag, und `minds fsck` weist
+darauf hin.
 
-Kurz nachsehen:
-
-```sh
-command -v minds   # muss einen Pfad ausgeben, sonst greifen die Hooks nicht
-```
-
-Kommt nichts zurück, das Zielverzeichnis in `~/.zshrc` oder `~/.bashrc` ergänzen und
-die Shell neu öffnen:
+Im PATH liegen sollte `minds` trotzdem — für deine eigenen Aufrufe im Terminal:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
