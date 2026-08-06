@@ -714,6 +714,162 @@ fn the_hook_swallows_a_foreign_flag_without_losing_the_event() {
     );
 }
 
+/// #66/#64: Ein Hook-Verzeichnis außerhalb des Repos bekommt keine Hooks ohne
+/// Zustimmung — nicht-interaktiv heißt das: Abbruch mit Hinweis auf das Flag,
+/// und **nichts** ist halb eingerichtet.
+#[test]
+fn enable_refuses_an_outside_hooks_dir_without_confirmation() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let outside = tempfile::tempdir().unwrap();
+    git(
+        dir,
+        &["config", "core.hooksPath", outside.path().to_str().unwrap()],
+    );
+
+    // stdin ist im Test eine Pipe, kein Terminal — der nicht-interaktive Fall.
+    let out = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(
+        !out.status.success(),
+        "enable darf ohne Zustimmung nicht nach draußen schreiben"
+    );
+    assert!(
+        stderr(&out).contains("--global-hooks"),
+        "die Meldung muss den Ausweg nennen:\n{}",
+        stderr(&out)
+    );
+
+    assert!(
+        !outside.path().join("post-commit").exists(),
+        "draußen darf nichts entstanden sein"
+    );
+    assert!(
+        !dir.join(".claude/settings.json").exists(),
+        "nichts halb Eingerichtetes: auch die Agent-Konfiguration bleibt aus"
+    );
+}
+
+/// #64: Mit `--global-hooks` liegt die Zustimmung vor — die Hooks entstehen
+/// draußen, und `minds fsck` benennt den besonderen Ort, statt ihn wie einen
+/// gewöhnlichen zu behandeln.
+#[test]
+fn the_global_hooks_flag_confirms_an_outside_dir_and_fsck_names_it() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let outside = tempfile::tempdir().unwrap();
+    git(
+        dir,
+        &["config", "core.hooksPath", outside.path().to_str().unwrap()],
+    );
+
+    let out = minds(
+        dir,
+        &["enable", "--agent", "claude-code", "--global-hooks"],
+        None,
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        outside.path().join("post-commit").exists(),
+        "mit Zustimmung entstehen die Hooks draußen"
+    );
+
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(fsck.status.success(), "{}", stdout(&fsck));
+    assert!(
+        stdout(&fsck).contains("außerhalb des Repos"),
+        "fsck muss den Ort benennen:\n{}",
+        stdout(&fsck)
+    );
+}
+
+/// #66, der Leitfall: Ein eingecheckter Symlink lenkt das Hook-Verzeichnis um
+/// (`core.hooksPath = ".husky/_"`, `.husky` ist ein Link nach draußen). Am
+/// fremden Ziel darf nichts entstehen — egal, dass kein Glied des
+/// konfigurierten Pfads selbst ein Link ist.
+#[cfg(unix)]
+#[test]
+fn a_checked_in_symlink_cannot_redirect_enable_outside() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.join(".husky")).unwrap();
+    git(dir, &["config", "core.hooksPath", ".husky/_"]);
+
+    let out = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(
+        !out.status.success(),
+        "der Symlink darf enable nicht nach draußen lenken"
+    );
+    assert!(
+        !outside.path().join("_").exists(),
+        "am fremden Ziel darf nichts entstanden sein"
+    );
+}
+
+/// Die Gegenprobe zu #66 (Umgehung 4, das Falsch-Rot): Ein symlinktes `.git`
+/// ist ein von Git unterstütztes Setup — dorthin kann ein Checkout nichts
+/// legen, und `enable` muss ohne Rückfrage durchlaufen.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_git_dir_still_enables_without_questions() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let store = tempfile::tempdir().unwrap();
+    let gitstore = store.path().join("gitstore");
+    std::fs::rename(dir.join(".git"), &gitstore).unwrap();
+    std::os::unix::fs::symlink(&gitstore, dir.join(".git")).unwrap();
+
+    let out = minds(dir, &["enable", "--agent", "claude-code"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        gitstore.join("hooks/post-commit").exists(),
+        "die Hooks gehören ins (symlinkte) Git-Verzeichnis"
+    );
+}
+
+/// Die zweite Gegenprobe zu #66: In einem Linked Worktree liegt das effektive
+/// Hook-Verzeichnis im common dir des Haupt-Repos — von Git verwaltet, kein
+/// fremder Ort. `fsck` darf dort kein „außerhalb des Repos" behaupten.
+#[test]
+fn fsck_in_a_linked_worktree_claims_no_outside() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "chore: Grundstein"]);
+
+    let wt = tempfile::tempdir().unwrap();
+    let linked = wt.path().join("zweig");
+    let added = git(dir, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+    if !added.status.success() {
+        eprintln!("git worktree add scheitert hier — Test übersprungen");
+        return;
+    }
+
+    let fsck = minds(&linked, &["fsck"], None);
+    assert!(fsck.status.success(), "{}", stdout(&fsck));
+    assert!(
+        !stdout(&fsck).contains("außerhalb des Repos"),
+        "das common dir ist kein fremder Ort:\n{}",
+        stdout(&fsck)
+    );
+}
+
 /// #11, Akzeptanzkriterium 3: `--summary --sign` erzeugt kein unsigniertes
 /// Review mit der Zusammenfassung „--sign" — es ist ein Fehler mit Meldung.
 #[test]

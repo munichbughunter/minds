@@ -87,6 +87,7 @@ pub fn run(
     child_remote: Option<&str>,
     verbose: bool,
     recall: bool,
+    global_hooks: bool,
 ) -> ExitCode {
     let paths = match locate() {
         Ok(paths) => paths,
@@ -113,7 +114,15 @@ pub fn run(
         }
     };
 
-    match enable_agents(&paths, agents, store, child_remote, verbose, recall) {
+    match enable_agents(
+        &paths,
+        agents,
+        store,
+        child_remote,
+        verbose,
+        recall,
+        global_hooks,
+    ) {
         // Im Regelfall still — den Nutzer interessiert das Setup nicht. `-v`
         // zeigt jeden Schritt; nur echte Fehler kommen immer durch.
         Ok(()) => ExitCode::SUCCESS,
@@ -147,6 +156,7 @@ impl Which {
 /// Registriert die gewählten Agents, immer die Git-Hooks (ein Checkpoint soll
 /// entstehen, wenn committet wird — unabhängig davon, welcher Agent lief) und
 /// schreibt die Store-Config.
+#[allow(clippy::too_many_arguments)]
 fn enable_agents(
     paths: &RepoPaths,
     agents: &[Which],
@@ -154,6 +164,7 @@ fn enable_agents(
     child_remote: Option<&str>,
     verbose: bool,
     recall: bool,
+    global_hooks: bool,
 ) -> std::io::Result<()> {
     // Zuerst, vor jedem Schreibzugriff: Gibt es überhaupt einen Ort, aus dem
     // Git Hooks ausführt, und lässt sich dort schreiben? Wenn nicht, soll der
@@ -162,9 +173,22 @@ fn enable_agents(
     // checkt aber nie ein.
     let hooks_dir = paths.hooks.require()?.to_path_buf();
 
+    // Die Ortsregel (#66/#64), ebenfalls vor jedem Schreibzugriff: Liegt das
+    // effektive Hook-Verzeichnis außerhalb von Arbeitskopie und
+    // Git-Verzeichnis — auch über einen eingecheckten Symlink, einen
+    // Pfad-Alias oder eine Schreibweise mit Schrägstrich —, wird nur mit
+    // ausdrücklicher Zustimmung geschrieben: Ein `enable` dort erfasst alle
+    // Repositories des Nutzers, nicht dieses eine.
+    if hooks_scope(&paths.root, &paths.git_dir, &hooks_dir) == HooksScope::Outside {
+        confirm_outside_hooks_dir(&paths.root, &hooks_dir, global_hooks)?;
+    }
+
     // Der Hinweis gehört vor die erste Änderung am Dateisystem — auch vor das
     // Anlegen des Verzeichnisses. Wer abbricht, soll wissen, wohin es gegangen
     // wäre, und nicht ein leeres Verzeichnis an fremder Stelle zurücklassen.
+    // Nach einer bestätigten Rückfrage wiederholt er deren Kernsatz — bewusst:
+    // Mit `--global-hooks` ist er die einzige Erwähnung, und eine Zeile zu viel
+    // ist billiger als eine Zustimmung ohne Erinnerung daran.
     if let Some(note) = moved_hooks_note(&paths.root, &paths.git_dir, &hooks_dir) {
         println!("{note}");
     }
@@ -702,6 +726,129 @@ fn canonical_prefix(path: &Path) -> PathBuf {
     }
 }
 
+/// Wo das effektive Hook-Verzeichnis liegt — die **Ortsregel** aus #66.
+///
+/// Entschieden wird über kanonisierte Pfade ([`canonical_prefix`]), nicht über
+/// Schreibweisen oder Symlink-Suchen. Ein Versuch, Symlinks direkt zu jagen
+/// (`no_symlinks_below_root`, #9), wurde in vier Review-Runden viermal umgangen:
+/// nachgestellter Schrägstrich (POSIX lässt `lstat("link/")` dem Link folgen),
+/// Pfad-Alias (`/tmp` vs. `/private/tmp`), Symlink im Vorfahren statt am Blatt —
+/// und er lehnte legitime Setups ab. Der *Ort* nach Auflösung ist von alldem
+/// unabhängig: Wohin auch immer ein eingecheckter Symlink zeigt, entweder liegt
+/// das Ziel in der Arbeitskopie (dann gelten die Blatt-Schutzmaßnahmen von
+/// [`read_existing_hook`]/[`write_hook`] dort genauso), oder es liegt draußen —
+/// und draußen wird ohne Zustimmung nicht geschrieben (#64).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HooksScope {
+    /// Im Git-Verzeichnis (`<git-dir>/hooks`, auch über ein symlinktes oder
+    /// geteiltes `.git`). Dorthin kann ein Checkout nichts legen — immer in
+    /// Ordnung, keine Rückfrage.
+    GitDir,
+    /// In der Arbeitskopie (husky, lefthook). Legitim; die Folgen trägt der
+    /// Hinweis aus [`moved_hooks_note`].
+    Worktree,
+    /// Außerhalb von beidem. Ein `enable` hier schaltet die Erfassung für
+    /// **alle** Repositories ein, die dieses Verzeichnis benutzen — das
+    /// passiert nur mit ausdrücklicher Zustimmung.
+    Outside,
+}
+
+/// Ordnet das Hook-Verzeichnis einer Zone zu — über kanonisierte Pfade, damit
+/// Symlinks, Aliasse und Schreibweisen die Antwort nicht verschieben.
+///
+/// Ein **hängender** Symlink im Pfad (Ziel existiert noch nicht) lässt sich
+/// nicht kanonisieren — dann ist der Ort nicht bestimmbar, und unbestimmbar
+/// zählt als [`HooksScope::Outside`]: fail-closed, denn das Ziel kann nach dem
+/// `enable` an jedem Ort entstehen.
+///
+/// **Grenze:** Die Ortsregel trägt gegen *eingecheckte* Inhalte — Symlinks,
+/// die ein Checkout mitbringt. Gegen einen nebenläufigen Prozess, der
+/// zwischen dieser Prüfung und dem Schreiben einen Vorfahren austauscht, trägt
+/// sie nicht; dieses Fenster teilt sie mit [`read_existing_hook`], und wer es
+/// ausnutzen kann, führt bereits lokalen Code aus.
+pub(crate) fn hooks_scope(root: &Path, git_dir: &Path, hooks_dir: &Path) -> HooksScope {
+    if dangling_redirect(hooks_dir) {
+        return HooksScope::Outside;
+    }
+    let resolved = canonical_prefix(hooks_dir);
+    if resolved.starts_with(canonical_prefix(git_dir)) {
+        HooksScope::GitDir
+    } else if resolved.starts_with(canonical_prefix(root)) {
+        HooksScope::Worktree
+    } else {
+        HooksScope::Outside
+    }
+}
+
+/// Führt der tiefste existierende Teil dieses Pfades über einen Symlink, der
+/// sich nicht auflösen lässt?
+///
+/// [`canonical_prefix`] fiele dann auf die lexikalische Fortsetzung zurück und
+/// ordnete den Ort der Arbeitskopie zu — dabei entscheidet das (noch nicht
+/// existierende) Link-Ziel, wo wirklich geschrieben würde. Heute scheitert
+/// zwar auch `create_dir_all` an einem hängenden Link (`EEXIST`), aber das ist
+/// ein Nebeneffekt von std, keine Zusage — die Einordnung hier ist die
+/// Antwort, die nicht von Implementierungsdetails abhängt.
+fn dangling_redirect(path: &Path) -> bool {
+    let mut head = path;
+    loop {
+        match fs::symlink_metadata(head) {
+            Ok(meta) => {
+                return meta.file_type().is_symlink() && fs::canonicalize(head).is_err();
+            }
+            Err(_) => match head.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => head = parent,
+                _ => return false,
+            },
+        }
+    }
+}
+
+/// Holt die Zustimmung für ein Hook-Verzeichnis außerhalb des Repos ein —
+/// oder verweigert sie.
+///
+/// Drei Wege, in dieser Reihenfolge:
+/// - `--global-hooks` gesetzt: Zustimmung liegt vor (Skripte, CI).
+/// - stdin ist ein Terminal: Rückfrage mit Default **Nein**.
+/// - sonst: Abbruch mit dem Hinweis auf das Flag — ein nicht-interaktiver
+///   Lauf darf eine so weitreichende Entscheidung nicht stillschweigend
+///   treffen.
+fn confirm_outside_hooks_dir(
+    root: &Path,
+    hooks_dir: &Path,
+    global_hooks: bool,
+) -> std::io::Result<()> {
+    use std::io::IsTerminal;
+
+    if global_hooks {
+        return Ok(());
+    }
+
+    let where_ = label_for(root, &canonical_prefix(hooks_dir));
+    if std::io::stdin().is_terminal() {
+        eprintln!(
+            "core.hooksPath zeigt aus dem Repo heraus („{where_}“).\n\
+             Hooks dort gelten für ALLE Repositories, die dieses Verzeichnis benutzen."
+        );
+        eprint!("Trotzdem einrichten? [j/N] ");
+        let mut answer = String::new();
+        // EOF (0 Bytes) lässt `answer` leer — und leer heißt Nein.
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim();
+        if answer.eq_ignore_ascii_case("j") || answer.eq_ignore_ascii_case("ja") {
+            return Ok(());
+        }
+        return Err(std::io::Error::other(
+            "abgebrochen — es wurde nichts geschrieben",
+        ));
+    }
+
+    Err(std::io::Error::other(format!(
+        "core.hooksPath zeigt aus dem Repo heraus („{where_}“) — die Hooks gälten für alle \
+         deine Repositories. Wenn das gewollt ist, bestätige mit: minds enable --global-hooks"
+    )))
+}
+
 /// Legt das Hook-Verzeichnis an und prüft, dass sich dort schreiben lässt —
 /// **bevor** `enable` irgendetwas anderes anfasst.
 ///
@@ -724,10 +871,10 @@ fn canonical_prefix(path: &Path) -> PathBuf {
 ///
 /// Was gegen den eingecheckten Symlink trägt, sitzt eine Ebene tiefer und ist
 /// nicht von Schreibweisen abhängig: [`read_existing_hook`] und [`write_hook`]
-/// arbeiten am Blatt und schreiben nie durch einen Link hindurch. Offen bleibt,
-/// dass ein umgelenktes Verzeichnis unsere Dateien woanders entstehen lässt —
-/// das ist eine Frage des *Ortes*, nicht des Links, und wird dort beantwortet,
-/// wo `enable` künftig vor dem Schreiben außerhalb des Repos zurückfragt.
+/// arbeiten am Blatt und schreiben nie durch einen Link hindurch. Und dass ein
+/// umgelenktes Verzeichnis unsere Dateien woanders entstehen lässt, ist eine
+/// Frage des *Ortes*, nicht des Links — beantwortet von [`hooks_scope`] und
+/// der Rückfrage in [`confirm_outside_hooks_dir`] (#66/#64).
 fn ensure_writable(hooks_dir: &Path) -> std::io::Result<()> {
     let explain = |err: std::io::Error| {
         std::io::Error::new(
@@ -2020,6 +2167,170 @@ mod tests {
             moved_hooks_note(&root, &root.join(".git"), &root.join(".husky"))
                 .is_some_and(|note| !note.contains("aus dem Repo heraus")),
             ".husky liegt im Repo"
+        );
+    }
+
+    // --- Ortsregel (#66): die vier dokumentierten Umgehungen ----------------
+
+    /// Umgehung 3 aus #66: `core.hooksPath = ".husky/_"` mit `.husky` als
+    /// eingechecktem Symlink — die Prüfung am letzten Glied griffe nie, weil
+    /// `_` selbst kein Link ist. Die Ortsregel fragt nach dem aufgelösten
+    /// Ziel, nicht nach dem Glied.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_ancestor_cannot_smuggle_the_hooks_dir_outside() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        let elsewhere = dir.path().join("beute");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(".husky")).unwrap();
+
+        assert_eq!(
+            hooks_scope(&root, &root.join(".git"), &root.join(".husky/_")),
+            HooksScope::Outside
+        );
+    }
+
+    /// Umgehung 1 aus #66: Der nachgestellte Schrägstrich (`".husky/"`,
+    /// `".husky/./"`) lässt `lstat` dem Link folgen — `is_symlink()` wäre
+    /// `false`. Der Ortsregel ist die Schreibweise gleichgültig.
+    #[cfg(unix)]
+    #[test]
+    fn a_trailing_slash_does_not_hide_the_redirect() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        let elsewhere = dir.path().join("beute");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(".husky")).unwrap();
+
+        for spelling in [".husky/", ".husky/./"] {
+            assert_eq!(
+                hooks_scope(&root, &root.join(".git"), &root.join(spelling)),
+                HooksScope::Outside,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// Umgehung 2 aus #66: Ein absoluter Pfad über einen Alias (symlinkter
+    /// Elternpfad, `/tmp` vs. `/private/tmp`) auf dieselbe Arbeitskopie. Eine
+    /// lexikalische Grenze prüfte dann keinen einzigen Vorfahren — die
+    /// Ortsregel kanonisiert beide Seiten und erkennt: Das ist **innen**, und
+    /// zwar zu Recht.
+    #[cfg(unix)]
+    #[test]
+    fn an_aliased_path_into_the_worktree_counts_as_inside() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".husky")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+
+        assert_eq!(
+            hooks_scope(&root, &root.join(".git"), &alias.join(".husky")),
+            HooksScope::Worktree
+        );
+    }
+
+    /// Umgehung 4 aus #66 — das Falsch-Rot: Ein symlinktes `.git` (und damit
+    /// ein Hook-Verzeichnis, das kanonisch außerhalb der Arbeitskopie liegt)
+    /// ist von Git unterstützt, und dorthin kann ein Checkout nichts legen.
+    /// Die Ortsregel ordnet es dem Git-Verzeichnis zu, nicht dem Draußen.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_git_dir_is_not_outside() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        let store = dir.path().join("gitstore");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(store.join("hooks")).unwrap();
+        std::os::unix::fs::symlink(&store, root.join(".git")).unwrap();
+
+        assert_eq!(
+            hooks_scope(&root, &root.join(".git"), &root.join(".git/hooks")),
+            HooksScope::GitDir
+        );
+    }
+
+    /// Ein hängender Symlink (Ziel existiert noch nicht) lässt sich nicht
+    /// kanonisieren — der Ort ist unbestimmbar, und unbestimmbar heißt
+    /// Draußen. Sonst hinge die Ablehnung nur am `EEXIST`-Nebeneffekt von
+    /// `create_dir_all`, und ein Refactor öffnete die Lücke lautlos.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_counts_as_outside() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gibt-es-spaeter"), root.join(".husky"))
+            .unwrap();
+
+        for spelling in [".husky", ".husky/_"] {
+            assert_eq!(
+                hooks_scope(&root, &root.join(".git"), &root.join(spelling)),
+                HooksScope::Outside,
+                "{spelling}"
+            );
+        }
+    }
+
+    /// Eine Symlink-Schleife lässt sich nicht auflösen (`ELOOP`) — der Ort ist
+    /// unbestimmbar und zählt als Draußen. Und `canonicalize` hängt daran
+    /// nicht, es antwortet mit einem Fehler.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_loop_counts_as_outside() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        std::os::unix::fs::symlink(root.join(".husky2"), root.join(".husky")).unwrap();
+        std::os::unix::fs::symlink(root.join(".husky"), root.join(".husky2")).unwrap();
+
+        assert_eq!(
+            hooks_scope(&root, &root.join(".git"), &root.join(".husky")),
+            HooksScope::Outside
+        );
+    }
+
+    /// Eine Symlink-**Kette** nach draußen ist dieselbe Umleitung mit einem
+    /// Zwischenschritt — `canonicalize` folgt ihr bis zum Ende.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_chain_still_ends_outside() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        let elsewhere = dir.path().join("beute");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("zwischen"), root.join(".husky")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.path().join("zwischen")).unwrap();
+
+        assert_eq!(
+            hooks_scope(&root, &root.join(".git"), &root.join(".husky")),
+            HooksScope::Outside
+        );
+    }
+
+    /// Der Normal- und der husky-Fall — kein Draußen, keine Rückfrage.
+    #[test]
+    fn the_default_and_husky_dirs_stay_in_their_zones() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+
+        assert_eq!(
+            hooks_scope(root, &root.join(".git"), &root.join(".git/hooks")),
+            HooksScope::GitDir
+        );
+        assert_eq!(
+            hooks_scope(root, &root.join(".git"), &root.join(".husky/_")),
+            HooksScope::Worktree
+        );
+        assert_eq!(
+            hooks_scope(root, &root.join(".git"), Path::new("/home/anna/git-hooks")),
+            HooksScope::Outside
         );
     }
 
