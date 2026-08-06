@@ -839,6 +839,52 @@ fn a_symlinked_git_dir_still_enables_without_questions() {
     );
 }
 
+/// #65, end-to-end: Ein Symlink auf **eine** Agent-Konfiguration bricht
+/// `enable` ab, **bevor** irgendetwas geschrieben ist — nicht mitten in der
+/// Reihe. Sonst bliebe ein Repo zurück, dessen Agents journalieren, während
+/// kein Hook je etwas eincheckt.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_agent_config_stops_enable_before_anything_is_written() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let victim = tempfile::tempdir().unwrap();
+    let target = victim.path().join("fremd.json");
+    std::fs::write(&target, "{\"fremd\":true}\n").unwrap();
+    std::fs::create_dir_all(dir.join(".gemini")).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(".gemini/settings.json")).unwrap();
+
+    // Ohne --agent: Claude, Codex und Cursor kämen vor Gemini an die Reihe.
+    let out = minds(dir, &["enable"], None);
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("Symlink"),
+        "die Meldung muss den Grund nennen:\n{}",
+        stderr(&out)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "{\"fremd\":true}\n",
+        "die fremde Datei wurde angefasst"
+    );
+    for untouched in [
+        ".claude/settings.json",
+        ".codex/hooks.json",
+        ".cursor/hooks.json",
+        ".git/hooks/post-commit",
+    ] {
+        assert!(
+            !dir.join(untouched).exists(),
+            "nichts halb Eingerichtetes — {untouched} ist entstanden"
+        );
+    }
+}
+
 /// Die zweite Gegenprobe zu #66: In einem Linked Worktree liegt das effektive
 /// Hook-Verzeichnis im common dir des Haupt-Repos — von Git verwaltet, kein
 /// fremder Ort. `fsck` darf dort kein „außerhalb des Repos" behaupten.
