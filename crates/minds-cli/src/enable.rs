@@ -1395,8 +1395,22 @@ fn is_ours(command: &str, role: Role) -> bool {
     let Some(program) = words.next() else {
         return false;
     };
-    let stem = basename(program);
-    matches!(stem, "minds" | "minds.exe") && words.next() == Some(role.subcommand())
+    if !matches!(basename(program), "minds" | "minds.exe") {
+        return false;
+    }
+    if words.next() != Some(role.subcommand()) {
+        return false;
+    }
+    match role {
+        // `minds hook` hat keine Bedeutung außerhalb einer Registrierung —
+        // wer es aufruft, meint unseren Capture-Hook.
+        Role::Capture => true,
+        // `minds brief` dagegen **ist** ein Nutzerkommando: `minds brief
+        // docs/ > brief.md` ist ein legitimer eigener SessionStart-Hook.
+        // Unserer ist nur der mit `--hook`; ohne diese Grenze nähme `enable`
+        // dem Nutzer seinen Aufruf weg — samt Pfadfilter und Umleitung.
+        Role::Recall => words.any(|word| word == "--hook"),
+    }
 }
 
 /// Was in der Konfiguration eines Agenten steht — die Frage, die `fsck` stellt.
@@ -1422,10 +1436,12 @@ pub(crate) struct AgentReport {
     pub(crate) recall: Option<Match>,
     /// Was `enable` hier nicht ergänzen würde, mit Grund.
     pub(crate) refused: Option<String>,
-    /// Nur Codex: Fehlt der Schalter `codex_hooks = true`, liest Codex die
-    /// `hooks.json` **gar nicht** — die Registrierung wäre vollständig und
-    /// trotzdem wirkungslos.
-    pub(crate) codex_flag_missing: bool,
+    /// Nur Codex: Steht der Schalter `codex_hooks = true`? Fehlt er, liest
+    /// Codex die `hooks.json` **gar nicht** — die Registrierung wäre
+    /// vollständig und trotzdem wirkungslos. `None` heißt: nicht feststellbar
+    /// (die Datei ist nicht lesbar oder zu verschachtelt), und dann wird
+    /// nichts behauptet.
+    pub(crate) codex_flag: Option<bool>,
 }
 
 impl AgentReport {
@@ -1450,12 +1466,17 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
         outdated: 0,
         recall: None,
         refused: None,
-        codex_flag_missing: false,
+        codex_flag: Some(true),
     };
     if !report.present {
         return report;
     }
-    if let Err(err) = check_agent_leaf(&path) {
+    // `check_agent_path`, nicht nur das Blatt: Der wirksamere Angriff aus #65
+    // ist das verlinkte **Verzeichnis** (`.claude` → `~/.claude`). `enable`
+    // lehnt das ab; läse `fsck` dort weiter, meldete es den Zustand einer
+    // fremden Datei als den des Repos — eine falsche Entwarnung im Job-Log,
+    // gelesen mit den Rechten des CI-Runners.
+    if let Err(err) = check_agent_path(root, &path) {
         report.refused = Some(err.to_string());
         return report;
     }
@@ -1530,28 +1551,39 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
         // Ohne den Schalter liest Codex die `hooks.json` gar nicht — eine
         // vollständige Registrierung wäre dann trotzdem wirkungslos, und
         // „registriert für codex" eine falsche Auskunft.
-        report.codex_flag_missing = !codex_flag_is_set(&root.join(".codex/config.toml"));
+        report.codex_flag = codex_flag_state(&root.join(".codex/config.toml"));
     }
     report
 }
 
 /// Steht `codex_hooks = true` als top-level-Zeile in dieser Datei?
 ///
-/// Dieselbe Frage wie in [`ensure_codex_hooks_flag`], nur lesend. Bei einer
-/// Datei, die die Zeilenlogik nicht sicher deuten kann, wird nichts behauptet
-/// — `enable` würde dort ebenfalls abbrechen und den Nutzer schicken.
-fn codex_flag_is_set(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
+/// Dieselbe Frage wie in [`ensure_codex_hooks_flag`] — und über **denselben
+/// Leser**: `check_agent_leaf` fängt Symlink, Sonderdatei und Übergröße ab.
+/// Ohne ihn hing `fsck` an einer eingecheckten FIFO, bis jemand schreibt (im
+/// CI-Gate: bis die Pipeline abbricht), und eine 240-MB-Datei kostete 1,8 GB
+/// Speicher.
+///
+/// `None` heißt **nicht feststellbar** — die Datei lässt sich nicht lesen oder
+/// die Zeilenlogik trägt dort nicht. Das ist etwas anderes als „der Schalter
+/// fehlt" und erst recht anderes als „er steht da": `enable` bricht in diesem
+/// Fall laut ab, und `fsck` darf dann nicht beruhigen.
+fn codex_flag_state(path: &Path) -> Option<bool> {
+    if !path.exists() {
+        return Some(false);
+    }
+    check_agent_leaf(path).ok()?;
+    let text = fs::read_to_string(path).ok()?;
     let lines: Vec<String> = text.lines().map(str::to_owned).collect();
     if !is_simple_toml(&lines) {
-        return true;
+        return None;
     }
     let top_level = top_level_end(&lines);
-    lines[..top_level]
-        .iter()
-        .any(|line| toml_key(line) == Some("codex_hooks") && line.trim() == "codex_hooks = true")
+    Some(
+        lines[..top_level].iter().any(|line| {
+            toml_key(line) == Some("codex_hooks") && line.trim() == "codex_hooks = true"
+        }),
+    )
 }
 
 /// `{"type":"command","command":"minds hook …"}`, ggf. in eine Matcher-Gruppe
@@ -1648,13 +1680,21 @@ fn apply_registration(groups: &mut Vec<Value>, reg: &Registration) -> Applied {
         }
     }
 
-    // Gruppen, die durch das Entfernen leer geworden sind, verschwinden mit —
-    // eine `{"hooks": []}` wäre ein Rest, den niemand geschrieben hat.
+    // Nur Gruppen, die **wir** geleert haben, verschwinden mit — eine leere
+    // `{"hooks": []}` kann auch der Nutzer angelegt haben, samt `matcher` und
+    // eigenen Schlüsseln. Sie pauschal zu entfernen wäre Datenverlust, und
+    // zwar ein nicht-deterministischer: sichtbar nur, wenn nebenan ein anderes
+    // Event ohnehin einen Schreibvorgang auslöst.
+    let emptied: Vec<usize> = ours.iter().map(|&(g, _)| g).collect();
+    let mut index = 0usize;
     groups.retain(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .is_none_or(|entries| !entries.is_empty())
+        let keep = !emptied.contains(&index)
+            || group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_none_or(|entries| !entries.is_empty());
+        index += 1;
+        keep
     });
 
     if changed {
@@ -3444,6 +3484,74 @@ mod tests {
         );
     }
 
+    /// `minds brief` ist ein **Nutzerkommando**, anders als `minds hook`. Ein
+    /// eigener SessionStart-Aufruf mit Pfadfilter und Umleitung gehört dem
+    /// Nutzer — `enable` darf ihn nicht als „veraltet" umschreiben.
+    #[test]
+    fn a_users_own_brief_call_is_not_ours() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let own = "minds brief docs/ > /tmp/mein-brief.md";
+        fs::write(
+            &path,
+            json!({ "hooks": { "SessionStart": [{ "hooks": [{
+                "type": "command", "command": own
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+
+        // Ohne `--recall`: nichts anfassen, nichts anlegen.
+        assert_eq!(
+            enable_recall_hook(dir.path(), false).unwrap().change,
+            Change::Unchanged
+        );
+        assert_eq!(
+            read_json(&path).unwrap()["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            own,
+            "der eigene Aufruf des Nutzers wurde überschrieben"
+        );
+
+        // Und die Gegenprobe: **unser** Aufruf trägt `--hook`.
+        assert!(!is_ours(own, Role::Recall));
+        assert!(is_ours("minds brief --hook", Role::Recall));
+        assert!(is_ours(RECALL_COMMAND, Role::Recall));
+    }
+
+    /// Eine **fremde leere Gruppe** darf nicht verschwinden, wenn nebenan
+    /// unsere aufgeräumt wird. Der Fehler war zusätzlich nicht-deterministisch:
+    /// sichtbar nur, wenn ein anderes Event ohnehin einen Schreibvorgang
+    /// auslöste.
+    #[test]
+    fn a_foreign_empty_group_survives_our_cleanup() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [
+                { "matcher": "Bash", "hooks": [], "userNote": "hier kommt noch was" },
+                { "hooks": [{ "type": "command", "command": "minds hook --agent claude-code --event Stop" }] },
+                { "hooks": [{ "type": "command", "command": "minds hook --agent claude-code" }] },
+            ] } })
+            .to_string(),
+        )
+        .unwrap();
+
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+
+        let value = read_json(&path).unwrap();
+        let stop = value["hooks"]["Stop"].as_array().unwrap();
+        let foreign = stop
+            .iter()
+            .find(|g| g.get("userNote").is_some())
+            .expect("die fremde Gruppe wurde gelöscht");
+        assert_eq!(foreign["matcher"].as_str(), Some("Bash"));
+    }
+
     /// Eine Konfiguration **ohne** `hooks`-Schlüssel ist der häufigste
     /// Zustand — nur `model` oder `permissions` gesetzt. `enable` ergänzt sie
     /// anstandslos, also darf `fsck` sie nicht als abgelehnt melden.
@@ -3476,10 +3584,70 @@ mod tests {
     fn codex_without_its_flag_is_not_reported_as_registered() {
         let dir = tmp();
         enable_codex(dir.path()).unwrap();
-        assert!(!inspect_agent(dir.path(), Which::Codex).codex_flag_missing);
+        assert_eq!(
+            inspect_agent(dir.path(), Which::Codex).codex_flag,
+            Some(true)
+        );
 
         fs::remove_file(dir.path().join(".codex/config.toml")).unwrap();
-        assert!(inspect_agent(dir.path(), Which::Codex).codex_flag_missing);
+        assert_eq!(
+            inspect_agent(dir.path(), Which::Codex).codex_flag,
+            Some(false)
+        );
+    }
+
+    /// Und eine `config.toml`, die sich nicht deuten lässt, heißt **nicht
+    /// feststellbar** — nicht „in Ordnung". `enable` bricht dort laut ab, also
+    /// darf `fsck` nicht beruhigen.
+    #[test]
+    fn an_unreadable_codex_config_is_not_an_all_clear() {
+        let dir = tmp();
+        enable_codex(dir.path()).unwrap();
+        let path = dir.path().join(".codex/config.toml");
+
+        // Mehrzeilige Werte: dieselbe Grenze, an der `ensure_codex_hooks_flag`
+        // abbricht.
+        fs::write(
+            &path,
+            "notiz = \"\"\"\nmehrzeilig\n\"\"\"\nmodel = \"gpt\"\n",
+        )
+        .unwrap();
+        assert_eq!(inspect_agent(dir.path(), Which::Codex).codex_flag, None);
+
+        // Und eine Sonderdatei ebenso — statt `fsck` daran hängen zu lassen.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(inspect_agent(dir.path(), Which::Codex).codex_flag, None);
+    }
+
+    /// `fsck` folgt keinem verlinkten Agent-Verzeichnis: Es meldete sonst den
+    /// Zustand einer **fremden** Datei als den des Repos — im CI-Gate gelesen
+    /// mit den Rechten des Runners.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_agent_refuses_a_symlinked_directory_like_enable_does() {
+        let dir = tmp();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let elsewhere = dir.path().join("fremd-home");
+        fs::create_dir_all(&elsewhere).unwrap();
+        // Eine vollständige Registrierung — außerhalb des Repos.
+        fs::write(
+            elsewhere.join("settings.json"),
+            json!({ "hooks": { "Stop": [{ "hooks": [{
+                "type": "command", "command": "minds hook --agent claude-code"
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join(".claude")).unwrap();
+
+        let report = inspect_agent(&root, Which::ClaudeCode);
+        assert!(
+            report.refused.is_some(),
+            "fsck liest durch den Link: {report:?}"
+        );
+        assert_eq!(report.current, 0, "fremder Zustand als eigener gemeldet");
     }
 
     /// Ein Eintrag mit **falschem Agenten** ist unserer — nur falsch. Er wird

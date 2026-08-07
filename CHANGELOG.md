@@ -36,7 +36,13 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   Nutzerkonfiguration überschrieben.
 
   Jetzt gilt: Das erste Wort muss auf `minds` enden — nackt oder als Pfad —,
-  das zweite genau `hook` bzw. `brief` sein. Ein eigener Eintrag mit altem
+  das zweite genau `hook` bzw. `brief` sein; beim Recall-Eintrag zusätzlich
+  `--hook`, denn `minds brief docs/ > brief.md` ist ein legitimer eigener
+  SessionStart-Hook und gehört dem Nutzer. Verglichen wird der **Argumentteil**:
+  Ein von Hand gepinnter Pfad bleibt stehen — `minds` hat dort nie einen
+  geschrieben, und für die Agent-Registrierungen ist er die einzige Abhilfe
+  gegen die PATH-Blindheit aus
+  [#25](https://github.com/munichbughunter/minds/issues/25). Ein eigener Eintrag mit altem
   Wortlaut wird **an Ort und Stelle** korrigiert (Reihenfolge, `matcher` und
   Zusatzschlüssel des Nutzers bleiben), Fremdes bleibt unangetastet, und der
   Ersatz wird gemeldet — auch ohne `-v`, denn diese Zeile kann jemand von Hand
