@@ -21,6 +21,22 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- **`minds brief --hook` verliert seine Fehler nicht mehr.** Der von
+  `minds enable --recall` registrierte SessionStart-Hook lautet
+  `minds brief --hook 2>/dev/null || true`: stderr ging ins Nichts, der
+  Rückgabewert wurde verschluckt. Scheiterte `brief`, startete die Sitzung
+  **ohne** den Kontext, den minds ihr mitgeben wollte — derselbe Stillausfall
+  wie [#10](https://github.com/munichbughunter/minds/issues/10), nur auf dem
+  Lese- statt dem Capture-Pfad. Die Fehler gehen jetzt nach
+  `<git-dir>/minds/hook.log`, und ein Panic ebenfalls: Bisher schaltete der
+  Prozess seit [#54](https://github.com/munichbughunter/minds/issues/54) zwar
+  den Panic-Handler still, hatte aber keine Klammer, die ihn auffing — er war
+  unterdrückt *und* nirgends aufgezeichnet. Vom Log bekommt dieser Pfad nur
+  den **Ort**, nicht die Meldung: `brief` hält redigierte Sessions im
+  Speicher. Ohne `--hook` bleibt alles beim Alten — dort steht ein Mensch
+  davor, und der Fehler gehört auf stderr.
+  ([#68](https://github.com/munichbughunter/minds/issues/68))
+
 - `minds enable` funktioniert in **verlinkten Worktrees** (`git worktree add`).
   Dort ist `.git` eine Datei mit einem `gitdir:`-Verweis; sie wurde nicht
   aufgelöst, und `enable` meldete „kein Git-Repository gefunden" — in einem

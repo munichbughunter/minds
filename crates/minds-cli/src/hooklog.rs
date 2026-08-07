@@ -91,6 +91,13 @@ pub(crate) enum Source {
     PrepareCommitMsg,
     /// `minds sync` — der pre-push-Hook.
     Sync,
+    /// `minds brief --hook` — die Kontext-Rückführung beim Sitzungsstart.
+    ///
+    /// Der einzige Lese-Pfad in dieser Liste. Er läuft aus der
+    /// Agent-Konfiguration (`.claude/settings.json`), nicht aus einem
+    /// Git-Hook, und sein Aufruf trägt dieselbe Umleitung: Scheitert er, fehlt
+    /// der neuen Sitzung der Kontext — und niemand erfuhr es (#68).
+    Brief,
 }
 
 impl Source {
@@ -101,7 +108,20 @@ impl Source {
             Source::Checkpoint => "checkpoint",
             Source::PrepareCommitMsg => "prepare-commit-msg",
             Source::Sync => "sync",
+            Source::Brief => "brief",
         }
+    }
+
+    /// Gehört die Standardausgabe dieses Pfades jemand anderem?
+    ///
+    /// Bei `minds hook` ist stdout der **Steuerkanal** des Agenten, bei
+    /// `minds brief --hook` der **Nutzinhalt** (`additionalContext`) — beide
+    /// Male darf keine Diagnose hinein, und beide Male auch dann nicht, wenn
+    /// am anderen Ende ein Terminal hängt. Die kalten Pfade dagegen sind auch
+    /// Kommandos für Menschen: Wer `minds checkpoint` im Terminal aufruft,
+    /// soll seinen Panic sehen.
+    fn owns_stdout(self) -> bool {
+        matches!(self, Source::Hook | Source::Brief)
     }
 }
 
@@ -172,7 +192,7 @@ fn guarded_into(
     // sonst die äußere, und der nächste Panic ginge doch nach draußen. Und der
     // Slot wird beim Betreten geleert — sonst meldete ein Unwind, den unser
     // Handler nie sah, den Text eines *früheren*, längst gefangenen Panics.
-    let outer = IN_GUARD.replace(Some(source != Source::Hook));
+    let outer = IN_GUARD.replace(Some(!source.owns_stdout()));
     let _ = last_panic();
     let outcome = std::panic::catch_unwind(run);
     IN_GUARD.set(outer);
@@ -200,7 +220,13 @@ fn guarded_into(
             // Meldung: Dort steht kein Transkript im Speicher, und sie war
             // schon vorher drin.
             let note = match source {
-                Source::Hook => format!("Panic — Event verworfen: {}", location_of(&note)),
+                // Beide Pfade halten fremde Nutzlast im Speicher: `hook` das
+                // rohe Event, `brief` die redigierten Sessions. Ein `unwrap()`
+                // darauf bettete deren `Debug` in die Panic-Meldung ein — und
+                // `hook.log` wandert in Bug-Reports.
+                s if s.owns_stdout() => {
+                    format!("Panic — Vorgang abgebrochen: {}", location_of(&note))
+                }
                 _ => format!("Panic — Vorgang abgebrochen: {note}"),
             };
 
@@ -271,7 +297,7 @@ thread_local! {
 /// Prozess als Hook startet, bekommt bis zu seinem Ende die Hook-Regeln.
 pub(crate) fn silence_panics_for(source: Source) {
     silence_panics();
-    IN_GUARD.set(Some(source != Source::Hook));
+    IN_GUARD.set(Some(!source.owns_stdout()));
 }
 
 pub(crate) fn silence_panics() {
