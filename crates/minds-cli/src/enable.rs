@@ -1324,13 +1324,44 @@ pub(crate) enum Match {
 }
 
 /// Ordnet eine vorhandene Kommandozeile unserem Soll zu.
+///
+/// Verglichen wird der **Argumentteil**, nicht die ganze Zeile: Das erste Wort
+/// gehört dem Nutzer. `minds` hat dort nie einen Pfad geschrieben —
+/// `/opt/bin/minds hook --agent claude-code` stammt also immer von Hand, und
+/// zwar aus einem guten Grund: Die PATH-Blindheit aus #25 ist für die
+/// Agent-Registrierungen nicht gelöst, ein gepinnter Pfad ist dort die einzige
+/// Abhilfe. Wer sie als „veraltet" behandelte, nähme sie still zurück — und
+/// die Erfassung fiele danach aus.
 pub(crate) fn classify(command: &str, reg: &Registration) -> Match {
-    if command.trim() == reg.command {
+    if !is_ours(command, reg.role) {
+        return Match::Foreign;
+    }
+    if arguments_of(command) == arguments_of(&reg.command) {
         Match::Current
-    } else if is_ours(command, reg.role) {
-        Match::Ours
     } else {
-        Match::Foreign
+        Match::Ours
+    }
+}
+
+/// Alles hinter dem Programmnamen, auf einfache Leerzeichen normalisiert.
+fn arguments_of(command: &str) -> Vec<&str> {
+    command.split_whitespace().skip(1).collect()
+}
+
+/// Der Soll-Wortlaut mit dem Programm, das dort **schon steht**.
+///
+/// So bleibt ein von Hand gesetzter Pfad erhalten, während die Argumente auf
+/// den Stand kommen.
+fn refreshed_command(existing: &str, reg: &Registration) -> String {
+    let program = existing
+        .split_whitespace()
+        .next()
+        .unwrap_or_else(|| reg.command.split_whitespace().next().unwrap_or("minds"));
+    let arguments = arguments_of(&reg.command).join(" ");
+    if arguments.is_empty() {
+        program.to_owned()
+    } else {
+        format!("{program} {arguments}")
     }
 }
 
@@ -1391,6 +1422,10 @@ pub(crate) struct AgentReport {
     pub(crate) recall: Option<Match>,
     /// Was `enable` hier nicht ergänzen würde, mit Grund.
     pub(crate) refused: Option<String>,
+    /// Nur Codex: Fehlt der Schalter `codex_hooks = true`, liest Codex die
+    /// `hooks.json` **gar nicht** — die Registrierung wäre vollständig und
+    /// trotzdem wirkungslos.
+    pub(crate) codex_flag_missing: bool,
 }
 
 impl AgentReport {
@@ -1415,6 +1450,7 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
         outdated: 0,
         recall: None,
         refused: None,
+        codex_flag_missing: false,
     };
     if !report.present {
         return report;
@@ -1447,9 +1483,20 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
             return report;
         }
     };
-    let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
-        report.refused = Some("„hooks“ ist kein Objekt".to_owned());
-        return report;
+    // Ein **fehlender** `hooks`-Schlüssel ist keine Ablehnung: Das ist der
+    // häufigste Zustand einer echten Konfiguration (nur `model`, nur
+    // `permissions`), und `enable` ergänzt sie anstandslos. Nur ein `hooks`,
+    // das etwas anderes *ist*, würde es ablehnen — und dann sagt es das auch.
+    let empty = Map::new();
+    let hooks = match value.get("hooks") {
+        None => &empty,
+        Some(value) => match value.as_object() {
+            Some(map) => map,
+            None => {
+                report.refused = Some("„hooks“ ist kein Objekt".to_owned());
+                return report;
+            }
+        },
     };
 
     let count = |reg: &Registration| -> Option<Match> {
@@ -1479,7 +1526,32 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
     if which == Which::ClaudeCode {
         report.recall = count(&recall_registration());
     }
+    if which == Which::Codex {
+        // Ohne den Schalter liest Codex die `hooks.json` gar nicht — eine
+        // vollständige Registrierung wäre dann trotzdem wirkungslos, und
+        // „registriert für codex" eine falsche Auskunft.
+        report.codex_flag_missing = !codex_flag_is_set(&root.join(".codex/config.toml"));
+    }
     report
+}
+
+/// Steht `codex_hooks = true` als top-level-Zeile in dieser Datei?
+///
+/// Dieselbe Frage wie in [`ensure_codex_hooks_flag`], nur lesend. Bei einer
+/// Datei, die die Zeilenlogik nicht sicher deuten kann, wird nichts behauptet
+/// — `enable` würde dort ebenfalls abbrechen und den Nutzer schicken.
+fn codex_flag_is_set(path: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(path) else {
+        return false;
+    };
+    let lines: Vec<String> = text.lines().map(str::to_owned).collect();
+    if !is_simple_toml(&lines) {
+        return true;
+    }
+    let top_level = top_level_end(&lines);
+    lines[..top_level]
+        .iter()
+        .any(|line| toml_key(line) == Some("codex_hooks") && line.trim() == "codex_hooks = true")
 }
 
 /// `{"type":"command","command":"minds hook …"}`, ggf. in eine Matcher-Gruppe
@@ -1520,30 +1592,75 @@ enum Applied {
 /// alter zurück, `fsck` meldete ihn als veraltet, und `minds enable` behöbe
 /// ihn nicht — ein Hinweis, den man nicht loswerden kann, wird überlesen,
 /// mitsamt den echten daneben.
-fn apply_registration(groups: &mut [Value], reg: &Registration) -> Applied {
-    let mut refreshed = false;
-    for group in groups.iter_mut() {
-        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+fn apply_registration(groups: &mut Vec<Value>, reg: &Registration) -> Applied {
+    // **Erst sehen, dann handeln.** Ein früher Ausstieg beim ersten aktuellen
+    // Eintrag verlor eine Änderung, die davor schon geschrieben war: Der
+    // Aufrufer sah „schon aktuell", schrieb die Datei nicht, und die Korrektur
+    // existierte nur im Speicher. Steht der alte Eintrag *vor* dem neuen,
+    // blieb er damit für immer stehen — und der Agent führte das Event
+    // zweimal aus.
+    let mut current = 0usize;
+    let mut ours: Vec<(usize, usize)> = Vec::new();
+    for (g, group) in groups.iter().enumerate() {
+        let Some(entries) = group.get("hooks").and_then(Value::as_array) else {
             continue;
         };
-        for entry in entries {
+        for (e, entry) in entries.iter().enumerate() {
             let Some(command) = entry.get("command").and_then(Value::as_str) else {
                 continue;
             };
             match classify(command, reg) {
-                Match::Current => return Applied::AlreadyCurrent,
-                Match::Ours => {
-                    entry["command"] = Value::String(reg.command.clone());
-                    refreshed = true;
-                }
+                Match::Current => current += 1,
+                Match::Ours => ours.push((g, e)),
                 Match::Foreign => {}
             }
         }
     }
-    if refreshed {
+
+    if current == 0 && ours.is_empty() {
+        return Applied::Missing;
+    }
+
+    // Gibt es schon einen aktuellen, wären angeglichene Zweitschriften
+    // zeichengleiche **Duplikate** — jedes Event ginge doppelt ins Journal.
+    // Dann werden die eigenen Alt-Einträge entfernt statt umgeschrieben. Das
+    // ist kein Widerspruch zu „Fremdes bleibt": Es sind unsere, und wir räumen
+    // nur ab, was wir selbst hinterlassen haben.
+    let mut changed = false;
+    if current > 0 {
+        for &(g, e) in ours.iter().rev() {
+            if let Some(entries) = groups[g].get_mut("hooks").and_then(Value::as_array_mut) {
+                entries.remove(e);
+                changed = true;
+            }
+        }
+    } else {
+        for &(g, e) in &ours {
+            let Some(entries) = groups[g].get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            let existing = entries[e]["command"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            entries[e]["command"] = Value::String(refreshed_command(&existing, reg));
+            changed = true;
+        }
+    }
+
+    // Gruppen, die durch das Entfernen leer geworden sind, verschwinden mit —
+    // eine `{"hooks": []}` wäre ein Rest, den niemand geschrieben hat.
+    groups.retain(|group| {
+        group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_none_or(|entries| !entries.is_empty())
+    });
+
+    if changed {
         Applied::Refreshed
     } else {
-        Applied::Missing
+        Applied::AlreadyCurrent
     }
 }
 
@@ -3237,6 +3354,132 @@ mod tests {
             vec!["minds hook --agent claude-code"],
             "ersetzt, nicht dupliziert"
         );
+    }
+
+    /// Der Blocker aus dem Review: Steht der **alte** Eintrag vor dem
+    /// aktuellen, kehrte die Suche beim aktuellen sofort zurück — die
+    /// Korrektur davor existierte nur im Speicher, nichts wurde geschrieben,
+    /// und der alte feuerte für immer mit. Der Agent führte das Event zweimal
+    /// aus.
+    #[test]
+    fn an_old_entry_before_the_current_one_is_removed_not_kept() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [
+                { "hooks": [{ "type": "command", "command": "minds hook --agent claude-code --event Stop" }] },
+                { "hooks": [{ "type": "command", "command": "minds hook --agent claude-code" }] },
+            ] } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        assert!(outcome.refreshed, "die Bereinigung wurde nicht gemeldet");
+
+        let value = read_json(&path).unwrap();
+        let commands: Vec<&str> = value["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            vec!["minds hook --agent claude-code"],
+            "der alte Eintrag blieb stehen — das Event feuert doppelt"
+        );
+    }
+
+    /// Ein von Hand gepinnter **Pfad** ist die Entscheidung des Nutzers, nicht
+    /// eine „ältere minds-Version". `minds` hat dort nie einen geschrieben —
+    /// und für die Agent-Registrierungen ist er die einzige Abhilfe gegen die
+    /// PATH-Blindheit aus #25.
+    #[test]
+    fn a_hand_pinned_path_survives_and_counts_as_current() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let pinned = "/opt/bin/minds hook --agent claude-code";
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [{ "hooks": [{
+                "type": "command", "command": pinned, "timeout": 30
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+
+        let value = read_json(&path).unwrap();
+        let entry = &value["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(
+            entry["command"].as_str().unwrap(),
+            pinned,
+            "der gepinnte Pfad wurde zurückgenommen"
+        );
+        assert_eq!(entry["timeout"], 30, "fremde Schlüssel bleiben");
+
+        // Und mit veralteten Argumenten bleibt der Pfad, nur die Argumente
+        // kommen auf den Stand.
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [{ "hooks": [{
+                "type": "command", "command": "/opt/bin/minds hook --agent claude-code --event Stop"
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        let value = read_json(&path).unwrap();
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            pinned
+        );
+    }
+
+    /// Eine Konfiguration **ohne** `hooks`-Schlüssel ist der häufigste
+    /// Zustand — nur `model` oder `permissions` gesetzt. `enable` ergänzt sie
+    /// anstandslos, also darf `fsck` sie nicht als abgelehnt melden.
+    #[test]
+    fn a_config_without_a_hooks_key_is_not_refused() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, json!({ "model": "opus" }).to_string()).unwrap();
+
+        let report = inspect_agent(dir.path(), Which::ClaudeCode);
+        assert!(report.refused.is_none(), "{:?}", report.refused);
+        assert_eq!(report.current, 0);
+        assert_eq!(report.total, HOOK_EVENTS.len());
+
+        // Und `enable` kommt damit tatsächlich zurecht.
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        let after = inspect_agent(dir.path(), Which::ClaudeCode);
+        assert_eq!(after.current, after.total);
+        assert_eq!(
+            read_json(&path).unwrap()["model"].as_str(),
+            Some("opus"),
+            "Fremdes bleibt"
+        );
+    }
+
+    /// Ohne `codex_hooks = true` liest Codex die `hooks.json` gar nicht — eine
+    /// vollständige Registrierung wäre dann trotzdem wirkungslos.
+    #[test]
+    fn codex_without_its_flag_is_not_reported_as_registered() {
+        let dir = tmp();
+        enable_codex(dir.path()).unwrap();
+        assert!(!inspect_agent(dir.path(), Which::Codex).codex_flag_missing);
+
+        fs::remove_file(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(inspect_agent(dir.path(), Which::Codex).codex_flag_missing);
     }
 
     /// Ein Eintrag mit **falschem Agenten** ist unserer — nur falsch. Er wird

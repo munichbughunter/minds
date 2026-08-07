@@ -697,16 +697,22 @@ fn agent_report_lines(reports: &[crate::enable::AgentReport]) -> Vec<String> {
             ));
             lines.push("  `minds enable` trägt sie ein".to_owned());
         } else if missing > 0 {
-            let (verb, object) = if missing == 1 {
-                ("fehlt", "sie")
-            } else {
-                ("fehlen", "sie")
-            };
+            let verb = if missing == 1 { "fehlt" } else { "fehlen" };
             lines.push(format!(
                 "Agents: in „{file}“ {verb} {missing} von {} Registrierungen",
                 report.total
             ));
-            lines.push(format!("  `minds enable` trägt {object} ein"));
+            lines.push("  `minds enable` trägt sie ein".to_owned());
+        } else if report.codex_flag_missing {
+            // Vollständig registriert und trotzdem wirkungslos: Ohne den
+            // Schalter liest Codex die `hooks.json` gar nicht.
+            lines.push(format!(
+                "Agents: „{file}“ ist vollständig, aber „codex_hooks“ fehlt in „.codex/config.toml“"
+            ));
+            lines.push(
+                "  ohne den Schalter liest Codex die Registrierung nicht — `minds enable`"
+                    .to_owned(),
+            );
         } else {
             registered.push(report.which.name());
         }
@@ -1141,6 +1147,7 @@ mod tests {
             outdated,
             recall: None,
             refused: None,
+            codex_flag_missing: false,
         }
     }
 
