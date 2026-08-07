@@ -1368,6 +1368,120 @@ fn is_ours(command: &str, role: Role) -> bool {
     matches!(stem, "minds" | "minds.exe") && words.next() == Some(role.subcommand())
 }
 
+/// Was in der Konfiguration eines Agenten steht — die Frage, die `fsck` stellt.
+///
+/// Die Inspektion sitzt **hier**, nicht in `fsck`: Das Formatwissen je Agent
+/// steht laut Modul-Doku gebündelt und „nirgends sonst". Die
+/// JSON-Verschachtelung `hooks → Event → Gruppen → hooks → command` ein
+/// zweites Mal zu schreiben wäre genau die Divergenz, vor der derselbe Absatz
+/// warnt — `enable` liefert Befunde, `fsck` formuliert.
+#[derive(Debug)]
+pub(crate) struct AgentReport {
+    pub(crate) which: Which,
+    /// Gibt es die Datei überhaupt? Fehlt sie, ist dieser Agent hier schlicht
+    /// nicht eingerichtet — kein Mangel.
+    pub(crate) present: bool,
+    /// Wie viele Soll-Einträge es gibt (sieben bei den JSON-Agents, einer beim
+    /// OpenCode-Plugin).
+    pub(crate) total: usize,
+    pub(crate) current: usize,
+    pub(crate) outdated: usize,
+    /// Der Recall-Eintrag. `None` heißt: keiner da — und das ist **kein**
+    /// Mangel, sondern die Voreinstellung (`--recall` ist opt-in).
+    pub(crate) recall: Option<Match>,
+    /// Was `enable` hier nicht ergänzen würde, mit Grund.
+    pub(crate) refused: Option<String>,
+}
+
+impl AgentReport {
+    /// Soll-Einträge, die weder aktuell noch veraltet vorhanden sind.
+    pub(crate) fn missing(&self) -> usize {
+        self.total.saturating_sub(self.current + self.outdated)
+    }
+}
+
+/// Sieht nach, was in der Konfiguration dieses Agenten steht.
+///
+/// Nutzt dieselben Leser wie `enable` selbst ([`check_agent_leaf`],
+/// [`read_json`]) — was `enable` ablehnt, meldet `fsck` als abgelehnt, statt
+/// zu einem `minds enable` zu raten, das im selben Repo abbräche.
+pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
+    let path = root.join(which.file());
+    let mut report = AgentReport {
+        which,
+        present: path.exists(),
+        total: 0,
+        current: 0,
+        outdated: 0,
+        recall: None,
+        refused: None,
+    };
+    if !report.present {
+        return report;
+    }
+    if let Err(err) = check_agent_leaf(&path) {
+        report.refused = Some(err.to_string());
+        return report;
+    }
+
+    // Das OpenCode-Plugin ist eine Datei mit Marke und exaktem Rumpf — die
+    // Form der Git-Hooks, nicht die der JSON-Registrierungen. Es geht trotzdem
+    // durch denselben Bericht, damit `fsck` eine Schleife hat.
+    if which == Which::OpenCode {
+        report.total = 1;
+        match fs::read_to_string(&path) {
+            Ok(text) if text == OPENCODE_PLUGIN => report.current = 1,
+            Ok(text) if text.contains(MARK) => report.outdated = 1,
+            Ok(_) => {
+                report.refused = Some("stammt nicht von minds".to_owned());
+            }
+            Err(err) => report.refused = Some(err.to_string()),
+        }
+        return report;
+    }
+
+    let value = match read_json(&path) {
+        Ok(value) => value,
+        Err(err) => {
+            report.refused = Some(err.to_string());
+            return report;
+        }
+    };
+    let Some(hooks) = value.get("hooks").and_then(Value::as_object) else {
+        report.refused = Some("„hooks“ ist kein Objekt".to_owned());
+        return report;
+    };
+
+    let count = |reg: &Registration| -> Option<Match> {
+        hooks
+            .get(reg.event)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|group| group.get("hooks").and_then(Value::as_array))
+            .flatten()
+            .filter_map(|entry| entry.get("command").and_then(Value::as_str))
+            .map(|command| classify(command, reg))
+            .filter(|m| *m != Match::Foreign)
+            // `Current` schlägt `Ours`: Steht der richtige Eintrag da, ist es
+            // gleich, ob daneben noch ein alter liegt.
+            .max_by_key(|m| u8::from(*m == Match::Current))
+    };
+
+    for reg in expected_entries(which) {
+        report.total += 1;
+        match count(&reg) {
+            Some(Match::Current) => report.current += 1,
+            Some(Match::Ours) => report.outdated += 1,
+            _ => {}
+        }
+    }
+    if which == Which::ClaudeCode {
+        report.recall = count(&recall_registration());
+    }
+    report
+}
+
 /// `{"type":"command","command":"minds hook …"}`, ggf. in eine Matcher-Gruppe
 /// verpackt.
 fn hook_group(matcher: bool, command: &str) -> Value {

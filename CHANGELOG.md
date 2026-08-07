@@ -340,6 +340,20 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Hinzugefügt
 
+- `minds fsck` prüft jetzt auch die **Agent-Registrierungen**. Bisher sah es
+  nur auf die Git-Hooks; ob der Agent überhaupt journaliert, war für den
+  Bericht unsichtbar. Gemeldet werden drei Zustände: eine Konfiguration ganz
+  ohne minds-Eintrag (der Fall, den ein eingecheckter Fremdeintrag erzeugt —
+  [#78](https://github.com/munichbughunter/minds/issues/78)), Einträge aus
+  einer älteren Version, und eine unvollständige Registrierung. Der
+  Recall-Eintrag bekommt einen eigenen Satz, wenn er veraltet ist — sein
+  **Fehlen** dagegen nicht: `--recall` ist opt-in, und was niemand wollte,
+  fehlt nicht.
+
+  Höchstens eine Zeile je Agent, nie je Event, und eine Datei, die es gar
+  nicht gibt, bleibt still. Ein Hinweis, kein Befund: Der Rückgabewert bleibt
+  0, denn er ist das CI-Gate.
+  ([#68](https://github.com/munichbughunter/minds/issues/68))
 - `minds fsck` prüft die Hooks vom effektiven Hook-Verzeichnis aus und meldet, wenn
   `post-commit` oder `prepare-commit-msg` dort fehlen — samt Hinweis, wenn der
   minds-Block stattdessen im ignorierten `.git/hooks` liegt. Ein Hinweis, kein Befund:
