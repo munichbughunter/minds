@@ -21,6 +21,46 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- Ein Git-Hook, dem das **Execute-Bit** abhandengekommen ist, wird von `minds
+  enable` wieder repariert — und von `minds fsck` benannt. Git überspringt eine
+  nicht ausführbare Hook-Datei **stillschweigend**: kein Fehler, keine Meldung,
+  nur kein Checkpoint. Das Bit geht auf gewöhnlichen Wegen verloren (ein
+  `git archive`/Tarball, eine Kopie über ein Dateisystem ohne Modusbits, ein zu
+  breites `chmod -R`), und bisher blieb der Hook danach für immer tot: `enable`
+  kehrte bei textgleichem Inhalt zurück, bevor es die Datei überhaupt öffnete,
+  und meldete „unverändert"; `fsck` verglich nur den Blocktext und meldete
+  „installiert". Beide sehen jetzt hin. Die Reparatur wird **gemeldet**, auch
+  ohne `-v`: `chmod -x` ist auch der Weg, einen Hook absichtlich stillzulegen,
+  und diese Entscheidung wortlos zurückzunehmen wäre eine Überraschung. Kennt
+  das Dateisystem gar keine Execute-Bits (CIFS, exFAT), bricht `enable` mit
+  dieser Begründung ab, statt bei jedem Lauf dieselbe Reparatur zu melden.
+  ([#52](https://github.com/munichbughunter/minds/issues/52))
+- `minds enable` hängt seine Shell-Zeilen nicht mehr an einen Hook mit
+  **fremdem Interpreter**. An eine Datei mit `#!/usr/bin/env python3` wurde der
+  minds-Block bisher einfach angehängt — der Hook warf ab da Syntaxfehler, und
+  das `|| true` im Block fängt in Python nichts. Jetzt bricht `enable` mit
+  Begründung ab und nennt den Interpreter, statt einen fremden Hook zu
+  beschädigen; Bourne-Verwandte (`sh`, `bash`, `dash`, `ksh`, `zsh` …), die
+  Wrapper `env` und `busybox` sowie Dateien ohne Shebang werden weiterhin
+  ergänzt. Geprüft wird **vor** der ersten Änderung: Ein fremder Hook an einer
+  der drei Stellen lässt den Lauf nicht mehr mittendrin abbrechen, mit
+  Agent-Konfiguration auf der Platte und ohne Store-Config. Und `minds fsck`
+  meldet dieselbe Datei als abgelehnt — samt Grund —, statt „installiert" zu
+  sagen oder zu einem `minds enable` zu raten, das garantiert abbräche.
+  ([#52](https://github.com/munichbughunter/minds/issues/52))
+- Der Codex-Schalter `codex_hooks = true` wird **exakt** gesetzt. Der Abgleich
+  lief über einen Präfix-Vergleich und traf damit auch einen fremden Schlüssel
+  wie `codex_hooks_timeout = 30` — dessen Zeile wurde durch `codex_hooks = true`
+  *ersetzt*: Nutzerkonfiguration zerstört, und der eigentliche Schalter fehlte
+  trotzdem. Zusätzlich gilt der Schalter jetzt als das, was er ist — top-level:
+  Eine `codex_hooks`-Zeile unter `[profiles.test]` gehört einer anderen Tabelle
+  und bleibt unangetastet, und ein fehlender Schalter wird **vor** der ersten
+  Tabelle eingefügt statt ans Dateiende, wo er in der letzten Tabelle gelandet
+  wäre. Und wo die Zeilenlogik an ihre Grenze kommt — mehrzeilige Werte,
+  Arrays über mehrere Zeilen —, wird nicht geraten: `enable` sagt, dass der
+  Schalter von Hand gehört, statt ihn womöglich in ein Literal zu schreiben.
+  ([#52](https://github.com/munichbughunter/minds/issues/52))
+
 - `minds enable` schreibt nicht mehr ungefragt in ein Hook-Verzeichnis
   **außerhalb des Repos** — und ein eingecheckter Symlink kann es nicht mehr
   unbemerkt dorthin umlenken. Entschieden wird über den **aufgelösten Ort**,

@@ -296,6 +296,10 @@ enum HookState {
         /// Getrennt von `missing`, weil der Rat ein anderer ist — `minds enable`
         /// würde diese Datei nicht anlegen, sondern ablehnen.
         refused: Vec<(&'static str, String)>,
+        /// Hooks mit aktuellem Block, denen das Execute-Bit fehlt. Git
+        /// überspringt sie stillschweigend; der Rat ist derselbe wie bei
+        /// `outdated` (`minds enable`), der Satz muss ein anderer sein.
+        not_executable: Vec<&'static str>,
         /// Wo unser Block stattdessen liegt: das ignorierte `<git-dir>/hooks` —
         /// der Fingerabdruck eines `enable` aus der Zeit vor #9.
         stray: Option<PathBuf>,
@@ -322,9 +326,11 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
     let mut missing = Vec::new();
     let mut outdated = Vec::new();
     let mut refused = Vec::new();
+    let mut not_executable = Vec::new();
     for name in crate::enable::hook_names() {
         match inspect_hook(name, &hooks_dir.join(name)) {
             Hook::Installed => {}
+            Hook::NotExecutable => not_executable.push(name),
             // Ein veralteter Block wird für **alle** Hooks gemeldet, nicht nur
             // für die aus `REQUIRED_HOOKS`: Der Fall, der ihn eingeführt hat,
             // ist `pre-push` — dessen Fehlen kostet nichts, dessen alter Rumpf
@@ -370,6 +376,7 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
         refused,
         stray,
         outside,
+        not_executable,
     }
 }
 
@@ -406,6 +413,11 @@ fn common_git_dir(git_dir: &Path) -> Option<PathBuf> {
 enum Hook {
     /// Eine Hook-Datei mit unserem Block, in der Fassung dieser Version.
     Installed,
+    /// Unser Block, aktuell — aber die Datei trägt kein Execute-Bit. Git
+    /// überspringt sie dann **stillschweigend**: kein Fehler, keine Meldung,
+    /// nur kein Checkpoint. Von außen sieht das aus wie eine heile
+    /// Installation, und genau deshalb bekommt es einen eigenen Zustand.
+    NotExecutable,
     /// Unser Block, aber mit einem anderen Rumpf: geschrieben von einer älteren
     /// `minds`-Version. Git führt ihn aus, er tut nur nicht mehr das Richtige.
     Outdated,
@@ -427,7 +439,16 @@ enum Hook {
 /// `fsck` bricht deshalb trotzdem nicht ab — es ist ein Bericht.
 fn inspect_hook(name: &str, path: &Path) -> Hook {
     match crate::enable::read_existing_hook(path) {
-        Ok(Some(content)) if content.contains(crate::enable::MARK_BEGIN) => {
+        // Was `enable` am Inhalt ablehnt (fremder Interpreter), meldet `fsck`
+        // als abgelehnt — nicht als „fehlt" oder „installiert". Sonst riete es
+        // zu einem `minds enable`, das im selben Repo garantiert abbräche.
+        Ok(Some(content)) => {
+            if let Err(err) = crate::enable::check_hook_content(path, &content) {
+                return Hook::Refused(err.to_string());
+            }
+            if !content.contains(crate::enable::MARK_BEGIN) {
+                return Hook::Absent;
+            }
             // Da liegt unser Block — aber steht darin noch, was diese Version
             // schreibt? Ein Rumpf aus einer älteren `minds` wird von Git
             // ausgeführt und sieht von außen wie eine heile Installation aus.
@@ -440,11 +461,19 @@ fn inspect_hook(name: &str, path: &Path) -> Hook {
             // `hook_names()`), aber die Signatur lädt dazu ein.
             debug_assert!(expected.is_some(), "unbekannter Hook-Name: {name}");
             match crate::enable::block_body(&content) {
-                Some(body) if Some(body.as_str()) == expected => Hook::Installed,
+                Some(body) if Some(body.as_str()) == expected => {
+                    // Der Inhalt stimmt — aber ohne Execute-Bit führt Git die
+                    // Datei nie aus, und niemand erführe warum.
+                    if crate::enable::is_executable(path) {
+                        Hook::Installed
+                    } else {
+                        Hook::NotExecutable
+                    }
+                }
                 _ => Hook::Outdated,
             }
         }
-        Ok(_) => Hook::Absent,
+        Ok(None) => Hook::Absent,
         Err(err) => Hook::Refused(err.to_string()),
     }
 }
@@ -459,7 +488,7 @@ fn inspect_hook(name: &str, path: &Path) -> Hook {
 /// Anführungszeichen: Ein Pfad mit Leerzeichen ist sonst nicht als einer zu
 /// erkennen, und ein leerer Pfad ließe den Satz mitten im Nichts enden.
 fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
-    let (hooks_dir, missing, outdated, refused, stray, outside) = match state {
+    let (hooks_dir, missing, outdated, refused, stray, outside, not_executable) = match state {
         HookState::Unusable(why) => {
             let first = match why {
                 NoHooksDir::Empty => {
@@ -484,7 +513,16 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
             refused,
             stray,
             outside,
-        } => (hooks_dir, missing, outdated, refused, stray, *outside),
+            not_executable,
+        } => (
+            hooks_dir,
+            missing,
+            outdated,
+            refused,
+            stray,
+            *outside,
+            not_executable,
+        ),
     };
 
     let dir = short(root, hooks_dir);
@@ -502,7 +540,8 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
     } else {
         "`minds enable`"
     };
-    if missing.is_empty() && outdated.is_empty() && refused.is_empty() {
+    if missing.is_empty() && outdated.is_empty() && refused.is_empty() && not_executable.is_empty()
+    {
         let mut lines = vec![format!("Hooks: installiert in „{dir}“")];
         lines.extend(scope_note);
         return lines;
@@ -544,6 +583,25 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
         lines.push(format!("  {enable_cmd} bringt den Block auf den Stand"));
     }
 
+    // Der Inhalt stimmt, nur das Execute-Bit fehlt. Das ist der stillste der
+    // Hook-Zustände: Git meldet nichts, wenn es eine nicht ausführbare Datei
+    // überspringt — von außen sieht das aus wie eine heile Installation.
+    if !not_executable.is_empty() {
+        let (verb, object) = if not_executable.len() == 1 {
+            ("ist", "ihn")
+        } else {
+            ("sind", "sie")
+        };
+        lines.push(format!(
+            "Hooks: {} in „{dir}“ {verb} nicht ausführbar",
+            not_executable.join(", ")
+        ));
+        lines.push(format!(
+            "  Git überspringt {object} stillschweigend — kein Commit erzeugt einen Checkpoint"
+        ));
+        lines.push(format!("  {enable_cmd} setzt das Recht wieder"));
+    }
+
     // Abgelehnte Hooks bekommen den Grund statt des Rats: `minds enable` würde
     // hier nicht installieren, sondern mit derselben Begründung abbrechen.
     for (name, reason) in refused {
@@ -570,8 +628,11 @@ fn report_hooks(root: &Path, state: &HookState) -> usize {
     }
     usize::from(!matches!(
         state,
-        HookState::Checked { missing, outdated, refused, .. }
-            if missing.is_empty() && outdated.is_empty() && refused.is_empty()
+        HookState::Checked { missing, outdated, refused, not_executable, .. }
+            if missing.is_empty()
+                && outdated.is_empty()
+                && refused.is_empty()
+                && not_executable.is_empty()
     ))
 }
 
@@ -594,7 +655,7 @@ fn report_hooks(root: &Path, state: &HookState) -> usize {
 fn report_binary(root: &Path, hooks: &HookState) -> usize {
     match config::recorded_binary(root) {
         Some(recorded) => {
-            if is_executable(&recorded) {
+            if crate::enable::is_executable(&recorded) {
                 return 0;
             }
             println!(
@@ -619,22 +680,6 @@ fn report_binary(root: &Path, hooks: &HookState) -> usize {
             println!("  `minds enable` merkt sich den Ort des Binaries");
             1
         }
-    }
-}
-
-/// Ausführbar im Sinn des Hooks: dieselbe Frage, die `[ -f … ] && [ -x … ]`
-/// dort stellt — `is_file` gehört dazu, ein Verzeichnis mit x-Bit ist keins.
-fn is_executable(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
-            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        path.is_file()
     }
 }
 
@@ -761,9 +806,25 @@ mod tests {
         assert!(ok);
     }
 
+    /// Schreibt eine Hook-Datei wie `minds enable` sie hinterlässt — **samt
+    /// Execute-Bit**. Ohne das prüften die Fixtures einen Zustand, den `enable`
+    /// nie erzeugt, und `fsck` meldete zu Recht „nicht ausführbar".
     fn write_hook(dir: &Path, name: &str, body: &str) {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(name), body).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        make_executable(&path);
+    }
+
+    /// Setzt das Execute-Bit; auf Nicht-Unix ein No-op, wie im Produktionscode.
+    fn make_executable(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = path;
     }
 
     /// Der Block, den `minds enable` für diesen Hook schriebe — die Fixtures
@@ -954,6 +1015,7 @@ mod tests {
             refused: vec![("post-commit", "…/post-commit ist ein Symlink".to_owned())],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state),
@@ -1001,6 +1063,7 @@ mod tests {
             missing: vec![],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(lines(&state), ["Hooks: installiert in „.husky“"]);
     }
@@ -1018,6 +1081,7 @@ mod tests {
             missing: vec!["post-commit"],
             stray: None,
             outside: true,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state),
@@ -1030,6 +1094,63 @@ mod tests {
         );
     }
 
+    /// Der stillste Hook-Zustand (#52): Inhalt korrekt, Execute-Bit weg. Git
+    /// überspringt die Datei wortlos — ohne diese Zeile meldete `fsck`
+    /// „installiert" für einen Hook, der nie feuert.
+    #[test]
+    fn golden_a_hook_without_its_execute_bit_is_named() {
+        let state = HookState::Checked {
+            refused: vec![],
+            outdated: vec![],
+            hooks_dir: PathBuf::from("/repo/.git/hooks"),
+            missing: vec![],
+            stray: None,
+            outside: false,
+            not_executable: vec!["post-commit"],
+        };
+        assert_eq!(
+            lines(&state),
+            [
+                "Hooks: post-commit in „.git/hooks“ ist nicht ausführbar",
+                "  Git überspringt ihn stillschweigend — kein Commit erzeugt einen Checkpoint",
+                "  `minds enable` setzt das Recht wieder",
+            ]
+        );
+    }
+
+    /// Und der Weg dorthin über den echten Prüfpfad: Datei mit gültigem Block,
+    /// aber ohne `+x`.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_without_its_execute_bit_is_not_reported_as_installed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(dir) = repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        for name in crate::enable::hook_names() {
+            write_hook(&hooks, name, &our_block(name));
+        }
+        std::fs::set_permissions(
+            hooks.join("post-commit"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+
+        let state = hook_state(root, &root.join(".git"));
+        let HookState::Checked {
+            missing,
+            outdated,
+            not_executable,
+            ..
+        } = &state
+        else {
+            panic!("erwartet: geprüftes Verzeichnis")
+        };
+        assert!(missing.is_empty() && outdated.is_empty(), "{state:?}");
+        assert_eq!(not_executable, &vec!["post-commit"]);
+    }
+
     /// Und im sauberen Zustand hängt die Ortszeile an der Installiert-Zeile.
     #[test]
     fn golden_an_installed_outside_dir_still_carries_the_note() {
@@ -1040,6 +1161,7 @@ mod tests {
             missing: vec![],
             stray: None,
             outside: true,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state),
@@ -1061,6 +1183,7 @@ mod tests {
             missing: vec!["prepare-commit-msg"],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state),
@@ -1080,6 +1203,7 @@ mod tests {
             missing: vec!["post-commit", "prepare-commit-msg"],
             stray: Some(PathBuf::from("/repo/.git/hooks")),
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state),
@@ -1148,6 +1272,7 @@ mod tests {
             missing: vec!["post-commit"],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state)[0],
@@ -1228,6 +1353,7 @@ mod tests {
             refused: vec![],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state),
@@ -1247,6 +1373,7 @@ mod tests {
             refused: vec![],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         assert_eq!(
             lines(&state)[0],
@@ -1263,6 +1390,7 @@ mod tests {
             refused: vec![],
             stray: None,
             outside: false,
+            not_executable: vec![],
         };
         // Ein Hinweis zählt, bricht aber die Integrität nicht — der
         // Rückgabewert von `fsck` bleibt davon unberührt.
