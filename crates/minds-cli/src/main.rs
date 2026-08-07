@@ -455,7 +455,16 @@ fn unknown_flag(spec: &Spec, arg: &str) -> String {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // `args()` **panickt** bei einem Argument, das kein UTF-8 ist — in der
+    // allerersten Zeile, vor jeder eigenen Vorkehrung. Für `minds hook` wäre
+    // das der schlimmste Ort: Backtrace auf stderr und Exit 101, und die
+    // Agent-Registrierung ruft ihn ohne `2>/dev/null` auf. `args_os` plus
+    // verlustbehaftete Wandlung kann nicht scheitern; ein solches Argument
+    // wird dann eben ein unbekanntes Flag und bekommt die übliche Meldung.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
 
     let Some(command) = args.first().map(String::as_str) else {
         print!("{USAGE}");
@@ -479,6 +488,26 @@ fn main() -> ExitCode {
         eprint!("{USAGE}");
         return ExitCode::FAILURE;
     };
+
+    // Sobald feststeht, dass dieser Prozess ein Hook-Pfad ist, gelten die
+    // Hook-Regeln — **ab hier**, nicht erst in `guarded`. Die Zusage aus #54
+    // lautet „`minds hook` schreibt kein Byte auf stderr", und ein Panic im
+    // Parser ginge sonst mit Exit 101 und vollem Backtrace an den Agenten:
+    // Die Claude-Registrierung ruft `minds hook` **ohne** `2>/dev/null` auf,
+    // anders als die drei Git-Hookbodies.
+    //
+    // `brief --hook` gehört dazu: Sein stdout *ist* der injizierte Kontext.
+    let hook_path = match spec.name {
+        "hook" => Some(hooklog::Source::Hook),
+        "checkpoint" => Some(hooklog::Source::Checkpoint),
+        "prepare-commit-msg" => Some(hooklog::Source::PrepareCommitMsg),
+        "sync" => Some(hooklog::Source::Sync),
+        "brief" if args.iter().any(|a| a == "--hook") => Some(hooklog::Source::Hook),
+        _ => None,
+    };
+    if let Some(source) = hook_path {
+        hooklog::silence_panics_for(source);
+    }
 
     let rest = &args[1..];
 
