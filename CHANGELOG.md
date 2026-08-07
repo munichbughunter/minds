@@ -21,6 +21,41 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- Die Agent-Registrierungen haben eine **Soll-Quelle** bekommen, und die
+  Erkennung liest zwei Wörter statt einer Teilzeichenkette. Daran hingen zwei
+  Fehlklassen. Erstens: Ein eingecheckter Eintrag, der `minds hook` nur
+  zufällig im Text trägt — `echo "minds hook ist nett"` —, galt als
+  Registrierung; der echte Capture-Hook entstand nie, lautlos, bei jedem
+  Kollegen, der das Repo klonte
+  ([#78](https://github.com/munichbughunter/minds/issues/78)). Zweitens: Ein
+  geänderter Aufruf erreichte **bestehende Installationen nie**, weil jede
+  vorhandene Registrierung als „schon da" durchging
+  ([#68](https://github.com/munichbughunter/minds/issues/68)). Beide sind
+  dieselbe Codestelle, und ein halber Umbau wäre schlimmer als keiner gewesen:
+  Ein exakter Vergleich ohne verlässlichen Besitztest hätte fremde
+  Nutzerkonfiguration überschrieben.
+
+  Jetzt gilt: Das erste Wort muss auf `minds` enden — nackt oder als Pfad —,
+  das zweite genau `hook` bzw. `brief` sein. Ein eigener Eintrag mit altem
+  Wortlaut wird **an Ort und Stelle** korrigiert (Reihenfolge, `matcher` und
+  Zusatzschlüssel des Nutzers bleiben), Fremdes bleibt unangetastet, und der
+  Ersatz wird gemeldet — auch ohne `-v`, denn diese Zeile kann jemand von Hand
+  geändert haben. Ein vorhandener Recall-Eintrag wird auch **ohne** `--recall`
+  gepflegt: Der Schalter regiert das Anlegen, nicht die Wartung, sonst bliebe
+  ein `fsck`-Hinweis stehen, den kein `minds enable` behebt.
+- Ein **eigenes, aber veraltetes OpenCode-Plugin** wird wieder aktualisiert.
+  Es trägt die Marke hinter `//`, verglichen wurde aber gegen die Shell-Fassung
+  mit `#` — der Test war damit *immer* falsch, das Plugin galt als fremde
+  Datei und blieb für immer auf dem alten Stand.
+  ([#68](https://github.com/munichbughunter/minds/issues/68))
+- `minds enable` sagt jetzt, wenn es an einer Stelle **nichts registrieren
+  konnte**, weil dort Fremdes steht: ein `hooks`, das kein Objekt ist, ein
+  Event, das kein Array ist, ein fremdes `minds.ts`. Bisher gingen diese Fälle
+  als „unverändert" durch — eine Beruhigung, die nicht stimmte, denn der Agent
+  journaliert dann nicht. Und ein kaputtes Event reißt die übrigen sechs nicht
+  mehr mit. ([#68](https://github.com/munichbughunter/minds/issues/68),
+  [#78](https://github.com/munichbughunter/minds/issues/78))
+
 - **`minds brief --hook` verliert seine Fehler nicht mehr.** Der von
   `minds enable --recall` registrierte SessionStart-Hook lautet
   `minds brief --hook 2>/dev/null || true`: stderr ging ins Nichts, der

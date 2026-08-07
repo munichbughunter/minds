@@ -53,9 +53,27 @@ use crate::config;
 /// kennen müssen.
 pub(crate) const BACKGROUND_IMPORT_FLAG: &str = "--__background-import";
 
+/// Die Marke selbst — **ohne** Kommentarzeichen.
+///
+/// Das ist der Teil, der in jeder Sprache derselbe ist: In einem Shell-Hook
+/// steht `#` davor, im TypeScript-Plugin `//`. Wer nach der Shell-Fassung
+/// sucht, findet das Plugin nicht — und genau das ist passiert:
+/// `OPENCODE_PLUGIN.contains(MARK_BEGIN)` war **immer falsch**, ein veraltetes
+/// *eigenes* Plugin fiel damit in den Zweig „fremde Datei, nicht anrühren" und
+/// wurde nie aktualisiert.
+/// Als Makro, damit `concat!` sie annimmt: Es nimmt Literale, keine
+/// Konstanten. So bleibt [`MARK_BEGIN`] nachweislich dieselbe Marke mit
+/// Kommentarzeichen davor, statt sie ein zweites Mal zu schreiben.
+macro_rules! mark {
+    () => {
+        ">>> minds >>>"
+    };
+}
+pub(crate) const MARK: &str = mark!();
+
 /// Anfang unseres Blocks in Shell-Hooks — die Marke für idempotentes Ersetzen.
 /// `fsck` erkennt an derselben Marke, ob ein Hook von uns stammt.
-pub(crate) const MARK_BEGIN: &str = "# >>> minds >>>";
+pub(crate) const MARK_BEGIN: &str = concat!("# ", mark!());
 /// Ende unseres Blocks.
 pub(crate) const MARK_END: &str = "# <<< minds <<<";
 
@@ -141,8 +159,8 @@ pub fn run(
 }
 
 /// Die Agents, die `enable` kennt.
-#[derive(Debug, Clone, Copy)]
-enum Which {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Which {
     ClaudeCode,
     Codex,
     Cursor,
@@ -150,14 +168,101 @@ enum Which {
     OpenCode,
 }
 
+/// Was sich je Agent unterscheidet — und sonst nichts.
+struct AgentSpec {
+    /// Die Registrierungsdatei, relativ zur Repo-Wurzel.
+    file: &'static str,
+    /// Der Name, unter dem sich `minds hook` gerufen sieht (`--agent`).
+    name: &'static str,
+    /// Schickt der Agent den Eventnamen im Payload mit? Wenn nicht, muss er in
+    /// der Registrierung stehen (`--event`, siehe `hook_event::parse`).
+    event_in_payload: bool,
+}
+
+/// **Die** Liste der Agents: `enable` schreibt daraus, `fsck` prüft dagegen.
+///
+/// Vorher stand dasselbe Wissen an vier Stellen — `Which::ALL`, `agent_label`,
+/// `agent_files` und die Aufrufe in [`enable_agents`], die Dateipfad und
+/// `--agent`-Namen als Literale mitschleppten, plus die Regel
+/// `agent != "claude-code"` als Zeichenkettenvergleich beim Aufrufer. Vier
+/// Orte, die auseinanderlaufen können, für eine Tatsache.
+///
+/// Die fünfunddreißig Registrierungen entstehen als **Produkt** aus dieser
+/// Liste und [`HOOK_EVENTS`], nicht als Aufzählung.
+const ALL_AGENTS: [(Which, AgentSpec); 5] = [
+    (
+        Which::ClaudeCode,
+        AgentSpec {
+            file: ".claude/settings.json",
+            name: "claude-code",
+            // Claude Code schickt `hook_event_name` mit.
+            event_in_payload: true,
+        },
+    ),
+    (
+        Which::Codex,
+        AgentSpec {
+            file: ".codex/hooks.json",
+            name: "codex",
+            event_in_payload: false,
+        },
+    ),
+    (
+        Which::Cursor,
+        AgentSpec {
+            file: ".cursor/hooks.json",
+            name: "cursor",
+            event_in_payload: false,
+        },
+    ),
+    (
+        Which::Gemini,
+        AgentSpec {
+            file: ".gemini/settings.json",
+            name: "gemini",
+            event_in_payload: false,
+        },
+    ),
+    (
+        Which::OpenCode,
+        AgentSpec {
+            // Kein JSON, sondern ein TypeScript-Plugin — siehe
+            // [`enable_opencode`]. Steht trotzdem hier, damit die Liste der
+            // Agents eine ist.
+            file: ".opencode/plugin/minds.ts",
+            name: "opencode",
+            event_in_payload: true,
+        },
+    ),
+];
+
 impl Which {
-    const ALL: &'static [Which] = &[
+    pub(crate) const ALL: &'static [Which] = &[
         Which::ClaudeCode,
         Which::Codex,
         Which::Cursor,
         Which::Gemini,
         Which::OpenCode,
     ];
+
+    fn spec(self) -> &'static AgentSpec {
+        &ALL_AGENTS
+            .iter()
+            .find(|(which, _)| *which == self)
+            .expect("jeder Agent steht in ALL_AGENTS")
+            .1
+    }
+
+    /// Die Registrierungsdatei, relativ zur Repo-Wurzel — auch das Etikett im
+    /// Bericht.
+    pub(crate) fn file(self) -> &'static str {
+        self.spec().file
+    }
+
+    /// Der Name für `--agent`.
+    pub(crate) fn name(self) -> &'static str {
+        self.spec().name
+    }
 }
 
 /// Registriert die gewählten Agents, immer die Git-Hooks (ein Checkpoint soll
@@ -265,22 +370,25 @@ fn enable_agents(
     }
 
     for &agent in agents {
-        let change = match agent {
-            Which::ClaudeCode => claude_style(&paths.root, ".claude/settings.json", "claude-code")?,
+        let outcome = match agent {
             Which::Codex => enable_codex(&paths.root)?,
-            Which::Cursor => claude_style(&paths.root, ".cursor/hooks.json", "cursor")?,
-            Which::Gemini => claude_style(&paths.root, ".gemini/settings.json", "gemini")?,
             Which::OpenCode => enable_opencode(&paths.root)?,
+            json_agent => claude_style(&paths.root, json_agent)?,
         };
-        report(verbose, agent_label(agent), change);
+        report_outcome(verbose, agent.file(), &outcome);
     }
 
-    // Opt-in Kontext-Rückführung: ein SessionStart-Hook, der `minds brief --hook`
+    // Kontext-Rückführung: ein SessionStart-Hook, der `minds brief --hook`
     // ausgibt und dessen additionalContext der neuen Session vorangeht. Nur für
     // Claude Code (der Envelope-Vertrag ist agent-spezifisch).
-    if recall && agents.iter().any(|a| matches!(a, Which::ClaudeCode)) {
-        let change = enable_recall_hook(&paths.root)?;
-        report(verbose, ".claude/settings.json (recall)", change);
+    //
+    // **Immer** aufgerufen, wenn Claude Code dabei ist — `recall` entscheidet
+    // nur über das Anlegen. Ein vorhandener Eintrag wird auch ohne den Schalter
+    // gepflegt, sonst bliebe ein `fsck`-Hinweis stehen, den kein `minds enable`
+    // behebt.
+    if agents.iter().any(|a| matches!(a, Which::ClaudeCode)) {
+        let outcome = enable_recall_hook(&paths.root, recall)?;
+        report_outcome(verbose, ".claude/settings.json (recall)", &outcome);
     }
 
     for &(name, body) in commit_hooks() {
@@ -623,16 +731,6 @@ fn git_ok(args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn agent_label(agent: Which) -> &'static str {
-    match agent {
-        Which::ClaudeCode => ".claude/settings.json",
-        Which::Codex => ".codex/hooks.json",
-        Which::Cursor => ".cursor/hooks.json",
-        Which::Gemini => ".gemini/settings.json",
-        Which::OpenCode => ".opencode/plugin/minds.ts",
-    }
-}
-
 /// Meldet, was mit einer Datei geschah — im Regelfall nur bei `-v`.
 ///
 /// [`Change::Repaired`] ist die Ausnahme und geht **immer** durch: Ein Hook
@@ -640,6 +738,24 @@ fn agent_label(agent: Which) -> &'static str {
 /// sondern auch, weil jemand ihn mit `chmod -x` gezielt stillgelegt hat. Diese
 /// Entscheidung wortlos zurückzunehmen wäre dieselbe Sorte Überraschung, die
 /// das Modul sonst vermeidet.
+/// Wie [`report`], zusätzlich für die Stellen, an denen Fremdes im Weg stand
+/// oder ein alter Eintrag ersetzt wurde.
+///
+/// Beide Zeilen gehen **immer** durch, auch ohne `-v`, aus demselben Grund wie
+/// [`Change::Repaired`]: Der Nutzer hat diese Entscheidungen nicht getroffen.
+/// Eine blockierte Registrierung heißt, dass dieser Agent nichts journaliert;
+/// ein ersetzter Eintrag heißt, dass eine Zeile, die jemand von Hand geändert
+/// haben kann, wieder auf unseren Stand gesetzt wurde.
+fn report_outcome(verbose: bool, label: &str, outcome: &Outcome) {
+    for blocked in &outcome.blocked {
+        println!("{}", blocked.sentence(label));
+    }
+    if outcome.refreshed {
+        println!("Hinweis: in „{label}“ wurde ein Eintrag aus einer älteren minds-Version ersetzt");
+    }
+    report(verbose, label, outcome.change);
+}
+
 fn report(verbose: bool, label: &str, change: Change) {
     if change == Change::Repaired {
         println!("Hinweis: {label} war nicht ausführbar und wurde wieder eingeschaltet");
@@ -1004,10 +1120,11 @@ const HOOK_EVENTS: &[(&str, bool)] = &[
 /// Trägt in eine Claude-artige `hooks`-Map je Event einen Command-Hook ein, der
 /// `minds hook --agent <agent>` aufruft — idempotent und ohne Fremdes zu
 /// verwerfen.
-fn claude_style(root: &Path, rel: &str, agent: &str) -> std::io::Result<Change> {
-    let path = root.join(rel);
+fn claude_style(root: &Path, which: Which) -> std::io::Result<Outcome> {
+    let path = root.join(which.file());
     let mut root_value = read_json(&path)?;
     let existed = path.exists();
+    let mut outcome = Outcome::new(Change::Unchanged);
 
     let obj = as_object(&mut root_value);
     let hooks = obj
@@ -1016,34 +1133,46 @@ fn claude_style(root: &Path, rel: &str, agent: &str) -> std::io::Result<Change> 
     let hooks = match hooks.as_object_mut() {
         Some(map) => map,
         // Eine fremde, nicht-Objekt-`hooks` würden wir sonst zertrümmern.
-        None => return Ok(Change::Unchanged),
+        None => {
+            outcome.blocked.push(Blocked::HooksNotAnObject);
+            return Ok(outcome);
+        }
     };
 
     let mut changed = false;
-    for &(event, matcher) in HOOK_EVENTS {
-        let command = command_for(agent, event, agent != "claude-code");
+    for reg in expected_entries(which) {
         let groups = hooks
-            .entry(event)
+            .entry(reg.event)
             .or_insert_with(|| Value::Array(Vec::new()));
         let Some(groups) = groups.as_array_mut() else {
+            // Weiterlaufen, nicht zurückkehren: Eine kaputte `SessionStart`
+            // darf `PreToolUse` nicht mitreißen.
+            outcome.blocked.push(Blocked::EventNotAnArray(reg.event));
             continue;
         };
-        if array_has_minds_hook(groups) {
-            continue;
+        match apply_registration(groups, &reg) {
+            Applied::AlreadyCurrent => {}
+            Applied::Refreshed => {
+                outcome.refreshed = true;
+                changed = true;
+            }
+            Applied::Missing => {
+                groups.push(hook_group(reg.matcher, &reg.command));
+                changed = true;
+            }
         }
-        groups.push(hook_group(matcher, &command));
-        changed = true;
     }
 
     if !changed && existed {
-        return Ok(Change::Unchanged);
+        return Ok(outcome);
     }
     write_json(&path, &root_value)?;
-    Ok(if existed {
+    outcome.change = if existed {
         Change::Updated
     } else {
         Change::Created
-    })
+    };
+    Ok(outcome)
 }
 
 /// Registriert einen zusätzlichen SessionStart-Hook, der `minds brief --hook`
@@ -1051,44 +1180,192 @@ fn claude_style(root: &Path, rel: &str, agent: &str) -> std::io::Result<Change> 
 /// voran. So lernt jede Session aus den vorigen (Vision-Problem #3). Idempotent,
 /// erkennbar an `minds brief` in der Kommandozeile; fremde SessionStart-Hooks
 /// (auch der Capture-Hook `minds hook`) bleiben unangetastet.
-fn enable_recall_hook(root: &Path) -> std::io::Result<Change> {
+/// `add` entscheidet nur über das **Anlegen**. Ein vorhandener Eintrag wird
+/// auch ohne `--recall` **gepflegt**: Sonst meldete `fsck` „veraltet", der
+/// Nutzer liefe `minds enable`, nichts geschähe, und der Hinweis bliebe für
+/// immer stehen. Der Schalter regiert die Entscheidung, nicht die Wartung.
+fn enable_recall_hook(root: &Path, add: bool) -> std::io::Result<Outcome> {
     let path = root.join(".claude/settings.json");
     let existed = path.exists();
     let mut root_value = read_json(&path)?;
+    let mut outcome = Outcome::new(Change::Unchanged);
 
     let obj = as_object(&mut root_value);
     let hooks = obj
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()));
     let Some(hooks) = hooks.as_object_mut() else {
-        return Ok(Change::Unchanged);
+        outcome.blocked.push(Blocked::HooksNotAnObject);
+        return Ok(outcome);
     };
+    let reg = recall_registration();
     let groups = hooks
-        .entry("SessionStart")
+        .entry(reg.event)
         .or_insert_with(|| Value::Array(Vec::new()));
     let Some(groups) = groups.as_array_mut() else {
-        return Ok(Change::Unchanged);
+        outcome.blocked.push(Blocked::EventNotAnArray(reg.event));
+        return Ok(outcome);
     };
 
-    let already = groups
-        .iter()
-        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|h| h.get("command").and_then(Value::as_str))
-        .any(|cmd| cmd.contains("minds brief"));
-    if already {
-        return Ok(Change::Unchanged);
+    match apply_registration(groups, &reg) {
+        Applied::AlreadyCurrent => return Ok(outcome),
+        Applied::Refreshed => outcome.refreshed = true,
+        Applied::Missing => {
+            if !add {
+                // Keiner da und keiner gewollt — das ist die Voreinstellung,
+                // kein Mangel.
+                return Ok(outcome);
+            }
+            groups.push(hook_group(reg.matcher, &reg.command));
+        }
     }
 
-    groups.push(json!({
-        "hooks": [{ "type": "command", "command": "minds brief --hook 2>/dev/null || true" }]
-    }));
     write_json(&path, &root_value)?;
-    Ok(if existed {
+    outcome.change = if existed {
         Change::Updated
     } else {
         Change::Created
-    })
+    };
+    Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// Die Soll-Registrierungen: eine Quelle für `enable` und `fsck`
+// ---------------------------------------------------------------------------
+
+/// Wozu ein Eintrag da ist — und damit, woran er als **unserer** erkannt wird.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// Der Capture-Hook: `minds hook …`
+    Capture,
+    /// Die Kontext-Rückführung: `minds brief --hook …` (nur Claude Code, opt-in)
+    Recall,
+}
+
+impl Role {
+    /// Das Unterkommando — der einzige Diskriminator, den das JSON hergibt.
+    fn subcommand(self) -> &'static str {
+        match self {
+            Role::Capture => "hook",
+            Role::Recall => "brief",
+        }
+    }
+}
+
+/// Ein Eintrag, den `minds enable` in eine Agent-Konfiguration schreibt.
+///
+/// Eine Quelle für beide Leser: `enable` schreibt `command`, `fsck` vergleicht
+/// dagegen. Zwei Auffassungen davon, was „unser Eintrag" ist, hießen: `fsck`
+/// meldet etwas, das `enable` nicht repariert — derselbe Satz steht über
+/// [`block_span`], aus demselben Grund.
+pub(crate) struct Registration {
+    pub(crate) event: &'static str,
+    pub(crate) matcher: bool,
+    pub(crate) role: Role,
+    pub(crate) command: String,
+}
+
+/// Die Kommandozeile der Kontext-Rückführung.
+///
+/// `2>/dev/null` bleibt, obwohl `brief --hook` seine Fehler seit #68 selbst
+/// ins Log schreibt — dieselbe Begründung wie über [`PRE_PUSH_BODY`]: Die
+/// Umleitung ist damit kein Verschweigen mehr, sondern die Verlagerung an
+/// einen Ort, an dem der Wortlaut auch morgen noch steht. Die stderr eines
+/// SessionStart-Hooks landete sonst im Transkript des Agenten, wo sie niemand
+/// mit Absicht liest.
+const RECALL_COMMAND: &str = "minds brief --hook 2>/dev/null || true";
+
+/// Alle Registrierungen, die `enable` für diesen Agenten schreibt — je Event
+/// eine, in der Reihenfolge von [`HOOK_EVENTS`].
+pub(crate) fn expected_entries(which: Which) -> Vec<Registration> {
+    let spec = which.spec();
+    let name = which.name();
+    HOOK_EVENTS
+        .iter()
+        .map(|&(event, matcher)| Registration {
+            event,
+            matcher,
+            role: Role::Capture,
+            command: if spec.event_in_payload {
+                format!("minds hook --agent {name}")
+            } else {
+                // Agents, deren Payload den Eventnamen nicht mitschickt,
+                // bekommen ihn über die Registrierung.
+                format!("minds hook --agent {name} --event {event}")
+            },
+        })
+        .collect()
+}
+
+/// Der Soll-Eintrag der Kontext-Rückführung (`--recall`).
+///
+/// Getrennt von [`expected_entries`], weil er **opt-in** ist: Sein Fehlen ist
+/// keine Lücke, sondern eine Entscheidung. `fsck` darf ihn deshalb nie
+/// vermissen — nur veraltet finden.
+pub(crate) fn recall_registration() -> Registration {
+    Registration {
+        event: "SessionStart",
+        matcher: false,
+        role: Role::Recall,
+        command: RECALL_COMMAND.to_owned(),
+    }
+}
+
+/// Wie ein vorhandener Eintrag zu unserem Soll steht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Match {
+    /// Zeichengleich mit dem, was **diese** Version schreibt.
+    Current,
+    /// Unser Eintrag, aber ein anderer Wortlaut — aus einer älteren Version
+    /// oder von Hand geändert.
+    Ours,
+    /// Nicht unserer. Bleibt unangetastet.
+    Foreign,
+}
+
+/// Ordnet eine vorhandene Kommandozeile unserem Soll zu.
+pub(crate) fn classify(command: &str, reg: &Registration) -> Match {
+    if command.trim() == reg.command {
+        Match::Current
+    } else if is_ours(command, reg.role) {
+        Match::Ours
+    } else {
+        Match::Foreign
+    }
+}
+
+/// Ist diese Kommandozeile ein Aufruf **unseres** Binaries mit diesem
+/// Unterkommando?
+///
+/// **Zwei Wörter, nicht eine Teilzeichenkette.** Das erste muss auf `minds`
+/// enden — nackt oder als Pfad —, das zweite genau das Unterkommando sein.
+/// Vorher stand hier `cmd.contains("minds hook")`, und daran hingen zwei
+/// Fehlklassen:
+///
+/// - `echo "minds hook ist nett"` galt als registriert, und der echte Eintrag
+///   entstand nie — ein Stillausfall, den ein eingecheckter Fremdeintrag bei
+///   jedem Kollegen auslöst (#78).
+/// - Umgekehrt hätte ein Präfix-Test `/usr/local/bin/minds hook …` für fremd
+///   gehalten und einen **zweiten** Eintrag danebengelegt; jedes Event ginge
+///   dann doppelt ins Journal.
+///
+/// Und es löst die Frage, die es unter `SessionStart` braucht, wo Capture und
+/// Recall nebeneinander stehen: `minds brief --hook` ist unserer für
+/// [`Role::Recall`] und fremd für [`Role::Capture`] — ohne Sonderlogik.
+///
+/// **Was bewusst nicht erkannt wird:** `FOO=1 minds hook …`,
+/// `sh -c 'minds hook …'`, ein Pfad mit Leerzeichen in Anführungszeichen. Alle
+/// gelten als fremd, im schlimmsten Fall entsteht ein zweiter Eintrag daneben
+/// — sichtbar in der Datei und von `fsck` berichtet. Einen Shell-Parser dafür
+/// zu bauen wäre eine Genauigkeit, die nicht die des Agenten wäre; dieselbe
+/// Grenze zieht [`is_simple_toml`].
+fn is_ours(command: &str, role: Role) -> bool {
+    let mut words = command.split_whitespace();
+    let Some(program) = words.next() else {
+        return false;
+    };
+    let stem = basename(program);
+    matches!(stem, "minds" | "minds.exe") && words.next() == Some(role.subcommand())
 }
 
 /// `{"type":"command","command":"minds hook …"}`, ggf. in eine Matcher-Gruppe
@@ -1102,28 +1379,108 @@ fn hook_group(matcher: bool, command: &str) -> Value {
     }
 }
 
-/// `true`, wenn irgendeine Gruppe schon einen `minds hook`-Command trägt — die
-/// Idempotenz-Prüfung. Bewusst über die Teilzeichenkette, damit auch eine
-/// ältere, leicht anders geschriebene Registrierung als „schon da" gilt.
-fn array_has_minds_hook(groups: &[Value]) -> bool {
-    groups.iter().any(|group| {
-        group
-            .get("hooks")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|h| h.get("command").and_then(Value::as_str))
-            .any(|cmd| cmd.contains("minds hook"))
-    })
+/// Was [`apply_registration`] an einer Gruppenliste vorgefunden hat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Applied {
+    /// Stand schon zeichengleich da — nichts zu tun.
+    AlreadyCurrent,
+    /// Ein eigener Eintrag mit anderem Wortlaut wurde auf den Stand gebracht.
+    Refreshed,
+    /// Kein eigener Eintrag da. Ob deswegen einer entsteht, entscheidet der
+    /// Aufrufer: beim Capture-Hook immer, beim Recall nur mit `--recall`.
+    Missing,
 }
 
-fn command_for(agent: &str, event: &str, with_event: bool) -> String {
-    if with_event {
-        // Agents, deren Payload den Eventnamen nicht mitschickt, bekommen ihn
-        // über die Registrierung (siehe hook_event::parse, event_override).
-        format!("minds hook --agent {agent} --event {event}")
+/// Trägt eine Registrierung in die Gruppenliste eines Events ein — oder bringt
+/// eine vorhandene **eigene** auf den Stand.
+///
+/// Drei Regeln, in dieser Reihenfolge:
+///
+/// 1. Steht sie schon zeichengleich da, passiert nichts.
+/// 2. Gibt es eigene Einträge mit anderem Wortlaut, werden sie **an Ort und
+///    Stelle** korrigiert. So bleiben Reihenfolge, `matcher` und
+///    Zusatzschlüssel des Nutzers erhalten; geändert wird genau ein Feld.
+/// 3. Sonst kommt eine neue Gruppe dazu.
+///
+/// **Alle** eigenen Einträge, nicht nur der erste: Sonst bliebe ein zweiter
+/// alter zurück, `fsck` meldete ihn als veraltet, und `minds enable` behöbe
+/// ihn nicht — ein Hinweis, den man nicht loswerden kann, wird überlesen,
+/// mitsamt den echten daneben.
+fn apply_registration(groups: &mut [Value], reg: &Registration) -> Applied {
+    let mut refreshed = false;
+    for group in groups.iter_mut() {
+        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(command) = entry.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            match classify(command, reg) {
+                Match::Current => return Applied::AlreadyCurrent,
+                Match::Ours => {
+                    entry["command"] = Value::String(reg.command.clone());
+                    refreshed = true;
+                }
+                Match::Foreign => {}
+            }
+        }
+    }
+    if refreshed {
+        Applied::Refreshed
     } else {
-        format!("minds hook --agent {agent}")
+        Applied::Missing
+    }
+}
+
+/// Eine Stelle, an der nichts registriert wurde, weil dort Fremdes steht.
+///
+/// „unverändert" wäre hier eine Beruhigung, die nicht stimmt: Der Agent
+/// journaliert dann nicht, und ohne diese Meldung erführe es niemand (#78).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Blocked {
+    /// `hooks` ist da, ist aber kein Objekt.
+    HooksNotAnObject,
+    /// Der Wert unter diesem Event ist kein Array.
+    EventNotAnArray(&'static str),
+    /// Ein `minds.ts`, das unsere Marke nicht trägt.
+    ForeignPlugin,
+}
+
+impl Blocked {
+    fn sentence(self, file: &str) -> String {
+        match self {
+            Blocked::HooksNotAnObject => format!(
+                "Hinweis: in „{file}“ ist „hooks“ kein Objekt — dort wurde nichts registriert"
+            ),
+            Blocked::EventNotAnArray(event) => format!(
+                "Hinweis: in „{file}“ ist „{event}“ kein Array — dieses Event wird nicht erfasst"
+            ),
+            Blocked::ForeignPlugin => {
+                format!("Hinweis: „{file}“ stammt nicht von minds — die Datei bleibt unangetastet")
+            }
+        }
+    }
+}
+
+/// Was `enable` an einer Agent-Datei tat — und was es dort **nicht** tun
+/// konnte.
+#[derive(Debug)]
+struct Outcome {
+    change: Change,
+    /// Stellen, an denen Fremdes im Weg stand.
+    blocked: Vec<Blocked>,
+    /// Wurde ein eigener Eintrag mit altem Wortlaut ersetzt?
+    refreshed: bool,
+}
+
+impl Outcome {
+    fn new(change: Change) -> Self {
+        Self {
+            change,
+            blocked: Vec::new(),
+            refreshed: false,
+        }
     }
 }
 
@@ -1133,15 +1490,16 @@ fn command_for(agent: &str, event: &str, with_event: bool) -> String {
 
 /// Codex braucht zweierlei: die Hook-Registrierung *und* den Schalter
 /// `codex_hooks = true`, ohne den Codex die `hooks.json` gar nicht liest.
-fn enable_codex(root: &Path) -> std::io::Result<Change> {
-    let hooks_change = claude_style(root, ".codex/hooks.json", "codex")?;
+fn enable_codex(root: &Path) -> std::io::Result<Outcome> {
+    let mut outcome = claude_style(root, Which::Codex)?;
     let toml_change = ensure_codex_hooks_flag(&root.join(".codex/config.toml"))?;
     // Der interessantere der beiden Änderungsstände bestimmt den Bericht.
-    Ok(match (hooks_change, toml_change) {
+    outcome.change = match (outcome.change, toml_change) {
         (Change::Created, _) | (_, Change::Created) => Change::Created,
         (Change::Updated, _) | (_, Change::Updated) => Change::Updated,
         _ => Change::Unchanged,
-    })
+    };
+    Ok(outcome)
 }
 
 /// Setzt `codex_hooks = true` in `config.toml` — zeilenbasiert, ohne
@@ -1324,27 +1682,35 @@ export const minds = async () => ({
 /// Schreibt das OpenCode-Plugin. Existiert bereits ein *fremdes* `minds.ts`
 /// (ohne unsere Marke), bleibt es unangetastet — wir überschreiben nichts, was
 /// wir nicht selbst geschrieben haben.
-fn enable_opencode(root: &Path) -> std::io::Result<Change> {
+fn enable_opencode(root: &Path) -> std::io::Result<Outcome> {
     let path = root.join(".opencode/plugin/minds.ts");
     check_agent_leaf(&path)?;
+    let mut outcome = Outcome::new(Change::Unchanged);
     if path.exists() {
         let current = fs::read_to_string(&path)?;
         if current == OPENCODE_PLUGIN {
-            return Ok(Change::Unchanged);
+            return Ok(outcome);
         }
-        if !current.contains(MARK_BEGIN) {
-            // Fremde Datei mit unserem Namen — nicht anrühren.
-            return Ok(Change::Unchanged);
+        // [`MARK`], nicht `MARK_BEGIN`: Das Plugin ist TypeScript und trägt
+        // die Marke hinter `//`, nicht hinter `#`. Der Vergleich gegen die
+        // Shell-Fassung war **immer** falsch — ein veraltetes eigenes Plugin
+        // galt damit als fremd und wurde nie aktualisiert.
+        if !current.contains(MARK) {
+            // Fremde Datei mit unserem Namen — nicht anrühren, aber sagen.
+            outcome.blocked.push(Blocked::ForeignPlugin);
+            return Ok(outcome);
         }
+        outcome.refreshed = true;
     }
     create_parent(&path)?;
     let existed = path.exists();
     write_atomic_no_follow(&path, OPENCODE_PLUGIN, false)?;
-    Ok(if existed {
+    outcome.change = if existed {
         Change::Updated
     } else {
         Change::Created
-    })
+    };
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -2628,12 +2994,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_json_config_is_refused_and_its_target_untouched() {
-        for (file, agent) in [
-            (".claude/settings.json", "claude-code"),
-            (".cursor/hooks.json", "cursor"),
-            (".gemini/settings.json", "gemini"),
-            (".codex/hooks.json", "codex"),
+        for which in [
+            Which::ClaudeCode,
+            Which::Cursor,
+            Which::Gemini,
+            Which::Codex,
         ] {
+            let file = which.file();
             let dir = tmp();
             let victim = dir.path().join("opfer.json");
             fs::write(&victim, "{\"fremd\":true}\n").unwrap();
@@ -2642,7 +3009,7 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::os::unix::fs::symlink(&victim, &path).unwrap();
 
-            let err = claude_style(dir.path(), file, agent).unwrap_err();
+            let err = claude_style(dir.path(), which).unwrap_err();
             assert!(err.to_string().contains("Symlink"), "{file}: {err}");
             assert_eq!(
                 fs::read_to_string(&victim).unwrap(),
@@ -2657,6 +3024,300 @@ mod tests {
                 "{file}: der Link selbst wurde ersetzt"
             );
         }
+    }
+
+    // --- Soll-Quelle und Erkennung (#68 Teil 2, #78) ------------------------
+
+    /// Der Kern von #78: Ein eingecheckter Fremdeintrag, der die Zeichenkette
+    /// nur zufällig enthält, galt als Registrierung — der echte Capture-Hook
+    /// entstand nie, lautlos, bei jedem Kollegen, der das Repo klont.
+    #[test]
+    fn a_foreign_command_mentioning_minds_does_not_count_as_registered() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let foreign = "echo \"minds hook ist nett\"";
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [{ "hooks": [{ "type": "command", "command": foreign }] }] } })
+                .to_string(),
+        )
+        .unwrap();
+
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+
+        let value = read_json(&path).unwrap();
+        let commands: Vec<&str> = value["hooks"]["Stop"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert!(
+            commands.contains(&foreign),
+            "der fremde Eintrag wurde angetastet: {commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.starts_with("minds hook --agent")),
+            "der echte Eintrag fehlt: {commands:?}"
+        );
+    }
+
+    /// Die Zwei-Wort-Erkennung im Einzelnen.
+    #[test]
+    fn ownership_is_read_as_two_words_not_a_substring() {
+        for (command, role, expected) in [
+            ("minds hook --agent claude-code", Role::Capture, true),
+            // Ein absoluter Pfad ist unserer — sonst entstünde ein zweiter
+            // Eintrag daneben, und jedes Event ginge doppelt ins Journal.
+            ("/usr/local/bin/minds hook --agent x", Role::Capture, true),
+            ("  minds hook  ", Role::Capture, true),
+            ("minds.exe hook --agent x", Role::Capture, true),
+            // #78: Das erste Wort ist `echo`.
+            ("echo \"minds hook ist nett\"", Role::Capture, false),
+            ("# minds hook --agent x", Role::Capture, false),
+            // Die Rollen trennen sich von selbst — beide stehen unter
+            // SessionStart.
+            ("minds brief --hook", Role::Recall, true),
+            ("minds brief --hook", Role::Capture, false),
+            ("minds hook --agent claude-code", Role::Recall, false),
+            // Bewusst nicht erkannt: Ein Wrapper ist fremd.
+            ("sh -c 'minds hook'", Role::Capture, false),
+            ("", Role::Capture, false),
+        ] {
+            assert_eq!(is_ours(command, role), expected, "{command:?} / {role:?}");
+        }
+    }
+
+    /// #68 Teil 2: Ein Eintrag mit altem Wortlaut wird **ersetzt**, nicht
+    /// dupliziert — und erreicht damit bestehende Installationen.
+    #[test]
+    fn an_entry_with_an_old_wording_is_refreshed_not_duplicated() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // So könnte eine ältere Version registriert haben.
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [{ "hooks": [{
+                "type": "command",
+                "command": "minds hook --agent claude-code --event Stop"
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+
+        let outcome = claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        assert!(outcome.refreshed, "die Ersetzung wurde nicht gemeldet");
+
+        let value = read_json(&path).unwrap();
+        let stop = value["hooks"]["Stop"].as_array().unwrap();
+        let commands: Vec<&str> = stop
+            .iter()
+            .flat_map(|g| g["hooks"].as_array().unwrap())
+            .map(|h| h["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            commands,
+            vec!["minds hook --agent claude-code"],
+            "ersetzt, nicht dupliziert"
+        );
+    }
+
+    /// Ein Eintrag mit **falschem Agenten** ist unserer — nur falsch. Er wird
+    /// korrigiert, nicht daneben ein zweiter gelegt.
+    #[test]
+    fn an_entry_with_the_wrong_agent_is_corrected() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            json!({ "hooks": { "Stop": [{ "hooks": [{
+                "type": "command", "command": "minds hook --agent cursor"
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+
+        let value = read_json(&path).unwrap();
+        let stop = value["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "kein zweiter Eintrag: {stop:?}");
+        assert_eq!(
+            stop[0]["hooks"][0]["command"].as_str().unwrap(),
+            "minds hook --agent claude-code"
+        );
+    }
+
+    /// Capture und Recall stehen beide unter `SessionStart` und stören sich
+    /// nicht — auch beim zweiten Lauf nicht.
+    #[test]
+    fn capture_and_recall_share_session_start_without_disturbing_each_other() {
+        let dir = tmp();
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        enable_recall_hook(dir.path(), true).unwrap();
+
+        let after_first = read_json(&dir.path().join(".claude/settings.json")).unwrap();
+        let groups = after_first["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 2, "je einer für Capture und Recall");
+
+        // Zweiter Lauf: nichts ändert sich.
+        assert_eq!(
+            claude_style(dir.path(), Which::ClaudeCode).unwrap().change,
+            Change::Unchanged
+        );
+        assert_eq!(
+            enable_recall_hook(dir.path(), true).unwrap().change,
+            Change::Unchanged
+        );
+        let after_second = read_json(&dir.path().join(".claude/settings.json")).unwrap();
+        assert_eq!(after_first, after_second);
+    }
+
+    /// Ein vorhandener Recall-Eintrag wird auch **ohne** `--recall` gepflegt —
+    /// sonst bliebe ein `fsck`-Hinweis stehen, den kein `enable` behebt. Fehlt
+    /// er, wird ohne den Schalter aber auch keiner angelegt.
+    #[test]
+    fn a_recall_entry_is_maintained_without_the_flag_but_never_created() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Ohne Eintrag und ohne Schalter: nichts entsteht.
+        fs::write(
+            &path,
+            json!({ "hooks": { "SessionStart": [] } }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            enable_recall_hook(dir.path(), false).unwrap().change,
+            Change::Unchanged
+        );
+        let value = read_json(&path).unwrap();
+        assert!(
+            value["hooks"]["SessionStart"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Mit altem Eintrag und ohne Schalter: wird gepflegt.
+        fs::write(
+            &path,
+            json!({ "hooks": { "SessionStart": [{ "hooks": [{
+                "type": "command", "command": "minds brief --hook"
+            }] }] } })
+            .to_string(),
+        )
+        .unwrap();
+        let outcome = enable_recall_hook(dir.path(), false).unwrap();
+        assert!(outcome.refreshed);
+        let value = read_json(&path).unwrap();
+        assert_eq!(
+            value["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap(),
+            RECALL_COMMAND
+        );
+    }
+
+    /// Ein kaputtes Event darf die übrigen sechs nicht mitreißen — und der
+    /// Nutzer erfährt davon, auch ohne `-v`.
+    #[test]
+    fn a_broken_event_does_not_stop_the_other_six() {
+        let dir = tmp();
+        let path = dir.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            json!({ "hooks": { "SessionStart": "kein Array" } }).to_string(),
+        )
+        .unwrap();
+
+        let outcome = claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        assert_eq!(
+            outcome.blocked,
+            vec![Blocked::EventNotAnArray("SessionStart")]
+        );
+
+        let value = read_json(&path).unwrap();
+        assert_eq!(
+            value["hooks"]["SessionStart"].as_str(),
+            Some("kein Array"),
+            "das Fremde bleibt"
+        );
+        for event in ["PreToolUse", "Stop", "SessionEnd"] {
+            assert!(
+                !value["hooks"][event].as_array().unwrap().is_empty(),
+                "{event} wurde mitgerissen"
+            );
+        }
+    }
+
+    /// Was `enable` schreibt, muss die Klassifikation als aktuell erkennen —
+    /// sonst meldete `fsck` in jedem frisch eingerichteten Repo „veraltet".
+    /// Über den Produktionspfad, wie `what_enable_writes_is_what_fsck_recognizes`.
+    #[test]
+    fn what_enable_writes_classifies_as_current() {
+        for which in [
+            Which::ClaudeCode,
+            Which::Cursor,
+            Which::Gemini,
+            Which::Codex,
+        ] {
+            let dir = tmp();
+            claude_style(dir.path(), which).unwrap();
+            let value = read_json(&dir.path().join(which.file())).unwrap();
+
+            for reg in expected_entries(which) {
+                let found = value["hooks"][reg.event]
+                    .as_array()
+                    .unwrap_or_else(|| panic!("{}: {} fehlt", which.file(), reg.event))
+                    .iter()
+                    .flat_map(|g| g["hooks"].as_array().unwrap())
+                    .filter_map(|h| h["command"].as_str())
+                    .any(|cmd| classify(cmd, &reg) == Match::Current);
+                assert!(found, "{}: {} nicht aktuell", which.file(), reg.event);
+            }
+        }
+    }
+
+    /// Ein **eigenes**, aber veraltetes OpenCode-Plugin wird aktualisiert.
+    ///
+    /// Die Marke steht dort hinter `//`, nicht hinter `#`; der Vergleich lief
+    /// aber gegen die Shell-Fassung und war damit immer falsch. Das Plugin
+    /// galt als fremd und blieb für immer auf dem alten Stand.
+    #[test]
+    fn an_outdated_opencode_plugin_of_ours_is_refreshed() {
+        let dir = tmp();
+        let path = dir.path().join(".opencode/plugin/minds.ts");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Was eine frühere Version geschrieben haben könnte: unsere Marke,
+        // anderer Rumpf.
+        let outdated = format!("// {MARK}\n// alt\n// <<< minds <<<\n");
+        fs::write(&path, &outdated).unwrap();
+
+        assert_eq!(enable_opencode(dir.path()).unwrap().change, Change::Updated);
+        assert_eq!(fs::read_to_string(&path).unwrap(), OPENCODE_PLUGIN);
+    }
+
+    /// Die Gegenprobe: Eine wirklich fremde Datei desselben Namens bleibt.
+    #[test]
+    fn a_foreign_opencode_plugin_stays_untouched() {
+        let dir = tmp();
+        let path = dir.path().join(".opencode/plugin/minds.ts");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let foreign = "// mein eigenes Plugin\nexport const x = 1;\n";
+        fs::write(&path, foreign).unwrap();
+
+        assert_eq!(
+            enable_opencode(dir.path()).unwrap().change,
+            Change::Unchanged
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), foreign);
     }
 
     /// Der wirksamere Angriff aus dem Security-Review: nicht die Datei, das
@@ -2771,7 +3432,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
-        let err = enable_recall_hook(dir.path()).unwrap_err();
+        let err = enable_recall_hook(dir.path(), true).unwrap_err();
         assert!(err.to_string().contains("Symlink"), "{err}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "{}\n");
     }
@@ -3905,7 +4566,7 @@ mod tests {
     #[test]
     fn claude_creates_all_events_once() {
         let dir = tmp();
-        let change = claude_style(dir.path(), ".claude/settings.json", "claude-code").unwrap();
+        let change = claude_style(dir.path(), Which::ClaudeCode).unwrap().change;
         assert_eq!(change, Change::Created);
 
         let value = read_json(&dir.path().join(".claude/settings.json")).unwrap();
@@ -3927,9 +4588,9 @@ mod tests {
     fn recall_adds_a_session_start_brief_hook_and_is_idempotent() {
         let dir = tmp();
         // Erst der reguläre Capture-Hook, dann die Rückführung obendrauf.
-        claude_style(dir.path(), ".claude/settings.json", "claude-code").unwrap();
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
 
-        let change = enable_recall_hook(dir.path()).unwrap();
+        let change = enable_recall_hook(dir.path(), true).unwrap().change;
         assert_eq!(change, Change::Updated);
 
         let value = read_json(&dir.path().join(".claude/settings.json")).unwrap();
@@ -3945,14 +4606,17 @@ mod tests {
         assert!(commands.iter().any(|c| c.contains("minds brief --hook")));
 
         // Zweiter Lauf ändert nichts.
-        assert_eq!(enable_recall_hook(dir.path()).unwrap(), Change::Unchanged);
+        assert_eq!(
+            enable_recall_hook(dir.path(), true).unwrap().change,
+            Change::Unchanged
+        );
     }
 
     #[test]
     fn claude_is_idempotent() {
         let dir = tmp();
-        claude_style(dir.path(), ".claude/settings.json", "claude-code").unwrap();
-        let again = claude_style(dir.path(), ".claude/settings.json", "claude-code").unwrap();
+        claude_style(dir.path(), Which::ClaudeCode).unwrap();
+        let again = claude_style(dir.path(), Which::ClaudeCode).unwrap().change;
         assert_eq!(again, Change::Unchanged);
 
         let value = read_json(&dir.path().join(".claude/settings.json")).unwrap();
@@ -3971,7 +4635,7 @@ mod tests {
         )
         .unwrap();
 
-        let change = claude_style(dir.path(), ".claude/settings.json", "claude-code").unwrap();
+        let change = claude_style(dir.path(), Which::ClaudeCode).unwrap().change;
         assert_eq!(change, Change::Updated);
 
         let value = read_json(&path).unwrap();
@@ -3988,7 +4652,7 @@ mod tests {
     #[test]
     fn non_claude_agents_carry_the_event_override() {
         let dir = tmp();
-        claude_style(dir.path(), ".cursor/hooks.json", "cursor").unwrap();
+        claude_style(dir.path(), Which::Cursor).unwrap();
         let value = read_json(&dir.path().join(".cursor/hooks.json")).unwrap();
         let cmd = value["hooks"]["Stop"][0]["hooks"][0]["command"]
             .as_str()
@@ -4001,12 +4665,12 @@ mod tests {
     #[test]
     fn codex_writes_the_flag_and_is_idempotent() {
         let dir = tmp();
-        let created = enable_codex(dir.path()).unwrap();
+        let created = enable_codex(dir.path()).unwrap().change;
         assert_eq!(created, Change::Created);
         let toml = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
         assert!(toml.contains("codex_hooks = true"));
 
-        let again = enable_codex(dir.path()).unwrap();
+        let again = enable_codex(dir.path()).unwrap().change;
         assert_eq!(again, Change::Unchanged);
     }
 
@@ -4026,8 +4690,11 @@ mod tests {
     #[test]
     fn opencode_plugin_is_written_and_idempotent() {
         let dir = tmp();
-        assert_eq!(enable_opencode(dir.path()).unwrap(), Change::Created);
-        assert_eq!(enable_opencode(dir.path()).unwrap(), Change::Unchanged);
+        assert_eq!(enable_opencode(dir.path()).unwrap().change, Change::Created);
+        assert_eq!(
+            enable_opencode(dir.path()).unwrap().change,
+            Change::Unchanged
+        );
         let ts = fs::read_to_string(dir.path().join(".opencode/plugin/minds.ts")).unwrap();
         assert!(ts.contains("minds"));
         assert!(ts.contains("--agent"));
@@ -4083,7 +4750,7 @@ mod tests {
         let path = dir.path().join(".claude/settings.json");
         create_parent(&path).unwrap();
         fs::write(&path, "{ kaputt ").unwrap();
-        assert!(claude_style(dir.path(), ".claude/settings.json", "claude-code").is_err());
+        assert!(claude_style(dir.path(), Which::ClaudeCode).is_err());
         // Die kaputte Datei ist noch da, nicht ersetzt.
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ kaputt ");
     }
