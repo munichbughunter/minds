@@ -839,6 +839,69 @@ fn a_symlinked_git_dir_still_enables_without_questions() {
     );
 }
 
+/// #52, end-to-end: Ein Hook ohne Execute-Bit erfasst nichts — Git
+/// überspringt ihn wortlos. `minds fsck` benennt das, und `minds enable`
+/// repariert es, obwohl der Inhalt unverändert stimmt.
+#[cfg(unix)]
+#[test]
+fn a_hook_without_its_execute_bit_is_named_by_fsck_and_repaired_by_enable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    let hook = dir.join(".git/hooks/post-commit");
+    let before = std::fs::read_to_string(&hook).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Der Beweis, dass es nicht nur um Bits geht: So entsteht kein Checkpoint.
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Ohne Execute-Bit""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: ohne Bit"]);
+    let refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        refs.trim().is_empty(),
+        "Voraussetzung verfehlt: der Hook lief trotz fehlendem Bit"
+    );
+
+    // fsck sagt es — vorher galt der Hook als „installiert".
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(
+        stdout(&fsck).contains("nicht ausführbar"),
+        "fsck verschweigt den toten Hook:\n{}",
+        stdout(&fsck)
+    );
+
+    // Und enable repariert, ohne den Inhalt anzufassen.
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+    assert_eq!(std::fs::read_to_string(&hook).unwrap(), before);
+    assert!(
+        std::fs::metadata(&hook).unwrap().permissions().mode() & 0o111 != 0,
+        "das Execute-Bit wurde nicht wiederhergestellt"
+    );
+    assert!(!stdout(&minds(dir, &["fsck"], None)).contains("nicht ausführbar"));
+}
+
 /// #65, end-to-end: Ein Symlink auf **eine** Agent-Konfiguration bricht
 /// `enable` ab, **bevor** irgendetwas geschrieben ist — nicht mitten in der
 /// Reihe. Sonst bliebe ein Repo zurück, dessen Agents journalieren, während

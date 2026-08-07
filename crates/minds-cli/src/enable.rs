@@ -65,6 +65,12 @@ enum Change {
     Created,
     Updated,
     Unchanged,
+    /// Inhaltlich unverändert, aber das Execute-Bit war weg und wurde wieder
+    /// gesetzt (#52). Eigene Variante, weil „ergänzt" hier falsch wäre — und
+    /// weil dieser eine Fall auch ohne `-v` sichtbar sein muss: `chmod -x` ist
+    /// ein verbreiteter Weg, einen Hook *absichtlich* stillzulegen. Wer ihn so
+    /// abgeschaltet hat, soll nicht wortlos wieder eingeschaltet werden.
+    Repaired,
 }
 
 impl Change {
@@ -73,6 +79,7 @@ impl Change {
             Change::Created => "angelegt",
             Change::Updated => "ergänzt",
             Change::Unchanged => "unverändert",
+            Change::Repaired => "wieder ausführbar gemacht",
         }
     }
 }
@@ -200,7 +207,17 @@ fn enable_agents(
     // Store-Config. Der Agent journalierte dann, und nichts checkte je ein.
     // (`read_existing_hook` verträgt ein fehlendes Elternverzeichnis.)
     for name in hook_names() {
-        read_existing_hook(&hooks_dir.join(name))?;
+        let path = hooks_dir.join(name);
+        if let Some(content) = read_existing_hook(&path)? {
+            // Nicht erst beim Schreiben: Ein fremder Hook mit
+            // `#!/usr/bin/env python3` an *einer* der drei Stellen ließe den
+            // Lauf sonst mitten in der Reihe abbrechen — mit
+            // Agent-Konfiguration und den ersten Hooks auf der Platte, aber
+            // ohne Store-Config. Der Agent journalierte dann, und nichts
+            // checkte je ein.
+            check_hook_content(&path, &content)?;
+            check_hook_repairable(&path)?;
+        }
     }
 
     // Und dieselbe Vorprüfung für die Agent-Dateien (#65): Ein Symlink an
@@ -599,7 +616,18 @@ fn agent_label(agent: Which) -> &'static str {
     }
 }
 
+/// Meldet, was mit einer Datei geschah — im Regelfall nur bei `-v`.
+///
+/// [`Change::Repaired`] ist die Ausnahme und geht **immer** durch: Ein Hook
+/// verliert sein Execute-Bit nicht nur durch Unfälle (Tarball, `chmod -R`),
+/// sondern auch, weil jemand ihn mit `chmod -x` gezielt stillgelegt hat. Diese
+/// Entscheidung wortlos zurückzunehmen wäre dieselbe Sorte Überraschung, die
+/// das Modul sonst vermeidet.
 fn report(verbose: bool, label: &str, change: Change) {
+    if change == Change::Repaired {
+        println!("Hinweis: {label} war nicht ausführbar und wurde wieder eingeschaltet");
+        return;
+    }
     vln(verbose, &format!("  {label}: {}", change.word()));
 }
 
@@ -1103,10 +1131,24 @@ fn enable_codex(root: &Path) -> std::io::Result<Change> {
 /// TOML-Abhängigkeit.
 ///
 /// Bewusst schlicht: Steht die Zeile schon (auf `true`), passiert nichts. Steht
-/// sie auf `false` oder fehlt sie, wird sie gesetzt bzw. angehängt. Das deckt
-/// den Alltag; eine `codex_hooks` tief in einer `[table]` verschachtelt käme in
-/// echtem TOML vor, ist hier aber nicht der Fall (der Schalter ist top-level).
+/// sie auf `false` oder fehlt sie, wird sie gesetzt bzw. angehängt.
+///
+/// # Zwei Genauigkeiten, die nicht verhandelbar sind
+///
+/// **Der Schlüssel wird exakt verglichen.** Ein Präfix-Vergleich traf auch
+/// `codex_hooks_timeout = 30` — die fremde Zeile wurde dann durch
+/// `codex_hooks = true` *ersetzt*: Nutzerkonfiguration zerstört, und der
+/// eigentliche Schalter fehlte trotzdem, weil die Schleife danach abbrach.
+///
+/// **Nur oberhalb der ersten `[tabelle]`.** Der Schalter ist top-level; eine
+/// `codex_hooks`-Zeile unter `[profiles.test]` gehört zu einer anderen Tabelle.
+/// Sie zu ändern hieße, an fremder Konfiguration zu drehen *und* den Schalter,
+/// den Codex liest, nicht zu setzen. Aus demselben Grund wird ein fehlender
+/// Schlüssel **vor** der ersten Tabelle eingefügt und nicht angehängt — ans
+/// Ende gehängt landete er in der letzten Tabelle der Datei.
 fn ensure_codex_hooks_flag(path: &Path) -> std::io::Result<Change> {
+    const FLAG: &str = "codex_hooks = true";
+
     check_agent_leaf(path)?;
     let existed = path.exists();
     let current = if existed {
@@ -1116,21 +1158,42 @@ fn ensure_codex_hooks_flag(path: &Path) -> std::io::Result<Change> {
     };
 
     let mut lines: Vec<String> = current.lines().map(str::to_owned).collect();
-    let mut found = false;
+
+    // Zu verschachtelt für die Zeilenlogik? Dann wird nicht geraten. Steht der
+    // Schalter schon irgendwo als einfache Zeile, ist ohnehin nichts zu tun —
+    // sonst muss der Nutzer ihn selbst setzen, und er erfährt es.
+    if !is_simple_toml(&lines) {
+        if lines
+            .iter()
+            .any(|line| toml_key(line) == Some("codex_hooks") && line.trim() == FLAG)
+        {
+            return Ok(Change::Unchanged);
+        }
+        return Err(std::io::Error::other(format!(
+            "{} enthält mehrzeilige Werte — minds kann dort nicht sicher ergänzen. \
+             Trage `{FLAG}` von Hand ein (ohne den Schalter liest Codex die hooks.json nicht)",
+            display_path(path)
+        )));
+    }
+
+    let top_level = top_level_end(&lines);
+
     let mut changed = false;
-    for line in &mut lines {
-        if line.trim_start().starts_with("codex_hooks") {
-            found = true;
-            if line.trim() != "codex_hooks = true" {
-                *line = "codex_hooks = true".to_string();
+    let found = lines[..top_level]
+        .iter_mut()
+        .find(|line| toml_key(line) == Some("codex_hooks"));
+
+    match found {
+        Some(line) => {
+            if line.trim() != FLAG {
+                *line = FLAG.to_string();
                 changed = true;
             }
-            break;
         }
-    }
-    if !found {
-        lines.push("codex_hooks = true".to_string());
-        changed = true;
+        None => {
+            lines.insert(top_level, FLAG.to_string());
+            changed = true;
+        }
     }
 
     if !changed && existed {
@@ -1145,6 +1208,80 @@ fn ensure_codex_hooks_flag(path: &Path) -> std::io::Result<Change> {
     } else {
         Change::Created
     })
+}
+
+/// Trägt die Zeilenlogik für diese Datei — oder ist sie zu verschachtelt, um
+/// sie ohne TOML-Parser sicher zu deuten?
+///
+/// Der erste Versuch war eine Heuristik, die mehrzeilige Strings und Arrays zu
+/// überspringen versuchte. Sie ist an gewöhnlichem TOML gescheitert: Das
+/// letzte Array-Element ohne nachgestelltes Komma (`  [3, 4]`) sieht aus wie
+/// ein Tabellenkopf, ein `"""` in einem *Kommentar* verschiebt den Zustand
+/// für den Rest der Datei, und `'''` und `"""` sind nicht dasselbe
+/// Trennzeichen. Jeder dieser Fälle fügte `codex_hooks = true` mitten in ein
+/// Literal ein — die Datei ist dann unparsebar, und Codex startet gar nicht.
+///
+/// Statt die Heuristik weiter zu flicken, wird hier **abgegrenzt**: Eine Datei
+/// gilt als einfach, wenn jede Zeile leer, ein Kommentar, ein Tabellenkopf
+/// oder eine Zuweisung mit ausgeglichenen Klammern und ohne mehrzeilige
+/// Trennzeichen ist. Für alles andere ist die Antwort nicht „raten", sondern
+/// „das kann ich nicht" — dieselbe Linie, die [`read_existing_hook`] und
+/// [`check_hook_content`] ziehen.
+fn is_simple_toml(lines: &[String]) -> bool {
+    lines.iter().all(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return true;
+        }
+        if trimmed.starts_with('[') {
+            // Ein Tabellenkopf steht für sich; alles andere mit `[` am Anfang
+            // ist die Fortsetzung eines Arrays.
+            return trimmed.ends_with(']');
+        }
+        // Eine Zuweisung, die in derselben Zeile endet: keine mehrzeiligen
+        // Trennzeichen, und was an Klammern aufgeht, geht auch wieder zu.
+        !trimmed.contains("\"\"\"")
+            && !trimmed.contains("'''")
+            && trimmed.matches('[').count() == trimmed.matches(']').count()
+            && trimmed.matches('{').count() == trimmed.matches('}').count()
+    })
+}
+
+/// Wo der top-level-Bereich endet: bei der ersten Tabellenüberschrift.
+///
+/// Nur für Dateien gedacht, die [`is_simple_toml`] passiert haben — dort ist
+/// eine Zeile mit `[` am Anfang und `]` am Ende zuverlässig ein Tabellenkopf.
+fn top_level_end(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']')
+        })
+        .unwrap_or(lines.len())
+}
+
+/// Der Schlüssel links vom ersten `=` einer TOML-Zeile — `None` für
+/// Kommentare, Tabellenköpfe und Zeilen ohne Zuweisung.
+///
+/// Kein TOML-Parser: Für die eine Frage, die hier ansteht („heißt diese Zeile
+/// genau `codex_hooks`?"), genügt der Vergleich der linken Seite. Äußere
+/// Anführungszeichen fallen weg — `"codex_hooks" = true` ist zulässiges TOML
+/// und meint denselben Schlüssel. Ihn nicht zu erkennen wäre schlimmer als ihn
+/// umzuschreiben: Wir fügten sonst einen **zweiten** `codex_hooks` ein, und
+/// doppelte Schlüssel weist TOML zurück.
+fn toml_key(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    if line.starts_with('#') || line.starts_with('[') {
+        return None;
+    }
+    let key = line.split_once('=')?.0.trim();
+    Some(
+        key.strip_prefix('"')
+            .and_then(|k| k.strip_suffix('"'))
+            .or_else(|| key.strip_prefix('\'').and_then(|k| k.strip_suffix('\'')))
+            .unwrap_or(key),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,25 +1515,212 @@ pub(crate) fn block_body(text: &str) -> Option<String> {
 /// Fremde Zeilen in derselben Datei (die eigenen Hooks des Nutzers) bleiben; nur
 /// der Block zwischen [`MARK_BEGIN`] und [`MARK_END`] gehört uns und wird
 /// ersetzt. Eine neue Datei bekommt eine `#!/bin/sh`-Zeile und `chmod +x`.
+///
+/// # Warum auch ein textgleicher Hook neu geschrieben werden kann
+///
+/// Ein Hook ohne Execute-Bit wird von Git **stillschweigend übersprungen** —
+/// kein Fehler, keine Meldung, nur kein Checkpoint. Das Bit geht verloren:
+/// durch ein `git archive`/Tarball, eine Kopie über ein Dateisystem ohne
+/// Modusbits, ein `chmod -R` mit zu breitem Muster. Vorher kehrte diese
+/// Funktion bei textgleichem Inhalt zurück, bevor überhaupt eine Datei geöffnet
+/// wurde — der Hook blieb für immer tot, und `enable` meldete „unverändert".
+///
+/// Repariert wird über denselben Weg wie jedes Schreiben, nicht über ein
+/// `chmod` auf den Zielpfad: Das folgte einem Symlink, den jemand inzwischen
+/// dorthin gelegt hat, und [`make_executable`] nimmt aus genau diesem Grund ein
+/// **Handle** statt eines Pfades. Fehlt das Bit, läuft der Schreibvorgang
+/// deshalb ganz normal durch [`write_hook`] — mit identischem Inhalt.
 fn enable_git_hook(hooks_dir: &Path, name: &str, body: &str) -> std::io::Result<Change> {
     let path = hooks_dir.join(name);
     let current = read_existing_hook(&path)?;
     let existed = current.is_some();
     let current = current.unwrap_or_default();
 
+    // Auch hier, nicht nur im Vorlauf: `enable_git_hook` ist von außen
+    // aufrufbar, und die Zusage „wir beschädigen keinen fremden Hook" darf
+    // nicht daran hängen, dass jemand vorher die richtige Schleife gelaufen
+    // ist. Im Regelfall hat der Vorlauf schon abgebrochen.
+    check_hook_content(&path, &current)?;
+
     let block = format!("{MARK_BEGIN}\n{body}\n{MARK_END}");
     let next = replace_block(&current, &block);
-    if next == current && existed {
+    let text_matches = next == current && existed;
+    if text_matches && is_executable(&path) {
         return Ok(Change::Unchanged);
     }
 
     create_parent(&path)?;
     write_hook(&path, &next)?;
+
+    // Nach **jedem** Schreiben, nicht nur nach der Reparatur: Ein Dateisystem
+    // ohne Modusbits (CIFS/exFAT mit festem `file_mode`, 9p) nimmt das `chmod`
+    // an und ändert nichts. Ohne diese Prüfung meldete der erste Lauf
+    // „angelegt" und hinterließe einen toten Hook, und jeder weitere Lauf
+    // dieselbe Reparatur — ein Hinweis, den man nicht loswerden kann, wird
+    // überlesen, mitsamt den echten daneben.
+    if !is_executable(&path) {
+        return Err(std::io::Error::other(format!(
+            "{} lässt sich nicht ausführbar machen — dieses Dateisystem kennt \
+             keine Execute-Bits. Git führt den Hook dort nicht aus",
+            display_path(&path)
+        )));
+    }
+
+    if text_matches {
+        return Ok(Change::Repaired);
+    }
+
     Ok(if existed {
         Change::Updated
     } else {
         Change::Created
     })
+}
+
+/// Die Interpreter, deren Shebang einen angehängten `sh`-Block überlebt.
+///
+/// Nicht „POSIX-konform", sondern schlicht: Führt dieser Interpreter unseren
+/// Block aus, wie er dasteht? Das tun die Bourne-Nachfahren. `zsh` ist kein
+/// `sh`, führt die Konstrukte im Block (`$(…)`, `[ -f … ]`, `||`) aber
+/// unverändert richtig aus.
+const SHELL_INTERPRETERS: &[&str] = &["sh", "bash", "dash", "ash", "ksh", "ksh93", "mksh", "zsh"];
+
+/// Programme, die den *eigentlichen* Interpreter erst als Argument nennen —
+/// `#!/usr/bin/env python3`, `#!/bin/busybox sh`. Bei ihnen zählt das erste
+/// Wort dahinter, nicht sie selbst.
+const INTERPRETER_WRAPPERS: &[&str] = &["env", "busybox"];
+
+/// Prüft den **Inhalt** einer Hook-Datei, nachdem [`read_existing_hook`] ihre
+/// Form geprüft hat: Gehören unsere Shell-Zeilen dort überhaupt hinein?
+///
+/// Getrennte Funktion, weil `fsck` dieselbe Frage stellen muss. Meldete `fsck`
+/// „installiert" oder „fehlt" für eine Datei, an der `enable` abbricht, wäre
+/// das genau die Divergenz, die #9 geschlossen hat — der Rat `minds enable`
+/// scheiterte dann garantiert.
+///
+/// # Warum Abbruch und nicht stilles Überspringen
+///
+/// Dieselbe Linie wie in [`read_existing_hook`]: Was `minds` nicht sicher
+/// deuten kann, wird nicht angefasst — und der Nutzer erfährt es. Ein stilles
+/// `Change::Unchanged` ginge durch [`report`], das ohne `-v` gar nichts
+/// ausgibt; der Nutzer bekäme dauerhaft keinen Checkpoint und nie einen
+/// Hinweis. Genau die Klasse stiller Ausfälle, die #9, #10 und #25 geschlossen
+/// haben.
+///
+/// Geprüft wird **immer**, auch wenn unser Block schon in der Datei steht: Ist
+/// er dort durch eine frühere Version in eine Python-Datei geraten, ist die
+/// Datei kaputt, und ein weiteres `enable` soll das benennen statt es zu
+/// vertiefen.
+pub(crate) fn check_hook_content(path: &Path, content: &str) -> std::io::Result<()> {
+    let Some(interpreter) = foreign_interpreter(content) else {
+        return Ok(());
+    };
+    // Gekürzt, **bevor** entschärft wird: Der Text stammt aus einer
+    // eingecheckten Datei und darf bis `MAX_HOOK_BYTES` lang sein; `sanitize`
+    // vergrößert ihn zusätzlich (ein Steuerzeichen wird zu `\u{1}`). Diese
+    // Meldung landet über `fsck` im CI-Job-Log — dort verdrängte eine Zeile
+    // von mehreren Megabyte jeden echten Befund. Der Kernel liest ohnehin nur
+    // die ersten Bytes der Shebang-Zeile.
+    const MAX_NAME: usize = 60;
+    let short: String = interpreter.chars().take(MAX_NAME).collect();
+    let short = if interpreter.chars().nth(MAX_NAME).is_some() {
+        format!("{short}…")
+    } else {
+        short
+    };
+    Err(std::io::Error::other(format!(
+        "{} beginnt mit „{}“ — minds ergänzt nur sh-kompatible Hooks. \
+         Verschiebe den Hook oder rufe minds aus ihm selbst auf",
+        display_path(path),
+        crate::text::sanitize(&short)
+    )))
+}
+
+/// Ein Hook, dem das Execute-Bit fehlt, muss auch neu geschrieben werden
+/// können — sonst bricht der Lauf erst beim Schreiben ab, mit den vorherigen
+/// Schritten auf der Platte.
+///
+/// Der Fall ist schmal, aber real: `chmod 0444` auf einen Hook nimmt beides,
+/// das Execute- **und** das Write-Bit. Ohne diese Vorprüfung meldete
+/// `write_atomic_no_follow` „ist schreibgeschützt" — richtig, aber am Problem
+/// vorbei: Der Nutzer wollte wissen, dass sein Hook nicht ausführbar ist.
+fn check_hook_repairable(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if is_executable(path) {
+            return Ok(());
+        }
+        let Ok(meta) = fs::metadata(path) else {
+            return Ok(());
+        };
+        if meta.permissions().mode() & 0o200 == 0 {
+            return Err(std::io::Error::other(format!(
+                "{} ist nicht ausführbar — Git überspringt den Hook stillschweigend —, \
+                 und schreibgeschützt, sodass minds das nicht beheben kann. \
+                 `chmod +x` von Hand",
+                display_path(path)
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Der Interpreter aus der Shebang-Zeile, **wenn** er keine Bourne-Shell ist.
+///
+/// `None` heißt: kein Shebang (dann steht dort entweder nichts oder gewöhnliche
+/// Shell-Zeilen, wie Git sie auch ohne Shebang mit `sh` ausführt), oder ein
+/// Shebang auf eine Shell aus [`SHELL_INTERPRETERS`].
+///
+/// `#!/usr/bin/env python3` und `#!/bin/busybox sh` werden mit aufgelöst: Bei
+/// einem Wrapper aus [`INTERPRETER_WRAPPERS`] zählt das erste Argument
+/// dahinter, nicht der Wrapper selbst.
+///
+/// Ein Shebang **ohne** Programm (`#!` oder `#!/usr/bin/env` allein) ergibt
+/// ebenfalls `None`: So eine Datei startet schon der Kernel nicht, und sie
+/// abzulehnen hieße, einen Fall zu benennen, den der Nutzer nie sieht.
+fn foreign_interpreter(content: &str) -> Option<&str> {
+    let first = content.lines().next()?;
+    let rest = first.strip_prefix("#!")?;
+
+    let mut words = rest.split_whitespace();
+    let mut program = words.next()?;
+    if INTERPRETER_WRAPPERS.contains(&basename(program)) {
+        // Der Wrapper kann Optionen und Zuweisungen tragen
+        // (`env -S FOO=1 python3`); der Interpreter ist das erste Wort ohne
+        // `=` und ohne führendes `-`.
+        program = words.find(|w| !w.contains('=') && !w.starts_with('-'))?;
+    }
+
+    (!SHELL_INTERPRETERS.contains(&basename(program))).then_some(program)
+}
+
+/// Der letzte Pfadbestandteil eines Interpreter-Pfades, textuell — hier ist
+/// kein Dateisystemzugriff gemeint, der Pfad muss nicht existieren.
+fn basename(program: &str) -> &str {
+    program.rsplit('/').next().unwrap_or(program)
+}
+
+/// Ausführbar für irgendjemanden — die Frage, die auch `[ -x … ]` im Hook und
+/// `git` vor dem Ausführen stellen.
+///
+/// Für ein Verzeichnis ist `[ -x ]` ebenfalls wahr; `is_file` gehört deshalb
+/// dazu. Auf Nicht-Unix gibt es keine Execute-Bits — dort zählt allein, dass
+/// die Datei da ist.
+pub(crate) fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 /// Größter Hook, den wir noch einlesen. Alles darüber ist keiner.
@@ -1543,7 +1867,13 @@ fn write_atomic_no_follow(path: &Path, content: &str, executable: bool) -> std::
             // Die Rechte über das offene Handle, nicht über den Pfad: Ein
             // `chmod` auf einen Pfad folgte einem Link, der inzwischen dort
             // liegen könnte.
-            make_executable(&file).map_err(|err| with_path(&temp, err))?;
+            //
+            // Bei einer **bestehenden** Datei werden die Execute-Bits
+            // *ergänzt*, nicht ersetzt: Ein Hook, den jemand bewusst auf
+            // `0640` gestellt hat, soll nicht welt-lesbar zurückkommen — die
+            // Reparatur des fehlenden `+x` ist kein Grund, den Rest
+            // umzuschreiben. Nur eine neue Datei bekommt das volle `0755`.
+            make_executable(&file, existing.as_ref()).map_err(|err| with_path(&temp, err))?;
         } else if let Some(meta) = &existing {
             // Ebenfalls über das Handle, aus demselben Grund.
             file.set_permissions(meta.permissions())
@@ -1684,14 +2014,20 @@ fn replace_block(current: &str, block: &str) -> String {
     out
 }
 
+/// Macht die Datei ausführbar. Gab es sie schon, werden die Execute-Bits zu
+/// ihren bisherigen Rechten **ergänzt**; eine neue Datei bekommt `0755`.
 #[cfg(unix)]
-fn make_executable(file: &fs::File) -> std::io::Result<()> {
+fn make_executable(file: &fs::File, existing: Option<&fs::Metadata>) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(0o755))
+    let mode = match existing {
+        Some(meta) => meta.permissions().mode() | 0o111,
+        None => 0o755,
+    };
+    file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn make_executable(_file: &fs::File) -> std::io::Result<()> {
+fn make_executable(_file: &fs::File, _existing: Option<&fs::Metadata>) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -2370,6 +2706,448 @@ mod tests {
         let err = enable_opencode(dir.path()).unwrap_err();
         assert!(err.to_string().contains("Symlink"), "{err}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "// fremd\n");
+    }
+
+    // --- Härtung (#52) ------------------------------------------------------
+
+    /// Teil (a): Ein Hook, dem das Execute-Bit abhandengekommen ist, wird von
+    /// Git stillschweigend übersprungen — und blieb für immer tot, weil
+    /// `enable` bei textgleichem Inhalt „unverändert" meldete, ohne die Datei
+    /// je zu öffnen.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_lost_its_execute_bit_is_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        assert_eq!(
+            enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap(),
+            Change::Created
+        );
+        let path = hooks.join("post-commit");
+        let before = fs::read_to_string(&path).unwrap();
+
+        // Das Bit geht verloren — Tarball ohne Modusbits, `chmod -R`, Kopie
+        // über ein fremdes Dateisystem.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap(),
+            Change::Repaired,
+            "die Reparatur ist weder „unverändert“ noch „ergänzt“"
+        );
+        assert!(is_executable(&path), "das Execute-Bit fehlt weiterhin");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            before,
+            "der Inhalt darf sich dabei nicht ändern"
+        );
+
+        // Und mit Bit bleibt es beim Kurzschluss — kein Schreiben ohne Grund.
+        assert_eq!(
+            enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap(),
+            Change::Unchanged
+        );
+    }
+
+    /// Teil (b): An einen Hook mit fremdem Interpreter werden keine
+    /// Shell-Zeilen angehängt — der Hook wäre danach kaputt, und das `|| true`
+    /// im Block fängt in Python gar nichts.
+    #[test]
+    fn a_hook_with_a_foreign_interpreter_is_refused_instead_of_broken() {
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join("post-commit");
+        let original = "#!/usr/bin/env python3\nprint('mein Hook')\n";
+        fs::write(&path, original).unwrap();
+
+        let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
+        assert!(err.to_string().contains("python3"), "{err}");
+        assert!(err.to_string().contains("sh-kompatible"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "die fremde Datei wurde angefasst"
+        );
+    }
+
+    /// Auch mit unserem Block darin: Ist er durch eine frühere Version in eine
+    /// Python-Datei geraten, ist die Datei kaputt — ein weiteres `enable` soll
+    /// das benennen, statt es zu vertiefen.
+    #[test]
+    fn a_foreign_interpreter_is_refused_even_with_our_block_inside() {
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let path = hooks.join("post-commit");
+        fs::write(
+            &path,
+            format!("#!/usr/bin/env python3\nprint('x')\n{MARK_BEGIN}\nalt\n{MARK_END}\n"),
+        )
+        .unwrap();
+
+        let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
+        assert!(err.to_string().contains("python3"), "{err}");
+    }
+
+    /// Und der Vorlauf greift, bevor irgendetwas entsteht: Ein fremder Hook an
+    /// **einer** der drei Stellen darf nicht dazu führen, dass die anderen
+    /// beiden schon geschrieben sind — sonst journaliert der Agent, und nichts
+    /// checkt je ein.
+    #[test]
+    fn a_foreign_hook_stops_the_run_before_the_other_hooks_are_written() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        // `pre-push` steht in ALL_HOOKS zuletzt — ohne Vorlauf kämen die
+        // beiden Commit-Hooks vorher auf die Platte.
+        fs::write(
+            hooks.join("pre-push"),
+            "#!/usr/bin/env python3\nprint('mein Hook')\n",
+        )
+        .unwrap();
+
+        let paths = RepoPaths {
+            root: root.to_path_buf(),
+            git_dir: root.join(".git"),
+            hooks: HooksDir::At(hooks.clone()),
+        };
+        let err = enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("python3"), "{err}");
+
+        assert!(
+            !hooks.join("post-commit").exists(),
+            "nichts halb Eingerichtetes: post-commit ist entstanden"
+        );
+        assert!(
+            !root.join(".claude/settings.json").exists(),
+            "nichts halb Eingerichtetes: die Agent-Konfiguration ist entstanden"
+        );
+    }
+
+    /// Die Fehlermeldung trägt fremden Text aus einer eingecheckten Datei —
+    /// und landet über `fsck` im CI-Job-Log. Sie muss kurz bleiben, sonst
+    /// verdrängt eine Zeile von mehreren Megabyte jeden echten Befund.
+    #[test]
+    fn the_interpreter_in_the_message_stays_short() {
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let flood = "\u{1}".repeat(200_000);
+        fs::write(
+            hooks.join("post-commit"),
+            format!("#!/usr/bin/env {flood}\nrest\n"),
+        )
+        .unwrap();
+
+        let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.len() < 1000,
+            "die Meldung ist {} Zeichen lang",
+            err.len()
+        );
+        assert!(err.contains("sh-kompatible"), "{err}");
+        assert!(!err.contains('\u{1}'), "rohes Steuerzeichen in der Meldung");
+    }
+
+    /// Ein bewusst eng gestellter Hook (`0640`) darf durch die Reparatur nicht
+    /// welt-lesbar werden — ergänzt wird das Execute-Bit, ersetzt wird nichts.
+    #[cfg(unix)]
+    #[test]
+    fn repairing_the_execute_bit_keeps_the_rest_of_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmp();
+        let hooks = dir.path().join("hooks");
+        enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap();
+        let path = hooks.join("post-commit");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        assert_eq!(
+            enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap(),
+            Change::Repaired
+        );
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o111, 0o111, "ausführbar: {mode:o}");
+        assert_eq!(mode & 0o007, 0o001, "für andere nur x, kein r/w: {mode:o}");
+    }
+
+    /// Ein Hook, der weder ausführbar noch beschreibbar ist, wird im **Vorlauf**
+    /// abgelehnt — mit einer Meldung, die das eigentliche Problem benennt.
+    #[cfg(unix)]
+    #[test]
+    fn an_unrepairable_hook_is_refused_in_the_preflight() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        enable_git_hook(&hooks, "pre-push", PRE_PUSH_BODY).unwrap();
+        fs::set_permissions(hooks.join("pre-push"), fs::Permissions::from_mode(0o444)).unwrap();
+
+        let paths = RepoPaths {
+            root: root.to_path_buf(),
+            git_dir: root.join(".git"),
+            hooks: HooksDir::At(hooks.clone()),
+        };
+        let err = enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("nicht ausführbar"), "{err}");
+        assert!(
+            !root.join(".claude/settings.json").exists(),
+            "nichts halb Eingerichtetes"
+        );
+    }
+
+    /// Die Gegenprobe: Bourne-Verwandte und Dateien ohne Shebang bleiben
+    /// erlaubt — Git führt einen Hook ohne Shebang selbst mit `sh` aus.
+    #[test]
+    fn shell_hooks_and_hooks_without_a_shebang_are_still_extended() {
+        for head in [
+            "#!/bin/sh\n",
+            "#!/bin/bash\n",
+            "#!/usr/bin/env bash\n",
+            "#!/bin/zsh\n",
+            "#!/usr/bin/env -S bash -e\n",
+            "", // kein Shebang
+        ] {
+            let dir = tmp();
+            let hooks = dir.path().join("hooks");
+            fs::create_dir_all(&hooks).unwrap();
+            fs::write(hooks.join("post-commit"), format!("{head}echo meins\n")).unwrap();
+
+            let change = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY)
+                .unwrap_or_else(|err| panic!("{head:?} wurde abgelehnt: {err}"));
+            assert_eq!(change, Change::Updated, "{head:?}");
+            let written = fs::read_to_string(hooks.join("post-commit")).unwrap();
+            assert!(written.contains("echo meins"), "{head:?}: Fremdes bleibt");
+            assert!(written.contains(MARK_BEGIN), "{head:?}: Block fehlt");
+        }
+    }
+
+    /// Die Interpreter-Erkennung im Einzelnen — inklusive der `env`-Auflösung,
+    /// bei der der Interpreter erst hinter `env` steht.
+    #[test]
+    fn the_interpreter_is_read_from_the_shebang() {
+        for (line, expected) in [
+            ("#!/bin/sh", None),
+            ("#!/usr/bin/env sh", None),
+            ("#!/bin/bash -e", None),
+            ("#!/usr/bin/env python3", Some("python3")),
+            ("#!/usr/bin/python3", Some("/usr/bin/python3")),
+            ("#!/usr/bin/env node", Some("node")),
+            ("#!/usr/bin/env FOO=1 ruby", Some("ruby")),
+            ("#!/usr/bin/perl -w", Some("/usr/bin/perl")),
+            ("echo kein Shebang", None),
+            ("", None),
+            // Wrapper, die den Interpreter erst als Argument nennen.
+            ("#!/bin/busybox sh", None),
+            ("#!/bin/busybox awk", Some("awk")),
+            // Ohne Programm startet schon der Kernel nicht — kein Fall, den
+            // der Nutzer je sähe.
+            ("#!", None),
+            ("#!/usr/bin/env", None),
+            // CRLF: `lines()` schneidet das \r ab, es darf nicht im Namen landen.
+            ("#!/bin/sh\r", None),
+        ] {
+            assert_eq!(
+                foreign_interpreter(&format!("{line}\nrest\n")),
+                expected,
+                "{line}"
+            );
+        }
+    }
+
+    /// Teil (c): Ein fremder Schlüssel mit demselben Präfix wurde durch
+    /// `codex_hooks = true` **ersetzt** — Nutzerkonfiguration zerstört, und
+    /// der eigentliche Schalter fehlte trotzdem.
+    #[test]
+    fn a_key_sharing_the_prefix_is_not_mistaken_for_the_flag() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "model = \"o3\"\ncodex_hooks_timeout = 30\n").unwrap();
+
+        assert_eq!(ensure_codex_hooks_flag(&path).unwrap(), Change::Updated);
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("codex_hooks_timeout = 30"),
+            "der fremde Schlüssel wurde zerstört:\n{written}"
+        );
+        assert!(
+            written.lines().any(|l| l.trim() == "codex_hooks = true"),
+            "der Schalter fehlt:\n{written}"
+        );
+    }
+
+    /// Der Schalter ist top-level: Eine gleichnamige Zeile in einer Tabelle
+    /// gehört jemand anderem — und der echte Schalter muss **vor** die erste
+    /// Tabelle, sonst landete er beim Anhängen in ihr.
+    #[test]
+    fn the_flag_stays_out_of_foreign_tables() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "model = \"o3\"\n\n[profiles.test]\ncodex_hooks = false\n",
+        )
+        .unwrap();
+
+        assert_eq!(ensure_codex_hooks_flag(&path).unwrap(), Change::Updated);
+
+        let written = fs::read_to_string(&path).unwrap();
+        let table = written.find("[profiles.test]").expect("Tabelle bleibt");
+        let flag = written
+            .find("codex_hooks = true")
+            .expect("der Schalter entsteht");
+        assert!(
+            flag < table,
+            "der Schalter landete in der Tabelle:\n{written}"
+        );
+        assert!(
+            written.contains("codex_hooks = false"),
+            "die fremde Tabelle wurde verändert:\n{written}"
+        );
+    }
+
+    /// Eine Datei, die die Zeilenlogik nicht sicher deuten kann, wird **nicht
+    /// verändert** — der Schalter steht schon drin, also ist nichts zu tun.
+    ///
+    /// Der erste Versuch hatte hier eine Heuristik, die an gewöhnlichem TOML
+    /// scheiterte: `[3, 4]` als letztes Array-Element ohne Komma sah aus wie
+    /// ein Tabellenkopf. Jeder dieser Fälle fügte den Schalter **in** ein
+    /// Literal ein, und Codex startete danach gar nicht mehr.
+    #[test]
+    fn a_file_too_nested_to_read_is_left_alone_when_the_flag_is_there() {
+        for (name, content) in [
+            ("Array über mehrere Zeilen", "a = [\n  [\"x\"],\n]\n"),
+            (
+                "letztes Array-Element ohne Komma",
+                "y = [\n  [1, 2],\n  [3, 4]\n]\n",
+            ),
+            (
+                "mehrzeiliger String mit Klammern",
+                "x = \"\"\"\n[nicht] tabelle\n\"\"\"\n",
+            ),
+            (
+                "Trennzeichen gemischt",
+                "a = '''\ner sagte \"\"\"hallo\n[keine tabelle]\n'''\n",
+            ),
+        ] {
+            let dir = tmp();
+            let path = dir.path().join("config.toml");
+            let before = format!("{content}codex_hooks = true\n");
+            fs::write(&path, &before).unwrap();
+
+            assert_eq!(
+                ensure_codex_hooks_flag(&path).unwrap(),
+                Change::Unchanged,
+                "{name}: der vorhandene Schalter wurde übersehen"
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                before,
+                "{name}: die Datei wurde verändert"
+            );
+        }
+    }
+
+    /// Und fehlt der Schalter in einer solchen Datei, wird nicht geraten,
+    /// sondern gesagt, was zu tun ist.
+    #[test]
+    fn a_file_too_nested_to_read_is_reported_instead_of_guessed() {
+        for (name, content) in [
+            (
+                "letztes Array-Element ohne Komma",
+                "y = [\n  [1, 2],\n  [3, 4]\n]\n",
+            ),
+            ("mehrzeiliger String", "a = '''\nzeile\n'''\n"),
+        ] {
+            let dir = tmp();
+            let path = dir.path().join("config.toml");
+            fs::write(&path, content).unwrap();
+
+            let err = ensure_codex_hooks_flag(&path).unwrap_err();
+            assert!(err.to_string().contains("von Hand"), "{name}: {err}");
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                content,
+                "{name}: die Datei wurde trotzdem angefasst"
+            );
+        }
+    }
+
+    /// Ein Trennzeichen in einem **Kommentar** ist harmlos — die Zeile ist
+    /// Text, kein Wert. Die erste Fassung hielt die Datei ab dort für einen
+    /// offenen String und hängte den Schalter ans Ende: mitten in
+    /// `[profiles.test]`, wo Codex ihn nie liest.
+    #[test]
+    fn a_delimiter_inside_a_comment_does_not_move_the_flag_into_a_table() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "# nutze \"\"\" mit Bedacht\nmodel = \"o3\"\n\n[profiles.test]\nfoo = 1\n",
+        )
+        .unwrap();
+
+        assert_eq!(ensure_codex_hooks_flag(&path).unwrap(), Change::Updated);
+
+        let written = fs::read_to_string(&path).unwrap();
+        let flag = written
+            .find("codex_hooks = true")
+            .expect("Schalter gesetzt");
+        let table = written.find("[profiles.test]").expect("Tabelle bleibt");
+        assert!(
+            flag < table,
+            "der Schalter landete in der Tabelle:\n{written}"
+        );
+    }
+
+    /// Ein gequoteter Schlüssel ist derselbe Schlüssel. Ihn nicht zu erkennen
+    /// hieße, einen **zweiten** `codex_hooks` einzufügen — und doppelte
+    /// Schlüssel weist TOML zurück.
+    #[test]
+    fn a_quoted_key_is_the_same_key() {
+        let dir = tmp();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "\"codex_hooks\" = false\n").unwrap();
+
+        assert_eq!(ensure_codex_hooks_flag(&path).unwrap(), Change::Updated);
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            written
+                .lines()
+                .filter(|l| toml_key(l) == Some("codex_hooks"))
+                .count(),
+            1,
+            "doppelter Schlüssel:\n{written}"
+        );
+        assert!(written.contains("codex_hooks = true"), "{written}");
     }
 
     /// Die Nachbardatei darf keinem vorgelegten Symlink folgen. Der Name ist
