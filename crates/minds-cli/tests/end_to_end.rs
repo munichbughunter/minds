@@ -839,6 +839,158 @@ fn a_symlinked_git_dir_still_enables_without_questions() {
     );
 }
 
+/// #54: Ein Panic im heißen Pfad bleibt **vollständig** still. `catch_unwind`
+/// allein genügte nicht — der Standard-Handler hatte `thread 'main' panicked
+/// at …` samt Backtrace-Hinweis vorher schon auf stderr geschrieben, und
+/// stderr des Hooks gibt Claude Code dem Modell zurück.
+#[test]
+fn a_panic_in_the_hook_reaches_neither_stdout_nor_stderr() {
+    use std::io::Write;
+
+    if !cfg!(debug_assertions) {
+        eprintln!("Release-Build — der Panic-Haken existiert dort nicht, Test übersprungen");
+        return;
+    }
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    let payload = format!(
+        r#"{{"session_id":"sess-panic","cwd":"{}","hook_event_name":"Stop"}}"#,
+        dir.display()
+    );
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .args(["hook", "--agent", "claude-code"])
+        .env("MINDS_PANIC_FOR_TEST", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    without_user_config(&mut cmd);
+    let mut child = cmd.spawn().expect("minds startet");
+    // Kein `unwrap`: Beendet sich das Kind vor dem Schreiben, ist EPIPE hier
+    // kein Testfehler — was zählt, steht unten.
+    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+    let out = child.wait_with_output().expect("minds endet");
+
+    // Regel 1: immer 0 — Exit 2 hieße bei Claude Code „blockiere diese Aktion".
+    assert!(out.status.success(), "der Hook endet immer mit 0");
+    // Regel 2: kein Byte auf stdout, und seit #54 auch keines auf stderr.
+    assert!(out.stdout.is_empty(), "stdout: {:?}", stdout(&out));
+    assert!(
+        out.stderr.is_empty(),
+        "stderr trägt den Panic in die Agent-Sitzung:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verschwunden ist er trotzdem nicht — samt Ort, sonst wüsste niemand, wo
+    // nachzusehen ist.
+    let log = std::fs::read_to_string(dir.join(".git/minds/hook.log")).expect("das Log existiert");
+    assert!(log.contains("Panic"), "{log}");
+    assert!(
+        log.contains("hook.rs"),
+        "der Ort des Panics fehlt im Log:\n{log}"
+    );
+}
+
+/// #54, die Kehrseite: Der Panic-Text ist ein **neuer** Kanal ins Log (vorher
+/// stand dort eine Konstante). Die Zusage des Moduls — keine Nutzlast in
+/// `hook.log`, die Datei geht in Bug-Reports mit — muss auch für ihn gelten.
+/// Deshalb landet vom heißen Pfad nur der **Ort** dort, nicht die Meldung.
+#[test]
+fn a_panic_message_never_carries_the_payload_into_the_log() {
+    use std::io::Write;
+
+    if !cfg!(debug_assertions) {
+        eprintln!("Release-Build — der Panic-Haken existiert dort nicht, Test übersprungen");
+        return;
+    }
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let secret = "glpat-AAAAAAAAAAAAAAAAAAAA";
+    let payload = format!(
+        r#"{{"session_id":"sess-x","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"Deploy mit {secret}"}}"#,
+        dir.display()
+    );
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .args(["hook", "--agent", "claude-code"])
+        .env("MINDS_PANIC_FOR_TEST", "payload")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    without_user_config(&mut cmd);
+    let mut child = cmd.spawn().expect("minds startet");
+    let _ = child.stdin.take().unwrap().write_all(payload.as_bytes());
+    let out = child.wait_with_output().expect("minds endet");
+    assert!(out.status.success());
+
+    let log = std::fs::read_to_string(dir.join(".git/minds/hook.log")).expect("das Log existiert");
+    assert!(
+        !log.contains(secret),
+        "der Panic-Kanal trägt Payload ins Log:\n{log}"
+    );
+    assert!(
+        !log.contains("Deploy mit"),
+        "der Panic-Kanal trägt Payload ins Log:\n{log}"
+    );
+    // Der Ort bleibt — sonst wäre der Gewinn aus #54 gleich wieder weg.
+    assert!(log.contains("hook.rs:"), "der Ort fehlt:\n{log}");
+}
+
+/// #54, das Fenster **vor** der Klammer: Ein Panic im Argument-Parsing ging
+/// mit Exit 101 und vollem Backtrace an den Agenten — und die
+/// Claude-Registrierung ruft `minds hook` ohne `2>/dev/null` auf. Seit der
+/// Prozess sich beim Dispatch als Hook-Pfad erklärt, gelten die Regeln ab
+/// der ersten Zeile.
+#[cfg(unix)]
+#[test]
+fn a_panic_before_the_guard_still_obeys_the_hook_rules() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // Ungültiges UTF-8 als Argument: `std::env::args()` panickt daran, noch
+    // bevor irgendein minds-Code läuft.
+    let ugly = std::ffi::OsStr::from_bytes(b"\xff\xfe-kaputt-\xff");
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .arg("hook")
+        .arg("--agent")
+        .arg(ugly)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    without_user_config(&mut cmd);
+    let out = cmd.output().expect("minds endet");
+
+    assert!(
+        out.stderr.is_empty(),
+        "stderr trägt den Panic in die Agent-Sitzung:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty(), "stdout: {:?}", stdout(&out));
+    assert!(
+        out.status.success(),
+        "Regel 1: der Hook endet immer mit 0, auch hier"
+    );
+}
+
 /// #52, end-to-end: Ein Hook ohne Execute-Bit erfasst nichts — Git
 /// überspringt ihn wortlos. `minds fsck` benennt das, und `minds enable`
 /// repariert es, obwohl der Inhalt unverändert stimmt.

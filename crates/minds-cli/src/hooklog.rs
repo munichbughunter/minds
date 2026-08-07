@@ -158,18 +158,51 @@ fn guarded_into(
     source: Source,
     run: impl FnOnce() -> std::process::ExitCode + std::panic::UnwindSafe,
 ) -> std::process::ExitCode {
-    match std::panic::catch_unwind(run) {
+    silence_panics();
+    // Die Klammer markieren, damit der Handler *nur hier* schweigt — außerhalb
+    // behält jeder Panic seine Meldung, im Test-Binary also jedes `assert!`.
+    //
+    // `minds hook` bleibt auch am Terminal still: Regel 2 des Hook-Moduls
+    // kennt keine Ausnahme, und ein Agent, der den Hook an einem PTY startet,
+    // bekäme sonst doch einen Backtrace in die Sitzung. Der kalte Pfad ist
+    // anders — `minds checkpoint` ist auch ein Kommando für Menschen, und wer
+    // es im Terminal aufruft, soll seinen Panic sehen.
+    //
+    // `replace`/Restore statt `set(None)`: Eine innere Klammer entwaffnete
+    // sonst die äußere, und der nächste Panic ginge doch nach draußen. Und der
+    // Slot wird beim Betreten geleert — sonst meldete ein Unwind, den unser
+    // Handler nie sah, den Text eines *früheren*, längst gefangenen Panics.
+    let outer = IN_GUARD.replace(Some(source != Source::Hook));
+    let _ = last_panic();
+    let outcome = std::panic::catch_unwind(run);
+    IN_GUARD.set(outer);
+
+    match outcome {
         Ok(code) => code,
         Err(payload) => {
-            // Der Standard-Handler hat den Ort schon auf stderr geschrieben —
-            // im Hook also nirgendwohin. Deshalb kommt die Meldung hier mit:
-            // „Panic" allein sagt niemandem, ob es zweimal dieselbe Ursache war.
-            let what = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "ohne Meldung".to_owned());
-            let note = format!("Panic — Vorgang abgebrochen: {what}");
+            // Bevorzugt der Text aus unserem eigenen Handler: Er trägt **Ort und
+            // Meldung** (`src/foo.rs:42:9: etwas ging schief`). Die Nutzlast von
+            // `catch_unwind` kennt nur die Meldung — ohne Ort sagt „Panic"
+            // niemandem, wo er nachsehen soll.
+            let note = last_panic().unwrap_or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "ohne Meldung".to_owned())
+            });
+            // Für den heißen Pfad **nur der Ort**, nicht die Meldung: Eine
+            // Panic-Meldung kann Nutzlast einbetten (`panic!("… {payload}")`,
+            // `Result::unwrap` bettet den vollen `Debug` ein), und der rohe
+            // Mitschnitt läuft genau hier vorbei. `hook.log` ist die Datei, die
+            // in einem Bug-Report mitgeht — der Ort sagt, wo nachzusehen ist,
+            // und mehr braucht es dafür nicht. Die kalten Pfade behalten die
+            // Meldung: Dort steht kein Transkript im Speicher, und sie war
+            // schon vorher drin.
+            let note = match source {
+                Source::Hook => format!("Panic — Event verworfen: {}", location_of(&note)),
+                _ => format!("Panic — Vorgang abgebrochen: {note}"),
+            };
 
             match git_dir {
                 Some(dir) => log_at(dir, source, &note),
@@ -177,6 +210,108 @@ fn guarded_into(
             }
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+thread_local! {
+    /// Läuft gerade eine [`guarded`]-Klammer auf diesem Thread — und darf ihr
+    /// Panic am Terminal trotzdem sichtbar sein?
+    ///
+    /// `None` heißt außerhalb, `Some(false)` in der Klammer und **immer still**
+    /// (der heiße Pfad), `Some(true)` in der Klammer, aber am TTY sichtbar
+    /// (der kalte Pfad).
+    static IN_GUARD: std::cell::Cell<Option<bool>> = const {
+        std::cell::Cell::new(None)
+    };
+    /// Wo der eigene Handler ablegt, was der Standard-Handler gedruckt hätte.
+    static LAST_PANIC: std::cell::RefCell<Option<String>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Installiert einen Panic-Handler, der **innerhalb** einer [`guarded`]-Klammer
+/// schweigt und den Text stattdessen für das Log aufhebt.
+///
+/// # Warum das nötig ist
+///
+/// `catch_unwind` fängt den Panic — aber **zu spät**: Der Standard-Handler
+/// läuft davor und hat `thread 'main' panicked at …` samt Backtrace-Hinweis
+/// schon auf stderr geschrieben. Für `minds hook` ist das ein Regelbruch:
+/// stderr des Hooks gehört dem Agenten, Claude Code reicht ihn dem Modell
+/// zurück. Ein Rust-Backtrace mitten in der Sitzung des Nutzers ist genau das
+/// Rauschen, das dieses Modul vermeiden soll (#54). Für den kalten Pfad ist es
+/// der umgekehrte Verlust: Dort wirft der Hook-Body stderr weg, und der Ort
+/// des Panics wäre spurlos verschwunden.
+///
+/// # Warum er nicht einfach alles verschluckt
+///
+/// `set_hook` ist **global**. Ein Handler, der bedingungslos schweigt, nähme
+/// jedem Panic im selben Prozess seine Meldung — im Test-Binary also jedem
+/// fehlgeschlagenen `assert!`, dessen Diagnose die halbe Testausgabe ist.
+/// Deshalb zwei Bedingungen:
+///
+/// - **Nur in der Klammer.** Außerhalb läuft der vorherige Handler unverändert.
+/// - **Nur ohne Terminal.** Ist stderr ein TTY, sitzt ein Mensch davor: Wer
+///   `RUST_BACKTRACE=1 minds checkpoint` aufruft, um einem Panic nachzugehen,
+///   soll ihn sehen. Aus einem Git-Hook heraus ist stderr `/dev/null` oder eine
+///   Pipe, nie ein TTY — die Zusage aus #54 bleibt dort unangetastet.
+///
+/// Der Handler wird **einmal je Prozess** gesetzt (`Once`) und nie wieder
+/// abgenommen: Ihn pro Aufruf zu tauschen wäre ein Wettlauf, sobald mehr als
+/// ein Thread läuft.
+/// Erklärt den **ganzen Prozess** zum Hook-Pfad: Handler installieren *und*
+/// die Klammer aufmachen, ohne sie je zu schließen.
+///
+/// Der Unterschied zu [`silence_panics`] ist der Geltungsbereich. `guarded`
+/// klammert eine Funktion; hier geht es um alles davor — `parse`, der
+/// `SPECS`-Lookup, das Log-Schreiben bei einem Argumentfehler. Ein Panic dort
+/// ging bisher voll auf stderr und mit Exit 101 hinaus, und für `minds hook`
+/// ist das doppelt falsch: Die Agent-Registrierung lautet `minds hook --agent
+/// …` **ohne** `2>/dev/null`, anders als die drei Git-Hookbodies. Wer den
+/// Prozess als Hook startet, bekommt bis zu seinem Ende die Hook-Regeln.
+pub(crate) fn silence_panics_for(source: Source) {
+    silence_panics();
+    IN_GUARD.set(Some(source != Source::Hook));
+}
+
+pub(crate) fn silence_panics() {
+    use std::io::IsTerminal;
+
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let Some(show_at_terminal) = IN_GUARD.get() else {
+                previous(info);
+                return;
+            };
+            // `Display` von `PanicHookInfo` ist genau das, was der
+            // Standard-Handler gedruckt hätte: Ort und Meldung.
+            LAST_PANIC.with(|slot| *slot.borrow_mut() = Some(info.to_string()));
+            if show_at_terminal && std::io::stderr().is_terminal() {
+                previous(info);
+            }
+        }));
+    });
+}
+
+/// Nimmt den Text des letzten Panics heraus — und lässt den Platz leer, damit
+/// ein zweiter Panic nicht den Text des ersten meldet.
+fn last_panic() -> Option<String> {
+    LAST_PANIC.with(|slot| slot.borrow_mut().take())
+}
+
+/// Nur der Ort aus einem Panic-Text: `panicked at src/x.rs:1:2:` — alles vor
+/// dem ersten Zeilenumbruch.
+///
+/// `PanicHookInfo::to_string()` setzt Ort und Meldung genau so zusammen. Fehlt
+/// der Umbruch (die Meldung kam aus der `catch_unwind`-Nutzlast, ohne Ort),
+/// bleibt nichts übrig, was einen Ort benennt — dann ist die ehrliche Antwort
+/// „ohne Ort", nicht die Meldung selbst.
+fn location_of(text: &str) -> &str {
+    match text.split_once('\n') {
+        Some((location, _)) => location,
+        None => "ohne Ort",
     }
 }
 
@@ -553,6 +688,53 @@ mod tests {
         assert!(content.contains("checkpoint: Panic"), "{content}");
         // Und mit dem Wortlaut — sonst stünde da nur, *dass* etwas passiert ist.
         assert!(content.contains("etwas ging schief"), "{content}");
+        // Samt **Ort** (#54): Ohne ihn weiß niemand, wo er nachsehen soll — und
+        // nur dieser Teil belegt, dass der Text aus unserem eigenen Handler
+        // kommt und nicht aus der `catch_unwind`-Nutzlast.
+        assert!(
+            content.contains("hooklog.rs:"),
+            "kein Ort im Log:\n{content}"
+        );
+    }
+
+    /// Die Rückfallebene: Ein Unwind, den unser Handler nie gesehen hat (er
+    /// stammt von einem anderen Thread), muss trotzdem im Log landen — dann
+    /// eben ohne Ort. Ohne diesen Zweig wäre ein solcher Panic spurlos.
+    #[test]
+    fn an_unwind_without_our_handler_still_lands_in_the_log() {
+        let dir = git_dir();
+        let code = guarded_at(dir.path(), Source::Sync, || {
+            std::panic::resume_unwind(Box::new("aus einem anderen Thread".to_owned()))
+        });
+
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", std::process::ExitCode::FAILURE)
+        );
+        let content = read(dir.path());
+        assert!(
+            content.contains("aus einem anderen Thread"),
+            "die Nutzlast fehlt:\n{content}"
+        );
+    }
+
+    /// Außerhalb der Klammer bleibt der Standard-Handler zuständig — sonst
+    /// nähme der stille Handler jedem `assert!` im selben Prozess seine
+    /// Diagnose, und ein roter Test sagte nicht mehr, woran er scheiterte.
+    #[test]
+    fn outside_the_guard_panics_keep_their_message() {
+        // Den Handler installieren, wie es `guarded` täte …
+        silence_panics();
+        // … und dann *außerhalb* panicken lassen.
+        let payload = std::panic::catch_unwind(|| panic!("sichtbar")).unwrap_err();
+        assert!(
+            payload
+                .downcast_ref::<&str>()
+                .is_some_and(|s| s.contains("sichtbar")),
+            "die Nutzlast ging verloren"
+        );
+        // Und der Slot bleibt leer: Was außerhalb passiert, gehört nicht ins Log.
+        assert!(last_panic().is_none(), "der Slot wurde außerhalb gefüllt");
     }
 
     #[test]

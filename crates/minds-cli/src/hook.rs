@@ -62,25 +62,56 @@ const MAX_STDIN: u64 = 32 * 1024 * 1024;
 /// ungleich 0. Ein falsch registrierter Hook darf die Sitzung nicht anders
 /// behandeln als ein kaputter; beides landet im Log.
 pub fn run(agent: Option<&str>, event_override: Option<&str>) -> ExitCode {
-    // Regel 1. Auch ein Panic in unserem eigenen Code darf die Sitzung des
-    // Nutzers nicht beenden.
-    let outcome = std::panic::catch_unwind(|| match agent {
-        Some(agent) => record(agent, event_override),
-        None => Err("ohne --agent aufgerufen".into()),
+    // Regel 1 und 2 in einer Klammer: [`hooklog::guarded`] fängt den Panic
+    // **und** stellt den Standard-Handler still, der sonst vorher schon
+    // `thread 'main' panicked at …` auf stderr geschrieben hätte — auf einen
+    // Kanal, den Claude Code dem Modell zurückgibt (#54). Der Ort des Panics
+    // steht dann im Log, wo er hingehört.
+    //
+    // Der Rückgabewert von `guarded` (bei Panic `FAILURE`) wird hier bewusst
+    // verworfen: Für den heißen Pfad gilt Regel 1 ohne Ausnahme.
+    let _ = hooklog::guarded(Source::Hook, || {
+        let outcome = match agent {
+            Some(agent) => record(agent, event_override),
+            None => Err("ohne --agent aufgerufen".into()),
+        };
+        if let Err(err) = outcome {
+            hooklog::log(Source::Hook, &format!("{err:#}"));
+        }
+        ExitCode::SUCCESS
     });
-
-    match outcome {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => hooklog::log(Source::Hook, &format!("{err:#}")),
-        Err(_) => hooklog::log(Source::Hook, "Panic im Hook — Event verworfen"),
-    }
 
     ExitCode::SUCCESS
 }
 
+/// Provoziert einen Panic im heißen Pfad — der einzige Weg, die Zusage aus
+/// Regel 1 und 2 gegen den echten Prozess zu prüfen (#54).
+///
+/// Nur in Debug-Builds vorhanden; im ausgelieferten Release-Binary existiert
+/// weder die Variable noch dieser Code. Ein sichtbares Flag wäre der falsche
+/// Preis für einen Test — es stünde in `--help` und in der Kommando-Tabelle.
+#[cfg(debug_assertions)]
+const PANIC_FOR_TEST: &str = "MINDS_PANIC_FOR_TEST";
+
 fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let mut bytes = Vec::new();
     std::io::stdin().take(MAX_STDIN).read_to_end(&mut bytes)?;
+
+    // Nach dem Lesen von stdin, nicht davor: Sonst schlösse das Kind die Pipe,
+    // während der Test noch schreibt (EPIPE), und der Test würde aus einem
+    // Grund rot, der mit #54 nichts zu tun hat.
+    #[cfg(debug_assertions)]
+    match std::env::var(PANIC_FOR_TEST).as_deref() {
+        Ok("1") => panic!("absichtlicher Panic für den Test"),
+        // Der schlimmere Fall, den ein Test bewachen muss: ein Panic, der
+        // Payload in seine Meldung einbettet. Er darf nicht im Log landen —
+        // `hook.log` wird in Bug-Reports mitgeschickt.
+        Ok("payload") => panic!(
+            "absichtlicher Panic mit Nutzlast: {}",
+            String::from_utf8_lossy(&bytes)
+        ),
+        _ => {}
+    }
 
     // Die Uhr liest der Prozess, nicht der Parser: So bleibt `parse` eine reine
     // Funktion und damit gegen Fixtures testbar.

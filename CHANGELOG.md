@@ -21,6 +21,28 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- Ein **Panic in `minds hook`** schreibt nichts mehr auf stderr. `catch_unwind`
+  fing ihn zwar, aber zu spät: Der Standard-Handler von Rust hatte
+  `thread 'main' panicked at …` samt Backtrace-Hinweis vorher schon
+  ausgegeben — und stderr des Hooks gehört dem Agenten, Claude Code reicht ihn
+  dem Modell zurück. Ein Rust-Backtrace mitten in der Sitzung des Nutzers ist
+  genau das Rauschen, das der Hook vermeiden soll. Jetzt ist der Handler still,
+  und der **Ort** des Panics (`hook.rs:99:9`) steht in
+  `<git-dir>/minds/hook.log`, wo Diagnose hingehört — der Ort allein, nicht
+  die Panic-Meldung: Sie könnte Nutzlast einbetten, und `hook.log` ist die
+  Datei, die in einen Bug-Report wandert. Der kalte Pfad
+  (`checkpoint`, `sync`, `prepare-commit-msg`) gewinnt dasselbe, behält aber
+  die Meldung — dort liegt kein Mitschnitt im Speicher; und wer eines dieser
+  Kommandos im **Terminal** aufruft, sieht seinen Panic weiterhin.
+  ([#54](https://github.com/munichbughunter/minds/issues/54))
+- Ein Argument, das **kein UTF-8** ist, lässt `minds` nicht mehr abstürzen.
+  `std::env::args()` panickt daran — in der ersten Zeile, vor jeder eigenen
+  Vorkehrung, mit Backtrace auf stderr und Exit 101. Für `minds hook` war das
+  der schlimmste denkbare Ort: Die Agent-Registrierung ruft ihn ohne
+  `2>/dev/null` auf. Solche Argumente werden jetzt verlustbehaftet gewandelt
+  und laufen in die gewöhnliche „unbekanntes Flag"-Meldung.
+  ([#54](https://github.com/munichbughunter/minds/issues/54))
+
 - Ein Git-Hook, dem das **Execute-Bit** abhandengekommen ist, wird von `minds
   enable` wieder repariert — und von `minds fsck` benannt. Git überspringt eine
   nicht ausführbare Hook-Datei **stillschweigend**: kein Fehler, keine Meldung,
