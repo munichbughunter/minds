@@ -186,7 +186,12 @@ fn enable_agents(
     // Pfad-Alias oder eine Schreibweise mit Schrägstrich —, wird nur mit
     // ausdrücklicher Zustimmung geschrieben: Ein `enable` dort erfasst alle
     // Repositories des Nutzers, nicht dieses eine.
-    if hooks_scope(&paths.root, &paths.git_dir, &hooks_dir) == HooksScope::Outside {
+    // Gegen das **gemeinsame** Git-Verzeichnis geprüft: In einem Linked
+    // Worktree liegen die Hooks im `.git` des Hauptbaums und damit kanonisch
+    // außerhalb dessen, was dieser Baum als root/git_dir kennt. Das ist ein von
+    // Git verwalteter Ort, kein fremder — die Rückfrage aus #64 gälte dort
+    // sonst bei jedem `enable` im Worktree.
+    if hooks_scope(&paths.root, &paths.common_git_dir, &hooks_dir) == HooksScope::Outside {
         confirm_outside_hooks_dir(&paths.root, &hooks_dir, global_hooks)?;
     }
 
@@ -196,8 +201,20 @@ fn enable_agents(
     // Nach einer bestätigten Rückfrage wiederholt er deren Kernsatz — bewusst:
     // Mit `--global-hooks` ist er die einzige Erwähnung, und eine Zeile zu viel
     // ist billiger als eine Zustimmung ohne Erinnerung daran.
-    if let Some(note) = moved_hooks_note(&paths.root, &paths.git_dir, &hooks_dir) {
+    if let Some(note) = moved_hooks_note(&paths.root, &paths.common_git_dir, &hooks_dir) {
         println!("{note}");
+    }
+
+    // Der Worktree-Fall bekommt seinen eigenen Satz: Die Hooks liegen im
+    // gemeinsamen Verzeichnis und gelten damit für **alle** Bäume dieses
+    // Repositories, nicht nur für den, in dem gerade `enable` läuft. Das ist
+    // richtig so — Git führt für alle dieselben aus —, aber niemand liest es
+    // aus einem Pfad heraus.
+    if !same_location(&paths.git_dir, &paths.common_git_dir) {
+        println!(
+            "Hinweis: dies ist ein verlinkter Worktree — die Hooks gelten für alle \
+             Arbeitsbäume dieses Repositories"
+        );
     }
 
     // Die Hooks selbst einmal ansehen, bevor irgendetwas entsteht — auch vor
@@ -2039,8 +2056,16 @@ fn make_executable(_file: &fs::File, _existing: Option<&fs::Metadata>) -> std::i
 struct RepoPaths {
     /// Die Repo-Wurzel (Elternverzeichnis von `.git`).
     root: PathBuf,
-    /// Das Git-Verzeichnis selbst.
+    /// Das Git-Verzeichnis selbst. In einem Linked Worktree das **private**
+    /// (`…/.git/worktrees/<name>`) — dort liegen Journal und `hook.log`, und
+    /// zwar bewusst je Worktree: Die Sessions gehören zu dem Baum, in dem der
+    /// Agent gearbeitet hat.
     git_dir: PathBuf,
+    /// Das **gemeinsame** Git-Verzeichnis. Außerhalb eines Worktrees dasselbe
+    /// wie [`Self::git_dir`]; in einem Linked Worktree das `.git` des
+    /// Hauptbaums. Dort liegen die Hooks — Git führt für alle Worktrees
+    /// dieselben aus.
+    common_git_dir: PathBuf,
     /// Woher Git die Hooks **tatsächlich** ausführt — oder dass es das nicht tut.
     hooks: HooksDir,
 }
@@ -2190,27 +2215,102 @@ fn locate() -> std::io::Result<RepoPaths> {
     let start = std::env::current_dir()?;
     for dir in start.ancestors() {
         let candidate = dir.join(".git");
-        match fs::metadata(&candidate) {
-            Ok(m) if m.is_dir() => {
-                let hooks = effective_hooks_dir(dir, &candidate);
-                return Ok(RepoPaths {
-                    root: dir.to_path_buf(),
-                    git_dir: candidate,
-                    hooks,
-                });
-            }
-            // `.git` als Datei (verlinkte Worktrees) wird hier bewusst nicht
-            // aufgelöst: `enable` ist ein Setup-Schritt im Hauptbaum.
+        let git_dir = match fs::metadata(&candidate) {
+            Ok(m) if m.is_dir() => candidate,
+            // `.git` als **Datei**: ein Linked Worktree (`git worktree add`)
+            // oder ein Submodul. Sie trägt eine `gitdir:`-Zeile auf das
+            // eigentliche Git-Verzeichnis (#21).
+            //
+            // Bis v0.1.1 wurde das nicht aufgelöst, und `enable` meldete „kein
+            // Git-Repository gefunden" — in einem offensichtlichen Repo. Die
+            // Meldung war faktisch falsch, und die Einschränkung für den
+            // Nutzer unsichtbar. Agents arbeiten zunehmend in Worktrees.
+            Ok(m) if m.is_file() => match linked_git_dir(dir, &candidate, &m) {
+                Some(git_dir) => git_dir,
+                None => continue,
+            },
             _ => continue,
-        }
+        };
+
+        // Das gemeinsame Verzeichnis zuerst: Es ist auch der richtige Rückfall
+        // für `effective_hooks_dir`. Antwortet Git dort nicht, läge
+        // `<privates>/hooks` sonst an einem Ort, aus dem Git nie liest — der
+        // stille Ausfall aus #9, eine Ecke weiter.
+        let common = common_git_dir(&git_dir).unwrap_or_else(|| git_dir.clone());
+        let hooks = effective_hooks_dir(dir, &common);
+        return Ok(RepoPaths {
+            common_git_dir: common,
+            root: dir.to_path_buf(),
+            git_dir,
+            hooks,
+        });
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!(
             "kein Git-Repository gefunden, ausgehend von {}",
-            start.display()
+            display_path(&start)
         ),
     ))
+}
+
+/// Das Git-Verzeichnis hinter einer `.git`-**Datei** — die `gitdir:`-Zeile.
+///
+/// `None`, wenn die Datei keine solche Zeile trägt: Dann ist sie irgendetwas
+/// anderes, das zufällig `.git` heißt, und die Suche geht weiter aufwärts.
+fn linked_git_dir(root: &Path, marker: &Path, meta: &fs::Metadata) -> Option<PathBuf> {
+    // Eine `.git`-Datei ist genau eine Zeile. Alles darüber ist keine — und
+    // wird gar nicht erst gelesen.
+    if meta.len() > MAX_GITFILE_BYTES {
+        return None;
+    }
+    // Nicht lesbar oder kein Text? Dann ist das hier keine `.git`-Datei,
+    // sondern etwas anderes mit demselben Namen — die Suche geht weiter
+    // aufwärts, statt mit „stream did not contain valid UTF-8" abzubrechen.
+    let text = fs::read_to_string(marker).ok()?;
+
+    // Wie Git selbst (`read_gitfile_gently`): **erste** Zeile, Präfix mit
+    // Leerzeichen. Wer laxer parst, folgt einem Verweis, dem Git nicht folgt —
+    // und legt Verzeichnisse an einem Ort an, den niemand gemeint hat.
+    let target = text.lines().next()?.strip_prefix("gitdir: ")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+
+    // Relativ ist der Normalfall bei `git worktree add`; `join` behandelt
+    // absolut und relativ richtig.
+    let git_dir = root.join(target);
+
+    // Gegenprobe, dass dort wirklich ein Git-Verzeichnis liegt. Ohne sie
+    // legte ein falscher Verweis `<ziel>/hooks` an einem beliebigen Pfad an —
+    // an der Zustimmung aus #64 vorbei —, und der Lauf scheiterte erst danach.
+    git_dir.join("HEAD").is_file().then_some(git_dir)
+}
+
+/// Größte `.git`-Datei, die wir noch lesen. Sie trägt eine Zeile.
+const MAX_GITFILE_BYTES: u64 = 4096;
+
+/// Das **gemeinsame** Git-Verzeichnis: bei einem Linked Worktree das `.git`
+/// des Hauptbaums. `None`, wenn es keins gibt — der Normalfall, dann ist das
+/// Git-Verzeichnis selbst das gemeinsame.
+///
+/// # Warum die Datei und nicht `rev-parse --git-common-dir`
+///
+/// Git legt in einem Linked Worktree eine Datei `commondir` neben `HEAD` und
+/// schreibt den Pfad hinein, relativ zum privaten Verzeichnis. Sie zu lesen ist
+/// nicht nur billiger als ein Subprozess, sondern **eindeutig**: `rev-parse`
+/// antwortet relativ zum Arbeitsverzeichnis des Aufrufs und findet über die
+/// gewöhnliche Suche womöglich ein ganz anderes Repository. Genau das ist bei
+/// `--separate-git-dir` passiert, wo die Repo-Wurzel über `<git-dir>/..` falsch
+/// bestimmt wird: `git -C <falsche Wurzel>` antwortete mit dem gemeinsamen
+/// Verzeichnis eines **fremden** Repos, und die Warnung aus #66/#64 blieb aus.
+pub(crate) fn common_git_dir(git_dir: &Path) -> Option<PathBuf> {
+    let text = fs::read_to_string(git_dir.join("commondir")).ok()?;
+    let target = text.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(git_dir.join(target))
 }
 
 /// Liest eine JSON-Datei oder liefert ein leeres Objekt. Ungültiges JSON wird
@@ -2813,6 +2913,7 @@ mod tests {
         let paths = RepoPaths {
             root: root.to_path_buf(),
             git_dir: root.join(".git"),
+            common_git_dir: root.join(".git"),
             hooks: HooksDir::At(hooks.clone()),
         };
         let err = enable_agents(
@@ -2903,6 +3004,7 @@ mod tests {
         let paths = RepoPaths {
             root: root.to_path_buf(),
             git_dir: root.join(".git"),
+            common_git_dir: root.join(".git"),
             hooks: HooksDir::At(hooks.clone()),
         };
         let err = enable_agents(
@@ -3434,6 +3536,137 @@ mod tests {
             hooks_scope(&root, &root.join(".git"), &root.join(".husky")),
             HooksScope::Outside
         );
+    }
+
+    // --- Linked Worktrees (#21) ---------------------------------------------
+
+    /// Die `.git`-**Datei** eines Linked Worktrees trägt eine `gitdir:`-Zeile.
+    /// Bis v0.1.1 wurde sie nicht aufgelöst, und `enable` meldete „kein
+    /// Git-Repository gefunden" — in einem offensichtlichen Repo.
+    #[test]
+    fn a_gitdir_file_points_at_the_real_git_dir() {
+        let dir = tmp();
+        let root = dir.path().join("zweig");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join(".git");
+
+        // Ein echtes Git-Verzeichnis am Ziel — die Gegenprobe verlangt `HEAD`.
+        let absolute = dir.path().join("main/.git/worktrees/zweig");
+        fs::create_dir_all(&absolute).unwrap();
+        fs::write(absolute.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Absolut, wie `git worktree add` es über Baumgrenzen hinweg schreibt.
+        fs::write(&marker, format!("gitdir: {}\n", absolute.display())).unwrap();
+        let meta = fs::metadata(&marker).unwrap();
+        assert_eq!(
+            linked_git_dir(&root, &marker, &meta),
+            Some(absolute.clone())
+        );
+
+        // Relativ — `join` löst gegen die Wurzel auf.
+        fs::write(&marker, "gitdir: ../main/.git/worktrees/zweig\n").unwrap();
+        let meta = fs::metadata(&marker).unwrap();
+        assert_eq!(
+            linked_git_dir(&root, &marker, &meta),
+            Some(root.join("../main/.git/worktrees/zweig"))
+        );
+
+        // Kein gültiger Verweis — die Suche geht jeweils weiter aufwärts,
+        // statt den ganzen Lauf abzubrechen.
+        for (name, content) in [
+            ("keine gitdir-Zeile", b"irgendwas anderes\n".to_vec()),
+            // Wie Git: nur die **erste** Zeile zählt.
+            (
+                "gitdir erst in Zeile zwei",
+                format!("mull\ngitdir: {}\n", absolute.display()).into_bytes(),
+            ),
+            // Und mit Leerzeichen — `gitdir:/pfad` ist für Git keins.
+            (
+                "kein Leerzeichen nach dem Doppelpunkt",
+                format!("gitdir:{}\n", absolute.display()).into_bytes(),
+            ),
+            ("leeres Ziel", b"gitdir: \n".to_vec()),
+            ("kein UTF-8", vec![0xff, 0xfe, 0x00, 0x01]),
+            ("viel zu groß", vec![b'x'; MAX_GITFILE_BYTES as usize + 1]),
+        ] {
+            fs::write(&marker, &content).unwrap();
+            let meta = fs::metadata(&marker).unwrap();
+            assert_eq!(linked_git_dir(&root, &marker, &meta), None, "{name}");
+        }
+    }
+
+    /// Der Verweis muss auf ein Git-Verzeichnis zeigen. Ohne diese Gegenprobe
+    /// legte eine `.git`-Datei mit erfundenem Ziel Verzeichnisse an einem
+    /// beliebigen Pfad an — an der Zustimmung aus #64 vorbei.
+    #[test]
+    fn a_gitdir_file_pointing_nowhere_is_not_followed() {
+        let dir = tmp();
+        let root = dir.path().join("zweig");
+        fs::create_dir_all(&root).unwrap();
+        let marker = root.join(".git");
+        let nowhere = dir.path().join("gibt-es-nicht");
+        fs::write(&marker, format!("gitdir: {}\n", nowhere.display())).unwrap();
+
+        let meta = fs::metadata(&marker).unwrap();
+        assert_eq!(linked_git_dir(&root, &marker, &meta), None);
+        assert!(!nowhere.exists(), "das Ziel wurde angelegt");
+
+        // Mit einem echten Git-Verzeichnis dagegen schon.
+        fs::create_dir_all(&nowhere).unwrap();
+        fs::write(nowhere.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(linked_git_dir(&root, &marker, &meta), Some(nowhere));
+    }
+
+    /// Im Linked Worktree liegen die Hooks im **gemeinsamen** Git-Verzeichnis.
+    /// Gegen das private geprüft, fielen sie in die Außerhalb-Zone aus #66 —
+    /// und `enable` fragte bei jedem Lauf im Worktree nach.
+    #[test]
+    fn a_linked_worktree_hooks_dir_is_not_outside() {
+        let Some(dir) = init_repo() else { return };
+        let main = dir.path();
+        // Der Worktree in ein **eigenes** TempDir, nicht nach `../zweig`: Das
+        // läge außerhalb der Aufräumzone, bliebe liegen, und jeder weitere
+        // Lauf schlüge mit „already exists" fehl — der Test übersprünge sich
+        // danach dauerhaft selbst und wäre grün, ohne etwas zu prüfen.
+        let elsewhere = tmp();
+        let worktree = elsewhere.path().join("zweig");
+        let Ok(status) = Command::new("git")
+            .arg("-C")
+            .arg(main)
+            .args(["worktree", "add", "-q"])
+            .arg(&worktree)
+            .status()
+        else {
+            return;
+        };
+        if !status.success() {
+            eprintln!("git worktree add scheitert hier — Test übersprungen");
+            return;
+        }
+        let private = main.join(".git/worktrees/zweig");
+        let common = main.join(".git");
+        let hooks = common.join("hooks");
+
+        // Und die Datei, auf der die Auflösung steht.
+        assert_eq!(
+            common_git_dir(&private).map(|p| canonical_prefix(&p)),
+            Some(canonical_prefix(&common)),
+            "das gemeinsame Verzeichnis wird nicht erkannt"
+        );
+        assert_eq!(
+            common_git_dir(&common),
+            None,
+            "ein gewöhnliches Git-Verzeichnis hat kein gemeinsames darüber"
+        );
+
+        // Gegen das private Verzeichnis: außerhalb — das wäre die Rückfrage.
+        assert_eq!(
+            hooks_scope(&worktree, &private, &hooks),
+            HooksScope::Outside,
+            "Voraussetzung des Tests verfehlt"
+        );
+        // Gegen das gemeinsame: der richtige Ort.
+        assert_eq!(hooks_scope(&worktree, &common, &hooks), HooksScope::GitDir);
     }
 
     /// Der Normal- und der husky-Fall — kein Draußen, keine Rückfrage.

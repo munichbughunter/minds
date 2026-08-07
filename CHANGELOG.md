@@ -21,6 +21,27 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- `minds enable` funktioniert in **verlinkten Worktrees** (`git worktree add`).
+  Dort ist `.git` eine Datei mit einem `gitdir:`-Verweis; sie wurde nicht
+  aufgelöst, und `enable` meldete „kein Git-Repository gefunden" — in einem
+  offensichtlichen Repository, mit einer Meldung, die faktisch falsch war.
+  Agents arbeiten zunehmend in Worktrees. Die Hooks landen im **gemeinsamen**
+  Git-Verzeichnis, wo Git sie für alle Arbeitsbäume ausführt; `enable` sagt das
+  auch, weil es niemand aus einem Pfad herausliest. Ein Commit im Worktree
+  erzeugt damit einen Checkpoint, und `minds fsck` meldet ihn dort als heil.
+  Dieselbe Auflösung macht `minds enable` nebenbei in **Submodulen**
+  brauchbar — auch dort ist `.git` eine Datei; die Hooks landen im
+  `.git/modules/<name>` des Submoduls, das Super-Repo bleibt unberührt.
+  ([#21](https://github.com/munichbughunter/minds/issues/21))
+
+  > *Was das noch nicht abdeckt:* `minds show` und `minds why` zeigen im
+  > Worktree den Commit des **Hauptbaums**, weil die Wurzel dort über
+  > `<git-dir>/..` bestimmt wird und das in einem Worktree
+  > `…/.git/worktrees` ergibt. Erfassung und Prüfung stimmen, das Nachschlagen
+  > noch nicht — der Weg dahin ist
+  > [#20](https://github.com/munichbughunter/minds/issues/20), das dieselbe
+  > Berechnung an elf Stellen zusammenführt.
+
 - Ein **Panic in `minds hook`** schreibt nichts mehr auf stderr. `catch_unwind`
   fing ihn zwar, aber zu spät: Der Standard-Handler von Rust hatte
   `thread 'main' panicked at …` samt Backtrace-Hinweis vorher schon

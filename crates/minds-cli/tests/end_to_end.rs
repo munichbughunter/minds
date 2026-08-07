@@ -1100,6 +1100,99 @@ fn a_symlinked_agent_config_stops_enable_before_anything_is_written() {
     }
 }
 
+/// #21, end-to-end: `minds enable` in einem Linked Worktree richtet ein — und
+/// ein Commit **dort** erzeugt einen Checkpoint. Vorher meldete `enable` „kein
+/// Git-Repository gefunden", weil es die `.git`-Datei nicht auflöste.
+#[test]
+fn enable_works_in_a_linked_worktree_and_captures_there() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let main = repo.path();
+    std::fs::write(main.join("a.txt"), "a\n").unwrap();
+    git(main, &["add", "a.txt"]);
+    git(main, &["commit", "-q", "-m", "chore: Grundstein"]);
+
+    let outside = tempfile::tempdir().unwrap();
+    let linked = outside.path().join("zweig");
+    if !git(main, &["worktree", "add", "-q", linked.to_str().unwrap()])
+        .status
+        .success()
+    {
+        eprintln!("git worktree add scheitert hier — Test übersprungen");
+        return;
+    }
+
+    // Einrichten **im Worktree** — der Fall, der vorher abbrach.
+    let enable = minds(&linked, &["enable", "--agent", "claude-code"], None);
+    assert!(enable.status.success(), "{}", stderr(&enable));
+    assert!(
+        stdout(&enable).contains("verlinkter Worktree"),
+        "der Worktree-Fall gehört benannt:\n{}",
+        stdout(&enable)
+    );
+
+    // Die Hooks liegen im gemeinsamen Verzeichnis — Git führt für alle
+    // Arbeitsbäume dieselben aus.
+    assert!(
+        main.join(".git/hooks/post-commit").exists(),
+        "der Hook gehört ins gemeinsame Git-Verzeichnis"
+    );
+
+    // Und die Wirkung: eine Session im Worktree, ein Commit im Worktree, ein
+    // Checkpoint. Ohne manuelles `checkpoint` — das kann nur der Hook getan
+    // haben.
+    event(
+        &linked,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"Im Worktree""#,
+    );
+    event(&linked, r#""hook_event_name":"Stop""#);
+    std::fs::write(linked.join("b.txt"), "b\n").unwrap();
+    git(&linked, &["add", "b.txt"]);
+    assert!(
+        git(&linked, &["commit", "-q", "-m", "feat: im Worktree"])
+            .status
+            .success()
+    );
+
+    let refs = stdout(&git(
+        &linked,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        !refs.trim().is_empty(),
+        "kein Checkpoint aus dem Worktree — der Hook hat nicht gefeuert"
+    );
+
+    // Und die Kette Commit → Store steht: Der Trailer am Commit des Worktrees
+    // nennt genau den Ref, der entstanden ist.
+    let message = stdout(&git(&linked, &["log", "-1", "--format=%B"]));
+    let session = message
+        .lines()
+        .find_map(|line| line.strip_prefix("Minds-Session-Id: "))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("kein Trailer am Worktree-Commit:\n{message}"));
+    let hex = session.strip_prefix("b3-").expect("b3-Präfix");
+    assert!(
+        refs.contains(hex),
+        "der Trailer nennt einen anderen Ref als den entstandenen:\n{refs}"
+    );
+
+    // `minds fsck` bestätigt, dass nichts verwaist ist — der Lese-Weg über
+    // `show`/`why` ist im Worktree noch nicht richtig, weil `repo_root()`
+    // dort `…/.git/worktrees` ergibt. Das ist #20 („Repo::work_dir fehlt"),
+    // ein workspace-weites Problem mit elf Fundstellen, und bewusst nicht
+    // Teil von #21.
+    let fsck = minds(&linked, &["fsck"], None);
+    assert!(fsck.status.success(), "{}", stdout(&fsck));
+    assert!(
+        stdout(&fsck).contains("0 verwaist"),
+        "fsck im Worktree meldet Waisen:\n{}",
+        stdout(&fsck)
+    );
+}
+
 /// Die zweite Gegenprobe zu #66: In einem Linked Worktree liegt das effektive
 /// Hook-Verzeichnis im common dir des Haupt-Repos — von Git verwaltet, kein
 /// fremder Ort. `fsck` darf dort kein „außerhalb des Repos" behaupten.
