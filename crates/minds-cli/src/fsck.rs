@@ -363,7 +363,7 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
     let mut outside =
         crate::enable::hooks_scope(root, git_dir, &hooks_dir) == crate::enable::HooksScope::Outside;
     if outside {
-        if let Some(common) = common_git_dir(git_dir) {
+        if let Some(common) = crate::enable::common_git_dir(git_dir) {
             outside = crate::enable::hooks_scope(root, &common, &hooks_dir)
                 == crate::enable::HooksScope::Outside;
         }
@@ -378,35 +378,6 @@ fn hook_state(root: &Path, git_dir: &Path) -> HookState {
         outside,
         not_executable,
     }
-}
-
-/// Das *common dir* zu einem Git-Verzeichnis — bei Linked Worktrees das
-/// `.git` des Haupt-Repos, sonst das Verzeichnis selbst. `None`, wenn Git
-/// nicht antwortet; der Aufrufer bleibt dann bei seiner ersten Einordnung.
-fn common_git_dir(git_dir: &Path) -> Option<PathBuf> {
-    let out = Command::new("git")
-        .arg("--git-dir")
-        .arg(git_dir)
-        .args(["rev-parse", "--git-common-dir"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let answer = String::from_utf8_lossy(&out.stdout);
-    let answer = answer.trim_end_matches(['\n', '\r']);
-    if answer.is_empty() {
-        return None;
-    }
-    // Eine relative Antwort ist relativ zum Arbeitsverzeichnis des Aufrufs —
-    // im Zweifel gegen das Git-Verzeichnis aufgelöst, damit der Vergleich
-    // nicht an der Schreibweise hängt.
-    let path = Path::new(answer);
-    Some(if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        git_dir.join(path)
-    })
 }
 
 /// Was an einem Hook-Pfad liegt.
