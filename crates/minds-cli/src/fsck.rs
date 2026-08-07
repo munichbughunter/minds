@@ -67,6 +67,7 @@ fn fsck(require_review: bool) -> Fallible<bool> {
     check_journal(&repo);
     let hooks = hook_state(&root, repo.git_dir());
     let hints = report_hooks(&root, &hooks)
+        + report_agents(&root)
         + report_binary(&root, &hooks)
         + report_log(&root, repo.git_dir());
 
@@ -654,6 +655,119 @@ fn report_binary(root: &Path, hooks: &HookState) -> usize {
     }
 }
 
+/// Der Agent-Abschnitt des Berichts, Zeile für Zeile.
+///
+/// Reine Funktion wie [`hook_report_lines`], damit der Wortlaut prüfbar ist
+/// statt nur sichtbar.
+///
+/// **Höchstens eine Zeile je Agent, nie je Event.** Fünf Agents mal sieben
+/// Events wären fünfunddreißig Zeilen für einen Sachverhalt, der in eine
+/// passt. Und eine fehlende Datei bleibt still: Ein Repo ohne Gemini soll
+/// keine Gemini-Zeile bekommen — dieselbe Entscheidung, die `REQUIRED_HOOKS`
+/// für `pre-push` trifft.
+fn agent_report_lines(reports: &[crate::enable::AgentReport]) -> Vec<String> {
+    use crate::enable::Match;
+
+    let mut lines = Vec::new();
+    let mut registered: Vec<&str> = Vec::new();
+
+    for report in reports {
+        let file = report.which.file();
+        if !report.present {
+            continue;
+        }
+        if let Some(reason) = &report.refused {
+            lines.push(format!(
+                "Agents: „{file}“ ist keine Konfiguration, die minds ergänzt"
+            ));
+            lines.push(format!("  {reason}"));
+            continue;
+        }
+
+        let missing = report.missing();
+        if report.outdated > 0 {
+            lines.push(format!(
+                "Agents: „{file}“ trägt Einträge aus einer älteren minds-Version"
+            ));
+            lines.push("  `minds enable` bringt sie auf den Stand".to_owned());
+        } else if report.current == 0 {
+            // Der #78-Fall: Die Datei ist da, aber nichts von uns steht drin.
+            lines.push(format!(
+                "Agents: „{file}“ trägt keine minds-Registrierung — kein Event wird erfasst"
+            ));
+            lines.push("  `minds enable` trägt sie ein".to_owned());
+        } else if missing > 0 {
+            let verb = if missing == 1 { "fehlt" } else { "fehlen" };
+            lines.push(format!(
+                "Agents: in „{file}“ {verb} {missing} von {} Registrierungen",
+                report.total
+            ));
+            lines.push("  `minds enable` trägt sie ein".to_owned());
+        } else if report.codex_flag == Some(false) {
+            // Vollständig registriert und trotzdem wirkungslos: Ohne den
+            // Schalter liest Codex die `hooks.json` gar nicht.
+            lines.push(format!(
+                "Agents: „{file}“ ist vollständig, aber „codex_hooks“ fehlt in „.codex/config.toml“"
+            ));
+            lines.push(
+                "  ohne den Schalter liest Codex die Registrierung nicht — `minds enable`"
+                    .to_owned(),
+            );
+        } else if report.codex_flag.is_none() {
+            // Nicht feststellbar heißt nicht „in Ordnung": `enable` bricht in
+            // diesem Fall laut ab, also darf `fsck` hier nicht beruhigen.
+            lines.push(format!(
+                "Agents: „{file}“ ist vollständig, aber „.codex/config.toml“ lässt sich nicht deuten"
+            ));
+            lines.push(
+                "  ob Codex die Registrierung liest, ist von hier aus nicht zu sagen".to_owned(),
+            );
+        } else {
+            registered.push(report.which.name());
+        }
+
+        // Der Recall-Eintrag hat seinen eigenen Satz: Sein **Fehlen** ist kein
+        // Mangel (`--recall` ist opt-in), sein veralteter Wortlaut schon.
+        if report.recall == Some(Match::Ours) {
+            lines.push(format!(
+                "Agents: der Recall-Eintrag in „{file}“ stammt aus einer älteren minds-Version"
+            ));
+            lines.push("  `minds enable` bringt ihn auf den Stand".to_owned());
+        }
+    }
+
+    // Die Sammelzeile steht immer, wenn mindestens einer vollständig
+    // eingerichtet ist: Ein schweigender Abschnitt liest sich wie „nicht
+    // geprüft".
+    if !registered.is_empty() {
+        lines.insert(
+            0,
+            format!("Agents: registriert für {}", registered.join(", ")),
+        );
+    }
+    lines
+}
+
+/// Meldet den Zustand der Agent-Konfigurationen und gibt zurück, ob das ein
+/// Hinweis war.
+///
+/// Wie bei den Hooks: höchstens **einer** für den ganzen Abschnitt, und ohne
+/// Einfluss auf den Rückgabewert. Der ist das CI-Gate (R5) — eine fehlende
+/// Cursor-Registrierung hält keine Pipeline an.
+fn report_agents(root: &Path) -> usize {
+    let reports: Vec<_> = crate::enable::Which::ALL
+        .iter()
+        .map(|&which| crate::enable::inspect_agent(root, which))
+        .collect();
+    let lines = agent_report_lines(&reports);
+    // Nur die Sammelzeile heißt: alles in Ordnung.
+    let only_summary = lines.len() <= 1;
+    for line in lines {
+        println!("{line}");
+    }
+    usize::from(!only_summary)
+}
+
 /// Der Log-Abschnitt des Berichts, Zeile für Zeile — leer, wenn es kein Log
 /// gibt, und das ist der Normalfall.
 ///
@@ -1023,6 +1137,139 @@ mod tests {
     /// Baut die Zeilen zu einem Zustand, wie ihn `fsck` gedruckt hätte.
     fn lines(state: &HookState) -> Vec<String> {
         hook_report_lines(Path::new("/repo"), state)
+    }
+
+    // --- Agent-Registrierungen (#68 Teil 3, #78) ----------------------------
+
+    /// Ein Bericht, wie ihn `inspect_agent` liefern würde.
+    fn agent(
+        which: crate::enable::Which,
+        current: usize,
+        outdated: usize,
+        total: usize,
+    ) -> crate::enable::AgentReport {
+        crate::enable::AgentReport {
+            which,
+            present: true,
+            total,
+            current,
+            outdated,
+            recall: None,
+            refused: None,
+            codex_flag: Some(true),
+        }
+    }
+
+    /// Alles registriert: eine einzige Zeile, die sagt, worüber `fsck`
+    /// überhaupt geredet hat.
+    #[test]
+    fn golden_agents_all_registered() {
+        let reports = vec![
+            agent(crate::enable::Which::ClaudeCode, 7, 0, 7),
+            agent(crate::enable::Which::Cursor, 7, 0, 7),
+        ];
+        assert_eq!(
+            agent_report_lines(&reports),
+            ["Agents: registriert für claude-code, cursor"]
+        );
+    }
+
+    /// Der #78-Fall: Die Datei ist da, aber nichts von uns steht drin — weil
+    /// ein Fremdeintrag die Registrierung verhinderte. Vorher sah das für
+    /// `fsck` aus wie ein Repo ohne Agent.
+    #[test]
+    fn golden_an_agent_without_any_registration_is_named() {
+        let reports = vec![agent(crate::enable::Which::ClaudeCode, 0, 0, 7)];
+        assert_eq!(
+            agent_report_lines(&reports),
+            [
+                "Agents: „.claude/settings.json“ trägt keine minds-Registrierung — kein Event wird erfasst",
+                "  `minds enable` trägt sie ein",
+            ]
+        );
+    }
+
+    /// Veraltete Einträge — der Fall, den #68 Teil 2 überhaupt erst erreichbar
+    /// gemacht hat.
+    #[test]
+    fn golden_outdated_entries_are_named() {
+        let reports = vec![agent(crate::enable::Which::Gemini, 5, 2, 7)];
+        assert_eq!(
+            agent_report_lines(&reports),
+            [
+                "Agents: „.gemini/settings.json“ trägt Einträge aus einer älteren minds-Version",
+                "  `minds enable` bringt sie auf den Stand",
+            ]
+        );
+    }
+
+    /// Teilweise registriert, im Singular und im Plural.
+    #[test]
+    fn golden_partial_registration_reads_in_both_numbers() {
+        let one = vec![agent(crate::enable::Which::Cursor, 6, 0, 7)];
+        assert_eq!(
+            agent_report_lines(&one),
+            [
+                "Agents: in „.cursor/hooks.json“ fehlt 1 von 7 Registrierungen",
+                "  `minds enable` trägt sie ein",
+            ]
+        );
+
+        let many = vec![agent(crate::enable::Which::Cursor, 3, 0, 7)];
+        assert_eq!(
+            agent_report_lines(&many),
+            [
+                "Agents: in „.cursor/hooks.json“ fehlen 4 von 7 Registrierungen",
+                "  `minds enable` trägt sie ein",
+            ]
+        );
+    }
+
+    /// Der Recall-Eintrag: veraltet bekommt einen Satz, **fehlend** nicht —
+    /// `--recall` ist opt-in, sein Fehlen ist eine Entscheidung.
+    #[test]
+    fn golden_the_recall_entry_is_named_only_when_outdated() {
+        let mut outdated = agent(crate::enable::Which::ClaudeCode, 7, 0, 7);
+        outdated.recall = Some(crate::enable::Match::Ours);
+        assert_eq!(
+            agent_report_lines(&[outdated]),
+            [
+                "Agents: registriert für claude-code",
+                "Agents: der Recall-Eintrag in „.claude/settings.json“ stammt aus einer älteren minds-Version",
+                "  `minds enable` bringt ihn auf den Stand",
+            ]
+        );
+
+        // Keiner da: kein Wort darüber.
+        let absent = agent(crate::enable::Which::ClaudeCode, 7, 0, 7);
+        assert_eq!(
+            agent_report_lines(&[absent]),
+            ["Agents: registriert für claude-code"]
+        );
+    }
+
+    /// Eine abgelehnte Datei bekommt den Grund statt des Rats — `minds enable`
+    /// würde hier nicht ergänzen, sondern mit derselben Begründung abbrechen.
+    #[test]
+    fn golden_a_refused_agent_file_carries_its_reason() {
+        let mut refused = agent(crate::enable::Which::OpenCode, 0, 0, 1);
+        refused.refused = Some("stammt nicht von minds".to_owned());
+        assert_eq!(
+            agent_report_lines(&[refused]),
+            [
+                "Agents: „.opencode/plugin/minds.ts“ ist keine Konfiguration, die minds ergänzt",
+                "  stammt nicht von minds",
+            ]
+        );
+    }
+
+    /// Eine fehlende Datei bleibt still: Ein Repo ohne Gemini soll keine
+    /// Gemini-Zeile bekommen.
+    #[test]
+    fn golden_an_absent_agent_file_stays_silent() {
+        let mut absent = agent(crate::enable::Which::Gemini, 0, 0, 0);
+        absent.present = false;
+        assert!(agent_report_lines(&[absent]).is_empty());
     }
 
     #[test]

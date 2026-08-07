@@ -502,7 +502,7 @@ fn main() -> ExitCode {
         "checkpoint" => Some(hooklog::Source::Checkpoint),
         "prepare-commit-msg" => Some(hooklog::Source::PrepareCommitMsg),
         "sync" => Some(hooklog::Source::Sync),
-        "brief" if args.iter().any(|a| a == "--hook") => Some(hooklog::Source::Hook),
+        "brief" if args.iter().any(|a| a == "--hook") => Some(hooklog::Source::Brief),
         _ => None,
     };
     if let Some(source) = hook_path {
@@ -536,18 +536,17 @@ fn main() -> ExitCode {
                     flag(rest, "--event").as_deref(),
                 );
             }
-            // Die kalten Hook-Kommandos laufen aus Skripten, die stderr
-            // wegwerfen — ihr Parse-Fehler gehört zusätzlich ins Log, sonst
-            // stünde #10 eine Etage höher wieder offen: Ein Hook-Body, der
-            // gegen dieses Binary driftet, bräche die Erfassung dauerhaft
-            // und lautlos.
-            let source = match spec.name {
-                "checkpoint" => Some(hooklog::Source::Checkpoint),
-                "prepare-commit-msg" => Some(hooklog::Source::PrepareCommitMsg),
-                "sync" => Some(hooklog::Source::Sync),
-                _ => None,
-            };
-            if let Some(source) = source {
+            // Die übrigen Hook-Pfade laufen aus Skripten und Konfigurationen,
+            // die stderr wegwerfen — ihr Parse-Fehler gehört zusätzlich ins
+            // Log, sonst stünde #10 eine Etage höher wieder offen: Ein
+            // Hook-Body, der gegen dieses Binary driftet, bräche die Erfassung
+            // dauerhaft und lautlos. `brief --hook` gehört dazu (#68); es fiel
+            // bisher als einziges durch.
+            //
+            // Dieselbe Zuordnung wie oben, statt sie ein zweites Mal zu
+            // schreiben. `hook` ist ausgenommen: Sein Notpfad steht darüber
+            // und endet mit 0.
+            if let Some(source) = hook_path.filter(|s| *s != hooklog::Source::Hook) {
                 hooklog::log(source, &message);
             }
             eprintln!("minds {}: {message}", spec.name);

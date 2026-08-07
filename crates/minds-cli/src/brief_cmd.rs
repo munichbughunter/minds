@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use minds_core::Session;
 
 use crate::context::{self, Context};
+use crate::hooklog::{self, Source};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -29,17 +30,52 @@ const CAP: usize = 8;
 
 /// Führt `minds brief` aus. `paths` sind die Dateien, um die es geht; leer =
 /// ganzes Repo. `hook` verpackt die Ausgabe ins Claude-SessionStart-Envelope.
+///
+/// # Zwei Aufrufer, zwei Kanäle
+///
+/// Ohne `--hook` steht ein Mensch davor: Der Fehler gehört auf stderr, wie bei
+/// `recall` und `distill`.
+///
+/// Mit `--hook` läuft das Kommando aus der Agent-Konfiguration, und die
+/// registrierte Zeile lautet `minds brief --hook 2>/dev/null || true`. stderr
+/// geht dort ins Nichts, der Rückgabewert wird verschluckt — scheiterte
+/// `brief`, startete die Sitzung ohne den Kontext, den minds ihr mitgeben
+/// wollte, und niemand erfuhr es (#68). Deshalb hier dieselbe Klammer wie bei
+/// den Git-Hooks: der Fehler nach `<git-dir>/minds/hook.log`, der Panic
+/// ebenfalls, und **kein Byte** auf stdout — dort steht der injizierte
+/// Kontext, ein Fehlertext würde als solcher in die Sitzung gehoben.
 pub fn run(paths: &[String], hook: bool) -> ExitCode {
-    match brief(paths, hook) {
+    if !hook {
+        return match brief(paths, false) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("minds brief: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    hooklog::guarded(Source::Brief, || match brief(paths, true) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("minds brief: {err}");
+            hooklog::log(Source::Brief, &format!("{err:#}"));
             ExitCode::FAILURE
         }
-    }
+    })
 }
 
+/// Provoziert einen Panic — der einzige Weg, gegen den echten Prozess zu
+/// prüfen, dass er weder die Sitzung erreicht noch spurlos verschwindet (#68).
+/// Nur in Debug-Builds vorhanden, wie das Pendant in [`crate::hook`].
+#[cfg(debug_assertions)]
+const PANIC_FOR_TEST: &str = "MINDS_BRIEF_PANIC_FOR_TEST";
+
 fn brief(paths: &[String], hook: bool) -> Fallible<()> {
+    #[cfg(debug_assertions)]
+    if std::env::var(PANIC_FOR_TEST).as_deref() == Ok("1") {
+        panic!("absichtlicher Panic für den Test");
+    }
+
     let ctx = Context::open()?;
     let all = ctx.all_sessions()?;
 

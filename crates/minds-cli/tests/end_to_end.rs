@@ -900,6 +900,196 @@ fn a_panic_in_the_hook_reaches_neither_stdout_nor_stderr() {
     );
 }
 
+/// #68 Teil 3 und #78, end-to-end: `minds fsck` benennt eine Konfiguration,
+/// in der nichts von uns steht — der Zustand, den ein eingecheckter
+/// Fremdeintrag erzeugt. Ohne diesen Abschnitt sah das für `fsck` aus wie ein
+/// Repo, in dem gar kein Agent eingerichtet ist.
+#[test]
+fn fsck_names_an_agent_config_without_any_registration() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "chore: Grundstein"]);
+
+    // Eine Konfiguration, die aussieht wie eine — aber keine ist.
+    std::fs::create_dir_all(dir.join(".claude")).unwrap();
+    std::fs::write(
+        dir.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo \"minds hook ist nett\""}]}]}}"#,
+    )
+    .unwrap();
+
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(fsck.status.success(), "ein Hinweis ist kein Befund");
+    assert!(
+        stdout(&fsck).contains("trägt keine minds-Registrierung"),
+        "fsck verschweigt die leere Konfiguration:\n{}",
+        stdout(&fsck)
+    );
+
+    // Nach `enable` ist der Zustand geheilt — und `fsck` sagt das auch.
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+    let fsck = minds(dir, &["fsck"], None);
+    assert!(
+        stdout(&fsck).contains("registriert für claude-code"),
+        "fsck bestätigt die Registrierung nicht:\n{}",
+        stdout(&fsck)
+    );
+    assert!(
+        !stdout(&fsck).contains("trägt keine minds-Registrierung"),
+        "der Hinweis bleibt stehen:\n{}",
+        stdout(&fsck)
+    );
+}
+
+/// Und der Gegenbeweis, dass `enable` und `fsck` dieselbe Sprache sprechen:
+/// Was `enable` gerade geschrieben hat, darf `fsck` nicht als veraltet melden
+/// — sonst stünde der Hinweis in **jedem** frisch eingerichteten Repo.
+#[test]
+fn what_enable_writes_fsck_calls_current() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(minds(dir, &["enable", "--recall"], None).status.success());
+
+    let out = stdout(&minds(dir, &["fsck"], None));
+    assert!(
+        !out.contains("älteren minds-Version"),
+        "frisch eingerichtet und schon veraltet:\n{out}"
+    );
+    assert!(
+        !out.contains("fehlen") && !out.contains("fehlt 1"),
+        "frisch eingerichtet und schon unvollständig:\n{out}"
+    );
+    assert!(out.contains("Agents: registriert für"), "{out}");
+}
+
+/// #68: Ein scheiterndes `minds brief --hook` verschwindet nicht mehr. Die
+/// registrierte Zeile lautet `minds brief --hook 2>/dev/null || true` — stderr
+/// ging ins Nichts, der Rückgabewert wurde verschluckt, und die Sitzung
+/// startete ohne den Kontext, den minds ihr mitgeben wollte.
+#[test]
+fn a_failing_brief_hook_lands_in_the_log_instead_of_nowhere() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    // Ein Store, der sich nicht öffnen lässt: Die Konfiguration zeigt auf ein
+    // Child-Repo, das es nicht gibt.
+    git(dir, &["config", "minds.backend", "child-repo"]);
+    git(dir, &["config", "minds.childPath", "../gibt-es-nicht"]);
+
+    let out = minds(dir, &["brief", "--hook"], None);
+    assert!(
+        !out.status.success(),
+        "der Fehler soll sich im Rückgabewert zeigen — der Hook fängt ihn mit `|| true`"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stdout trägt den injizierten Kontext, keine Diagnose:\n{}",
+        stdout(&out)
+    );
+
+    let log = std::fs::read_to_string(dir.join(".git/minds/hook.log")).expect("das Log existiert");
+    assert!(
+        log.contains("brief:"),
+        "der Eintrag nennt seinen Pfad nicht:\n{log}"
+    );
+}
+
+/// Und ohne `--hook` bleibt es beim alten Weg: Dort steht ein Mensch davor,
+/// der Fehler gehört auf stderr — und **nicht** ins Log, das sonst bei jedem
+/// Terminal-Aufruf mitwüchse.
+#[test]
+fn a_failing_brief_without_the_hook_flag_stays_on_stderr() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    git(dir, &["config", "minds.backend", "child-repo"]);
+    git(dir, &["config", "minds.childPath", "../gibt-es-nicht"]);
+
+    let out = minds(dir, &["brief"], None);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("minds brief:"),
+        "der Fehler gehört im Terminal auf stderr"
+    );
+    assert!(
+        !dir.join(".git/minds/hook.log").exists(),
+        "der Terminal-Aufruf soll das Log nicht füllen"
+    );
+}
+
+/// #68: Ein Panic im `--hook`-Pfad erreicht die Sitzung nicht — weder über
+/// stdout (dort steht der injizierte Kontext) noch über stderr —, verschwindet
+/// aber auch nicht: Der **Ort** steht im Log. Die Meldung nicht, denn `brief`
+/// hält redigierte Sessions im Speicher.
+#[test]
+fn a_panic_in_brief_hook_reaches_neither_channel_but_leaves_its_place() {
+    if !cfg!(debug_assertions) {
+        eprintln!("Release-Build — der Panic-Haken existiert dort nicht, Test übersprungen");
+        return;
+    }
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .args(["brief", "--hook"])
+        .env("MINDS_BRIEF_PANIC_FOR_TEST", "1")
+        .env("RUST_BACKTRACE", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    without_user_config(&mut cmd);
+    let out = cmd.output().expect("minds endet");
+
+    assert!(out.stdout.is_empty(), "stdout: {:?}", stdout(&out));
+    assert!(
+        out.stderr.is_empty(),
+        "stderr trägt den Panic in die Sitzung:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let log = std::fs::read_to_string(dir.join(".git/minds/hook.log")).expect("das Log existiert");
+    assert!(log.contains("brief: Panic"), "{log}");
+    assert!(
+        log.contains("brief_cmd.rs:"),
+        "der Ort des Panics fehlt:\n{log}"
+    );
+    assert!(
+        !log.contains("absichtlicher Panic"),
+        "die Meldung gehört nicht ins Log — sie könnte Nutzlast tragen:\n{log}"
+    );
+}
+
 /// #54, die Kehrseite: Der Panic-Text ist ein **neuer** Kanal ins Log (vorher
 /// stand dort eine Konstante). Die Zusage des Moduls — keine Nutzlast in
 /// `hook.log`, die Datei geht in Bug-Reports mit — muss auch für ihn gelten.
