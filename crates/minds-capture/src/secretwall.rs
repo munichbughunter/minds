@@ -65,14 +65,50 @@ pub fn guard(event: &mut NewEvent) -> Option<&'static str> {
     Some(reason)
 }
 
-/// Baut den minimalen Ersatz-Payload: Tool-Name, der Pfad unter seinem
-/// Originalschlüssel, der Auslass-Marker und der Grund.
+/// Der zweite Weg zur selben Mauer: prüft die `input`-Map eines
+/// `tool_use`-Blocks und liefert den Ersatz für `ToolCall::arguments`, falls
+/// sie eine Zugangsdaten-Datei berührt — plus den Regelnamen für den Audit.
+///
+/// [`guard`] schützt den Hook-Weg (Journal-Events), diese Funktion den
+/// **Import-Weg** (`minds import` liest `tool_use`-Blöcke direkt aus dem
+/// Transkript, ohne Journal). Beide teilen sich [`secret_path_in`] und
+/// [`walled_input`] — Pfad-Schlüssel, Heuristik und Ersatz-Form stehen damit
+/// an genau einer Stelle. Eine zweite Fassung in `import.rs` wäre exakt die
+/// Divergenz, die schon einmal die Fehlerquelle war.
+pub fn wall_tool_input(input: &Map<String, Value>) -> Option<(String, &'static str)> {
+    let (path_key, path, reason) = secret_path_in(input)?;
+    Some((walled_input(path_key, path, reason).to_string(), reason))
+}
+
+/// Die **eine** Ersatz-Form für ein gewalltes `tool_input` — beide Eingangswege
+/// bauen sie hier.
+///
+/// Marker und Grund stehen bewusst **im** `tool_input` und nicht daneben:
+/// `normalize::claude_tool` übernimmt später nur `tool_input` verbatim in
+/// [`ToolCall::arguments`](minds_core::ToolCall::arguments). Lägen die Marker
+/// daneben (so war es), verlöre der Hook-Weg die Auskunft „hier wurde eine
+/// Datei ausgelassen" im Envelope vollständig — der Reader sähe je nach
+/// Eingangsweg zwei verschiedene Dinge.
+///
+/// Der Feldname des Grundes heißt `minds_omitted_reason` und **darf kein
+/// Detektor-Stichwort enthalten**: Ein früheres `minds_secret_file_reason`
+/// wurde von der Redaction-Pipeline selbst getroffen — `secret` matcht im
+/// Strict-Tier ohne Wortgrenzen, und im Store stand statt des Grundes
+/// `[redacted:secret]`. Gemessen, nicht vermutet.
+fn walled_input(path_key: &str, path: &str, reason: &str) -> Value {
+    serde_json::json!({
+        path_key: path,
+        "minds_omitted": SECRET_FILE_PLACEHOLDER,
+        "minds_omitted_reason": reason,
+    })
+}
+
+/// Baut den minimalen Ersatz-Payload: Tool-Name plus das gewallte `tool_input`
+/// aus [`walled_input`].
 fn sanitized(name: &str, path_key: &str, path: &str, reason: &str) -> Box<RawValue> {
     let value = serde_json::json!({
         "tool_name": name,
-        "tool_input": { path_key: path },
-        "minds_omitted": SECRET_FILE_PLACEHOLDER,
-        "minds_secret_file_reason": reason,
+        "tool_input": walled_input(path_key, path, reason),
     });
     // `serde_json::json!` erzeugt per Konstruktion gültiges JSON.
     RawValue::from_string(value.to_string()).expect("json! ist gültiges JSON")
@@ -269,6 +305,88 @@ mod tests {
         );
         assert_eq!(guard(&mut e), Some("dotenv"));
         assert!(!e.payload.get().contains("hunter2"));
+    }
+
+    #[test]
+    fn both_ingestion_paths_agree_on_the_same_fixtures() {
+        // Akzeptanzkriterium aus #93: Hook-Weg (`guard`) und Import-Weg
+        // (`wall_tool_input`) gegen **dieselben** Eingaben — driften die beiden
+        // je auseinander, wird genau dieser Test rot. Die Fälle decken beide
+        // Richtungen ab: Mauer greift / Mauer greift nicht.
+        let cases: &[(&str, Option<&'static str>)] = &[
+            (".env", Some("dotenv")),
+            ("config/credentials.json", Some("credentials-file")),
+            ("/home/p/service_account.json", Some("gcp-service-account")),
+            ("/home/p/.aws/credentials.bak", Some("aws-credentials")),
+            ("certs/server.pem", Some("private-key")),
+            // Die Dateiklassen, für die die Mauer die **einzige** Schicht ist —
+            // patternfreie Inhalte, die kein Detektor fangen kann.
+            ("/home/p/.dockercfg", Some("docker-config")),
+            (
+                "/home/p/ansible/vault_pass.txt",
+                Some("ansible-vault-password"),
+            ),
+            (".vault_pass", Some("ansible-vault-password")),
+            ("src/retry.rs", None),
+            (".env.example", None),
+        ];
+
+        for (path, expected) in cases {
+            // Hook-Weg.
+            let payload = format!(
+                r#"{{"tool_name":"Write","tool_input":{{"file_path":"{path}","content":"GEHEIM"}}}}"#
+            );
+            let mut event = tool_event(EventKind::ToolPre, &payload);
+            let hook_reason = guard(&mut event);
+            assert_eq!(hook_reason, *expected, "Hook-Weg bei {path:?}");
+
+            // Import-Weg, dieselbe Eingabe als `tool_use`-Input.
+            let input: Map<String, Value> =
+                serde_json::from_str(&format!(r#"{{"file_path":"{path}","content":"GEHEIM"}}"#))
+                    .unwrap();
+            let import_reason = wall_tool_input(&input).map(|(_, reason)| reason);
+            assert_eq!(import_reason, *expected, "Import-Weg bei {path:?}");
+
+            // Greift die Mauer, verlieren beide den Inhalt und behalten den Pfad.
+            if expected.is_some() {
+                assert!(!event.payload.get().contains("GEHEIM"));
+                let (replacement, _) = wall_tool_input(&input).unwrap();
+                assert!(!replacement.contains("GEHEIM"));
+                assert!(replacement.contains(path));
+                assert!(replacement.contains("[omitted:secret-file]"));
+
+                // **Ergebnis-Parität, nicht nur Regel-Parität:** Der Hook-Weg
+                // wird bis zur Envelope-Sicht zu Ende gegangen — `claude_tool`
+                // übernimmt `tool_input` verbatim in `ToolCall::arguments`.
+                // Was dort ankommt, muss byte-gleich dem Import-Ersatz sein.
+                // Genau diese Divergenz gab es schon einmal: Die Marker lagen
+                // *neben* `tool_input`, und der Hook-Weg verlor sie im
+                // Envelope vollständig.
+                let hook_tool: Tool = serde_json::from_str(event.payload.get()).unwrap();
+                let hook_arguments = serde_json::to_string(&hook_tool.tool_input.unwrap()).unwrap();
+                assert_eq!(
+                    hook_arguments, replacement,
+                    "Envelope-Sicht der beiden Wege driftet bei {path:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_walled_replacement_is_a_fixpoint_of_the_redaction_pipeline() {
+        // Der Ersatz läuft später durch `redact_session`. Frisst ein künftiger
+        // Detektor den Marker oder den Grund an, verfälscht das die Zähler und
+        // nimmt dem Reader die Auskunft — genau so ist der Grund schon einmal
+        // verschwunden, als sein Feldname noch `secret` enthielt.
+        let input: Map<String, Value> =
+            serde_json::from_str(r#"{"file_path":".env","content":"DB_PASSWORD=hunter2"}"#)
+                .unwrap();
+        let (replacement, _) = wall_tool_input(&input).unwrap();
+
+        let pipeline = minds_redact::RedactionConfig::default().pipeline().unwrap();
+        let out = pipeline.redact(&replacement);
+        assert_eq!(out.text, replacement, "der Ersatz ist kein Fixpunkt mehr");
+        assert_eq!(out.counts, minds_core::RedactionCounts::default());
     }
 
     #[test]

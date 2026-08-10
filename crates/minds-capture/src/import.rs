@@ -111,6 +111,23 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
         Err(err) => note = Some(format!("{} nicht lesbar: {err}", dir.display())),
     }
 
+    // Keine stillen Ausfälle — auch keine stillen Auslassungen: Wenn die
+    // secretfile-Mauer gegriffen hat, soll der Nutzer das beim Import sehen,
+    // nicht erst beim Lesen des Records.
+    let walled = sessions
+        .iter()
+        .flat_map(|s| &s.turns)
+        .flat_map(|t| &t.tool_calls)
+        .filter(|c| c.arguments.contains(minds_redact::SECRET_FILE_PLACEHOLDER))
+        .count();
+    if walled > 0 {
+        let hint = format!("{walled} Tool-Call(s) hinter der secretfile-Mauer ausgelassen");
+        note = Some(match note {
+            Some(existing) => format!("{existing}; {hint}"),
+            None => hint,
+        });
+    }
+
     AgentImport {
         agent: "claude-code".to_string(),
         sessions,
@@ -361,8 +378,35 @@ fn assistant_blocks(content: Option<&serde_json::Value>) -> (String, Vec<ToolCal
                     .unwrap_or("")
                     .to_string();
                 let input = block.get("input");
-                let arguments = input.map(|i| i.to_string()).unwrap_or_default();
-                let raw = input.and_then(|i| RawValue::from_string(i.to_string()).ok());
+                // Doppelt serialisiert: In einem defekten oder fremden
+                // Transkript kann `input` ein JSON-**String** sein statt eines
+                // Objekts. Ohne das Unwrap würde die Mauer nie gefragt — die
+                // Verbatim-Kopie unten nähme den Inhalt aber trotzdem mit.
+                // Sicherheitsentscheidung und Datenübernahme müssen auf
+                // **derselben** Form arbeiten, sonst ist die Prüfung strenger
+                // als die Kopie. Eine Ebene genügt; Transkripte sind untrusted,
+                // aber nicht adversarial rekursiv — und jede weitere Ebene wäre
+                // wieder ein String, den die Mauer sehen kann.
+                let unwrapped: Option<serde_json::Value> = match input {
+                    Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
+                    _ => None,
+                };
+                let effective = unwrapped.as_ref().or(input);
+                // Die Mauer gilt auch auf diesem Eingangsweg (#93): Ein `Write`
+                // auf eine Zugangsdaten-Datei trägt den vollen Inhalt im
+                // `input`. Die Prüfung sitzt in `secretwall`, damit
+                // Pfad-Schlüssel und Heuristik nicht doppelt existieren.
+                let walled = effective
+                    .and_then(|i| i.as_object())
+                    .and_then(crate::secretwall::wall_tool_input);
+                let arguments = match &walled {
+                    Some((replacement, _reason)) => replacement.clone(),
+                    None => effective.map(|i| i.to_string()).unwrap_or_default(),
+                };
+                // Der Effekt entsteht aus dem **Original**: Er extrahiert nur
+                // den Pfad, nie den Inhalt, und einen Artefakt-Hash bildet der
+                // Import ohnehin nicht (`claude_effect` setzt `content: None`).
+                let raw = effective.and_then(|i| RawValue::from_string(i.to_string()).ok());
                 let effect = normalize::claude_effect(&name, raw.as_deref());
                 tool_calls.push(ToolCall {
                     name,
@@ -612,5 +656,92 @@ mod tests {
             "-Users-anna-dev-minds"
         );
         assert_eq!(claude_slug(Path::new("/home/a.b/proj")), "-home-a-b-proj");
+    }
+
+    // --- Die Mauer gilt auch auf dem Import-Weg (#93) -------------------------
+
+    #[test]
+    fn a_write_to_a_credential_file_loses_its_content_on_import() {
+        // Der zweite Eingangsweg in den Store: Ein Transkript trägt den vollen
+        // Dateiinhalt im `input` des `tool_use`-Blocks. Ohne Mauer stünde er
+        // wörtlich in `ToolCall::arguments` — und für einen GCP-Key rettet
+        // danach zwar die PEM-Regel den Schlüssel, aber nicht die Nachbarfelder.
+        let jsonl = concat!(
+            r#"{"type":"user","cwd":"/home/p/projekt","timestamp":"2026-07-23T09:00:00Z","sessionId":"s-1","message":{"role":"user","content":"leg den Key ab"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-23T09:00:05Z","sessionId":"s-1","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/home/p/projekt/credentials.json","content":"{\"private_key\":\"-----BEGIN PRIVATE KEY-----\\nGEHEIMWERT123\\n-----END PRIVATE KEY-----\","#,
+            r#"\"client_email\":\"svc@beispiel.iam.gserviceaccount.com\"}"}}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+
+        let sessions = parse_claude_code(jsonl.as_bytes(), "fallback");
+        assert_eq!(sessions.len(), 1);
+        let call = &sessions[0].turns[1].tool_calls[0];
+
+        for leak in ["GEHEIMWERT123", "PRIVATE KEY", "gserviceaccount"] {
+            assert!(
+                !call.arguments.contains(leak),
+                "{leak:?} steht in den Import-Arguments:\n{}",
+                call.arguments
+            );
+        }
+        // Wie beim Hook-Pfad: Pfad, Marker und Grund bleiben — der Reader soll
+        // sehen, *dass* und *warum* hier eine Datei ausgelassen wurde.
+        assert!(call.arguments.contains("credentials.json"), "Pfad weg");
+        assert!(call.arguments.contains("[omitted:secret-file]"));
+        assert!(call.arguments.contains("credentials-file"), "Grund fehlt");
+        // Der Effekt behält seinen Pfad; einen Inhalts-Hash bildet der Import
+        // ohnehin nie (`claude_effect` setzt `content: None`).
+        let effect = call.effect.as_ref().unwrap();
+        assert_eq!(
+            effect.path.as_deref(),
+            Some("/home/p/projekt/credentials.json")
+        );
+        assert!(effect.content.is_none());
+    }
+
+    #[test]
+    fn a_double_serialized_input_cannot_slip_past_the_wall() {
+        // Der Fund aus dem Security-Review: `input` als JSON-**String** statt
+        // Objekt. Die Mauer parste strikt (nur Objekt), die Verbatim-Kopie
+        // nahm alles — die Prüfung war strenger als die Übernahme, und genau
+        // die Dateiklasse, für die die Mauer die einzige Schicht ist
+        // (patternfreies Vault-Passwort), stand wörtlich im Store.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-07-23T09:00:00Z","sessionId":"s-1","message":{"role":"user","content":"x"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-23T09:00:05Z","sessionId":"s-1","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","name":"Write","input":"{\"file_path\":\"/home/p/.vault_pass\",\"content\":\"doppelt-serialisiert-geheim\"}"}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+
+        let sessions = parse_claude_code(jsonl.as_bytes(), "fallback");
+        let call = &sessions[0].turns[1].tool_calls[0];
+        assert!(
+            !call.arguments.contains("doppelt-serialisiert-geheim"),
+            "Inhalt überlebt das Unwrap:\n{}",
+            call.arguments
+        );
+        assert!(call.arguments.contains("[omitted:secret-file]"));
+        assert!(call.arguments.contains("ansible-vault-password"));
+        // Auch der Effekt sieht den Pfad jetzt — vorher scheiterte die
+        // Extraktion am String-Literal.
+        assert_eq!(
+            call.effect.as_ref().unwrap().path.as_deref(),
+            Some("/home/p/.vault_pass")
+        );
+    }
+
+    #[test]
+    fn an_ordinary_write_keeps_its_arguments_on_import() {
+        // Die Gegenprobe: Gewöhnliche Dateien bleiben Byte für Byte erhalten —
+        // die Arguments sind für `why`/`show` echter Kontext.
+        let jsonl = concat!(
+            r#"{"type":"user","timestamp":"2026-07-23T09:00:00Z","sessionId":"s-1","message":{"role":"user","content":"fix"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-23T09:00:05Z","sessionId":"s-1","message":{"role":"assistant","model":"m","content":[{"type":"tool_use","name":"Write","input":{"file_path":"src/retry.rs","content":"fn main(){}"}}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+        );
+
+        let sessions = parse_claude_code(jsonl.as_bytes(), "fallback");
+        let call = &sessions[0].turns[1].tool_calls[0];
+        assert!(call.arguments.contains("fn main(){}"), "Kontext verloren");
+        assert!(!call.arguments.contains("minds_omitted"));
     }
 }
