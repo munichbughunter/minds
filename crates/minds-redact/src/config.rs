@@ -40,6 +40,7 @@
 //! email           = true
 //! keyed_values    = true     # DB_PASSWORD=… — der .env-Fall
 //! url_credentials = true     # postgres://user:pw@host
+//! short_flags     = true     # curl -u user:pass
 //! allow           = ["AKIAIOSFODNN7EXAMPLE", "noreply@example.com"]
 //! secret_keys     = ["VAULT_ROLE_ID"]        # Feldnamen
 //! deny_secrets    = ["korrekt-pferd-batterie-klammer"]

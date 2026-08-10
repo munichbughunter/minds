@@ -1707,11 +1707,16 @@ fn a_hook_error_never_carries_the_raw_transcript() {
     // Ohne einen einzigen Detektor lädt die Policy, und `redact_session`
     // scheitert erst an der gebauten Session (`RedactionError::NoDetectors`) —
     // im `übersprungen`-Zweig, mit den Token im Envelope.
+    //
+    // **Jeder neue Detektor muss hier abgeschaltet werden.** Bleibt einer an,
+    // ist die Pipeline nicht leer, `NoDetectors` tritt nicht ein, und der Test
+    // prüft nichts mehr — er scheitert dann daran, dass gar kein Log entsteht.
     std::fs::create_dir_all(dir.join(".minds")).unwrap();
     std::fs::write(
         dir.join(".minds/redact.json"),
         r#"{"known_tokens":false,"email":false,"keyed_values":false,
-            "url_credentials":false,"high_entropy":{"enabled":false}}"#,
+            "url_credentials":false,"short_flags":false,
+            "high_entropy":{"enabled":false}}"#,
     )
     .unwrap();
 
