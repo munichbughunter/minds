@@ -51,10 +51,47 @@ const GITHUB_FINE_GRAINED: &str = concat!(
     "github_pat_KLzdocJ2isAjIhKtJ0RlgL_",
     "KOmxgJTeKdNnFRIBXuDL7DxtpYlSXpfKtHF4vUCsMehGAkWvj7FAc9QeWJK"
 );
-const GITLAB_PAT: &str = "glpat-ORS-6ilI8ihN5KXSc7Tv";
-const SLACK_TOKEN: &str = "xoxb-NhFdnXsiVpzz63FfkCzJr";
+// Ab hier gilt für **jede** Token-Konstante mit erkennbarem Präfix: Sie wird
+// per `concat!` aufgebrochen, sodass im Quelltext kein zusammenhängendes
+// Token-Literal steht.
+//
+// Das ist keine Kosmetik. Fremde Secret-Scanner (GitHubs Push-Protection,
+// GitLabs Secret Detection) lesen den **Quelltext** und können synthetische
+// Fixtures nicht von echten Zugangsdaten unterscheiden — ein Push wird dann
+// blockiert. Für den Compiler ist `concat!` dasselbe Literal, die Fixtures
+// verlieren also nichts. Bitte nicht zu einem Einzeiler „aufräumen".
+
+/// GitLab-PAT in der **langen** Form, wie sie seit 16.x ausgegeben wird — der
+/// alte Cap von exakt 20 Zeichen hätte nur den Anfang gedeckt.
+const GITLAB_PAT: &str = concat!("glpat", "-ORS6ilI8ihN5KXSc7TvA1b2C3d4");
+/// Die klassische 20-Zeichen-Form, **mit** eingebettetem Bindestrich. Bleibt im
+/// Korpus, damit die Cap-Erweiterung die alte Variante nicht verdrängt.
+const GITLAB_PAT_CLASSIC: &str = concat!("glpat", "-ORS-6ilI8ihN5KXSc7Tv");
+/// Der Key, der für dieses Projekt am meisten zählt: Die Testgruppe arbeitet
+/// mit Claude Code, ein `sk-ant-` steht in echten Sessions.
+const ANTHROPIC_KEY: &str = concat!(
+    "sk-ant",
+    "-api03-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v2W3x4Y5z6"
+);
+const OPENAI_KEY: &str = concat!("sk-proj", "-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0");
+/// Legacy-Registrierungstoken für GitLab-Runner.
+const RUNNER_REGISTRATION: &str = concat!("GR13489", "41K7pR2xQm9vTzL4nB6wYd");
+const SENDGRID_KEY: &str = concat!(
+    "SG",
+    ".A1b2C3d4E5f6G7h8I9j0K1.A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"
+);
+/// Slack-Bot-Token in realistischer **Länge** — über dem alten Cap von 48.
+const SLACK_TOKEN: &str = concat!(
+    "xoxb",
+    "-1234567890123-1234567890123-NhFdnXsiVpzz63FfkCzJrA1b2"
+);
 const GOOGLE_API_KEY: &str = "AIzar3J1TWDtkwtDDb_xHKas1VOqg6YYZYn9Zhy";
-const STRIPE_KEY: &str = "sk_live_enCkhvMdgaKjIg8xNbe3nNyj";
+/// Stripe-Key in der langen Variante — der alte Cap von 64 hätte den Schwanz
+/// am Entropie-Netz hängen lassen.
+const STRIPE_KEY: &str = concat!(
+    "sk_live",
+    "_enCkhvMdgaKjIg8xNbe3nNyjA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v2W3x4Y5z6"
+);
 const NPM_TOKEN: &str = "npm_Oq9wMxEhh2FDEEtfjgVvVqE1SkHbn88HxjSI";
 const JWT: &str = concat!(
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.",
@@ -163,10 +200,40 @@ fn must_redact() -> Vec<MustRedact> {
             kept: &["GH_TOKEN="],
         },
         MustRedact {
+            // Beide Formen in einem Fixture: die lange seit 16.x und die
+            // klassische mit eingebettetem Bindestrich.
             id: "gitlab-pat",
-            text: format!("PRIVATE-TOKEN: {GITLAB_PAT}"),
-            gone: &[GITLAB_PAT],
-            kept: &["PRIVATE-TOKEN:"],
+            text: format!("PRIVATE-TOKEN: {GITLAB_PAT}\nalter Token: {GITLAB_PAT_CLASSIC}"),
+            gone: &[GITLAB_PAT, GITLAB_PAT_CLASSIC],
+            kept: &["PRIVATE-TOKEN:", "alter Token:"],
+        },
+        MustRedact {
+            // Bewusst **ohne** Zuweisung: In einer Fehlermeldung gibt es keinen
+            // Schlüsselnamen, an dem sich der Key-Value-Detektor festhalten
+            // könnte. Was hier greift, ist die Token-Form selbst.
+            id: "anthropic-api-key",
+            text: format!("Fehler 401: der Key {ANTHROPIC_KEY} wurde abgelehnt"),
+            gone: &[ANTHROPIC_KEY, "api03"],
+            kept: &["Fehler 401:", "wurde abgelehnt"],
+        },
+        MustRedact {
+            id: "openai-api-key",
+            text: format!("Fehler 401: der Key {OPENAI_KEY} wurde abgelehnt"),
+            gone: &[OPENAI_KEY],
+            kept: &["Fehler 401:", "wurde abgelehnt"],
+        },
+        MustRedact {
+            id: "sendgrid-key",
+            text: format!("Fehler 403: {SENDGRID_KEY} hat keine Rechte"),
+            gone: &[SENDGRID_KEY],
+            kept: &["Fehler 403:", "hat keine Rechte"],
+        },
+        MustRedact {
+            // Legacy-Registrierungstoken für Runner, fester Präfix.
+            id: "gitlab-runner-registration",
+            text: format!("Runner meldet {RUNNER_REGISTRATION} zurueck"),
+            gone: &[RUNNER_REGISTRATION],
+            kept: &["Runner meldet", "zurueck"],
         },
         MustRedact {
             id: "slack-token",
@@ -454,6 +521,59 @@ const MUST_SURVIVE: &[(&str, &str)] = &[
         "AKIA1234 ist zu kurz fuer einen echten Key",
     ),
     ("near-miss-github", "ghp_zutokurz taucht im Log auf"),
+    (
+        // `sk-` ist als Präfix bewusst nur mit voller Länge gültig, sonst
+        // träfe es jede Abkürzung mit Bindestrich.
+        "near-miss-openai",
+        "sk-learn und sk-image sind Python-Pakete",
+    ),
+    (
+        // Der Anthropic-Präfix ohne plausiblen Rest bleibt Prosa.
+        "near-miss-anthropic",
+        "das Praefix sk-ant- steht in der Doku",
+    ),
+    (
+        // `SG.` verlangt zwei durch Punkt getrennte Abschnitte; ein Satzanfang
+        // erfüllt das nicht.
+        "near-miss-sendgrid",
+        "SG. Mueller hat den Termin bestaetigt",
+    ),
+    (
+        // Die neuen GitLab-Präfixe brauchen ebenfalls Mindestlänge.
+        "near-miss-gitlab-runner",
+        "glrt-kurz steht im Runner-Log",
+    ),
+    ("near-miss-gitlab-cbt", "glcbt-kurz steht im Job-Log"),
+    (
+        // Gegenprobe zu den vielen neuen `gl…`-Präfixen: Projektnamen bleiben.
+        "gitlab-project-slug",
+        "gruppe/gl-runner-config und gl-agent-doku bleiben Prosa",
+    ),
+    (
+        // `sk-` steht am Ende gewöhnlicher Wörter. Ohne Wortanfang-Prüfung
+        // schwärzt eine lange Build-Id hier die halbe Zeile.
+        "near-miss-task-id",
+        "Build task-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071 fertig",
+    ),
+    (
+        "near-miss-disk-id",
+        "disk-aaaaaaaabbbbccccddddeeeeeeeeeeeeaaaaaaaabbbbcccc gemountet",
+    ),
+    (
+        // `SG.` mitten im Wort.
+        "near-miss-msg-prefix",
+        "MSG.AbCdEfGhIjKlMnOpQr.AbCdEfGhIjKlMnOpQrStUv im Log",
+    ),
+    (
+        // Über Keys wird geredet — in Claude-Code-Sessions ständig. Ohne die
+        // Typ-Sektion im Muster wäre das ein Treffer.
+        "prose-about-anthropic-keys",
+        "Doku: https://docs.example.test/sk-ant-api-keys-rotieren-anleitung",
+    ),
+    (
+        "prose-about-slack-app",
+        "Job xapp-android-build-pipeline-nightly ist rot",
+    ),
     (
         // Der Vorfilter trifft `-----BEGIN `, die Regex verlangt PRIVATE KEY.
         "certificate-header",
@@ -875,6 +995,62 @@ fn every_known_token_format_has_a_fixture() {
     }
 
     report.finish("Token-Formen ohne Korpus-Abdeckung");
+}
+
+#[test]
+fn every_token_fixture_is_caught_by_the_token_rule_alone() {
+    // Der Namensabgleich oben beweist nur, *dass* ein Fixture existiert — nicht,
+    // dass die **Token-Regel** es fängt. In der Default-Policy greifen daneben
+    // Entropie-Netz und Key-Value-Detektor; ein Fixture kann also grün sein,
+    // während seine Regel gar nichts tut.
+    //
+    // Deshalb hier ein Durchlauf mit **nur** dem Token-Detektor. Erst damit
+    // ziehen die längeren Konstanten: Ein Rückbau der geweiteten Caps macht
+    // diesen Test rot, den Rest des Korpus nicht.
+    // Geprüft wird der **erste** `gone`-Eintrag: Bei den Token-Fixtures ist das
+    // per Konvention der Token selbst. Weitere Einträge dürfen zu anderen
+    // Schichten gehören — beim GitHub-Fixture etwa das `oauth2` aus der
+    // Credential-URL, das der URL-Detektor entfernt.
+    let token_only = RedactionPipeline::new().with(KnownTokenRedactor::new());
+    let formats = KnownTokenRedactor::new().covered_formats();
+    let mut report = Report::default();
+
+    for case in must_redact() {
+        if !formats.contains(&case.id) {
+            continue; // Fixture einer anderen Schicht (dotenv, URL, …)
+        }
+        let Some(token) = case.gone.first() else {
+            report.note(format!("{}: Fixture ohne gone-Eintrag", case.id));
+            continue;
+        };
+        let out = token_only.redact(&case.text);
+        if out.text.contains(token) {
+            report.note(format!(
+                "{}: {token:?} überlebt den reinen Token-Durchlauf:\n    {}",
+                case.id, out.text
+            ));
+            continue;
+        }
+        // Der volle String allein genügt als Nachweis nicht: Ein Fund, der nur
+        // bis zur ersten Wortgrenze reicht, lässt den **Schwanz** stehen — der
+        // Token-String als Ganzes ist dann weg, das Geheimnis aber nicht. Genau
+        // dieser Teilleck-Mechanismus ist der Grund für die geweiteten Caps,
+        // also wird er hier geprüft.
+        let tail = token
+            .char_indices()
+            .rev()
+            .nth(11)
+            .map(|(i, _)| &token[i..])
+            .unwrap_or(token);
+        if out.text.contains(tail) {
+            report.note(format!(
+                "{}: Ende {tail:?} überlebt — der Fund deckt den Token nur teilweise:\n    {}",
+                case.id, out.text
+            ));
+        }
+    }
+
+    report.finish("Token-Formen, die ohne die anderen Schichten nicht greifen");
 }
 
 // ---------------------------------------------------------------------------
