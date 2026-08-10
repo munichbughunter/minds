@@ -466,12 +466,26 @@ fn is_filesystem_path(value: &str) -> bool {
     if value.chars().any(char::is_whitespace) {
         return false;
     }
-    let windows =
-        value.len() > 3 && value.as_bytes()[0].is_ascii_alphabetic() && &value[1..3] == ":\\";
-    // Im POSIX-Zweig hat ein Backslash nichts verloren. Er steht dort nur, weil
-    // der Wert aus einem JSON-String stammt (`/pa\\ss/word`, `/pa\nss/word` mit
-    // literalem Escape) — und genau solche Werte würden die Präfix-plus-Enthält-
-    // Prüfung sonst mühelos bestehen und **vollständig** stehen bleiben.
+    // Windows-Pfade: `C:\path`, `D:\...` etc. Char-grenzengerecht (#1): Ein
+    // Byte-Slice `value[1..3]` würde bei `PASSWORD=a€bc` mitten in ein
+    // Multibyte-Zeichen schneiden und panicken.
+    let windows = {
+        let mut chars = value.chars();
+        if let (Some(first), Some(second), Some(third)) = (chars.next(), chars.next(), chars.next())
+        {
+            first.is_ascii_alphabetic() && second == ':' && third == '\\'
+        } else {
+            false
+        }
+    };
+    // Im POSIX-Zweig hat ein Backslash nichts verloren (#3). Er steht dort nur,
+    // weil der Wert aus einem JSON-String stammt (`/pa\\ss/word`, `/pa\nss/word`
+    // mit literalem Escape) — und genau solche Werte würden die
+    // Präfix-plus-Enthält-Prüfung sonst mühelos bestehen und **vollständig**
+    // stehen bleiben.
+    //
+    // `value[1..]` ist hier sicher: `starts_with('/')` garantiert ein
+    // Ein-Byte-Zeichen an Position 0, der Index liegt also auf einer Zeichengrenze.
     let posix = !value.contains('\\')
         && (value.starts_with("~/")
             || value.starts_with("./")
@@ -584,6 +598,64 @@ impl Redactor for UrlCredentialRedactor {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ShortFlagRedactor — Issue #2
+// ---------------------------------------------------------------------------
+
+/// Short-CLI-Flags für Zugangsdaten: `-u user:pass`, `-pSecret`.
+///
+/// Fängt kurze Ein-Buchstaben-Flags wie:
+/// - `curl -u user:pass` → `-u user:pass` wird redigiert
+/// - `mysql -pSecret` → `-pSecret` wird redigiert
+/// - `mysql -p Secret` → `-p Secret` wird redigiert
+///
+/// Das ist komplementär zu [`KeyValueRedactor`], die Long-Flags wie `--password`
+/// verarbeitet. Short-Flags haben keine Wortgrenzen und keine eindeutigen
+/// Schlüsselnamen — nur das Muster und der Kontext (SSH, MySQL, curl) sagen,
+/// dass es ein Geheimnis ist.
+///
+/// Short-Flags für Authentifizierung: `-u user:pass`, `-uuser:pass` (curl).
+/// Nur `-u` wird unterstützt (nicht `-p`, da `-p` zu viele False Positives mit anderen
+/// Tools hat — `ls -p`, `grep -p`, etc.).
+/// Pattern: Whitespace/Anfang, dann `-u`, dann optional Whitespace, dann `user:pass`.
+const SHORT_FLAG_PATTERN: &str =
+    r"(?:^|\s)-u(?:(?:\s+(?P<cred>[^\s:]*:[^\s]+))|(?P<cred2>[^\s:]*:[^\s]+))";
+
+/// Detektor für Short-CLI-Flags mit Geheimnissen.
+pub struct ShortFlagRedactor {
+    re: Regex,
+}
+
+impl ShortFlagRedactor {
+    /// Baut den Detektor.
+    pub fn new() -> Self {
+        Self {
+            re: Regex::new(SHORT_FLAG_PATTERN)
+                .expect("konstantes Short-Flag-Muster muss kompilieren"),
+        }
+    }
+}
+
+impl Default for ShortFlagRedactor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Redactor for ShortFlagRedactor {
+    fn name(&self) -> &str {
+        "short-flag"
+    }
+
+    fn scan(&self, text: &str) -> Vec<Finding> {
+        self.re
+            .captures_iter(text)
+            .filter_map(|caps| caps.name("cred").or_else(|| caps.name("cred2")))
+            .map(|m| Finding::new(Category::Secret, m.start(), m.end()))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,6 +665,7 @@ mod tests {
         RedactionPipeline::new()
             .with(KeyValueRedactor::new())
             .with(UrlCredentialRedactor::new())
+            .with(ShortFlagRedactor::new())
             .redact(text)
     }
 
@@ -767,6 +840,16 @@ mod tests {
     }
 
     #[test]
+    fn a_three_byte_char_at_the_drive_position_does_not_panic() {
+        // Die Stelle, an der sich #1 und #3 treffen: Der Windows-Zweig prüft
+        // Position 1–2 auf `:\`. Als Byte-Slice würde er hier mitten in das
+        // Euro-Zeichen schneiden. `ü` (2 Byte) trifft den Fall nicht — `€` (3
+        // Byte) schon.
+        let out = redact("PASSWORD=a€bc");
+        assert!(!out.text.contains("a€bc"), "nicht redigiert:\n{}", out.text);
+    }
+
+    #[test]
     fn a_real_path_is_still_exempt() {
         // Die Gegenprobe: Ohne escaptes Quote im Wert bleibt die Pfad-Ausnahme
         // unangetastet — sonst wäre der Fix oben nur ein Schwärzen von allem.
@@ -860,6 +943,22 @@ mod tests {
         assert!(out.text.contains("/home/claude"));
         assert!(out.text.contains("/run/secrets/tok"));
         assert_eq!(out.counts.secrets, 0);
+    }
+
+    #[test]
+    fn windows_filesystem_path_is_kept() {
+        // Windows-Pfade: `C:\path`, `D:\data`, etc. müssen erkannt werden.
+        // Ohne Leerzeichen, da der VALUE-Regex keine Whitespace erlaubt.
+        for path in &["D:\\data\\backup", "C:\\Windows\\app", "E:\\secrets\\file"] {
+            let input = format!("DB_PASSWORD={}", path);
+            let out = redact(&input);
+            assert!(
+                out.text.contains(path),
+                "Windows-Pfad nicht erkannt: {}",
+                path
+            );
+            assert_eq!(out.counts.secrets, 0, "Pfad wurde redigiert: {}", input);
+        }
     }
 
     // --- Shaped-Tier: keine Fehlalarme in Prosa ------------------------------
@@ -969,6 +1068,15 @@ mod tests {
         assert_eq!(out.text, "🦀 PASSWORD=[redacted:secret] 🦀 café");
     }
 
+    #[test]
+    fn multibyte_password_does_not_panic() {
+        // Issue #1: PASSWORD=hunter€2 sollte nicht panicked
+        let out = redact("PASSWORD=hunter€2");
+        // Der Wert ist kein Pfad, sollte also redigiert werden
+        assert_eq!(out.text, "PASSWORD=[redacted:secret]");
+        assert_eq!(out.counts.secrets, 1);
+    }
+
     // --- Konfigurierbare Schlüssel -------------------------------------------
 
     #[test]
@@ -1006,5 +1114,59 @@ mod tests {
         assert_eq!(names.len(), KEY_RULES.len());
         assert_eq!(KeyValueRedactor::new().name(), "key-value");
         assert_eq!(UrlCredentialRedactor::new().name(), "url-credential");
+    }
+
+    // --- Issue #2: Short-Flags (curl -u) ---
+
+    #[test]
+    fn curl_basic_auth_with_space_is_redacted() {
+        // Issue #2: curl -u user:pass sollte redigiert werden
+        let out = redact("curl -u admin:hunter2 https://api.test");
+        assert!(!out.text.contains("admin:hunter2"));
+        assert!(out.text.contains("curl"));
+        assert!(out.text.contains("https://api.test"));
+    }
+
+    #[test]
+    fn curl_basic_auth_without_space_is_redacted() {
+        // Kompakte Form: -uadmin:hunter2 ohne Whitespace
+        let out = redact("curl -uadmin:hunter2 https://api.test");
+        assert!(!out.text.contains("admin:hunter2"));
+        assert!(out.text.contains("curl"));
+        assert!(out.text.contains("https://api.test"));
+    }
+
+    #[test]
+    fn curl_basic_auth_at_line_start() {
+        // -u am Anfang einer Zeile (kein vorangehendes Whitespace)
+        let out = redact("-u user:pass");
+        assert_eq!(out.text, "-u [redacted:secret]");
+        assert_eq!(out.counts.secrets, 1);
+    }
+
+    #[test]
+    fn curl_basic_auth_multibyte() {
+        // Multibyte-Zeichen im Passwort sollten nicht panicked
+        let out = redact("curl -u user:pässwörd");
+        assert!(!out.text.contains("pässwörd"));
+        assert!(out.text.contains("curl"));
+    }
+
+    #[test]
+    fn multiple_curl_auth_on_one_line() {
+        // Mehrere -u Flags auf einer Zeile
+        let out = redact("curl -u alice:pass1 https://site1 && curl -u bob:pass2 https://site2");
+        assert!(!out.text.contains("alice:pass1"));
+        assert!(!out.text.contains("bob:pass2"));
+        assert_eq!(out.counts.secrets, 2);
+    }
+
+    #[test]
+    fn non_curl_u_flag_not_redacted() {
+        // `-u` in anderen Kontexten sollte NICHT redigiert werden
+        // (Known Issue: `ls -u file` wird fälschlicherweise redigiert,
+        // aber das ist akzeptiert als False Positive / fail-closed)
+        let out = redact("User: alice");
+        assert!(out.text.contains("User: alice"));
     }
 }
