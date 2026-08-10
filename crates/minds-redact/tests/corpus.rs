@@ -730,6 +730,16 @@ const DOCUMENTED_GAPS: &[(&str, &str, &str)] = &[
         "hunter2",
     ),
     (
+        // Zitiert ein Assistant den Inhalt einer Mauer-Datei in **Prosa**,
+        // sieht die pfadbasierte Mauer ihn nicht, und ein patternfreier Wert
+        // entgeht auch jedem Detektor. Gilt auf beiden Eingangswegen (Hook wie
+        // Import) gleichermaßen — seit #93 ist der Tool-Call-Weg dicht, dieser
+        // Prosa-Weg bleibt die benannte Restlücke.
+        "assistant-prose-echoes-walled-file",
+        "Die Datei .vault_pass enthaelt: korrekt-pferd-batterie-heftklammer",
+        "korrekt-pferd-batterie-heftklammer",
+    ),
+    (
         // Der **verschlüsselte** PEM nach RFC 1421 trägt zwischen BEGIN und
         // Körper zwei Kopfzeilen (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: …`).
         // Deren `:` und `,` stehen nicht in der Körperklasse, also greift die
