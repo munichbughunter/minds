@@ -60,7 +60,9 @@ mod secret;
 pub mod secretfile;
 mod session;
 
-pub use assignment::{KeyValueRedactor, Tier, UrlCredentialRedactor, has_credential_shape};
+pub use assignment::{
+    KeyValueRedactor, ShortFlagRedactor, Tier, UrlCredentialRedactor, has_credential_shape,
+};
 pub use config::{AllowList, ConfigError, DenyListRedactor, HighEntropyConfig, RedactionConfig};
 pub use pii::EmailRedactor;
 pub use pipeline::{RedactedText, RedactionPipeline};
