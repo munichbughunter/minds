@@ -46,6 +46,28 @@
 //! höchstens 4 bit/Zeichen und bleibt damit unter der Entropieschwelle). Trifft
 //! eine *Denylist* dort, war das eine bewusste Konfigurationsentscheidung.
 //!
+//! Das gilt seit #35 auch für die Felder, die lange als „kann nichts enthalten"
+//! ausgenommen waren: die Zeitstempel (`turns[t].at`, `lineage.started_at`,
+//! `lineage.ended_at`), die Kennung `lineage.local_id` und die Endpunkte in
+//! `edges`. Auf dem Hook-Pfad stimmte die Annahme — die Werte kommen von der
+//! eigenen Uhr und aus `SessionKey::new`. Auf dem **Import-Pfad** stammen sie
+//! aus einer fremden JSONL-Datei, und der Endpunkt einer Kante kommt direkt aus
+//! dem Payload der Gegenseite; geprüft wird dort nur der eigene Session-Key.
+//!
+//! Die Alternative wäre gewesen, statt zu scannen zu **validieren** (RFC 3339
+//! für die Zeitstempel, `SessionKey`-Charset für die Kennungen). Dagegen
+//! sprach die Crate-Grenze: Dieses Modul müsste dafür Format-Wissen tragen, das
+//! es nicht definiert — und beim ersten abweichenden Adapter würde es Sessions
+//! ablehnen, die niemand ablehnen wollte. Scannen ist die Antwort, die dem
+//! Rest des Envelopes gleicht.
+//!
+//! Genau **eine** Zeichenkette bleibt ungescannt: `effect.content`. Sie ist
+//! kein Gegenbeispiel, sondern der andere saubere Weg — dort erzwingt der Typ
+//! [`ContentHash`](minds_core::ContentHash) per `TryFrom<String>` 64
+//! Hex-Zeichen, ein fremder Adapter kann also gar nichts anderes hineinschreiben.
+//! Die Ausnahme steht an [`RedactionPipeline::redact_effect`] und ist dort an
+//! den Newtype-Vertrag gebunden, nicht an eine Detektor-Schwelle.
+//!
 //! # Was als Fehler gilt
 //!
 //! - [`RedactionError::NoDetectors`] — eine Pipeline ohne Detektoren würde
@@ -96,8 +118,8 @@
 use std::fmt;
 
 use minds_core::{
-    Agent, Effect, Intent, Lineage, Model, Produced, Redaction, RedactionCounts, Session, ToolCall,
-    Turn,
+    Agent, Edge, Effect, Endpoint, Intent, Lineage, Model, Produced, Redaction, RedactionCounts,
+    Session, ToolCall, Turn,
 };
 
 use crate::pipeline::RedactionPipeline;
@@ -184,6 +206,8 @@ pub enum Field {
     IntentDiscarded(usize),
     /// `turns[t].text`
     TurnText(usize),
+    /// `turns[t].at`
+    TurnAt(usize),
     /// `turns[t].tool_calls[c].name`
     ToolCallName {
         /// Index des Zugs.
@@ -211,6 +235,18 @@ pub enum Field {
     ProducedFile(usize),
     /// `lineage.cwd`
     LineageCwd,
+    /// `lineage.local_id`
+    LineageLocalId,
+    /// `lineage.started_at`
+    LineageStartedAt,
+    /// `lineage.ended_at`
+    LineageEndedAt,
+    /// `edges[e].to.agent`
+    EdgeAgent(usize),
+    /// `edges[e].to.local_id`
+    EdgeLocalId(usize),
+    /// `edges[e].to.id`
+    EdgeCommitId(usize),
 }
 
 impl fmt::Display for Field {
@@ -224,6 +260,7 @@ impl fmt::Display for Field {
             Field::IntentConstraint(i) => write!(f, "intent.constraints[{i}]"),
             Field::IntentDiscarded(i) => write!(f, "intent.discarded[{i}]"),
             Field::TurnText(t) => write!(f, "turns[{t}].text"),
+            Field::TurnAt(t) => write!(f, "turns[{t}].at"),
             Field::ToolCallName { turn, call } => {
                 write!(f, "turns[{turn}].tool_calls[{call}].name")
             }
@@ -236,6 +273,12 @@ impl fmt::Display for Field {
             Field::ProducedCommitHint => f.write_str("produced.commit_hint"),
             Field::ProducedFile(i) => write!(f, "produced.files[{i}]"),
             Field::LineageCwd => f.write_str("lineage.cwd"),
+            Field::LineageLocalId => f.write_str("lineage.local_id"),
+            Field::LineageStartedAt => f.write_str("lineage.started_at"),
+            Field::LineageEndedAt => f.write_str("lineage.ended_at"),
+            Field::EdgeAgent(e) => write!(f, "edges[{e}].to.agent"),
+            Field::EdgeLocalId(e) => write!(f, "edges[{e}].to.local_id"),
+            Field::EdgeCommitId(e) => write!(f, "edges[{e}].to.id"),
         }
     }
 }
@@ -424,9 +467,16 @@ impl RedactionPipeline {
             produced,
             // `lineage.cwd` und `effect.path` (unten) tragen fast immer einen
             // Home-Pfad und damit einen Benutzernamen — PII. Sie laufen deshalb
-            // durch dieselbe Pipeline wie jedes andere Textfeld. `edges` dagegen
-            // hält nur Agentnamen, UUIDs und Commit-Hashes: nichts Sensibles,
-            // deshalb unverändert durch.
+            // durch dieselbe Pipeline wie jedes andere Textfeld, ebenso die
+            // Zeitstempel und Kennungen daneben und die Endpunkte in `edges`.
+            //
+            // Hier stand einmal, `edges` halte „nur Agentnamen, UUIDs und
+            // Commit-Hashes: nichts Sensibles". Das war genau die Annahme über
+            // fremde Adapter, die die Modul-Doku als Anti-Pattern benennt: Auf
+            // dem Import-Pfad stammen `at` und `local_id` unvalidiert aus einer
+            // fremden JSONL-Datei, und der Endpunkt einer Kante kommt direkt aus
+            // dem Agent-Payload — geprüft wird dort nur der *eigene*
+            // Session-Key, nicht die Gegenseite.
             lineage,
             edges,
             // Wird unten aus dem Audit neu gesetzt; der alte Wert ist per
@@ -508,7 +558,12 @@ impl RedactionPipeline {
                 text,
                 tool_calls: redacted_calls,
                 parent,
-                at,
+                at: match at {
+                    Some(value) => {
+                        Some(self.redact_field(Field::TurnAt(turn_index), value, &mut audit)?)
+                    }
+                    None => None,
+                },
             });
         }
 
@@ -520,6 +575,7 @@ impl RedactionPipeline {
         let produced = Produced { commit_hint, files };
 
         let lineage = self.redact_lineage(lineage, &mut audit)?;
+        let edges = self.redact_edges(edges, &mut audit)?;
 
         let session = Session {
             schema_version,
@@ -594,10 +650,23 @@ impl RedactionPipeline {
 
     /// Redigiert den Pfad eines [`Effect`]; `kind` und `content` bleiben.
     ///
-    /// `content` ist ein blake3-Hash (Hex, geringe Entropie) und trägt nichts
-    /// Sensibles — der [`HighEntropyRedactor`](crate::HighEntropyRedactor) fasst
-    /// ihn ohnehin nicht an. Redigiert wird nur der Pfad, der bei absoluten
-    /// Angaben einen Benutzernamen enthalten kann.
+    /// Redigiert wird nur der Pfad, der bei absoluten Angaben einen
+    /// Benutzernamen enthalten kann.
+    ///
+    /// # `content` ist die einzige ungescannte Zeichenkette im Envelope
+    ///
+    /// Und sie ist es **wegen ihres Typs**, nicht wegen ihres Inhalts: Hier
+    /// stand früher „blake3-Hash, geringe Entropie, der Detektor fasst ihn
+    /// ohnehin nicht an" — das ist eine Aussage über Detektor-Schwellen und
+    /// damit dieselbe Sorte Annahme, die #35 an den Zeitstempeln aufgedeckt hat.
+    ///
+    /// Was hier trägt, ist [`ContentHash`](minds_core::ContentHash): ein
+    /// Newtype mit privatem Feld und `#[serde(try_from = "String")]`, dessen
+    /// Konvertierung 64 Hex-Zeichen erzwingt. Ein fremder Adapter *kann* dort
+    /// keinen Freitext unterbringen — die Deserialisierung schlägt vorher fehl.
+    ///
+    /// **Wer diese Prüfung lockert, muss hier scannen.** Der Build erinnert
+    /// nicht daran: Das Feld bliebe bestehen, nur seine Garantie wäre weg.
     fn redact_effect(
         &self,
         effect: Option<Effect>,
@@ -624,11 +693,19 @@ impl RedactionPipeline {
         }))
     }
 
-    /// Redigiert `lineage.cwd`; Kennung und Zeitfenster bleiben.
+    /// Redigiert die gesamte Herkunft — Kennung, Zeitfenster und
+    /// Arbeitsverzeichnis.
     ///
-    /// `local_id` ist die agent-eigene UUID, `started_at`/`ended_at` sind
-    /// Zeitstempel — beides keine PII. Nur `cwd` trägt in aller Regel einen
-    /// Home-Pfad und damit einen Benutzernamen.
+    /// `cwd` ist der offensichtliche Fall: Dort steht fast immer ein Home-Pfad
+    /// und damit ein Benutzername. Die drei anderen Felder standen lange nicht
+    /// hier, mit der Begründung „UUID und Zeitstempel, beides keine PII" — und
+    /// das ist auf dem Hook-Pfad auch richtig, weil die Werte von der eigenen
+    /// Uhr und aus `SessionKey::new` stammen.
+    ///
+    /// Auf dem **Import-Pfad** stimmt es nicht: Dort kommen `local_id` und die
+    /// Zeitstempel unvalidiert aus einer fremden JSONL-Datei. Eine Ausnahme ist
+    /// hier also eine Annahme über einen fremden Adapter — genau das, was die
+    /// Modul-Doku als Anti-Pattern benennt. Der Scan kostet drei kurze Strings.
     fn redact_lineage(
         &self,
         lineage: Option<Lineage>,
@@ -643,16 +720,61 @@ impl RedactionPipeline {
         else {
             return Ok(None);
         };
-        let cwd = match cwd {
-            Some(cwd) => Some(self.redact_field(Field::LineageCwd, cwd, audit)?),
-            None => None,
-        };
+        // Reihenfolge wie im Envelope deklariert — `RedactionAudit::sites` sagt
+        // zu, die Orte in genau dieser Folge zu liefern.
+        let local_id = self.redact_field(Field::LineageLocalId, local_id, audit)?;
+        let started_at = started_at
+            .map(|at| self.redact_field(Field::LineageStartedAt, at, audit))
+            .transpose()?;
+        let ended_at = ended_at
+            .map(|at| self.redact_field(Field::LineageEndedAt, at, audit))
+            .transpose()?;
+        let cwd = cwd
+            .map(|cwd| self.redact_field(Field::LineageCwd, cwd, audit))
+            .transpose()?;
         Ok(Some(Lineage {
             local_id,
             started_at,
             ended_at,
             cwd,
         }))
+    }
+
+    /// Redigiert die Endpunkte der Herkunftskanten.
+    ///
+    /// Der Endpunkt einer Kante ist die Stelle im Envelope, an der ein
+    /// **fremder** Agent am direktesten hineinschreibt: `agent` und `local_id`
+    /// kommen aus dem Payload der Gegenseite, und geprüft wird beim Anlegen nur
+    /// der eigene Session-Key. Ein Commit-Hash ist zwar Hex und trägt nichts —
+    /// aber dass er einer ist, weiß nur, wer dem Absender glaubt.
+    ///
+    /// `kind` und `evidence` sind Enums und haben keinen Text, den man scannen
+    /// könnte; sie wandern unverändert durch.
+    ///
+    /// Die Duplikatfreiheit, die `minds-capture` beim Anlegen herstellt, wird
+    /// hier **bewusst nicht** nachgezogen: Kollabieren zwei verschiedene
+    /// Endpunkte auf denselben Platzhalter, steht die Kante danach doppelt im
+    /// Envelope. Sie zusammenzuführen wäre die falsche Antwort — es waren zwei
+    /// verschiedene Sessions, und das darf der Record nicht verschweigen.
+    fn redact_edges(
+        &self,
+        edges: Vec<Edge>,
+        audit: &mut RedactionAudit,
+    ) -> Result<Vec<Edge>, RedactionError> {
+        let mut out = Vec::with_capacity(edges.len());
+        for (index, Edge { kind, to, evidence }) in edges.into_iter().enumerate() {
+            let to = match to {
+                Endpoint::Session { agent, local_id } => Endpoint::Session {
+                    agent: self.redact_field(Field::EdgeAgent(index), agent, audit)?,
+                    local_id: self.redact_field(Field::EdgeLocalId(index), local_id, audit)?,
+                },
+                Endpoint::Commit { id } => Endpoint::Commit {
+                    id: self.redact_field(Field::EdgeCommitId(index), id, audit)?,
+                },
+            };
+            out.push(Edge { kind, to, evidence });
+        }
+        Ok(out)
     }
 }
 
@@ -841,15 +963,56 @@ mod tests {
                 effect: None,
             }],
             parent: None,
-            at: None,
+            at: Some(TERM.into()),
         });
         s.produced = Produced {
             commit_hint: Some(TERM.into()),
             files: vec![TERM.into()],
         };
+        // Auf dem Import-Pfad kommen diese Werte aus einer fremden Datei, die
+        // Endpunkte sogar direkt aus dem Payload der Gegenseite.
+        s.lineage = Some(Lineage {
+            local_id: TERM.into(),
+            started_at: Some(TERM.into()),
+            ended_at: Some(TERM.into()),
+            cwd: Some(TERM.into()),
+        });
+        s.edges = vec![
+            Edge {
+                kind: minds_core::EdgeKind::Spawned,
+                to: Endpoint::Session {
+                    agent: TERM.into(),
+                    local_id: TERM.into(),
+                },
+                evidence: minds_core::Evidence::Declared,
+            },
+            Edge {
+                kind: minds_core::EdgeKind::Produced,
+                to: Endpoint::Commit { id: TERM.into() },
+                evidence: minds_core::Evidence::Declared,
+            },
+        ];
+
+        // Die Erwartung wird aus dem **Input** abgeleitet, nicht danebengezählt:
+        // Eine nachgetragene Zahl bliebe grün, wenn das Envelope um ein Feld
+        // wächst und jemand das Destructuring repariert, ohne zu scannen — der
+        // Test belegt das neue Feld ja nie. Über die kanonische Form zählt er
+        // stattdessen, wie viele Vorkommen es tatsächlich gibt.
+        let before = minds_core::to_canonical_string(&s).unwrap();
+        let expected = before.matches(TERM).count();
+        assert!(
+            expected >= 20,
+            "Fixture deckt zu wenige Felder ab: {expected}"
+        );
 
         let out = pipeline.redact_session(s).unwrap();
         let r = out.session();
+
+        let after = minds_core::to_canonical_string(r).unwrap();
+        assert!(
+            !after.contains(TERM),
+            "Leck in der kanonischen Form:\n{after}"
+        );
 
         for text in [
             &r.agent.name,
@@ -864,15 +1027,96 @@ mod tests {
             &r.turns[0].tool_calls[0].arguments,
             r.produced.commit_hint.as_ref().unwrap(),
             &r.produced.files[0],
+            r.turns[0].at.as_ref().unwrap(),
         ] {
             assert!(!text.contains(TERM), "Leck: {text}");
         }
 
-        // Zwölf Textfelder, zwölf Treffer. Wächst das Envelope, bricht zuerst
-        // `redact_session` — und danach diese Zahl.
-        assert_eq!(out.audit().fields_changed(), 12);
-        assert_eq!(r.redaction.counts.secrets, 12);
+        let lineage = r.lineage.as_ref().unwrap();
+        for text in [
+            &lineage.local_id,
+            lineage.started_at.as_ref().unwrap(),
+            lineage.ended_at.as_ref().unwrap(),
+            lineage.cwd.as_ref().unwrap(),
+        ] {
+            assert!(!text.contains(TERM), "Leck in lineage: {text}");
+        }
+
+        match &r.edges[0].to {
+            Endpoint::Session { agent, local_id } => {
+                assert!(!agent.contains(TERM), "Leck in edges[0].agent");
+                assert!(!local_id.contains(TERM), "Leck in edges[0].local_id");
+            }
+            other => panic!("unerwarteter Endpunkt: {other:?}"),
+        }
+        match &r.edges[1].to {
+            Endpoint::Commit { id } => assert!(!id.contains(TERM), "Leck in edges[1].id"),
+            other => panic!("unerwarteter Endpunkt: {other:?}"),
+        }
+
+        // So viele Vorkommen im Input, so viele geänderte Felder.
+        assert_eq!(out.audit().fields_changed(), expected);
+        assert_eq!(r.redaction.counts.secrets, expected as u32);
         assert_eq!(r.redaction.counts.pii, 0);
+    }
+
+    #[test]
+    fn a_realistic_lineage_survives_the_new_scan() {
+        // Die Gegenprobe zum Abdeckungstest: Der **Normalfall** darf durch die
+        // neu gescannten Felder nicht ärmer werden. Ein Agent, dessen
+        // Zeitstempel oder Kennung verschwindet, verliert seinen Platz in den
+        // Metriken und seine Identität im Record — lautlos.
+        //
+        // Der Test hält zugleich die Entropie-Schwelle fest: Eine Senkung
+        // würde hier zuerst sichtbar.
+        let mut s = session();
+        s.turns.push(Turn {
+            role: Role::Assistant,
+            text: "alles in Ordnung".into(),
+            tool_calls: Vec::new(),
+            parent: None,
+            at: Some("2026-07-23T09:12:04.512Z".into()),
+        });
+        s.lineage = Some(Lineage {
+            local_id: "31f3f224-f440-41ac-9bfa-0123456789ab".into(),
+            started_at: Some("2026-07-23T09:12:04.512Z".into()),
+            ended_at: Some("2026-07-23T11:12:04+02:00".into()),
+            cwd: Some("/srv/projekt".into()),
+        });
+        s.edges = vec![
+            Edge {
+                kind: minds_core::EdgeKind::Spawned,
+                to: Endpoint::Session {
+                    agent: "claude-code".into(),
+                    local_id: "9c1e5f80-2a44-4d31-8bfa-abcdef012345".into(),
+                },
+                evidence: minds_core::Evidence::Declared,
+            },
+            Edge {
+                kind: minds_core::EdgeKind::Produced,
+                to: Endpoint::Commit {
+                    id: "356a192b7913b04c54574d18c28d46e6395428ab".into(),
+                },
+                evidence: minds_core::Evidence::Declared,
+            },
+        ];
+
+        let out = pipeline().redact_session(s).unwrap();
+        let r = out.session();
+
+        assert_eq!(
+            r.redaction.counts,
+            RedactionCounts::default(),
+            "der Normalfall wurde angefasst: {:?}",
+            out.audit().sites()
+        );
+        let lineage = r.lineage.as_ref().unwrap();
+        assert_eq!(lineage.local_id, "31f3f224-f440-41ac-9bfa-0123456789ab");
+        assert_eq!(
+            lineage.started_at.as_deref(),
+            Some("2026-07-23T09:12:04.512Z")
+        );
+        assert_eq!(r.turns[0].at.as_deref(), Some("2026-07-23T09:12:04.512Z"));
     }
 
     #[test]

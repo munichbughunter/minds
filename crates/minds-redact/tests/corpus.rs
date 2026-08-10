@@ -608,6 +608,20 @@ const MUST_SURVIVE: &[(&str, &str)] = &[
         "Der Retry-Test flackert seit dem Umstieg auf tokio 1.35 sporadisch.",
     ),
     ("semver", "minds 0.1.0 (build 2026-07-22)"),
+    // --- Envelope-Felder, die seit #35 mitgescannt werden -------------------
+    //
+    // Sie stehen dort **nackt**, ohne Prosa drumherum — deshalb genügen die
+    // bestehenden Einträge mit Präfix (`hash: …`, `request_id: …`) nicht. Wird
+    // hier etwas rot, verliert eine Session ihren Zeitstempel oder ihre
+    // Agent-Identität, und zwar lautlos.
+    ("rfc3339-utc", "2026-07-23T09:12:04.512Z"),
+    ("rfc3339-offset", "2026-07-23T11:12:04+02:00"),
+    ("session-uuid-bare", "31f3f224-f440-41ac-9bfa-0123456789ab"),
+    (
+        "commit-endpoint-sha",
+        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    ),
+    ("agent-endpoint-name", "claude-code"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -645,6 +659,20 @@ const ACCEPTED_OVER_REDACTION: &[(&str, &str, &str)] = &[
         "escaped-space-costs-one-word",
         r"PASSWORD=abc\ und der Rest bleibt",
         "PASSWORD=[redacted:secret] der Rest bleibt",
+    ),
+    (
+        // Seit #35 läuft auch `lineage.local_id` durch die Pipeline. Eine
+        // UUID bleibt stehen (Entropie ~3.4 bit), eine 32-stellige
+        // base62-Kennung nicht — ein Agent mit dieser Konvention verliert
+        // damit seine Kennung im Record.
+        //
+        // Der Preis ist bewusst: Die Alternative wäre, dem fremden Adapter zu
+        // glauben, dass dort nie etwas anderes steht. Sobald der Store
+        // symbolische Endpunkte auflöst, darf eine geschwärzte Kennung
+        // allerdings **nicht** als gültiger Schlüssel gelten.
+        "base62-session-id",
+        "aB3xZ9qLmN7pQrS2tUvW4yZ6cD8eF0gH",
+        "[redacted:secret]",
     ),
     (
         // Unsauber escaptes JSON: Das Quote hinter `abc\` beendet den Wert
