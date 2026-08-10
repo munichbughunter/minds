@@ -23,11 +23,13 @@
 //! | [`EmailRedactor`] | E-Mail-Adressen | Form |
 //! | [`KeyValueRedactor`] | `DB_PASSWORD=hunter2`, `--token …` | **Schlüsselname** |
 //! | [`UrlCredentialRedactor`] | `postgres://user:pw@host` | **Struktur** |
+//! | [`ShortFlagRedactor`] | `curl -u user:pass` | **Struktur** |
 //! | [`DenyListRedactor`] | aufgezählte Begriffe | Config |
 //!
-//! Die letzten drei sind der Grund, warum kurze, entropiearme Passwörter nicht
-//! durchrutschen: `hunter2` ist als Wert nicht erkennbar — als Wert **hinter
-//! `PASSWORD=`** schon.
+//! [`KeyValueRedactor`], [`UrlCredentialRedactor`] und [`ShortFlagRedactor`]
+//! sind der Grund, warum kurze, entropiearme Passwörter nicht durchrutschen:
+//! `hunter2` ist als Wert nicht erkennbar — als Wert **hinter `PASSWORD=`**
+//! oder **hinter `-u admin:`** schon.
 //!
 //! # Schicht 3 — die Garantie: [`RedactionPipeline::redact_session`]
 //!
@@ -60,7 +62,9 @@ mod secret;
 pub mod secretfile;
 mod session;
 
-pub use assignment::{KeyValueRedactor, Tier, UrlCredentialRedactor, has_credential_shape};
+pub use assignment::{
+    KeyValueRedactor, ShortFlagRedactor, Tier, UrlCredentialRedactor, has_credential_shape,
+};
 pub use config::{AllowList, ConfigError, DenyListRedactor, HighEntropyConfig, RedactionConfig};
 pub use pii::EmailRedactor;
 pub use pipeline::{RedactedText, RedactionPipeline};

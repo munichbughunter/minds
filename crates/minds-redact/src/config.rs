@@ -40,6 +40,7 @@
 //! email           = true
 //! keyed_values    = true     # DB_PASSWORD=… — der .env-Fall
 //! url_credentials = true     # postgres://user:pw@host
+//! short_flags     = true     # curl -u user:pass
 //! allow           = ["AKIAIOSFODNN7EXAMPLE", "noreply@example.com"]
 //! secret_keys     = ["VAULT_ROLE_ID"]        # Feldnamen
 //! deny_secrets    = ["korrekt-pferd-batterie-klammer"]
@@ -66,7 +67,7 @@ use std::collections::HashSet;
 use aho_corasick::{AhoCorasick, MatchKind};
 use serde::{Deserialize, Serialize};
 
-use crate::assignment::{KeyValueRedactor, UrlCredentialRedactor};
+use crate::assignment::{KeyValueRedactor, ShortFlagRedactor, UrlCredentialRedactor};
 use crate::pii::EmailRedactor;
 use crate::pipeline::RedactionPipeline;
 use crate::redactor::{Category, Finding, Redactor};
@@ -319,6 +320,8 @@ pub struct RedactionConfig {
     /// Zugangsdaten im Autoritätsteil einer URL erkennen
     /// (`postgres://user:pw@host`).
     pub url_credentials: bool,
+    /// Short-CLI-Flags für Authentifizierung erkennen (`curl -u user:pass`).
+    pub short_flags: bool,
     /// Generisches High-Entropy-Auffangnetz.
     pub high_entropy: HighEntropyConfig,
     /// Zusätzliche **Schlüsselnamen**, deren Wert als Geheimnis gilt
@@ -344,6 +347,7 @@ impl Default for RedactionConfig {
             email: true,
             keyed_values: true,
             url_credentials: true,
+            short_flags: true,
             high_entropy: HighEntropyConfig::default(),
             secret_keys: Vec::new(),
             allow: Vec::new(),
@@ -397,6 +401,9 @@ impl RedactionConfig {
         }
         if self.url_credentials {
             pipeline.push(UrlCredentialRedactor::new());
+        }
+        if self.short_flags {
+            pipeline.push(ShortFlagRedactor::new());
         }
 
         let denylist = self.denylist()?;
@@ -602,10 +609,11 @@ mod tests {
 
         assert!(cfg.keyed_values);
         assert!(cfg.url_credentials);
+        assert!(cfg.short_flags);
 
-        // known-token + high-entropy + email + key-value + url-credential,
+        // known-token + high-entropy + email + key-value + url-credential + short-flag,
         // keine Denylist.
-        assert_eq!(cfg.pipeline().unwrap().len(), 5);
+        assert_eq!(cfg.pipeline().unwrap().len(), 6);
     }
 
     #[test]
@@ -693,6 +701,7 @@ mod tests {
             email: false,
             keyed_values: false,
             url_credentials: false,
+            short_flags: false,
             high_entropy: HighEntropyConfig {
                 enabled: false,
                 ..HighEntropyConfig::default()
