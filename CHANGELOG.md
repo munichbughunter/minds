@@ -19,6 +19,22 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Behoben
+
+- **Die Redaktion prüft jetzt wirklich jedes Textfeld des Envelopes** (#35).
+  Ausgenommen waren bislang die Zeitstempel (`turns[].at`,
+  `lineage.started_at`, `lineage.ended_at`), die Kennung `lineage.local_id`
+  und die Endpunkte der Herkunftskanten — mit der Begründung, dort könne
+  nichts stehen. Auf dem Hook-Pfad stimmte das; beim **Import** stammen diese
+  Werte aus einer fremden Transkriptdatei, und der Endpunkt einer Kante kommt
+  direkt aus dem Payload der Gegenseite.
+
+  Sichtbare Folge: In seltenen Fällen kann dort jetzt `[redacted:…]` stehen,
+  wo vorher ein Wert stand, und der Nenner in der Redaction-Meldung wächst.
+  Wo dabei erstmals etwas gefunden wird, ändert sich der Envelope und damit
+  die `SessionId` — ein erneuter Import derselben Session legt sie dann unter
+  einer zweiten Kennung ab.
+
 ## [0.1.1] — 2026-08-10 — „Der Hook feuert wirklich"
 
 *Elf Reparaturen an dem einen Versprechen, das alle anderen trägt: dass ein
