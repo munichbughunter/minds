@@ -358,8 +358,16 @@ fn is_filesystem_path(value: &str) -> bool {
     if value.chars().any(char::is_whitespace) {
         return false;
     }
-    let windows =
-        value.len() > 3 && value.as_bytes()[0].is_ascii_alphabetic() && &value[1..3] == ":\\";
+    // Windows-Pfade: `C:\path`, `D:\...` etc. Char-grenzengerecht.
+    let windows = {
+        let mut chars = value.chars();
+        if let (Some(first), Some(second), Some(third)) = (chars.next(), chars.next(), chars.next())
+        {
+            first.is_ascii_alphabetic() && second == ':' && third == '\\'
+        } else {
+            false
+        }
+    };
     windows
         || value.starts_with("~/")
         || value.starts_with("./")
@@ -605,6 +613,22 @@ mod tests {
         assert_eq!(out.counts.secrets, 0);
     }
 
+    #[test]
+    fn windows_filesystem_path_is_kept() {
+        // Windows-Pfade: `C:\path`, `D:\data`, etc. müssen erkannt werden.
+        // Ohne Leerzeichen, da der VALUE-Regex keine Whitespace erlaubt.
+        for path in &["D:\\data\\backup", "C:\\Windows\\app", "E:\\secrets\\file"] {
+            let input = format!("DB_PASSWORD={}", path);
+            let out = redact(&input);
+            assert!(
+                out.text.contains(path),
+                "Windows-Pfad nicht erkannt: {}",
+                path
+            );
+            assert_eq!(out.counts.secrets, 0, "Pfad wurde redigiert: {}", input);
+        }
+    }
+
     // --- Shaped-Tier: keine Fehlalarme in Prosa ------------------------------
 
     #[test]
@@ -710,6 +734,15 @@ mod tests {
     fn multibyte_context_is_preserved() {
         let out = redact("🦀 PASSWORD=hünter2 🦀 café");
         assert_eq!(out.text, "🦀 PASSWORD=[redacted:secret] 🦀 café");
+    }
+
+    #[test]
+    fn multibyte_password_does_not_panic() {
+        // Issue #1: PASSWORD=hunter€2 sollte nicht panicked
+        let out = redact("PASSWORD=hunter€2");
+        // Der Wert ist kein Pfad, sollte also redigiert werden
+        assert_eq!(out.text, "PASSWORD=[redacted:secret]");
+        assert_eq!(out.counts.secrets, 1);
     }
 
     // --- Konfigurierbare Schlüssel -------------------------------------------
