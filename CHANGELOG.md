@@ -19,6 +19,23 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-08-10 — „Der Hook feuert wirklich"
+
+*Elf Reparaturen an dem einen Versprechen, das alle anderen trägt: dass ein
+Commit erfasst wird. Keine neue Funktionalität — und trotzdem das Release, ohne
+das jedes Feature unsichtbar geblieben wäre.*
+
+Der rote Faden ist die **stille Falschheit**. Fast jeder Fehler hier meldete
+Erfolg und tat nichts: `enable` schrieb Hooks in ein Verzeichnis, aus dem Git
+nie liest; die Hooks fanden `minds` nicht und schwiegen; ein Tippfehler
+schaltete das CI-Gate ab und ließ die Pipeline grün; ein eingecheckter
+Fremdeintrag verhinderte die Registrierung, ohne dass es jemand sah. Was diese
+Fälle verbindet, ist nicht ihre Ursache, sondern ihre Bauart — sie brechen
+nichts, sie hören nur auf zu arbeiten.
+
+`minds fsck` ist deshalb das Kommando, das in diesem Release am meisten
+gewachsen ist: Es benennt inzwischen jeden dieser Zustände.
+
 ### Behoben
 
 - Die Agent-Registrierungen haben eine **Soll-Quelle** bekommen, und die
@@ -390,6 +407,48 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   Hook aus einer älteren `minds` sah damit heil aus, obwohl Git ihn ausführt und er
   nicht mehr tut, was er soll. Der Rat ist `minds enable`; ein Hinweis, kein Befund.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
+
+### Bekannte Einschränkungen
+
+*Der Stand von v0.1.1. Die Liste unter v0.1.0 beschreibt den damaligen Stand und
+wird nicht rückwirkend umgeschrieben — was dort steht, gilt heute teilweise nicht
+mehr (die PATH-Abhängigkeit etwa ist mit
+[#25](https://github.com/munichbughunter/minds/issues/25) weg).*
+
+- **Die Redaktion hat bekannte Lücken.** `curl -u user:pass` wird nicht redigiert
+  ([#2](https://github.com/munichbughunter/minds/issues/2)), JSON-escapte Secrets
+  und PEM-Schlüssel mit literalem `\n` leaken teilweise
+  ([#3](https://github.com/munichbughunter/minds/issues/3)), `sk-ant`/`sk-proj`
+  fehlen in den Token-Regeln
+  ([#33](https://github.com/munichbughunter/minds/issues/33)), und ein
+  Multibyte-Zeichen im Wert (`PASSWORD=hunter€2`) löst einen Panic aus
+  ([#1](https://github.com/munichbughunter/minds/issues/1)). **Das ist der
+  Schwerpunkt der nächsten Version.** Wer heute mit fremdem oder besonders
+  schutzbedürftigem Code arbeitet, sollte das wissen.
+- **`minds forget` tilgt nicht überall.** Der Session-Branch auf der Forge bleibt
+  ([#5](https://github.com/munichbughunter/minds/issues/5)), ein erneuter `put`
+  reanimiert die Session ([#6](https://github.com/munichbughunter/minds/issues/6)),
+  und der Klartext bleibt als Parent-Commit erreichbar
+  ([#14](https://github.com/munichbughunter/minds/issues/14)). Zusätzlich liefern
+  `recall`, `distill` und `brief` **nichts mehr**, sobald eine Session getilgt
+  wurde ([#83](https://github.com/munichbughunter/minds/issues/83)).
+- **`minds gitlab mirror` funktioniert nicht.** Der Notiz-Body geht als Header
+  über die Leitung, GitLab lehnt mit „body is missing" ab
+  ([#7](https://github.com/munichbughunter/minds/issues/7)).
+- **Im verlinkten Worktree** zeigen `minds show` und `minds why` den Commit des
+  Hauptbaums. Erfassung und `fsck` stimmen dort, das Nachschlagen nicht
+  ([#20](https://github.com/munichbughunter/minds/issues/20)).
+- **Ein `git push` öffnet zwei Netzwerkverbindungen**, wenn es neue Sessions zu
+  übertragen gibt: eine für den Kontext, eine für den Code. Spürbar gegen
+  entfernte Remotes ([#85](https://github.com/munichbughunter/minds/issues/85)).
+  Ohne neue Sessions kostet der Hook nichts.
+- **Kein Windows-Binary.** Gebaut werden macOS (Apple Silicon und Intel) und Linux
+  (x86_64 und ARM64, musl/statisch). Unter Windows über WSL oder aus dem Quelltext.
+- **Die Tool-Ebene ist Claude-Code-spezifisch.** Für Codex, Cursor, Gemini und
+  opencode wird der Prompt erfasst, aber Tool-Aufrufe, berührte Dateien und
+  Modell-/Token-Angaben werden nicht ausgewertet.
+- **Die Review-Schicht braucht zwei Personen auf einem Repo**, um beansprucht zu
+  werden.
 
 ## [0.1.0] — 2026-07-29
 
