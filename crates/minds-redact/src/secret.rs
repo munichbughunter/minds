@@ -62,6 +62,17 @@ struct TokenRule {
     /// Am Anfang verankertes (`\A`), striktes, längenbegrenztes Muster, das die
     /// volle Token-Form *inklusive* Präfix beschreibt.
     pattern: &'static str,
+    /// Ob der Präfix am **Wortanfang** stehen muss.
+    ///
+    /// Für Präfixe, die auch als Wortende vorkommen: `sk-` steht in `disk-`,
+    /// `task-`, `risk-`; `SG.` in `MSG.`. Ohne diese Prüfung wird aus
+    /// `disk-<lange Build-ID>` ein Fund, der die halbe Zeile schwärzt.
+    ///
+    /// Bewusst **nicht** für alle Regeln: Ein Token, das ohne Trenner in einem
+    /// base64-Blob steckt, soll weiter gefunden werden. Die Prüfung kostet
+    /// Recall und wird nur dort bezahlt, wo sie nachweislich Fehlalarme
+    /// verhindert.
+    needs_word_start: bool,
 }
 
 /// Die Regeltabelle. Bewusst kuratiert auf hochwertige, fehlalarmarme Formen mit
@@ -69,54 +80,154 @@ struct TokenRule {
 ///
 /// Jedes `pattern` ist mit `\A` verankert und in der Länge gedeckelt (keine
 /// offenen `+`/`*` ohne Obergrenze), damit Funde präzise begrenzt bleiben.
+///
+/// # Bewusst *nicht* enthalten: der kontextfreie AWS-Secret-Key
+///
+/// Ein AWS Secret Access Key ist 40 Zeichen base64 **ohne Präfix** — es gibt
+/// nichts, woran ein Vorfilter greifen könnte. Die naheliegende Regel
+/// `\b[A-Za-z0-9/+=]{40}\b` träfe jeden **Git-SHA**, und minds ist ein
+/// Git-Werkzeug: Commit-Hashes stehen in praktisch jedem Transkript. Der
+/// Record wäre unbrauchbar.
+///
+/// Ungeschützt ist der Key deshalb nicht — er wird von den anderen Schichten
+/// getragen: `.aws/credentials` ist über [`crate::secretfile`] gemauert, die
+/// beschriftete Form (`aws_secret_access_key=…`) fängt der
+/// [`KeyValueRedactor`](crate::KeyValueRedactor), und der kontextfreie Fall
+/// liegt beim Entropie-Netz. Dort bleibt ein kleiner Rest: base64-Läufe dieser
+/// Länge liegen nur selten unter der Schwelle von 4.5 bit/Zeichen.
 const RULES: &[TokenRule] = &[
     // AWS Access Key ID: AKIA/ASIA + 16 Großbuchstaben/Ziffern.
     TokenRule {
         name: "aws-access-key-id",
         prefixes: &["AKIA", "ASIA"],
         pattern: r"\A(?:AKIA|ASIA)[0-9A-Z]{16}",
+        needs_word_start: false,
     },
     // GitHub-Token (PAT/OAuth/App): ghp_/gho_/ghu_/ghs_/ghr_ + 36 alnum.
     TokenRule {
         name: "github-token",
         prefixes: &["ghp_", "gho_", "ghu_", "ghs_", "ghr_"],
         pattern: r"\Agh[pousr]_[0-9A-Za-z]{36}",
+        needs_word_start: false,
     },
     // GitHub Fine-grained PAT: github_pat_ + 22 alnum + _ + 59 alnum.
     TokenRule {
         name: "github-fine-grained-pat",
         prefixes: &["github_pat_"],
         pattern: r"\Agithub_pat_[0-9A-Za-z]{22}_[0-9A-Za-z]{59}",
+        needs_word_start: false,
     },
-    // GitLab Personal Access Token: glpat- + 20 Zeichen (base64url-ish).
+    // Anthropic API Key: sk-ant- + **Typ-Sektion** + Rest. Für dieses Projekt
+    // die wichtigste Form überhaupt — die Testgruppe arbeitet mit Claude Code,
+    // diese Keys stehen buchstäblich in den Sessions, die minds archiviert.
+    //
+    // Die Typ-Sektion (`api03`, `oat01`, `sid01`, `adm01`) ist nicht Kosmetik,
+    // sondern trennt Key von Prosa: Ohne sie matcht jede Kebab-Kette hinter
+    // `sk-ant-`, und ausgerechnet in Claude-Code-Sessions wird über Keys
+    // *geredet* — `sk-ant-api-keys-rotieren-anleitung` hätte den Record
+    // zerstört.
+    TokenRule {
+        name: "anthropic-api-key",
+        prefixes: &["sk-ant-"],
+        pattern: r"\Ask-ant-[a-z]{3}[0-9]{2}-[0-9A-Za-z_-]{24,256}\b",
+        needs_word_start: false,
+    },
+    // OpenAI: die neuen typisierten Keys (`sk-proj-`, `sk-svcacct-`,
+    // `sk-admin-`) und die alte Form `sk-` + 48 alnum.
+    //
+    // Das nackte `sk-` ist der Grund, warum der Vorfilter **überlappend**
+    // suchen muss: Es ist ein Präfix von `sk-ant-`. Meldete der Automat an
+    // einer Position nur den kürzesten Treffer, liefe ein Anthropic-Key in
+    // diese Regel, scheiterte an ihr — und wäre nie geprüft worden.
+    //
+    // `needs_word_start`, weil `sk-` auch am Ende gewöhnlicher Wörter steht:
+    // `disk-`, `task-`, `risk-`, `desk-`. Mit einer langen Build-ID dahinter
+    // wäre jedes davon ein Fehlalarm.
+    TokenRule {
+        name: "openai-api-key",
+        prefixes: &["sk-proj-", "sk-svcacct-", "sk-admin-", "sk-"],
+        pattern: r"\Ask-(?:(?:proj|svcacct|admin)-[0-9A-Za-z_-]{20,256}|[0-9A-Za-z]{48})\b",
+        needs_word_start: true,
+    },
+    // GitLab — und hier lohnt die Vollständigkeit besonders, weil Produkt und
+    // Testgruppe auf GitLab zielen. Neben dem PAT gibt es eine ganze Familie:
+    // Runner (`glrt-`), Deploy (`gldt-`), **CI/CD-Job-Token** (`glcbt-`),
+    // Pipeline-Trigger (`glptt-`), Feed (`glft-`), Incoming Mail (`glimt-`),
+    // Agent für Kubernetes (`glagent-`), SCIM (`glsoat-`).
+    //
+    // `glcbt-` ist der wahrscheinlichste Token in einer Agent-Session mit
+    // GitLab-CI überhaupt, und `glptt-` ist der gefährlichste: 40 Hex-Zeichen
+    // liegen mit H ≈ 4.0 **strukturell** unter der Entropie-Schwelle von 4.5 —
+    // das Auffangnetz fängt diese Form nie, egal wie lang sie ist. Ohne Regel
+    // steht der Token im Klartext im Envelope.
     TokenRule {
         name: "gitlab-pat",
-        prefixes: &["glpat-"],
-        pattern: r"\Aglpat-[0-9A-Za-z_-]{20}",
+        prefixes: &[
+            "glpat-", "glrt-", "gldt-", "glcbt-", "glptt-", "glft-", "glimt-", "glagent-",
+            "glsoat-",
+        ],
+        pattern: r"\Agl(?:pat|rt|dt|cbt|ptt|ft|imt|agent|soat)-[0-9A-Za-z_-]{20,128}\b",
+        needs_word_start: false,
     },
-    // Slack-Token: xox[baprse]- + 10–48 Zeichen. Obergrenze gegen Überlauf.
+    // Slack-Token: Bot/User/App-Level, Client (`xoxc-`) und das zugehörige
+    // `d`-Cookie (`xoxd-`). Die beiden letzten sind bei Browser-Auth **immer
+    // ein Paar** — eins allein ist nutzlos, beide zusammen sind eine
+    // vollständige Session-Übernahme.
+    //
+    // Der Cap ist bewusst großzügig: Reale `xoxc-`/`xoxp-` haben die Form
+    // `<team>-<user>-<session>-<64 hex>` und liegen bei ~106 Zeichen. Ein zu
+    // kleiner Cap schneidet den Fund ab und lässt den Schwanz stehen — und
+    // gerade bei hex-lastigen Läufen rettet das Entropie-Netz nicht. Hinter
+    // `xox…-` steht nie Prosa, Über-Redaktion kostet hier also nichts.
+    //
+    // `xapp-` bekommt die Ziffern-Sektion, weil es sonst jeden Projektnamen
+    // trifft (`xapp-android-build-pipeline-nightly`).
     TokenRule {
         name: "slack-token",
-        prefixes: &["xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxe-"],
-        pattern: r"\Axox[baprse]-[0-9A-Za-z-]{10,48}",
+        prefixes: &[
+            "xoxb-", "xoxa-", "xoxp-", "xoxr-", "xoxs-", "xoxe-", "xoxc-", "xoxd-", "xapp-",
+        ],
+        pattern: r"\A(?:xox[baprsecd]-|xapp-[0-9]-)[0-9A-Za-z-]{10,255}\b",
+        needs_word_start: false,
+    },
+    // Legacy-Runner-Registrierungstoken: fester Präfix `GR1348941`.
+    TokenRule {
+        name: "gitlab-runner-registration",
+        prefixes: &["GR1348941"],
+        pattern: r"\AGR1348941[0-9A-Za-z_-]{20,64}\b",
+        needs_word_start: false,
+    },
+    // SendGrid API Key: SG. + Key-Id + . + Secret. `needs_word_start`, weil
+    // der Präfix sonst mitten im Wort feuert (`MSG.`).
+    TokenRule {
+        name: "sendgrid-key",
+        prefixes: &["SG."],
+        pattern: r"\ASG\.[0-9A-Za-z_-]{16,32}\.[0-9A-Za-z_-]{16,64}\b",
+        needs_word_start: true,
     },
     // Google API Key: AIza + 35 Zeichen.
     TokenRule {
         name: "google-api-key",
         prefixes: &["AIza"],
         pattern: r"\AAIza[0-9A-Za-z_-]{35}",
+        needs_word_start: false,
     },
-    // Stripe Live Secret/Restricted Key: sk_live_/rk_live_ + 16–64 alnum.
+    // Stripe Live Secret/Restricted Key: sk_live_/rk_live_ + alnum. Neuere
+    // Keys reichen deutlich über die ursprünglichen 64 Zeichen hinaus; ohne
+    // den größeren Cap deckt der Fund nur den Anfang ab und der Rest hängt am
+    // Entropie-Netz.
     TokenRule {
         name: "stripe-live-key",
         prefixes: &["sk_live_", "rk_live_"],
-        pattern: r"\A(?:sk|rk)_live_[0-9A-Za-z]{16,64}",
+        pattern: r"\A(?:sk|rk)_live_[0-9A-Za-z]{16,128}",
+        needs_word_start: false,
     },
     // npm Access Token: npm_ + 36 alnum.
     TokenRule {
         name: "npm-token",
         prefixes: &["npm_"],
         pattern: r"\Anpm_[0-9A-Za-z]{36}",
+        needs_word_start: false,
     },
     // JSON Web Token: header.payload.signature, jede Sektion base64url. Der
     // Header beginnt fast immer mit `eyJ` (base64url von `{"`). Längen gedeckelt.
@@ -124,6 +235,7 @@ const RULES: &[TokenRule] = &[
         name: "jwt",
         prefixes: &["eyJ"],
         pattern: r"\AeyJ[0-9A-Za-z_=-]{10,4000}\.[0-9A-Za-z_=-]{6,4000}\.[0-9A-Za-z_=-]{6,4000}",
+        needs_word_start: false,
     },
     // PEM Private-Key-Block: BEGIN…END, optionaler Key-Typ, base64/Whitespace-
     // Körper (gedeckelt). Der Vorfilter „-----BEGIN " matcht auch CERTIFICATE —
@@ -150,6 +262,7 @@ const RULES: &[TokenRule] = &[
             r"[A-Za-z0-9+/=\s\\]{0,10000}?",
             r"-----END (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
         ),
+        needs_word_start: false,
     },
 ];
 
@@ -195,9 +308,10 @@ impl KnownTokenRedactor {
             });
         }
 
-        // `Standard` genügt: wir wollen jedes Präfix-Vorkommen als Kandidat, die
-        // Regex entscheidet danach. Überlappungen zwischen Kandidaten löst die
-        // Pipeline beim Zusammenführen.
+        // `Standard` ist Pflicht, nicht Geschmackssache: Nur diese Semantik
+        // erlaubt die überlappende Suche in [`Redactor::scan`], und die
+        // brauchen wir, seit ein Präfix Präfix eines anderen sein kann
+        // (`sk-` und `sk-ant-`).
         let prefilter = AhoCorasick::builder()
             .match_kind(MatchKind::Standard)
             .build(&prefixes)
@@ -230,8 +344,25 @@ impl Redactor for KnownTokenRedactor {
 
     fn scan(&self, text: &str) -> Vec<Finding> {
         let mut out = Vec::new();
-        for m in self.prefilter.find_iter(text) {
+        // **Überlappend** suchen, nicht `find_iter`: Ist ein Präfix Präfix
+        // eines anderen (`sk-` und `sk-ant-`), meldet die nicht-überlappende
+        // Suche an einer Position nur den kürzesten Treffer. Der Anthropic-Key
+        // liefe dann in die OpenAI-Regel, scheiterte an ihr — und die
+        // zuständige Regel wäre nie gefragt worden. Jedes Präfix-Vorkommen ist
+        // ein Kandidat; welche Regel greift, entscheidet die Regex danach.
+        // Überlappende *Funde* führt die Pipeline anschließend zusammen.
+        for m in self.prefilter.find_overlapping_iter(text) {
             let start = m.start();
+            let rule_spec = &RULES[self.prefix_to_rule[m.pattern().as_usize()]];
+            // Präfixe, die auch Wortende sein können (`sk-` in `disk-`, `SG.`
+            // in `MSG.`), nur am Wortanfang zulassen. Alle Präfixe sind ASCII,
+            // deshalb genügt der Byte-Blick zurück.
+            if rule_spec.needs_word_start
+                && start > 0
+                && text.as_bytes()[start - 1].is_ascii_alphanumeric()
+            {
+                continue;
+            }
             let rule = &self.rules[self.prefix_to_rule[m.pattern().as_usize()]];
             // `\A` verankert am Anfang des Slices — ein Treffer beginnt also
             // zwingend bei `start`. `start` liegt auf einer UTF-8-Grenze, weil
@@ -424,7 +555,7 @@ mod tests {
 
     #[test]
     fn detects_slack_token() {
-        let token = "xoxb-123456789012-abcdefghijklmnopqrstuvwx";
+        let token = concat!("xoxb", "-123456789012-abcdefghijklmnopqrstuvwx");
         let (_, n) = redact_with(KnownTokenRedactor::new(), token);
         assert_eq!(n, 1);
     }
@@ -540,7 +671,154 @@ mod tests {
         assert!(formats.contains(&"aws-access-key-id"));
         assert!(formats.contains(&"gitlab-pat"));
         assert!(formats.contains(&"private-key-pem"));
+        assert!(formats.contains(&"anthropic-api-key"));
         assert_eq!(formats.len(), RULES.len());
+    }
+
+    #[test]
+    fn a_prefix_that_starts_with_another_prefix_is_still_a_candidate() {
+        // `sk-` ist ein Präfix von `sk-ant-`. Meldete der Vorfilter an einer
+        // Position nur den kürzesten Treffer, liefe ein Anthropic-Key in die
+        // OpenAI-Regel, scheiterte dort — und wäre nie geprüft worden.
+        //
+        // Der Test läuft **ohne** Entropie-Netz: Sonst bewiese er nur, dass
+        // irgendein Detektor zugegriffen hat, nicht die Token-Regel.
+        let key = concat!(
+            "sk-ant",
+            "-api03-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v2W3x4Y5z6"
+        );
+        let (text, n) = redact_with(
+            KnownTokenRedactor::new(),
+            &format!("Fehler: {key} ungueltig"),
+        );
+        assert_eq!(n, 1, "kein known-token-Fund fuer sk-ant:\n{text}");
+        assert!(!text.contains("api03"), "Key steht noch im Text:\n{text}");
+        assert!(text.starts_with("Fehler: "), "Kontext weg:\n{text}");
+    }
+
+    #[test]
+    fn the_new_token_formats_are_caught_without_the_entropy_net() {
+        // Akzeptanzkriterium aus #33: Die Abdeckung darf nicht am Netz hängen.
+        // Ein Key in einer Fehlermeldung hat keine Zuweisung, die der
+        // Key-Value-Detektor sehen könnte — hier zählt allein die Token-Regel.
+        for (form, token) in [
+            (
+                "openai-proj",
+                concat!("sk-proj", "-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"),
+            ),
+            (
+                "openai-legacy",
+                "sk-A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0U1v2W3x4",
+            ),
+            ("gitlab-runner", concat!("glrt", "-A1b2C3d4E5f6G7h8I9j0K1")),
+            ("gitlab-deploy", concat!("gldt", "-A1b2C3d4E5f6G7h8I9j0K1")),
+            // Der wahrscheinlichste Token einer GitLab-CI-Session.
+            (
+                "gitlab-ci-job",
+                concat!("glcbt", "-K7pR2xQm9vTzL4nB6wYdA1b2"),
+            ),
+            (
+                "gitlab-ci-job-routable",
+                concat!("glcbt", "-1_K7pR2xQm9vTzL4nB6wYd"),
+            ),
+            // 40 Hex: H ≈ 4.0, das Entropie-Netz kann hier konstruktions-
+            // bedingt nicht helfen. Ohne eigene Regel bliebe der Token stehen.
+            (
+                "gitlab-trigger",
+                concat!("glptt", "-a3f9c21b8e4d70561fa2b93c8d7e015426ab9cd3"),
+            ),
+            (
+                "gitlab-agent",
+                concat!("glagent", "-K7pR2xQm9vTzL4nB6wYdA1b2"),
+            ),
+            ("gitlab-feed", concat!("glft", "-K7pR2xQm9vTzL4nB6wYdA1b2")),
+            (
+                "gitlab-runner-registration",
+                concat!("GR13489", "41K7pR2xQm9vTzL4nB6wYd"),
+            ),
+            // Das Gegenstück zu xoxc- bei Browser-Auth; ebenfalls Hex.
+            (
+                "slack-d-cookie",
+                concat!(
+                    "xoxd",
+                    "-a3f9c21b8e4d70561fa2b93c8d7e015426ab9cd3f81e2a740b6c359d8e1f0a2b"
+                ),
+            ),
+            // Volle reale Länge (~106 Zeichen nach dem Präfix): Ein zu kleiner
+            // Cap schnitte den Fund ab und ließe den Schwanz stehen.
+            (
+                "slack-client-full-length",
+                concat!(
+                    "xoxc",
+                    "-2345678901234-2345678901234-2345678901234-a3f9c21b8e4d70561fa2b93c8d7e015426ab9cd3f81e2a740b6c359d8e1f0a2b"
+                ),
+            ),
+            (
+                "anthropic-oauth",
+                concat!(
+                    "sk-ant",
+                    "-oat01-AbCdEf0123456789_-AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AAA"
+                ),
+            ),
+            (
+                "slack-client",
+                concat!("xoxc", "-1234567890-1234567890-A1b2C3d4E5f6G7h8I9j0K1l2"),
+            ),
+            (
+                "slack-app-level",
+                concat!("xapp", "-1-A01BCDEFGHI-1234567890123-A1b2C3d4E5f6G7h8I9j0"),
+            ),
+            (
+                "sendgrid",
+                concat!(
+                    "SG",
+                    ".A1b2C3d4E5f6G7h8I9j0K1.A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"
+                ),
+            ),
+        ] {
+            let (text, n) = redact_with(
+                KnownTokenRedactor::new(),
+                &format!("Fehler: {token} abgelehnt"),
+            );
+            assert_eq!(n, 1, "{form}: kein known-token-Fund:\n{text}");
+            assert_eq!(
+                text, "Fehler: [redacted:secret] abgelehnt",
+                "{form}: Fund deckt nicht den ganzen Token ab"
+            );
+        }
+    }
+
+    #[test]
+    fn token_prefixes_that_are_also_word_endings_do_not_fire() {
+        // `sk-` steht am Ende gewöhnlicher Wörter, `SG.` mitten in `MSG.`.
+        // Mit einer langen Id dahinter wäre jedes davon ein Fehlalarm, der
+        // eine halbe Zeile schwärzt — der Record wäre kaputt, ohne dass
+        // irgendetwas geschützt würde.
+        for text in [
+            "Build task-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071 fertig",
+            "disk-aaaaaaaabbbbccccddddeeeeeeeeeeeeaaaaaaaabbbbcccc gemountet",
+            "MSG.AbCdEfGhIjKlMnOpQr.AbCdEfGhIjKlMnOpQrStUv im Log",
+        ] {
+            let (out, n) = redact_with(KnownTokenRedactor::new(), text);
+            assert_eq!(n, 0, "Fehlalarm auf {text:?}:\n{out}");
+            assert_eq!(out, text);
+        }
+    }
+
+    #[test]
+    fn talking_about_keys_does_not_redact_the_sentence() {
+        // In Claude-Code-Sessions wird über Keys *geredet*. Ohne die
+        // Typ-Sektion im Anthropic-Muster und die Ziffern-Sektion bei `xapp-`
+        // matchte jede Kebab-Kette hinter dem Präfix.
+        for text in [
+            "Doku: https://docs.example.test/sk-ant-api-keys-rotieren-anleitung",
+            "Branch feature/sk-ant-key-rotation-und-fehlerbehandlung gemergt",
+            "Job xapp-android-build-pipeline-nightly ist rot",
+            "Ordner xapp-frontend-komponenten-bibliothek angelegt",
+        ] {
+            let (out, n) = redact_with(KnownTokenRedactor::new(), text);
+            assert_eq!(n, 0, "Fehlalarm auf {text:?}:\n{out}");
+        }
     }
 
     // --- High-Entropy ---------------------------------------------------------
