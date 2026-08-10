@@ -128,12 +128,26 @@ const RULES: &[TokenRule] = &[
     // PEM Private-Key-Block: BEGIN…END, optionaler Key-Typ, base64/Whitespace-
     // Körper (gedeckelt). Der Vorfilter „-----BEGIN " matcht auch CERTIFICATE —
     // die Regex verwirft das, weil sie „PRIVATE KEY" verlangt.
+    //
+    // Der Backslash in der Körperklasse ist der **JSON-Fall**: Tool-Argumente
+    // liegen serialisiert vor, ein Key steht dort als
+    // `-----BEGIN RSA PRIVATE KEY-----\nMII…` mit *literalem* Backslash-n.
+    // Ohne `\\` bricht die Klasse am ersten Escape ab, die Regel matcht nicht,
+    // und übrig bleibt, was das Entropie-Netz einzeln erwischt — also gerade
+    // die kurze Schlusszeile **nicht**, denn die liegt unter 32 Zeichen.
+    //
+    // Bewusst als Zeichenklasse und nicht als Alternation `(?:\\r|\\n|[…])`:
+    // Die Zähl-Wiederholung `{0,10000}` wird vom Compiler entrollt, und eine
+    // Alternation je Kopie vervielfacht den Automaten (vgl. die Begründung an
+    // [`crate::assignment::VALUE`]). Ein Zeichen mehr in der Klasse kostet
+    // dagegen nichts. Breiter wird die Regel dadurch kaum: Sie bleibt beidseitig
+    // an den BEGIN-/END-Markern verankert.
     TokenRule {
         name: "private-key-pem",
         prefixes: &["-----BEGIN "],
         pattern: concat!(
             r"\A-----BEGIN (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
-            r"[A-Za-z0-9+/=\s]{0,10000}?",
+            r"[A-Za-z0-9+/=\s\\]{0,10000}?",
             r"-----END (?:RSA |DSA |EC |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----",
         ),
     },

@@ -86,7 +86,28 @@ const KEY_SUFFIX: &str = r"[A-Za-z0-9_.\-]{0,32}";
 /// Leerraum. Bewusst nicht `[ \t]`: ein exotischer Trenner (geschütztes
 /// Leerzeichen aus einem kopierten Snippet) soll den Fund nicht verhindern.
 /// Breiter beim Trenner heißt hier mehr Redaction, nicht weniger.
-const SEPARATOR: &str = r#"["']?[^\S\r\n]*[:=][^\S\r\n]*"#;
+///
+/// # Warum das Quote escapt sein darf
+///
+/// Ein Tool-Argument ist ein JSON-String; steht darin wieder JSON (weil der
+/// Agent `curl -d '{"password":"…"}'` aufruft oder eine Datei schreibt), ist
+/// **jedes** Quote escapt und der Schlüssel endet auf `\"`:
+///
+/// ```text
+/// {"command":"curl -d '{\"password\": \"hunter2\"}'"}
+/// ```
+///
+/// Ohne die Backslash-Erlaubnis scheitert der Trenner am Zeichen vor dem
+/// Doppelpunkt, und dann matcht die **ganze Regel nicht** — kein Teil-Leck wie
+/// beim Wert, sondern ein vollständiges. Das ist kein Randfall: Es ist die
+/// Normalform verschachtelter Tool-Argumente.
+///
+/// `{0,4}` statt `?`, weil die Verschachtelung tiefer gehen kann: Wird ein
+/// Transkript selbst wieder als JSON-String weitergereicht, steht dort
+/// `{\\\"password\\\": …}`. Die Obergrenze kostet nichts — es ist ein
+/// ASCII-Literal, kein negierter Unicode-Bereich, der beim Entrollen teuer
+/// würde (siehe [`VALUE`]).
+const SEPARATOR: &str = r#"(?:\\{0,4}["'])?[^\S\r\n]*[:=][^\S\r\n]*"#;
 
 /// Der Wert in drei Formen: doppelt gequotet, einfach gequotet, nackt.
 ///
@@ -113,9 +134,64 @@ const SEPARATOR: &str = r#"["']?[^\S\r\n]*[:=][^\S\r\n]*"#;
 ///
 /// `+` kompiliert dagegen zu einer konstant großen Schleife. Ein Sicherheits-
 /// verlust ist das nicht: Die Laufzeit bleibt linear (endlicher Automat, kein
-/// Backtracking), und die Länge des Fundes ist ohnehin **durch die Zeile
-/// begrenzt** — `\r` und `\n` sind aus allen drei Klassen ausgeschlossen.
-const VALUE: &str = r#"(?:"(?P<dq>[^"\r\n]+)"|'(?P<sq>[^'\r\n]+)'|(?:bearer[^\S\r\n]+|basic[^\S\r\n]+)?(?P<bare>[^\s"'\r\n]+))"#;
+/// Backtracking), und die Länge des Fundes ist **durch die Zeile begrenzt** —
+/// `\r` und `\n` sind aus allen drei Basisklassen ausgeschlossen.
+///
+/// Die Escape-Alternative ist deshalb **nicht in allen drei Klassen gleich**:
+///
+/// - **gequotet** (`dq`/`sq`): `\\.`, und `.` schließt nur `\n` aus. Ein
+///   Backslash vor einem einzelnen `\r` (Terminal-Artefakt) wird also
+///   mitgelesen, der Fund läuft bis zum Zeilenende. Die engere Form
+///   `\\[^\r\n]` wäre sauberer, verliert hier aber den Fund *ganz*: Die
+///   Wiederholung bricht am `\r` ab, `\\?` frisst den Backslash, und das dann
+///   verlangte Schluss-Quote steht nicht da. Aus Über-Redaktion würde „gar
+///   nicht redigiert" — fail-closed gewinnt.
+/// - **nackt** (`bare`): `\\[^\r\n]`. Dort gibt es diesen Totalausfall nicht,
+///   weil kein Schluss-Delimiter verlangt wird und das nachgestellte `\\?` den
+///   Fund rettet. Die enge Form kostet also keinen Recall — und sie verhindert,
+///   dass ein Fund über ein `\r` hinweg die **nächste Zuweisung verschluckt**
+///   (siehe `escaped-space-swallows-next-key` in `DOCUMENTED_GAPS`).
+///
+/// Bei CRLF stellt sich die Frage nirgends, weil `\n` in keiner Klasse steht.
+///
+/// # Warum jede Klasse eine Escape-Alternative hat
+///
+/// Tool-Argumente liegen im Envelope **immer** JSON-serialisiert vor. Ein
+/// Passwort mit einem `"` darin steht dort als `"hun\"ter2"`. Ohne die
+/// Escape-Alternative endet `[^"\r\n]+` am escapten Quote, und aus
+///
+/// ```text
+/// {"password": "hun\"ter2"}
+/// ```
+///
+/// wird `{"password": "[redacted:secret]"ter2"}` — der Fund hört mitten im
+/// Geheimnis auf und `ter2` bleibt stehen. `(?:[^"\\\r\n]|\\.)` liest die
+/// Escape-Sequenz als **ein** Element und läuft bis zum echten Schluss-Quote.
+///
+/// Der nackte Wert braucht dieselbe Alternative, und zwar aus einem zweiten
+/// Grund: `\ ` ist die übliche Art, ein Leerzeichen in einem Shell-Argument zu
+/// escapen. Ohne sie endet der Fund bei `PASSWORD=hun\ ter2` nach `hun` und
+/// lässt `ter2` stehen — derselbe Teil-Leck-Mechanismus, nur in der Shell
+/// statt in JSON. Der Preis ist ein Wort Über-Redaktion, wenn hinter dem
+/// Backslash gewöhnlicher Text folgt (`PASSWORD=abc\ und weiter` schwärzt
+/// `abc\ und`); festgehalten in `ACCEPTED_OVER_REDACTION`.
+///
+/// # Die beiden Gegenproben am Ende
+///
+/// `\\?` hinter der Wiederholung fängt Werte, die **auf** einen Backslash
+/// enden. Ohne es verlangt die Escape-Alternative nach dem letzten Backslash
+/// noch ein Zeichen, und der Fund entfiele ganz:
+///
+/// - gequotet: `{"password": "abc\"}` — unsauber escapt, fände keinen Treffer.
+/// - nackt: `API_KEY=mysecretkey\` am Zeilenende (Shell-Fortsetzung) verlöre
+///   sein letztes Zeichen. Das ist mehr als Kosmetik: `mysecretkey\` ist nicht
+///   rein alphabetisch und besteht damit [`has_credential_shape`], `mysecretkey`
+///   fällt durch — der Shaped-Tier würde den Wert **gar nicht** mehr redigieren.
+///
+/// Die Alternative `|\\` deckt den Rest ab: einen Wert, der *genau* ein
+/// Backslash ist. `+` verlangt sonst ein Element, das nur die Escape-Alternative
+/// liefern kann, und die braucht ein Folgezeichen.
+const VALUE: &str = r#"(?:"(?P<dq>(?:[^"\\\r\n]|\\.)+\\?|\\)"|'(?P<sq>(?:[^'\\\r\n]|\\.)+\\?|\\)'|(?:bearer[^\S\r\n]+|basic[^\S\r\n]+)?(?P<bare>(?:[^\s"'\\\r\n]|\\[^\r\n])+\\?))"#;
 
 /// Lazy-Präfix zwischen `--` und dem Stichwort: `--db-password`.
 const CLI_PREFIX: &str = r"[A-Za-z0-9\-]{0,32}?";
@@ -329,8 +405,30 @@ fn value_of<'t>(caps: &Captures<'t>) -> Option<Match<'t>> {
 }
 
 /// Ob ein Wert trotz sensiblem Schlüssel stehen bleiben darf.
+///
+/// # Warum ein escaptes Quote jede Ausnahme aufhebt
+///
+/// Beide Ausnahmen unten sind **Präfix- plus Enthält-Tests** — und die erfüllt
+/// ein längerer String leichter als ein kurzer. Seit [`VALUE`] Escape-Sequenzen
+/// mitliest, sind die Werte genau das: länger. Das kippte die Entscheidung in
+/// die falsche Richtung:
+///
+/// ```text
+/// {"password": "/pa\"ss/word"}
+/// ```
+///
+/// Vorher endete der Fund am escapten Quote (`/pa\`) — kein zweiter `/`, also
+/// kein Pfad, also redigiert (mit dem bekannten Teil-Leck dahinter). Jetzt liest
+/// der Fund korrekt `/pa\"ss/word`, und *dieser* Wert beginnt mit `/` und
+/// enthält einen zweiten `/`: Er sähe wie ein Pfad aus und bliebe **vollständig**
+/// stehen. Aus einem Teil-Leck wäre ein ganzes geworden.
+///
+/// Deshalb die Vorschaltung: Ein Wert, der noch ein escaptes Quote trägt, ist
+/// weder ein Pfad noch eine Variablenreferenz. Ein echter Pfad-Token enthält so
+/// etwas nie — `\"` steht dort nur, weil der Wert aus einem JSON-String stammt.
 fn is_exempt(value: &str, tier: Tier) -> bool {
-    if is_variable_reference(value) || is_filesystem_path(value) {
+    let escaped_quote = value.contains(r#"\""#) || value.contains(r"\'");
+    if !escaped_quote && (is_variable_reference(value) || is_filesystem_path(value)) {
         return true;
     }
     match tier {
@@ -342,7 +440,17 @@ fn is_exempt(value: &str, tier: Tier) -> bool {
 /// `$TOKEN`, `${VAULT_PW}`, `%SECRET%` — eine **Referenz** auf ein Geheimnis
 /// ist nicht das Geheimnis. Sie zu redigieren würde Information vernichten,
 /// ohne irgendetwas zu schützen.
+///
+/// Die Leerraum-Absage steht aus demselben Grund hier wie in
+/// [`is_filesystem_path`]: Der `%…%`-Zweig ist ein Präfix-plus-Suffix-Test, und
+/// seit [`VALUE`] Escape-Sequenzen mitliest, reicht ein Wert über Leerraum
+/// hinweg. `PASSWORD=%hunterzwei\ x%` sähe sonst wie eine Referenz aus und
+/// bliebe **vollständig** stehen — eine echte Variablenreferenz enthält nie
+/// Leerraum.
 fn is_variable_reference(value: &str) -> bool {
+    if value.chars().any(char::is_whitespace) {
+        return false;
+    }
     value.starts_with('$') || (value.starts_with('%') && value.ends_with('%') && value.len() > 2)
 }
 
@@ -358,7 +466,9 @@ fn is_filesystem_path(value: &str) -> bool {
     if value.chars().any(char::is_whitespace) {
         return false;
     }
-    // Windows-Pfade: `C:\path`, `D:\...` etc. Char-grenzengerecht.
+    // Windows-Pfade: `C:\path`, `D:\...` etc. Char-grenzengerecht (#1): Ein
+    // Byte-Slice `value[1..3]` würde bei `PASSWORD=a€bc` mitten in ein
+    // Multibyte-Zeichen schneiden und panicken.
     let windows = {
         let mut chars = value.chars();
         if let (Some(first), Some(second), Some(third)) = (chars.next(), chars.next(), chars.next())
@@ -368,11 +478,20 @@ fn is_filesystem_path(value: &str) -> bool {
             false
         }
     };
-    windows
-        || value.starts_with("~/")
-        || value.starts_with("./")
-        || value.starts_with("../")
-        || (value.starts_with('/') && value[1..].contains('/'))
+    // Im POSIX-Zweig hat ein Backslash nichts verloren (#3). Er steht dort nur,
+    // weil der Wert aus einem JSON-String stammt (`/pa\\ss/word`, `/pa\nss/word`
+    // mit literalem Escape) — und genau solche Werte würden die
+    // Präfix-plus-Enthält-Prüfung sonst mühelos bestehen und **vollständig**
+    // stehen bleiben.
+    //
+    // `value[1..]` ist hier sicher: `starts_with('/')` garantiert ein
+    // Ein-Byte-Zeichen an Position 0, der Index liegt also auf einer Zeichengrenze.
+    let posix = !value.contains('\\')
+        && (value.starts_with("~/")
+            || value.starts_with("./")
+            || value.starts_with("../")
+            || (value.starts_with('/') && value[1..].contains('/')));
+    windows || posix
 }
 
 /// Sieht der Wert aus wie ein maschinell erzeugtes Credential?
@@ -615,6 +734,160 @@ mod tests {
         let out = redact("curl --password hunter2 -X GET https://api.test");
         assert!(!out.text.contains("hunter2"));
         assert!(out.text.contains("--password "));
+    }
+
+    // --- JSON-Escapes im Wert (#3) -------------------------------------------
+
+    #[test]
+    fn escaped_quote_does_not_end_the_value() {
+        // Tool-Argumente sind JSON: ein `"` im Passwort steht dort als `\"`.
+        // Endet der Fund am escapten Quote, bleibt der Rest des Geheimnisses
+        // stehen — genau der Leak aus #3.
+        let out = redact(r#"{"password": "hun\"ter2", "host": "db.internal"}"#);
+        assert!(
+            !out.text.contains("ter2"),
+            "Rest des Passworts:\n{}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("hun"),
+            "Anfang des Passworts:\n{}",
+            out.text
+        );
+        // Der Nachbarschlüssel darf nicht mit verschwinden.
+        assert!(
+            out.text.contains("db.internal"),
+            "Kontext gefressen:\n{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn escaped_backslash_before_the_closing_quote_is_covered() {
+        // `"abc\\"` ist ein Wert, der auf einen Backslash endet. Die
+        // Escape-Alternative muss das Paar als Einheit lesen und trotzdem am
+        // echten Schluss-Quote landen.
+        let out = redact(r#"{"password": "abc\\", "next": 1}"#);
+        assert!(!out.text.contains("abc"), "durchgerutscht:\n{}", out.text);
+        assert!(
+            out.text.contains(r#""next""#),
+            "Kontext gefressen:\n{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_shell_escaped_space_stays_inside_the_secret() {
+        // `\ ` ist die übliche Art, ein Leerzeichen in einem Shell-Argument zu
+        // escapen — das Passwort lautet hier `hun ter2`. Ohne die
+        // Escape-Alternative in der bare-Klasse endete der Fund nach `hun` und
+        // ließe `ter2` stehen: derselbe Teil-Leck-Mechanismus wie bei JSON.
+        let out = redact(r"PASSWORD=hun\ ter2");
+        assert!(!out.text.contains("ter2"), "Teil-Leck:\n{}", out.text);
+        assert_eq!(out.counts.secrets, 1);
+    }
+
+    #[test]
+    fn a_backslash_before_prose_costs_exactly_one_word() {
+        // Der Preis der Alternative oben, gemessen und festgehalten: Folgt auf
+        // den Backslash gewöhnlicher Text, wandert genau **ein** Wort mit in
+        // den Fund — nicht der Rest der Zeile. Der Satz dahinter bleibt lesbar.
+        let out = redact(r"PASSWORD=abc\ und der Rest bleibt");
+        assert!(!out.text.contains("abc"), "Passwort blieb:\n{}", out.text);
+        assert!(
+            out.text.contains("der Rest bleibt"),
+            "mehr als ein Wort geschwärzt:\n{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn a_shell_continuation_keeps_the_value_shaped() {
+        // Shaped-Tier: `mysecretkey\` besteht `has_credential_shape` (nicht rein
+        // alphabetisch), `mysecretkey` fällt durch. Verlöre der Fund seinen
+        // End-Backslash, würde der Wert deshalb **gar nicht** mehr redigiert —
+        // ein Total-Leck, das wie ein harmloses Kürzen aussieht.
+        let out = redact("docker run -e API_KEY=mysecretkey\\\n  -e OTHER=1");
+        assert!(
+            !out.text.contains("mysecretkey"),
+            "Shaped-Wert blieb stehen:\n{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("-e OTHER=1"),
+            "Kontext weg:\n{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn an_escaped_value_never_passes_as_a_path() {
+        // Seit der Wert die Escapes mitliest, ist er länger — und beide
+        // Pfad-Prädikate sind Präfix-plus-Enthält-Tests, die ein längerer
+        // String leichter erfüllt. `/pa\"ss/word` sähe wie ein Pfad aus und
+        // bliebe vollständig stehen; vorher wurde wenigstens `/pa\` redigiert.
+        for text in [
+            r#"{"password": "/pa\"ss/word"}"#,
+            r#"{"password": "b:\"ss/word"}"#,
+        ] {
+            let out = redact(text);
+            assert!(
+                !out.text.contains("ss/word"),
+                "als Pfad durchgewinkt: {text:?}\n{}",
+                out.text
+            );
+        }
+    }
+
+    #[test]
+    fn a_three_byte_char_at_the_drive_position_does_not_panic() {
+        // Die Stelle, an der sich #1 und #3 treffen: Der Windows-Zweig prüft
+        // Position 1–2 auf `:\`. Als Byte-Slice würde er hier mitten in das
+        // Euro-Zeichen schneiden. `ü` (2 Byte) trifft den Fall nicht — `€` (3
+        // Byte) schon.
+        let out = redact("PASSWORD=a€bc");
+        assert!(!out.text.contains("a€bc"), "nicht redigiert:\n{}", out.text);
+    }
+
+    #[test]
+    fn a_real_path_is_still_exempt() {
+        // Die Gegenprobe: Ohne escaptes Quote im Wert bleibt die Pfad-Ausnahme
+        // unangetastet — sonst wäre der Fix oben nur ein Schwärzen von allem.
+        for text in [
+            "PWD=/run/secrets/tok",
+            r"TOKEN_FILE=C:\keys\deploy.tok",
+            "PASSWORD=${VAULT_PW}",
+        ] {
+            let out = redact(text);
+            assert_eq!(out.text, text, "Ausnahme verloren: {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_ending_in_a_backslash_is_still_found() {
+        // Unsauber escaptes JSON: der Wert endet auf einen Backslash, direkt
+        // vor dem Schluss-Quote. Ohne das `\\?` in VALUE verlangte `\\.` hier
+        // noch ein Zeichen — der Fund entfiele komplett, und aus „zu kurz
+        // redigiert" würde „gar nicht redigiert".
+        let out = redact(r#"{"password": "abc\"}"#);
+        assert!(
+            !out.text.contains("abc"),
+            "gar nichts gefunden:\n{}",
+            out.text
+        );
+        assert_eq!(out.counts.secrets, 1);
+    }
+
+    #[test]
+    fn a_windows_path_value_is_still_kept() {
+        // Backslashes im Wert sind meistens ein Pfad, kein Geheimnis. Die
+        // Escape-Alternative darf die Pfad-Ausnahme nicht aushebeln.
+        let out = redact(r"TOKEN_FILE=C:\keys\deploy.tok");
+        assert!(
+            out.text.contains(r"C:\keys\deploy.tok"),
+            "Pfad geschwärzt:\n{}",
+            out.text
+        );
     }
 
     #[test]

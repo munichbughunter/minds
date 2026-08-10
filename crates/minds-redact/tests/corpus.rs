@@ -67,6 +67,37 @@ const PEM_KEY: &str = concat!(
     "gJdSaOvTpQiXmZbNlHrKcYtEuAfWdGxPjRoLsVnBqMzCyIeUkTaFhDpWvNgXlOrJ\n",
     "-----END RSA PRIVATE KEY-----"
 );
+/// Derselbe Schlüssel, wie er im **Envelope wirklich steht**: als Inhalt eines
+/// JSON-Strings, also mit literalem `\n` statt echtem Zeilenumbruch.
+///
+/// Tool-Argumente liegen immer JSON-serialisiert vor — das ist der Hauptkanal
+/// des Systems, nicht ein Randfall. Die letzte Körperzeile ist **absichtlich
+/// kurz** (unter der Entropie-Schwelle von 32 Zeichen): Fängt die PEM-Regel den
+/// Block nicht als Ganzes, bleibt genau sie stehen, und das ist echtes
+/// Schlüsselmaterial.
+const PEM_KEY_IN_JSON: &str = concat!(
+    "-----BEGIN RSA PRIVATE KEY-----\\n",
+    "MIIEowIBAAKCAQEAx7Vn9pQmKtLbYcHZfWjRuEoNsAiPdGqTvXlMzBhKrCyWnUeF\\n",
+    "gJdSaOvTpQiXmZbNlHrKcYtEuAfWdGxPjRoLsVnBqMzCyIeUkTaFhDpWvNgXlOrJ\\n",
+    "qZ8Wn3xKtLmPvRc=\\n",
+    "-----END RSA PRIVATE KEY-----"
+);
+/// Die kurze Schlusszeile aus [`PEM_KEY_IN_JSON`], einzeln benannt: Sie ist der
+/// Teil, den das Entropie-Netz nicht auffängt.
+const PEM_SHORT_TAIL: &str = "qZ8Wn3xKtLmPvRc=";
+
+/// Der **verschlüsselte** PEM nach RFC 1421 — mit Kopfzeilen zwischen BEGIN und
+/// Körper. Steht in [`DOCUMENTED_GAPS`], weil die PEM-Regel ihn nicht fängt.
+const ENCRYPTED_PEM_KEY: &str = concat!(
+    "-----BEGIN RSA PRIVATE KEY-----\n",
+    "Proc-Type: 4,ENCRYPTED\n",
+    "DEK-Info: AES-128-CBC,7B3A9C2E5F1D8046A2B4C6E8F0A1B3C5\n",
+    "\n",
+    "MIIEowIBAAKCAQEAx7Vn9pQmKtLbYcHZfWjRuEoNsAiPdGqTvXlMzBhKrCyWnUeF\n",
+    "qZ8Wn3xKtLmPvRc=\n",
+    "-----END RSA PRIVATE KEY-----"
+);
+
 /// Prefixloser base64-Blob, hoch genug für das Entropie-Netz (~4.6 bit/Zeichen).
 const ENTROPY_BLOB: &str = "dMlHUvTCQCyEZDz/TddJ8HyS5SUkCnD8zRA9a9SkpXz9";
 const JSON_API_KEY: &str = "s3rv1ce-4cc0unt-k3y-2024";
@@ -174,6 +205,88 @@ fn must_redact() -> Vec<MustRedact> {
             text: format!("cat deploy.key\n{PEM_KEY}"),
             gone: &["MIIEowIBAAKCAQEA", "BEGIN RSA PRIVATE KEY"],
             kept: &["cat deploy.key"],
+        },
+        MustRedact {
+            // Derselbe Schlüssel im Hauptkanal: als JSON-serialisiertes
+            // Tool-Argument, mit literalem `\n` statt Zeilenumbruch.
+            id: "private-key-pem-in-json",
+            text: format!(r#"{{"command":"cat deploy.key","output":"{PEM_KEY_IN_JSON}"}}"#),
+            gone: &[
+                "MIIEowIBAAKCAQEA",
+                "gJdSaOvTpQiXmZbN",
+                // Die kurze Schlusszeile: unter der Entropie-Schwelle und
+                // deshalb der Teil, der ohne PEM-Treffer stehen bliebe.
+                PEM_SHORT_TAIL,
+                // Beweist, dass die **PEM-Regel** gegriffen hat und nicht nur
+                // das Entropie-Netz die langen Zeilen einzeln erwischte.
+                "BEGIN RSA PRIVATE KEY",
+            ],
+            kept: &[r#""command""#],
+        },
+        MustRedact {
+            // Ein Passwort mit `"` darin — im JSON-String steht davor ein
+            // Backslash. Endet der Fund am escapten Quote, bleibt der Rest
+            // des Passworts stehen.
+            id: "json-escaped-quote-in-secret",
+            text: r#"{"password": "hun\"ter2", "host": "db.internal", "port": 5432}"#.into(),
+            gone: &["ter2", "hun"],
+            kept: &[r#""password""#, "db.internal", "5432"],
+        },
+        MustRedact {
+            // Die Normalform verschachtelter Tool-Argumente: Ein Bash-Aufruf
+            // schreibt JSON, also ist im Envelope **jedes** Quote escapt — auch
+            // das des Schlüssels (`\"password\":`). Scheitert der Trenner am
+            // Backslash vor dem Doppelpunkt, matcht die ganze Regel nicht und
+            // der Wert steht vollständig im Record.
+            id: "double-escaped-json-argument",
+            text: r#"{"command":"curl -d '{\"password\": \"hunter2\", \"host\": \"db\"}' https://api.test"}"#
+                .into(),
+            gone: &["hunter2"],
+            kept: &["curl -d", "https://api.test"],
+        },
+        MustRedact {
+            // Shaped-Tier plus Shell-Zeilenfortsetzung: `mysecretkey\` besteht
+            // die Shape-Prüfung, `mysecretkey` nicht. Verliert der Fund den
+            // End-Backslash, kippt der Wert von „redigiert" auf „exempt".
+            id: "shell-continuation-shaped-token",
+            text: "docker run -e API_KEY=mysecretkey\\\n  -e OTHER=1".into(),
+            gone: &["mysecretkey"],
+            kept: &["docker run", "-e OTHER=1"],
+        },
+        MustRedact {
+            // Ein Passwort, das nach dem Mitlesen der Escapes wie ein Pfad
+            // aussieht (`/…/…`). Die Pfad-Ausnahme darf darauf nicht
+            // hereinfallen, sonst bleibt der Wert ganz stehen.
+            id: "json-escaped-quote-in-path-like-secret",
+            text: r#"{"password": "/pa\"ss/word", "host": "db.internal"}"#.into(),
+            gone: &["ss/word"],
+            kept: &["db.internal"],
+        },
+        MustRedact {
+            // Derselbe Mechanismus über den Backslash statt das Quote: auch
+            // `/pa\ss/word` sähe wie ein Pfad aus. Ein echter POSIX-Pfad trägt
+            // keinen Backslash.
+            id: "json-escaped-backslash-in-path-like-secret",
+            text: r#"{"password": "/pa\\ss/word", "host": "db.internal"}"#.into(),
+            gone: &["ss/word"],
+            kept: &["db.internal"],
+        },
+        MustRedact {
+            // Und über den zweiten Ausnahme-Zweig: Der verlängerte Wert beginnt
+            // und endet auf `%` und sähe damit wie eine Variablenreferenz aus.
+            // Eine echte Referenz enthält keinen Leerraum.
+            id: "percent-shaped-value-with-escaped-space",
+            text: r"PASSWORD=%hunterzwei\ x%".into(),
+            gone: &["hunterzwei"],
+            kept: &["PASSWORD="],
+        },
+        MustRedact {
+            // Dreifach serialisiert: ein Transkript, das selbst wieder als
+            // JSON-String weitergereicht wurde.
+            id: "triple-escaped-json-argument",
+            text: r#"{"log":"{\\\"password\\\": \\\"hunter2\\\"}"}"#.into(),
+            gone: &["hunter2"],
+            kept: &[r#""log""#],
         },
         MustRedact {
             // Fünf Zeilen, fünf Funde — keiner davon form-erkennbar.
@@ -318,6 +431,18 @@ const MUST_SURVIVE: &[(&str, &str)] = &[
         "API_KEY=$MY_API_KEY",
     ),
     ("percent-reference", "set PASSWORD=%DEPLOY_PW%"),
+    (
+        // Gegenprobe zur Leerraum-Absage in `is_variable_reference`: Die
+        // Ausnahme muss im JSON-Kanal erhalten bleiben.
+        "percent-reference-in-json",
+        r#"{"password": "%DEPLOY_PW%"}"#,
+    ),
+    (
+        // Gegenprobe zum Escape-Guard vor den Ausnahmen: Ein Windows-Pfad
+        // besteht aus Backslashes — er darf davon nicht mitgerissen werden.
+        "windows-path-in-json-argument",
+        r#"{"token_file": "C:\keys\deploy.tok"}"#,
+    ),
     // --- URLs ohne Zugangsdaten ---------------------------------------------
     ("plain-repo-url", "https://gitlab.com/pdoering-it/minds"),
     ("at-after-path", "https://example.com/a@b"),
@@ -387,6 +512,29 @@ const ACCEPTED_OVER_REDACTION: &[(&str, &str, &str)] = &[
         "DB_USER=admin",
         "DB_USER=[redacted:pii]",
     ),
+    (
+        // Der Preis der Escape-Alternative im nackten Wert: `\ ` gehört zum
+        // Geheimnis (`hun\ ter2`), also muss der Fund darüber hinweglesen —
+        // folgt dahinter Prosa, wandert genau ein Wort mit. Ein Wort zu viel
+        // ist der Preis dafür, `ter2` nicht stehen zu lassen.
+        //
+        // Steht in diesem Wort ein **weiterer sensibler Schlüssel**, wird der
+        // mitverschluckt und nicht mehr geprüft — das ist kein Schönheits-
+        // fehler mehr, sondern die Lücke `escaped-space-swallows-next-key`
+        // in [`DOCUMENTED_GAPS`].
+        "escaped-space-costs-one-word",
+        r"PASSWORD=abc\ und der Rest bleibt",
+        "PASSWORD=[redacted:secret] der Rest bleibt",
+    ),
+    (
+        // Unsauber escaptes JSON: Das Quote hinter `abc\` beendet den Wert
+        // nicht mehr, also läuft der Fund bis zum nächsten. Der Nachbar
+        // verliert sein öffnendes Quote — der Record wird an der Stelle
+        // strukturell schief, aber es leckt nichts.
+        "malformed-json-eats-separator",
+        r#"{"password": "abc\", "host": "db.internal"}"#,
+        r#"{"password": "[redacted:secret]"host": "db.internal"}"#,
+    ),
 ];
 
 /// Stellen, an denen die Policy **bewusst zu wenig** fängt: `(id, Text, Wert)`.
@@ -409,6 +557,43 @@ const DOCUMENTED_GAPS: &[(&str, &str, &str)] = &[
         "alphabetic-shaped-token",
         "TOKEN=supersecrettoken",
         "supersecrettoken",
+    ),
+    (
+        // Ein nackter Wert, der auf `\ ` endet, liest über den Leerraum hinweg
+        // — und verschluckt dabei die **nächste Zuweisung derselben Regel**.
+        // `captures_iter` setzt hinter dem Fund wieder auf, der zweite
+        // Schlüssel wird also nie geprüft.
+        //
+        // Der Preis ist bewusst: Ohne die Escape-Alternative bliebe bei
+        // `PASSWORD=hun\ ter2` das `ter2` stehen — der häufigere Fall. Sauber
+        // lösen ließe sich beides nur, indem die Suche je Regel hinter dem
+        // *Wert-Anfang* fortsetzt statt hinter dem Fund; das ändert die
+        // Laufzeit-Charakteristik und gehört in ein eigenes Issue.
+        "escaped-space-swallows-next-key",
+        r"PASSWORD=abc\ SECRET: hunter2",
+        "hunter2",
+    ),
+    (
+        // Abgeschnittene Tool-Ausgabe: Der Wert hat kein Schluss-Quote, also
+        // greift weder `dq` noch `sq`, und `bare` darf nicht mit `"` beginnen.
+        // Unverändert gegenüber dem Stand vor den Escape-Alternativen.
+        "truncated-json-value",
+        r#"{"password": "hunter2"#,
+        "hunter2",
+    ),
+    (
+        // Der **verschlüsselte** PEM nach RFC 1421 trägt zwischen BEGIN und
+        // Körper zwei Kopfzeilen (`Proc-Type: 4,ENCRYPTED`, `DEK-Info: …`).
+        // Deren `:` und `,` stehen nicht in der Körperklasse, also greift die
+        // PEM-Regel nicht; das Entropie-Netz fängt nur die langen Zeilen, und
+        // die kurze Schlusszeile bleibt stehen.
+        //
+        // Nicht durch Erweitern der Körperklasse geschlossen: `:` und `,`
+        // dort aufzunehmen macht die Regel über mehrere Blöcke hinweg gierig.
+        // Der saubere Weg ist eine eigene Regel für den Header — eigenes Issue.
+        "encrypted-pem-headers",
+        ENCRYPTED_PEM_KEY,
+        PEM_SHORT_TAIL,
     ),
 ];
 
