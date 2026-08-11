@@ -67,11 +67,41 @@ impl Put {
     }
 }
 
+/// Einer der Orte, an denen eine Session liegen kann — und den `forget` tilgt.
+///
+/// Eine Session kann an mehreren gleichzeitig liegen (ein Repo, das vor dem
+/// Umzug auf Session-Refs schrieb und danach denselben Inhalt erneut ablegte).
+/// `forget` benennt jeden getilgten Ort, damit „vergessen" keine Zusage ist,
+/// die nur für einen von dreien gilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgottenPlace {
+    /// `refs/minds/store/<hash>` — der maßgebliche Ort.
+    StoreRef,
+    /// `refs/minds/sessions/<hex>` — der browsbare Branch (`session.json`
+    /// **und** `session.md`), der beim Push in der Forge sichtbar wird.
+    SessionBranch,
+    /// Der Kontext-Baum eines Bestandsrepos (vor dem Umzug auf Session-Refs).
+    ContextTree,
+}
+
+impl ForgottenPlace {
+    /// Eine menschenlesbare Bezeichnung für die CLI-Ausgabe.
+    pub fn label(self) -> &'static str {
+        match self {
+            ForgottenPlace::StoreRef => "Store-Referenz",
+            ForgottenPlace::SessionBranch => "Session-Branch (session.json und session.md)",
+            ForgottenPlace::ContextTree => "Kontext-Baum (Bestandsformat)",
+        }
+    }
+}
+
 /// Was [`ContextStore::forget`] bewirkt hat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Forget {
-    /// Der Inhalt lag vor und wurde durch einen Tombstone ersetzt.
-    Forgotten(SessionId),
+    /// Der Inhalt lag vor und wurde an den genannten Orten durch einen
+    /// Tombstone ersetzt. Die Liste ist nie leer und in fester Reihenfolge
+    /// (maßgeblicher Ort zuerst).
+    Forgotten(SessionId, Vec<ForgottenPlace>),
     /// Unter der ID lag nichts (oder schon ein Tombstone) — nichts zu tun.
     Absent(SessionId),
 }
@@ -80,13 +110,21 @@ impl Forget {
     /// Die betroffene ID, in beiden Fällen.
     pub fn id(&self) -> SessionId {
         match self {
-            Forget::Forgotten(id) | Forget::Absent(id) => *id,
+            Forget::Forgotten(id, _) | Forget::Absent(id) => *id,
         }
     }
 
     /// Ob dabei tatsächlich ein Inhalt ersetzt wurde.
     pub fn was_forgotten(&self) -> bool {
-        matches!(self, Forget::Forgotten(_))
+        matches!(self, Forget::Forgotten(..))
+    }
+
+    /// Die getilgten Orte — leer, wenn nichts zu tun war.
+    pub fn places(&self) -> &[ForgottenPlace] {
+        match self {
+            Forget::Forgotten(_, places) => places,
+            Forget::Absent(_) => &[],
+        }
     }
 }
 
@@ -334,7 +372,10 @@ mod tests {
                 Some(bytes) if crate::tombstone::reason(bytes).is_some() => Ok(Forget::Absent(id)),
                 Some(_) => {
                     entries.insert(id, crate::tombstone::bytes(reason));
-                    Ok(Forget::Forgotten(id))
+                    // Das In-Memory-Backend kennt nur einen Ort — es dient den
+                    // Trait-Tests, nicht der Forge. Der Session-Branch entsteht
+                    // allein im Git-Backend.
+                    Ok(Forget::Forgotten(id, vec![ForgottenPlace::StoreRef]))
                 }
             }
         }
