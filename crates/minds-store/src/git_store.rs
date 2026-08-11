@@ -77,7 +77,7 @@ use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
 use crate::index::CommitIndex;
 use crate::layout::{id_of_path, path_of};
-use crate::store::{ContextStore, Forget, Put};
+use crate::store::{ContextStore, Forget, ForgottenPlace, Put};
 
 /// Wie oft [`GitStore::put_bytes`] einen verlorenen Wettlauf am Ref wiederholt,
 /// bevor er ihn meldet.
@@ -268,6 +268,37 @@ impl GitStore {
         message: &str,
     ) -> minds_git::Result<RefUpdate> {
         self.write_into_session(reference, SESSION_FILE, bytes, message)
+    }
+
+    /// Ersetzt den **gesamten** Baum eines Session-Branches durch den Tombstone.
+    ///
+    /// Anders als [`overwrite_session`](Self::overwrite_session) wird hier nicht
+    /// eine Datei getauscht, sondern ein frischer Baum geschrieben: Der Branch
+    /// trägt neben der `session.json` eine gerenderte `session.md`, und **beide**
+    /// müssen weg. Ein aufgesetzter Baum, der nur `session.json` ersetzte, ließe
+    /// den Klartext in `session.md` stehen — genau das Leck, das dieses Kommando
+    /// schließt. `write_tree(None, …)` beschreibt den Baum vollständig, es bleibt
+    /// keine dritte Datei zurück.
+    ///
+    /// Wie bei [`overwrite_session`](Self::overwrite_session) wird der Tombstone
+    /// **aufgesetzt**, nicht als neuer Wurzel-Commit geschrieben: Der aktuelle
+    /// Baum ist inhaltsfrei, der Klartext bleibt aber im Parent-Commit
+    /// erreichbar (`<branch>~1:session.md`). Das gilt bewusst für **alle** drei
+    /// Orte gleich und wird gesammelt in Issue #14 auf elternlose Tombstones
+    /// umgestellt — hier den Branch als Sonderfall vorzuziehen, hieße zwei
+    /// verschiedene Tilg-Semantiken nebeneinander zu haben.
+    fn overwrite_session_branch(
+        &self,
+        reference: &str,
+        bytes: &[u8],
+        message: &str,
+    ) -> minds_git::Result<RefUpdate> {
+        let tomb = self.repo.write_blob(bytes)?;
+        let tree = self.repo.write_tree(
+            None,
+            [(SESSION_BRANCH_FILE, tomb), (SESSION_BRANCH_MD, tomb)],
+        )?;
+        self.repo.commit_tree_to_ref(reference, tree, message)
     }
 }
 
@@ -477,20 +508,22 @@ impl ContextStore for GitStore {
 
     /// Ersetzt die Nutzlast an **jedem** Ort, an dem sie liegt.
     ///
-    /// Seit dem Umzug auf einen Ref je Session gibt es zwei mögliche Orte: den
-    /// Session-Ref (neu) und den Kontext-Baum (Bestandsrepos). Ein Repo, das vor
-    /// dem Umzug schrieb und danach dieselbe Session erneut ablegte, hat sie an
-    /// **beiden**. Nur einen zu tilgen wäre die schlimmste Sorte Fehler, die
-    /// dieses Kommando machen kann: Es meldete „vergessen", und der Klartext
-    /// stünde weiter im anderen Baum. Deshalb wird hier nicht abgekürzt, sondern
-    /// jeder Ort geprüft und getilgt.
+    /// Eine Session kann an drei Orten liegen: dem Store-Ref (neu, maßgeblich),
+    /// dem **Session-Branch** (browsbar in der Forge, mit `session.json` *und*
+    /// gerenderter `session.md`) und dem Kontext-Baum (Bestandsrepos). Ein Repo,
+    /// das vor dem Umzug schrieb und danach dieselbe Session erneut ablegte, hat
+    /// sie an mehreren. Nur einen zu tilgen wäre die schlimmste Sorte Fehler,
+    /// die dieses Kommando machen kann: Es meldete „vergessen", und der Klartext
+    /// stünde weiter im anderen Baum — auf der Forge, für jeden mit Repo-Zugriff
+    /// lesbar. Deshalb wird hier nicht abgekürzt, sondern jeder Ort geprüft und
+    /// getilgt, und `forget` benennt zurück, welche es waren.
     fn forget(&self, id: SessionId, reason: &str) -> Result<Forget> {
         let tomb = crate::tombstone::bytes(reason);
         let message = format!("minds: Session {id} vergessen");
-        let mut forgotten = false;
+        let mut places = Vec::new();
 
-        // Der neue Ort. Der Tombstone wird an den Session-Ref **angehängt** —
-        // ein Fast-Forward, kein Rewrite: Die Referenz bleibt auflösbar, der
+        // Der maßgebliche Ort. Der Tombstone wird an den Store-Ref **angehängt**
+        // — ein Fast-Forward, kein Rewrite: Die Referenz bleibt auflösbar, der
         // Inhalt ist aus dem aktuellen Baum weg.
         let reference = session_ref(id);
         if self.payload_at(
@@ -499,7 +532,21 @@ impl ContextStore for GitStore {
                 .map_err(StoreError::backend)?,
         ) {
             self.retry_write(|| self.overwrite_session(&reference, &tomb, &message))?;
-            forgotten = true;
+            places.push(ForgottenPlace::StoreRef);
+        }
+
+        // Der browsbare Branch. Ohne diesen Zweig meldete `forget` „vergessen",
+        // während `session.md` mit dem vollen Klartext weiter als Forge-Branch
+        // stünde — ein DSGVO-Verstoß mit Erfolgsmeldung. Geprüft wird an
+        // `session.json`; getilgt werden beide Dateien des Branch-Baums.
+        let branch = session_branch_ref(id);
+        if self.payload_at(
+            self.repo
+                .read_blob_at(&branch, SESSION_BRANCH_FILE)
+                .map_err(StoreError::backend)?,
+        ) {
+            self.retry_write(|| self.overwrite_session_branch(&branch, &tomb, &message))?;
+            places.push(ForgottenPlace::SessionBranch);
         }
 
         // Der alte Ort. Eine vor dem Umzug abgelegte Session muss sich löschen
@@ -511,14 +558,14 @@ impl ContextStore for GitStore {
                 .map_err(StoreError::backend)?,
         ) {
             self.retry_write(|| self.write_blob_once(&path, &tomb, &message))?;
-            forgotten = true;
+            places.push(ForgottenPlace::ContextTree);
         }
 
-        Ok(if forgotten {
-            Forget::Forgotten(id)
-        } else {
+        Ok(if places.is_empty() {
             // Nicht da — oder schon ein Tombstone. Beides ist „nichts zu tun".
             Forget::Absent(id)
+        } else {
+            Forget::Forgotten(id, places)
         })
     }
 }

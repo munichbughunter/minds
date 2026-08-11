@@ -165,6 +165,7 @@ mod tests {
     use super::*;
     use crate::InRepoStore;
     use crate::fixture::{TempRepo, redacted};
+    use crate::store::ForgottenPlace;
 
     /// Ein Parent mit Code und ein bares Child daneben.
     fn parent_and_child() -> (TempRepo, TempRepo, ChildRepoStore) {
@@ -305,6 +306,95 @@ mod tests {
         assert!(
             parents.trim().is_empty(),
             "Session-Branch hat Eltern: {parents}"
+        );
+    }
+
+    #[test]
+    fn forget_erases_the_session_branch_including_the_markdown() {
+        // Akzeptanzkriterium #5: put + put_session_branch + forget, danach darf
+        // `session.md` den Klartext nicht mehr tragen. Ohne den Branch-Zweig in
+        // `forget` bliebe die gerenderte Absicht als Forge-Branch lesbar — ein
+        // DSGVO-Verstoß mit Erfolgsmeldung.
+        const NEEDLE: &str = "Datenschutz-Loeschung-Pruefwort-4711";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+
+        store.put(&session).unwrap();
+        store.put_session_branch(&session).unwrap();
+
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch
+            .lines()
+            .next()
+            .expect("ein Session-Branch")
+            .to_owned();
+
+        // Vorbedingung: Der Klartext steht wirklich in beiden Dateien.
+        let md_before = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(
+            md_before.contains(NEEDLE),
+            "session.md ohne Klartext:\n{md_before}"
+        );
+
+        let result = store.forget(id, "DSGVO").unwrap();
+
+        // Beide angelegten Orte werden getilgt und in fester Reihenfolge
+        // benannt: der maßgebliche Store-Ref zuerst, dann der Branch. Kein
+        // Ort wird übersprungen, keiner mehrfach gezählt.
+        assert_eq!(
+            result.places(),
+            &[ForgottenPlace::StoreRef, ForgottenPlace::SessionBranch],
+            "unerwartete Orte oder Reihenfolge"
+        );
+
+        // Der Ref bleibt auflösbar (cat-file wirft sonst) — aber inhaltsfrei.
+        let md_after = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(
+            !md_after.contains(NEEDLE),
+            "session.md leckt nach forget:\n{md_after}"
+        );
+        let json_after = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+        assert!(
+            !json_after.contains(NEEDLE),
+            "session.json leckt nach forget:\n{json_after}"
+        );
+
+        // Und der Baum trägt keine dritte Datei — der frische Baum ersetzt
+        // vollständig, statt aufzusetzen.
+        let files = child.git(&["ls-tree", "-r", "--name-only", &branch]);
+        let mut names: Vec<&str> = files.lines().map(str::trim).collect();
+        names.sort();
+        assert_eq!(names, vec!["session.json", "session.md"]);
+    }
+
+    #[test]
+    fn forgetting_without_a_branch_still_names_the_store_ref() {
+        // Der In-Repo-Fall (kein Session-Branch): `forget` tilgt den Store-Ref
+        // und benennt genau den — nicht den Branch, den es nicht gibt.
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted("nur im Store");
+        let id = session.session().id().unwrap();
+        store.put(&session).unwrap();
+
+        let result = store.forget(id, "DSGVO").unwrap();
+        assert!(result.was_forgotten());
+        assert!(result.places().contains(&ForgottenPlace::StoreRef));
+        assert!(!result.places().contains(&ForgottenPlace::SessionBranch));
+
+        // Kein Session-Branch entstand.
+        let branches = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        assert!(
+            branches.trim().is_empty(),
+            "unerwarteter Branch: {branches}"
         );
     }
 

@@ -7,10 +7,13 @@
 //!
 //! # Grenzen, ehrlich benannt
 //!
-//! - Gelöscht wird der **maßgebliche Store-Record** (`refs/minds/context`). Ein
-//!   bereits in die Forge gepushter **Session-Branch** (`minds/session/<hash>`,
-//!   Child-Backend) trägt den Inhalt weiter, bis er dort separat entfernt wird.
-//! - Der alte Blob überlebt in der **Historie** des Kontext-Refs, bis ein
+//! - Getilgt werden **alle lokalen Orte**: der maßgebliche Store-Ref, der
+//!   browsbare **Session-Branch** (`minds/session/<hash>`, `session.json` *und*
+//!   `session.md`) und der Kontext-Baum eines Bestandsrepos. `forget` benennt in
+//!   seiner Ausgabe, welche es waren. Ein bereits **gepushter** Branch wird auf
+//!   der Forge erst mit dem nächsten Push aktualisiert — der Tombstone ist ein
+//!   Fast-Forward und überträgt sich wie jeder andere Ref.
+//! - Der alte Blob überlebt in der **Historie** des jeweiligen Refs, bis ein
 //!   History-Rewrite ihn tilgt. Der aktuelle Stand ist sofort inhaltsfrei.
 
 use std::process::ExitCode;
@@ -44,11 +47,15 @@ fn forget(target: &str, reason: &str) -> Fallible<()> {
 
     let ctx = Context::open()?;
     match ctx.store.forget(id, reason)? {
-        Forget::Forgotten(id) => {
+        forget @ Forget::Forgotten(id, _) => {
             println!("vergessen: {id}");
             println!("  Grund: {reason}");
+            println!("  Getilgt an:");
+            for place in forget.places() {
+                println!("    - {}", place.label());
+            }
             println!(
-                "  Die Referenz bleibt auflösbar; der Inhalt ist aus dem aktuellen Stand des Stores entfernt."
+                "  Die Referenzen bleiben auflösbar; der Inhalt ist aus dem aktuellen Stand entfernt."
             );
         }
         Forget::Absent(id) => {
