@@ -152,11 +152,13 @@ impl ContextStore for ChildRepoStore {
         // Neben der maßgeblichen session.json eine gerenderte session.md, damit
         // GitLab den Branch nativ als lesbare Seite zeigt (Track C). Der Renderer
         // lebt in minds-core, weil der Store nicht vom Reader abhängen darf.
+        //
+        // Der Reanimations-Schutz (#6) — eine vergessene Session darf nicht als
+        // Klartext-`session.md` zurückkehren, auch nicht unter einem
+        // nebenläufigen `forget` — steckt vollständig in
+        // `put_session_branch_bytes`; siehe dessen Doku.
         let markdown = minds_core::session_markdown(bytes.id(), session.session());
-        self.0
-            .write_session_branch(&bytes, &markdown)
-            .map(|_| ())
-            .map_err(StoreError::backend)
+        self.0.put_session_branch_bytes(&bytes, &markdown)
     }
 }
 
@@ -370,6 +372,211 @@ mod tests {
         let mut names: Vec<&str> = files.lines().map(str::trim).collect();
         names.sort();
         assert_eq!(names, vec!["session.json", "session.md"]);
+    }
+
+    #[test]
+    fn a_repeated_put_session_branch_after_forget_does_not_resurrect_the_markdown() {
+        // Der zweite Reanimations-Vektor (#6): Nach `forget` darf ein erneuter
+        // `put_session_branch` — der nächste Capture-Lauf — den Klartext nicht
+        // wieder als `session.md` auf die Forge schreiben.
+        const NEEDLE: &str = "Reanimations-Pruefwort-8842";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+
+        store.put(&session).unwrap();
+        store.put_session_branch(&session).unwrap();
+        store.forget(id, "DSGVO").unwrap();
+
+        // Der Wiederholungslauf.
+        store.put_session_branch(&session).unwrap();
+
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch.lines().next().expect("ein Session-Branch");
+        let md = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(!md.contains(NEEDLE), "session.md reanimiert:\n{md}");
+        let json = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+        assert!(!json.contains(NEEDLE), "session.json reanimiert:\n{json}");
+    }
+
+    #[test]
+    fn writing_the_branch_over_its_tombstone_is_refused() {
+        // Variante 2 des Branch-Rennens (#6): Der Branch existiert und ist nach
+        // `forget` getombsteint. Ein direkter `write_session_branch` — der
+        // nebenläufige Capture, dessen Vor-Check den Tombstone verpasste — darf
+        // den Klartext NICHT auf den Branch-Tombstone aufsetzen. Der atomare
+        // Guard prüft den Parent und lehnt ab (`Ok(None)`); ohne ihn setzte der
+        // Klartext-Baum als `Advanced` auf den Tombstone auf.
+        const NEEDLE: &str = "Branch-Tombstone-Overwrite-Pruefwort-6003";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+
+        store.put(&session).unwrap();
+        store.put_session_branch(&session).unwrap();
+        store.forget(id, "DSGVO").unwrap();
+
+        // Der direkte Schreibversuch, der den Vor-Check der oberen Schicht umgeht.
+        let outcome = store.0.write_session_branch(&bytes, &markdown).unwrap();
+        assert!(
+            outcome.is_none(),
+            "der Guard hätte den Tombstone-Parent ablehnen müssen"
+        );
+
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch.lines().next().expect("ein Session-Branch");
+        let md = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(!md.contains(NEEDLE), "session.md reanimiert:\n{md}");
+        let json = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+        assert!(!json.contains(NEEDLE), "session.json reanimiert:\n{json}");
+    }
+
+    #[test]
+    fn a_plaintext_branch_left_over_a_forgotten_store_ref_gets_tombstoned() {
+        // Variante 1 des Branch-Rennens (#6), der cross-ref-Fall: Der Vor-Check
+        // sah den Store-Ref als Klartext (Rennen), der Branch wurde frisch mit
+        // Klartext angelegt, während der Store-Ref bereits getombsteint war —
+        // `forget` sah den Branch nie, weil er noch nicht existierte. Der nächste
+        // `put_session_branch` muss diesen zurückgebliebenen Klartext-Branch
+        // selbst tilgen (Post-Check gegen den maßgeblichen Store-Ref).
+        const NEEDLE: &str = "Branch-Race-Reanimation-Pruefwort-6002";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+
+        // Store-Ref anlegen und tilgen — der Branch existiert dabei nicht.
+        store.put(&session).unwrap();
+        store.forget(id, "DSGVO").unwrap();
+
+        // Der Race-Ausgang: ein frischer Klartext-Branch trotz getombsteintem
+        // Store-Ref, direkt geschrieben (umgeht den Vor-Check). Er entsteht, weil
+        // der Branch keinen eigenen Tombstone-Parent hat, den der Guard sähe.
+        let outcome = store.0.write_session_branch(&bytes, &markdown).unwrap();
+        assert!(
+            outcome.is_some(),
+            "der frische Branch entsteht (kein Branch-eigener Tombstone)"
+        );
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch
+            .lines()
+            .next()
+            .expect("ein Session-Branch")
+            .to_owned();
+        // Vorbedingung: Der Klartext steht wirklich auf dem Branch.
+        let md_before = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(md_before.contains(NEEDLE), "Testaufbau: kein Klartext da");
+
+        // Der reguläre Weg. Weil der Store-Ref hier schon getombsteint ist, greift
+        // der **Vor-Check** (Stufe 1): Er sieht die Session als vergessen und tilgt
+        // den zurückgebliebenen Klartext-Branch, bevor er überhaupt schreibt. (Der
+        // Post-Check aus Stufe 3 nutzt dieselbe `tombstone_branch_if_plaintext`,
+        // nur für den nebenläufigen Fall, in dem der Vor-Check den Tombstone noch
+        // nicht sah.)
+        store.put_session_branch(&session).unwrap();
+
+        let md = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(!md.contains(NEEDLE), "session.md nicht getilgt:\n{md}");
+        let json = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+        assert!(
+            !json.contains(NEEDLE),
+            "session.json nicht getilgt:\n{json}"
+        );
+    }
+
+    #[test]
+    fn a_cleaned_up_branch_tombstone_names_the_store_ref_reason() {
+        // Wird ein im Rennen zurückgebliebener Klartext-Branch nachträglich
+        // getilgt, soll sein Tombstone denselben Grund nennen wie der maßgebliche
+        // Store-Ref — nicht einen generischen Platzhalter. So bleibt die
+        // Löschbegründung an beiden Orten dieselbe.
+        const NEEDLE: &str = "Branch-Grund-Gleichlauf-Pruefwort-6004";
+        const REASON: &str = "DSGVO-Art-17-Loeschbegehren";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+
+        store.put(&session).unwrap();
+        store.forget(id, REASON).unwrap();
+        // Der Race-Ausgang: ein Klartext-Branch trotz getombsteintem Store-Ref.
+        store.0.write_session_branch(&bytes, &markdown).unwrap();
+
+        // Der Cleanup tilgt den Branch und schreibt den Store-Ref-Grund hinein.
+        store.put_session_branch(&session).unwrap();
+
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch.lines().next().expect("ein Session-Branch");
+        let json = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+        assert!(
+            json.contains(REASON),
+            "Branch-Tombstone nennt den Store-Ref-Grund nicht:\n{json}"
+        );
+        assert!(
+            !json.contains(NEEDLE),
+            "Klartext im Branch-Tombstone:\n{json}"
+        );
+    }
+
+    #[test]
+    fn put_session_branch_after_forget_without_a_prior_branch_stays_empty() {
+        // Der scharfe Fall (#6): Eine Session, die es nur als Store-Ref gibt —
+        // so legt `import` sie ab, ganz ohne Branch. `forget` tombsteint dann
+        // nur den Store-Ref. Käme der Reanimations-Schutz allein aus dem
+        // Branch-Ref, sähe er hier nichts (den Branch gibt es nie), und der
+        // nächste Capture legte ihn mit Klartext als `session.md` neu an. Der
+        // Guard muss deshalb den *Store-Ref* konsultieren.
+        const NEEDLE: &str = "Branch-ohne-Store-Tombstone-Pruefwort-6001";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+
+        // Nur der Store-Ref — bewusst KEIN put_session_branch vor dem forget.
+        store.put(&session).unwrap();
+        store.forget(id, "DSGVO").unwrap();
+
+        // Der Wiederholungslauf, der den Branch erstmals anlegen wollte.
+        store.put_session_branch(&session).unwrap();
+
+        // Es darf kein Branch mit Klartext entstanden sein. Am strengsten:
+        // gar kein Session-Branch (der Guard griff, bevor einer angelegt wurde).
+        let branches = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        for branch in branches.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let md = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+            assert!(
+                !md.contains(NEEDLE),
+                "session.md reanimiert auf {branch}:\n{md}"
+            );
+            let json = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+            assert!(
+                !json.contains(NEEDLE),
+                "session.json reanimiert auf {branch}:\n{json}"
+            );
+        }
     }
 
     #[test]
