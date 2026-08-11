@@ -41,7 +41,7 @@
 use minds_core::RedactionCounts;
 
 use crate::config::AllowList;
-use crate::redactor::{Category, Finding, Redactor};
+use crate::redactor::{Category, Finding, Redactor, is_redaction_placeholder};
 
 /// Ergebnis einer Bereinigung: der Text ohne sensible Stellen und die Zähler der
 /// ersetzten Funde je Kategorie.
@@ -151,6 +151,12 @@ impl RedactionPipeline {
             // Erst nach `is_valid` slicen — vorher ist der Span nicht
             // garantiert in-bounds und auf einer Zeichengrenze.
             .filter(|finding| !self.allow.allows(&text[finding.start..finding.end]))
+            // Ein bereits redigierter Platzhalter wird nicht ein zweites Mal
+            // getroffen: Sonst schriebe ein Detektor anderer Kategorie ihn um,
+            // der Text änderte sich, und der Verifikationslauf verwürfe die
+            // Session als instabil. Zentral hier, damit es für **jeden**
+            // Detektor gilt — nicht nur den, der zufällig einen Guard hat.
+            .filter(|finding| !is_redaction_placeholder(&text[finding.start..finding.end]))
             .collect();
 
         // Nach Start aufsteigend; bei gleichem Start der längere Fund zuerst. Das

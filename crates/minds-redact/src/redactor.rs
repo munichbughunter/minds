@@ -50,6 +50,29 @@ impl Category {
     }
 }
 
+/// Ob `text` **exakt** ein Redaktions-Platzhalter ist.
+///
+/// Ein Wert, der bereits das Ergebnis der Redaktion ist, darf nicht ein zweites
+/// Mal getroffen werden — sonst schriebe ein Detektor **anderer Kategorie** ihn
+/// um (`[redacted:secret]` hinter `DB_USER=` → `[redacted:pii]`), der Text
+/// änderte sich, und der Verifikationslauf in
+/// [`redact_session`](crate::RedactionPipeline::redact_session) verwürfe die
+/// ganze Session als instabil. Das war ein stiller Erfassungsausfall, kein Leck
+/// — der Platzhalter trägt nichts Schützenswertes.
+///
+/// Bewusst ein **Exakt**-Vergleich: `PASSWORD=x[redacted:secret]` (ein echtes
+/// Geheimnis, das den Marker zufällig enthält) muss weiter redigiert werden.
+/// Der Vergleich sitzt in [`RedactionPipeline::redact`](crate::RedactionPipeline::redact),
+/// gilt also für **jeden** Detektor — heutige wie künftige.
+///
+/// Die Liste der Platzhalter ist hier hand-aufgezählt; `placeholder()` erzwingt
+/// bei einer neuen [`Category`] den Variant, **nicht** diese Stelle. Der Test
+/// `every_category_placeholder_is_recognized` schließt die Lücke mit einem
+/// exhaustiven `match`, der dann bricht.
+pub(crate) fn is_redaction_placeholder(text: &str) -> bool {
+    text == Category::Secret.placeholder() || text == Category::Pii.placeholder()
+}
+
 /// Ein sensibler Bereich in einem Text: halboffener Byte-Span `[start, end)`
 /// plus Kategorie.
 ///
@@ -113,6 +136,25 @@ mod tests {
     fn placeholder_is_fixed_per_category() {
         assert_eq!(Category::Secret.placeholder(), "[redacted:secret]");
         assert_eq!(Category::Pii.placeholder(), "[redacted:pii]");
+    }
+
+    #[test]
+    fn every_category_placeholder_is_recognized() {
+        // Der Compile-Anker, den `is_redaction_placeholder` selbst nicht hat:
+        // Eine neue `Category`-Variante macht dieses `match` non-exhaustiv und
+        // bricht den Build hier — die Erinnerung, den Platzhalter mitzuziehen.
+        for category in [Category::Secret, Category::Pii] {
+            match category {
+                Category::Secret | Category::Pii => {}
+            }
+            assert!(
+                is_redaction_placeholder(category.placeholder()),
+                "{category:?}-Platzhalter nicht erkannt"
+            );
+        }
+        // Und die Gegenprobe: gewöhnlicher Text ist keiner.
+        assert!(!is_redaction_placeholder("[redacted:secret]x"));
+        assert!(!is_redaction_placeholder("hunter2"));
     }
 
     #[test]

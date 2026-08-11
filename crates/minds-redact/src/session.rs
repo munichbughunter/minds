@@ -93,12 +93,20 @@
 //! gleiche Eingabe hieße gleiches Ergebnis.
 //!
 //! Verglichen wird der **Text, nicht der Zähler** — das ist keine Schlamperei,
-//! sondern nötig: Aus `DB_PASSWORD=hunter2` wird
-//! `DB_PASSWORD=[redacted:secret]`, und im zweiten Lauf trifft
-//! [`KeyValueRedactor`](crate::KeyValueRedactor) den Platzhalter erneut als
-//! Wert hinter `PASSWORD=`. Er ersetzt ihn durch sich selbst: Zähler +1, Text
-//! unverändert. Ein Zähler-Vergleich würde hier falschen Alarm schlagen, der
-//! Text-Vergleich nicht.
+//! sondern der direkte Maßstab: Die Frage ist „steht nach dem Lauf noch etwas,
+//! das ein weiterer Lauf verändern würde?", und die beantwortet der Text
+//! selbst, nicht ein Zähler, der nur ein Proxy dafür ist.
+//!
+//! Ein konkreter Fall zeigt, warum die beiden auseinanderfallen können. Aus
+//! `DB_USER=hunter2` (Identity, PII) wird beim ersten Lauf
+//! `DB_USER=[redacted:secret]` — *Secret*, weil eine überlappende Secret-Regel
+//! die Spanne gewann. Ein zweiter Lauf sähe nur noch den Platzhalter hinter
+//! `DB_USER=` und schriebe ihn zu `[redacted:pii]` um: Text geändert, Session
+//! zu Recht als instabil verworfen. Genau diesen Kategorie-Flip verhindert
+//! [`KeyValueRedactor`](crate::KeyValueRedactor) inzwischen, indem er einen
+//! Redaktions-Platzhalter als bereits erledigt behandelt (`is_exempt`) — die
+//! Redaktion erreicht damit nach *einem* Lauf einen Fixpunkt, und der
+//! Verifikationslauf bestätigt ihn, statt ihn herzustellen.
 //!
 //! # Der Audit trägt Zähler und Ortsangaben — nie Werte
 //!
