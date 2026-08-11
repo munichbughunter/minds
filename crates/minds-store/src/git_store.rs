@@ -91,7 +91,7 @@
 use std::collections::BTreeSet;
 
 use minds_core::{Evidence, SESSION_ID_PREFIX, SessionId};
-use minds_git::{GitError, RefUpdate, Repo};
+use minds_git::{GitError, MINDS_REF_NAMESPACE, RefUpdate, Repo};
 
 use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
@@ -136,6 +136,17 @@ const INDEX_PATH: &str = "index.json";
 /// nicht im selben Namensraum liegen.
 const SESSION_STORE_PREFIX: &str = "refs/minds/store/";
 
+/// Der Namensraum der eigenen Push-Buchhaltung: `refs/minds/remotes/<remote>/…`.
+///
+/// Geschrieben wird hier nur in `minds-cli/sync` nach einem bestätigten Push (ein
+/// Tracking-Ref auf den gepushten Commit). `forget` muss diese Refs
+/// **mit**behandeln: Zeigt einer noch auf den Klartext-Commit, hielte er ihn
+/// erreichbar und gc-immun, obwohl der maßgebliche Ref längst ein Tombstone ist
+/// (#14). Deshalb lebt die Konstante hier — beim Store, der die Löschung
+/// vollständig machen muss — und `minds-cli` bezieht sie von hier, damit beide
+/// Seiten dieselbe Konvention teilen.
+pub const TRACKING_REF_PREFIX: &str = "refs/minds/remotes/";
+
 /// Die Nutzlast im Baum eines Session-Refs.
 const SESSION_FILE: &str = "session.json";
 
@@ -178,6 +189,15 @@ const SESSION_BRANCH_HEX: usize = 16;
 pub(crate) struct GitStore {
     repo: Repo,
     reference: String,
+}
+
+/// Ein Tilgungs-Ort für [`GitStore::forget_one`]: welcher der drei Orte, unter
+/// welchem Ref er liegt und in welcher Datei sein Payload steht. Gebündelt, damit
+/// `forget_one` nicht an einer langen Argumentliste hängt.
+struct Site<'a> {
+    place: ForgottenPlace,
+    reference: &'a str,
+    file: &'a str,
 }
 
 impl GitStore {
@@ -418,49 +438,308 @@ impl GitStore {
         Ok(None)
     }
 
-    /// Ersetzt die Nutzlast eines Session-Refs (heute: durch einen Tombstone).
+    /// Ersetzt die Nutzlast eines Session-Refs durch einen Tombstone — als
+    /// **elternlosen** Wurzel-Commit (#14).
     ///
-    /// Setzt bewusst auf den bisherigen Stand des Refs auf, statt einen neuen
-    /// Wurzel-Commit zu schreiben: Das Vergessen ist ein zusätzlicher Commit,
-    /// kein Rewrite — die Historie des Refs bezeugt, dass etwas da war.
+    /// Ein aufgesetzter Tombstone ließe den alten `session.json`-Klartext über
+    /// `<ref>~1` regulär erreichbar, und er reiste bei jedem Push mit — die
+    /// DSGVO-Löschung wäre kosmetisch. Deshalb kappt die Tilgung die Historie:
+    /// [`Repo::reset_ref_to_root`] schreibt den neuen Baum ohne Eltern. Der
+    /// aktuelle Baum wird als Basis genommen, damit Nebendateien (etwa
+    /// [`SESSION_LINKS_FILE`]) erhalten bleiben; nur `session.json` wird zum
+    /// Tombstone, und alle früheren Stände fallen weg.
     fn overwrite_session(
         &self,
         reference: &str,
         bytes: &[u8],
         message: &str,
     ) -> minds_git::Result<RefUpdate> {
-        self.write_into_session(reference, SESSION_FILE, bytes, message)
+        self.reset_root_with_file(reference, SESSION_FILE, bytes, message)
     }
 
-    /// Ersetzt den **gesamten** Baum eines Session-Branches durch den Tombstone.
+    /// Ersetzt den **gesamten** Baum eines Session-Branches durch den Tombstone —
+    /// als elternlosen Wurzel-Commit (#14).
     ///
-    /// Anders als [`overwrite_session`](Self::overwrite_session) wird hier nicht
-    /// eine Datei getauscht, sondern ein frischer Baum geschrieben: Der Branch
-    /// trägt neben der `session.json` eine gerenderte `session.md`, und **beide**
-    /// müssen weg. Ein aufgesetzter Baum, der nur `session.json` ersetzte, ließe
-    /// den Klartext in `session.md` stehen — genau das Leck, das dieses Kommando
-    /// schließt. `write_tree(None, …)` beschreibt den Baum vollständig, es bleibt
-    /// keine dritte Datei zurück.
+    /// Zwei Gründe für den frischen Baum: Der Branch trägt neben der
+    /// `session.json` eine gerenderte `session.md`, und **beide** müssen weg — ein
+    /// aufgesetzter Baum, der nur `session.json` ersetzte, ließe den Klartext in
+    /// `session.md` stehen. `write_tree(None, …)` beschreibt den Baum vollständig,
+    /// es bleibt keine dritte Datei zurück.
     ///
-    /// Wie bei [`overwrite_session`](Self::overwrite_session) wird der Tombstone
-    /// **aufgesetzt**, nicht als neuer Wurzel-Commit geschrieben: Der aktuelle
-    /// Baum ist inhaltsfrei, der Klartext bleibt aber im Parent-Commit
-    /// erreichbar (`<branch>~1:session.md`). Das gilt bewusst für **alle** drei
-    /// Orte gleich und wird gesammelt in Issue #14 auf elternlose Tombstones
-    /// umgestellt — hier den Branch als Sonderfall vorzuziehen, hieße zwei
-    /// verschiedene Tilg-Semantiken nebeneinander zu haben.
+    /// Und wie bei [`overwrite_session`](Self::overwrite_session) wird der
+    /// Tombstone elternlos geschrieben: Der alte Klartext bliebe sonst über
+    /// `<branch>~1:session.md` erreichbar. [`Repo::reset_ref_to_root`] kappt die
+    /// Historie des Branch-Refs — eine private Orphan-Kette mit genau einer
+    /// Session, deren Rewrite billig ist.
     fn overwrite_session_branch(
         &self,
         reference: &str,
         bytes: &[u8],
         message: &str,
     ) -> minds_git::Result<RefUpdate> {
+        // Den Branch-Ref einmal auflösen und denselben Stand als CAS-Erwartung
+        // übergeben (#14, B2): Bei einem verlorenen Wettlauf meldet
+        // `reset_ref_to_root` `RefRaced`, und `retry_write` setzt frisch auf.
+        let current = self.repo.commit_at(reference)?;
         let tomb = self.repo.write_blob(bytes)?;
         let tree = self.repo.write_tree(
             None,
             [(SESSION_BRANCH_FILE, tomb), (SESSION_BRANCH_MD, tomb)],
         )?;
-        self.repo.commit_tree_to_ref(reference, tree, message)
+        self.repo
+            .reset_ref_to_root(reference, tree, current, message)
+    }
+
+    /// Tauscht `path` im aktuellen Baum von `reference` gegen `bytes` und setzt
+    /// den Ref als **elternlosen** Wurzel-Commit neu (#14).
+    ///
+    /// Der Weg, auf dem `forget` einen Tombstone so setzt, dass der alte Inhalt
+    /// von `path` über keinen Ref mehr erreichbar ist. Anders als
+    /// [`write_into_session`](Self::write_into_session) (das für reguläres
+    /// Fortschreiben — Kanten, Index — auf den Stand **aufsetzt**) fällt hier die
+    /// Historie weg. Der aktuelle Baum ist die Basis, damit die übrigen Einträge
+    /// (andere Sessions im Kontext-Baum, Nebendateien am Store-Ref) im aktuellen
+    /// Stand erhalten bleiben — nur ihre Historie geht mit, nicht ihr Inhalt.
+    ///
+    /// Der Ref wird **einmal** aufgelöst (`current`), und aus genau diesem Commit
+    /// stammen sowohl die Baum-Basis als auch die CAS-Erwartung an
+    /// [`reset_ref_to_root`](minds_git::Repo::reset_ref_to_root). Das schließt die
+    /// Lücke, in der ein nebenläufiger `forget` auf dem geteilten Kontext-Baum
+    /// zwischen „Basis lesen" und „CAS prüfen" den Ref bewegt und so eine
+    /// Klartext-Auferstehung festschreibt (#14, B2): Bewegt sich der Ref, schlägt
+    /// die CAS fehl (`RefRaced`), und `retry_write` liest Basis und Erwartung
+    /// frisch.
+    fn reset_root_with_file(
+        &self,
+        reference: &str,
+        path: &str,
+        bytes: &[u8],
+        message: &str,
+    ) -> minds_git::Result<RefUpdate> {
+        let current = self.repo.commit_at(reference)?;
+        let base = current.map(|c| self.repo.tree_of(c)).transpose()?;
+        let blob = self.repo.write_blob(bytes)?;
+        let tree = self.repo.write_tree(base, [(path, blob)])?;
+        self.repo
+            .reset_ref_to_root(reference, tree, current, message)
+    }
+
+    /// Löst die Push-Buchhaltung eines Orts vom Klartext: setzt jeden
+    /// `refs/minds/remotes/<remote>/<rest>`, der denselben Ref ankert und dabei
+    /// abgeschnittenen Klartext trägt, auf den aktuellen Stand um — oder löscht
+    /// ihn, wenn es den maßgeblichen Ref gar nicht mehr gibt (#14). Gibt zurück, ob
+    /// etwas verändert wurde.
+    ///
+    /// Nach dem Reset trägt der maßgebliche Ref einen elternlosen Tombstone; der
+    /// Klartext ist über ihn nicht mehr erreichbar. Ein Tracking-Ref aber, den
+    /// `minds sync` nach einem früheren Push anlegte, zeigt **weiter** auf den
+    /// Klartext-Commit und hielte ihn `gc`-immun erreichbar — die DSGVO-Löschung
+    /// bliebe lokal unvollständig, obwohl `rev-list` über die Session-Refs sauber
+    /// aussieht.
+    ///
+    /// **Umsetzen, nicht löschen:** Ein gelöschter Tracking-Ref entankerte den
+    /// Klartext zwar, ließe `minds sync` den Tombstone-Ref aber für einen
+    /// non-fast-forward-Push anbieten (der Remote trägt noch den Klartext) — der
+    /// prallt ab und erzeugt bei jedem Push Fehler-Rauschen. Auf den neuen Stand
+    /// umgesetzt, ankert der Tracking-Ref keinen Klartext mehr **und** `sync` sieht
+    /// `tracked == local`, bietet also nichts an; die Remote-Seite zieht #102 nach.
+    ///
+    /// **Nur echte Klartext-Anker, kein Fast-Forward-Rückstand:** Umgesetzt wird
+    /// nur, wenn der Tracking-Stand **kein** Vorfahr des aktuellen ist — dann hat
+    /// ein Orphan-Reset die Kette gekappt und der alte Stand ist unerreichbarer
+    /// Klartext. Liegt der Tracking-Ref bloß fast-forward zurück (der geteilte
+    /// Kontext-Ref, den eine *andere* Session vorwärtsschrieb), gehört der
+    /// Rückstand `minds sync`; ihn anzufassen verschlänge einen legitimen Push.
+    ///
+    /// **Bedingungslos, nicht an `payload_at` gekoppelt:** Schlug ein früheres
+    /// Umsetzen fehl, ist der maßgebliche Ref längst ein Tombstone (kein Payload
+    /// mehr), der Tracking-Ref hinge aber noch am Klartext. Liefe dieser Schritt
+    /// nur bei vorhandenem Payload, könnte ein zweiter `forget` den Leak nicht mehr
+    /// heilen. Darum läuft er für jeden Ort, unabhängig vom Tilgungs-Guard.
+    fn retarget_tracking(&self, reference: &str) -> Result<bool> {
+        let Some(rest) = reference.strip_prefix(MINDS_REF_NAMESPACE) else {
+            return Ok(false);
+        };
+        let target = self
+            .repo
+            .commit_at(reference)
+            .map_err(StoreError::backend)?;
+        let mut changed = false;
+        for (name, current) in self
+            .repo
+            .refs_under(TRACKING_REF_PREFIX)
+            .map_err(StoreError::backend)?
+        {
+            // `name` = refs/minds/remotes/<remote>/<rest>. Der Remote-Name darf
+            // Schrägstriche enthalten, deshalb über das Suffix statt `split_once`:
+            // getroffen wird, was hinter *irgendeinem* Remote-Segment genau `rest`
+            // trägt.
+            let anchors_same_place = name
+                .strip_prefix(TRACKING_REF_PREFIX)
+                .and_then(|after| after.strip_suffix(rest))
+                .and_then(|remote_slash| remote_slash.strip_suffix('/'))
+                .is_some_and(|remote| !remote.is_empty());
+            if !anchors_same_place {
+                continue;
+            }
+            match target {
+                Some(head) if current != head => {
+                    // Nur umsetzen, wenn `current` **kein** Vorfahr von `head`
+                    // ist: Dann hat ein Orphan-Reset (Tombstone) die Kette gekappt,
+                    // und der Tracking-Ref ankert abgeschnittenen (Klartext-)Inhalt
+                    // — de-ankern. Ist `current` dagegen ein Vorfahr (der geteilte
+                    // Kontext-Ref wanderte bloß fast-forward vorwärts, weil eine
+                    // *andere* Session ihn fortschrieb), gehört der Rückstand
+                    // `minds sync`, nicht `forget`; ihn anzufassen risse einen
+                    // legitimen, noch ausstehenden Push weg (#14).
+                    if !self
+                        .repo
+                        .is_ancestor(current, head)
+                        .map_err(StoreError::backend)?
+                    {
+                        self.repo
+                            .set_ref(&name, head)
+                            .map_err(StoreError::backend)?;
+                        changed = true;
+                    }
+                }
+                Some(_) => {}
+                // Kein maßgeblicher Ref mehr — der Tracking-Ref ist verwaist.
+                None => {
+                    self.repo.delete_ref(&name).map_err(StoreError::backend)?;
+                    changed = true;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    /// Tilgt **einen** Ort und löst dessen Push-Buchhaltung vom Klartext — der
+    /// wiederholte Baustein von [`forget_guarded`](Self::forget_guarded).
+    ///
+    /// Trägt der Ort noch Payload, wird er getilgt (mit Guard und Retry). Danach
+    /// läuft [`retarget_tracking`](Self::retarget_tracking) **immer** — auch wenn
+    /// hier nichts getilgt wurde —, damit ein aus einem früheren Fehlschlag
+    /// zurückgebliebener Tracking-Ref eingeholt wird. Der Ort gilt als „getilgt"
+    /// (und wird gezählt), wenn hier Payload wich **oder** ein Tracking-Ref
+    /// umgesetzt/gelöscht wurde.
+    fn forget_one(
+        &self,
+        id: SessionId,
+        site: Site<'_>,
+        forgotten: &mut Vec<ForgottenPlace>,
+        guard: &mut impl FnMut(ForgottenPlace) -> Result<()>,
+        write: impl FnMut() -> minds_git::Result<RefUpdate>,
+    ) -> Result<()> {
+        let Site {
+            place,
+            reference,
+            file,
+        } = site;
+        let has_payload = self.payload_at(
+            self.repo
+                .read_blob_at(reference, file)
+                .map_err(StoreError::backend)?,
+        );
+        if has_payload {
+            guard(place)
+                .and_then(|()| self.retry_write(write))
+                .map_err(|source| {
+                    StoreError::forget_incomplete(id, forgotten.clone(), place, source)
+                })?;
+        }
+        let retargeted = self.retarget_tracking(reference).map_err(|source| {
+            StoreError::forget_incomplete(id, forgotten.clone(), place, source)
+        })?;
+        if has_payload || retargeted {
+            forgotten.push(place);
+        }
+        Ok(())
+    }
+
+    /// Tilgt eine Session an **jedem** Ort, an dem sie liegt — der Rumpf hinter
+    /// [`ContextStore::forget`], mit einem einschiebbaren `guard` für Tests.
+    ///
+    /// Eine Session kann an drei Orten liegen: dem Store-Ref (neu, maßgeblich),
+    /// dem Session-Branch (browsbar in der Forge, `session.json` *und*
+    /// `session.md`) und dem Kontext-Baum (Bestandsformat). Ein Repo, das vor dem
+    /// Umzug schrieb und danach dieselbe Session erneut ablegte, hat sie an
+    /// mehreren. Jeder Ort wird als **elternloser** Tombstone getilgt (#14),
+    /// sodass der Klartext über keinen Ref mehr erreichbar bleibt.
+    ///
+    /// Die Tilgung mehrerer Orte ist **nicht** in einer Git-Transaktion atomar:
+    /// Bricht sie nach dem ersten Ort ab, sind die schon getilgten weg, der
+    /// offene trägt weiter Klartext. Damit das nicht unsichtbar bleibt, meldet der
+    /// Fehler [`StoreError::ForgetIncomplete`] die schon getilgten Orte und den
+    /// offenen — und ein erneuter `forget` vollendet die Löschung, weil er die
+    /// schon getilgten Orte an ihrem Tombstone erkennt und überspringt.
+    ///
+    /// `guard` läuft vor jedem Schreibschritt; gibt er einen Fehler, wird der wie
+    /// ein Schreibfehler an diesem Ort behandelt. In Produktion ist er ein No-op;
+    /// Tests nutzen ihn, um einen Abbruch mitten in der Sequenz zu erzwingen.
+    pub(crate) fn forget_guarded(
+        &self,
+        id: SessionId,
+        reason: &str,
+        mut guard: impl FnMut(ForgottenPlace) -> Result<()>,
+    ) -> Result<Forget> {
+        let tomb = crate::tombstone::bytes(reason);
+        let message = format!("minds: Session {id} vergessen");
+        let mut forgotten = Vec::new();
+
+        // Der maßgebliche Ort.
+        let reference = session_ref(id);
+        self.forget_one(
+            id,
+            Site {
+                place: ForgottenPlace::StoreRef,
+                reference: &reference,
+                file: SESSION_FILE,
+            },
+            &mut forgotten,
+            &mut guard,
+            || self.overwrite_session(&reference, &tomb, &message),
+        )?;
+
+        // Der browsbare Branch. Ohne diesen Ort meldete `forget` „vergessen",
+        // während `session.md` mit dem vollen Klartext weiter als Forge-Branch
+        // stünde. Geprüft an `session.json`, getilgt beide Dateien des Baums.
+        let branch = session_branch_ref(id);
+        self.forget_one(
+            id,
+            Site {
+                place: ForgottenPlace::SessionBranch,
+                reference: &branch,
+                file: SESSION_BRANCH_FILE,
+            },
+            &mut forgotten,
+            &mut guard,
+            || self.overwrite_session_branch(&branch, &tomb, &message),
+        )?;
+
+        // Der alte Ort — geteilter Baum: Der elternlose Reset trägt den
+        // vollständigen aktuellen Baum, sodass nur die Historie wegfällt und die
+        // übrigen Sessions im aktuellen Stand bleiben.
+        let path = path_of(id);
+        self.forget_one(
+            id,
+            Site {
+                place: ForgottenPlace::ContextTree,
+                reference: &self.reference,
+                file: &path,
+            },
+            &mut forgotten,
+            &mut guard,
+            || self.reset_root_with_file(&self.reference, &path, &tomb, &message),
+        )?;
+
+        Ok(if forgotten.is_empty() {
+            // Nicht da — oder schon ein Tombstone ohne Tracking-Rest. Beides ist
+            // „nichts zu tun".
+            Forget::Absent(id)
+        } else {
+            Forget::Forgotten(id, forgotten)
+        })
     }
 }
 
@@ -690,67 +969,14 @@ impl ContextStore for GitStore {
         }
     }
 
-    /// Ersetzt die Nutzlast an **jedem** Ort, an dem sie liegt.
+    /// Ersetzt die Nutzlast an **jedem** Ort, an dem sie liegt, durch einen
+    /// elternlosen Tombstone — die Löschung überlebt keinen Ref-Rewalk mehr.
     ///
-    /// Eine Session kann an drei Orten liegen: dem Store-Ref (neu, maßgeblich),
-    /// dem **Session-Branch** (browsbar in der Forge, mit `session.json` *und*
-    /// gerenderter `session.md`) und dem Kontext-Baum (Bestandsrepos). Ein Repo,
-    /// das vor dem Umzug schrieb und danach dieselbe Session erneut ablegte, hat
-    /// sie an mehreren. Nur einen zu tilgen wäre die schlimmste Sorte Fehler,
-    /// die dieses Kommando machen kann: Es meldete „vergessen", und der Klartext
-    /// stünde weiter im anderen Baum — auf der Forge, für jeden mit Repo-Zugriff
-    /// lesbar. Deshalb wird hier nicht abgekürzt, sondern jeder Ort geprüft und
-    /// getilgt, und `forget` benennt zurück, welche es waren.
+    /// Der Rumpf steht in [`forget_guarded`](Self::forget_guarded), das die
+    /// Mehr-Ort-Logik und den Fehlerpfad ([`StoreError::ForgetIncomplete`])
+    /// trägt; hier läuft es mit einem No-op-Guard.
     fn forget(&self, id: SessionId, reason: &str) -> Result<Forget> {
-        let tomb = crate::tombstone::bytes(reason);
-        let message = format!("minds: Session {id} vergessen");
-        let mut places = Vec::new();
-
-        // Der maßgebliche Ort. Der Tombstone wird an den Store-Ref **angehängt**
-        // — ein Fast-Forward, kein Rewrite: Die Referenz bleibt auflösbar, der
-        // Inhalt ist aus dem aktuellen Baum weg.
-        let reference = session_ref(id);
-        if self.payload_at(
-            self.repo
-                .read_blob_at(&reference, SESSION_FILE)
-                .map_err(StoreError::backend)?,
-        ) {
-            self.retry_write(|| self.overwrite_session(&reference, &tomb, &message))?;
-            places.push(ForgottenPlace::StoreRef);
-        }
-
-        // Der browsbare Branch. Ohne diesen Zweig meldete `forget` „vergessen",
-        // während `session.md` mit dem vollen Klartext weiter als Forge-Branch
-        // stünde — ein DSGVO-Verstoß mit Erfolgsmeldung. Geprüft wird an
-        // `session.json`; getilgt werden beide Dateien des Branch-Baums.
-        let branch = session_branch_ref(id);
-        if self.payload_at(
-            self.repo
-                .read_blob_at(&branch, SESSION_BRANCH_FILE)
-                .map_err(StoreError::backend)?,
-        ) {
-            self.retry_write(|| self.overwrite_session_branch(&branch, &tomb, &message))?;
-            places.push(ForgottenPlace::SessionBranch);
-        }
-
-        // Der alte Ort. Eine vor dem Umzug abgelegte Session muss sich löschen
-        // lassen, ohne dass jemand sie vorher migriert.
-        let path = path_of(id);
-        if self.payload_at(
-            self.repo
-                .read_blob_at(&self.reference, &path)
-                .map_err(StoreError::backend)?,
-        ) {
-            self.retry_write(|| self.write_blob_once(&path, &tomb, &message))?;
-            places.push(ForgottenPlace::ContextTree);
-        }
-
-        Ok(if places.is_empty() {
-            // Nicht da — oder schon ein Tombstone. Beides ist „nichts zu tun".
-            Forget::Absent(id)
-        } else {
-            Forget::Forgotten(id, places)
-        })
+        self.forget_guarded(id, reason, |_| Ok(()))
     }
 }
 
@@ -1004,6 +1230,12 @@ mod tests {
         let (fixture, store) = fresh_store();
         let id = store.put(&redacted("streng geheim")).unwrap().id();
 
+        // Den Blob-Hash des Klartexts festhalten, bevor er vergessen wird.
+        let payload_blob = fixture
+            .git(&["rev-parse", &format!("{}:{SESSION_FILE}", session_ref(id))])
+            .trim()
+            .to_owned();
+
         let forgotten = store.forget(id, "DSGVO").unwrap();
         assert!(forgotten.was_forgotten());
 
@@ -1017,13 +1249,248 @@ mod tests {
         assert!(!blob.contains("streng geheim"), "Inhalt überlebt: {blob}");
         assert!(blob.contains("minds_tombstone"));
 
-        // Append-only: das Vergessen ist ein zusätzlicher Commit, kein Rewrite.
+        // #14: Das Vergessen kappt die Historie — der Tombstone ist ein
+        // **elternloser** Wurzel-Commit, kein aufgesetzter. Nur dieser eine
+        // Commit hängt am Ref.
         assert_eq!(
             fixture
                 .git(&["rev-list", "--count", &session_ref(id)])
                 .trim(),
-            "2"
+            "1"
         );
+        assert_eq!(
+            fixture
+                .git(&["log", "-1", "--format=%P", &session_ref(id)])
+                .trim(),
+            "",
+            "der Tombstone-Commit muss elternlos sein"
+        );
+
+        // Der Kern von #14 (Akzeptanzkriterium): Der Klartext-Blob ist über
+        // **keinen** Ref mehr erreichbar — nach `gc` wäre er weg.
+        let reachable = fixture.git(&["rev-list", "--objects", "--all"]);
+        assert!(
+            !reachable.contains(&payload_blob),
+            "der Klartext-Blob {payload_blob} ist noch erreichbar:\n{reachable}"
+        );
+    }
+
+    #[test]
+    fn forget_retargets_a_tracking_ref_off_the_plaintext_onto_the_tombstone() {
+        // #14 (B1): Nach einem Sync zeigt ein lokaler Tracking-Ref
+        // (`refs/minds/remotes/<remote>/store/<hash>`) auf den Klartext-Commit.
+        // Tilgt `forget` nur den maßgeblichen Store-Ref, hielte der Tracking-Ref
+        // den Klartext-Blob erreichbar und gc-immun — die Löschung wäre lokal
+        // unvollständig, während `rev-list` über die Session-Refs sauber aussieht.
+        // `forget` setzt den Tracking-Ref deshalb auf den Tombstone um.
+        let (fixture, store) = fresh_store();
+        let id = store.put(&redacted("streng geheim")).unwrap().id();
+        let payload_blob = fixture
+            .git(&["rev-parse", &format!("{}:{SESSION_FILE}", session_ref(id))])
+            .trim()
+            .to_owned();
+        let payload_commit = fixture
+            .git(&["rev-parse", &session_ref(id)])
+            .trim()
+            .to_owned();
+
+        // Ein früherer Sync: der Tracking-Ref verankert den Klartext-Commit.
+        let tracking = format!("{TRACKING_REF_PREFIX}origin/store/{}", hex_of(id));
+        fixture.git(&["update-ref", &tracking, &payload_commit]);
+        let before = fixture.git(&["rev-list", "--objects", "--all"]);
+        assert!(before.contains(&payload_blob), "Testaufbau: Blob nicht da");
+
+        store.forget(id, "DSGVO").unwrap();
+
+        // Der Klartext ist über keinen Ref mehr erreichbar …
+        let after = fixture.git(&["rev-list", "--objects", "--all"]);
+        assert!(
+            !after.contains(&payload_blob),
+            "Klartext-Blob über den Tracking-Ref noch erreichbar:\n{after}"
+        );
+        // … und der Tracking-Ref lebt noch, zeigt aber jetzt auf den Tombstone
+        // (denselben Stand wie der Store-Ref): `minds sync` sieht „schon auf
+        // Stand" und bietet keinen non-fast-forward-Push an.
+        let tombstone = fixture
+            .git(&["rev-parse", &session_ref(id)])
+            .trim()
+            .to_owned();
+        let now = fixture.git(&["rev-parse", &tracking]).trim().to_owned();
+        assert_eq!(
+            now, tombstone,
+            "Tracking-Ref nicht auf den Tombstone umgesetzt"
+        );
+    }
+
+    #[test]
+    fn a_second_forget_heals_a_reappeared_tracking_ref() {
+        // #14-Blocker: Schlug das Umsetzen des Tracking-Refs beim ersten `forget`
+        // fehl — oder legte ein späterer Sync ihn erneut auf den Klartext —, ist
+        // der Store-Ref längst ein Tombstone, der Tracking-Ref hinge aber wieder
+        // am Klartext. Ein zweiter `forget` muss das heilen, obwohl `payload_at`
+        // am Store-Ref jetzt false ist (der Schritt hängt nicht am Payload).
+        let (fixture, store) = fresh_store();
+        let id = store.put(&redacted("streng geheim")).unwrap().id();
+        let payload_blob = fixture
+            .git(&["rev-parse", &format!("{}:{SESSION_FILE}", session_ref(id))])
+            .trim()
+            .to_owned();
+        let payload_commit = fixture
+            .git(&["rev-parse", &session_ref(id)])
+            .trim()
+            .to_owned();
+        let tracking = format!("{TRACKING_REF_PREFIX}origin/store/{}", hex_of(id));
+
+        // Erste Tilgung — der Store-Ref wird zum Tombstone.
+        store.forget(id, "DSGVO").unwrap();
+        // Der Tracking-Ref taucht (erneut) am Klartext-Commit auf.
+        fixture.git(&["update-ref", &tracking, &payload_commit]);
+        assert!(
+            fixture
+                .git(&["rev-list", "--objects", "--all"])
+                .contains(&payload_blob),
+            "Testaufbau: Klartext wieder erreichbar"
+        );
+
+        // Zweite Tilgung heilt, obwohl der Store-Ref schon ein Tombstone ist.
+        store.forget(id, "DSGVO").unwrap();
+        assert!(
+            !fixture
+                .git(&["rev-list", "--objects", "--all"])
+                .contains(&payload_blob),
+            "zweiter forget heilt den wieder-aufgetauchten Tracking-Ref nicht"
+        );
+    }
+
+    #[test]
+    fn forget_retargets_a_tracking_ref_of_a_remote_with_a_slash() {
+        // #14-Major: Der Remote-Name darf Schrägstriche enthalten. Ein
+        // `refs/minds/remotes/team/origin/store/<hash>` muss trotzdem getroffen
+        // werden, sonst überlebte der Klartext-Anker.
+        let (fixture, store) = fresh_store();
+        let id = store.put(&redacted("streng geheim")).unwrap().id();
+        let payload_blob = fixture
+            .git(&["rev-parse", &format!("{}:{SESSION_FILE}", session_ref(id))])
+            .trim()
+            .to_owned();
+        let payload_commit = fixture
+            .git(&["rev-parse", &session_ref(id)])
+            .trim()
+            .to_owned();
+        let tracking = format!("{TRACKING_REF_PREFIX}team/origin/store/{}", hex_of(id));
+        fixture.git(&["update-ref", &tracking, &payload_commit]);
+
+        store.forget(id, "DSGVO").unwrap();
+
+        assert!(
+            !fixture
+                .git(&["rev-list", "--objects", "--all"])
+                .contains(&payload_blob),
+            "Tracking-Ref eines Remote mit / überlebt am Klartext"
+        );
+    }
+
+    #[test]
+    fn forget_retargets_every_remote_tracking_ref_of_a_place() {
+        // Ankern zwei Remotes denselben Klartext-Commit, muss `forget` **beide**
+        // Tracking-Refs umsetzen — sonst hielte der übersehene den Klartext.
+        let (fixture, store) = fresh_store();
+        let id = store.put(&redacted("streng geheim")).unwrap().id();
+        let payload_blob = fixture
+            .git(&["rev-parse", &format!("{}:{SESSION_FILE}", session_ref(id))])
+            .trim()
+            .to_owned();
+        let payload_commit = fixture
+            .git(&["rev-parse", &session_ref(id)])
+            .trim()
+            .to_owned();
+        let t1 = format!("{TRACKING_REF_PREFIX}origin/store/{}", hex_of(id));
+        let t2 = format!("{TRACKING_REF_PREFIX}team/mirror/store/{}", hex_of(id));
+        fixture.git(&["update-ref", &t1, &payload_commit]);
+        fixture.git(&["update-ref", &t2, &payload_commit]);
+
+        store.forget(id, "DSGVO").unwrap();
+
+        assert!(
+            !fixture
+                .git(&["rev-list", "--objects", "--all"])
+                .contains(&payload_blob),
+            "einer der beiden Tracking-Refs ankert den Klartext noch"
+        );
+    }
+
+    #[test]
+    fn forget_leaves_a_fast_forward_context_tracking_ref_alone() {
+        // #14-Major: Der geteilte Kontext-Tracking-Ref darf NICHT umgesetzt
+        // werden, wenn er bloß fast-forward hinter dem Kontext-HEAD zurückliegt
+        // (ein Push anderer Sessions steht aus). Nur ein Orphan-Reset, der die
+        // Kette kappt, de-ankert — sonst verschlänge `forget` einen legitimen,
+        // noch ausstehenden Kontext-Push.
+        let (fixture, store) = fresh_store();
+        let id = store.put(&redacted("streng geheim")).unwrap().id();
+
+        // Den geteilten Kontext-Ref über den Index fast-forward fortschreiben.
+        let mut index = store.index().unwrap();
+        index.link("aaaa", id, Evidence::Inferred);
+        store.set_index(&index).unwrap();
+        let c1 = fixture
+            .git(&["rev-parse", DEFAULT_CONTEXT_REF])
+            .trim()
+            .to_owned();
+        // Der Kontext-Tracking-Ref liegt auf diesem früheren Stand.
+        let tracking = format!("{TRACKING_REF_PREFIX}origin/context");
+        fixture.git(&["update-ref", &tracking, &c1]);
+        // Kontext fast-forward weiter (eine andere Kante).
+        index.link("bbbb", id, Evidence::Inferred);
+        store.set_index(&index).unwrap();
+        let c2 = fixture
+            .git(&["rev-parse", DEFAULT_CONTEXT_REF])
+            .trim()
+            .to_owned();
+        assert_ne!(c1, c2, "Testaufbau: Kontext wanderte nicht");
+
+        // forget der Session — sie liegt nur am Store-Ref, NICHT im Kontext-Baum.
+        store.forget(id, "DSGVO").unwrap();
+
+        // Der Kontext-Tracking-Ref blieb auf c1 (fast-forward, nicht umgesetzt):
+        // `minds sync` kann den ausstehenden Kontext-Push regulär nachholen.
+        let now = fixture.git(&["rev-parse", &tracking]).trim().to_owned();
+        assert_eq!(
+            now, c1,
+            "fast-forward-Kontext-Tracking-Ref fälschlich umgesetzt"
+        );
+    }
+
+    #[test]
+    fn forget_keeps_the_side_files_of_the_store_ref() {
+        // Der elternlose Reset des Store-Refs nimmt den aktuellen Baum als Basis,
+        // damit Nebendateien (die Kanten in `links.json`) erhalten bleiben — nur
+        // `session.json` wird zum Tombstone. Ein `write_tree(None, …)` wie beim
+        // Branch verlöre sie.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        let commit = "a".repeat(40);
+        store.link(id, &commit, Evidence::Inferred).unwrap();
+        // Vorbedingung: die Kante liegt am Store-Ref.
+        let before = fixture.git(&["ls-tree", "-r", "--name-only", &session_ref(id)]);
+        assert!(before.contains(SESSION_LINKS_FILE), "Testaufbau:\n{before}");
+
+        store.forget(id, "DSGVO").unwrap();
+
+        // Nach dem forget trägt der Store-Ref den Tombstone, aber `links.json`
+        // steht weiter im aktuellen Baum.
+        let after = fixture.git(&["ls-tree", "-r", "--name-only", &session_ref(id)]);
+        assert!(
+            after.contains(SESSION_LINKS_FILE),
+            "links.json ging beim forget verloren:\n{after}"
+        );
+        let links = fixture.git(&[
+            "cat-file",
+            "blob",
+            &format!("{}:{SESSION_LINKS_FILE}", session_ref(id)),
+        ]);
+        assert!(links.contains(&commit), "Kante verloren:\n{links}");
     }
 
     #[test]
@@ -1043,12 +1510,13 @@ mod tests {
         let blob = fixture.git(&["cat-file", "blob", &revision]);
         assert!(!blob.contains("streng geheim"), "reanimiert: {blob}");
         assert!(blob.contains("minds_tombstone"));
-        // Kein dritter Commit — der abgeprallte `put` schreibt nichts.
+        // Der abgeprallte `put` schreibt nichts — es bleibt beim einen
+        // elternlosen Tombstone-Commit aus dem `forget` (#14).
         assert_eq!(
             fixture
                 .git(&["rev-list", "--count", &session_ref(id)])
                 .trim(),
-            "2"
+            "1"
         );
         assert!(matches!(store.get(id), Err(StoreError::Forgotten { .. })));
     }

@@ -59,6 +59,29 @@ impl Repo {
             Err(err) => Err(GitError::revwalk(tip, err)),
         }))
     }
+
+    /// Ob `ancestor` von `descendant` aus erreichbar ist — ob ein Ref-Update von
+    /// `ancestor` auf `descendant` also ein **Fast-Forward** wäre.
+    ///
+    /// `true` auch für `ancestor == descendant` (der triviale Fast-Forward).
+    /// `false`, wenn `descendant` eine **eigene Wurzel** hat, die `ancestor` nicht
+    /// enthält — etwa ein elternloser Tombstone aus `forget` (#14), der die alte
+    /// Kette kappt. Ein Push eines solchen Refs bräuchte `--force`; `minds sync`
+    /// nutzt das, um einen solchen Ref zu überspringen statt den ganzen Push
+    /// scheitern zu lassen.
+    ///
+    /// Im Positiv-Fall läuft der Walk nur bis `ancestor`; ist `ancestor` **kein**
+    /// Vorfahr, wird die gesamte Historie von `descendant` besucht. Für die kurzen
+    /// Ketten der Session-Refs ist beides billig; nur der geteilte Kontext-Ref
+    /// kann eine lange Historie haben.
+    pub fn is_ancestor(&self, ancestor: CommitId, descendant: CommitId) -> Result<bool> {
+        for reached in self.revwalk(descendant)? {
+            if reached? == ancestor {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +154,30 @@ mod tests {
         // vom Tip aus los, und die Wurzel kommt zuletzt.
         assert_eq!(seen.first(), Some(&merge));
         assert_eq!(seen.last(), Some(&c1));
+    }
+
+    #[test]
+    fn is_ancestor_follows_the_graph_edges() {
+        // c1 ── c2   (main)
+        //  └─── f1   (feature)
+        let fixture = TempRepo::init();
+        let c1 = fixture.commit("c1");
+        let c2 = fixture.commit("c2");
+        fixture.git(&["checkout", "--quiet", "-b", "feature", &c1.to_string()]);
+        let f1 = fixture.commit("f1");
+
+        let repo = Repo::open(fixture.path()).unwrap();
+        // Fast-Forward-Beziehung: c1 → c2.
+        assert!(repo.is_ancestor(c1, c2).unwrap());
+        // Der triviale Fast-Forward (gleich).
+        assert!(repo.is_ancestor(c2, c2).unwrap());
+        // Rückwärts ist kein Fast-Forward.
+        assert!(!repo.is_ancestor(c2, c1).unwrap());
+        // Divergierte Zweige: keiner ist Vorfahre des anderen — genau die Lage
+        // eines elternlosen Tombstones gegenüber dem alten Stand, die einen
+        // Force-Push bräuchte (#14).
+        assert!(!repo.is_ancestor(c2, f1).unwrap());
+        assert!(!repo.is_ancestor(f1, c2).unwrap());
     }
 
     #[test]
