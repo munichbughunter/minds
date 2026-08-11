@@ -45,6 +45,26 @@
 //! Byte-Vergleich fällt durch, der reguläre Weg läuft, und der richtige Inhalt
 //! steht wieder da. Repariert wird dabei sichtbar — es entsteht ein Commit.
 //!
+//! **Ein Tombstone ist die eine Ausnahme, die nicht überschrieben wird.** Er
+//! weicht per Konstruktion von der Session ab, fiele also durch denselben
+//! Byte-Vergleich und würde als „Fremdes, das repariert werden muss" mit dem
+//! Klartext ersetzt — und reanimierte damit eine [`vergessene`](ContextStore::forget)
+//! Session beim nächsten Capture. Deshalb schreibt [`GitStore::put_bytes`] über
+//! [`GitStore::write_session`] nur mit einem **atomaren Guard**
+//! ([`Repo::commit_tree_to_ref_unless`]): Der Tombstone wird am selben Parent
+//! geprüft, auf den der Compare-and-Swap aufsetzt — ein `forget` im Fenster löst
+//! `RefRaced` aus, der Retry sieht den Tombstone. Bei [`Put::Forgotten`] hält der
+//! Store an: Die DSGVO-Löschung überlebt einen wiederholten Capture, eine zweite
+//! Maschine und einen erneuten Import.
+//!
+//! Der browsbare Session-Branch (`put_session_branch`) ist der **zweite** Weg zur
+//! Forge und braucht denselben Schutz — nur lässt er sich nicht in *einem*
+//! atomaren Schritt geben, weil sein Tombstone-Kriterium am *Store-Ref* hängt und
+//! Gits CAS per-Ref ist. [`GitStore::put_session_branch_bytes`] staffelt ihn
+//! deshalb: atomarer Guard gegen den Branch-eigenen Tombstone **plus** ein
+//! Post-Check gegen den Store-Ref, der einen im Rennen zurückgebliebenen
+//! Klartext-Branch nachträglich tilgt.
+//!
 //! # Wettläufe werden wiederholt, nicht gemeldet
 //!
 //! Ein `post-commit`-Hook und ein Aufruf von Hand reichen für zwei gleichzeitige
@@ -193,8 +213,15 @@ impl GitStore {
         &self.reference
     }
 
-    /// Ein Schreibversuch für die Nutzlast einer Session: Blob, Baum, Commit,
-    /// **eigener** Ref.
+    /// Ein Schreibversuch für die Nutzlast einer Session — außer am Ref liegt
+    /// bereits ein Tombstone; dann gibt der Guard `None` zurück und die Session
+    /// bleibt vergessen (#6). Sonst: Blob, Baum, Commit, **eigener** Ref.
+    ///
+    /// Der Tombstone-Check läuft **atomar** mit dem Compare-and-Swap: Er prüft
+    /// den Blob am selben Parent, auf den aufgesetzt würde. Ein `forget`, das
+    /// zwischen Prüfung und Commit landet, löst `RefRaced` aus — der Aufrufer
+    /// wiederholt und sieht den Tombstone. So kann kein nebenläufiger Lauf den
+    /// Klartext auf einen Tombstone aufsetzen.
     ///
     /// Der Baum trägt genau eine Datei und setzt auf **nichts** auf
     /// (`write_tree(None, …)`) — daher ist der Schreibvorgang unabhängig davon,
@@ -208,11 +235,16 @@ impl GitStore {
         &self,
         reference: &str,
         session: &SessionBytes,
-    ) -> minds_git::Result<RefUpdate> {
+    ) -> minds_git::Result<Option<RefUpdate>> {
         let blob = self.repo.write_blob(session.as_bytes())?;
         let tree = self.repo.write_tree(None, [(SESSION_FILE, blob)])?;
-        self.repo
-            .commit_tree_to_ref(reference, tree, &commit_message(session.id()))
+        self.repo.commit_tree_to_ref_unless(
+            reference,
+            tree,
+            SESSION_FILE,
+            |bytes| crate::tombstone::reason(bytes).is_some(),
+            &commit_message(session.id()),
+        )
     }
 
     /// Legt `bytes` unter `path` im Kontext-Baum ab — ein Blob, in den
@@ -230,30 +262,160 @@ impl GitStore {
         self.repo.commit_tree_to_ref(&self.reference, tree, message)
     }
 
-    /// Legt für `session` einen eigenständigen Ref an, der beim Push als Branch
-    /// in der Forge sichtbar wird.
+    /// Legt für `session` den browsbaren Branch an — es sei denn, er trägt schon
+    /// einen Tombstone. Reanimations-Schutz und Retry stecken in
+    /// [`put_session_branch_bytes`](Self::put_session_branch_bytes); dies ist der
+    /// nackte Schreibvorgang darunter.
     ///
     /// Der Ref heißt `refs/minds/sessions/<hex>` — unter `refs/minds/`, damit
-    /// [`Repo::commit_tree_to_ref`] ihn schreiben darf und `git branch` ihn
+    /// [`Repo::commit_tree_to_ref_unless`] ihn schreiben darf und `git branch` ihn
     /// nicht zeigt. Sein Baum trägt die Session allein als [`SESSION_BRANCH_FILE`]
     /// und [`SESSION_BRANCH_MD`] (nicht auf den Store-Baum aufgesetzt), und der
     /// Commit ist elternlos: ein Branch, eine Session. `markdown` ist die
     /// gerenderte `session.md`, die die Aufrufstelle beisteuert (der Store selbst
-    /// rendert nicht). Idempotent über `commit_tree_to_ref` — zeigt der Ref schon
-    /// auf diesen Baum, entsteht nichts, und ein wiederholter Push ist ein No-op.
+    /// rendert nicht).
+    ///
+    /// Der Guard prüft [`SESSION_BRANCH_FILE`] am selben Parent, auf den der CAS
+    /// aufsetzt: Trägt der Branch dort einen Tombstone, kommt `Ok(None)` und
+    /// nichts wird geschrieben — Klartext wird **nie** über einen getilgten Branch
+    /// gesetzt, auch nicht, wenn ein `forget` zwischen Vor-Check und Commit landet
+    /// (dann `RefRaced`, der Retry sieht den Tombstone). Zeigt der Ref schon auf
+    /// diesen Baum, entsteht nichts, und ein wiederholter Push ist ein No-op.
     pub(crate) fn write_session_branch(
         &self,
         session: &SessionBytes,
         markdown: &str,
-    ) -> minds_git::Result<RefUpdate> {
+    ) -> minds_git::Result<Option<RefUpdate>> {
         let reference = session_branch_ref(session.id());
         let json = self.repo.write_blob(session.as_bytes())?;
         let md = self.repo.write_blob(markdown.as_bytes())?;
         let tree = self
             .repo
             .write_tree(None, [(SESSION_BRANCH_FILE, json), (SESSION_BRANCH_MD, md)])?;
-        self.repo
-            .commit_tree_to_ref(&reference, tree, &commit_message(session.id()))
+        self.repo.commit_tree_to_ref_unless(
+            &reference,
+            tree,
+            SESSION_BRANCH_FILE,
+            |bytes| crate::tombstone::reason(bytes).is_some(),
+            &commit_message(session.id()),
+        )
+    }
+
+    /// Legt den browsbaren Session-Branch an — mit dem vollen Reanimations-Schutz
+    /// aus #6. Der Weg, den [`ContextStore::put_session_branch`] geht.
+    ///
+    /// Der Branch ist der **zweite** Weg auf die Forge (neben dem Store-Ref), und
+    /// eine vergessene Session darf über ihn nicht als Klartext-`session.md`
+    /// zurückkehren. Anders als der Store-Ref lässt sich der Branch **nicht** in
+    /// einem einzigen atomaren Schritt schützen: Sein Tombstone-Kriterium hängt am
+    /// *Store-Ref*, und Gits Compare-and-Swap ist per-Ref — den Store-Ref-Stand
+    /// kann der Commit auf den Branch-Ref nicht mitprüfen. Der Schutz ist deshalb
+    /// dreifach gestaffelt:
+    ///
+    /// 1. **Vor-Check.** Ist die Session schon vergessen, wird gar nicht erst
+    ///    geschrieben — und ein etwa aus einem Rennen zurückgebliebener
+    ///    Klartext-Branch sofort mitgetilgt.
+    /// 2. **Atomarer Branch-Guard.** [`write_session_branch`](Self::write_session_branch)
+    ///    setzt Klartext nie über einen Branch-eigenen Tombstone (`RefRaced`-Retry
+    ///    inklusive) — das schließt den Fall, dass ein `forget` den *Branch* tilgt,
+    ///    während dieser Aufruf läuft.
+    /// 3. **Post-Check.** Nach dem Schreiben wird der Store-Ref erneut geprüft.
+    ///    Hat ein `forget` ihn getombsteint, nachdem der Vor-Check ihn noch als
+    ///    Klartext sah (der Branch existierte da noch nicht, `forget` sah ihn also
+    ///    nicht), wird der eben angelegte Branch hier selbst getilgt.
+    ///
+    /// Zusammen decken 2 und 3 jede Verschränkung von Capture und `forget` ab:
+    /// `forget` tombsteint den Store-Ref **vor** dem Branch-Scan, dieser Pfad
+    /// prüft den Store-Ref **nach** dem Branch-Schreiben — beide „nach"-Kanten
+    /// kreuzen sich, ein Klartext-Branch bleibt an keiner Reihenfolge zurück.
+    pub(crate) fn put_session_branch_bytes(
+        &self,
+        session: &SessionBytes,
+        markdown: &str,
+    ) -> Result<()> {
+        let id = session.id();
+
+        // 1. Schon vergessen: nicht schreiben — und einen Klartext-Branch, der
+        //    aus einem Rennen zurückblieb, jetzt tilgen.
+        if let Some(reason) = self.forgotten_reason(id)? {
+            return self.tombstone_branch_if_plaintext(id, &reason);
+        }
+
+        // 2. Schreiben, atomar gegen einen Branch-eigenen Tombstone, mit Retry.
+        let mut attempts_left = PUT_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            match self.write_session_branch(session, markdown) {
+                // Der Branch-Parent trägt einen Tombstone — bleibt vergessen.
+                Ok(None) => return Ok(()),
+                Ok(Some(_)) => break,
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
+
+        // 3. Post-Check gegen den maßgeblichen Store-Ref.
+        if let Some(reason) = self.forgotten_reason(id)? {
+            self.tombstone_branch_if_plaintext(id, &reason)?;
+        }
+        Ok(())
+    }
+
+    /// Tilgt den Session-Branch von `id`, falls er dort noch Klartext trägt.
+    ///
+    /// Ein bereits getombsteinter oder gar nicht vorhandener Branch ist ein
+    /// No-op. Der `reason` landet im Tombstone, damit der Branch denselben Grund
+    /// nennt wie der maßgebliche Store-Ref.
+    fn tombstone_branch_if_plaintext(&self, id: SessionId, reason: &str) -> Result<()> {
+        let reference = session_branch_ref(id);
+        let stored = self
+            .repo
+            .read_blob_at(&reference, SESSION_BRANCH_FILE)
+            .map_err(StoreError::backend)?;
+        if self.payload_at(stored) {
+            let tomb = crate::tombstone::bytes(reason);
+            let message = format!("minds: Session {id} vergessen");
+            self.retry_write(|| self.overwrite_session_branch(&reference, &tomb, &message))?;
+        }
+        Ok(())
+    }
+
+    /// Der Tilgungsgrund von `id`, falls sie vergessen wurde — sonst `None`.
+    ///
+    /// Geprüft wird zuerst der maßgebliche Store-Ref, dann der browsbare
+    /// Session-Branch; der erste gefundene Tombstone gewinnt. Der Reanimations-
+    /// Schutz aus `put_bytes` sitzt am Store-Ref; der Branch ist ein zweiter Weg,
+    /// auf dem ein wiederholter Capture den Klartext zurück auf die Forge
+    /// schriebe. `put_session_branch` fragt deshalb hier, bevor es schreibt.
+    ///
+    /// Entscheidend ist der **Store-Ref**, nicht nur der Branch: Eine per
+    /// `import` abgelegte Session hat keinen Branch. `forget` tombsteint dann nur
+    /// den Store-Ref — würde hier bloß der Branch geprüft, käme `None` heraus,
+    /// und ein späterer Capture legte den Branch mit Klartext neu an. Die Session
+    /// gälte als vergessen, läge aber wieder browsbar auf der Forge (#6). Ein
+    /// Tombstone an *einem* der beiden Orte genügt darum, den Branch-Schreibweg zu
+    /// sperren.
+    ///
+    /// Der Grund selbst dient als Tombstone-Text, wenn ein im Rennen frisch
+    /// angelegter Branch nachträglich getilgt werden muss (siehe
+    /// [`put_session_branch_bytes`](Self::put_session_branch_bytes)) — so trägt
+    /// der Branch-Tombstone denselben Grund wie der maßgebliche Store-Ref.
+    pub(crate) fn forgotten_reason(&self, id: SessionId) -> Result<Option<String>> {
+        for (reference, file) in [
+            (session_ref(id), SESSION_FILE),
+            (session_branch_ref(id), SESSION_BRANCH_FILE),
+        ] {
+            if let Some(bytes) = self
+                .repo
+                .read_blob_at(&reference, file)
+                .map_err(StoreError::backend)?
+            {
+                if let Some(reason) = crate::tombstone::reason(&bytes) {
+                    return Ok(Some(reason));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Ersetzt die Nutzlast eines Session-Refs (heute: durch einen Tombstone).
@@ -359,12 +521,34 @@ impl ContextStore for GitStore {
             return Ok(Put::AlreadyPresent(session.id()));
         }
 
+        // Ein Tombstone weicht per Konstruktion von der Session ab — ohne diese
+        // Prüfung fiele er durch den Vergleich oben und würde unten mit dem
+        // Klartext überschrieben. Genau das reanimierte eine vergessene Session
+        // beim nächsten Capture-Lauf. Ein Tombstone ist deshalb kein „anderer
+        // Inhalt, also überschreiben", sondern eine Endstation: nicht anfassen.
+        //
+        // Dieser Vorab-Check ist der schnelle Pfad (spart Blob und Baum, wenn
+        // schon offensichtlich vergessen). Er ist *nicht* die Garantie: Zwischen
+        // ihm und dem Schreiben könnte ein `forget` landen. Dagegen hält der
+        // atomare Guard in [`write_session`](Self::write_session), der den
+        // Tombstone am selben Parent prüft, auf den aufgesetzt würde — er liefert
+        // `Ok(None)`, wenn der Ref beim Schreiben (oder nach einem `RefRaced`
+        // beim erneuten Versuch) einen Tombstone trägt.
+        if crate::tombstone::reason(stored.as_deref().unwrap_or_default()).is_some() {
+            return Ok(Put::Forgotten(session.id()));
+        }
+
         let mut attempts_left = PUT_ATTEMPTS;
 
         loop {
             attempts_left -= 1;
             match self.write_session(&reference, session) {
-                Ok(update) => {
+                // Der Guard hat einen Tombstone am Parent gesehen — die Session
+                // bleibt vergessen. Das schließt das Fenster zwischen dem
+                // Vorab-Check oben und dem Schreiben: ein `forget`, das dazwischen
+                // (oder in einem `RefRaced`-Retry) landet, wird hier gefangen.
+                Ok(None) => return Ok(Put::Forgotten(session.id())),
+                Ok(Some(update)) => {
                     return Ok(if update.wrote_commit() {
                         Put::Written(session.id())
                     } else {
@@ -840,6 +1024,33 @@ mod tests {
                 .trim(),
             "2"
         );
+    }
+
+    #[test]
+    fn a_put_after_forget_does_not_resurrect_the_store_ref() {
+        // #6 am echten Git-Backend: Nach `forget` prallt ein erneuter `put` am
+        // Tombstone ab. Der Blob bleibt der Tombstone, kein neuer Commit — und
+        // `get` meldet weiter Forgotten.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        store.forget(id, "DSGVO").unwrap();
+
+        let again = store.put(&session).unwrap();
+        assert_eq!(again, Put::Forgotten(id));
+
+        let revision = format!("{}:{SESSION_FILE}", session_ref(id));
+        let blob = fixture.git(&["cat-file", "blob", &revision]);
+        assert!(!blob.contains("streng geheim"), "reanimiert: {blob}");
+        assert!(blob.contains("minds_tombstone"));
+        // Kein dritter Commit — der abgeprallte `put` schreibt nichts.
+        assert_eq!(
+            fixture
+                .git(&["rev-list", "--count", &session_ref(id)])
+                .trim(),
+            "2"
+        );
+        assert!(matches!(store.get(id), Err(StoreError::Forgotten { .. })));
     }
 
     // --- Vor dem ersten capture ----------------------------------------------

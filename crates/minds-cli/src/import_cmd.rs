@@ -55,8 +55,18 @@ fn import() -> Fallible<()> {
         for session in &report.sessions {
             match pipeline.redact_session(session.clone()) {
                 Ok(redacted) => {
-                    let id = store.put(&redacted)?.id();
-                    infos.push(SessionInfo::of(id, redacted.session()));
+                    let put = store.put(&redacted)?;
+                    // Eine vergessene Session wird nicht reanimiert (#6) — also
+                    // auch nicht als importiert gezählt oder für das
+                    // Commit-Matching verwendet. Im Store liegt nur ihr
+                    // Tombstone, nicht die Session.
+                    if put.was_forgotten() {
+                        // Wie der Redaction-Skip darunter ein informativer
+                        // Hinweis, kein Ergebnis — also auf stderr.
+                        eprintln!("  Session {} bleibt vergessen (nicht reanimiert)", put.id());
+                        continue;
+                    }
+                    infos.push(SessionInfo::of(put.id(), redacted.session()));
                     stored += 1;
                 }
                 Err(err) => eprintln!("  Session übersprungen (Redaction): {err}"),

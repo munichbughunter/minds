@@ -177,6 +177,16 @@ fn store_one(
     let redacted = pipeline.redact_session(session)?;
     let put = store.put(&redacted)?;
 
+    // Wurde die Session vergessen, bleibt sie vergessen (#6): kein Store-Record,
+    // und vor allem kein Branch — sonst stünde der Klartext beim nächsten
+    // Capture-Lauf wieder als `session.md` browsbar auf der Forge. Der
+    // Branch-Schreibweg schützt sich zwar selbst (gestaffelter Guard in
+    // `put_session_branch_bytes`), doch wir gehen ihn hier im schon entschiedenen
+    // Fall gar nicht erst an.
+    if put.was_forgotten() {
+        return Ok(put.id());
+    }
+
     // Die Session als eigenen Branch in der Forge sichtbar machen (nur beim
     // Child-Backend; sonst ein No-op). Best-effort: Der maßgebliche Record liegt
     // bereits im Store, und der Browsing-Branch lässt sich daraus jederzeit neu

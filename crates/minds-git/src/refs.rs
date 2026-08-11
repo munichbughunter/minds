@@ -172,6 +172,43 @@ impl Repo {
         self.commit_tree_onto(reference, tree, parent, message)
     }
 
+    /// Wie [`commit_tree_to_ref`](Self::commit_tree_to_ref), schreibt aber
+    /// **nicht**, wenn der aktuelle Blob unter `guard_path` das Prädikat
+    /// `reject` erfüllt — dann kommt `Ok(None)` zurück, kein Commit.
+    ///
+    /// Der Guard prüft den Blob am **selben** Parent-Commit, auf den der
+    /// Compare-and-Swap aufsetzt: `tree_of(parent)` liest aus einem
+    /// unveränderlichen Commit, und `commit_tree_onto` sichert mit genau diesem
+    /// `parent` ab. Bewegt ein paralleler Schreiber den Ref zwischen Prüfung und
+    /// Commit, schlägt der CAS mit [`GitError::RefRaced`] fehl — es wird nie über
+    /// den geprüften Stand hinweggeschrieben. Der Aufrufer wiederholt bei
+    /// `RefRaced` und sieht dann den neuen Stand.
+    ///
+    /// Der Store nutzt das, damit ein Tombstone einer vergessenen Session auch
+    /// unter Nebenläufigkeit nicht mit Klartext überschrieben wird
+    /// (`minds-store`, Issue #6). `minds-git` selbst kennt keine Tombstones —
+    /// `reject` ist ein reines Byte-Prädikat.
+    pub fn commit_tree_to_ref_unless(
+        &self,
+        reference: &str,
+        tree: TreeId,
+        guard_path: &str,
+        reject: impl FnOnce(&[u8]) -> bool,
+        message: &str,
+    ) -> Result<Option<RefUpdate>> {
+        validate_minds_ref(reference)?;
+        let parent = self.commit_at(reference)?;
+        if let Some(parent) = parent {
+            if let Some(bytes) = self.read_blob(self.tree_of(parent)?, guard_path)? {
+                if reject(&bytes) {
+                    return Ok(None);
+                }
+            }
+        }
+        self.commit_tree_onto(reference, tree, parent, message)
+            .map(Some)
+    }
+
     /// Wie [`Repo::commit_tree_to_ref`], aber mit explizit übergebenem
     /// Erwartungswert.
     ///
@@ -498,5 +535,96 @@ mod tests {
         let (_fixture, repo, tree) = repo_with_pending_tree();
         let update = repo.commit_tree_to_ref("refs/minds/local/wip", tree, "minds: wip");
         assert!(update.is_ok(), "{:?}", update.err());
+    }
+
+    #[test]
+    fn the_guard_refuses_to_write_over_a_matching_parent() {
+        // Das Herz des Reanimations-Schutzes (#6): Trägt der Parent unter dem
+        // Guard-Pfad einen Inhalt, den das Prädikat ablehnt, wird nicht
+        // geschrieben — `Ok(None)` — und der Ref bleibt, wo er ist.
+        let (fixture, repo, tree) = repo_with_pending_tree();
+        let first = repo
+            .commit_tree_to_ref(DEFAULT_CONTEXT_REF, tree, "minds: 1")
+            .unwrap();
+
+        let blob = repo.write_blob(b"{\"session\":\"bb\"}").unwrap();
+        let tree2 = repo
+            .write_tree(Some(tree), [("sessions/b3/bb.json", blob)])
+            .unwrap();
+        let outcome = repo
+            .commit_tree_to_ref_unless(
+                DEFAULT_CONTEXT_REF,
+                tree2,
+                "sessions/b3/aa.json",
+                |bytes| bytes == b"{\"session\":\"aa\"}",
+                "minds: 2",
+            )
+            .unwrap();
+
+        assert!(outcome.is_none(), "der Guard hätte ablehnen müssen");
+        // Der Ref steht unverändert auf dem ersten Commit — echtes git bestätigt.
+        assert_eq!(
+            repo.commit_at(DEFAULT_CONTEXT_REF).unwrap(),
+            Some(first.commit())
+        );
+        assert_eq!(
+            fixture.hash(DEFAULT_CONTEXT_REF),
+            first.commit().to_string()
+        );
+    }
+
+    #[test]
+    fn the_guard_writes_when_the_parent_passes_or_is_absent() {
+        let (_fixture, repo, tree) = repo_with_pending_tree();
+
+        // Kein Parent: Der Guard kann nichts prüfen — geschrieben wird trotzdem,
+        // selbst wenn das Prädikat alles ablehnen würde.
+        let created = repo
+            .commit_tree_to_ref_unless(
+                DEFAULT_CONTEXT_REF,
+                tree,
+                "sessions/b3/aa.json",
+                |_| true,
+                "minds: 1",
+            )
+            .unwrap()
+            .expect("ohne Parent gibt es nichts abzulehnen");
+        assert!(matches!(created, RefUpdate::Created(_)));
+
+        // Parent vorhanden, aber sein Blob erfüllt das Prädikat nicht: Es wird
+        // regulär aufgesetzt.
+        let blob = repo.write_blob(b"{\"session\":\"bb\"}").unwrap();
+        let tree2 = repo
+            .write_tree(Some(tree), [("sessions/b3/bb.json", blob)])
+            .unwrap();
+        let advanced = repo
+            .commit_tree_to_ref_unless(
+                DEFAULT_CONTEXT_REF,
+                tree2,
+                "sessions/b3/aa.json",
+                |bytes| bytes == b"ein Inhalt, den es hier nicht gibt",
+                "minds: 2",
+            )
+            .unwrap()
+            .expect("der Guard lässt den nicht passenden Parent durch");
+        assert!(matches!(advanced, RefUpdate::Advanced(_)));
+
+        // Parent vorhanden, aber der Guard-Pfad fehlt in seinem Baum: `read_blob`
+        // liefert `None`, das Prädikat wird nie gefragt — geschrieben wird.
+        let blob = repo.write_blob(b"{\"session\":\"cc\"}").unwrap();
+        let tree3 = repo
+            .write_tree(Some(tree2), [("sessions/b3/cc.json", blob)])
+            .unwrap();
+        let advanced = repo
+            .commit_tree_to_ref_unless(
+                DEFAULT_CONTEXT_REF,
+                tree3,
+                "sessions/b3/gibt-es-nicht.json",
+                |_| true,
+                "minds: 3",
+            )
+            .unwrap()
+            .expect("fehlt der Guard-Pfad, greift der Guard nicht");
+        assert!(matches!(advanced, RefUpdate::Advanced(_)));
     }
 }

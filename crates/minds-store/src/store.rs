@@ -51,19 +51,34 @@ pub enum Put {
     Written(SessionId),
     /// Die Session lag bereits unter dieser ID — nichts geschrieben.
     AlreadyPresent(SessionId),
+    /// Unter der ID liegt ein Tombstone: Die Session wurde
+    /// [`vergessen`](ContextStore::forget) und **nicht** reanimiert.
+    ///
+    /// Ein wiederholter Capture derselben Session (Hook läuft erneut, zweite
+    /// Maschine synchronisiert, Import läuft nochmal) darf den vergessenen
+    /// Klartext nicht wieder in den aktuellen Baum schreiben — sonst wäre die
+    /// DSGVO-Löschung nicht dauerhaft, solange die Quelldaten irgendwo noch
+    /// existieren. Deshalb ist das ein bewusster No-op, kein Fehler: Der
+    /// Capture-Lauf bricht nicht ab, aber die Session bleibt vergessen.
+    Forgotten(SessionId),
 }
 
 impl Put {
-    /// Die ID der Session, in beiden Fällen.
+    /// Die ID der Session, in allen Fällen.
     pub fn id(&self) -> SessionId {
         match self {
-            Put::Written(id) | Put::AlreadyPresent(id) => *id,
+            Put::Written(id) | Put::AlreadyPresent(id) | Put::Forgotten(id) => *id,
         }
     }
 
     /// Ob dabei tatsächlich geschrieben wurde.
     pub fn was_written(&self) -> bool {
         matches!(self, Put::Written(_))
+    }
+
+    /// Ob der `put` an einem Tombstone abprallte — die Session bleibt vergessen.
+    pub fn was_forgotten(&self) -> bool {
+        matches!(self, Put::Forgotten(_))
     }
 }
 
@@ -339,11 +354,17 @@ mod tests {
     impl ContextStore for MemoryStore {
         fn put_bytes(&self, session: &SessionBytes) -> Result<Put> {
             let mut entries = self.entries.borrow_mut();
-            if entries.contains_key(&session.id()) {
-                return Ok(Put::AlreadyPresent(session.id()));
+            match entries.get(&session.id()) {
+                // Ein Tombstone bleibt einer — wie im Git-Backend (#6).
+                Some(existing) if crate::tombstone::reason(existing).is_some() => {
+                    Ok(Put::Forgotten(session.id()))
+                }
+                Some(_) => Ok(Put::AlreadyPresent(session.id())),
+                None => {
+                    entries.insert(session.id(), session.as_bytes().to_vec());
+                    Ok(Put::Written(session.id()))
+                }
             }
-            entries.insert(session.id(), session.as_bytes().to_vec());
-            Ok(Put::Written(session.id()))
         }
 
         fn get_bytes(&self, id: SessionId) -> Result<Option<Vec<u8>>> {
@@ -569,6 +590,27 @@ mod tests {
         assert!(store.forget(id, "erst").unwrap().was_forgotten());
         // Ein zweiter Lauf sieht den Tombstone und tut nichts.
         assert!(!store.forget(id, "zweit").unwrap().was_forgotten());
+    }
+
+    #[test]
+    fn a_put_after_forget_does_not_resurrect_the_session() {
+        // Akzeptanzkriterium #6: put → forget → put. Der zweite `put` prallt am
+        // Tombstone ab, statt den Klartext zu reanimieren. Ohne das genügte ein
+        // wiederholter Capture, um eine DSGVO-Löschung rückgängig zu machen.
+        let store = MemoryStore::default();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        store.forget(id, "DSGVO").unwrap();
+
+        let again = store.put(&session).unwrap();
+        assert_eq!(again, Put::Forgotten(id), "die Session wurde reanimiert");
+        assert!(again.was_forgotten());
+        assert!(!again.was_written());
+
+        // Der Store bleibt beim Tombstone — `get` meldet weiter Forgotten.
+        assert!(matches!(store.get(id), Err(StoreError::Forgotten { .. })));
+        let raw = store.get_bytes(id).unwrap().unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("streng geheim"));
     }
 
     #[test]
