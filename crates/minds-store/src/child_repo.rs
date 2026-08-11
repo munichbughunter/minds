@@ -677,4 +677,99 @@ mod tests {
             Some(session.session())
         );
     }
+
+    #[test]
+    fn a_forget_that_breaks_off_names_the_open_place() {
+        // #14 (b): Bricht die Tilgung nach dem ersten Ort ab, meldet der Fehler
+        // die schon getilgten Orte und den offenen — statt eines nackten
+        // Backend-Fehlers, der die halbe Löschung unsichtbar ließe.
+        const NEEDLE: &str = "Teiltilgung-Pruefwort-1401";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+        store.put(&session).unwrap();
+        store.put_session_branch(&session).unwrap();
+
+        // Der Guard bricht am Branch ab — der Store-Ref ist da schon getilgt.
+        let result = store.0.forget_guarded(id, "DSGVO", |place| {
+            if place == ForgottenPlace::SessionBranch {
+                Err(StoreError::backend("injizierter Schreibfehler"))
+            } else {
+                Ok(())
+            }
+        });
+
+        let err = result.expect_err("die Tilgung bricht ab");
+        match &err {
+            StoreError::ForgetIncomplete {
+                forgotten, pending, ..
+            } => {
+                assert_eq!(forgotten.as_slice(), [ForgottenPlace::StoreRef]);
+                assert_eq!(*pending, ForgottenPlace::SessionBranch);
+            }
+            other => panic!("erwartete ForgetIncomplete, war {other:?}"),
+        }
+        // Die Meldung benennt den offenen Ort und rät zum erneuten forget.
+        let message = err.to_string();
+        assert!(
+            message.contains("Session-Branch") && message.contains("erneut"),
+            "Meldung ohne offenen Ort oder Rat: {message}"
+        );
+
+        // Der Store-Ref ist getilgt, der Branch trägt noch Klartext.
+        assert!(matches!(store.get(id), Err(StoreError::Forgotten { .. })));
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch.lines().next().expect("ein Session-Branch");
+        let md = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(
+            md.contains(NEEDLE),
+            "der offene Branch sollte Klartext tragen"
+        );
+    }
+
+    #[test]
+    fn a_second_forget_completes_a_broken_off_deletion() {
+        // #14 (b): Ein erneuter `forget` vollendet die abgebrochene Löschung — er
+        // erkennt den schon getilgten Store-Ref an seinem Tombstone (überspringt
+        // ihn) und tilgt den offen gebliebenen Branch.
+        const NEEDLE: &str = "Teiltilgung-Vollenden-Pruefwort-1402";
+        let (_parent, child, store) = parent_and_child();
+        let session = redacted(NEEDLE);
+        let id = session.session().id().unwrap();
+        store.put(&session).unwrap();
+        store.put_session_branch(&session).unwrap();
+
+        // Erster Lauf bricht am Branch ab.
+        let first = store.0.forget_guarded(id, "DSGVO", |place| {
+            if place == ForgottenPlace::SessionBranch {
+                Err(StoreError::backend("injiziert"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(first, Err(StoreError::ForgetIncomplete { .. })));
+
+        // Zweiter, regulärer Lauf vollendet die Tilgung.
+        let second = store.forget(id, "DSGVO").unwrap();
+        assert!(second.was_forgotten());
+        assert_eq!(second.places(), [ForgottenPlace::SessionBranch]);
+
+        let branch = child.git(&[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/sessions/",
+        ]);
+        let branch = branch.lines().next().expect("ein Session-Branch");
+        let md = child.git(&["cat-file", "blob", &format!("{branch}:session.md")]);
+        assert!(!md.contains(NEEDLE), "session.md nach zweitem forget: {md}");
+        let json = child.git(&["cat-file", "blob", &format!("{branch}:session.json")]);
+        assert!(
+            !json.contains(NEEDLE),
+            "session.json nach zweitem forget: {json}"
+        );
+    }
 }

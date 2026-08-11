@@ -66,8 +66,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
-use minds_git::{MINDS_REF_NAMESPACE, Repo};
-use minds_store::{Backend, DEFAULT_REVIEW_REF, ReviewStore};
+use minds_git::{CommitId, MINDS_REF_NAMESPACE, Repo};
+use minds_store::{Backend, DEFAULT_REVIEW_REF, ReviewStore, TRACKING_REF_PREFIX};
 
 use crate::config;
 use crate::hooklog::{self, Source};
@@ -76,7 +76,11 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Unterhalb dieses Präfix liegen die eigenen Tracking-Refs. Sie werden nie
 /// gepusht — sie sind die Buchhaltung *über* das Pushen.
-const TRACKING_PREFIX: &str = "refs/minds/remotes/";
+///
+/// Die Konstante lebt in `minds-store` ([`TRACKING_REF_PREFIX`]), weil `forget`
+/// dieselben Refs mit-tilgen muss (#14): Store und Sync teilen sich damit eine
+/// einzige Wahrheit über den Namensraum.
+const TRACKING_PREFIX: &str = TRACKING_REF_PREFIX;
 
 /// Bricht die Rekursion: Der Push dieses Moduls löst im selben Repo erneut
 /// `pre-push` aus. `--no-verify` verhindert das bereits; die Umgebungsvariable
@@ -134,7 +138,30 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
     // Erst danach steht fest, was zu pushen ist.
     merge_incoming(&root, &git_dir, remote, verbose);
 
-    let jobs = plan(&root, &repo, remote)?;
+    let (jobs, deferred) = plan(&root, &repo, remote)?;
+
+    // Zurückgestellte, non-fast-forward Refs (siehe `due`): ohne `--force` nicht
+    // pushbar. Nach `forget` tritt das dank des Tracking-Umsetzens (#14) nicht auf
+    // — hier landet nur echte Divergenz. Gezählt werden **Refs**, nicht Sessions.
+    // Der Hinweis geht auf stdout (sichtbar beim Push) **und** ins Log, weil ein
+    // nicht übertragbarer Ref sichtbar bleiben soll, bis er aufgelöst ist.
+    if !deferred.is_empty() {
+        ProgressLine::write(&format!(
+            "minds: {} divergierte(r) Ref(s) nicht übertragen \
+             — non-fast-forward, ohne `--force` nicht pushbar\n",
+            deferred.len()
+        ));
+        hooklog::log_at(
+            &git_dir,
+            Source::Sync,
+            &format!(
+                "{} divergierte(r) Ref(s) non-fast-forward, nicht synchronisiert: {}",
+                deferred.len(),
+                deferred.join(", ")
+            ),
+        );
+    }
+
     if jobs.iter().all(|job| job.updates.is_empty()) {
         // Der häufige Fall. Bis hierher wurde keine Verbindung geöffnet.
         vln(verbose, "minds sync: nichts Neues");
@@ -272,19 +299,25 @@ fn merge_incoming(root: &Path, git_dir: &Path, remote: &str, verbose: bool) {
 }
 
 /// Was zu tun ist — ohne eine einzige Netzoperation.
-fn plan(root: &Path, repo: &Repo, remote: &str) -> Fallible<Vec<Job>> {
+///
+/// Der zweite Rückgabewert nennt die Refs, die nur mit `--force` gingen (getilgte
+/// Sessions, #14) und deshalb übersprungen wurden — der Aufrufer meldet sie.
+fn plan(root: &Path, repo: &Repo, remote: &str) -> Fallible<(Vec<Job>, Vec<String>)> {
     let store = config::load(root);
     let mut jobs = Vec::new();
+    let mut deferred = Vec::new();
 
     // 1. Das Repo des Codes → das Remote, auf das der Nutzer gerade pusht.
     //    In-Repo-Backend: Kontext, Reviews und Session-Refs. Child-Backend:
     //    nur die Reviews (die liegen immer beim Code).
     if has_remote(root, remote) {
+        let (updates, mut skipped) = due(repo, remote, MINDS_REF_NAMESPACE, identity)?;
+        deferred.append(&mut skipped);
         jobs.push(Job {
             dir: root.to_path_buf(),
             remote: remote.to_string(),
             label: remote.to_string(),
-            updates: due(repo, remote, MINDS_REF_NAMESPACE, identity)?,
+            updates,
         });
     }
 
@@ -299,58 +332,83 @@ fn plan(root: &Path, repo: &Repo, remote: &str) -> Fallible<Vec<Job>> {
         };
         if child.is_dir() && has_remote(&child, DEFAULT_REMOTE) {
             let child_repo = Repo::open(&child)?;
+            // Alles unter refs/minds/ — die Nutzlast (`store/…`) identisch, die
+            // Browsing-Refs (`sessions/…`) als Branches. Welches was ist,
+            // entscheidet die Abbildung.
+            let (updates, mut skipped) = due(
+                &child_repo,
+                DEFAULT_REMOTE,
+                MINDS_REF_NAMESPACE,
+                session_branch,
+            )?;
+            deferred.append(&mut skipped);
             jobs.push(Job {
                 dir: child.clone(),
                 remote: DEFAULT_REMOTE.to_string(),
                 label: format!("Child-Repo {}", child.display()),
-                // Alles unter refs/minds/ — die Nutzlast (`store/…`) identisch,
-                // die Browsing-Refs (`sessions/…`) als Branches. Welches was
-                // ist, entscheidet die Abbildung.
-                updates: due(
-                    &child_repo,
-                    DEFAULT_REMOTE,
-                    MINDS_REF_NAMESPACE,
-                    session_branch,
-                )?,
+                updates,
             });
         }
     }
 
-    Ok(jobs)
+    Ok((jobs, deferred))
 }
 
-/// Alle Refs unter `prefix`, deren Stand noch nicht am `remote` vermerkt ist.
+/// Alle Refs unter `prefix`, deren Stand noch nicht am `remote` vermerkt ist —
+/// und daneben die, die nur mit `--force` gingen.
+///
+/// Ein Ref, dessen lokaler Stand **kein Fast-Forward** des zuletzt gepushten ist,
+/// landet nicht in den Updates: `minds sync` pusht nie mit `--force`, und ihn
+/// mitzuschicken ließe den ganzen (nicht-atomaren) Push scheitern und die übrigen
+/// Refs ungetrackt. Solche Refs kommen als zweiter Rückgabewert zurück, damit der
+/// Aufrufer sie melden kann.
+///
+/// Das ist ein **Sicherheitsnetz** für echte Divergenz (zwei Maschinen). Der
+/// häufige `forget`-Fall landet hier bewusst *nicht*: `forget` setzt den
+/// Tracking-Ref auf den elternlosen Tombstone um (#14), sodass `tracked == local`
+/// gilt und der Ref gar nicht erst betrachtet wird — kein abgewiesener Push. Nur
+/// wo der getrackte Stand aus anderem Grund divergiert, greift die Zurückstellung.
 fn due(
     repo: &Repo,
     remote: &str,
     prefix: &str,
     destination: fn(&str) -> String,
-) -> Fallible<Vec<Update>> {
-    let tracked: BTreeMap<String, String> = repo
+) -> Fallible<(Vec<Update>, Vec<String>)> {
+    let tracked: BTreeMap<String, CommitId> = repo
         .refs_under(&tracking_prefix(remote))?
         .into_iter()
-        .map(|(name, commit)| (name, commit.to_string()))
         .collect();
 
     let mut updates = Vec::new();
+    let mut deferred = Vec::new();
     for (name, commit) in repo.refs_under(prefix)? {
         // Die eigene Buchhaltung wird nie gepusht.
         if name.starts_with(TRACKING_PREFIX) {
             continue;
         }
-        let oid = commit.to_string();
         let tracking = tracking_ref(remote, &name);
-        if tracked.get(&tracking) == Some(&oid) {
-            continue;
+        match tracked.get(&tracking) {
+            // Schon auf diesem Stand vermerkt — nichts zu tun.
+            Some(previous) if *previous == commit => continue,
+            // Abweichend und **kein** Fast-Forward: ohne `--force` nicht pushbar.
+            // Zurückstellen statt den ganzen Push reißen (#14). Ist der getrackte
+            // Commit lokal weggeprunt, liefert der Revwalk `false` → ebenfalls
+            // zurückgestellt; das ist die sichere Seite (nie ungefragt force).
+            Some(previous) if !repo.is_ancestor(*previous, commit)? => {
+                deferred.push(name);
+                continue;
+            }
+            // Neu oder ein sauberes Fast-Forward — regulär pushen.
+            _ => {}
         }
         updates.push(Update {
             local: name.clone(),
-            oid,
+            oid: commit.to_string(),
             destination: destination(&name),
             tracking,
         });
     }
-    Ok(updates)
+    Ok((updates, deferred))
 }
 
 /// Der Ziel-Ref beim identischen Mapping: derselbe Name am Remote.
@@ -810,5 +868,68 @@ mod tests {
         assert_eq!(display("origin"), "origin");
         assert_eq!(display("https://token@example.org/x.git"), "Remote");
         assert_eq!(display("git@example.org:x.git"), "Remote");
+    }
+
+    #[test]
+    fn a_non_fast_forward_ref_is_deferred_while_the_others_still_push() {
+        // Das Sicherheitsnetz aus #14: Ein non-fast-forward Ref (hier per Hand als
+        // divergierender Orphan gebaut) darf `minds sync` nicht reißen — er wird
+        // zurückgestellt, die übrigen Refs (neu oder sauberes Fast-Forward) bleiben
+        // pushbar. (Nach `forget` selbst tritt der Fall dank des Tracking-
+        // Umsetzens nicht auf; dieser Test prüft die reine `due`-Weiche.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00")
+                .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+
+        git(&["init", "--quiet", "-b", "main"]);
+        git(&["commit", "--allow-empty", "--quiet", "-m", "a"]);
+        let a = git(&["rev-parse", "HEAD"]);
+        let tree = git(&["rev-parse", "HEAD^{tree}"]);
+        // Ein elternloser Commit (wie ein Tombstone): hat `a` nicht als Vorfahr.
+        let orphan = git(&["commit-tree", &tree, "-m", "tombstone"]);
+        // Ein Fast-Forward über `a`.
+        let forward = git(&["commit-tree", &tree, "-p", &a, "-m", "forward"]);
+
+        // gone: getrackt auf `a`, lokal auf den elternlosen `orphan` → non-ff.
+        git(&["update-ref", "refs/minds/store/gone", &orphan]);
+        git(&["update-ref", "refs/minds/remotes/origin/store/gone", &a]);
+        // moved: getrackt auf `a`, lokal auf `forward` → Fast-Forward.
+        git(&["update-ref", "refs/minds/store/moved", &forward]);
+        git(&["update-ref", "refs/minds/remotes/origin/store/moved", &a]);
+        // fresh: nie getrackt → regulär pushen.
+        git(&["update-ref", "refs/minds/store/fresh", &a]);
+
+        let repo = Repo::open(path).unwrap();
+        let (updates, deferred) = due(&repo, "origin", MINDS_REF_NAMESPACE, identity).unwrap();
+
+        // Der non-ff-Ref ist zurückgestellt, nicht in den Updates.
+        assert_eq!(deferred, vec!["refs/minds/store/gone".to_string()]);
+        let pushed: std::collections::BTreeSet<&str> =
+            updates.iter().map(|u| u.local.as_str()).collect();
+        assert_eq!(
+            pushed,
+            ["refs/minds/store/fresh", "refs/minds/store/moved"]
+                .into_iter()
+                .collect()
+        );
     }
 }

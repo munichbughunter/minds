@@ -16,6 +16,8 @@ use std::path::PathBuf;
 
 use minds_core::{CanonError, SessionId};
 
+use crate::store::ForgottenPlace;
+
 /// Kurzform für `Result` mit [`StoreError`].
 pub type Result<T> = std::result::Result<T, StoreError>;
 
@@ -115,6 +117,41 @@ pub enum StoreError {
         reason: String,
     },
 
+    /// Ein `forget` blieb auf halbem Weg stehen: Manche Orte sind getilgt, an
+    /// einem schlug das Schreiben fehl.
+    ///
+    /// Eine Session kann an mehreren Orten liegen (Store-Ref, Session-Branch,
+    /// Kontext-Baum). Bricht die Tilgung zwischen zwei Orten ab, sind die schon
+    /// getilgten weg, der offene trägt aber weiter Klartext — und das wäre von
+    /// außen unsichtbar, wenn der Fehler nur „Backend" sagte: `get` fände am
+    /// maßgeblichen Ort schon den Tombstone, während der Klartext anderswo
+    /// liegenbliebe. Diese Variante nennt beide Seiten, damit klar ist, dass ein
+    /// erneuter `minds forget` nötig ist — der die schon getilgten Orte
+    /// überspringt (Idempotenz) und den offenen erneut vornimmt (#14).
+    ///
+    /// `pending` meint dabei „an diesem Ort ist die Löschung nicht vollständig".
+    /// Das schließt den Fall ein, dass der Payload dort schon getilgt ist, aber
+    /// das Umsetzen der Push-Buchhaltung (`refs/minds/remotes/*`) fehlschlug — der
+    /// Klartext ist dann nur noch über einen Tracking-Ref erreichbar. Der Rat
+    /// (erneut `forget`) stimmt und ist idempotent; die genaue offene Stelle steht
+    /// in der Fehlerkette (`{:#}` / `source()`).
+    #[error(
+        "Session {id} nur teilweise vergessen: {}, aber {} blieb offen — `minds forget {id}` erneut ausführen, um die Löschung zu vollenden",
+        describe_forgotten(.forgotten),
+        .pending.label()
+    )]
+    ForgetIncomplete {
+        /// Die Session, deren Tilgung unvollständig blieb.
+        id: SessionId,
+        /// Die Orte, die bereits getilgt sind.
+        forgotten: Vec<ForgottenPlace>,
+        /// Der Ort, an dem das Schreiben fehlschlug — er trägt weiter Klartext.
+        pending: ForgottenPlace,
+        /// Ursache aus dem Backend.
+        #[source]
+        source: Source,
+    },
+
     /// Das Backend konnte nicht lesen oder schreiben.
     ///
     /// Die Fassade: Was darunter liegt (gix, Dateisystem, Rechte), erreicht den
@@ -125,6 +162,24 @@ pub enum StoreError {
         #[source]
         source: Source,
     },
+}
+
+/// Zählt die getilgten Orte lesbar auf — für die Meldung von
+/// [`StoreError::ForgetIncomplete`].
+fn describe_forgotten(places: &[ForgottenPlace]) -> String {
+    if places.is_empty() {
+        // Der erste Ort schlug fehl — es ist noch nichts getilgt.
+        "noch nichts getilgt".to_string()
+    } else {
+        format!(
+            "{} bereits getilgt",
+            places
+                .iter()
+                .map(|place| place.label())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 impl StoreError {
@@ -145,6 +200,22 @@ impl StoreError {
 
     pub(crate) fn malformed(id: SessionId, source: serde_json::Error) -> Self {
         Self::Malformed { id, source }
+    }
+
+    /// Verpackt einen Schreibfehler mitten in einer mehrörtigen Tilgung: welche
+    /// Orte schon getilgt sind und an welchem es hakte.
+    pub(crate) fn forget_incomplete(
+        id: SessionId,
+        forgotten: Vec<ForgottenPlace>,
+        pending: ForgottenPlace,
+        source: impl Into<Source>,
+    ) -> Self {
+        Self::ForgetIncomplete {
+            id,
+            forgotten,
+            pending,
+            source: source.into(),
+        }
     }
 }
 
