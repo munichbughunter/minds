@@ -10,7 +10,7 @@ use std::process::ExitCode;
 
 use minds_core::Session;
 
-use crate::context::Context;
+use crate::context::{Context, Skipped};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -32,7 +32,14 @@ pub fn run(target: Option<&str>) -> ExitCode {
 
 fn recall(target: &str) -> Fallible<()> {
     let ctx = Context::open()?;
-    let (label, sessions) = resolve_target(&ctx, target)?;
+    let mut skipped = Skipped::default();
+    let resolved = resolve_target(&ctx, target, &mut skipped);
+    // Der Hinweis kommt vor dem Ergebnis — auch wenn das Ziel nichts (mehr)
+    // liefert, denn gerade dann erklärt er, warum (#83).
+    if let Some(note) = skipped.note() {
+        eprintln!("minds recall: {note}");
+    }
+    let (label, sessions) = resolved?;
     let markdown =
         minds_reader::brief::render(&format!("Kontext-Brief — {label}"), &sessions, None);
     print!("{markdown}");
@@ -40,24 +47,31 @@ fn recall(target: &str) -> Fallible<()> {
 }
 
 /// Löst `target` zu einer Menge Sessions auf und liefert dazu eine Beschriftung.
+/// Übersprungenes sammelt sich in `skipped`.
 ///
 /// Reihenfolge der Deutung: `datei:zeile` (Blame) → Git-Revision → Dateipfad.
 /// Die erste, die greift, gewinnt.
-fn resolve_target(ctx: &Context, target: &str) -> Fallible<(String, Vec<Session>)> {
+fn resolve_target(
+    ctx: &Context,
+    target: &str,
+    skipped: &mut Skipped,
+) -> Fallible<(String, Vec<Session>)> {
     if let Some((path, line)) = split_file_line(target) {
         if let Some(commit) = ctx.blame_commit(path, line)? {
-            return Ok((
-                format!("{path}:{line} → commit {commit}"),
-                ctx.sessions_of_commit(commit)?,
-            ));
+            let (sessions, s) = ctx.sessions_of_commit(commit)?;
+            skipped.merge(s);
+            return Ok((format!("{path}:{line} → commit {commit}"), sessions));
         }
     }
 
     if let Some(commit) = ctx.resolve_rev(target) {
-        return Ok((format!("commit {commit}"), ctx.sessions_of_commit(commit)?));
+        let (sessions, s) = ctx.sessions_of_commit(commit)?;
+        skipped.merge(s);
+        return Ok((format!("commit {commit}"), sessions));
     }
 
-    let touching = ctx.sessions_touching(target)?;
+    let (touching, s) = ctx.sessions_touching(target)?;
+    skipped.merge(s);
     if !touching.is_empty() {
         return Ok((format!("Datei {target}"), touching));
     }

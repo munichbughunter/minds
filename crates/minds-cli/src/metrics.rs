@@ -39,7 +39,10 @@ pub fn run(format: Option<&str>) -> ExitCode {
 
 fn metrics(format: &str) -> Fallible<()> {
     let ctx = Context::open()?;
-    let sessions = ctx.all_sessions()?;
+    let (sessions, skipped) = ctx.all_sessions()?;
+    if let Some(note) = skipped.note() {
+        eprintln!("minds metrics: {note}");
+    }
     let metrics = Metrics::from_sessions(&sessions);
     let coverage = coverage(&ctx)?;
     let repo = repo_name(&ctx.root);

@@ -44,6 +44,9 @@ const CAP: usize = 8;
 /// den Git-Hooks: der Fehler nach `<git-dir>/minds/hook.log`, der Panic
 /// ebenfalls, und **kein Byte** auf stdout — dort steht der injizierte
 /// Kontext, ein Fehlertext würde als solcher in die Sitzung gehoben.
+///
+/// Übersprungene Sessions (#83) folgen derselben Aufteilung: ohne `--hook`
+/// eine Zeile auf stderr, mit `--hook` ein Eintrag im Log.
 pub fn run(paths: &[String], hook: bool) -> ExitCode {
     if !hook {
         return match brief(paths, false) {
@@ -77,7 +80,7 @@ fn brief(paths: &[String], hook: bool) -> Fallible<()> {
     }
 
     let ctx = Context::open()?;
-    let all = ctx.all_sessions()?;
+    let (all, skipped) = ctx.all_sessions()?;
 
     let sessions: Vec<Session> = if paths.is_empty() {
         all
@@ -97,6 +100,16 @@ fn brief(paths: &[String], hook: bool) -> Fallible<()> {
         &sessions,
         Some(CAP),
     );
+
+    // Der Hinweis kommt vor der Ausgabe — auch ein leerer Brief erklärt sich
+    // dann (#83). Im Hook-Fall geht er ins Log, stdout trägt nur das Envelope.
+    if let Some(note) = skipped.note() {
+        if hook {
+            hooklog::log(Source::Brief, &note);
+        } else {
+            eprintln!("minds brief: {note}");
+        }
+    }
 
     if hook {
         // Das dokumentierte SessionStart-Envelope: additionalContext wird der
