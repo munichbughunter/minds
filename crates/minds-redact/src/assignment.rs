@@ -427,6 +427,10 @@ fn value_of<'t>(caps: &Captures<'t>) -> Option<Match<'t>> {
 /// weder ein Pfad noch eine Variablenreferenz. Ein echter Pfad-Token enthält so
 /// etwas nie — `\"` steht dort nur, weil der Wert aus einem JSON-String stammt.
 fn is_exempt(value: &str, tier: Tier) -> bool {
+    // Bereits redigierte Platzhalter werden **nicht** hier abgefangen, sondern
+    // zentral in [`RedactionPipeline::redact`](crate::RedactionPipeline::redact)
+    // — dort für jeden Detektor, nicht nur diesen. Ein detektorlokaler Guard
+    // hätte denselben Kategorie-Flip beim `ShortFlagRedactor` offen gelassen.
     let escaped_quote = value.contains(r#"\""#) || value.contains(r"\'");
     if !escaped_quote && (is_variable_reference(value) || is_filesystem_path(value)) {
         return true;
@@ -943,6 +947,40 @@ mod tests {
         assert!(out.text.contains("/home/claude"));
         assert!(out.text.contains("/run/secrets/tok"));
         assert_eq!(out.counts.secrets, 0);
+    }
+
+    #[test]
+    fn a_redaction_placeholder_is_left_alone() {
+        // Idempotenz: Ein bereits redigierter Wert wird nicht ein zweites Mal
+        // angefasst. Sonst schriebe die Identity-Regel (PII) einen
+        // Secret-Platzhalter zu `[redacted:pii]` um — der Kategorie-Flip, der
+        // den Verifikationslauf von `redact_session` als instabil auslöst.
+        for input in [
+            "DB_USER=[redacted:secret]",
+            "PASSWORD=[redacted:pii]",
+            "login=[redacted:secret]",
+            "TOKEN=[redacted:secret]",
+            // Auch der ShortFlag-Detektor: `curl -u [redacted:pii]` entsteht,
+            // wenn im ersten Lauf eine E-Mail hinter `-u` gewann. Der zentrale
+            // Filter deckt ihn mit ab — ein detektorlokaler Guard hätte das
+            // nicht getan.
+            "curl -u [redacted:pii] https://api.test",
+            "curl -u [redacted:secret] https://api.test",
+        ] {
+            let out = redact(input);
+            assert_eq!(out.text, input, "Platzhalter angefasst: {input}");
+            assert_eq!(out.counts, minds_core::RedactionCounts::default());
+        }
+    }
+
+    #[test]
+    fn a_real_secret_containing_the_marker_is_still_redacted() {
+        // Der Exakt-Vergleich, nicht `contains`: Nur der Platzhalter *für sich*
+        // ist ausgenommen. Ein Geheimnis, das den Marker zufällig enthält, aber
+        // mehr ist, wird weiter redigiert.
+        let out = redact("PASSWORD=x[redacted:secret]y");
+        assert!(!out.text.contains("x[redacted:secret]y"));
+        assert_eq!(out.counts.secrets, 1);
     }
 
     #[test]

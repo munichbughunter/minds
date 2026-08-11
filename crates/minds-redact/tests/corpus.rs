@@ -417,6 +417,57 @@ fn must_redact() -> Vec<MustRedact> {
             gone: &["aHVudGVyMg"],
             kept: &["kind: Secret", "password:"],
         },
+        MustRedact {
+            // Short-Flag-Authentifizierung (#2): Tool-Calls schießen
+            // Shell-Kommandos ab, und `curl -u` ist die kürzeste Form.
+            id: "curl-basic-auth",
+            text: "curl -u admin:hunter2 https://api.example.test/v1".into(),
+            gone: &["admin:hunter2"],
+            kept: &["curl", "https://api.example.test/v1"],
+        },
+        MustRedact {
+            // Dieselbe .env mit CRLF-Zeilenenden — Windows-Editoren und
+            // manche Agents liefern genau das. Kein Detektor darf am `\r`
+            // scheitern oder darüber hinweglesen.
+            id: "dotenv-crlf",
+            text: DOTENV.replace('\n', "\r\n"),
+            gone: &["hunter2", "Sommer2024!", "abc123", "s3cr3t", "admin"],
+            kept: &["DB_PASSWORD=", "postgres://"],
+        },
+        MustRedact {
+            // Multibyte **im** Wert, nicht nur drumherum: Der Panic aus #1
+            // (`is_filesystem_path` schnitt in ein Mehrbyte-Zeichen) blieb
+            // unentdeckt, weil `in_multibyte_context` nur außen wickelt.
+            id: "multibyte-inside-secret",
+            text: "PASSWORD=hünter€2 und TOKEN=abc€123def456".into(),
+            gone: &["hünter€2", "abc€123def456"],
+            kept: &["PASSWORD=", "TOKEN="],
+        },
+        MustRedact {
+            // Die Exemption stellt nur den Platzhalter *selbst* frei — ein
+            // echtes Geheimnis daneben wird weiter redigiert.
+            id: "placeholder-does-not-shield-neighbours",
+            text: "PASSWORD=[redacted:secret] TOKEN=abc123def456".into(),
+            gone: &["abc123def456"],
+            kept: &["[redacted:secret]"],
+        },
+        MustRedact {
+            // Ein Geheimnis, an das der Marker angeklebt ist, ist nicht der
+            // Platzhalter — der Exakt-Vergleich lässt es nicht durch.
+            id: "secret-with-appended-marker",
+            text: "PASSWORD=hunter2[redacted:secret]".into(),
+            gone: &["hunter2"],
+            kept: &[],
+        },
+        MustRedact {
+            // Ein Trennzeichen hinter dem Marker verhindert den Exakt-Match
+            // (der Wert ist `[redacted:secret]-hunter2`, nicht der Platzhalter):
+            // Das Geheimnis dahinter muss verschwinden.
+            id: "marker-with-trailing-separator",
+            text: "PASSWORD=[redacted:secret]-hunter2".into(),
+            gone: &["hunter2"],
+            kept: &[],
+        },
     ]
 }
 
@@ -431,6 +482,10 @@ fn must_redact() -> Vec<MustRedact> {
 /// URL, die auch Zugangsdaten tragen könnte. Die Kommentare nennen den Detektor,
 /// der hier zu Recht schweigt.
 const MUST_SURVIVE: &[(&str, &str)] = &[
+    // --- Bereits redigierte Platzhalter bleiben ein Fixpunkt ----------------
+    // Zwei benachbarte Platzhalter verschiedener Kategorie ohne Trenner: Keiner
+    // wird umgeschrieben, der Ein-Pass-Fixpunkt hält (Zähler bleibt null).
+    ("adjacent-placeholders", "[redacted:secret][redacted:pii]"),
     // --- `token`/`secret` als Wort, nicht als Schlüssel ---------------------
     ("prose-token", "Der Token-Verbrauch war erstaunlich hoch."),
     (
@@ -738,6 +793,29 @@ const DOCUMENTED_GAPS: &[(&str, &str, &str)] = &[
         "assistant-prose-echoes-walled-file",
         "Die Datei .vault_pass enthaelt: korrekt-pferd-batterie-heftklammer",
         "korrekt-pferd-batterie-heftklammer",
+    ),
+    (
+        // Shaped-Tier: Werte unter 8 **Bytes** gelten nicht als
+        // credential-typisch (`has_credential_shape`, Filter 1) — ein kurzes
+        // echtes Token hinter `TOKEN=` bleibt also stehen. Die Schwelle auf 6
+        // zu senken wäre eine Policy-Änderung mit eigener Fehlalarm-Abwägung
+        // (`token: v1.2.3` würde dann verschwinden) und gehört in ein eigenes
+        // Issue, nicht in ein Test-Issue. Wem die Lücke zu groß ist: `token`
+        // in `secret_keys` hebt sie in den Strict-Tier.
+        "short-shaped-token",
+        "GITLAB_TOKEN=abc123",
+        "abc123",
+    ),
+    (
+        // Ein **ungeescaptes** Quote mitten im nackten Wert beendet den Fund:
+        // `abc` wird redigiert, `'def` bleibt stehen. Das Quote schließt in
+        // JSON einen String, deshalb steht der Wert dort escapt (`\'`, den die
+        // Escape-Alternative fängt) — nackt, ohne JSON, ist es die Grenze der
+        // bare-Klasse. Verwandt mit `truncated-json-value`, hier für den
+        // Nicht-JSON-Fall festgehalten.
+        "unescaped-quote-truncates-bare-value",
+        "PASSWORD=abc'def",
+        "def",
     ),
     (
         // Der **verschlüsselte** PEM nach RFC 1421 trägt zwischen BEGIN und
@@ -1161,6 +1239,118 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
     assert!(redacted.audit().fields_changed() >= cases.len() * 2);
 }
 
+/// Klartext-Werte, wie ein Agent sie als Tool-Argument übergibt — der
+/// **rohe** Inhalt, bevor die Erfassung ihn in JSON serialisiert.
+///
+/// Diese Fälle sind bewusst getrennt von [`must_redact`]: Sie sind noch *kein*
+/// JSON. Erst der Test unten packt jeden in `{"command": …}`, wodurch `"` zu
+/// `\"` und Zeilenumbrüche zu `\n` mit literalem Backslash werden — genau die
+/// Envelope-Form, an der die Redaktion vor #3 scheiterte. Fixtures aus
+/// [`must_redact`], die schon JSON tragen (`json-escaped-quote-in-secret`),
+/// gehören hier **nicht** herein: Ein zweites Wrapping erzeugte eine doppelte
+/// Verschachtelung, die real nicht vorkommt.
+const JSON_ARG_CASES: &[(&str, &str, &[&str])] = &[
+    (
+        // Der eigentliche Bug-Auslöser: `DB_USER=` (Identity, PII) **vor** dem
+        // Secret. Nach der JSON-Serialisierung verschmelzen die per `\n`
+        // getrennten Zeilen zu einer, eine Secret-Regel gewinnt die überspannte
+        // Spanne, und der zweite Verifikationslauf würde den Platzhalter hinter
+        // `DB_USER=` zu PII umschreiben — ohne den Idempotenz-Fix als `Unstable`
+        // verworfen.
+        "dotenv-as-command",
+        "printf 'DB_USER=admin\nDB_PASSWORD=hunter2\nTOKEN=abc123def456' > .env",
+        &["admin", "hunter2", "abc123def456"],
+    ),
+    (
+        "curl-basic-auth-as-command",
+        "curl -u admin:s3cr3tPass https://api.example.test",
+        &["admin", "s3cr3tPass"],
+    ),
+    (
+        // Der ShortFlag-Zwilling des Kategorie-Flips: Hinter `-u` gewinnt im
+        // ersten Lauf die E-Mail (`[redacted:pii]`), im zweiten würde die
+        // ShortFlag-Regel (Secret) den Platzhalter umschreiben. `redact_session`
+        // unten verwürfe die Session ohne den zentralen Idempotenz-Filter als
+        // `Unstable` — dieser Fall panickt dann statt zu lecken.
+        "curl-user-is-an-email",
+        "curl -u anna@example.com https://api.example.test",
+        &["anna@example.com"],
+    ),
+    (
+        "quoted-password-as-command",
+        r#"psql "password=hunter2 host=db.internal""#,
+        &["hunter2"],
+    ),
+    (
+        "multibyte-secret-as-command",
+        "export PASSWORD=hünter€2",
+        &["hünter€2"],
+    ),
+    (
+        "pem-heredoc-as-command",
+        "cat <<EOF > id\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx7Vn9pQmKtLb\n-----END RSA PRIVATE KEY-----\nEOF",
+        &["MIIEowIBAAKCAQEAx7Vn9pQmKtLb"],
+    ),
+];
+
+#[test]
+fn a_secret_survives_json_serialization_as_a_tool_argument() {
+    // Real sind `ToolCall::arguments` immer ein JSON-Dokument: Hook- wie
+    // Import-Weg serialisieren das `tool_input`, und ein Geheimnis darin steht
+    // **escapt**. Jeder Fall läuft **einzeln** durch eine eigene Session —
+    // sonst ordnete ein gemeinsamer Textpuffer einen überlebenden Needle dem
+    // falschen Fixture zu.
+    let mut report = Report::default();
+
+    for (id, plaintext, gone) in JSON_ARG_CASES {
+        let mut session = Session::new(
+            Agent {
+                name: "claude-code".into(),
+                version: "1.4.2".into(),
+            },
+            Model {
+                provider: "anthropic".into(),
+                id: "claude-opus-4".into(),
+            },
+            Intent {
+                request: "Deploy-Pipeline reparieren".into(),
+                ..Intent::default()
+            },
+        );
+        session.turns.push(Turn {
+            role: Role::Assistant,
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                name: "Bash".into(),
+                arguments: serde_json::json!({ "command": plaintext }).to_string(),
+                effect: None,
+            }],
+            parent: None,
+            at: None,
+        });
+
+        // `redact_session` erhebt eine instabile Redaktion (Kategorie-Flip auf
+        // einem Platzhalter) zum harten Fehler — das Fixture prüft also
+        // zugleich, dass dieser envelope-realistische Fall stabil bleibt.
+        let redacted = policy()
+            .redact_session(session)
+            .unwrap_or_else(|e| panic!("{id}: Session nicht redigierbar: {e:?}"));
+        let out = &redacted.session().turns[0].tool_calls[0].arguments;
+
+        for needle in *gone {
+            let quoted = serde_json::to_string(needle).expect("String serialisiert immer");
+            let escaped = &quoted[1..quoted.len() - 1];
+            if out.contains(needle) || out.contains(escaped) {
+                report.note(format!(
+                    "{id}: {needle:?} überlebt die JSON-Serialisierung:\n    {out}"
+                ));
+            }
+        }
+    }
+
+    report.finish("Ein Geheimnis leckt durch ein JSON-serialisiertes Tool-Argument");
+}
+
 #[test]
 fn the_dotenv_fixture_would_not_even_reach_the_net() {
     // `dotenv-block` prüft das Netz (Schicht 2) an genau dem Inhalt, für den in
@@ -1220,4 +1410,135 @@ fn the_entropy_threshold_has_measurable_headroom() {
         "unter 3.5 bit/Zeichen müsste der Git-SHA fallen — sonst stimmt die \
          Annahme über den Abstand nicht mehr"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Property-Test: die Grundinvarianten über zufälligem Input
+// ---------------------------------------------------------------------------
+//
+// Der Korpus prüft benannte Fälle. Ein Fuzz prüft die *Invarianten*, die für
+// **jeden** Input gelten müssen — und findet die Eingabe, an die niemand
+// gedacht hat. Der Multibyte-Panic aus #1 hätte so gefunden werden können,
+// bevor er in Produktion auffiel.
+//
+// Bewusst ohne `proptest`: Ein handgerollter, **deterministisch geseedeter**
+// Generator ist in CI reproduzierbar (dieselbe Zeichenkette bei jedem Lauf) und
+// braucht keine neue Dependency (vgl. #44, musl-static).
+
+/// splitmix64 — ein winziger, deterministischer PRNG. Fester Seed heißt: Findet
+/// die CI eine Gegeneingabe, findet der nächste lokale Lauf sie auch.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Ein Alphabet, das die Bruchstellen der Detektoren trifft: ASCII-Struktur
+/// (`= : / @ " ' \`), Zeilenenden (`\n \r`) **und** Multibyte-Zeichen — an
+/// denen die Byte-rechnenden Regeln auf Zeichengrenzen achten müssen.
+const FUZZ_CHARS: &[&str] = &[
+    "a", "B", "9", "_", "-", ".", " ", "=", ":", "/", "@", "%", "$", "\"", "'", "\\", "\n", "\r",
+    "€", "ä", "ö", "ü", "🦀", "中", "\u{200B}",
+];
+
+fn random_noise(rng: &mut Rng, len: usize) -> String {
+    (0..len)
+        .map(|_| FUZZ_CHARS[rng.below(FUZZ_CHARS.len())])
+        .collect()
+}
+
+/// Umschließt Rauschen in einer der realen Envelope-Formen, damit der Fuzz die
+/// **Wert-Parser** erreicht — `is_filesystem_path`, `has_credential_shape`, die
+/// Escape-Behandlung. Reines Rauschen aus [`FUZZ_CHARS`] bildet nie einen
+/// Schlüsselnamen und liefe an genau diesen Stellen vorbei.
+fn wrap_in_template(rng: &mut Rng, noise: &str) -> String {
+    match rng.below(6) {
+        0 => format!("PASSWORD={noise}"),
+        1 => format!("TOKEN={noise}"),
+        2 => format!("--password {noise}"),
+        3 => format!("curl -u {noise} https://h"),
+        4 => format!("scheme://{noise}@host/pfad"),
+        _ => format!(r#"{{"password": "{noise}"}}"#),
+    }
+}
+
+#[test]
+fn fuzz_the_pipeline_never_panics_and_keeps_its_contract() {
+    // Die Grundinvariante: Kein UTF-8-Input bringt die Pipeline zum Absturz —
+    // nicht durch einen Byte-Slice mitten in ein Mehrbyte-Zeichen (#1), nicht
+    // durch einen vertragswidrigen Span. Geprüft wird beides: `redact` panickt
+    // nicht, **und** meldet keinen ungültigen Fund (`invalid_findings`) — genau
+    // die Span-Vertragsbrüche, die der Fuzz jagt, würde die Pipeline sonst
+    // still verwerfen und zählen.
+    let pipeline = policy();
+    let mut rng = Rng(0x5EED_1234_ABCD_0001);
+
+    for _ in 0..30_000 {
+        let noise_len = rng.below(48);
+        let noise = random_noise(&mut rng, noise_len);
+        // Zur Hälfte nackt (trifft die äußeren Grenzen), zur Hälfte in eine
+        // Template-Form, die bis zu den Wert-Parsern durchdringt.
+        let input = if rng.below(2) == 0 {
+            noise
+        } else {
+            wrap_in_template(&mut rng, &noise)
+        };
+
+        let out = pipeline.redact(&input);
+        assert_eq!(
+            out.invalid_findings, 0,
+            "Detektor-Vertrag verletzt auf {input:?}"
+        );
+        // Idempotenz: Ein zweiter Lauf über das Ergebnis verändert nichts mehr —
+        // sonst würde `redact_session` diese Eingabe als instabil verwerfen.
+        // Genau diese Invariante hat der Platzhalter-Kategorie-Flip gebrochen.
+        let again = pipeline.redact(&out.text);
+        assert_eq!(again.text, out.text, "nicht idempotent auf {input:?}");
+    }
+}
+
+#[test]
+fn fuzz_an_injected_secret_never_survives() {
+    // Die zweite Invariante: Ein Geheimnis hinter einem eindeutigen Schlüssel
+    // verschwindet, **egal** was für Rauschen davor und dahinter steht — auch
+    // Multibyte, Escapes und Zeilenumbrüche. Geprüft in beiden Tiers: Strict
+    // (`PASSWORD=`) fasst jeden Wert, Shaped (`TOKEN=`) nur credential-förmige,
+    // und das injizierte Geheimnis ist genau das (alphanumerisch mit Ziffer).
+    const SECRET: &str = "hunter2SECRETvalue9";
+    let pipeline = policy();
+    let mut rng = Rng(0x5EED_1234_ABCD_0002);
+
+    for _ in 0..30_000 {
+        let before_len = rng.below(24);
+        let before = random_noise(&mut rng, before_len);
+        let after_len = rng.below(24);
+        let after = random_noise(&mut rng, after_len);
+        let key = if rng.below(2) == 0 {
+            "PASSWORD"
+        } else {
+            "TOKEN"
+        };
+        // Trenner vor dem Schlüssel: Die Key-Muster sind links unverankert,
+        // ein direkt angeklebtes Rauschzeichen (`xPASSWORD=`) träfe zwar
+        // trotzdem — der Space hält den Fall aber eindeutig und die
+        // Fehlermeldung lesbar.
+        let input = format!("{before} {key}={SECRET} {after}");
+        let out = pipeline.redact(&input);
+
+        assert!(
+            !out.text.contains(SECRET),
+            "injiziertes Geheimnis überlebt:\n  ein: {input:?}\n  aus: {:?}",
+            out.text
+        );
+    }
 }
