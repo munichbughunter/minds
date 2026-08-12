@@ -19,9 +19,81 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
-### Behoben
+## [0.1.2] — 2026-08-12 — „Die Mauer hält — vorne und hinten"
 
-- **Die Redaktion prüft jetzt wirklich jedes Textfeld des Envelopes** (#35).
+*Das Release, das über die Freigabe entscheidet — nicht über die Begeisterung.
+Die Redaktion ist das eine Versprechen, bei dem ein Fehlschlag nicht ärgerlich,
+sondern schädlich ist; und was doch durchrutscht, muss entfernbar bleiben.
+Deshalb zwei Hälften: **vorne** die Mauer — kein Geheimnis erreicht den Store,
+auf keinem der beiden Eingangswege —, **hinten** die Tilgung — `minds forget`
+hält, was die erste README-Seite verspricht, und lässt die Rückführung danach
+weiterarbeiten.*
+
+Fast jeder Fix hier ist im Code- oder Security-Review um eigene Folge-Befunde
+gewachsen — dreimal waren es Regressionen, die erst durch den Fix entstanden
+wären. Wo es zählte, wurde zusätzlich empirisch gegen das gebaute Binary
+gemessen, nicht nur gegen die Testsuite.
+
+### Sicherheit
+
+**Vorne — die Redaktion:**
+
+- **Kein Panic mehr bei Multibyte-Zeichen im Wert**
+  ([#1](https://github.com/munichbughunter/minds/issues/1)).
+  `PASSWORD=hunter€2` stürzte in der Windows-Pfad-Erkennung ab, weil mitten im
+  UTF-8-Zeichen byte-indiziert wurde. Die Prüfung arbeitet jetzt auf
+  char-Grenzen.
+
+- **`curl -u user:pass` wird redigiert**
+  ([#2](https://github.com/munichbughunter/minds/issues/2)). Neuer
+  Short-Flag-Detektor für Authentifizierungs-Flags, in beiden Formen
+  (`-u user:pass` und `-uuser:pass`), als eigener Schalter `short_flags` in
+  der Policy — per Default an.
+
+- **JSON-escapte Secrets leaken nicht mehr teilweise**
+  ([#3](https://github.com/munichbughunter/minds/issues/3)). Tool-Argumente
+  liegen im Envelope immer JSON-serialisiert vor — genau die Eingabeklasse,
+  die die Muster nicht abdeckten: Ein escaptes Quote im Wert ließ `ter2` aus
+  `hun\"ter2` stehen, ein PEM mit literalem `\n` matchte gar nicht. Die
+  Reviews fanden vier Folge-Befunde derselben Klasse; drei davon wären erst
+  durch den Fix entstanden — unter anderem kippte die Pfad-Ausnahme von einem
+  Teil- auf ein Total-Leck.
+
+- **Die Token-Regeln kennen jetzt die wahrscheinlichsten Formen**
+  ([#33](https://github.com/munichbughunter/minds/issues/33)). Anthropic
+  (`sk-ant-`), OpenAI (`sk-proj-`, `sk-svcacct-`, `sk-admin-`), SendGrid und
+  die **GitLab-Familie** (`glcbt-`, `glptt-`, `glft-`, `glimt-`, `glagent-`,
+  `glsoat-`) — Letztere fehlte fast vollständig, in einem Produkt, das auf
+  GitLab zielt. Zwei gemessene Funde dazu: Die nicht-überlappende
+  Vorfilter-Suche ließ ausgerechnet den Anthropic-Key komplett durchrutschen
+  (`sk-` gewann gegen `sk-ant-`), und die Längen-Caps lagen unter der Realität,
+  sodass Token-Schwänze stehen blieben. Gegen Fehlalarme verlangen die neuen
+  Regeln Struktur (Typ-Sektion, Ziffern-Sektion, Wortanfang) — Prosa *über*
+  Keys bleibt lesbar.
+
+- **Tokens in URL-Queries erreichen das hook.log nicht mehr**
+  ([#73](https://github.com/munichbughunter/minds/issues/73)). Die bei GitLab
+  dokumentierte Form `?private_token=…` hat kein `@` und kam wörtlich in eine
+  Datei, die nie gelöscht wird. Die Diagnose-Senke wendet die Redaction-Policy
+  jetzt gezielt je `name=wert`-Paar an — plus den formbasierten
+  Token-Detektor über den ganzen Text —, sodass Host und Fehlerursache lesbar
+  bleiben. `token` zählt in dieser Senke zum Strict-Tier, damit auch
+  präfixlose Tokens (self-hosted GitLab vor 16.x) fallen.
+
+- **Die secretfile-Mauer kennt die gängigen Zugangsdaten-Dateien**
+  ([#34](https://github.com/munichbughunter/minds/issues/34)).
+  GCP-Service-Accounts, `credentials.json`, FIDO-SSH-Keys, `htpasswd`,
+  `.netrc.gpg`, die Verzeichnisse `gcloud` und `/etc/wireguard/` — und
+  Dateien, für die die Mauer die **einzige** Schicht ist, weil kein Detektor
+  ihre Inhalte fangen kann: Ansible-Vault-Passwortdateien, `.dockercfg`,
+  `rclone.conf`, `.s3cfg`, `.boto`. Der schwerste Befund kam aus dem Review
+  und betraf den eigenen Fix: Die Segmentgrenzen-Prüfung ließ dekorierte
+  Varianten (`credentials.bak`, `config-prod`) durchfallen — byte-gleiche
+  Zugangsdaten. Die Regel ist umgedreht: Der Rest hinter dem Muster
+  disqualifiziert nur noch, wenn er die Datei zu etwas anderem macht.
+
+- **Die Redaktion prüft jetzt wirklich jedes Textfeld des Envelopes**
+  ([#35](https://github.com/munichbughunter/minds/issues/35)).
   Ausgenommen waren bislang die Zeitstempel (`turns[].at`,
   `lineage.started_at`, `lineage.ended_at`), die Kennung `lineage.local_id`
   und die Endpunkte der Herkunftskanten — mit der Begründung, dort könne
@@ -34,6 +106,73 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   Wo dabei erstmals etwas gefunden wird, ändert sich der Envelope und damit
   die `SessionId` — ein erneuter Import derselben Session legt sie dann unter
   einer zweiten Kennung ab.
+
+- **Die Mauer gilt auf beiden Eingangswegen**
+  ([#93](https://github.com/munichbughunter/minds/issues/93)). `minds import`
+  baute die Tool-Argumente direkt aus dem Transkript — ein `Write` auf eine
+  Zugangsdaten-Datei trug den vollen Inhalt im `input`, und der stand wörtlich
+  im Store. Prüfung, Heuristik und Ersatz-Form stehen jetzt an genau einer
+  Stelle (`secretwall`), mit byte-gleicher Envelope-Form auf Hook- und
+  Import-Weg. Drei Zusatzbefunde im selben Commit: Der Hook-Weg verlor Marker
+  und Auslass-Grund im Envelope schon immer; die Pipeline redigierte den
+  eigenen Auslass-Grund (`secret` im Feldnamen); doppelt serialisierter Input
+  schlüpfte an der Mauer vorbei, während die Verbatim-Kopie den Inhalt
+  mitnahm. `minds import` weist jetzt aus, wie viele Tool-Calls hinter der
+  Mauer ausgelassen wurden.
+
+- **Ein envelope-realistischer Korpus und zwei Property-Tests sichern die
+  Regressionsgrenze** ([#36](https://github.com/munichbughunter/minds/issues/36)).
+  Je 30.000 deterministische Eingaben, ohne neue Dependency: kein Panic auf
+  beliebigem UTF-8, ein injiziertes Geheimnis überlebt nie, und
+  `redact(redact(x)) == redact(x)`. Genau die Idempotenz-Invariante fand einen
+  Bug, den 1037 bestehende Tests nicht sahen: Ein JSON-serialisierter
+  `.env`-Inhalt kippte zwischen zwei Läufen die Kategorie
+  (`secret` → `pii`), `redact_session` lehnte die Session als `Unstable` ab —
+  ein stiller Erfassungsausfall. Ein bereits redigierter Platzhalter wird
+  jetzt nicht ein zweites Mal getroffen.
+
+**Hinten — die Tilgung:**
+
+- **`forget` tilgt auch den Session-Branch**
+  ([#5](https://github.com/munichbughunter/minds/issues/5)). Der browsbare
+  Branch (`refs/minds/sessions/<hex>`) trägt `session.json` **und** eine
+  gerenderte `session.md` — und blieb bei der Löschung stehen: „vergessen"
+  gemeldet, Klartext weiter auf der Forge, für jeden mit Repo-Zugriff lesbar.
+  `forget` prüft und tilgt jetzt alle drei Orte (Store-Ref, Session-Branch,
+  Kontext-Baum), ersetzt den Branch-Baum vollständig und benennt in seiner
+  Ausgabe jeden getilgten Ort.
+
+- **Ein erneuter `put` reanimiert keine vergessene Session mehr**
+  ([#6](https://github.com/munichbughunter/minds/issues/6)). Ein Capture auf
+  einer zweiten Maschine oder ein Import überschrieb den Tombstone mit
+  Klartext — eine DSGVO-Löschung mit Erfolgsmeldung, die nicht hielt. Der
+  Store-Ref wird jetzt mit einem atomaren Guard geschrieben (ein `forget` im
+  Fenster gewinnt), der Session-Branch dreifach gestaffelt geprüft; Import und
+  Checkpoint überspringen Vergessene, ohne zu scheitern.
+
+- **Der Tombstone ist ein elternloser Wurzel-Commit**
+  ([#14](https://github.com/munichbughunter/minds/issues/14)). Vorher blieb
+  der Klartext über `<ref>~1` regulär erreichbar und reiste bei jedem Sync auf
+  alle Clones. Jetzt ist er über **keinen** Ref mehr erreichbar und nach
+  `git gc` endgültig fort; auch die eigene Push-Buchhaltung
+  (`refs/minds/remotes/*`) wird vom Klartext gelöst, sonst hielte sie ihn
+  gc-immun. Bricht die Mehr-Ort-Tilgung ab, benennt `ForgetIncomplete` die
+  getilgten und die offenen Orte — ein erneuter `forget` vollendet idempotent.
+  Ein bereits auf die Forge **gepushter** Ref braucht weiterhin einen
+  Force-Push ([#102](https://github.com/munichbughunter/minds/issues/102)).
+
+### Behoben
+
+- **Die Rückführung überlebt getilgte und defekte Sessions**
+  ([#83](https://github.com/munichbughunter/minds/issues/83)). Eine einzige
+  vergessene Session brach `brief`, `distill` und `recall` dauerhaft ab — wer
+  die DSGVO-Löschung benutzte, verlor die Kontext-Rückführung vollständig,
+  und der SessionStart-Hook scheiterte bei jedem Sitzungsstart. Jetzt gilt der
+  Degrade-Vertrag von `show`/`why` auch hier: Übersprungen wird gezählt statt
+  abgebrochen, jedes betroffene Kommando nennt die Zahl vor der Ausgabe
+  (`minds brief: 1 vergessene Session übersprungen`; nur Defekte verweisen auf
+  `minds fsck`), und `brief --hook` schreibt den Hinweis ins hook.log statt in
+  die Sitzung.
 
 ## [0.1.1] — 2026-08-10 — „Der Hook feuert wirklich"
 
