@@ -31,8 +31,11 @@ fn search(query: &str) -> Fallible<()> {
     let ctx = Context::open()?;
     let needle = query.to_lowercase();
 
-    let hits: Vec<Session> = ctx
-        .all_sessions()?
+    let (sessions, skipped) = ctx.all_sessions()?;
+    if let Some(note) = skipped.note() {
+        eprintln!("minds search: {note}");
+    }
+    let hits: Vec<Session> = sessions
         .into_iter()
         .filter(|session| matches(session, &needle))
         .collect();

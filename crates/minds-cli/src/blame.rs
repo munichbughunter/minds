@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use minds_core::{Session, SessionId};
 use minds_git::{BlameProvider, CommitId};
 
-use crate::context::Context;
+use crate::context::{Context, Skipped};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -53,13 +53,15 @@ fn blame(path: &str) -> Fallible<()> {
     let mut session_of: BTreeMap<SessionId, Session> = BTreeMap::new();
     let mut commit_cache: BTreeMap<CommitId, Vec<SessionId>> = BTreeMap::new();
     let mut without = 0u32;
+    let mut skipped = Skipped::default();
 
     for entry in &lines {
         let ids = match commit_cache.get(&entry.commit) {
             Some(ids) => ids.clone(),
             None => {
-                let ids: Vec<SessionId> = ctx
-                    .linked_sessions(entry.commit)?
+                let (linked, s) = ctx.linked_sessions(entry.commit)?;
+                skipped.merge(s);
+                let ids: Vec<SessionId> = linked
                     .into_iter()
                     .filter(|(_, session)| !session.intent.request.trim().is_empty())
                     .map(|(id, session)| {
@@ -77,6 +79,10 @@ fn blame(path: &str) -> Fallible<()> {
             Some(id) => *lines_per_session.entry(*id).or_default() += 1,
             None => without += 1,
         }
+    }
+
+    if let Some(note) = skipped.note() {
+        eprintln!("minds blame: {note}");
     }
 
     let with_context = total as u32 - without;

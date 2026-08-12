@@ -41,7 +41,10 @@ pub fn run(limit: Option<&str>, all: bool) -> ExitCode {
 
 fn recap(limit: usize) -> Fallible<()> {
     let ctx = Context::open()?;
-    let mut sessions = ctx.all_sessions()?;
+    let (mut sessions, skipped) = ctx.all_sessions()?;
+    if let Some(note) = skipped.note() {
+        eprintln!("minds recap: {note}");
+    }
 
     if sessions.is_empty() {
         println!("Noch keine Sessions erfasst.");

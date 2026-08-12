@@ -29,7 +29,7 @@ pub fn run(path: Option<&str>, out: Option<&str>) -> ExitCode {
 
 fn distill(path: Option<&str>, out: Option<&str>) -> Fallible<()> {
     let ctx = Context::open()?;
-    let mut sessions = ctx.all_sessions()?;
+    let (mut sessions, skipped) = ctx.all_sessions()?;
     if let Some(path) = path {
         sessions.retain(|session| context::touches(session, path));
     }
@@ -40,6 +40,9 @@ fn distill(path: Option<&str>, out: Option<&str>) -> Fallible<()> {
     };
     let markdown = minds_reader::brief::render(&title, &sessions, None);
 
+    if let Some(note) = skipped.note() {
+        eprintln!("minds distill: {note}");
+    }
     match out {
         Some(file) => {
             std::fs::write(file, &markdown)?;

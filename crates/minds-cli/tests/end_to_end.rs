@@ -1950,3 +1950,238 @@ fn the_pre_push_hook_keeps_its_stderr_out_of_the_push_output() {
     assert_eq!(log.lines().count(), 1, "genau ein Eintrag:\n{log}");
     assert!(log.contains("\\n"), "die Umbrüche sind entschärft:\n{log}");
 }
+
+// ---------------------------------------------------------------------------
+// Eine getilgte Session bricht die Rückführung nicht mehr ab (#83)
+// ---------------------------------------------------------------------------
+
+/// Zeichnet eine Session auf (Prompt → Write → Stop), committet `file`,
+/// checkpointet und liefert die Session-Id aus dem Trailer des Commits.
+fn record_session(dir: &Path, local_id: &str, prompt: &str, file: &str) -> String {
+    let payload = |body: &str| {
+        format!(
+            r#"{{"session_id":"{local_id}","cwd":"{}",{body}}}"#,
+            dir.display()
+        )
+    };
+    for body in [
+        format!(r#""hook_event_name":"UserPromptSubmit","prompt":"{prompt}""#),
+        format!(
+            r#""hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{{"file_path":"{file}"}}"#
+        ),
+        r#""hook_event_name":"Stop""#.to_string(),
+    ] {
+        let out = minds(
+            dir,
+            &["hook", "--agent", "claude-code"],
+            Some(&payload(&body)),
+        );
+        assert!(out.status.success(), "hook endet immer mit 0");
+    }
+
+    std::fs::write(dir.join(file), "fn f() {}\n").unwrap();
+    git(dir, &["add", file]);
+    assert!(
+        git(dir, &["commit", "-q", "-m", &format!("feat: {file}")])
+            .status
+            .success()
+    );
+    let head = String::from_utf8_lossy(&git(dir, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_owned();
+    // Von Hand statt nur über den post-commit-Hook — ein zweiter Lauf über
+    // dieselbe Session ist ein No-op, und der Test hängt nicht am Hook-Pfad.
+    let checkpoint = minds(dir, &["checkpoint", "--commit", &head], None);
+    assert!(checkpoint.status.success(), "{}", stdout(&checkpoint));
+
+    let message = stdout(&git(dir, &["log", "-1", "--format=%B"]));
+    message
+        .lines()
+        .find_map(|line| line.strip_prefix("Minds-Session-Id: "))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("kein Trailer:\n{message}"))
+        .to_string()
+}
+
+/// #83, Akzeptanzkriterien 1–3: Nach `minds forget <session>` liefern `brief`,
+/// `distill` und `recall` weiterhin den Kontext der übrigen Sessions, statt am
+/// Tombstone abzubrechen — und die Zahl der Übersprungenen ist sichtbar: im
+/// Terminal auf stderr, für `brief --hook` in `<git-dir>/minds/hook.log`.
+#[test]
+fn a_forgotten_session_no_longer_starves_brief_distill_and_recall() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    // Zwei Sessions, zwei Commits: eine bleibt, eine wird vergessen.
+    let kept = record_session(dir, "sess-bleibt", "Schreibe eine Grußfunktion", "greet.rs");
+    let gone = record_session(dir, "sess-geht", "Baue die Anmeldung", "login.rs");
+    assert_ne!(kept, gone, "zwei verschiedene Sessions");
+    let gone_commit = String::from_utf8_lossy(&git(dir, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_owned();
+
+    let forget = minds(dir, &["forget", &gone, "--reason", "Testfall"], None);
+    assert!(forget.status.success(), "{}", stdout(&forget));
+
+    // `brief`: der übrige Kontext kommt, die Getilgte wird beziffert.
+    let brief = minds(dir, &["brief"], None);
+    assert!(
+        brief.status.success(),
+        "brief bricht am Tombstone ab:\n{}",
+        String::from_utf8_lossy(&brief.stderr)
+    );
+    assert!(
+        stdout(&brief).contains("Grußfunktion"),
+        "{}",
+        stdout(&brief)
+    );
+    assert!(
+        String::from_utf8_lossy(&brief.stderr).contains("1 vergessene Session übersprungen"),
+        "der Hinweis fehlt:\n{}",
+        String::from_utf8_lossy(&brief.stderr)
+    );
+
+    // `distill`: dito.
+    let distill = minds(dir, &["distill"], None);
+    assert!(
+        distill.status.success(),
+        "distill bricht am Tombstone ab:\n{}",
+        String::from_utf8_lossy(&distill.stderr)
+    );
+    assert!(
+        stdout(&distill).contains("Grußfunktion"),
+        "{}",
+        stdout(&distill)
+    );
+    assert!(
+        String::from_utf8_lossy(&distill.stderr).contains("1 vergessene Session übersprungen"),
+        "der Hinweis fehlt:\n{}",
+        String::from_utf8_lossy(&distill.stderr)
+    );
+
+    // `recall` über eine Datei der verbliebenen Session.
+    let recall = minds(dir, &["recall", "greet.rs"], None);
+    assert!(
+        recall.status.success(),
+        "recall bricht am Tombstone ab:\n{}",
+        String::from_utf8_lossy(&recall.stderr)
+    );
+    assert!(
+        stdout(&recall).contains("Grußfunktion"),
+        "{}",
+        stdout(&recall)
+    );
+
+    // `recall` über den Commit der Getilgten: ehrlich leer, mit Hinweis —
+    // derselbe Vertrag auch auf dem `linked_sessions`-Pfad.
+    let recall_gone = minds(dir, &["recall", &gone_commit], None);
+    assert!(
+        recall_gone.status.success(),
+        "recall über den Commit bricht ab:\n{}",
+        String::from_utf8_lossy(&recall_gone.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&recall_gone.stderr).contains("1 vergessene Session übersprungen"),
+        "der Hinweis fehlt:\n{}",
+        String::from_utf8_lossy(&recall_gone.stderr)
+    );
+
+    // `brief --hook`: die Sitzung startet mit dem übrigen Kontext, der Hinweis
+    // geht ins Log — stdout trägt nur das Envelope (#68).
+    let hook = minds(dir, &["brief", "--hook"], None);
+    assert!(
+        hook.status.success(),
+        "brief --hook bricht am Tombstone ab:\n{}",
+        String::from_utf8_lossy(&hook.stderr)
+    );
+    assert!(
+        stdout(&hook).contains("additionalContext"),
+        "{}",
+        stdout(&hook)
+    );
+    assert!(stdout(&hook).contains("Grußfunktion"), "{}", stdout(&hook));
+    let log = hook_log(dir).expect("der Hinweis steht im Log");
+    assert!(
+        log.contains("1 vergessene Session übersprungen"),
+        "der Hinweis fehlt im Log:\n{log}"
+    );
+}
+
+/// #83, dieselbe Klasse: Auch eine **defekte** Session (Inhalt hasht nicht zu
+/// ihrer Id) macht die Rückführung nicht mehr unerreichbar. Sie wird
+/// übersprungen und als unlesbar ausgewiesen — mit Verweis auf `minds fsck`,
+/// denn anders als Vergessen ist das ein Defekt.
+#[test]
+fn a_corrupt_session_is_skipped_and_points_at_fsck() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+    record_session(dir, "sess-bleibt", "Schreibe eine Grußfunktion", "greet.rs");
+
+    // Ein Ref im Store-Namensraum, dessen `session.json` nicht zu seiner Id
+    // hasht — mit Git-Plumbing gebaut, wie ihn ein kaputtes Werkzeug hinterließe.
+    let bogus = "a".repeat(64);
+    std::fs::write(dir.join("kaputt.txt"), "kein json").unwrap();
+    let blob = String::from_utf8_lossy(&git(dir, &["hash-object", "-w", "kaputt.txt"]).stdout)
+        .trim()
+        .to_owned();
+    std::fs::write(
+        dir.join("tree.txt"),
+        format!("100644 blob {blob}\tsession.json\n"),
+    )
+    .unwrap();
+    let mktree = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("git mktree < tree.txt")
+            .current_dir(dir)
+            .env("PATH", path_with_minds());
+        without_user_config(&mut cmd)
+            .output()
+            .expect("mktree läuft")
+    };
+    assert!(mktree.status.success());
+    let tree = String::from_utf8_lossy(&mktree.stdout).trim().to_owned();
+    let commit = String::from_utf8_lossy(
+        &git(dir, &["commit-tree", &tree, "-m", "defekter Eintrag"]).stdout,
+    )
+    .trim()
+    .to_owned();
+    let update = git(
+        dir,
+        &["update-ref", &format!("refs/minds/store/{bogus}"), &commit],
+    );
+    assert!(update.status.success());
+
+    let brief = minds(dir, &["brief"], None);
+    assert!(
+        brief.status.success(),
+        "brief bricht an der defekten Session ab:\n{}",
+        String::from_utf8_lossy(&brief.stderr)
+    );
+    assert!(
+        stdout(&brief).contains("Grußfunktion"),
+        "{}",
+        stdout(&brief)
+    );
+    let stderr = String::from_utf8_lossy(&brief.stderr);
+    assert!(
+        stderr.contains("1 unlesbare Session übersprungen — siehe minds fsck"),
+        "der Hinweis fehlt oder zeigt nicht auf fsck:\n{stderr}"
+    );
+}
