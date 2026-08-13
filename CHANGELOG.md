@@ -19,6 +19,22 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Hinzugefügt
+
+- **Integrationstests für die Kommandos des Pilot-Zuschnitts**
+  (Teil von [#51](https://github.com/munichbughunter/minds/issues/51)).
+  Bewusst nicht alle zwölf ungedeckten Kommandos — genau die Pfade, die beim
+  Pilot-Partner nicht selbst debuggbar sind: `prepare-commit-msg` über einen
+  echten `git commit` (inklusive Amend, der weder eine neue noch eine zweite
+  Change-Id erzeugen darf), `blame`/`recap`/`search` je mit Happy-Path und
+  benanntem Fehlerfall, das `brief --hook`-JSON-Envelope als Vertragsfläche
+  (Schema **und** Session-Inhalt — Claude Code parst es stumm) und
+  `gitlab mirror` über die ganze CLI-Strecke gegen einen lokalen HTTP-Stub
+  mit echtem `curl`: Flags landen im richtigen URL-Segment, die Note im Body,
+  der Token als Header — und eine fehlende Token-Variable wird beim Namen
+  genannt. Der Rest von #51 (u. a. `verify`, `gitlab webhook`, `distill`)
+  bleibt offen und im Issue dokumentiert.
+
 ### Behoben
 
 - **`gitlab mirror` sendet den Body wieder — Header und Body getrennt**
