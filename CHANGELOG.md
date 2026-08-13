@@ -19,6 +19,23 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Behoben
+
+- **`gitlab mirror` sendet den Body wieder — Header und Body getrennt**
+  ([#7](https://github.com/munichbughunter/minds/issues/7)). Token-Header
+  (`--header @-`) und JSON-Body (`--data-binary @-`) teilten sich dasselbe
+  stdin — curl liest `-H @-` aber bis EOF: Der POST ging mit leerem Body raus
+  (GitLab: „body is missing"), das Spiegeln funktionierte schlicht nicht, und
+  der Notiz-Inhalt wanderte als kaputter HTTP-Header über die Leitung. Der
+  Body geht jetzt über eine kurzlebige Tempdatei (unter Unix 0600), stdin
+  gehört allein dem Token — der weiterhin nie in der Argumentliste und nie
+  auf der Platte steht. Dazu zitiert die Fehlermeldung jetzt die
+  Server-Antwort (`--fail-with-body` legt GitLabs `message` auf stdout,
+  gekürzt auf 500 Zeichen) — vorher blieb die eigentliche Ursache, etwa
+  „404 Project Not Found", unsichtbar. Vier neue Tests fahren echtes `curl`
+  gegen einen lokalen HTTP-Stub und sichern den Pfad erstmals ab, darunter
+  die Invariante „der Token taucht in keiner Fehlermeldung auf".
+
 ## [0.1.2] — 2026-08-12 — „Die Mauer hält — vorne und hinten"
 
 *Das Release, das über die Freigabe entscheidet — nicht über die Begeisterung.
