@@ -19,6 +19,18 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Entfernt
+
+- **Die eingecheckte `site/` ist raus aus dem Repository**
+  ([#60](https://github.com/munichbughunter/minds/issues/60)). 58 generierte
+  HTML-Dateien — die Default-Ausgabe von `minds render` — veralteten mit
+  jedem Commit gegenüber dem Code und widersprachen der eigenen Definition
+  des Readers als „bei jedem Lauf neu gebaut, zustandslos". `site/` steht
+  jetzt in der `.gitignore`; `minds render` erzeugt die Ausgabe weiterhin
+  lokal. Die übrigen Streu-Dateien aus dem Issue (`hello.txt`, `test.txt`,
+  `retest_szenario_1.txt`, `test-szenario-3`) waren bereits untracked und
+  ignoriert.
+
 ### Behoben
 
 - **`gitlab mirror` sendet den Body wieder — Header und Body getrennt**
