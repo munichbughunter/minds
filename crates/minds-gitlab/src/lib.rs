@@ -31,7 +31,8 @@
 //! Dieselbe Linie wie beim Signieren, das `ssh-keygen` aufruft: Die eine harte
 //! Abhängigkeit ist ohnehin da, und ein HTTP-Client zöge hundert Kisten in einen
 //! Build, der heute mit `serde` und `gix` auskommt. `curl` liegt in jedem
-//! CI-Image, in dem auch `git` liegt.
+//! CI-Image, in dem auch `git` liegt. Vorausgesetzt wird curl ≥ 7.76 (2021,
+//! wegen `--fail-with-body`).
 //!
 //! # Der Token kommt nie über die Kommandozeile
 //!
@@ -180,8 +181,6 @@ impl Project {
                 "POST",
                 "--header",
                 "Content-Type: application/json",
-                "--data-binary",
-                "@-",
             ],
             path,
             Some(json),
@@ -191,16 +190,42 @@ impl Project {
     /// Der eine Ort, an dem das Netz angefasst wird.
     ///
     /// Der Token geht über stdin an `--header @-`, damit er nicht in der
-    /// Argumentliste des Prozesses steht. Ist auch ein Body zu schicken, geht der
-    /// über eine zweite Zeile derselben Eingabe — `curl` liest `@-` bis zum
-    /// Zeilenende.
+    /// Argumentliste des Prozesses steht. `curl` liest `@-` dabei bis EOF —
+    /// stdin gehört damit vollständig dem Header und kann nicht zusätzlich
+    /// den Body tragen (genau das war #7: beide `@-` teilten sich stdin, der
+    /// Body kam als Header an und der POST blieb leer). Der Body geht deshalb
+    /// über `--data-binary @<datei>` aus einer Tempdatei, die nur für den
+    /// Besitzer lesbar ist und mit dem Ende des Aufrufs verschwindet. Der
+    /// Token bleibt stdin — er soll weder auf die Platte noch in die
+    /// Argumentliste.
     fn curl(&self, extra: &[&str], path: &str, body: Option<&str>) -> Result<String, String> {
         let url = format!("{}/api/v4{path}", self.base_url);
         let mut command = Command::new("curl");
         command
             .args(["--silent", "--show-error", "--fail-with-body"])
             .args(["--header", "@-"])
-            .args(extra)
+            .args(extra);
+
+        let body_file = match body {
+            Some(body) => {
+                // `NamedTempFile` legt unter Unix mit 0600 an; niemand außer
+                // dem Besitzer liest mit, solange die Datei lebt.
+                let mut file = tempfile::NamedTempFile::new()
+                    .map_err(|err| format!("curl: Body-Datei nicht anlegbar: {err}"))?;
+                file.write_all(body.as_bytes())
+                    .map_err(|err| format!("curl: Body nicht schreibbar: {err}"))?;
+                // Als `OsString`, nicht über `format!`: Ein Nicht-UTF-8-TMPDIR
+                // würde lossy konvertiert auf eine Datei zeigen, die es nicht
+                // gibt — und der Body käme wieder leer an.
+                let mut at_path = std::ffi::OsString::from("@");
+                at_path.push(file.path());
+                command.arg("--data-binary").arg(at_path);
+                Some(file)
+            }
+            None => None,
+        };
+
+        command
             .arg(&url)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -213,24 +238,34 @@ impl Project {
             let mut stdin = child.stdin.take().ok_or("curl: kein stdin")?;
             writeln!(stdin, "PRIVATE-TOKEN: {}", self.token)
                 .map_err(|err| format!("curl: Header nicht schreibbar: {err}"))?;
-            if let Some(body) = body {
-                stdin
-                    .write_all(body.as_bytes())
-                    .map_err(|err| format!("curl: Body nicht schreibbar: {err}"))?;
-            }
         }
         let output = child
             .wait_with_output()
             .map_err(|err| format!("curl endet nicht: {err}"))?;
+        // Erst wenn curl fertig ist, darf die Body-Datei verschwinden.
+        drop(body_file);
 
         if !output.status.success() {
-            // Die Fehlerausgabe kann den Body enthalten — aber nie den Token, der
-            // ging über stdin.
-            return Err(format!(
+            // stderr trägt curls Diagnose, stdout dank `--fail-with-body` die
+            // Antwort des Servers — dort steht die eigentliche Ursache, etwa
+            // GitLabs `{"message": …}`. Der Token kann in beidem nicht stehen,
+            // er ging über stdin.
+            let mut message = format!(
                 "GitLab-Aufruf fehlgeschlagen ({}): {}",
                 path,
                 String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            );
+            let response = String::from_utf8_lossy(&output.stdout);
+            let response = response.trim();
+            if !response.is_empty() {
+                message.push_str(" — Antwort: ");
+                let mut chars = response.chars();
+                message.extend(chars.by_ref().take(500));
+                if chars.next().is_some() {
+                    message.push('…');
+                }
+            }
+            return Err(message);
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
@@ -289,6 +324,172 @@ mod tests {
         let verdict = review(Decision::Approve, "");
         let body = note_body(&verdict.content_hash().unwrap(), &verdict);
         assert!(!body.contains("> \n"), "{body}");
+    }
+
+    // --- Stub-Server für den curl-Pfad --------------------------------------
+    //
+    // Ein echter `curl`-Prozess gegen einen lokalen `TcpListener`: Nur so ist
+    // sichtbar, was wirklich über die Leitung geht — die Aufteilung von stdin
+    // zwischen Header und Body war genau der Fehler, den ein Mock der eigenen
+    // Abstraktion nie gefunden hätte (#7).
+
+    struct Received {
+        method: String,
+        path: String,
+        headers: Vec<String>,
+        body: String,
+    }
+
+    /// Startet einen Server, der die `responses` der Reihe nach ausliefert und
+    /// jeden empfangenen Request in den Kanal legt. Nach der letzten Antwort
+    /// endet der Thread; der Kanal meldet dann `Err` — „kein weiterer Request".
+    fn stub_server(responses: Vec<(u16, String)>) -> (String, std::sync::mpsc::Receiver<Received>) {
+        use std::io::Write as _;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let request = read_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = sender.send(request);
+            }
+        });
+        (format!("http://{address}"), receiver)
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> Received {
+        use std::io::{BufRead, BufReader, Read};
+
+        let mut reader = BufReader::new(stream);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).unwrap();
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let path = parts.next().unwrap_or_default().to_string();
+
+        let mut headers = Vec::new();
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let line = line.trim_end_matches(['\r', '\n']).to_string();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+            headers.push(line);
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body).unwrap();
+        Received {
+            method,
+            path,
+            headers,
+            body: String::from_utf8_lossy(&body).into_owned(),
+        }
+    }
+
+    #[test]
+    fn the_note_travels_as_body_and_the_token_as_header() {
+        let verdict = review(Decision::Approve, "Backoff ist jetzt korrekt");
+        let hash = verdict.content_hash().unwrap();
+        let (url, received) = stub_server(vec![
+            (200, "[]".into()),          // has_note: noch keine Notes am MR
+            (201, r#"{"id":1}"#.into()), // die angelegte Note
+        ]);
+        let project = Project::with_token(&url, "1", "geheim123".into());
+
+        let created = project.mirror(4, &hash, &verdict).unwrap();
+        assert!(created);
+
+        let get = received.recv().unwrap();
+        assert_eq!(get.method, "GET");
+        assert!(
+            get.headers.iter().any(|h| h == "PRIVATE-TOKEN: geheim123"),
+            "{:?}",
+            get.headers
+        );
+
+        let post = received.recv().unwrap();
+        assert_eq!(post.method, "POST");
+        assert!(post.path.ends_with("/projects/1/merge_requests/4/notes"));
+        assert!(
+            post.headers.iter().any(|h| h == "PRIVATE-TOKEN: geheim123"),
+            "{:?}",
+            post.headers
+        );
+        // Der Kern von #7: Die Note steht im Body — als JSON, das GitLab
+        // versteht — und taucht in keinem Header auf.
+        let payload: serde_json::Value = serde_json::from_str(&post.body)
+            .unwrap_or_else(|err| panic!("POST-Body ist kein JSON ({err}): {:?}", post.body));
+        let note = payload["body"].as_str().unwrap();
+        assert!(note.contains(&marker(&hash)));
+        assert!(
+            !post.headers.iter().any(|h| h.contains("minds:review")),
+            "Note im Header statt im Body: {:?}",
+            post.headers
+        );
+    }
+
+    #[test]
+    fn an_existing_marker_prevents_the_post() {
+        let verdict = review(Decision::Approve, "gut");
+        let hash = verdict.content_hash().unwrap();
+        let existing = format!(r#"[{{"body":"{} schon gespiegelt"}}]"#, marker(&hash));
+        let (url, received) = stub_server(vec![(200, existing)]);
+        let project = Project::with_token(&url, "1", "geheim123".into());
+
+        let created = project.mirror(4, &hash, &verdict).unwrap();
+        assert!(!created);
+
+        assert_eq!(received.recv().unwrap().method, "GET");
+        // Der Server hat genau eine Antwort — käme ein POST, wäre er hier
+        // noch erreichbar. Der geschlossene Kanal heißt: kein weiterer Request.
+        assert!(received.recv().is_err());
+    }
+
+    #[test]
+    fn a_gitlab_error_names_the_cause_from_the_response_body() {
+        let verdict = review(Decision::Approve, "gut");
+        let hash = verdict.content_hash().unwrap();
+        let (url, _received) =
+            stub_server(vec![(404, r#"{"message":"404 Project Not Found"}"#.into())]);
+        let project = Project::with_token(&url, "kein%2Fprojekt", "geheim123".into());
+
+        let err = project.mirror(4, &hash, &verdict).unwrap_err();
+        // `--fail-with-body` legt die Server-Antwort auf stdout — die eigentliche
+        // Ursache steht dort, nicht in curls stderr.
+        assert!(err.contains("404 Project Not Found"), "{err}");
+    }
+
+    #[test]
+    fn the_error_quotes_the_response_but_never_the_token() {
+        let verdict = review(Decision::Approve, "gut");
+        let hash = verdict.content_hash().unwrap();
+        // Ein Body, der das Wort „PRIVATE-TOKEN" führt — der echte Wert darf
+        // trotzdem nie in einem Err-String auftauchen: Er ging über stdin und
+        // steht weder in URL noch argv noch Body.
+        let (url, _received) = stub_server(vec![(
+            401,
+            r#"{"message":"401 Unauthorized (PRIVATE-TOKEN invalid)"}"#.into(),
+        )]);
+        let project = Project::with_token(&url, "1", "geheim123".into());
+
+        let err = project.mirror(4, &hash, &verdict).unwrap_err();
+        assert!(err.contains("401 Unauthorized"), "{err}");
+        assert!(!err.contains("geheim123"), "{err}");
     }
 
     #[test]

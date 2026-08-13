@@ -10,6 +10,4 @@ repository.workspace = true
 minds-core = { version = "0.1.0", path = "../minds-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true
