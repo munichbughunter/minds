@@ -307,7 +307,7 @@ impl Journal {
     /// Netz, kein Git, keine Sperre.
     pub fn append(&self, key: &SessionKey, event: NewEvent) -> Result<JournalEvent> {
         let dir = self.session_dir(key);
-        create_dir_private(&dir)?;
+        create_dir_private(&self.root, &dir)?;
 
         let (seq, claim) = self.reserve(&dir)?;
 
@@ -326,10 +326,26 @@ impl Journal {
         write_private(&tmp, &serde_json::to_vec(&event)?)?;
         fs::rename(&tmp, &claim).map_err(|e| CaptureError::io("Event umbenennen", &claim, e))?;
 
+        // Auch das Verzeichnis synchronisieren (#49): `rename` ist ein Eintrag
+        // im Verzeichnis, und ohne dessen fsync kann ein Stromausfall das
+        // Event verschwinden lassen, obwohl der Hook Erfolg gemeldet hat — die
+        // Datei selbst war schon synchronisiert, ihr Name noch nicht.
+        // Kostenabwägung: ein `open` + `fsync` je Event; auf Linux/SSD wenige
+        // Millisekunden, auf macOS (F_FULLFSYNC) je nach Hardware auch
+        // spürbar mehr — der Hook-Pfad trägt das, und wer je gemessen
+        // darunter leidet, findet hier die eine Stelle zum Abwägen. Fehler
+        // nicht verschlucken — mit einer Ausnahme für Dateisysteme, die
+        // Verzeichnis-fsync schlicht nicht anbieten (siehe `sync_dir`). Ein
+        // Fehler hier heißt übrigens nicht „nichts persistiert": Die
+        // Event-Datei liegt bereits; nur ihre Haltbarkeit über einen Crash
+        // ist unbestätigt.
+        sync_dir(&dir)?;
+
         // Unverbindlicher Startwert fuer den naechsten Aufruf. Schlaegt das
         // fehl, kostet es genau einen `read_dir` — kein Grund, das Event
-        // zurueckzurollen.
-        let _ = fs::write(dir.join(HINT_FILE), (seq + 1).to_string());
+        // zurueckzurollen. 0600 wie alles hier, aber ohne fsync: Der Hinweis
+        // ist rekonstruierbar und darf einen Absturz nicht überleben müssen.
+        let _ = write_hint(&dir.join(HINT_FILE), seq + 1);
 
         Ok(event)
     }
@@ -530,15 +546,147 @@ fn scan_next_seq(dir: &Path) -> u64 {
         .unwrap_or(0)
 }
 
-fn create_dir_private(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).map_err(|e| CaptureError::io("Journal-Verzeichnis anlegen", dir, e))?;
+/// Legt das Session-Verzeichnis an — jede Journal-Ebene mit 0700, und nie
+/// durch einen Symlink.
+///
+/// Zwei Regeln aus den Reviews zu #49:
+///
+/// - **Gehärtet wird ab `journal/`, nicht ab `minds/`:** Im selben
+///   `<git-dir>/minds` liegen auch `hook.log`, `sync.lock` und das
+///   Ref-Schreib-Lock. Wer diese Ebene selbst auf 0700 zöge, entzöge in
+///   einem gruppen-geteilten Repo dem zweiten Nutzer Lock **und**
+///   Fehlerkanal (#113) — sein Verlust wäre vollständig still. Die
+///   Metadaten-Zusage von #49 braucht das nicht: 0700 auf `journal/` sperrt
+///   alles darunter.
+/// - **Kein Anlegen und kein chmod durch einen Symlink** — dieselbe
+///   Invariante, die `hooklog` für dasselbe Verzeichnis verteidigt. Eine
+///   verlinkte Ebene ist ein Fehler, kein Ziel.
+///
+/// Neue Ebenen entstehen direkt mit 0700 (`DirBuilder::mode`, kein
+/// Umask-Fenster); die anschließende chmod-Wanderung heilt Bestandsjournale
+/// von vor dieser Härtung. Scheitert sie, ist das ein Fehler, kein
+/// Achselzucken: Rohdaten unter einer 0755-Ebene weiterzuschreiben wäre die
+/// stillere und schlechtere Wahl.
+fn create_dir_private(root: &Path, leaf: &Path) -> Result<()> {
+    refuse_symlinked_levels(root, leaf)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(leaf)
+            .map_err(|e| CaptureError::io("Journal-Verzeichnis anlegen", leaf, e))?;
+
+        let mut level = leaf;
+        loop {
+            fs::set_permissions(level, fs::Permissions::from_mode(0o700))
+                .map_err(|e| CaptureError::io("Journal-Verzeichnis härten", level, e))?;
+            if level == root {
+                break;
+            }
+            match level.parent() {
+                Some(parent) if parent.starts_with(root) => level = parent,
+                _ => break,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(leaf)
+            .map_err(|e| CaptureError::io("Journal-Verzeichnis anlegen", leaf, e))?;
+        let _ = root;
+    }
+    Ok(())
+}
+
+/// Verweigert jede Journal-Ebene, die ein Symlink ist — geprüft **vor** dem
+/// Anlegen (Vorlauf-Regel), von `<git-dir>/minds` bis zum Session-Blatt.
+///
+/// `create_dir_all`/`set_permissions` folgen Symlinks: Ein Angreifer mit
+/// Schreibrecht im Git-Verzeichnis könnte sonst Rohdaten in ein fremdes
+/// Verzeichnis (oder in den committbaren Worktree) umlenken und die
+/// 0700-Härtung auf ein fremdes Ziel anwenden. Zwischen Prüfung und Anlegen
+/// bleibt ein schmales Fenster — dieselbe Abwägung wie im `hooklog`, dessen
+/// Deskriptor-Prüfung hier für Verzeichnisse kein Gegenstück hat.
+fn refuse_symlinked_levels(root: &Path, leaf: &Path) -> Result<()> {
+    let base = root.parent().unwrap_or(root);
+    let mut level = leaf;
+    loop {
+        if let Ok(meta) = fs::symlink_metadata(level) {
+            if meta.file_type().is_symlink() {
+                return Err(CaptureError::io(
+                    "Journal-Ebene ist ein Symlink — dorthin wird nicht geschrieben",
+                    level,
+                    std::io::Error::other("Symlink statt Verzeichnis"),
+                ));
+            }
+        }
+        if level == base {
+            return Ok(());
+        }
+        match level.parent() {
+            Some(parent) if parent.starts_with(base) => level = parent,
+            _ => return Ok(()),
+        }
+    }
+}
+
+/// Synchronisiert die Verzeichnis-Einträge — macht ein `rename` haltbar.
+///
+/// Dateisysteme ohne Verzeichnis-fsync (NFS-, SMB-, FUSE-Mounts) melden
+/// `ENOTSUP`/`EINVAL` — das ist dort kein Fehler, sondern die Obergrenze
+/// dessen, was das Dateisystem hergibt: Die Event-Datei selbst bleibt hart
+/// synchronisiert (`write_private`), und ein harter Fehler hier machte das
+/// Journal auf solchen Repos komplett funktionslos.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    match fs::File::open(dir).and_then(|f| f.sync_all()) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            ) =>
+        {
+            Ok(())
+        }
+        Err(e) => Err(CaptureError::io(
+            "Journal-Verzeichnis synchronisieren",
+            dir,
+            e,
+        )),
+    }
+}
+
+/// Unter Windows gibt es keinen Verzeichnis-fsync (`File::open` auf ein
+/// Verzeichnis scheitert dort grundsätzlich); das NTFS-Metadaten-Journal
+/// übernimmt die Rolle.
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Schreibt den `.next`-Hinweis mit 0600 — wie alles im Journal.
+fn write_hint(path: &Path, next: u64) -> std::io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // Nur der Eigentuemer. Das Journal enthaelt Rohdaten.
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        // `mode()` wirkt nur bei Neuanlage — ein `.next` aus einem
+        // Bestandsjournal wird hier mitgeheilt.
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    Ok(())
+    let mut f = f;
+    f.write_all(next.to_string().as_bytes())
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -738,5 +886,86 @@ mod tests {
         let path = j.session_dir(&key).join("0000000000.json");
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "das Journal enthaelt Rohdaten");
+
+        // Auch der Hinweis — er verraet zwar nur eine Zahl, aber 0600 gilt
+        // fuer alles hier.
+        let hint = fs::metadata(j.session_dir(&key).join(HINT_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(hint, 0o600, "{hint:o}");
+
+        // Und jede Journal-Ebene (#49): Ohne die Härtung entstünden
+        // Zwischenebenen mit Umask-Rechten, und andere lokale Nutzer saehen
+        // Agentnamen und Session-Kennungen. `minds/` selbst bleibt bewusst
+        // ungehärtet — dort liegen die geteilten Koordinationsdateien
+        // (hook.log, Locks), siehe `create_dir_private`.
+        for dir in [
+            j.root().to_path_buf(),
+            j.session_dir(&key).parent().unwrap().to_path_buf(),
+            j.session_dir(&key),
+        ] {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}: {mode:o}", dir.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_from_before_the_hardening_is_healed_on_append() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "heilung").unwrap();
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+
+        // Ein Bestandsjournal simulieren: alle Ebenen offen, der Hinweis 0644.
+        for dir in [
+            j.root().to_path_buf(),
+            j.session_dir(&key).parent().unwrap().to_path_buf(),
+            j.session_dir(&key),
+        ] {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let hint = j.session_dir(&key).join(HINT_FILE);
+        fs::set_permissions(&hint, fs::Permissions::from_mode(0o644)).unwrap();
+
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+
+        for dir in [
+            j.root().to_path_buf(),
+            j.session_dir(&key).parent().unwrap().to_path_buf(),
+            j.session_dir(&key),
+        ] {
+            let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "nicht geheilt: {}", dir.display());
+        }
+        let mode = fs::metadata(&hint).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "der Hinweis wurde nicht geheilt: {mode:o}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_journal_level_is_refused_not_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        // Dieselbe Invariante wie im hooklog: Ein Symlink im Git-Verzeichnis
+        // darf weder beschrieben noch chmodded werden — sonst lenkte er
+        // Rohdaten in fremdes (oder committbares) Gebiet um.
+        let git_dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::set_permissions(target.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        fs::create_dir_all(git_dir.path().join("minds")).unwrap();
+        std::os::unix::fs::symlink(target.path(), git_dir.path().join("minds/journal")).unwrap();
+
+        let j = Journal::open(git_dir.path());
+        let key = SessionKey::new("claude-code", "symlink").unwrap();
+        let err = j.append(&key, event(EventKind::Prompt)).unwrap_err();
+        assert!(err.to_string().contains("Symlink"), "{err}");
+
+        // Das Ziel blieb unberührt: keine Dateien, Rechte unverändert.
+        assert!(fs::read_dir(target.path()).unwrap().next().is_none());
+        let mode = fs::metadata(target.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "{mode:o}");
     }
 }
