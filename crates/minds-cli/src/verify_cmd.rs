@@ -66,7 +66,7 @@ fn verify(
         .get(id)?
         .ok_or_else(|| format!("Session {id} liegt nicht im Store"))?;
 
-    let payload = minds_core::attestation_payload(id, &session);
+    let payload = minds_core::attestation_payload(id, &session)?;
     let signature = std::fs::read_to_string(sig_file)
         .map_err(|err| format!("Signaturdatei {sig_file:?} nicht lesbar: {err}"))?;
     let signers = resolve_signers(signers, &ctx.root)?;

@@ -139,6 +139,12 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
         println!("\n(nichts geschrieben — mit --write anlegen; Hash wäre {hash})");
         return Ok(());
     }
+    // Ingest-Validierung (#12): Eine Netz-Nutzlast, deren Felder keinen
+    // signierbaren Payload ergäben (Zeilen-/Steuer-/Versteckzeichen in
+    // Reviewer oder Subjekt), kommt gar nicht erst in den Store — sonst
+    // stünde dort ein Verdict, das audit nur degradiert ausweisen und
+    // niemand je signieren könnte.
+    minds_core::review_payload(&hash, &review)?;
     let written = ReviewStore::new(repo).put(&review)?;
     println!("\nReview {written} angelegt.");
     Ok(())

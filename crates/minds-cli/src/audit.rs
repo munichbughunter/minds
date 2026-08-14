@@ -112,6 +112,11 @@ enum PayloadState {
     Present,
     Forgotten,
     Missing,
+    /// Die Nutzlast ist da, aber ein Feld könnte im signierbaren Klartext
+    /// eine Zeile fälschen oder Text verstecken (#12). Fail-closed ohne
+    /// Abbruch: kein fälschbarer Payload im Bündel, aber der Eintrag bleibt
+    /// sichtbar — übersprungen wird gezählt, nicht abgebrochen (#83).
+    Unsignable,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,8 +128,11 @@ struct VerdictRecord {
     at: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     summary: String,
-    /// Der kanonische Text, über den signiert wird.
+    /// Der kanonische Text, über den signiert wird. Leer, wenn ein Feld ihn
+    /// fälschen könnte — dann benennt `payload_error` das Feld (#12).
     review_payload: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payload_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<String>,
 }
@@ -266,14 +274,24 @@ fn does_not_prove() -> Vec<String> {
 
 fn session_record(store: &dyn ContextStore, id: SessionId) -> Fallible<SessionRecord> {
     match store.get(id) {
-        Ok(Some(session)) => Ok(SessionRecord {
-            id: id.to_string(),
-            agent: format!("{} {}", session.agent.name, session.agent.version),
-            model: format!("{}/{}", session.model.provider, session.model.id),
-            intent: session.intent.request.clone(),
-            attestation_payload: attestation_payload(id, &session),
-            payload: PayloadState::Present,
-        }),
+        Ok(Some(session)) => {
+            // Ein manipuliertes Feld legt nicht den ganzen Audit lahm — genau
+            // dieses Bündel bräuchte man, um den Eintrag zu untersuchen. Der
+            // Payload bleibt dann leer (nichts Fälschbares), der Zustand
+            // benennt es.
+            let (payload_text, payload) = match attestation_payload(id, &session) {
+                Ok(payload) => (payload, PayloadState::Present),
+                Err(_) => (String::new(), PayloadState::Unsignable),
+            };
+            Ok(SessionRecord {
+                id: id.to_string(),
+                agent: format!("{} {}", session.agent.name, session.agent.version),
+                model: format!("{}/{}", session.model.provider, session.model.id),
+                intent: session.intent.request.clone(),
+                attestation_payload: payload_text,
+                payload,
+            })
+        }
         // Getilgt: Die Referenz bleibt in der Kette, der Inhalt fehlt. Genau das
         // soll ein Auditor sehen können.
         Err(minds_store::StoreError::Forgotten { .. }) => {
@@ -297,13 +315,20 @@ fn forgotten(id: SessionId, payload: PayloadState) -> SessionRecord {
 
 fn verdict_record(store: &ReviewStore, review: &Review) -> Fallible<VerdictRecord> {
     let hash = review.content_hash()?;
+    // Wie bei den Sessions: degradieren statt abbrechen. Der Fehlertext
+    // benennt nur das Feld, nie den Wert.
+    let (payload_text, payload_error) = match review_payload(&hash, review) {
+        Ok(payload) => (payload, None),
+        Err(err) => (String::new(), Some(err.to_string())),
+    };
     Ok(VerdictRecord {
         hash: hash.to_string(),
         decision: review.decision.as_str().to_string(),
         reviewer: review.reviewer.clone(),
         at: review.at.clone(),
         summary: review.summary.clone(),
-        review_payload: review_payload(&hash, review),
+        review_payload: payload_text,
+        payload_error,
         signature: store.signature(&hash)?,
     })
 }

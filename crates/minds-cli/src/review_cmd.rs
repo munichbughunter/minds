@@ -75,7 +75,7 @@ fn review(
         // gibt es erst, wenn das Review steht. Scheitert das Signieren, bleibt
         // ein gültiges, unsigniertes Verdict zurück — kein halber Zustand.
         let key = resolve_key(key, &root)?;
-        let signature = signing::ssh_sign(&review_payload(&hash, &review), Path::new(&key))?;
+        let signature = signing::ssh_sign(&review_payload(&hash, &review)?, Path::new(&key))?;
         store.put_signature(&hash, &signature)?;
         println!("  signiert mit {key}");
     }
@@ -166,7 +166,12 @@ fn signature_state(
         return "· signiert (ungeprüft — mit --signers <datei> prüfen)".into();
     };
     let identity = identity.unwrap_or(&review.reviewer);
-    let payload = review_payload(&hash, review);
+    // Fail-closed (#12): Ein Review, dessen Felder eine Zeile fälschen könnten,
+    // bekommt keinen Payload — und damit hier kein „gültig".
+    let payload = match review_payload(&hash, review) {
+        Ok(payload) => payload,
+        Err(err) => return format!("· Signatur nicht prüfbar: {err}"),
+    };
     match signing::ssh_verify(&payload, &signature, Path::new(signers), identity) {
         Ok(true) => format!("· Signatur gültig ({identity})"),
         Ok(false) => format!("· SIGNATUR UNGÜLTIG ({identity})"),
@@ -275,4 +280,43 @@ fn git_config(root: &Path, key: &str) -> Option<String> {
         .ok()?;
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #12: Ein gespeichertes Review mit gefälschtem Reviewer-Feld darf in der
+    /// Statuszeile nie als „gültig" erscheinen — der Payload-Bau schlägt fehl,
+    /// bevor eine Signatur überhaupt geprüft wird, und genau das steht dann da.
+    #[test]
+    fn a_forged_review_is_unverifiable_not_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("kein git im Pfad — Test übersprungen");
+            return;
+        }
+        let store = ReviewStore::new(Repo::discover(dir.path()).unwrap());
+        let forged = Review::new(
+            Subject::Change(format!("I{}", "ab".repeat(20))),
+            Decision::Approve,
+            "anna@example.org\ndecision=approve",
+            "",
+            None,
+        );
+        let hash = forged.content_hash().unwrap();
+        store.put(&forged).unwrap();
+        store.put_signature(&hash, "keine-echte-signatur").unwrap();
+
+        let state = signature_state(&store, &forged, Some("egal"), None);
+        assert!(state.contains("Signatur nicht prüfbar"), "{state}");
+        assert!(!state.contains("Signatur gültig"), "{state}");
+        assert!(!state.contains("UNGÜLTIG"), "{state}");
+    }
 }

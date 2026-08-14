@@ -49,7 +49,7 @@ fn sign(target: &str, key: Option<&str>) -> Fallible<()> {
         .ok_or_else(|| format!("Session {id} liegt nicht im Store"))?;
 
     let key = resolve_key(key, &ctx.root)?;
-    let payload = minds_core::attestation_payload(id, &session);
+    let payload = minds_core::attestation_payload(id, &session)?;
     let signature = signing::ssh_sign(&payload, Path::new(&key))?;
     print!("{signature}");
     Ok(())
