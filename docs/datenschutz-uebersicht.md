@@ -4,6 +4,8 @@
 ist aus dem Code belegbar; die bekannten Lücken stehen am Ende — mit
 Issue-Nummern, nicht in einer Fußnote.*
 
+*English version: [privacy-overview.md](privacy-overview.md)*
+
 ---
 
 ## 1. Was wird erfasst?

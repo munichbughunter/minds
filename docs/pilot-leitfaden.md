@@ -5,6 +5,8 @@ ist und warum es das gibt, steht in [`fuer-tester.md`](fuer-tester.md); dieses
 Dokument regelt den Zuschnitt: was der Pilot prüft, wie du installierst, und
 was ausdrücklich nicht dazugehört.*
 
+*English version: [pilot-guide.md](pilot-guide.md)*
+
 ---
 
 ## 1. Der Zuschnitt
