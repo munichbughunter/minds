@@ -19,6 +19,8 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Hinzugefügt
+
 - **Integrationstests für die Kommandos des Pilot-Zuschnitts**
   (Teil von [#51](https://github.com/munichbughunter/minds/issues/51)).
   Bewusst nicht alle zwölf ungedeckten Kommandos — genau die Pfade, die beim
@@ -32,6 +34,24 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   der Token als Header — und eine fehlende Token-Variable wird beim Namen
   genannt. Der Rest von #51 (u. a. `verify`, `gitlab webhook`, `distill`)
   bleibt offen und im Issue dokumentiert.
+
+- **Pilot-Leitfaden und Datenschutz-Übersicht**
+  (`docs/pilot-leitfaden.md`, `docs/datenschutz-uebersicht.md`). Die eine
+  Seite für die interne Freigabe beim Pilotpartner und der Leitfaden für den
+  Pilot-Zuschnitt — jede belastbare Zusage gegen den Code verifiziert, die
+  bekannten Lücken mit Issue-Nummern benannt statt versteckt.
+
+### Entfernt
+
+- **Die eingecheckte `site/` ist raus aus dem Repository**
+  ([#60](https://github.com/munichbughunter/minds/issues/60)). 58 generierte
+  HTML-Dateien — die Default-Ausgabe von `minds render` — veralteten mit
+  jedem Commit gegenüber dem Code und widersprachen der eigenen Definition
+  des Readers als „bei jedem Lauf neu gebaut, zustandslos". `site/` steht
+  jetzt in der `.gitignore`; `minds render` erzeugt die Ausgabe weiterhin
+  lokal. Die übrigen Streu-Dateien aus dem Issue (`hello.txt`, `test.txt`,
+  `retest_szenario_1.txt`, `test-szenario-3`) waren bereits untracked und
+  ignoriert.
 
 ### Behoben
 
@@ -49,6 +69,43 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   „404 Project Not Found", unsichtbar. Vier neue Tests fahren echtes `curl`
   gegen einen lokalen HTTP-Stub und sichern den Pfad erstmals ab, darunter
   die Invariante „der Token taucht in keiner Fehlermeldung auf".
+
+### Bekannte Einschränkungen
+
+*Die Liste des Übergabestands. Sie ersetzt für den heutigen Stand die
+älteren Listen unter v0.1.1 und v0.1.0 — die bleiben historisch stehen,
+gelesen als „gilt heute" wird nur diese hier.*
+
+- **Verlinkte Git-Worktrees:** Die Erfassung und `fsck` stimmen dort, aber
+  `minds show` und `minds why` zeigen den Commit des Hauptbaums
+  ([#20](https://github.com/munichbughunter/minds/issues/20)).
+- **Kein natives Windows-Binary** — der unterstützte Weg ist WSL.
+- **Tool-Ebene vollständig nur für Claude Code.** Andere Agents (Codex,
+  Cursor, Gemini, opencode): Der Prompt wird erfasst, die Tool- und
+  Datei-Ebene noch nicht gedeutet.
+- **Die Review-Schicht braucht zwei Personen auf einem Repo** — allein
+  bleiben Erfassung, `why` und `recall` testbar, Reviews nicht.
+- **`forget` erreicht bereits gepushte Refs nicht automatisch**
+  ([#102](https://github.com/munichbughunter/minds/issues/102)) — `sync`
+  force-pusht grundsätzlich nie; lokal wirkt die Tilgung vollständig.
+  Dazu der Kollisions-Randfall des Browse-Branches
+  ([#100](https://github.com/munichbughunter/minds/issues/100), Richtung:
+  über-tilgen, kein Leck) und das Rohdaten-Fenster im Journal
+  ([#49](https://github.com/munichbughunter/minds/issues/49)) — Details in
+  der [Datenschutz-Übersicht](docs/datenschutz-uebersicht.md).
+- **`minds import` nutzt die eingebaute Standard-Policy**, nicht die
+  repo-eigene `.minds/redact.json` — projektspezifische Denylists greifen
+  beim Backfill nicht.
+- **Ein Push mit neuen Sessions öffnet zwei Verbindungen**
+  ([#85](https://github.com/munichbughunter/minds/issues/85)); ohne neue
+  Sessions kostet der Hook nichts.
+- **`minds gitlab webhook` hat keine Token-Verifikation**
+  ([#8](https://github.com/munichbughunter/minds/issues/8)) — als lokales
+  Kommando enthalten (Default: Dry-Run), aber nicht verwenden; das
+  CI-Gate (`fsck --require-review`) wird als Pipeline-Tor noch nicht
+  empfohlen.
+- **Kein Self-Update** — Versionswechsel laufen über `install.sh` mit
+  `MINDS_VERSION`.
 
 ## [0.1.2] — 2026-08-12 — „Die Mauer hält — vorne und hinten"
 
