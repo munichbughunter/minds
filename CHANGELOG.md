@@ -19,8 +19,6 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
-### Hinzugefügt
-
 - **Integrationstests für die Kommandos des Pilot-Zuschnitts**
   (Teil von [#51](https://github.com/munichbughunter/minds/issues/51)).
   Bewusst nicht alle zwölf ungedeckten Kommandos — genau die Pfade, die beim
