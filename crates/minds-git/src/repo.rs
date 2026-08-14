@@ -62,6 +62,18 @@ impl Repo {
         self.inner.git_dir()
     }
 
+    /// Das **geteilte** Git-Verzeichnis — im verlinkten Worktree das des
+    /// Hauptbaums.
+    ///
+    /// [`git_dir`](Self::git_dir) ist dort worktree-privat
+    /// (`.git/worktrees/<name>`), die Refs unter `refs/minds/*` liegen aber im
+    /// gemeinsamen Verzeichnis. Alles, was Ref-Schreiber **repo-weit**
+    /// serialisieren muss (das Sidecar-Lock aus `refs.rs`), gehört hierher —
+    /// sonst nähmen zwei Worktrees verschiedene Locks für dieselben Refs.
+    pub(crate) fn common_dir(&self) -> &Path {
+        self.inner.common_dir()
+    }
+
     /// Das gix-Handle. Crate-intern — siehe `error.rs` zur Fassade.
     pub(crate) fn gix(&self) -> &gix::Repository {
         &self.inner

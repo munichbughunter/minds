@@ -101,7 +101,14 @@ use crate::store::{ContextStore, Forget, ForgottenPlace, Put};
 
 /// Wie oft [`GitStore::put_bytes`] einen verlorenen Wettlauf am Ref wiederholt,
 /// bevor er ihn meldet.
-const PUT_ATTEMPTS: u32 = 3;
+///
+/// Zehn statt der historischen drei: Seit der Compare-and-Swap in `minds-git`
+/// wirklich durchgesetzt wird (#4 — vorher schluckte ein Verify-vor-dem-Lock
+/// in gix die Konflikte still), sind verlorene Wettläufe der **normale**
+/// Ausgang unter Last, kein Randfall. Jeder Versuch liest frisch, mergt neu
+/// und ist Millisekunden kurz — die Schranke ist ein Notausgang gegen einen
+/// Ref, der sich nie beruhigt, keine Fairness-Annahme.
+const PUT_ATTEMPTS: u32 = 10;
 
 /// Der einzige Nachbar der Sessions im Baum — die Commit→Session-Zuordnung, die
 /// nicht in die Commit-Message passt (siehe [`crate::index`]).
@@ -494,10 +501,9 @@ impl GitStore {
     /// den Ref als **elternlosen** Wurzel-Commit neu (#14).
     ///
     /// Der Weg, auf dem `forget` einen Tombstone so setzt, dass der alte Inhalt
-    /// von `path` über keinen Ref mehr erreichbar ist. Anders als
-    /// [`write_into_session`](Self::write_into_session) (das für reguläres
-    /// Fortschreiben — Kanten, Index — auf den Stand **aufsetzt**) fällt hier die
-    /// Historie weg. Der aktuelle Baum ist die Basis, damit die übrigen Einträge
+    /// von `path` über keinen Ref mehr erreichbar ist. Anders als das reguläre
+    /// Fortschreiben (Kanten via `update_blob_in_ref`, das auf den Stand
+    /// **aufsetzt**) fällt hier die Historie weg. Der aktuelle Baum ist die Basis, damit die übrigen Einträge
     /// (andere Sessions im Kontext-Baum, Nebendateien am Store-Ref) im aktuellen
     /// Stand erhalten bleiben — nur ihre Historie geht mit, nicht ihr Inhalt.
     ///
@@ -890,30 +896,65 @@ impl ContextStore for GitStore {
 
     fn link(&self, session: SessionId, commit_hex: &str, evidence: Evidence) -> Result<()> {
         let reference = session_ref(session);
-        let mut links = self.links_at(&reference)?;
-
-        // Idempotent, und stärkere Herkunft gewinnt — dieselbe Regel wie in
-        // [`CommitIndex::link`], nur auf der Sicht *einer* Session.
-        match links.iter_mut().find(|link| link.commit == commit_hex) {
-            Some(existing) => {
-                if existing.evidence >= evidence {
-                    return Ok(());
-                }
-                existing.evidence = evidence;
-            }
-            None => links.push(SessionLink {
-                commit: commit_hex.to_owned(),
-                evidence,
-            }),
-        }
-        links.sort_by(|a, b| a.commit.cmp(&b.commit));
-
-        let bytes = serde_json::to_vec(&links).expect("Kanten serialisieren immer");
         let message = format!("minds: Kante {commit_hex} → {session}");
-        self.retry_write(|| {
-            self.write_into_session(&reference, SESSION_LINKS_FILE, &bytes, &message)
-        })
-        .map(|_| ())
+
+        // Lesen, Mergen und Schreiben laufen als **ein** atomarer Schritt über
+        // `update_blob_in_ref`: Der Merge arbeitet auf dem Blob genau des
+        // Commits, auf den der CAS aufsetzt. Vorher lag der Merge außerhalb —
+        // wer das Rennen verlor, schrieb im Retry seine veralteten Bytes über
+        // die Kante des Gewinners (Lost Update, #4), und `why`/`show` fanden
+        // die Session über diesen Commit nicht mehr. Bei `RefRaced` wird vom
+        // neuen Stand aus erneut gemergt.
+        let mut attempts_left = PUT_ATTEMPTS;
+        let mut corrupt = false;
+        loop {
+            attempts_left -= 1;
+            let outcome =
+                self.repo
+                    .update_blob_in_ref(&reference, SESSION_LINKS_FILE, &message, |current| {
+                        // Eine unlesbare links.json nicht still durch eine
+                        // frische Liste ersetzen — das schriebe den Verlust
+                        // aller bisherigen Kanten aktiv fest. Die Lese-Seite
+                        // (`links_at`) bleibt tolerant; nur das Zurückschreiben
+                        // scheitert benannt.
+                        let mut links: Vec<SessionLink> = match current {
+                            Some(bytes) => match serde_json::from_slice(bytes) {
+                                Ok(links) => links,
+                                Err(_) => {
+                                    corrupt = true;
+                                    return None;
+                                }
+                            },
+                            None => Vec::new(),
+                        };
+
+                        // Idempotent, und stärkere Herkunft gewinnt — dieselbe
+                        // Regel wie in [`CommitIndex::link`], nur auf der Sicht
+                        // *einer* Session.
+                        match links.iter_mut().find(|link| link.commit == commit_hex) {
+                            Some(existing) => {
+                                if existing.evidence >= evidence {
+                                    return None;
+                                }
+                                existing.evidence = evidence;
+                            }
+                            None => links.push(SessionLink {
+                                commit: commit_hex.to_owned(),
+                                evidence,
+                            }),
+                        }
+                        links.sort_by(|a, b| a.commit.cmp(&b.commit));
+                        Some(serde_json::to_vec(&links).expect("Kanten serialisieren immer"))
+                    });
+            match outcome {
+                Ok(_) if corrupt => {
+                    return Err(StoreError::CorruptLinks { reference });
+                }
+                Ok(_) => return Ok(()),
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
     }
 
     fn index(&self) -> Result<CommitIndex> {
@@ -955,9 +996,13 @@ impl ContextStore for GitStore {
 
     fn put_index_bytes(&self, bytes: &[u8]) -> Result<()> {
         // Anders als eine Session ist der Index nicht content-adressiert: Zwei
-        // Läufe schreiben verschiedene Inhalte an denselben Pfad. Deshalb kein
-        // „liegt schon so da"-Kurzschluss, aber dieselbe CAS-Retry gegen einen
-        // parallelen Schreiber.
+        // Läufe schreiben verschiedene Inhalte an denselben Pfad. Der Retry
+        // hält nur den Ref-Wechsel konsistent (kein Fork der Kette) — auf
+        // **Inhaltsebene** bleibt `set_index` last-write-wins, denn der Merge
+        // liegt beim Aufrufer außerhalb der Schleife (das Muster aus #4).
+        // Vertretbar, weil der heiße Pfad (`link`) je Session schreibt und
+        // `set_index` nur noch Import/Migration dient; wer hier nebenläufig
+        // mergen will, braucht `update_blob_in_ref` wie `link`.
         let mut attempts_left = PUT_ATTEMPTS;
         loop {
             attempts_left -= 1;
@@ -1007,21 +1052,6 @@ impl GitStore {
             return Ok(Vec::new());
         };
         Ok(serde_json::from_slice(&bytes).unwrap_or_default())
-    }
-
-    /// Setzt eine Datei in den Baum eines Session-Refs — auf den bisherigen
-    /// Stand aufgesetzt, damit die Nutzlast daneben stehen bleibt.
-    fn write_into_session(
-        &self,
-        reference: &str,
-        path: &str,
-        bytes: &[u8],
-        message: &str,
-    ) -> minds_git::Result<RefUpdate> {
-        let blob = self.repo.write_blob(bytes)?;
-        let base = self.repo.tree_at(reference)?;
-        let tree = self.repo.write_tree(base, [(path, blob)])?;
-        self.repo.commit_tree_to_ref(reference, tree, message)
     }
 
     /// Ob an dieser Stelle eine zu tilgende Nutzlast liegt (kein Tombstone).
@@ -1654,6 +1684,73 @@ mod tests {
         assert_eq!(
             store.index().unwrap().links_of("cafe")[0].evidence,
             Evidence::Observed
+        );
+    }
+
+    #[test]
+    fn concurrent_links_lose_no_edge() {
+        // #4: Zwei Schreiber, dieselbe Session, verschiedene Commits. Vor dem
+        // Fix mergte `link` außerhalb der CAS-Schleife — wer das Rennen verlor,
+        // schrieb im Retry seine veralteten Bytes über die Kante des Gewinners,
+        // und `why`/`show` fanden die Session über diesen Commit nicht mehr.
+        let (fixture, store) = fresh_store();
+        let id = store.put(&redacted("Wettlauf")).unwrap().id();
+        let path = fixture.path().to_path_buf();
+
+        let writers: Vec<_> = (0..2)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let store = GitStore::new(Repo::open(&path).unwrap(), DEFAULT_CONTEXT_REF);
+                    for i in 0..3 {
+                        store
+                            .link(id, &format!("c{writer}{i}"), Evidence::Inferred)
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+
+        let links = store.links_at(&session_ref(id)).unwrap();
+        let log = fixture.git(&["log", "--format=%s", &session_ref(id)]);
+        for commit in ["c00", "c01", "c02", "c10", "c11", "c12"] {
+            assert!(
+                links.iter().any(|link| link.commit == commit),
+                "Kante {commit} fehlt\nlinks: {links:?}\nlog:\n{log}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupt_links_file_is_not_clobbered() {
+        // Aus dem Review zu #4: Eine unlesbare links.json darf beim Schreiben
+        // nicht still durch eine frische Liste ersetzt werden — das nähme alle
+        // bisherigen Kanten mit. Lesen bleibt tolerant, Schreiben scheitert
+        // benannt.
+        let (_fixture, store) = fresh_store();
+        let id = store.put(&redacted("kaputte Kanten")).unwrap().id();
+        store.link(id, "cafe", Evidence::Inferred).unwrap();
+
+        store
+            .repo
+            .update_blob_in_ref(&session_ref(id), SESSION_LINKS_FILE, "kaputt", |_| {
+                Some(b"{nicht json".to_vec())
+            })
+            .unwrap();
+
+        let err = store.link(id, "beef", Evidence::Inferred).unwrap_err();
+        assert!(matches!(err, StoreError::CorruptLinks { .. }), "{err:?}");
+        assert_eq!(
+            store
+                .repo
+                .read_blob_at(&session_ref(id), SESSION_LINKS_FILE)
+                .unwrap()
+                .unwrap(),
+            b"{nicht json",
+            "der kaputte Stand darf nicht überschrieben werden"
         );
     }
 

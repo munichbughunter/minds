@@ -242,6 +242,13 @@ pub trait ContextStore {
     ///
     /// Der Default bleibt der alte Weg (lesen, ergänzen, ganz zurückschreiben),
     /// damit ein Store, der keine Session-Refs kennt, weiter funktioniert.
+    ///
+    /// **Nicht nebenläufigkeitsfest:** Lesen und Zurückschreiben sind hier zwei
+    /// getrennte Backend-Aufrufe — zwei parallele Schreiber können einander
+    /// überschreiben (Lost Update, #4). Die Git-Backends überschreiben `link`
+    /// deshalb mit einem CAS-gestützten Read-Modify-Write
+    /// (`update_blob_in_ref`); ein neues Backend, das nebenläufig beschrieben
+    /// wird, muss dasselbe tun. Produktiv nutzt diesen Default heute niemand.
     fn link(&self, session: SessionId, commit_hex: &str, evidence: Evidence) -> Result<()> {
         let mut index = self.index()?;
         index.link(commit_hex.to_owned(), session, evidence);

@@ -76,6 +76,33 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Behoben
 
+- **Nebenläufige Kanten-Schreiber verlieren einander nicht mehr**
+  ([#4](https://github.com/munichbughunter/minds/issues/4)). Zwei
+  gleichzeitige Checkpoints derselben Session — der `post-commit`-Hook und
+  ein Aufruf von Hand reichen — konnten eine Kante `Commit → Session`
+  still verlieren: `why`/`show` fanden die Session über diesen Commit
+  danach nicht mehr, obwohl beide Aufrufe Erfolg meldeten. Der Fix ging
+  tiefer als das Issue: `GitStore::link` mergte außerhalb der
+  CAS-Schleife (das beschriebene Lost Update), aber der Test gegen echte
+  Threads zeigte, dass auch der Compare-and-Swap darunter nicht hielt —
+  gix (0.85) verifiziert den Erwartungswert einer Ref-Transaktion gegen
+  einen **vor** dem Lock gelesenen Stand, zwei Schreiber bekamen beide
+  `Ok`. Jetzt teilen sich Lesen, Mergen und Schreiben einen beobachteten
+  Commit (`update_blob_in_ref`), und der Ref-Wechsel verifiziert unter
+  einem eigenen, prozessübergreifenden Lock — Staleness wird zu
+  `RefRaced` und einem frischen Versuch, nie zu stillem Überschreiben.
+  Das schützt denselben Pfad auch für `put` und `forget`. Die
+  Wiederholungsgrenze steigt von drei auf zehn Versuche, weil verlorene
+  Wettläufe seit der echten Durchsetzung der Normalfall unter Last sind.
+  Drei Befunde aus den Reviews im selben Commit: Das Lock lebt im
+  **geteilten** Git-Verzeichnis (`common_dir`), damit verlinkte Worktrees
+  dasselbe nehmen — sonst wäre die Serialisierung genau in der Topologie
+  wirkungslos, für die es sie braucht; eine nach hartem Prozessende
+  liegengebliebene Lock-Datei nennt in der Fehlermeldung ihren Pfad samt
+  Abhilfe; und eine unlesbare `links.json` wird beim Schreiben nicht mehr
+  still durch eine frische Liste ersetzt, sondern scheitert benannt —
+  Lesen bleibt tolerant.
+
 - **`gitlab mirror` sendet den Body wieder — Header und Body getrennt**
   ([#7](https://github.com/munichbughunter/minds/issues/7)). Token-Header
   (`--header @-`) und JSON-Body (`--data-binary @-`) teilten sich dasselbe
