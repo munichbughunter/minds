@@ -21,6 +21,23 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **Das Rohdaten-Journal hält sein Rechte-Versprechen auf jeder Ebene**
+  ([#49](https://github.com/munichbughunter/minds/issues/49)). Die
+  Ereignisdateien waren 0600, aber `create_dir_all` legte die Verzeichnisse
+  darüber mit Umask-Rechten an — andere lokale Nutzer sahen Agentnamen und
+  Session-Kennungen. Jetzt entsteht jede Journal-Ebene direkt mit 0700
+  (kein Umask-Fenster), jeder Append heilt Bestandsjournale mit — testbelegt
+  — und der `.next`-Hinweis liegt mit 0600. Nach dem `rename` eines Events
+  wird auch das **Verzeichnis** synchronisiert — ohne das konnte ein
+  Stromausfall ein Event verschwinden lassen, obwohl der Hook Erfolg
+  gemeldet hatte (Kostenabwägung im Code; Dateisysteme ohne
+  Verzeichnis-fsync bleiben funktionsfähig). Zwei Schärfungen aus den
+  Reviews: Gehärtet wird ab `journal/`, nicht ab `minds/` — sonst entzöge
+  die Härtung in einem gruppen-geteilten Repo dem zweiten Nutzer Lock und
+  Fehlerkanal —, und eine per Symlink umgelenkte Journal-Ebene wird
+  verweigert statt beschrieben oder chmodded, dieselbe Invariante, die das
+  `hook.log` bereits verteidigt.
+
 - **Signierbare Payloads sind nicht mehr über Freitextfelder fälschbar**
   ([#12](https://github.com/munichbughunter/minds/issues/12)). Die
   zeilenbasierten Klartexte, über die `minds sign` und `review --sign`
