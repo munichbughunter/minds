@@ -19,6 +19,27 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Sicherheit
+
+- **Signierbare Payloads sind nicht mehr über Freitextfelder fälschbar**
+  ([#12](https://github.com/munichbughunter/minds/issues/12)). Die
+  zeilenbasierten Klartexte, über die `minds sign` und `review --sign`
+  signieren, bauten sich aus unvalidierten Feldern — ein `reviewer` von
+  `anna@example.org\ndecision=approve` erzeugte einen Payload mit zwei
+  `decision=`-Zeilen: Die menschenlesbare Zusage war fälschbar, obwohl der
+  Hash korrekt bindet. Beide Payload-Funktionen sind jetzt fail-closed und
+  lehnen neben allen Zeilenumbrüchen (inkl. NEL) auch die Versteck- und
+  Umdeutungszeichen ab (Bidi-Overrides, Unicode-Tags, Zero-Width, BOM —
+  dasselbe Sentinel-Prädikat wie die Log-Entschärfung, NFD-Namen wie
+  `Müller` in Zerlegungsform bleiben gültig). Die Zeilenzahl ist als
+  Invariante testfixiert. Der Fehler benennt das Feld und zitiert nie den
+  Wert. Dazu aus den Reviews: `minds audit` degradiert einen betroffenen
+  Eintrag sichtbar (`unsignable`) statt repo-weit abzubrechen, die
+  `reviews`-Statuszeile meldet „Signatur nicht prüfbar" statt „gültig", und
+  `gitlab webhook --write` lehnt eine Netz-Nutzlast ab, deren Felder keinen
+  signierbaren Payload ergäben — vergifteter Bestand entsteht gar nicht
+  erst.
+
 ### Hinzugefügt
 
 - **Integrationstests für die Kommandos des Pilot-Zuschnitts**

@@ -21,7 +21,7 @@ mod attribution;
 pub use attribution::{Attribution, AttributionError};
 
 mod attest;
-pub use attest::{ATTESTATION_VERSION, attestation_payload};
+pub use attest::{ATTESTATION_VERSION, PayloadError, attestation_payload};
 
 mod comment;
 pub use comment::{Anchor, COMMENT_SCHEMA_VERSION, Comment, order_key};

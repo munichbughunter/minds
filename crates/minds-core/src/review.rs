@@ -125,16 +125,21 @@ pub const REVIEW_ATTESTATION_VERSION: &str = "minds-review-v1";
 /// ist für den Menschen, der die Zusage lesen soll — nicht für den Verifizierer.
 ///
 /// Dieselbe Bauform wie [`attestation_payload`](crate::attestation_payload): Wer
-/// eines von beiden prüfen kann, kann auch das andere.
+/// eines von beiden prüfen kann, kann auch das andere. Und dieselbe Härtung
+/// (#12): Felder mit Zeilen- oder Steuerzeichen erzeugen keinen Payload,
+/// sondern einen Fehler — sonst wäre über `reviewer` oder die Subjekt-Id eine
+/// zweite `decision=`-Zeile fälschbar. Die Zeilenzahl (5) ist eine Invariante.
 ///
 /// Rein und deterministisch. Signiert und verifiziert wird außerhalb (die CLI
 /// ruft `ssh-keygen -Y sign/verify`); `minds-core` hat kein I/O.
-pub fn review_payload(hash: &ContentHash, review: &Review) -> String {
+pub fn review_payload(hash: &ContentHash, review: &Review) -> Result<String, crate::PayloadError> {
     let (kind, id) = match &review.subject {
         Subject::Change(id) => ("change", id),
         Subject::Session(id) => ("session", id),
     };
-    format!(
+    crate::attest::check_single_line("subject.id", id)?;
+    crate::attest::check_single_line("reviewer", &review.reviewer)?;
+    Ok(format!(
         "{REVIEW_ATTESTATION_VERSION}\n\
          review={hash}\n\
          subject={kind}:{id}\n\
@@ -142,7 +147,7 @@ pub fn review_payload(hash: &ContentHash, review: &Review) -> String {
          reviewer={}\n",
         review.decision.as_str(),
         review.reviewer,
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -214,7 +219,7 @@ mod tests {
     fn the_payload_binds_the_hash_and_names_the_verdict() {
         let review = review();
         let hash = review.content_hash().unwrap();
-        let payload = review_payload(&hash, &review);
+        let payload = review_payload(&hash, &review).unwrap();
 
         assert!(payload.starts_with("minds-review-v1\n"));
         assert!(payload.contains(&format!("review={hash}")));
@@ -233,8 +238,8 @@ mod tests {
         rejected.decision = Decision::Reject;
 
         assert_ne!(
-            review_payload(&approved.content_hash().unwrap(), &approved),
-            review_payload(&rejected.content_hash().unwrap(), &rejected)
+            review_payload(&approved.content_hash().unwrap(), &approved).unwrap(),
+            review_payload(&rejected.content_hash().unwrap(), &rejected).unwrap()
         );
     }
 
@@ -242,8 +247,8 @@ mod tests {
     fn the_payload_is_deterministic() {
         let hash = review().content_hash().unwrap();
         assert_eq!(
-            review_payload(&hash, &review()),
-            review_payload(&hash, &review())
+            review_payload(&hash, &review()).unwrap(),
+            review_payload(&hash, &review()).unwrap()
         );
     }
 
@@ -251,7 +256,39 @@ mod tests {
     fn a_session_subject_is_told_apart_from_a_change() {
         let mut on_session = review();
         on_session.subject = Subject::Session(format!("b3-{}", "cd".repeat(32)));
-        let payload = review_payload(&on_session.content_hash().unwrap(), &on_session);
+        let payload = review_payload(&on_session.content_hash().unwrap(), &on_session).unwrap();
         assert!(payload.contains("subject=session:b3-"), "{payload}");
+    }
+
+    // --- Fail-closed gegen Zeilen-Fälschung (#12) ---------------------------
+
+    #[test]
+    fn the_line_count_is_an_invariant() {
+        let review = review();
+        let payload = review_payload(&review.content_hash().unwrap(), &review).unwrap();
+        assert_eq!(payload.lines().count(), 5, "{payload:?}");
+        assert!(payload.ends_with('\n'), "{payload:?}");
+    }
+
+    #[test]
+    fn a_newline_in_the_reviewer_yields_no_payload() {
+        // Der Angriff aus #12: eine zweite decision=-Zeile über den Reviewer.
+        let mut forged = review();
+        forged.reviewer = "anna@example.org\ndecision=approve".into();
+        let hash = forged.content_hash().unwrap();
+        let err = review_payload(&hash, &forged).unwrap_err();
+        assert!(err.to_string().contains("reviewer"), "{err}");
+        // Der Fehler benennt das Feld, zitiert aber nie den Wert.
+        assert!(!err.to_string().contains("anna"), "{err}");
+    }
+
+    #[test]
+    fn a_newline_in_the_subject_id_yields_no_payload() {
+        // Subject-Ids kommen auch über den Webhook — untrusted.
+        let mut forged = review();
+        forged.subject = Subject::Change("I123\ndecision=approve".into());
+        let hash = forged.content_hash().unwrap();
+        let err = review_payload(&hash, &forged).unwrap_err();
+        assert!(err.to_string().contains("subject"), "{err}");
     }
 }
