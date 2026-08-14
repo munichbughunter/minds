@@ -24,8 +24,9 @@ eine bestimmte Version `MINDS_VERSION`. Im Air-Gap hängen dieselben Archive an 
 auspacken.
 
 Gebaut werden macOS (Apple Silicon und Intel) und Linux (x86_64 und ARM64, jeweils
-musl und statisch). Für Windows gibt es noch kein fertiges Binary — dort aus dem
-[Quelltext bauen](#aus-dem-quelltext-bauen).
+musl und statisch). Für Windows gibt es kein natives Binary — der unterstützte Weg
+ist **WSL**, dort gilt die Linux-Installation unverändert. Alternativ lässt sich
+minds aus dem [Quelltext bauen](#aus-dem-quelltext-bauen).
 
 ### Einmal `minds enable` — den Ort merkt sich Minds
 
@@ -99,6 +100,14 @@ aus — für Agents, nicht für Menschen.
 Absicht: lieber ein Agent richtig als vier halb. Welcher als nächstes vollständig
 unterstützt wird, richtet sich nach dem Bedarf der Nutzer — [sag uns, was du
 benutzt](https://github.com/munichbughunter/minds/issues).
+
+## Plattform-Fokus: GitLab
+
+Erfassung, Nachschlagen und Reviews brauchen nur Git — sie funktionieren auf jeder
+Forge und ganz ohne. Die **Plattform-Brücke** dagegen — Verdicts als MR-Notiz
+spiegeln (`minds gitlab mirror`), perspektivisch Webhook und CI-Gate — zielt auf
+**GitLab**, self-managed wie gitlab.com. Eine Anbindung anderer Plattformen ist
+derzeit nicht geplant.
 
 ## Aus dem Quelltext bauen
 
