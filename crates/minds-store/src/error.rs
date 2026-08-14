@@ -43,6 +43,18 @@ pub enum StoreError {
     #[error("Session lässt sich nicht kanonisch serialisieren")]
     Canonical(#[from] CanonError),
 
+    /// Die Kanten-Datei einer Session ist nicht lesbar.
+    ///
+    /// Die neue Kante wird dann **nicht** geschrieben — ein Zurückschreiben
+    /// auf Basis einer frischen Liste schriebe den Verlust aller bisherigen
+    /// Kanten aktiv fest. Die Lese-Seite bleibt tolerant (der Index ist eine
+    /// heuristische Ergänzung); nachzugehen ist dem in `minds fsck`.
+    #[error("links.json unter {reference} ist nicht lesbar — Kante nicht geschrieben")]
+    CorruptLinks {
+        /// Der betroffene Session-Ref.
+        reference: String,
+    },
+
     /// Die Session ist nicht als redigiert markiert.
     ///
     /// Auf dem Schreibpfad verhindert das schon der Typ

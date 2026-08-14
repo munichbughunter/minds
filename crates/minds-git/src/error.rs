@@ -146,6 +146,21 @@ pub enum GitError {
         actual: String,
     },
 
+    /// Das repo-weite Schreib-Lock für `refs/minds/*` war nicht zu bekommen.
+    ///
+    /// Die kritische Sektion ist Millisekunden kurz — wer hier scheitert,
+    /// wartet fast immer auf die Datei eines hart beendeten Prozesses
+    /// (SIGKILL, Stromausfall). Deshalb steht der Pfad in der Meldung: Sie
+    /// wandert bis in `hook.log`, und die Abhilfe soll dort lesbar sein, ohne
+    /// dass jemand den Code kennt.
+    #[error(
+        "Ref-Schreib-Lock nicht zu bekommen: {path} — hält es kein laufender minds-Prozess mehr, die Datei von Hand löschen"
+    )]
+    LockUnavailable {
+        /// Die Lock-Datei, die dem Schreiben im Weg steht.
+        path: std::path::PathBuf,
+    },
+
     /// Der angefragte Ref liegt außerhalb des Minds-Namensraums.
     ///
     /// Die Leitplanke gegen die eine Klasse Fehler, die man nicht wieder

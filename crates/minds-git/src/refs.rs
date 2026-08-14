@@ -55,6 +55,14 @@ pub const DEFAULT_CONTEXT_REF: &str = "refs/minds/context";
 /// liegt ebenfalls darunter und ist damit ohne weiteres Zutun erlaubt.
 pub const MINDS_REF_NAMESPACE: &str = "refs/minds/";
 
+/// Wie lange ein Ref-Schreiber auf das Sidecar-Lock wartet, bevor er mit
+/// einem benannten Fehler aufgibt (siehe `ref_write_lock`).
+///
+/// Die kritische Sektion ist Millisekunden kurz — wer so lange wartet, wartet
+/// auf einen toten Halter (etwa nach `kill -9`), und dessen Lock-Datei nennt
+/// die gix-Fehlermeldung samt Pfad.
+const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Was [`Repo::commit_tree_to_ref`] am Ref bewirkt hat.
 ///
 /// Der Unterschied ist für den Aufrufer selten handlungsrelevant, aber gut zu
@@ -209,6 +217,57 @@ impl Repo {
             .map(Some)
     }
 
+    /// Liest, verändert und schreibt **eine** Datei im Baum von `reference` —
+    /// atomar gegenüber parallelen Schreibern.
+    ///
+    /// Der springende Punkt ist derselbe wie bei
+    /// [`reset_ref_to_root`](Self::reset_ref_to_root): Lesen und
+    /// Compare-and-Swap teilen sich **einen** beobachteten Stand. `update`
+    /// bekommt den Blob aus genau dem Commit, auf den der CAS anschließend
+    /// aufsetzt. Läse ein Aufrufer erst selbst und schriebe dann über
+    /// [`commit_tree_to_ref`](Self::commit_tree_to_ref), lägen zwischen seinem
+    /// Lesen und dem CAS **zwei weitere** Ref-Lesungen — ein paralleler
+    /// Schreiber in dieser Lücke würde nicht als Wettlauf erkannt, sondern mit
+    /// veralteten Bytes überschrieben (Lost Update, minds-store Issue #4).
+    ///
+    /// Gibt `update` `None` zurück, wird nichts geschrieben (`Ok(None)`) — der
+    /// Weg für „schon auf dem Stand". Die übrigen Dateien des Baums bleiben
+    /// unangetastet, weil der neue Baum auf dem Baum desselben beobachteten
+    /// Commits aufsetzt.
+    ///
+    /// # Fehler
+    ///
+    /// - [`GitError::ForbiddenRef`] — `reference` liegt außerhalb von
+    ///   `refs/minds/`.
+    /// - [`GitError::Identity`] — es ist keine Git-Identität konfiguriert.
+    /// - [`GitError::RefRaced`] — ein paralleler Schreiber kam zuvor; der
+    ///   Aufrufer wiederholt und sieht dann dessen Stand.
+    pub fn update_blob_in_ref(
+        &self,
+        reference: &str,
+        path: &str,
+        message: &str,
+        update: impl FnOnce(Option<&[u8]>) -> Option<Vec<u8>>,
+    ) -> Result<Option<RefUpdate>> {
+        validate_minds_ref(reference)?;
+        let parent = self.commit_at(reference)?;
+        let base = match parent {
+            Some(commit) => Some(self.tree_of(commit)?),
+            None => None,
+        };
+        let current = match base {
+            Some(tree) => self.read_blob(tree, path)?,
+            None => None,
+        };
+        let Some(bytes) = update(current.as_deref()) else {
+            return Ok(None);
+        };
+        let blob = self.write_blob(&bytes)?;
+        let tree = self.write_tree(base, [(path, blob)])?;
+        self.commit_tree_onto(reference, tree, parent, message)
+            .map(Some)
+    }
+
     /// Setzt `reference` auf einen **elternlosen** Wurzel-Commit mit `tree` und
     /// kappt damit die bisherige Kette — der alte Baum ist über `<ref>~1` nicht
     /// mehr erreichbar.
@@ -289,7 +348,16 @@ impl Repo {
 
         // Dann den Ref per Compare-and-Swap darauf setzen: existiert er, muss er
         // noch auf `expected` zeigen; ist `expected` None, darf ihn niemand
-        // zwischenzeitlich angelegt haben.
+        // zwischenzeitlich angelegt haben. Verify-under-lock wie in
+        // [`commit_tree_onto`](Self::commit_tree_onto): Der Vergleich zählt
+        // erst mit gehaltenem Lock (siehe [`ref_write_lock`](Self::ref_write_lock)),
+        // der gix-eigene `PreviousValue` bleibt als zweites Netz bestehen.
+        let _serialized = self.ref_write_lock()?;
+        let now = self.commit_at(reference)?;
+        if now != expected {
+            return Err(GitError::ref_raced(reference, expected, now));
+        }
+
         let constraint = match expected {
             Some(expected) => PreviousValue::MustExistAndMatch(Target::Object(expected.to_gix())),
             None => PreviousValue::MustNotExist,
@@ -300,16 +368,7 @@ impl Repo {
                 Some(_) => RefUpdate::Advanced(CommitId::from_gix(new)),
                 None => RefUpdate::Created(CommitId::from_gix(new)),
             }),
-            Err(err) => {
-                // Wettlauf? Steht am Ref etwas anderes als erwartet, hat jemand
-                // dazwischengefunkt — sonst ist es ein echter Schreibfehler.
-                let now = self.commit_at(reference)?;
-                if now == expected {
-                    Err(GitError::commit(reference, err))
-                } else {
-                    Err(GitError::ref_raced(reference, expected, now))
-                }
-            }
+            Err(err) => Err(GitError::commit(reference, err)),
         }
     }
 
@@ -320,8 +379,12 @@ impl Repo {
     /// (`refs/minds/remotes/…`), deren maßgeblicher Ref gar nicht mehr existiert.
     /// Zeigt der maßgebliche Ref dagegen auf einen Tombstone, wird der Tracking-
     /// Ref nicht gelöscht, sondern mit [`set_ref`](Self::set_ref) darauf umgesetzt
-    /// (siehe dort). Der Löschvorgang läuft als Compare-and-Swap gegen den zuletzt
-    /// gesehenen Stand; bewegt sich der Ref dazwischen, meldet gix das als Fehler.
+    /// (siehe dort). Läuft **bewusst ohne** das Sidecar-Lock aus
+    /// `ref_write_lock` und verlässt sich auf gix' Erwartungswert — der ist
+    /// unter Nebenläufigkeit nicht verlässlich (#4), aber die Tracking-
+    /// Buchhaltung ist jederzeit aus dem maßgeblichen Stand neu bestimmbar:
+    /// Ein verlorener Wettlauf kostet hier schlimmstenfalls einen erneuten
+    /// Push, nie Inhalt.
     pub fn delete_ref(&self, reference: &str) -> Result<()> {
         validate_minds_ref(reference)?;
         match self
@@ -371,6 +434,46 @@ impl Repo {
             .is_none())
     }
 
+    /// Serialisiert alle Minds-Ref-Schreiber dieses Repositories — prozessweit
+    /// **und** prozessübergreifend (Datei-Lock im **geteilten**
+    /// Git-Verzeichnis, damit auch verlinkte Worktrees dasselbe Lock nehmen).
+    ///
+    /// Warum es das braucht: gix (0.85) verifiziert den `PreviousValue` einer
+    /// Ref-Transaktion gegen einen Stand, der **vor** dem Lock-Erwerb gelesen
+    /// wurde. Zwei Schreiber, die beide denselben alten Stand sahen, bekommen
+    /// dann **beide** `Ok` — der zweite hängt seine Kette am ersten vorbei
+    /// wieder an den alten Commit, und dessen Schreiben ist still verloren
+    /// (Lost Update, minds-store #4; im Test `concurrent_links_lose_no_edge`
+    /// reproduzierbar). Unter diesem Lock wird der Stand deshalb **selbst**
+    /// frisch gelesen und verglichen, bevor gix schreibt: Staleness wird zu
+    /// [`GitError::RefRaced`], nie zu einem stillen Überschreiben.
+    ///
+    /// Ein grobes, blockierendes Lock ist hier die richtige Währung: Die
+    /// Schreibvorgänge sind Millisekunden kurz, und `git` selbst fasst
+    /// `refs/minds/*` nie an.
+    ///
+    /// **Bewusst ausgenommen:** [`set_ref`](Self::set_ref) und
+    /// [`delete_ref`](Self::delete_ref) — sie pflegen ausschließlich die
+    /// Tracking-Buchhaltung (`refs/minds/remotes/…`), die jederzeit aus dem
+    /// maßgeblichen Stand neu bestimmbar ist; ein verlorener Wettlauf kostet
+    /// dort schlimmstenfalls einen erneuten Push, nie Inhalt.
+    fn ref_write_lock(&self) -> Result<gix::lock::Marker> {
+        let dir = self.common_dir().join("minds");
+        std::fs::create_dir_all(&dir)
+            .map_err(|err| GitError::commit("refs/minds (Lock-Verzeichnis)", err))?;
+        // Blockierend mit Backoff: Die kritische Sektion ist Millisekunden
+        // kurz; wer nach LOCK_TIMEOUT noch wartet, wartet auf einen toten
+        // Halter — dann ist ein benannter Fehler richtiger als ewiges Warten.
+        gix::lock::Marker::acquire_to_hold_resource(
+            dir.join("refs-write"),
+            gix::lock::acquire::Fail::AfterDurationWithBackoff(LOCK_TIMEOUT),
+            None,
+        )
+        .map_err(|_| GitError::LockUnavailable {
+            path: dir.join("refs-write.lock"),
+        })
+    }
+
     /// Wie [`Repo::commit_tree_to_ref`], aber mit explizit übergebenem
     /// Erwartungswert.
     ///
@@ -384,6 +487,9 @@ impl Repo {
         parent: Option<CommitId>,
         message: &str,
     ) -> Result<RefUpdate> {
+        use gix::refs::Target;
+        use gix::refs::transaction::PreviousValue;
+
         // Schon auf dem Stand? Dann kein Commit. Das hält die Kontext-Historie
         // frei von Rauschen und macht ein wiederholtes `put` gratis.
         if let Some(parent) = parent {
@@ -394,32 +500,38 @@ impl Repo {
 
         self.require_identity()?;
 
-        let outcome = self.gix().commit(
-            reference,
-            message,
-            tree.to_gix(),
-            parent.map(CommitId::to_gix),
-        );
+        // Erst das Commit-Objekt schreiben — noch ohne den Ref zu bewegen. Der
+        // Ref-Wechsel läuft dann als **expliziter** Compare-and-Swap, wie in
+        // [`reset_ref_to_root`](Self::reset_ref_to_root): gix' `commit`-
+        // Komfortweg hat den Erwartungswert unter echter Nebenläufigkeit nicht
+        // zuverlässig durchgesetzt — zwei parallele Schreiber bekamen beide
+        // `Ok`, und der zweite hängte seine Kette am ersten vorbei wieder an
+        // den alten Stand (Lost Update, minds-store #4).
+        let new = self
+            .gix()
+            .new_commit(message, tree.to_gix(), parent.map(CommitId::to_gix))
+            .map_err(|err| GitError::commit(reference, err))?
+            .id;
 
-        match outcome {
-            Ok(id) => {
-                let commit = CommitId::from_gix(id.detach());
-                Ok(match parent {
-                    Some(_) => RefUpdate::Advanced(commit),
-                    None => RefUpdate::Created(commit),
-                })
-            }
-            Err(err) => {
-                // War es ein Wettlauf? Nachsehen, statt in gix' Fehlervarianten
-                // zu raten: Steht am Ref etwas anderes als das, worauf wir
-                // aufgesetzt haben, hat jemand dazwischengefunkt.
-                let current = self.commit_at(reference)?;
-                if current == parent {
-                    Err(GitError::commit(reference, err))
-                } else {
-                    Err(GitError::ref_raced(reference, parent, current))
-                }
-            }
+        // Verify-under-lock: Erst mit gehaltenem Lock zählt der Vergleich —
+        // siehe [`ref_write_lock`](Self::ref_write_lock). Der gix-eigene
+        // `PreviousValue` bleibt als zweites Netz bestehen.
+        let _serialized = self.ref_write_lock()?;
+        let current = self.commit_at(reference)?;
+        if current != parent {
+            return Err(GitError::ref_raced(reference, parent, current));
+        }
+
+        let constraint = match parent {
+            Some(parent) => PreviousValue::MustExistAndMatch(Target::Object(parent.to_gix())),
+            None => PreviousValue::MustNotExist,
+        };
+        match self.gix().reference(reference, new, constraint, message) {
+            Ok(_) => Ok(match parent {
+                Some(_) => RefUpdate::Advanced(CommitId::from_gix(new)),
+                None => RefUpdate::Created(CommitId::from_gix(new)),
+            }),
+            Err(err) => Err(GitError::commit(reference, err)),
         }
     }
 
@@ -475,6 +587,237 @@ mod tests {
     fn commit_at_is_none_before_anything_was_written() {
         let (_fixture, repo, _tree) = repo_with_pending_tree();
         assert_eq!(repo.commit_at(DEFAULT_CONTEXT_REF).unwrap(), None);
+    }
+
+    // --- update_blob_in_ref: atomares Read-Modify-Write (#4) ----------------
+
+    #[test]
+    fn update_blob_reads_and_writes_the_same_observed_state() {
+        let (_fixture, repo, _tree) = repo_with_pending_tree();
+        let reference = "refs/minds/test/links";
+
+        repo.update_blob_in_ref(reference, "links.json", "eins", |current| {
+            assert!(current.is_none());
+            Some(b"[1]".to_vec())
+        })
+        .unwrap()
+        .expect("erster Stand wird geschrieben");
+
+        let update = repo
+            .update_blob_in_ref(reference, "links.json", "zwei", |current| {
+                assert_eq!(current, Some(&b"[1]"[..]));
+                Some(b"[1,2]".to_vec())
+            })
+            .unwrap();
+        assert!(update.is_some());
+        assert_eq!(
+            repo.read_blob_at(reference, "links.json").unwrap().unwrap(),
+            b"[1,2]"
+        );
+    }
+
+    #[test]
+    fn update_blob_leaves_neighbours_standing() {
+        // Der neue Baum setzt auf dem beobachteten auf — Nachbarn überleben.
+        let (_fixture, repo, _tree) = repo_with_pending_tree();
+        let reference = "refs/minds/test/session";
+        let payload = repo.write_blob(b"payload").unwrap();
+        let tree = repo.write_tree(None, [("session.json", payload)]).unwrap();
+        repo.commit_tree_to_ref(reference, tree, "payload").unwrap();
+
+        repo.update_blob_in_ref(reference, "links.json", "kante", |_| Some(b"[]".to_vec()))
+            .unwrap();
+
+        assert_eq!(
+            repo.read_blob_at(reference, "session.json")
+                .unwrap()
+                .unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn a_none_from_update_writes_nothing() {
+        let (_fixture, repo, _tree) = repo_with_pending_tree();
+        let reference = "refs/minds/test/noop";
+        let update = repo
+            .update_blob_in_ref(reference, "links.json", "nichts", |_| None)
+            .unwrap();
+        assert!(update.is_none());
+        assert_eq!(repo.commit_at(reference).unwrap(), None);
+    }
+
+    #[test]
+    fn a_stale_expectation_is_rejected_across_handles() {
+        // Sonde: Zwei Handles, sequenziell. Ein CAS mit veralteter Erwartung
+        // muss scheitern — sonst ist der Erwartungswert Fiktion.
+        let (fixture, repo, _tree) = repo_with_pending_tree();
+        let reference = "refs/minds/test/probe";
+        repo.update_blob_in_ref(reference, "f", "a", |_| Some(b"a".to_vec()))
+            .unwrap();
+        let stale = repo.commit_at(reference).unwrap();
+
+        let other = Repo::open(fixture.path()).unwrap();
+        other
+            .update_blob_in_ref(reference, "f", "b", |_| Some(b"b".to_vec()))
+            .unwrap();
+
+        let blob = repo.write_blob(b"c").unwrap();
+        let tree = repo.write_tree(None, [("f", blob)]).unwrap();
+        let outcome = repo.commit_tree_onto(reference, tree, stale, "stale");
+        assert!(
+            matches!(outcome, Err(GitError::RefRaced { .. })),
+            "{outcome:?}"
+        );
+        // Der Stand des Gewinners steht unverändert.
+        assert_eq!(
+            repo.read_blob_at(reference, "f").unwrap().unwrap(),
+            b"b",
+            "der veraltete CAS hat durchgeschrieben"
+        );
+    }
+
+    #[test]
+    fn threaded_updates_lose_nothing() {
+        // Wie der deterministische Wettlauf-Test, aber mit echten Threads:
+        // Jeder Marker, dessen Update `Ok` meldet, muss im Endstand stehen.
+        let (fixture, repo, _tree) = repo_with_pending_tree();
+        let reference = "refs/minds/test/threads";
+        repo.update_blob_in_ref(reference, "l.json", "init", |_| Some(b"[]".to_vec()))
+            .unwrap();
+
+        let path = fixture.path().to_path_buf();
+        let handles: Vec<_> = (0..2)
+            .map(|writer| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let repo = Repo::open(&path).unwrap();
+                    for i in 0..3 {
+                        let marker = format!("\"m{writer}{i}\"");
+                        let mut tries = 0;
+                        loop {
+                            tries += 1;
+                            let outcome =
+                                repo.update_blob_in_ref(reference, "l.json", "m", |current| {
+                                    let current = std::str::from_utf8(current.unwrap())
+                                        .unwrap()
+                                        .trim_end_matches(']')
+                                        .to_string();
+                                    let sep = if current.ends_with('[') { "" } else { "," };
+                                    Some(format!("{current}{sep}{marker}]").into_bytes())
+                                });
+                            match outcome {
+                                Ok(_) => break,
+                                Err(GitError::RefRaced { .. }) if tries < 10 => continue,
+                                Err(err) => panic!("w{writer} i{i}: {err}"),
+                            }
+                        }
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let content = repo.read_blob_at(reference, "l.json").unwrap().unwrap();
+        let content = String::from_utf8(content).unwrap();
+        for writer in 0..2 {
+            for i in 0..3 {
+                assert!(
+                    content.contains(&format!("\"m{writer}{i}\"")),
+                    "m{writer}{i} fehlt: {content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn linked_worktrees_share_the_write_lock() {
+        // Der Blocker aus dem Review: `git_dir()` ist im verlinkten Worktree
+        // privat, die Refs sind geteilt — das Lock muss aus dem Common Dir
+        // kommen, sonst serialisiert es nur je Worktree.
+        let (fixture, repo, _tree) = repo_with_pending_tree();
+        fixture.git(&["worktree", "add", "--detach", "wt"]);
+        let linked = Repo::open(fixture.path().join("wt")).unwrap();
+
+        assert_eq!(
+            std::fs::canonicalize(repo.common_dir()).unwrap(),
+            std::fs::canonicalize(linked.common_dir()).unwrap(),
+            "beide Worktrees müssen denselben Lock-Ort sehen"
+        );
+
+        // Und der Wettlauf über die Worktree-Grenze wird erkannt, nicht
+        // überschrieben — dieselbe Sonde wie oben, nur mit dem verlinkten
+        // Worktree als Gewinner.
+        let reference = "refs/minds/test/worktree";
+        repo.update_blob_in_ref(reference, "f", "a", |_| Some(b"a".to_vec()))
+            .unwrap();
+        let err = repo
+            .update_blob_in_ref(reference, "f", "verlierer", |current| {
+                assert_eq!(current, Some(&b"a"[..]));
+                linked
+                    .update_blob_in_ref(reference, "f", "gewinner", |_| Some(b"b".to_vec()))
+                    .unwrap();
+                Some(b"c".to_vec())
+            })
+            .unwrap_err();
+        assert!(matches!(err, GitError::RefRaced { .. }), "{err:?}");
+        assert_eq!(repo.read_blob_at(reference, "f").unwrap().unwrap(), b"b");
+    }
+
+    #[test]
+    fn a_leftover_lock_names_itself() {
+        // Stirbt ein Halter hart (SIGKILL), bleibt die Lock-Datei liegen. Der
+        // Fehler muss dann den Pfad nennen, damit die Abhilfe („von Hand
+        // löschen") ohne Code-Kenntnis lesbar ist. Der Test wartet bewusst
+        // die Backoff-Frist ab.
+        let (_fixture, repo, _tree) = repo_with_pending_tree();
+        let dir = repo.common_dir().join("minds");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("refs-write.lock"), b"").unwrap();
+
+        let err = repo
+            .update_blob_in_ref("refs/minds/test/lock", "f", "x", |_| Some(b"x".to_vec()))
+            .unwrap_err();
+        assert!(err.to_string().contains("refs-write.lock"), "{err}");
+        assert!(err.to_string().contains("von Hand"), "{err}");
+    }
+
+    #[test]
+    fn a_racing_writer_is_detected_not_overwritten() {
+        // Der Wettlauf aus minds-store #4, deterministisch: Während `update`
+        // noch mergt, schreibt ein paralleler Schreiber denselben Ref. Der CAS
+        // muss das als `RefRaced` melden — nicht mit veralteten Bytes gewinnen.
+        let (fixture, repo, _tree) = repo_with_pending_tree();
+        let reference = "refs/minds/test/raced";
+
+        repo.update_blob_in_ref(reference, "links.json", "basis", |_| {
+            Some(b"[\"a\"]".to_vec())
+        })
+        .unwrap();
+
+        let racer = Repo::open(fixture.path()).unwrap();
+        let err = repo
+            .update_blob_in_ref(reference, "links.json", "verlierer", |current| {
+                assert_eq!(current, Some(&b"[\"a\"]"[..]));
+                // Der Gewinner schreibt, während wir noch auf dem alten Stand
+                // arbeiten.
+                racer
+                    .update_blob_in_ref(reference, "links.json", "gewinner", |_| {
+                        Some(b"[\"a\",\"b\"]".to_vec())
+                    })
+                    .unwrap();
+                Some(b"[\"a\",\"c\"]".to_vec())
+            })
+            .unwrap_err();
+        assert!(matches!(err, GitError::RefRaced { .. }), "{err}");
+
+        // Der Stand des Gewinners steht — nichts wurde überschrieben.
+        assert_eq!(
+            repo.read_blob_at(reference, "links.json").unwrap().unwrap(),
+            b"[\"a\",\"b\"]"
+        );
     }
 
     #[test]
