@@ -15,6 +15,18 @@ use std::process::{Command, Output};
 /// Das unter Test stehende Binary — von Cargo bereitgestellt.
 const MINDS: &str = env!("CARGO_BIN_EXE_minds");
 
+/// Ein leeres Zuhause für jeden `minds`-Aufruf.
+///
+/// `minds enable` startet einen echten, losgelösten Backfill, und der sucht
+/// unter `$HOME/.claude/projects` nach Transkripten — mit dem **realen** Home
+/// des Testläufers also in dessen Claude-Verlauf. Seit #69 schreibt er seine
+/// Fehler in dasselbe `hook.log`, auf dem die Log-Tests stehen; ein fehlendes
+/// `HOME` im CI-Container oder ein Transkript, das zufällig passt, machte sie
+/// rot — nicht reproduzierbar, und grün aus dem falschen Grund. Ein leeres
+/// Verzeichnis heißt deterministisch „nichts zu importieren".
+static HOME: std::sync::LazyLock<tempfile::TempDir> =
+    std::sync::LazyLock::new(|| tempfile::tempdir().expect("ein leeres Home"));
+
 /// Ein frisch initialisiertes Repo, oder `None`, wenn kein `git` da ist.
 fn scratch_repo() -> Option<tempfile::TempDir> {
     let dir = tempfile::tempdir().unwrap();
@@ -76,7 +88,7 @@ fn path_with_minds() -> std::ffi::OsString {
 fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     use std::io::Write;
     let mut cmd = Command::new(MINDS);
-    cmd.current_dir(dir).args(args);
+    cmd.current_dir(dir).args(args).env("HOME", HOME.path());
     without_user_config(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
@@ -1891,6 +1903,214 @@ fn fsck_points_at_the_log_but_does_not_quote_it() {
         !report.contains("gibt-es-nicht"),
         "der Wortlaut darf nicht in den Bericht:\n{report}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Der Backfill schreibt in dasselbe Log (#69)
+// ---------------------------------------------------------------------------
+
+/// Ruft den Backfill **synchron** auf — so, wie `enable` ihn im Hintergrund
+/// startet, nur mit `wait`, damit der Test auf ihn warten kann. `home` ist das
+/// Zuhause, in dem er nach Transkripten sucht; ein leeres Verzeichnis heißt:
+/// nichts zu importieren.
+fn background_import(dir: &Path, home: &Path) -> Output {
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .args(["enable", "--__background-import"])
+        .env("HOME", home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    without_user_config(&mut cmd);
+    cmd.output().expect("minds endet")
+}
+
+/// Der Fall aus #69: Der Backfill scheitert, und sein Fehler soll dort stehen,
+/// wo `fsck` hinzeigt — nicht roh in einer zweiten Datei daneben.
+#[test]
+fn a_failing_background_import_lands_in_the_log_and_fsck_points_at_it() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let home = tempfile::tempdir().unwrap();
+
+    // Ein Store, der sich nicht öffnen lässt: ein Child-Repo, das es nicht
+    // gibt. Der Pfad steht in der Fehlermeldung, und er trägt genau die
+    // Zeichen, die `hook.log` zusagt zu entschärfen: eine ANSI-Sequenz, die
+    // im Terminal die Zeile löschte, und U+2028, das für Browser und Python
+    // ein Zeilenumbruch ist — ein zweiter, gefälschter Eintrag.
+    git(dir, &["config", "minds.backend", "child-repo"]);
+    git(
+        dir,
+        &[
+            "config",
+            "minds.childPath",
+            "../gibt\u{1b}[2Kes\u{2028}nicht",
+        ],
+    );
+
+    let out = background_import(dir, home.path());
+    assert!(
+        !out.status.success(),
+        "der Fehler soll sich im Rückgabewert zeigen:\n{}",
+        stdout(&out)
+    );
+
+    // 1. Der Eintrag steht im Log der Hook-Pfade, nennt seinen Ursprung — und
+    //    ist entschärft.
+    let log = hook_log(dir).expect("der Fehler steht in hook.log");
+    assert!(
+        log.contains("import:"),
+        "der Eintrag nennt seinen Pfad:\n{log}"
+    );
+    assert!(
+        !log.contains('\u{1b}') && !log.contains('\u{2028}'),
+        "Steuerzeichen stehen roh im Log:\n{log:?}"
+    );
+    assert!(
+        log.contains("gibt") && log.contains("nicht"),
+        "der Wortlaut fehlt:\n{log}"
+    );
+
+    // 2. Und nur dort: Die zweite Datei aus der Zeit vor #69 entsteht nicht
+    //    mehr.
+    assert!(
+        !dir.join(".git/minds/import.log").exists(),
+        "import.log darf nicht mehr entstehen"
+    );
+
+    // 3. Mit den Rechten, die das Log zusagt.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join(".git/minds/hook.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "hook.log hat Rechte {mode:o}");
+    }
+
+    // 4. `fsck` verweist darauf — sobald es wieder bis zum Bericht kommt. Mit
+    //    dem kaputten Store bricht es selbst ab; der Nutzer repariert also
+    //    erst die Konfiguration, und dann sagt ihm `fsck`, dass der Backfill
+    //    vorher etwas zu melden hatte.
+    git(dir, &["config", "--unset", "minds.backend"]);
+    git(dir, &["config", "--unset", "minds.childPath"]);
+    let fsck = minds(dir, &["fsck"], None);
+    let report = stdout(&fsck);
+    assert!(fsck.status.success(), "{report}");
+    assert!(report.contains("Log: 1 Eintrag"), "{report}");
+    assert!(report.contains("hook.log"), "{report}");
+    // Zitiert wird nicht — der Bericht landet in CI-Logs.
+    assert!(
+        !report.contains("gibt"),
+        "der Wortlaut darf nicht in den Bericht:\n{report}"
+    );
+}
+
+/// Der Hintergrundprozess gilt **ab dem ersten Byte** als Hook-Pfad, nicht erst
+/// in `import_cmd`: Ein Parse-Fehler — `enable` und dieses Binary sind
+/// auseinandergedriftet — ginge sonst auf ein stderr, das niemand liest, und
+/// der Backfill fiele dauerhaft und lautlos aus. Dieselbe Regel wie für `brief
+/// --hook` (#68).
+#[test]
+fn a_parse_error_in_the_background_import_lands_in_the_log() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let out = minds(dir, &["enable", "--__background-import", "--bogus"], None);
+    assert!(!out.status.success());
+
+    let log = hook_log(dir).expect("der Parse-Fehler steht im Log");
+    assert!(log.contains("import:"), "{log}");
+    assert!(log.contains("--bogus"), "{log}");
+}
+
+/// Wer Minds vor #69 eingerichtet hat, hat die alte Datei noch — roh, mit
+/// Umask-Rechten, unbegrenzt. Ein erneutes `enable` räumt sie weg; ein Symlink
+/// an ihrer Stelle ist nicht von uns und bleibt unangetastet.
+#[test]
+fn enable_removes_the_legacy_import_log_but_not_a_symlink() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let minds_dir = dir.join(".git/minds");
+    std::fs::create_dir_all(&minds_dir).unwrap();
+    let legacy = minds_dir.join("import.log");
+    std::fs::write(&legacy, "  claude-code: 3 Transkript(e)\n").unwrap();
+
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+    assert!(!legacy.exists(), "die Altlast bleibt liegen");
+
+    #[cfg(unix)]
+    {
+        let target = dir.join("fremd.log");
+        std::fs::write(&target, "nicht unsere Datei\n").unwrap();
+        std::os::unix::fs::symlink(&target, &legacy).unwrap();
+
+        assert!(
+            minds(dir, &["enable", "--agent", "claude-code"], None)
+                .status
+                .success()
+        );
+        assert!(
+            std::fs::symlink_metadata(&legacy).is_ok(),
+            "ein Symlink an der Stelle ist nicht unserer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "nicht unsere Datei\n"
+        );
+    }
+}
+
+/// Die Kehrseite, und der Grund, warum der Gutfall **nicht** ins Log geht:
+/// `fsck` meldet jeden Eintrag als Hinweis. Schriebe der Backfill „nichts zu
+/// importieren" dorthin, bekäme jeder Nutzer nach jedem `enable` einen Hinweis
+/// auf eine Datei, in der nichts Behebbares steht.
+#[test]
+fn a_background_import_without_anything_to_do_leaves_no_log() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    let home = tempfile::tempdir().unwrap();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    let out = background_import(dir, home.path());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout(&out).contains("nichts zu importieren"),
+        "der Hand-Aufrufer sieht das Ergebnis auf stdout:\n{}",
+        stdout(&out)
+    );
+    assert!(
+        hook_log(dir).is_none(),
+        "der Gutfall schreibt kein Log: {:?}",
+        hook_log(dir)
+    );
+    assert!(!dir.join(".git/minds/import.log").exists());
 }
 
 #[test]

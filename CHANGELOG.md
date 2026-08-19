@@ -21,6 +21,23 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **Der Backfill aus `minds enable` schreibt in `hook.log`, nicht mehr roh in
+  `import.log` daneben** ([#69](https://github.com/munichbughunter/minds/issues/69)).
+  Der Hintergrund-Import hängte stdout und stderr unverändert an eine zweite
+  Datei im selben Verzeichnis — ohne die Zusagen, die `hook.log` seit #10 hat
+  und auf die `fsck` und `docs/fuer-tester.md` verweisen: Steuerzeichen wurden
+  durchgereicht, die Datei wuchs unbegrenzt und lag mit Umask-Rechten da. Jetzt
+  ist der Backfill ein Hook-Pfad wie `checkpoint` (`Source::Import`): Seine
+  Fehler gehen entschärft, gedeckelt, rotiert und mit 0600 in dieselbe Datei,
+  `fsck` verweist darauf, ein Panic hinterlässt nur seinen Ort (der Prozess
+  hält die rohen Transkripte im Speicher), und `import.log` entsteht nicht
+  mehr — eine vorhandene aus älteren Ständen räumt `enable` weg. Dabei
+  aufgefallen: Ein Transkript ohne Leserechte war bisher nur eine *Notiz*
+  neben „kein Importer" und damit ebenfalls stumm; jetzt ist es ein Befund
+  und steht im Log. Der Gutfall bleibt still — sonst zeigte `fsck` nach
+  jedem `enable` einen Hinweis auf eine Datei, in der nichts Behebbares
+  steht.
+
 - **Das Rohdaten-Journal hält sein Rechte-Versprechen auf jeder Ebene**
   ([#49](https://github.com/munichbughunter/minds/issues/49)). Die
   Ereignisdateien waren 0600, aber `create_dir_all` legte die Verzeichnisse

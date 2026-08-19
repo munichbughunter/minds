@@ -412,12 +412,13 @@ fn enable_agents(
 
     // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
     // soll rückwirkend Kontext bekommen, ohne auf das Lesen (womöglich großer)
-    // Transkripte zu warten. Ausgabe und Fehler landen im Log, nicht im
-    // Terminal des Nutzers.
-    spawn_background_import(&paths.git_dir);
+    // Transkripte zu warten. Seine Fehler landen im Log der Hook-Pfade, nicht
+    // im Terminal des Nutzers — und `fsck` verweist darauf.
+    remove_legacy_import_log(&paths.git_dir);
+    spawn_background_import();
     vln(
         verbose,
-        "  Backfill läuft im Hintergrund → .git/minds/import.log",
+        "  Backfill läuft im Hintergrund (Fehler → .git/minds/hook.log)",
     );
 
     Ok(())
@@ -430,43 +431,53 @@ fn vln(verbose: bool, line: &str) {
     }
 }
 
-/// Startet den Backfill als **losgelösten** Prozess: dasselbe Binary, mit dem
-/// versteckten Flag, stdout/stderr in eine Log-Datei, kein `wait`.
+/// Räumt die Log-Datei aus der Zeit vor #69 weg, falls sie noch daliegt.
 ///
-/// Best effort: Lässt sich der Prozess nicht starten (kein `current_exe`, kein
-/// Log), bleibt das Setup trotzdem erfolgreich — der Backfill ist eine
-/// Zugabe, kein Kernschritt. Er kann jederzeit durch ein erneutes `minds
-/// enable` angestoßen werden.
-fn spawn_background_import(git_dir: &Path) {
+/// Bis dahin hängte `enable` das rohe stdout/stderr des Backfills an
+/// `.git/minds/import.log` — mit Umask-Rechten, unbegrenzt, Steuerzeichen
+/// inklusive. Wer Minds vorher eingerichtet hat, hat die Datei noch; nichts
+/// schreibt mehr hinein, und nichts verweist mehr darauf. Sie liegen zu
+/// lassen hieße, die Zusage „eine Datei, und die hat 0600" nur für Neulinge
+/// zu halten.
+///
+/// Nur eine gewöhnliche Datei wird entfernt. Ein Symlink an dieser Stelle ist
+/// nicht von uns — und `symlink_metadata` folgt ihm nicht, `is_file` ist für
+/// ihn also falsch. Best effort wie der Backfill selbst: Scheitert das
+/// Löschen, bleibt `enable` erfolgreich.
+fn remove_legacy_import_log(git_dir: &Path) {
+    let path = git_dir.join("minds").join("import.log");
+    if fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        let _ = fs::remove_file(&path);
+    }
+}
+
+/// Startet den Backfill als **losgelösten** Prozess: dasselbe Binary, mit dem
+/// versteckten Flag, ohne Terminal, kein `wait`.
+///
+/// Best effort: Lässt sich der Prozess nicht starten (kein `current_exe`),
+/// bleibt das Setup trotzdem erfolgreich — der Backfill ist eine Zugabe, kein
+/// Kernschritt. Er kann jederzeit durch ein erneutes `minds enable` angestoßen
+/// werden.
+///
+/// **Kein eigenes Log.** Bis #69 hingen stdout und stderr des Kindes roh an
+/// `.git/minds/import.log` — ohne Entschärfung, Deckel, Rotation oder `0600`,
+/// alles Zusagen, die `hook.log` zwei Zentimeter daneben hat und auf die
+/// `fsck` verweist. Jetzt schreibt der Backfill seine Fehler selbst über
+/// [`crate::hooklog`] ([`crate::hooklog::Source::Import`]); die Kanäle hier
+/// brauchen deshalb kein Ziel mehr. Was auf stdout stünde, wäre ohnehin nur
+/// der Gutfall, und der gehört nicht in ein Log, das `fsck` als Hinweis
+/// meldet.
+fn spawn_background_import() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
 
-    let log_dir = git_dir.join("minds");
-    let _ = fs::create_dir_all(&log_dir);
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_dir.join("import.log"));
-
     let mut cmd = Command::new(exe);
     cmd.arg("enable")
         .arg(BACKGROUND_IMPORT_FLAG)
-        .stdin(Stdio::null());
-
-    match log {
-        Ok(file) => {
-            let err = file.try_clone().ok();
-            cmd.stdout(Stdio::from(file));
-            if let Some(err) = err {
-                cmd.stderr(Stdio::from(err));
-            }
-        }
-        // Ohne Log lieber still als lärmend im Terminal.
-        Err(_) => {
-            cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        }
-    }
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     // Absichtlich kein `wait`: Der Prozess überlebt `minds enable` und wird von
     // init adoptiert.

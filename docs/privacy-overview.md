@@ -42,7 +42,7 @@ is no database, no service, no cloud component.
 | Location | Content | Protection |
 |---|---|---|
 | `.git/minds/journal/…` | **raw data before redaction**, including tool results in plain text | files 0600; deleted after a successful checkpoint (gap: section 6) |
-| `.git/minds/hook.log` | diagnostic lines from the hooks | 0600, rotated at 1 MiB; URL credentials are stripped |
+| `.git/minds/hook.log` | diagnostic lines from the hooks and from the backfill started by `minds enable` | 0600, rotated at 1 MiB; control characters escaped, lines capped; URL credentials are stripped |
 | `refs/minds/store/<hash>` | the **redacted** session (`session.json`) plus its edges to the commit | reaches the store only after redaction (enforced by the type system) |
 | `refs/minds/sessions/<hex>` | browsable copy (including rendered `session.md`) | appears on push as a regular branch `minds/session/<hex>` |
 | `refs/minds/context` | index over the sessions | same as store |
@@ -141,8 +141,8 @@ public as issues:
   above the event files are created with umask permissions — on multi-user
   machines, agent names and session identifiers (not the contents) are
   visible to other local users.
-- **`minds import` uses the built-in default policy, not the repository's
-  own `.minds/redact.json`.** When backfilling old transcripts, the standard
+- **The backfill started by `minds enable` uses the built-in default policy,
+  not the repository's own `.minds/redact.json`.** When backfilling old transcripts, the standard
   detectors and the credential-file wall apply, but no project-specific
   denylist (such as customer names). For the pilot: backfill only after
   consultation.
