@@ -43,8 +43,19 @@ pub struct AgentImport {
     /// Die gebauten Sessions (un-redigiert; Redaction folgt beim Ablegen).
     pub sessions: Vec<Session>,
     /// Eine ehrliche Notiz, wenn nichts (oder nur teilweise) gelesen werden
-    /// konnte — z. B. „kein Importer".
+    /// konnte — z. B. „kein Importer". Information, kein Befund: Sie
+    /// beschreibt einen erwarteten Zustand, nicht etwas, das jemand beheben
+    /// müsste.
     pub note: Option<String>,
+    /// Was **nicht** gelesen werden konnte, obwohl es da war: ein Transkript
+    /// oder das Projektverzeichnis ohne Leserechte. Anders als [`note`] ein
+    /// Befund — jede Zeile steht für eine Session, die danach im Store fehlt,
+    /// und gehört dorthin, wo der Aufrufer Fehler meldet (#69). Getrennt von
+    /// der Notiz, damit der Aufrufer das eine still lassen und das andere
+    /// laut machen kann.
+    ///
+    /// [`note`]: AgentImport::note
+    pub errors: Vec<String>,
 }
 
 /// Importiert die Transkripte **aller** bekannten Agents für das Repository unter
@@ -63,6 +74,7 @@ fn import_agent(agent: &str, repo_root: &Path, home: &Path) -> AgentImport {
             agent: other.to_string(),
             sessions: Vec::new(),
             note: Some("kein Importer (Format nicht verifiziert)".to_string()),
+            errors: Vec::new(),
         },
     }
 }
@@ -86,6 +98,7 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
 
     let mut sessions = Vec::new();
     let mut note = None;
+    let mut errors = Vec::new();
 
     match std::fs::read_dir(&dir) {
         Ok(entries) => {
@@ -103,12 +116,12 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
                     .unwrap_or("unbekannt");
                 match std::fs::read(&path) {
                     Ok(bytes) => sessions.extend(parse_claude_code(&bytes, fallback)),
-                    Err(err) => note = Some(format!("{} nicht lesbar: {err}", path.display())),
+                    Err(err) => errors.push(format!("{} nicht lesbar: {err}", path.display())),
                 }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => note = Some(format!("{} nicht lesbar: {err}", dir.display())),
+        Err(err) => errors.push(format!("{} nicht lesbar: {err}", dir.display())),
     }
 
     // Keine stillen Ausfälle — auch keine stillen Auslassungen: Wenn die
@@ -132,6 +145,7 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
         agent: "claude-code".to_string(),
         sessions,
         note,
+        errors,
     }
 }
 
@@ -647,6 +661,45 @@ mod tests {
         let claude = import_claude_code(Path::new("/nie/benutzt"), home.path());
         assert!(claude.sessions.is_empty());
         assert!(claude.note.is_none(), "kein Verzeichnis ist kein Fehler");
+        assert!(claude.errors.is_empty());
+    }
+
+    /// Ein Transkript, das da ist, aber nicht gelesen werden kann, ist ein
+    /// Befund — und steht getrennt von der Notiz, damit der Aufrufer ihn
+    /// laut machen kann, ohne „kein Importer" mitzumelden (#69).
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_transcript_is_an_error_not_a_note() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let repo_root = Path::new("/home/anna/projekt");
+        let dir = home
+            .path()
+            .join(".claude/projects")
+            .join(claude_slug(repo_root));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("s-1.jsonl");
+        std::fs::write(&file, SAMPLE).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root liest alles; dort gäbe es nichts zu finden.
+        if std::fs::read(&file).is_ok() {
+            return;
+        }
+
+        let claude = import_claude_code(repo_root, home.path());
+        assert!(claude.sessions.is_empty());
+        assert!(claude.note.is_none(), "{:?}", claude.note);
+        assert_eq!(claude.errors.len(), 1, "{:?}", claude.errors);
+        assert!(
+            claude.errors[0].contains("s-1.jsonl"),
+            "{:?}",
+            claude.errors
+        );
+        assert!(
+            claude.errors[0].contains("nicht lesbar"),
+            "{:?}",
+            claude.errors
+        );
     }
 
     #[test]

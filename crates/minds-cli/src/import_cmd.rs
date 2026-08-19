@@ -1,9 +1,25 @@
-//! `minds import` — der Backfill: bestehende Transkripte in den Store, verlinkt
-//! über den Index.
+//! Der Backfill: bestehende Transkripte in den Store, verlinkt über den Index.
 //!
-//! Ausgelöst wird das normalerweise **automatisch** von `minds enable` (im
-//! Hintergrund); von Hand aufrufbar ist es trotzdem — für einen erneuten Lauf
-//! oder zum Nachsehen.
+//! Ausgelöst wird das **automatisch** von `minds enable` — als losgelöster
+//! Hintergrundprozess, der sich selbst mit dem versteckten Flag aufruft. Von
+//! Hand aufrufbar ist es trotzdem (`minds enable --__background-import`) — für
+//! einen erneuten Lauf oder zum Nachsehen.
+//!
+//! # Wohin die Ausgabe geht
+//!
+//! Der Hintergrundprozess hat kein Terminal, und `enable` wartet nicht auf ihn.
+//! Damit ist er ein Hook-Pfad wie `checkpoint` oder `sync`, und er folgt deren
+//! Regeln: **Fehler** — ein Store, der sich nicht öffnen lässt, ein Transkript
+//! ohne Leserechte, eine Session, die die Redaction verweigert — gehen über
+//! [`crate::hooklog`] in `hook.log` (entschärft, gedeckelt, rotiert, `0600`)
+//! und zugleich auf stderr, für den, der von Hand aufruft. Der **Gutfall**
+//! schreibt nur auf stdout, also ins Terminal des Hand-Aufrufers und sonst
+//! nirgendwohin: Stünde „3 Session(s) gespeichert" oder „codex: kein Importer"
+//! im Log, zeigte `minds fsck` nach jedem `enable` einen Hinweis, und ein
+//! Hinweis, den man nicht loswird, wird überlesen — mitsamt den echten.
+//!
+//! Bis #69 landete beides roh in einer eigenen Datei daneben (`import.log`),
+//! ohne eine der Zusagen von `hook.log` — und `fsck` wusste nichts von ihr.
 //!
 //! ```text
 //!   Transkripte ──import──► Sessions ──redact──► Store
@@ -20,24 +36,31 @@ use minds_git::Repo;
 use minds_redact::RedactionConfig;
 
 use crate::config;
+use crate::hooklog::{self, Source};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Führt `minds import` aus.
+/// Führt den Backfill aus.
+///
+/// In der Panic-Klammer wie jeder Hook-Pfad: Der Prozess hat kein stderr, das
+/// jemand liest — ein Panic verschwände sonst spurlos. Und weil hier die
+/// **rohen** Transkripte im Speicher liegen, hält das Log vom Panic nur den
+/// Ort fest, nicht die Meldung.
 pub fn run() -> ExitCode {
-    match import() {
+    hooklog::guarded(Source::Import, || match import() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("minds import: {err}");
+            hooklog::report(Source::Import, &err.to_string());
             ExitCode::FAILURE
         }
-    }
+    })
 }
 
 fn import() -> Fallible<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::discover(&cwd)?;
     let root = repo_root(&repo);
+    let git_dir = repo.git_dir().to_path_buf();
     let store = config::load(&root).open(&root)?;
     let home = home_dir()?;
 
@@ -61,16 +84,35 @@ fn import() -> Fallible<()> {
                     // Commit-Matching verwendet. Im Store liegt nur ihr
                     // Tombstone, nicht die Session.
                     if put.was_forgotten() {
-                        // Wie der Redaction-Skip darunter ein informativer
-                        // Hinweis, kein Ergebnis — also auf stderr.
+                        // Anders als der Redaction-Skip darunter kein Befund:
+                        // Das Tombstone ist gewollt, die Session soll fehlen.
+                        // Ein Hinweis für den Hand-Aufrufer, nichts fürs Log.
                         eprintln!("  Session {} bleibt vergessen (nicht reanimiert)", put.id());
                         continue;
                     }
                     infos.push(SessionInfo::of(put.id(), redacted.session()));
                     stored += 1;
                 }
-                Err(err) => eprintln!("  Session übersprungen (Redaction): {err}"),
+                // Eine übersprungene Session ist ein Befund, kein Fortschritt:
+                // Sie fehlt danach im Store, und ohne Eintrag wüsste niemand,
+                // dass sie je da war — genau der stille Ausfall aus #10.
+                Err(err) => hooklog::report_at(
+                    &git_dir,
+                    Source::Import,
+                    &format!("Session übersprungen (Redaction): {err}"),
+                ),
             }
+        }
+        // Was nicht lesbar war, ist ein Befund: Die Session fehlt danach im
+        // Store. Die Notiz darunter ist Information — „kein Importer" ist für
+        // vier von fünf Agents der Dauerzustand, und ein Log, das bei jedem
+        // `enable` wächst, würde `fsck` zum Dauer-Hinweis.
+        for error in &report.errors {
+            hooklog::report_at(
+                &git_dir,
+                Source::Import,
+                &format!("{}: {error}", report.agent),
+            );
         }
         let count = report.sessions.len();
         match &report.note {

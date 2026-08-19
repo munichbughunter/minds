@@ -42,7 +42,7 @@ keine Datenbank, keinen Dienst, keine Cloud-Komponente.
 | Ort | Inhalt | Schutz |
 |---|---|---|
 | `.git/minds/journal/…` | **Rohdaten vor der Redaktion**, inklusive Tool-Ergebnissen im Klartext | Dateien 0600; wird nach erfolgreichem Einchecken gelöscht (Lücke: Abschnitt 6) |
-| `.git/minds/hook.log` | Diagnosezeilen der Hooks | 0600, rotiert bei 1 MiB; URL-Zugangsdaten werden entfernt |
+| `.git/minds/hook.log` | Diagnosezeilen der Hooks und des von `minds enable` gestarteten Backfills | 0600, rotiert bei 1 MiB; Steuerzeichen entschärft, Zeilen gedeckelt; URL-Zugangsdaten werden entfernt |
 | `refs/minds/store/<hash>` | die **redigierte** Session (`session.json`) samt Kanten zum Commit | erreicht den Store nur nach der Redaktion (typerzwungen) |
 | `refs/minds/sessions/<hex>` | browsbare Kopie (inkl. gerenderter `session.md`) | erscheint beim Push als regulärer Branch `minds/session/<hex>` |
 | `refs/minds/context` | Index über die Sessions | wie Store |
@@ -145,8 +145,8 @@ verschwiegen, alles ist als Issue öffentlich:
   Verzeichnisse über den Ereignisdateien entstehen mit Umask-Rechten — auf
   Mehrbenutzer-Maschinen sind Agent-Namen und Session-Kennungen (nicht die
   Inhalte) für andere lokale Nutzer sichtbar.
-- **`minds import` nutzt die eingebaute Standard-Policy, nicht die
-  repo-eigene `.minds/redact.json`.** Beim Nachimport alter Transkripte
+- **Der von `minds enable` gestartete Backfill nutzt die eingebaute
+  Standard-Policy, nicht die repo-eigene `.minds/redact.json`.** Beim Nachimport alter Transkripte
   greifen die Standard-Detektoren und die Zugangsdaten-Mauer, aber keine
   projektspezifische Denylist (etwa Kundennamen). Für den Piloten:
   Backfill nur nach Rücksprache.

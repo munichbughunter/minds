@@ -32,7 +32,9 @@
 //!
 //! **Eine Datei für alle Hook-Pfade.** Wer „bei mir kommt nichts an"
 //! untersucht, soll einen Ort aufmachen, nicht vier — welcher Pfad geschrieben
-//! hat, steht in der Zeile ([`Source`]).
+//! hat, steht in der Zeile ([`Source`]). Das gilt auch für den Backfill aus
+//! `minds enable`: Er ist kein Hook, läuft aber genauso ohne Terminal, und
+//! seine eigene Datei daneben hatte keine der Zusagen von hier (#69).
 //!
 //! # Was hier stehen darf und was `fsck` daraus macht
 //!
@@ -93,15 +95,23 @@ pub(crate) enum Source {
     Sync,
     /// `minds brief --hook` — die Kontext-Rückführung beim Sitzungsstart.
     ///
-    /// Der einzige Lese-Pfad in dieser Liste. Er läuft aus der
+    /// Der einzige reine Lese-Pfad in dieser Liste. Er läuft aus der
     /// Agent-Konfiguration (`.claude/settings.json`), nicht aus einem
     /// Git-Hook, und sein Aufruf trägt dieselbe Umleitung: Scheitert er, fehlt
     /// der neuen Sitzung der Kontext — und niemand erfuhr es (#68).
     Brief,
+    /// Der Backfill, den `minds enable` losgelöst im Hintergrund startet.
+    ///
+    /// Kein Hook, aber derselbe Fall: Der Prozess hat kein Terminal, und
+    /// `enable` wartet nicht auf ihn — was er zu melden hat, käme sonst
+    /// nirgends an. Bis #69 schrieb er roh in eine eigene Datei daneben
+    /// (`import.log`), ohne eine der Zusagen dieses Moduls.
+    Import,
 }
 
 impl Source {
-    /// Wie der Pfad in der Zeile heißt: der Name des Unterkommandos.
+    /// Wie der Pfad in der Zeile heißt: der Name des Unterkommandos — beim
+    /// Backfill, der keins ist, der Name des Vorgangs.
     fn as_str(self) -> &'static str {
         match self {
             Source::Hook => "hook",
@@ -109,6 +119,7 @@ impl Source {
             Source::PrepareCommitMsg => "prepare-commit-msg",
             Source::Sync => "sync",
             Source::Brief => "brief",
+            Source::Import => "import",
         }
     }
 
@@ -122,6 +133,18 @@ impl Source {
     /// soll seinen Panic sehen.
     fn owns_stdout(self) -> bool {
         matches!(self, Source::Hook | Source::Brief)
+    }
+
+    /// Hält dieser Pfad fremde Nutzlast im Speicher, während er läuft?
+    ///
+    /// `hook` das rohe Event, `brief` die redigierten Sessions, `import` die
+    /// **rohen** Transkripte aller Agents — noch vor der Redaction. Ein
+    /// `unwrap()` darauf bettete deren `Debug` in die Panic-Meldung ein, und
+    /// `hook.log` wandert in Bug-Reports. Für diese Pfade hält das Log vom
+    /// Panic deshalb nur den Ort fest, nicht die Meldung. Die übrigen Pfade
+    /// haben kein Transkript im Speicher und behalten sie.
+    fn holds_payload(self) -> bool {
+        matches!(self, Source::Hook | Source::Brief | Source::Import)
     }
 }
 
@@ -211,23 +234,18 @@ fn guarded_into(
                     .or_else(|| payload.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "ohne Meldung".to_owned())
             });
-            // Für den heißen Pfad **nur der Ort**, nicht die Meldung: Eine
-            // Panic-Meldung kann Nutzlast einbetten (`panic!("… {payload}")`,
-            // `Result::unwrap` bettet den vollen `Debug` ein), und der rohe
-            // Mitschnitt läuft genau hier vorbei. `hook.log` ist die Datei, die
-            // in einem Bug-Report mitgeht — der Ort sagt, wo nachzusehen ist,
-            // und mehr braucht es dafür nicht. Die kalten Pfade behalten die
-            // Meldung: Dort steht kein Transkript im Speicher, und sie war
-            // schon vorher drin.
-            let note = match source {
-                // Beide Pfade halten fremde Nutzlast im Speicher: `hook` das
-                // rohe Event, `brief` die redigierten Sessions. Ein `unwrap()`
-                // darauf bettete deren `Debug` in die Panic-Meldung ein — und
-                // `hook.log` wandert in Bug-Reports.
-                s if s.owns_stdout() => {
-                    format!("Panic — Vorgang abgebrochen: {}", location_of(&note))
-                }
-                _ => format!("Panic — Vorgang abgebrochen: {note}"),
+            // Wo fremde Nutzlast im Speicher liegt, **nur der Ort**, nicht die
+            // Meldung: Eine Panic-Meldung kann sie einbetten (`panic!("…
+            // {payload}")`, `Result::unwrap` bettet den vollen `Debug` ein), und
+            // der rohe Mitschnitt läuft genau hier vorbei. `hook.log` ist die
+            // Datei, die in einem Bug-Report mitgeht — der Ort sagt, wo
+            // nachzusehen ist, und mehr braucht es dafür nicht. Die übrigen
+            // Pfade behalten die Meldung: Dort steht kein Transkript im
+            // Speicher, und sie war schon vorher drin.
+            let note = if source.holds_payload() {
+                format!("Panic — Vorgang abgebrochen: {}", location_of(&note))
+            } else {
+                format!("Panic — Vorgang abgebrochen: {note}")
             };
 
             match git_dir {
@@ -720,6 +738,31 @@ mod tests {
         assert!(
             content.contains("hooklog.rs:"),
             "kein Ort im Log:\n{content}"
+        );
+    }
+
+    /// Der Backfill hält die **rohen** Transkripte im Speicher — vom Panic
+    /// bleibt deshalb nur der Ort, wie beim heißen Pfad (#69).
+    #[test]
+    fn a_panic_in_the_import_keeps_its_place_but_not_its_message() {
+        let dir = git_dir();
+        let code = guarded_at(dir.path(), Source::Import, || {
+            panic!("Transkript: streng geheim")
+        });
+
+        assert_eq!(
+            format!("{code:?}"),
+            format!("{:?}", std::process::ExitCode::FAILURE)
+        );
+        let content = read(dir.path());
+        assert!(content.contains("import: Panic"), "{content}");
+        assert!(
+            content.contains("hooklog.rs:"),
+            "kein Ort im Log:\n{content}"
+        );
+        assert!(
+            !content.contains("streng geheim"),
+            "die Meldung könnte Nutzlast tragen:\n{content}"
         );
     }
 

@@ -497,12 +497,17 @@ fn main() -> ExitCode {
     // anders als die drei Git-Hookbodies.
     //
     // `brief --hook` gehört dazu: Sein stdout *ist* der injizierte Kontext.
+    // Und der Hintergrund-Import aus `enable`: Er läuft ohne Terminal, also
+    // käme ein Panic oder Parse-Fehler dort nirgends an (#69).
     let hook_path = match spec.name {
         "hook" => Some(hooklog::Source::Hook),
         "checkpoint" => Some(hooklog::Source::Checkpoint),
         "prepare-commit-msg" => Some(hooklog::Source::PrepareCommitMsg),
         "sync" => Some(hooklog::Source::Sync),
         "brief" if args.iter().any(|a| a == "--hook") => Some(hooklog::Source::Brief),
+        "enable" if args.iter().any(|a| a == enable::BACKGROUND_IMPORT_FLAG) => {
+            Some(hooklog::Source::Import)
+        }
         _ => None,
     };
     if let Some(source) = hook_path {
