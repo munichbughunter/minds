@@ -77,4 +77,6 @@ pub use adapter::{Checkpoint, build, build_one, checkpoint};
 pub mod clock;
 
 mod journal;
-pub use journal::{EventKind, Journal, JournalEvent, NewEvent, ReadOutcome, SessionKey};
+pub use journal::{
+    EventKind, Journal, JournalEvent, NewEvent, ReadOutcome, SessionKey, SessionsOutcome,
+};

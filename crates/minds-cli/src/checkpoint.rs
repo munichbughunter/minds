@@ -95,7 +95,22 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
     let pipeline = config::load_redaction(&root)?.pipeline()?;
 
     let mut stored: Vec<SessionId> = Vec::new();
-    for key in journal.sessions()? {
+    let outcome = journal.sessions()?;
+    // Verzeichnisse ohne auflösbaren Schlüssel bleiben liegen (kein Discard —
+    // dort können vollständige Events liegen) und werden gemeldet, nicht
+    // verschwiegen. Der Pfad trägt nur Agentname und Hash, nie ein rohes
+    // local_id (#95) — er darf ins Log.
+    for dir in &outcome.unresolved {
+        hooklog::report_at(
+            git_dir,
+            Source::Checkpoint,
+            &format!(
+                "Journal-Verzeichnis ohne lesbare Schlüssel-Datei übersprungen: {}",
+                dir.display()
+            ),
+        );
+    }
+    for key in outcome.keys {
         let events = journal.read(&key)?.events;
         if events.is_empty() {
             continue;
@@ -106,16 +121,19 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 // Erst nach erfolgreicher Ablage verwerfen: Ein Absturz dazwischen
                 // darf Rohdaten nicht verlieren.
                 journal.discard(&key)?;
-                println!("  {}/{}: {id}", key.agent(), key.local_id());
+                println!("  {}: {id}", key.display_redacted(&pipeline));
                 stored.push(id);
             }
             Err(err) => {
                 // Journal bleibt liegen — die Session ist nicht verloren, nur
-                // vertagt. fsck macht sie sichtbar.
+                // vertagt. fsck macht sie sichtbar. Das local_id läuft durch
+                // die Redaktion, bevor es auf stderr und ins hook.log geht:
+                // Seit #35 gilt es als fremdbestimmter Wert, der auch ein
+                // Token sein kann (#95).
                 hooklog::report_at(
                     git_dir,
                     Source::Checkpoint,
-                    &format!("{}/{} übersprungen: {err}", key.agent(), key.local_id()),
+                    &format!("{} übersprungen: {err}", key.display_redacted(&pipeline)),
                 );
             }
         }

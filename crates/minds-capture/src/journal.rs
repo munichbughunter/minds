@@ -28,11 +28,47 @@
 //! ```text
 //! <git-dir>/minds/journal/
 //! └─ claude-code/                     # Agentname
-//!    └─ 31f3f224-f440-41ac-.../       # local_id der Agent-Session
+//!    └─ b3-3f2a9c1b5d7e8f04/          # blake3(local_id), gekürzt — siehe unten
+//!       ├─ .key                       # der echte Schlüssel, verbindlich
 //!       ├─ 0000000000.json            # seq 0
 //!       ├─ 0000000001.json
 //!       └─ .next                      # Hinweis, unverbindlich
 //! ```
+//!
+//! # Verzeichnisname und Schlüssel (#95)
+//!
+//! Der Verzeichnisname unter einem Agenten ist **kein** lesbares `local_id`
+//! mehr, sondern `b3-` plus 16 Hex-Ziffern von `blake3(local_id)`. Seit #35
+//! gilt `local_id` als fremdbestimmter Wert, der alles Mögliche enthalten kann
+//! — auch ein Token, dessen Alphabet exakt in das von [`SessionKey`] geprüfte
+//! Zeichenrepertoire passt. Ein Verzeichnisname steht aber in jedem `ls`,
+//! jedem Backup-Manifest und jedem Editor-Dateibaum; der Hash nimmt ihn aus
+//! all diesen Kanälen heraus. Der Agentname bleibt roh: Er ist unser eigenes,
+//! kleines Vokabular, keine fremdgegebene Kennung.
+//!
+//! Weil [`JournalEvent`] Agent und `local_id` nie trug (der Schlüssel lebte
+//! bisher nur im Pfad), braucht der Schlüssel einen neuen Ort: `.key`, eine
+//! kleine, versionierte JSON-Datei im Session-Verzeichnis, geschrieben mit
+//! denselben Rechten und derselben Zwei-Schritt-Haltbarkeit wie ein Event —
+//! ihr Verlust kostete nicht ein Event, sondern die Identität der ganzen
+//! Session. [`Journal::sessions`] liest sie zurück, statt den Verzeichnisnamen
+//! zu deuten: Der Name ist ab hier nur noch ein Bucket, kein Datum.
+//!
+//! `.key` ist zugleich die Verteidigung gegen den Angriff, den der Hash erst
+//! möglich macht: Ein Agent könnte sein `local_id` wörtlich auf den
+//! Verzeichnisnamen einer fremden Session setzen (Hex und `b3-` passieren die
+//! Zeichenprüfung) und so versuchen, deren Verzeichnis zu übernehmen. Deshalb
+//! wird `.key` bei **jedem** [`append`](Journal::append) gegen den erwarteten
+//! Schlüssel geprüft und ein Alt-Verzeichnis nur dann migriert, wenn es
+//! **kein** `.key` trägt — ein Verzeichnis mit fremdem Schlüssel wird nie
+//! beschrieben, nie verschoben, nie zusammengelegt.
+//!
+//! Bestandsverzeichnisse von vor dieser Härtung tragen den rohen
+//! `local_id`-Namen weiter. Sie werden nicht per Kommando migriert, sondern
+//! beim nächsten `append` derselben Session an ihren gehashten Platz
+//! verschoben — dasselbe „Heilung beim Zugriff"-Muster wie die 0700-Härtung
+//! aus #49. Bis dahin bleiben sie für `sessions`, `read` und `discard`
+//! vollständig sichtbar und nutzbar.
 //!
 //! # Die Sequenznummer, und warum sie ohne Sperre auskommt
 //!
@@ -77,6 +113,27 @@ const JOURNAL_DIR: &str = "minds/journal";
 
 /// Name der unverbindlichen Startwert-Datei.
 const HINT_FILE: &str = ".next";
+
+/// Name der Schlüssel-Datei im Session-Verzeichnis (#95). Anders als
+/// [`HINT_FILE`] ist sie verbindlich: Sie ist die einzige Quelle des rohen
+/// `local_id`, sobald der Verzeichnisname nur noch dessen Hash trägt.
+const KEY_FILE: &str = ".key";
+
+/// Präfix des gehashten Verzeichnisnamens — benennt den Algorithmus, dieselbe
+/// Konvention wie bei [`SessionId`](minds_core::SessionId).
+const DIR_HASH_PREFIX: &str = "b3-";
+
+/// Länge des Hex-Anteils im Verzeichnisnamen: 8 Byte / 64 Bit von blake3.
+///
+/// Kurz genug für ein lesbares `ls`, und als Bucket-Namensraum innerhalb
+/// *eines* Agenten weit überdimensioniert (Geburtstagsgrenze ~2³² Sessions).
+/// Die Länge ist trotzdem keine Sicherheitsgarantie für sich — die tragende
+/// Verteidigung ist die `.key`-Prüfung in [`Journal::append`], nicht die
+/// Kollisionsstatistik.
+const DIR_HASH_HEX_LEN: usize = 16;
+
+/// Aktuelle Fassung von [`KeyRecord`].
+const KEY_RECORD_VERSION: u8 = 1;
 
 /// Obergrenze für die Suche nach einer freien Sequenznummer. Wird sie erreicht,
 /// ist etwas grundsätzlich kaputt (volles Dateisystem, falsche Rechte) und ein
@@ -124,8 +181,38 @@ impl SessionKey {
     pub fn local_id(&self) -> &str {
         &self.local_id
     }
+
+    /// Anzeige für Menschen: `agent` roh, `local_id` durch die Pipeline (#95).
+    ///
+    /// Bewusst keine `Display`-Implementierung: Ein `Display`-Impl lüde dazu
+    /// ein, `{key}` zu schreiben und die Redaktion zu vergessen — genau der
+    /// Fehler, den diese Methode ausschließen soll. Der Pipeline-Parameter ist
+    /// Pflicht, nicht optionaler Kontext; wer ihn nicht hat, kann diese
+    /// Methode nicht aufrufen.
+    ///
+    /// `agent` bleibt roh (Scope-Entscheidung #95, siehe [`check_component`]):
+    /// unser eigenes Vokabular, kein fremder Text.
+    pub fn display_redacted(&self, pipeline: &minds_redact::RedactionPipeline) -> String {
+        format!("{}/{}", self.agent, pipeline.redact(&self.local_id).text)
+    }
 }
 
+/// Prüft die Zeichen einer Pfadkomponente — die einzige Stelle, an der
+/// `agent`/`local_id` je ihr Zeichenrepertoire bestätigen.
+///
+/// Diese Prüfung garantiert **Pfadsicherheit**, keine Inhaltssicherheit: Das
+/// erlaubte Alphabet `[A-Za-z0-9._-]` ist exakt das Alphabet gängiger Token
+/// (`glpat-…`, `ghp_…`, `AKIA…`), ein Token als `local_id` besteht sie also
+/// anstandslos. Seit #35 gilt der Wert deshalb als fremdbestimmt und wird im
+/// Envelope mitredigiert; #95 zieht dieselbe Linie außerhalb des Envelopes:
+///
+/// - Der **Verzeichnisname** trägt nur noch `blake3(local_id)` — siehe
+///   Modul-Doku „Verzeichnisname und Schlüssel".
+/// - Jede **Anzeige** läuft durch [`SessionKey::display_redacted`], nie über
+///   ein `Display`-Impl, das es bewusst nicht gibt.
+///
+/// Die andere Hälfte dieser Entscheidung — warum gescannt statt validiert
+/// wird — steht in der Modul-Doku von `minds_redact::session`.
 fn check_component(value: &str, field: &'static str) -> Result<()> {
     let ok = !value.is_empty()
         && value.len() <= 128
@@ -140,9 +227,36 @@ fn check_component(value: &str, field: &'static str) -> Result<()> {
     } else {
         Err(CaptureError::UnsafeKey {
             field,
-            value: value.chars().take(64).collect(),
+            len: value.chars().count(),
         })
     }
+}
+
+/// Der auf Platte persistierte Schlüssel (`.key`).
+///
+/// Vorwärts-tolerant gelesen (kein `deny_unknown_fields`) — ein alter Reader
+/// darf an einem neuen Feld nicht zerbrechen. `version` ist trotzdem ein
+/// exakter Vergleich beim Lesen: Ändert sich je die *Bedeutung* eines Feldes,
+/// muss das eine neue Version sein, kein stillschweigend anders gelesenes
+/// altes Feld.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct KeyRecord {
+    version: u8,
+    agent: String,
+    local_id: String,
+}
+
+/// Der Verzeichnisname zu einem `local_id`: `b3-` plus die ersten
+/// [`DIR_HASH_HEX_LEN`] Hex-Ziffern von `blake3(local_id)`.
+fn hashed_dir_name(local_id: &str) -> String {
+    use std::fmt::Write as _;
+    let digest = blake3::hash(local_id.as_bytes());
+    let mut out = String::with_capacity(DIR_HASH_PREFIX.len() + DIR_HASH_HEX_LEN);
+    out.push_str(DIR_HASH_PREFIX);
+    for byte in &digest.as_bytes()[..DIR_HASH_HEX_LEN / 2] {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -304,10 +418,15 @@ impl Journal {
     ///
     /// Das ist die einzige Operation auf dem heißen Pfad. Sie macht: bis zu
     /// zwei `create`-Aufrufe, ein `write`, ein `fsync`, ein `rename`. Kein
-    /// Netz, kein Git, keine Sperre.
+    /// Netz, kein Git, keine Sperre. Seit #95 kommen dazu: ein Lesen der
+    /// `.key`-Datei je Aufruf, und **einmal pro Session** (beim ersten Event)
+    /// deren Schreiben mit eigenem fsync — die Identität der Session hängt an
+    /// dieser Datei, sie muss einen Absturz genauso überleben wie ein Event.
     pub fn append(&self, key: &SessionKey, event: NewEvent) -> Result<JournalEvent> {
         let dir = self.session_dir(key);
+        self.migrate_legacy_dir(key, &dir)?;
         create_dir_private(&self.root, &dir)?;
+        self.ensure_key_file(&dir, key)?;
 
         let (seq, claim) = self.reserve(&dir)?;
 
@@ -323,7 +442,7 @@ impl Journal {
         };
 
         let tmp = dir.join(format!("{seq:010}.json.tmp"));
-        write_private(&tmp, &serde_json::to_vec(&event)?)?;
+        write_private(&tmp, &serde_json::to_vec(&event)?, "Event schreiben")?;
         fs::rename(&tmp, &claim).map_err(|e| CaptureError::io("Event umbenennen", &claim, e))?;
 
         // Auch das Verzeichnis synchronisieren (#49): `rename` ist ein Eintrag
@@ -371,9 +490,19 @@ impl Journal {
         })
     }
 
-    /// Alle Sessions, für die Events vorliegen.
-    pub fn sessions(&self) -> Result<Vec<SessionKey>> {
-        let mut out = Vec::new();
+    /// Alle Sessions, für die Events vorliegen — inklusive dem, was sich nicht
+    /// zuordnen ließ.
+    ///
+    /// Der Schlüssel kommt aus `.key`, nicht aus dem Verzeichnisnamen (#95).
+    /// Fehlt `.key`, ist das Verzeichnis ein Bestand von vor der Härtung und
+    /// sein Name selbst das `local_id` — der eine, dokumentierte Fallback.
+    /// Ist `.key` dagegen vorhanden, aber unlesbar oder in sich widersprüchlich,
+    /// wandert das Verzeichnis nach [`SessionsOutcome::unresolved`] statt still
+    /// zu verschwinden: Dort liegen möglicherweise vollständige Events, nur
+    /// ihre Identität ist verloren — ehrlich lückenhaft schlägt still
+    /// vollständig.
+    pub fn sessions(&self) -> Result<SessionsOutcome> {
+        let mut out = SessionsOutcome::default();
         let agents = match fs::read_dir(&self.root) {
             Ok(it) => it,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
@@ -392,14 +521,53 @@ impl Journal {
                 if !session.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
-                let local_id = session.file_name().to_string_lossy().into_owned();
-                if let Ok(key) = SessionKey::new(agent_name.clone(), local_id) {
-                    out.push(key);
+                let path = session.path();
+                let dir_name = session.file_name().to_string_lossy().into_owned();
+                match read_key_record(&path) {
+                    // Modernes Verzeichnis: `.key` ist die Quelle. Agent und
+                    // Hash müssen zum Fundort passen — ein kopiertes oder
+                    // untergeschobenes Verzeichnis fällt hier auf, statt als
+                    // Phantom-Schlüssel aufzutauchen, der nirgends auflösbar
+                    // wäre.
+                    Some(Ok(record)) => {
+                        let consistent = record.version == KEY_RECORD_VERSION
+                            && record.agent == agent_name
+                            && hashed_dir_name(&record.local_id) == dir_name;
+                        let key = consistent
+                            .then(|| SessionKey::new(record.agent, record.local_id).ok())
+                            .flatten();
+                        match key {
+                            Some(key) => out.keys.push(key),
+                            None => out.unresolved.push(displayable_unresolved(path, &dir_name)),
+                        }
+                    }
+                    Some(Err(_)) => out.unresolved.push(displayable_unresolved(path, &dir_name)),
+                    // Kein `.key`: Bestand von vor #95, der Name ist das
+                    // `local_id`. Was die Zeichenprüfung nicht besteht, ist
+                    // ein fremdes Verzeichnis, nie eines von uns — und wird
+                    // wie eh und je still übergangen. Ohne ein einziges Event
+                    // ebenso: Ein leeres Verzeichnis ist ein Absturzrest der
+                    // Anlage, keine Session — als Schlüssel gedeutet stünde
+                    // sein Name (auch ein Hash-Bucket, dessen `.key` nie
+                    // geschrieben wurde) für immer als Phantom im fsck-Bericht.
+                    None => {
+                        if has_event_files(&path) {
+                            if let Ok(key) = SessionKey::new(agent_name.clone(), dir_name) {
+                                out.keys.push(key);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        out.sort();
+        out.keys.sort();
+        // Ein verlorener Migrations-Wettlauf kann dieselbe Session kurzzeitig
+        // zweimal liefern — einmal über `.key` im gehashten Verzeichnis,
+        // einmal über den noch liegenden Alt-Namen. Doppelt verarbeiten wäre
+        // doppelt abgelegt.
+        out.keys.dedup();
+        out.unresolved.sort();
         Ok(out)
     }
 
@@ -408,7 +576,9 @@ impl Journal {
     /// Meldet Lücken und beschädigte Dateien mit, statt sie zu verschweigen —
     /// siehe [`ReadOutcome`].
     pub fn read(&self, key: &SessionKey) -> Result<ReadOutcome> {
-        let dir = self.session_dir(key);
+        let Some(dir) = self.resolve_session_dir(key) else {
+            return Ok(ReadOutcome::default());
+        };
         let mut events = Vec::new();
         let mut damaged = Vec::new();
 
@@ -417,7 +587,11 @@ impl Journal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(ReadOutcome::default());
             }
-            Err(e) => return Err(CaptureError::io("Session lesen", &dir, e)),
+            // Der physische Ort kann das Alt-Verzeichnis mit rohem Namen
+            // sein; der Fehlertext nennt stattdessen den gehashten Pfad
+            // derselben Session — er wandert über den Checkpoint ins
+            // hook.log, und dort darf kein rohes local_id stehen (#95).
+            Err(e) => return Err(CaptureError::io("Session lesen", self.session_dir(key), e)),
         };
 
         for entry in entries.flatten() {
@@ -460,17 +634,278 @@ impl Journal {
     /// Store darf keine Rohdaten verlieren; er darf sie nur nicht behalten,
     /// wenn sie sicher angekommen sind.
     pub fn discard(&self, key: &SessionKey) -> Result<()> {
-        let dir = self.session_dir(key);
+        let Some(dir) = self.resolve_session_dir(key) else {
+            return Ok(());
+        };
         match fs::remove_dir_all(&dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(CaptureError::io("Session verwerfen", &dir, e)),
+            // Wie in `read`: nie den (möglicherweise rohen) Alt-Pfad in den
+            // Fehlertext — der landet im hook.log (#95).
+            Err(e) => Err(CaptureError::io(
+                "Session verwerfen",
+                self.session_dir(key),
+                e,
+            )),
         }
     }
 
+    /// Der kanonische (gehashte) Pfad — das Ziel jedes neuen Schreibvorgangs.
     fn session_dir(&self, key: &SessionKey) -> PathBuf {
+        self.root
+            .join(&key.agent)
+            .join(hashed_dir_name(&key.local_id))
+    }
+
+    /// Der Pfad von vor #95: Das Blatt hieß `local_id` selbst. Wird nur noch
+    /// gelesen und migriert, nie neu angelegt.
+    fn legacy_session_dir(&self, key: &SessionKey) -> PathBuf {
         self.root.join(&key.agent).join(&key.local_id)
     }
+
+    /// Wo die Session tatsächlich liegt: der gehashte Pfad, wenn er zu ihr
+    /// gehört, sonst — für einen Bestand, der seit #95 nie wieder `append`
+    /// gesehen hat — der rohe. Ohne diesen Fallback hielte
+    /// [`read`](Self::read) eine volle Alt-Session für leer und
+    /// [`discard`](Self::discard) löschte nach dem Checkpoint nichts, sodass
+    /// derselbe Bestand bei jedem Lauf erneut verarbeitet würde.
+    ///
+    /// `None` heißt: Es gibt keinen Ort, der sicher zu dieser Session gehört.
+    /// Dieselbe `.key`-Prüfung wie beim [`append`](Self::append), aus
+    /// demselben Grund — ein Bucket, dessen Schlüssel widerspricht oder
+    /// unlesbar ist, gehört jemand anderem oder niemandem Bestimmbarem, und
+    /// aus ihm wird weder gelesen noch in ihm gelöscht. Ein Bucket ganz ohne
+    /// `.key` dagegen ist ein Absturzrest unserer eigenen Anlage (die `.key`
+    /// entsteht vor dem ersten Event) und darf behandelt werden: `read`
+    /// findet dort nichts, `discard` räumt ihn auf.
+    ///
+    /// Ein Alt-Kandidat zählt nur ohne `.key`: Trägt das Verzeichnis unter dem
+    /// rohen Namen eine Schlüssel-Datei, ist es der Hash-Bucket einer
+    /// *anderen* Session, deren Name zufällig (oder absichtlich, siehe
+    /// Modul-Doku) wie dieses `local_id` aussieht — nie unser Bestand.
+    fn resolve_session_dir(&self, key: &SessionKey) -> Option<PathBuf> {
+        let hashed = self.session_dir(key);
+        match read_key_record(&hashed) {
+            Some(Ok(record)) => {
+                let ours = record.version == KEY_RECORD_VERSION
+                    && record.agent == key.agent
+                    && record.local_id == key.local_id;
+                return ours.then_some(hashed);
+            }
+            Some(Err(_)) => return None,
+            None => {
+                if fs::symlink_metadata(&hashed).is_ok() {
+                    return Some(hashed);
+                }
+            }
+        }
+        let legacy = self.legacy_session_dir(key);
+        if matches!(fs::symlink_metadata(&legacy), Ok(m) if m.is_dir())
+            && read_key_record(&legacy).is_none()
+        {
+            return Some(legacy);
+        }
+        None
+    }
+
+    /// Verschiebt ein Bestandsverzeichnis an seinen gehashten Platz — Inhalt
+    /// und Sequenznummern bleiben erhalten. Kein Migrationskommando, sondern
+    /// dasselbe „Heilung beim Zugriff"-Muster wie die Rechte-Härtung aus #49.
+    ///
+    /// No-op, wenn das Ziel schon existiert oder kein Alt-Verzeichnis
+    /// vorliegt. Ein Kandidat mit `.key` ist kein Alt-Verzeichnis, sondern der
+    /// Bucket einer fremden Session — der wird nicht angefasst (siehe
+    /// Modul-Doku, Angriff über einen hash-förmigen `local_id`).
+    fn migrate_legacy_dir(&self, key: &SessionKey, hashed: &Path) -> Result<()> {
+        if fs::symlink_metadata(hashed).is_ok() {
+            return Ok(());
+        }
+        let legacy = self.legacy_session_dir(key);
+        if !matches!(fs::symlink_metadata(&legacy), Ok(m) if m.is_dir())
+            || read_key_record(&legacy).is_some()
+        {
+            return Ok(());
+        }
+        // Die Ebenen oberhalb des Blatts vor dem Verschieben prüfen — das
+        // Blatt selbst hat der `is_dir`-Test oben schon als Nicht-Symlink
+        // bestätigt (`symlink_metadata` folgt nicht). Bewusst nicht
+        // `refuse_symlinked_levels(root, legacy)`: Dessen Fehlertext nennt die
+        // beanstandete Ebene, und das Blatt trüge den rohen `local_id` ins
+        // hook.log (#95). Wird das Blatt *zwischen* Prüfung und `rename` zum
+        // Symlink getauscht, verschiebt `rename` nur den Link; die Anlage
+        // danach verweigert ihn fail-closed — dieselbe akzeptierte
+        // Fensterbreite wie im hooklog.
+        if let Some(agent_dir) = legacy.parent() {
+            refuse_symlinked_levels(&self.root, agent_dir)?;
+        }
+        match fs::rename(&legacy, hashed) {
+            Ok(()) => {}
+            // Wettlauf verloren, das Ziel steht — ein zweiter Hook-Prozess
+            // war schneller. Dann gibt es nichts mehr zu migrieren.
+            Err(_) if fs::symlink_metadata(hashed).is_ok() => return Ok(()),
+            // Der Fehlertext nennt das Ziel, nicht die Quelle: Der Quellname
+            // ist das rohe `local_id`, und die Meldung wandert ins hook.log
+            // (#95). Der gehashte Name bezeichnet dieselbe Session.
+            Err(e) => return Err(CaptureError::io("Bestandssession migrieren", hashed, e)),
+        }
+        // Das `rename` ist ein Eintrag im Agent-Verzeichnis — haltbar machen,
+        // wie beim Event-`rename` (#49).
+        if let Some(agent_dir) = hashed.parent() {
+            sync_dir(agent_dir)?;
+        }
+        Ok(())
+    }
+
+    /// Schreibt `.key` beim ersten Event einer Session und prüft sie bei jedem
+    /// weiteren.
+    ///
+    /// Die Prüfung ist die tragende Verteidigung des gehashten Layouts: Eine
+    /// Abweichung heißt Hash-Kollision, untergeschobene Kennung oder
+    /// beschädigte Datei — in allen drei Fällen wird in dieses Verzeichnis
+    /// **nicht** geschrieben, statt Events zweier Sessions zu vermischen.
+    fn ensure_key_file(&self, dir: &Path, key: &SessionKey) -> Result<()> {
+        match read_key_record(dir) {
+            Some(Ok(record)) => {
+                let ok = record.version == KEY_RECORD_VERSION
+                    && record.agent == key.agent
+                    && record.local_id == key.local_id;
+                if ok {
+                    Ok(())
+                } else {
+                    Err(CaptureError::KeyFileMismatch {
+                        dir: dir.to_path_buf(),
+                    })
+                }
+            }
+            // Ein Parse-Fehler ist ein Mismatch (der Inhalt bestätigt nichts);
+            // ein echter I/O-Fehler (Rechte, Medium) ist keiner — ihn als
+            // „Kollision" zu melden schickte die Diagnose in die falsche
+            // Richtung. Der Pfad ist der gehashte Bucket, kein Leck.
+            Some(Err(e)) if e.kind() == std::io::ErrorKind::InvalidData => {
+                Err(CaptureError::KeyFileMismatch {
+                    dir: dir.to_path_buf(),
+                })
+            }
+            Some(Err(e)) => Err(CaptureError::io(
+                "Schlüssel-Datei lesen",
+                dir.join(KEY_FILE),
+                e,
+            )),
+            None => {
+                let record = KeyRecord {
+                    version: KEY_RECORD_VERSION,
+                    agent: key.agent.clone(),
+                    local_id: key.local_id.clone(),
+                };
+                // Zwei-Schritt-Haltbarkeit wie ein Event: Ein Absturz darf
+                // keine sichtbare, halbe `.key` hinterlassen — die wäre beim
+                // nächsten `append` ein falscher Kollisionsalarm. Der
+                // Tmp-Name trägt die Prozess-Id, denn anders als bei Events
+                // reserviert hier kein `create_new` exklusiv: Zwei
+                // gleichzeitige erste Events derselben Session schrieben
+                // sonst in dieselbe Tmp-Datei, und der Verlierer des
+                // anschließenden `rename` risse dem Gewinner die live
+                // gewordene `.key` unter dem Deskriptor weg.
+                let path = dir.join(KEY_FILE);
+                let tmp = dir.join(format!("{KEY_FILE}.{}.tmp", std::process::id()));
+                write_private(
+                    &tmp,
+                    &serde_json::to_vec(&record)?,
+                    "Schlüssel-Datei schreiben",
+                )?;
+                match fs::rename(&tmp, &path) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        // Beide Prozesse schreiben denselben Inhalt — steht
+                        // inzwischen die richtige `.key`, ist nichts verloren.
+                        let _ = fs::remove_file(&tmp);
+                        match read_key_record(dir) {
+                            Some(Ok(record))
+                                if record.version == KEY_RECORD_VERSION
+                                    && record.agent == key.agent
+                                    && record.local_id == key.local_id =>
+                            {
+                                Ok(())
+                            }
+                            _ => Err(CaptureError::io("Schlüssel-Datei umbenennen", &path, e)),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Liest die `.key`-Datei eines Session-Verzeichnisses.
+///
+/// `None`: keine Datei — Bestand von vor #95 oder frisch angelegt.
+/// `Some(Err(_))`: vorhanden, aber unlesbar — das darf nie stillschweigend
+/// wie „keine" behandelt werden, sonst würde ein beschädigter Schlüssel zum
+/// Alt-Verzeichnis umgedeutet.
+fn read_key_record(dir: &Path) -> Option<std::io::Result<KeyRecord>> {
+    match fs::read(dir.join(KEY_FILE)) {
+        Ok(bytes) => Some(
+            serde_json::from_slice(&bytes)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// `true`, wenn `name` die Form eines von uns erzeugten Hash-Buckets hat.
+fn looks_like_hashed_dir(name: &str) -> bool {
+    name.strip_prefix(DIR_HASH_PREFIX).is_some_and(|hex| {
+        hex.len() == DIR_HASH_HEX_LEN
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+    })
+}
+
+/// `true`, wenn im Verzeichnis mindestens ein Event liegt.
+fn has_event_files(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".json"))
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Der Pfad eines unauflösbaren Verzeichnisses, wie er gemeldet werden darf.
+///
+/// [`SessionsOutcome::unresolved`] verspricht: nie ein rohes `local_id` im
+/// Pfad. Ein Blattname in Hash-Form hält das von selbst; jeder andere Name
+/// (ein Alt-Verzeichnis, in das eine `.key` geraten ist) könnte die rohe
+/// Kennung sein und wird durch `…` ersetzt — die Zusage wird hier erzwungen,
+/// nicht nur behauptet (#95). Das betroffene Verzeichnis bleibt auffindbar:
+/// Es ist das eine unter dem angezeigten Agenten, das aus der Reihe fällt.
+fn displayable_unresolved(path: PathBuf, dir_name: &str) -> PathBuf {
+    if looks_like_hashed_dir(dir_name) {
+        path
+    } else {
+        path.with_file_name("…")
+    }
+}
+
+/// Ergebnis von [`Journal::sessions`] — inklusive dem, was sich nicht
+/// zuordnen ließ (#95).
+#[derive(Debug, Default)]
+pub struct SessionsOutcome {
+    /// Sessions mit rekonstruierbarem Schlüssel, sortiert.
+    pub keys: Vec<SessionKey>,
+
+    /// Session-Verzeichnisse, deren Schlüssel sich nicht rekonstruieren ließ:
+    /// `.key` ist vorhanden, aber unlesbar oder in sich widersprüchlich. Die
+    /// Events dort liegen möglicherweise vollständig vor — nur ihre Identität
+    /// ist verloren. Sichtbar gemacht von `minds fsck` und `minds checkpoint`,
+    /// nie stillschweigend übersprungen. Der Pfad trägt nur Agentname und
+    /// Hash, nie ein rohes `local_id` — er darf angezeigt werden.
+    pub unresolved: Vec<PathBuf>,
 }
 
 /// Ergebnis von [`Journal::read`] — inklusive dem, was fehlt.
@@ -689,7 +1124,7 @@ fn write_hint(path: &Path, next: u64) -> std::io::Result<()> {
     f.write_all(next.to_string().as_bytes())
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+fn write_private(path: &Path, bytes: &[u8], op: &'static str) -> Result<()> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -697,15 +1132,13 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts
-        .open(path)
-        .map_err(|e| CaptureError::io("Event schreiben", path, e))?;
+    let mut f = opts.open(path).map_err(|e| CaptureError::io(op, path, e))?;
     f.write_all(bytes)
-        .map_err(|e| CaptureError::io("Event schreiben", path, e))?;
+        .map_err(|e| CaptureError::io(op, path, e))?;
     // Vor dem `rename` synchronisieren: Sonst kann ein Absturz eine sichtbare,
-    // aber leere Datei hinterlassen — also ein Event, das es nie gab.
-    f.sync_all()
-        .map_err(|e| CaptureError::io("Event synchronisieren", path, e))?;
+    // aber leere Datei hinterlassen — also ein Event (oder eine `.key`), das
+    // es nie gab.
+    f.sync_all().map_err(|e| CaptureError::io(op, path, e))?;
     Ok(())
 }
 
@@ -853,7 +1286,8 @@ mod tests {
         j.append(&b, event(EventKind::SessionStart)).unwrap();
 
         let found = j.sessions().unwrap();
-        assert_eq!(found, vec![a, b]);
+        assert_eq!(found.keys, vec![a, b]);
+        assert!(found.unresolved.is_empty());
     }
 
     #[test]
@@ -872,7 +1306,7 @@ mod tests {
         let (_tmp, j) = journal();
         let key = SessionKey::new("claude-code", "never").unwrap();
         assert!(j.read(&key).unwrap().events.is_empty());
-        assert!(j.sessions().unwrap().is_empty());
+        assert!(j.sessions().unwrap().keys.is_empty());
     }
 
     #[cfg(unix)]
@@ -895,6 +1329,14 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(hint, 0o600, "{hint:o}");
+
+        // Und die Schluessel-Datei (#95) — sie traegt das rohe local_id.
+        let key_mode = fs::metadata(j.session_dir(&key).join(KEY_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(key_mode, 0o600, "{key_mode:o}");
 
         // Und jede Journal-Ebene (#49): Ohne die Härtung entstünden
         // Zwischenebenen mit Umask-Rechten, und andere lokale Nutzer saehen
@@ -942,6 +1384,301 @@ mod tests {
         }
         let mode = fs::metadata(&hint).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "der Hinweis wurde nicht geheilt: {mode:o}");
+    }
+
+    /// Macht aus einer modern angelegten Session ein Bestandsverzeichnis von
+    /// vor #95: roher `local_id`-Name, keine `.key`-Datei.
+    fn make_legacy(j: &Journal, key: &SessionKey) -> PathBuf {
+        let hashed = j.session_dir(key);
+        let legacy = hashed.parent().unwrap().join(key.local_id());
+        fs::remove_file(hashed.join(KEY_FILE)).unwrap();
+        fs::rename(&hashed, &legacy).unwrap();
+        legacy
+    }
+
+    #[test]
+    fn directory_names_are_a_short_hash_not_the_local_id() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "glpat-ABCDEFGHIJ1234567890").unwrap();
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+
+        let dir = j.session_dir(&key);
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(DIR_HASH_PREFIX), "{name}");
+        assert_eq!(name.len(), DIR_HASH_PREFIX.len() + DIR_HASH_HEX_LEN);
+
+        // Nirgends unter der Journal-Wurzel trägt ein Pfadsegment die Kennung.
+        fn walk(dir: &Path, needle: &str) {
+            for entry in fs::read_dir(dir).unwrap().flatten() {
+                let name = entry.file_name();
+                assert!(
+                    !name.to_string_lossy().contains(needle),
+                    "roher local_id im Dateisystem: {}",
+                    entry.path().display()
+                );
+                if entry.file_type().unwrap().is_dir() {
+                    walk(&entry.path(), needle);
+                }
+            }
+        }
+        walk(j.root(), "glpat");
+    }
+
+    #[test]
+    fn a_key_file_is_written_on_the_first_event_and_verified_on_the_next() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "31f3f224").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+
+        let record: KeyRecord =
+            serde_json::from_slice(&fs::read(j.session_dir(&key).join(KEY_FILE)).unwrap()).unwrap();
+        assert_eq!(record.version, KEY_RECORD_VERSION);
+        assert_eq!(record.agent, "claude-code");
+        assert_eq!(record.local_id, "31f3f224");
+
+        // Ein zweites Event derselben Session besteht die Prüfung.
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+    }
+
+    #[test]
+    fn a_key_file_naming_a_different_session_is_refused_not_overwritten() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "mine").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+
+        // Simulierte Kollision: `.key` behauptet eine andere Session.
+        let foreign = KeyRecord {
+            version: KEY_RECORD_VERSION,
+            agent: "claude-code".into(),
+            local_id: "theirs".into(),
+        };
+        let path = j.session_dir(&key).join(KEY_FILE);
+        fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+        let err = j.append(&key, event(EventKind::Prompt)).unwrap_err();
+        assert!(matches!(err, CaptureError::KeyFileMismatch { .. }), "{err}");
+        // Der Fehlertext trägt kein rohes local_id — er wandert ins hook.log.
+        assert!(!err.to_string().contains("mine"), "{err}");
+        assert!(!err.to_string().contains("theirs"), "{err}");
+        // Auch die kalten Pfade fassen den unbestätigten Bucket nicht an:
+        // `read` liefert fail-closed nichts, `discard` löscht nichts, die
+        // `.key` bleibt, wie sie war — und `sessions` meldet das Verzeichnis
+        // als unauflösbar, statt es einer der beiden Kennungen zuzuschlagen.
+        assert!(j.read(&key).unwrap().events.is_empty());
+        j.discard(&key).unwrap();
+        assert!(path.exists(), ".key wurde angefasst");
+        let after: KeyRecord = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after.local_id, "theirs");
+        let found = j.sessions().unwrap();
+        assert!(found.keys.is_empty());
+        assert_eq!(found.unresolved, vec![j.session_dir(&key)]);
+    }
+
+    #[test]
+    fn a_pre_hash_journal_directory_is_healed_on_append() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "bestand").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        let legacy = make_legacy(&j, &key);
+
+        // Der nächste append derselben Session migriert: alter Pfad weg,
+        // gehashter Pfad da, `.key` geschrieben, Sequenz lückenlos fortgesetzt.
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+        assert!(!legacy.exists(), "Alt-Verzeichnis blieb liegen");
+        let out = j.read(&key).unwrap();
+        assert_eq!(out.events.len(), 2);
+        assert!(out.is_complete());
+        let record: KeyRecord =
+            serde_json::from_slice(&fs::read(j.session_dir(&key).join(KEY_FILE)).unwrap()).unwrap();
+        assert_eq!(record.local_id, "bestand");
+    }
+
+    #[test]
+    fn sessions_still_finds_an_unhealed_legacy_directory_by_name() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "bestand").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        make_legacy(&j, &key);
+
+        let found = j.sessions().unwrap();
+        assert_eq!(found.keys, vec![key]);
+        assert!(found.unresolved.is_empty());
+    }
+
+    #[test]
+    fn read_and_discard_work_on_an_unhealed_legacy_session() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "bestand").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        let legacy = make_legacy(&j, &key);
+
+        // Ohne den Fallback hielte `read` die Alt-Session für leer und
+        // `discard` löschte nichts — der Checkpoint verarbeitete sie dann bei
+        // jedem Lauf erneut.
+        assert_eq!(j.read(&key).unwrap().events.len(), 1);
+        j.discard(&key).unwrap();
+        assert!(!legacy.exists());
+        assert!(j.sessions().unwrap().keys.is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_key_file_is_reported_as_unresolved_not_silently_dropped() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "beschaedigt").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        let dir = j.session_dir(&key);
+
+        // Kaputtes JSON: keine Identität mehr, aber die Events liegen da.
+        fs::write(dir.join(KEY_FILE), b"kaputt").unwrap();
+        let found = j.sessions().unwrap();
+        assert!(found.keys.is_empty());
+        assert_eq!(found.unresolved, vec![dir.clone()]);
+
+        // Auch ein in sich widersprüchlicher Schlüssel (Hash passt nicht zum
+        // Fundort) ist unauflösbar, kein Phantom-Schlüssel.
+        let foreign = KeyRecord {
+            version: KEY_RECORD_VERSION,
+            agent: "claude-code".into(),
+            local_id: "woanders".into(),
+        };
+        fs::write(dir.join(KEY_FILE), serde_json::to_vec(&foreign).unwrap()).unwrap();
+        let found = j.sessions().unwrap();
+        assert!(found.keys.is_empty());
+        assert_eq!(found.unresolved, vec![dir]);
+    }
+
+    #[test]
+    fn an_attacker_cannot_impersonate_a_victim_by_naming_their_own_id_after_the_victims_hash() {
+        let (_tmp, j) = journal();
+        let victim = SessionKey::new("claude-code", "31f3f224-victim").unwrap();
+        j.append(&victim, event(EventKind::SessionStart)).unwrap();
+
+        // Der Angreifer nennt seine Session wörtlich wie das Verzeichnis des
+        // Opfers — `b3-` und Hex passieren die Zeichenprüfung anstandslos.
+        let victim_dir = j.session_dir(&victim);
+        let stolen_name = victim_dir.file_name().unwrap().to_str().unwrap().to_owned();
+        let attacker = SessionKey::new("claude-code", stolen_name).unwrap();
+        j.append(&attacker, event(EventKind::SessionStart)).unwrap();
+
+        // Beide Sessions leben getrennt weiter: nichts migriert, nichts
+        // vermischt, nichts überschrieben.
+        assert_eq!(j.read(&victim).unwrap().events.len(), 1);
+        assert_eq!(j.read(&attacker).unwrap().events.len(), 1);
+        let record: KeyRecord =
+            serde_json::from_slice(&fs::read(victim_dir.join(KEY_FILE)).unwrap()).unwrap();
+        assert_eq!(record.local_id, "31f3f224-victim");
+        let found = j.sessions().unwrap();
+        assert_eq!(found.keys.len(), 2);
+        assert!(found.unresolved.is_empty());
+    }
+
+    #[test]
+    fn a_hash_shaped_local_id_is_not_confused_with_a_real_hash_bucket() {
+        let (_tmp, j) = journal();
+        // Ein Bestandsverzeichnis, dessen roher Name zufällig wie ein
+        // Hash-Bucket aussieht: Ohne `.key` zählt der Name, nicht die Form.
+        let key = SessionKey::new("claude-code", "b3-0123456789abcdef").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        make_legacy(&j, &key);
+
+        let found = j.sessions().unwrap();
+        assert_eq!(found.keys, vec![key.clone()]);
+        assert_eq!(j.read(&key).unwrap().events.len(), 1);
+
+        // Die Heilung verschiebt es an seinen echten Hash-Platz.
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+        assert_eq!(j.read(&key).unwrap().events.len(), 2);
+    }
+
+    #[test]
+    fn an_unsafe_key_error_names_the_rule_not_the_value() {
+        // Ein Wert, der die Prüfung reißt, ist der verdächtigste von allen —
+        // ein JWT über 128 Zeichen, ein Base64-Secret mit `+`. Genau er darf
+        // nie im Fehlertext stehen, denn der wandert ins hook.log (#95).
+        let jwt = format!("eyJhbGciOiJIUzI1NiJ9.{}", "x".repeat(140));
+        let err = SessionKey::new("claude-code", &jwt).unwrap_err();
+        assert!(!err.to_string().contains("eyJ"), "{err}");
+        assert!(!err.to_string().contains("xxx"), "{err}");
+        assert!(err.to_string().contains("161 Zeichen"), "{err}");
+    }
+
+    #[test]
+    fn an_unresolved_directory_with_a_raw_name_is_never_named_by_it() {
+        // Ein Alt-Verzeichnis (roher Token-Name), in das eine kaputte `.key`
+        // geraten ist: unauflösbar — aber der gemeldete Pfad darf den Namen
+        // nicht tragen, er erscheint in fsck-Ausgabe und hook.log.
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "glpat-ABCDEFGHIJ1234567890").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        let legacy = make_legacy(&j, &key);
+        fs::write(legacy.join(KEY_FILE), b"kein json").unwrap();
+
+        let found = j.sessions().unwrap();
+        assert!(found.keys.is_empty());
+        assert_eq!(found.unresolved.len(), 1);
+        let shown = found.unresolved[0].to_string_lossy();
+        assert!(!shown.contains("glpat"), "{shown}");
+        assert!(shown.ends_with('…'), "{shown}");
+    }
+
+    #[test]
+    fn read_and_discard_leave_a_foreign_bucket_alone() {
+        // Dieselbe Verteidigung wie beim append, auf den kalten Pfaden: Ein
+        // Bucket, dessen `.key` einer anderen Session gehört, wird weder
+        // gelesen noch gelöscht — auch dann nicht, wenn er zufällig (oder
+        // absichtlich) am gehashten Platz dieses Schlüssels steht.
+        let (_tmp, j) = journal();
+        let owner = SessionKey::new("claude-code", "echte-session").unwrap();
+        j.append(&owner, event(EventKind::SessionStart)).unwrap();
+
+        let other = SessionKey::new("claude-code", "andere-session").unwrap();
+        // Fremdbesetzung simulieren: Der Bucket von `other` trägt den
+        // Schlüssel von `owner`.
+        let occupied = j.session_dir(&other);
+        fs::create_dir_all(&occupied).unwrap();
+        fs::copy(
+            j.session_dir(&owner).join(KEY_FILE),
+            occupied.join(KEY_FILE),
+        )
+        .unwrap();
+
+        assert!(j.read(&other).unwrap().events.is_empty());
+        j.discard(&other).unwrap();
+        assert!(occupied.exists(), "fremder Bucket wurde geloescht");
+    }
+
+    #[test]
+    fn an_empty_directory_is_a_crash_remnant_not_a_session() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "echt").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+
+        // Absturzreste der Anlage: ein Bucket ohne `.key` und ohne Events,
+        // und ein leeres Verzeichnis mit beliebigem Namen.
+        fs::create_dir_all(j.root().join("claude-code/b3-0000000000000000")).unwrap();
+        fs::create_dir_all(j.root().join("claude-code/leer")).unwrap();
+
+        let found = j.sessions().unwrap();
+        assert_eq!(found.keys, vec![key]);
+        assert!(found.unresolved.is_empty());
+    }
+
+    #[test]
+    fn display_redacted_hides_the_local_id_but_not_the_agent() {
+        let pipeline = minds_redact::RedactionConfig::default().pipeline().unwrap();
+        let key = SessionKey::new("claude-code", "glpat-ABCDEFGHIJ1234567890").unwrap();
+
+        let shown = key.display_redacted(&pipeline);
+        assert!(shown.starts_with("claude-code/"), "{shown}");
+        assert!(!shown.contains("glpat-ABCDEFGHIJ"), "{shown}");
+
+        // Eine gewöhnliche UUID bleibt lesbar — die Redaktion trifft Token,
+        // nicht Diagnose-Komfort.
+        let plain = SessionKey::new("claude-code", "31f3f224-f440-41ac-9244").unwrap();
+        assert_eq!(
+            plain.display_redacted(&pipeline),
+            "claude-code/31f3f224-f440-41ac-9244"
+        );
     }
 
     #[cfg(unix)]

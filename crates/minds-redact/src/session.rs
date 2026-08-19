@@ -61,6 +61,18 @@
 //! ablehnen, die niemand ablehnen wollte. Scannen ist die Antwort, die dem
 //! Rest des Envelopes gleicht.
 //!
+//! Seit #95 gilt dieselbe Prämisse auch **außerhalb** des Envelopes: `local_id`
+//! lebt schon vor jedem Checkpoint auf der Platte und in Ausgaben, und ein
+//! Token-förmiger Wert passierte dort jede Zeichenprüfung. Die Antworten
+//! stehen in `minds-capture` (der Journal-Verzeichnisname trägt nur noch
+//! `blake3(local_id)`, siehe die Modul-Doku von `journal.rs` und
+//! `check_component`) und an den Anzeige-Senken von `minds checkpoint` und
+//! `minds fsck`, die die Kennung durch genau diese Pipeline schicken
+//! (`SessionKey::display_redacted`). Beide Hälften — Envelope-Scan hier,
+//! Pfad- und Anzeige-Härtung dort — stützen sich auf dieselbe Einsicht: Der
+//! Wert ist fremdbestimmt, und keine Stelle darf annehmen, eine andere habe
+//! ihn schon entschärft.
+//!
 //! Genau **eine** Zeichenkette bleibt ungescannt: `effect.content`. Sie ist
 //! kein Gegenbeispiel, sondern der andere saubere Weg — dort erzwingt der Typ
 //! [`ContentHash`](minds_core::ContentHash) per `TryFrom<String>` 64

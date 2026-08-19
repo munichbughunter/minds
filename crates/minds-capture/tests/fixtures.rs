@@ -295,7 +295,7 @@ fn a_dotenv_read_never_reaches_the_journal_content() {
     );
 
     // Schon im Journal — vor jedem Checkpoint — ist der Inhalt weg.
-    let key = journal.sessions().unwrap().into_iter().next().unwrap();
+    let key = journal.sessions().unwrap().keys.into_iter().next().unwrap();
     let events = journal.read(&key).unwrap().events;
     let raw = events[0].payload.get();
     assert!(
