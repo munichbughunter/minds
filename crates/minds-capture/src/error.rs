@@ -38,8 +38,16 @@ pub enum CaptureError {
     ///
     /// Das ist die Sicherheitsgrenze des Journals: Der Wert kommt aus dem JSON,
     /// das der Agent auf stdin schickt. Siehe `SessionKey::new`.
-    #[error("unzulässiger Wert für {field}: {value:?}")]
-    UnsafeKey { field: &'static str, value: String },
+    ///
+    /// Der Wert selbst steht bewusst **nicht** im Fehler — nicht einmal im
+    /// Struct: Was hier abgelehnt wird, ist per Definition fremdbestimmt, und
+    /// gerade die Werte, die die Prüfung reißen (ein JWT über 128 Zeichen, ein
+    /// Base64-Secret mit `+`/`=`), sind die, die nie ins hook.log dürfen (#95).
+    /// Länge und Regel reichen, um den Fehler zu verstehen.
+    #[error(
+        "unzulässiger Wert für {field}: {len} Zeichen, erlaubt ist [A-Za-z0-9._-] (1–128, nicht ».« oder »..«)"
+    )]
+    UnsafeKey { field: &'static str, len: usize },
 
     /// Von hier aufwärts liegt kein Git-Repository.
     #[error("kein Git-Repository gefunden, ausgehend von {start}")]
@@ -52,6 +60,18 @@ pub enum CaptureError {
 
     #[error("Payload nennt weder session_id noch transcript_path")]
     NoSessionKey,
+
+    /// Die Schlüssel-Datei eines Session-Verzeichnisses bestätigt nicht den
+    /// Schlüssel, unter dem geschrieben werden soll — eine Hash-Kollision,
+    /// eine untergeschobene Kennung oder eine beschädigte Datei. In keinem der
+    /// drei Fälle darf dort geschrieben werden (#95).
+    ///
+    /// Der Text nennt bewusst nur das Verzeichnis (dessen Name ein Hash ist)
+    /// und keine `local_id`: Diese Meldung wandert über den Hook-Pfad ins
+    /// `hook.log`, und dort eine rohe Kennung abzulegen wäre genau das Leck,
+    /// das #95 schließt.
+    #[error("Schlüssel-Datei bestätigt eine andere Session: {dir}")]
+    KeyFileMismatch { dir: PathBuf },
 
     /// JSON ließ sich nicht lesen oder schreiben.
     #[error("JSON-Fehler")]

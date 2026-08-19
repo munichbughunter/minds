@@ -70,9 +70,15 @@ pub struct Checkpoint<'a> {
 ///
 /// Reihenfolge ist die von [`Journal::sessions`] (Agent, dann `local_id`) — so
 /// ist auch der Rückgabewert deterministisch.
+///
+/// Unauflösbare Verzeichnisse ([`SessionsOutcome::unresolved`]) meldet dieser
+/// Pfad nicht — wer sie sehen muss, geht über [`Journal::sessions`] selbst,
+/// wie `minds checkpoint` und `minds fsck` es tun.
+///
+/// [`SessionsOutcome::unresolved`]: crate::SessionsOutcome
 pub fn build(journal: &Journal) -> crate::Result<Vec<Session>> {
     let mut out = Vec::new();
-    for key in journal.sessions()? {
+    for key in journal.sessions()?.keys {
         let events = journal.read(&key)?.events;
         if events.is_empty() {
             continue;

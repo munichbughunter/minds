@@ -64,7 +64,7 @@ fn fsck(require_review: bool) -> Fallible<bool> {
 
     let orphans = check_trailers(&repo, store.as_ref())?;
     let index_orphans = check_index(store.as_ref())?;
-    check_journal(&repo);
+    check_journal(&repo, &root);
     let hooks = hook_state(&root, repo.git_dir());
     let hints = report_hooks(&root, &hooks)
         + report_agents(&root)
@@ -229,44 +229,100 @@ fn check_trailers(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fallibl
 /// Meldet den Zustand des Journals: was noch aussteht, was fehlt, was beschädigt
 /// ist. Nur Warnungen — ein volles Journal ist der Normalfall zwischen zwei
 /// Commits.
-fn check_journal(repo: &Repo) {
+///
+/// Eine kaputte Redaction-Policy bricht `fsck` hier bewusst **nicht** ab:
+/// Genau in dem Moment, in dem `checkpoint` daran fail-closed scheitert, ist
+/// `fsck` das Werkzeug, das die vertagte Session sichtbar macht. Fail-closed
+/// ist stattdessen die Anzeige — ohne Pipeline werden die Kennungen
+/// ausgeblendet, nie roh gezeigt (#95).
+fn check_journal(repo: &Repo, root: &Path) {
     let journal = Journal::open(repo.git_dir());
+    let pipeline = config::load_redaction(root)
+        .ok()
+        .and_then(|config| config.pipeline().ok());
+    for line in journal_report_lines(root, &journal, pipeline.as_ref()) {
+        println!("{line}");
+    }
+}
+
+/// Der Journal-Abschnitt des Berichts, Zeile für Zeile — reine Funktion, damit
+/// der Wortlaut golden testbar ist (siehe [`log_report_lines`]).
+///
+/// Das `local_id` läuft vor der Anzeige durch die Redaktion: `fsck` läuft im
+/// CI-Gate, seine Ausgabe landet in Pipeline-Logs — und seit #35 gilt die
+/// Kennung als fremdbestimmter Wert, der auch ein Token sein kann (#95).
+/// `None` heißt: Die Policy ließ sich nicht laden — dann erscheinen die
+/// Kennungen gar nicht, mit einer Zeile, die den Grund nennt. Ein
+/// unauflösbares Verzeichnis wird dagegen nur über seinen Pfad genannt; der
+/// trägt nur Agentname und Hash und braucht keine Redaktion.
+fn journal_report_lines(
+    root: &Path,
+    journal: &Journal,
+    pipeline: Option<&minds_redact::RedactionPipeline>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
     let Ok(sessions) = journal.sessions() else {
-        return;
+        return lines;
     };
 
-    if sessions.is_empty() {
-        println!("Journal: leer");
-        return;
+    if sessions.keys.is_empty() && sessions.unresolved.is_empty() {
+        lines.push("Journal: leer".to_owned());
+        return lines;
     }
 
-    println!(
-        "Journal: {} Session(s) noch nicht eingecheckt",
-        sessions.len()
-    );
-    for key in sessions {
-        let Ok(outcome) = journal.read(&key) else {
-            continue;
-        };
-        let mut notes = Vec::new();
-        if !outcome.gaps.is_empty() {
-            notes.push(format!("{} Lücke(n)", outcome.gaps.len()));
+    if !sessions.keys.is_empty() {
+        lines.push(format!(
+            "Journal: {} Session(s) noch nicht eingecheckt",
+            sessions.keys.len()
+        ));
+        if pipeline.is_none() {
+            lines.push(
+                "  Kennungen ausgeblendet — die Redaction-Policy ist nicht lesbar, \
+                 siehe „.minds/redact.json“"
+                    .to_owned(),
+            );
         }
-        if !outcome.damaged.is_empty() {
-            notes.push(format!("{} beschädigt", outcome.damaged.len()));
+        for key in &sessions.keys {
+            let Ok(outcome) = journal.read(key) else {
+                continue;
+            };
+            let mut notes = Vec::new();
+            if !outcome.gaps.is_empty() {
+                notes.push(format!("{} Lücke(n)", outcome.gaps.len()));
+            }
+            if !outcome.damaged.is_empty() {
+                notes.push(format!("{} beschädigt", outcome.damaged.len()));
+            }
+            let suffix = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", notes.join(", "))
+            };
+            let shown = match pipeline {
+                Some(pipeline) => key.display_redacted(pipeline),
+                None => format!("{}/…", key.agent()),
+            };
+            lines.push(format!(
+                "  {shown}: {} Event(s){suffix}",
+                outcome.events.len()
+            ));
         }
-        let suffix = if notes.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", notes.join(", "))
-        };
-        println!(
-            "  {}/{}: {} Event(s){suffix}",
-            key.agent(),
-            key.local_id(),
-            outcome.events.len()
-        );
     }
+
+    if !sessions.unresolved.is_empty() {
+        lines.push(format!(
+            "Journal: {} Verzeichnis(se) ohne lesbare Schlüssel-Datei",
+            sessions.unresolved.len()
+        ));
+        for dir in &sessions.unresolved {
+            lines.push(format!(
+                "  „{}“ — Session nicht zuordenbar, bleibt liegen",
+                short(root, dir)
+            ));
+        }
+    }
+
+    lines
 }
 
 /// Die Hooks, ohne die nichts erfasst wird.
@@ -1696,5 +1752,116 @@ mod tests {
 
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(report_log(empty.path(), &empty.path().join(".git")), 0);
+    }
+
+    /// Ein Journal in einem Wegwerf-„Git-Verzeichnis", mit einem Event unter
+    /// dem gegebenen Schlüssel.
+    fn journal_with_session(agent: &str, local_id: &str) -> (tempfile::TempDir, Journal) {
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&root.path().join(".git"));
+        let key = minds_capture::SessionKey::new(agent, local_id).unwrap();
+        let (at, at_nanos) = minds_capture::clock::now();
+        journal
+            .append(
+                &key,
+                minds_capture::NewEvent {
+                    at,
+                    at_nanos,
+                    kind: minds_capture::EventKind::Prompt,
+                    raw_kind: "UserPromptSubmit".into(),
+                    cwd: None,
+                    transcript_path: None,
+                    payload: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+                },
+            )
+            .unwrap();
+        (root, journal)
+    }
+
+    fn strict_pipeline() -> minds_redact::RedactionPipeline {
+        minds_redact::RedactionConfig::default().pipeline().unwrap()
+    }
+
+    #[test]
+    fn golden_the_journal_report_redacts_a_token_shaped_local_id() {
+        // Genau der Fall aus #95: eine Session-Kennung in Token-Form darf
+        // nach `minds fsck` nicht wörtlich in dessen Ausgabe stehen.
+        let (root, journal) = journal_with_session("claude-code", "glpat-ABCDEFGHIJ1234567890");
+        let lines = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        assert_eq!(
+            lines,
+            [
+                "Journal: 1 Session(s) noch nicht eingecheckt",
+                "  claude-code/[redacted:secret]: 1 Event(s)",
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_a_plain_session_id_stays_readable() {
+        // Die Redaktion trifft Token, nicht Diagnose-Komfort: Eine
+        // gewöhnliche UUID bleibt, wie sie ist.
+        let (root, journal) = journal_with_session("claude-code", "31f3f224-f440-41ac-9244");
+        let lines = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        assert_eq!(
+            lines,
+            [
+                "Journal: 1 Session(s) noch nicht eingecheckt",
+                "  claude-code/31f3f224-f440-41ac-9244: 1 Event(s)",
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_an_unresolved_directory_is_named_by_path_only() {
+        // Eine beschädigte Schlüssel-Datei macht die Session unauflösbar —
+        // gemeldet wird der Pfad (nur Agentname und Hash), nie eine Kennung.
+        let (root, journal) = journal_with_session("claude-code", "kaputt");
+        let dir = {
+            let mut sub = std::fs::read_dir(journal.root().join("claude-code")).unwrap();
+            sub.next().unwrap().unwrap().path()
+        };
+        std::fs::write(dir.join(".key"), b"kein json").unwrap();
+
+        let lines = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0],
+            "Journal: 1 Verzeichnis(se) ohne lesbare Schlüssel-Datei"
+        );
+        assert!(
+            lines[1].contains("Session nicht zuordenbar"),
+            "{}",
+            lines[1]
+        );
+        assert!(!lines[1].contains("kaputt"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn an_empty_journal_still_reads_as_empty() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::open(&root.path().join(".git"));
+        assert_eq!(
+            journal_report_lines(root.path(), &journal, Some(&strict_pipeline())),
+            ["Journal: leer".to_owned()]
+        );
+    }
+
+    #[test]
+    fn golden_a_broken_policy_hides_the_ids_but_not_the_sessions() {
+        // Genau dann, wenn `checkpoint` an der Policy fail-closed scheitert,
+        // muss `fsck` die vertagte Session noch zeigen — nur eben ohne
+        // Kennung, denn ungeprüft anzeigen wäre das Leck aus #95.
+        let (root, journal) = journal_with_session("claude-code", "glpat-ABCDEFGHIJ1234567890");
+        let lines = journal_report_lines(root.path(), &journal, None);
+        assert_eq!(
+            lines,
+            [
+                "Journal: 1 Session(s) noch nicht eingecheckt",
+                "  Kennungen ausgeblendet — die Redaction-Policy ist nicht lesbar, \
+                 siehe „.minds/redact.json“",
+                "  claude-code/…: 1 Event(s)",
+            ]
+        );
     }
 }
