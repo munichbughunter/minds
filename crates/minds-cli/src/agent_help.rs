@@ -49,7 +49,7 @@ fn card() -> serde_json::Value {
             {"name": "stack", "usage": "minds stack [--base <ref>]", "summary": "Abhängige Changes und ihr Review-Stand; überlebt Rebase und Force-Push."},
             {"name": "gitlab", "usage": "minds gitlab mirror <subject> --mr <nr> | minds gitlab webhook [--write]", "summary": "Verdicts als MR-Note spiegeln bzw. Webhook-Kommentar als Verdict deuten."},
             {"name": "audit", "usage": "minds audit --export [--out <datei>] [--base <ref>]", "summary": "Provenienz-Kette als portables, ohne dieses Werkzeug prüfbares Bündel."},
-            {"name": "sync", "usage": "minds sync [--remote <name>]", "summary": "Kontext und Reviews zum Remote — alle Refs in einer Verbindung, nie mit --force."},
+            {"name": "sync", "usage": "minds sync [--remote <name>]", "summary": "Kontext und Reviews zum Remote — alle Refs in einer Verbindung, nie mit --force, außer für die Übertragung einer DSGVO-Löschung (Tombstone-Ref)."},
             {"name": "render", "usage": "minds render [--out <verzeichnis>]", "summary": "Statische HTML-Seite über den Kontext."}
         ]
     })

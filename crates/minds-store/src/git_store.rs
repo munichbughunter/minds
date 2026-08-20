@@ -91,7 +91,7 @@
 use std::collections::BTreeSet;
 
 use minds_core::{Evidence, SESSION_ID_PREFIX, SessionId};
-use minds_git::{GitError, MINDS_REF_NAMESPACE, RefUpdate, Repo};
+use minds_git::{CommitId, GitError, MINDS_REF_NAMESPACE, RefUpdate, Repo};
 
 use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
@@ -134,8 +134,9 @@ const INDEX_PATH: &str = "index.json";
 ///   verschiedene Sessions schreiben, fassen verschiedene Refs an. Wer dieselbe
 ///   Session schreibt, schreibt denselben Baum — der zweite Lauf ist ein No-op.
 /// - **Kein divergenter Push.** Ein Session-Ref entsteht genau einmal und ändert
-///   sich danach nicht mehr (außer beim Vergessen, und das ist ein
-///   Fast-Forward). Er kann nicht non-fast-forward abprallen.
+///   sich danach nicht mehr — außer beim Vergessen, das ihn auf einen
+///   elternlosen Tombstone setzt (#14); den überträgt `minds sync` als gezielten
+///   Force-Push (#102). Regulär kann er nicht non-fast-forward abprallen.
 ///
 /// `refs/minds/store/` und nicht `refs/minds/sessions/`: Letzteres trägt die
 /// *browsbaren* Branches des Child-Backends (gekürzter Hash, mit `session.md`
@@ -170,6 +171,11 @@ const SESSION_FILE: &str = "session.json";
 /// konfliktfrei, die kalten Pfade (`fsck`, `render`, `show`) lesen dafür N
 /// kleine Blobs statt einen großen.
 const SESSION_LINKS_FILE: &str = "links.json";
+
+/// Der Namensraum der browsbaren Session-Branches: `refs/minds/sessions/<hex>`
+/// (gekürzter Hash). Der Push mappt sie im Child-Backend auf Branches
+/// `minds/session/<hex>`, damit die Forge jede Session als Seite zeigt.
+const SESSION_BRANCH_PREFIX: &str = "refs/minds/sessions/";
 
 /// Die Dateien im Baum eines Session-Branches: die Session als JSON (die
 /// maßgebliche, content-adressierte Form) und als `session.md` (die Forge
@@ -530,11 +536,11 @@ impl GitStore {
             .reset_ref_to_root(reference, tree, current, message)
     }
 
-    /// Löst die Push-Buchhaltung eines Orts vom Klartext: setzt jeden
-    /// `refs/minds/remotes/<remote>/<rest>`, der denselben Ref ankert und dabei
-    /// abgeschnittenen Klartext trägt, auf den aktuellen Stand um — oder löscht
-    /// ihn, wenn es den maßgeblichen Ref gar nicht mehr gibt (#14). Gibt zurück, ob
-    /// etwas verändert wurde.
+    /// Löst die Push-Buchhaltung eines Orts vom Klartext: **löscht** jeden
+    /// `refs/minds/remotes/<remote>/<rest>`, der einen session-exklusiven Ref
+    /// ankert und dabei abgeschnittenen Klartext trägt — beim geteilten
+    /// Kontext-Ref setzt er ihn stattdessen auf den aktuellen Stand um. Gibt
+    /// zurück, ob etwas verändert wurde.
     ///
     /// Nach dem Reset trägt der maßgebliche Ref einen elternlosen Tombstone; der
     /// Klartext ist über ihn nicht mehr erreichbar. Ein Tracking-Ref aber, den
@@ -543,12 +549,21 @@ impl GitStore {
     /// bliebe lokal unvollständig, obwohl `rev-list` über die Session-Refs sauber
     /// aussieht.
     ///
-    /// **Umsetzen, nicht löschen:** Ein gelöschter Tracking-Ref entankerte den
-    /// Klartext zwar, ließe `minds sync` den Tombstone-Ref aber für einen
-    /// non-fast-forward-Push anbieten (der Remote trägt noch den Klartext) — der
-    /// prallt ab und erzeugt bei jedem Push Fehler-Rauschen. Auf den neuen Stand
-    /// umgesetzt, ankert der Tracking-Ref keinen Klartext mehr **und** `sync` sieht
-    /// `tracked == local`, bietet also nichts an; die Remote-Seite zieht #102 nach.
+    /// **Löschen, nicht umsetzen (session-exklusive Refs, #102):** Der gelöschte
+    /// Tracking-Ref entankert den Klartext **und** lässt `minds sync` den Ref
+    /// wieder anbieten — der sieht am ungetrackten Ref einen Tombstone und
+    /// überträgt genau ihn per gezieltem Force-Push zur Forge. Würde der
+    /// Tracking-Ref stattdessen auf den Tombstone umgesetzt, sähe `sync`
+    /// `tracked == local` und böte nichts an; die Forge behielte den Klartext
+    /// als aktuelle Ref-Spitze (browsbare `session.md`), obwohl `forget` Erfolg
+    /// gemeldet hat.
+    ///
+    /// **Der geteilte Kontext-Ref wird weiter umgesetzt:** Sein Baum gehört
+    /// nicht einer Session allein, und `sync` kann seine Spitze nicht als
+    /// Tombstone verifizieren — ein Force-Push wäre dort nicht abgrenzbar und
+    /// könnte fremde Stände überschreiben. Umgesetzt ankert der Tracking-Ref
+    /// keinen Klartext mehr; die Remote-Historie des Kontext-Refs nachzuziehen
+    /// bleibt ein manueller Schritt.
     ///
     /// **Nur echte Klartext-Anker, kein Fast-Forward-Rückstand:** Umgesetzt wird
     /// nur, wenn der Tracking-Stand **kein** Vorfahr des aktuellen ist — dann hat
@@ -590,7 +605,7 @@ impl GitStore {
             }
             match target {
                 Some(head) if current != head => {
-                    // Nur umsetzen, wenn `current` **kein** Vorfahr von `head`
+                    // Nur anfassen, wenn `current` **kein** Vorfahr von `head`
                     // ist: Dann hat ein Orphan-Reset (Tombstone) die Kette gekappt,
                     // und der Tracking-Ref ankert abgeschnittenen (Klartext-)Inhalt
                     // — de-ankern. Ist `current` dagegen ein Vorfahr (der geteilte
@@ -603,9 +618,16 @@ impl GitStore {
                         .is_ancestor(current, head)
                         .map_err(StoreError::backend)?
                     {
-                        self.repo
-                            .set_ref(&name, head)
-                            .map_err(StoreError::backend)?;
+                        if session_exclusive(rest) {
+                            // De-ankern durch Löschen: `sync` sieht den Ref als
+                            // ungetrackt, erkennt den Tombstone an der Spitze und
+                            // trägt die Löschung per Force-Push zur Forge (#102).
+                            self.repo.delete_ref(&name).map_err(StoreError::backend)?;
+                        } else {
+                            self.repo
+                                .set_ref(&name, head)
+                                .map_err(StoreError::backend)?;
+                        }
                         changed = true;
                     }
                 }
@@ -787,7 +809,55 @@ fn session_branch_ref(id: SessionId) -> String {
         .take(SESSION_BRANCH_HEX / 2)
         .map(|byte| format!("{byte:02x}"))
         .collect();
-    format!("refs/minds/sessions/{hex}")
+    format!("{SESSION_BRANCH_PREFIX}{hex}")
+}
+
+/// Ob `rest` (der Ref-Name hinter `refs/minds/`) einen Ort bezeichnet, der genau
+/// **einer** Session gehört: die Nutzlast (`store/<hex>`) oder ihr browsbarer
+/// Branch (`sessions/<hex>`). Nur an solchen Refs ist ein Tombstone die ganze
+/// Wahrheit über den Ref — der geteilte Kontext-Ref trägt daneben die übrigen
+/// Sessions und fällt hier bewusst durch.
+fn session_exclusive(rest: &str) -> bool {
+    [SESSION_STORE_PREFIX, SESSION_BRANCH_PREFIX]
+        .into_iter()
+        .any(|prefix| {
+            prefix
+                .strip_prefix(MINDS_REF_NAMESPACE)
+                .is_some_and(|prefix| rest.starts_with(prefix))
+        })
+}
+
+/// Der Tombstone-Grund, wenn `commit` an einem **session-exklusiven** Minds-Ref
+/// einen Tombstone trägt — sonst `None`.
+///
+/// Das ist die Weiche, an der `minds sync` entscheidet, ob ein non-fast-forward-
+/// Ref per gezieltem Force-Push zur Forge darf (#102): Nur wenn der zu pushende
+/// Stand nachweislich ein Tombstone ist, darf er einen fremden Stand ersetzen —
+/// nie Klartext über Klartext. Deshalb ist die Prüfung fail-closed: Ein Ref
+/// außerhalb der Session-Namensräume, ein unlesbarer Commit oder eine Nutzlast,
+/// die kein Tombstone ist, ergeben alle `None`.
+pub fn tombstone_at(repo: &Repo, reference: &str, commit: CommitId) -> Option<String> {
+    let rest = reference.strip_prefix(MINDS_REF_NAMESPACE)?;
+    if !session_exclusive(rest) {
+        return None;
+    }
+    // Elternlos muss er sein: Ein Force-Push überträgt den Commit samt
+    // Historie. `forget` schreibt Tombstones nur als Wurzel (#14); trüge einer
+    // doch Eltern, reiste deren Inhalt mit — dann lieber zurückstellen.
+    if !repo.is_root_commit(commit).ok()? {
+        return None;
+    }
+    // Beide Orte tragen ihre Nutzlast als `session.json`; geprüft wird trotzdem
+    // die Datei des jeweiligen Orts, damit ein künftiges Auseinanderlaufen der
+    // Konstanten hier nicht stumm danebengriffe.
+    let file = if reference.starts_with(SESSION_STORE_PREFIX) {
+        SESSION_FILE
+    } else {
+        SESSION_BRANCH_FILE
+    };
+    let tree = repo.tree_of(commit).ok()?;
+    let bytes = repo.read_blob(tree, file).ok()??;
+    crate::tombstone::reason(&bytes)
 }
 
 impl ContextStore for GitStore {
@@ -1306,13 +1376,15 @@ mod tests {
     }
 
     #[test]
-    fn forget_retargets_a_tracking_ref_off_the_plaintext_onto_the_tombstone() {
+    fn forget_deletes_a_tracking_ref_that_anchors_the_plaintext() {
         // #14 (B1): Nach einem Sync zeigt ein lokaler Tracking-Ref
         // (`refs/minds/remotes/<remote>/store/<hash>`) auf den Klartext-Commit.
         // Tilgt `forget` nur den maßgeblichen Store-Ref, hielte der Tracking-Ref
         // den Klartext-Blob erreichbar und gc-immun — die Löschung wäre lokal
         // unvollständig, während `rev-list` über die Session-Refs sauber aussieht.
-        // `forget` setzt den Tracking-Ref deshalb auf den Tombstone um.
+        // `forget` löscht den Tracking-Ref deshalb (#102): De-ankern und zugleich
+        // `minds sync` den Ref wieder anbieten lassen, damit der Tombstone die
+        // Forge per gezieltem Force-Push erreicht.
         let (fixture, store) = fresh_store();
         let id = store.put(&redacted("streng geheim")).unwrap().id();
         let payload_blob = fixture
@@ -1338,18 +1410,63 @@ mod tests {
             !after.contains(&payload_blob),
             "Klartext-Blob über den Tracking-Ref noch erreichbar:\n{after}"
         );
-        // … und der Tracking-Ref lebt noch, zeigt aber jetzt auf den Tombstone
-        // (denselben Stand wie der Store-Ref): `minds sync` sieht „schon auf
-        // Stand" und bietet keinen non-fast-forward-Push an.
-        let tombstone = fixture
-            .git(&["rev-parse", &session_ref(id)])
-            .trim()
-            .to_owned();
-        let now = fixture.git(&["rev-parse", &tracking]).trim().to_owned();
-        assert_eq!(
-            now, tombstone,
-            "Tracking-Ref nicht auf den Tombstone umgesetzt"
+        // … und der Tracking-Ref ist fort: `minds sync` sieht den Store-Ref als
+        // ungetrackt, erkennt den Tombstone an der Spitze und überträgt die
+        // Löschung per Force-Push zur Forge (#102).
+        let refs = fixture.git(&["for-each-ref", "refs/minds/remotes"]);
+        assert!(
+            !refs.contains(&tracking),
+            "Tracking-Ref nicht gelöscht:\n{refs}"
         );
+    }
+
+    #[test]
+    fn a_tombstone_is_only_recognized_at_session_exclusive_refs() {
+        // #102: Auf dieser Prüfung fußt die Force-Weiche in `minds sync` — sie
+        // muss den Tombstone am Session-Ref erkennen und für alles andere
+        // fail-closed `None` liefern, sonst wäre der Force-Push nicht auf die
+        // Übertragung einer Löschung begrenzt.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        let reference = session_ref(id);
+        // Auch der browsbare Branch — sein Baum trägt `session.json` **und**
+        // `session.md`, das prüft die Datei-Weiche gegen einen echten Baum.
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+        store.put_session_branch_bytes(&bytes, &markdown).unwrap();
+        let branch = session_branch_ref(id);
+
+        let repo = Repo::open(fixture.path()).unwrap();
+        let plain = repo.commit_at(&reference).unwrap().unwrap();
+        assert_eq!(tombstone_at(&repo, &reference, plain), None, "Klartext");
+        let plain_branch = repo.commit_at(&branch).unwrap().unwrap();
+        assert_eq!(
+            tombstone_at(&repo, &branch, plain_branch),
+            None,
+            "Klartext-Branch"
+        );
+
+        store.forget(id, "DSGVO-Antrag #42").unwrap();
+        let repo = Repo::open(fixture.path()).unwrap();
+        let tomb = repo.commit_at(&reference).unwrap().unwrap();
+        assert_eq!(
+            tombstone_at(&repo, &reference, tomb).as_deref(),
+            Some("DSGVO-Antrag #42"),
+            "Tombstone am Store-Ref"
+        );
+        let tomb_branch = repo.commit_at(&branch).unwrap().unwrap();
+        assert_eq!(
+            tombstone_at(&repo, &branch, tomb_branch).as_deref(),
+            Some("DSGVO-Antrag #42"),
+            "Tombstone am Session-Branch"
+        );
+
+        // Der geteilte Kontext-Ref fällt durch — selbst wenn er auf denselben
+        // Commit zeigte, gehörte sein Baum nicht einer Session allein.
+        assert_eq!(tombstone_at(&repo, DEFAULT_CONTEXT_REF, tomb), None);
+        // Ein Ref außerhalb von refs/minds/ sowieso.
+        assert_eq!(tombstone_at(&repo, "refs/heads/main", tomb), None);
     }
 
     #[test]
@@ -1393,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn forget_retargets_a_tracking_ref_of_a_remote_with_a_slash() {
+    fn forget_unanchors_a_tracking_ref_of_a_remote_with_a_slash() {
         // #14-Major: Der Remote-Name darf Schrägstriche enthalten. Ein
         // `refs/minds/remotes/team/origin/store/<hash>` muss trotzdem getroffen
         // werden, sonst überlebte der Klartext-Anker.
@@ -1421,9 +1538,9 @@ mod tests {
     }
 
     #[test]
-    fn forget_retargets_every_remote_tracking_ref_of_a_place() {
+    fn forget_unanchors_every_remote_tracking_ref_of_a_place() {
         // Ankern zwei Remotes denselben Klartext-Commit, muss `forget` **beide**
-        // Tracking-Refs umsetzen — sonst hielte der übersehene den Klartext.
+        // Tracking-Refs de-ankern — sonst hielte der übersehene den Klartext.
         let (fixture, store) = fresh_store();
         let id = store.put(&redacted("streng geheim")).unwrap().id();
         let payload_blob = fixture

@@ -89,7 +89,12 @@ ausgelöst:
 
 1. **`git push`** — der `pre-push`-Hook überträgt `refs/minds/*` auf genau
    das Remote, auf das der Nutzer ohnehin pusht. Gibt es nichts Neues, wird
-   keine Verbindung geöffnet. Es wird nie mit `--force` gepusht. Abschaltbar
+   keine Verbindung geöffnet. Es wird nie mit `--force` gepusht — mit genau
+   einer, eng gefassten Ausnahme: Ein per `minds forget` getilgter
+   Session-Ref (nachweislich ein Tombstone, nie Klartext) wird gezielt
+   force-gepusht, damit die Löschung auch die Forge erreicht
+   ([#102](https://github.com/munichbughunter/minds/issues/102)); der
+   Vorgang wird beim Push gemeldet und in `hook.log` vermerkt. Abschaltbar
    per `git config minds.sync false`.
 2. **`minds gitlab mirror`** — nur auf expliziten Aufruf. Übertragen wird ein
    Review-Verdict als Merge-Request-Notiz (Entscheidung, Reviewer,
@@ -117,22 +122,28 @@ funktionsfähig und benennen die Session als vergessen, statt zu
 scheitern. Physisch
 entfernt das Objekt erst das nächste `git gc`; bis dahin ist es unerreichbar,
 aber vorhanden. Git führt für `refs/minds/*` in der Standard-Konfiguration
-kein Reflog.
+kein Reflog. Einen bereits auf die Forge gepushten Session-Ref zieht der
+nächste `git push` (oder `minds sync`) per gezieltem Force-Push nach —
+die Löschung erreicht damit auch die Ref-Spitze auf der Forge (#102).
 
 ## 6. Bekannte Lücken — Stand v0.1.3
 
 Die Liste, die eine Freigabe-Entscheidung braucht. Nichts davon ist
 verschwiegen, alles ist als Issue öffentlich:
 
-- **Gepushte Sessions erreicht `forget` nicht automatisch**
-  ([#102](https://github.com/munichbughunter/minds/issues/102)). Die
-  Löschung schreibt die Ref-Kette neu und ist damit kein Fast-Forward;
-  `sync` force-pusht grundsätzlich nie. Ein bereits auf die Forge gepushter
-  Session-Ref behält dort den Klartext, bis jemand von Hand
-  `git push --force` ausführt — und unterliegt danach der Objekt-Retention
-  der Plattform (Backups, Mirrors), die außerhalb der Kontrolle von Minds
-  liegt. **Empfehlung für den Piloten:** `forget` vor dem ersten Push wirkt
-  vollständig; nach einem Push gehört der Force-Push zum Löschprozess dazu.
+- **Die Forge behält getilgte Objekte nach ihren eigenen Regeln.** Die
+  Löschung eines bereits gepushten Session-Refs überträgt `sync` seit
+  [#102](https://github.com/munichbughunter/minds/issues/102) automatisch
+  (gezielter Force-Push des Tombstones beim nächsten Push). Damit weicht
+  der Klartext von der **Ref-Spitze** der Forge; die alten Objekte
+  unterliegen dort aber der Objekt-Retention der Plattform (unerreichbare
+  Objekte bis zum Housekeeping, Backups, Mirrors), die außerhalb der
+  Kontrolle von Minds liegt. Der geteilte Kontext-Ref eines Bestandsrepos
+  bleibt zudem außen vor: Er trägt auch die übrigen Sessions und wird nie
+  force-gepusht; seine Remote-Historie ist bei Bedarf von Hand
+  nachzuziehen. **Empfehlung für den Piloten:** `forget` vor dem ersten
+  Push wirkt vollständig; nach einem Push gehört die Housekeeping-Frage an
+  die Forge zum Löschprozess dazu.
 - **Das Rohdaten-Journal ist das eine Klartext-Fenster.** Zwischen Erfassung
   und Einchecken liegen die unredigierten Rohdaten — einschließlich
   Tool-Ergebnissen wie der Ausgabe von `cat .env` — unter
@@ -177,7 +188,8 @@ abgelegt. Es gibt keinen Kanal nach außen außer dem `git push` des Nutzers
 und dem explizit aufgerufenen GitLab-Spiegel (nur Review-Verdicts — deren
 freie Zusammenfassung verantwortet der Reviewer selbst, sie wird nicht
 redigiert).
-DSGVO-Löschung existiert und wirkt lokal vollständig; ihre bekannte Grenze
-ist der bereits gepushte Stand (#102). Vertrauliche Rückfragen und Befunde
+DSGVO-Löschung existiert, wirkt lokal vollständig und erreicht seit #102
+auch die Ref-Spitze bereits gepushter Session-Refs; ihre bekannte Grenze
+ist die Objekt-Retention der Forge. Vertrauliche Rückfragen und Befunde
 mit Session-Inhalten gehen an den benannten Ansprechpartner, nicht in den
 öffentlichen Issue-Tracker.

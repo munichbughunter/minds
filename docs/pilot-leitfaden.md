@@ -133,9 +133,11 @@ Die ehrliche Liste — lies sie als „gilt heute", sie ist Teil der Übergabe:
 - **Tool-Ebene nur für Claude Code** (siehe Abschnitt 4).
 - **Die Review-Schicht braucht zwei Personen auf einem Repo** — allein
   bleiben Erfassung, `why` und `recall` testbar, Reviews nicht.
-- **`forget` und bereits gepushte Sessions:**
-  [#102](https://github.com/munichbughunter/minds/issues/102) — Details und
-  Empfehlung in der Datenschutz-Übersicht.
+- **`forget` und bereits gepushte Sessions:** Die Löschung zieht der
+  nächste Push per gezieltem Force-Push nach
+  ([#102](https://github.com/munichbughunter/minds/issues/102)); was die
+  Forge an unerreichbaren Objekten behält, steht in der
+  Datenschutz-Übersicht.
 - **Ein Push mit neuen Sessions öffnet zwei Verbindungen**
   ([#85](https://github.com/munichbughunter/minds/issues/85)) — gegen ein
   entferntes Remote spürbar, ohne neue Sessions kostet der Hook nichts.
