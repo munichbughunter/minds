@@ -131,9 +131,10 @@ The honest list — read it as "applies today"; it is part of the handover:
 - **Tool level only for Claude Code** (see section 4).
 - **The review layer needs two people on one repository** — alone, you can
   test capture, `why`, and `recall`, but not reviews.
-- **`forget` and already-pushed sessions:**
-  [#102](https://github.com/munichbughunter/minds/issues/102) — details and
-  recommendation in the privacy overview.
+- **`forget` and already-pushed sessions:** the next push catches up the
+  deletion via a targeted force-push
+  ([#102](https://github.com/munichbughunter/minds/issues/102)); what the
+  forge retains as unreachable objects is covered in the privacy overview.
 - **A push with new sessions opens two connections**
   ([#85](https://github.com/munichbughunter/minds/issues/85)) — noticeable
   against a distant remote; without new sessions the hook costs nothing.

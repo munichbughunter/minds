@@ -105,7 +105,7 @@ pub use reviews::{DEFAULT_REVIEW_REF, ReviewStore};
 mod layout;
 
 mod git_store;
-pub use git_store::TRACKING_REF_PREFIX;
+pub use git_store::{TRACKING_REF_PREFIX, tombstone_at};
 
 mod in_repo;
 pub use in_repo::InRepoStore;

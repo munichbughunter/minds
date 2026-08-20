@@ -21,6 +21,31 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **Die DSGVO-Löschung eines bereits gepushten Session-Refs erreicht jetzt die
+  Forge** ([#102](https://github.com/munichbughunter/minds/issues/102)). Seit
+  die Tombstones elternlos sind (#14), war ein getilgter Ref kein Fast-Forward
+  mehr; `minds sync` (das nie mit `--force` pusht) ließ die Forge den Klartext
+  als aktuelle, browsbare Ref-Spitze behalten — lokal getilgt, remote sichtbar,
+  mit Erfolgsmeldung. Jetzt löscht `forget` die Push-Buchhaltung
+  (`refs/minds/remotes/*`) der getilgten Session-Refs, statt sie auf den
+  Tombstone umzusetzen, und `sync` überträgt genau diese Refs mit einer
+  `+`-Refspec: nur wenn der zu pushende Stand nachweislich ein Tombstone an
+  einem session-exklusiven Ref ist (fail-closed geprüft am Inhalt) und der
+  zuletzt gepushte Stand keiner war — nie Klartext über Klartext, jeder andere
+  Ref bleibt strikt fast-forward und echte Divergenz weiterhin zurückgestellt.
+  Zur Verifikation gehört der Nachweis der Elternlosigkeit — ein Tombstone mit
+  Historie reiste sonst samt Inhalt. Die Übertragung wird beim Push gemeldet
+  und in `hook.log` vermerkt; weist die Forge den Force-Push ab (Protected
+  Branch, Server-Hook), wird auch **das** bei jedem Lauf gemeldet, bis die
+  Löschung durch ist — statt stumm Erfolg zu suggerieren. `forget` nimmt jetzt
+  dasselbe Lock wie `sync`, damit ein laufender Push den eben gelöschten
+  Tracking-Ref nicht am Klartext neu erschafft, und verspricht den Force-Push
+  nur noch für die Orte, die ihn bekommen. Die `--force`-Zusage in
+  `agent-help`, `--help` und der Datenschutz-Übersicht ist entsprechend
+  präzisiert. Bewusst unverändert: Der geteilte Kontext-Ref eines Bestandsrepos
+  wird nie force-gepusht (er trägt auch die übrigen Sessions), und der
+  Store-Ref-Tombstone behält wie seit #14 seine `links.json` (Kanten
+  `commit → Session`, keine Nutzlast) — sie reist mit dem Erasure-Push mit.
 - **Der Backfill aus `minds enable` schreibt in `hook.log`, nicht mehr roh in
   `import.log` daneben** ([#69](https://github.com/munichbughunter/minds/issues/69)).
   Der Hintergrund-Import hängte stdout und stderr unverändert an eine zweite

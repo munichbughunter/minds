@@ -171,8 +171,9 @@ Verwendung:
 
   minds sync [--remote <name>] [-v]
         Schickt Kontext und Reviews an das Remote — alle fälligen Refs in
-        einer Verbindung, nie mit --force. Ruft der pre-push-Hook; ohne neue
-        Refs kostet der Aufruf keine Verbindung.
+        einer Verbindung, nie mit --force; einzige Ausnahme ist die
+        Übertragung einer DSGVO-Löschung (Tombstone-Ref). Ruft der
+        pre-push-Hook; ohne neue Refs kostet der Aufruf keine Verbindung.
 
   minds stack [--base <ref>]
         Zeigt die abhängigen Changes ab der Basis und ihren jeweiligen

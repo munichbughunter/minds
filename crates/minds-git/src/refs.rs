@@ -424,7 +424,12 @@ impl Repo {
     }
 
     /// Ob `commit` ein Wurzel-Commit ist — ohne Eltern.
-    fn is_root_commit(&self, commit: CommitId) -> Result<bool> {
+    ///
+    /// Öffentlich, weil `minds-store` damit belegt, dass ein Tombstone wirklich
+    /// elternlos ist (#102): Ein Force-Push überträgt den ganzen Commit samt
+    /// Historie, also gehört zur Verifikation „nachweislich ein Tombstone" auch
+    /// der Nachweis, dass keine Historie mitreist.
+    pub fn is_root_commit(&self, commit: CommitId) -> Result<bool> {
         Ok(self
             .gix()
             .find_commit(commit.to_gix())

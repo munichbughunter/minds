@@ -15,12 +15,17 @@
 //! 2. **Ein Push für alle Refs.** Kontext, Reviews und Session-Refs gehen als
 //!    Refspec-Liste in *einen* `git push`. N Refs kosten eine Verbindung, nicht
 //!    N.
-//! 3. **Nie `--force`.** Wird ein Ref abgewiesen, weil zwei Maschinen ihn
-//!    fortgeschrieben haben, wird der fremde Stand geholt und **vereinigt**
-//!    (der Thread-Log ist konfliktfrei mergebar, siehe
-//!    [`ReviewStore::merge_from`]), dann erneut gepusht — wieder fast-forward.
-//!    Was sich nicht vereinigen lässt, bleibt liegen. Der Remote wird nie
-//!    überschrieben.
+//! 3. **Nie `--force`** — mit genau einer, eng gefassten Ausnahme. Wird ein Ref
+//!    abgewiesen, weil zwei Maschinen ihn fortgeschrieben haben, wird der fremde
+//!    Stand geholt und **vereinigt** (der Thread-Log ist konfliktfrei mergebar,
+//!    siehe [`ReviewStore::merge_from`]), dann erneut gepusht — wieder
+//!    fast-forward. Was sich nicht vereinigen lässt, bleibt liegen. Der Remote
+//!    wird nie überschrieben. Die Ausnahme ist die Übertragung einer
+//!    DSGVO-Löschung (#102): Trägt ein session-exklusiver Ref lokal nachweislich
+//!    einen Tombstone ([`minds_store::tombstone_at`]), geht genau dieser Ref mit
+//!    einer `+`-Refspec — sonst behielte die Forge den Klartext einer gelöschten
+//!    Session als aktuelle, browsbare Ref-Spitze. Nie Klartext über Klartext;
+//!    jeder andere Ref bleibt strikt fast-forward.
 //!
 //! # Warum synchron und nicht im Hintergrund
 //!
@@ -67,7 +72,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
 
 use minds_git::{CommitId, MINDS_REF_NAMESPACE, Repo};
-use minds_store::{Backend, DEFAULT_REVIEW_REF, ReviewStore, TRACKING_REF_PREFIX};
+use minds_store::{Backend, DEFAULT_REVIEW_REF, ReviewStore, TRACKING_REF_PREFIX, tombstone_at};
 
 use crate::config;
 use crate::hooklog::{self, Source};
@@ -141,10 +146,11 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
     let (jobs, deferred) = plan(&root, &repo, remote)?;
 
     // Zurückgestellte, non-fast-forward Refs (siehe `due`): ohne `--force` nicht
-    // pushbar. Nach `forget` tritt das dank des Tracking-Umsetzens (#14) nicht auf
-    // — hier landet nur echte Divergenz. Gezählt werden **Refs**, nicht Sessions.
-    // Der Hinweis geht auf stdout (sichtbar beim Push) **und** ins Log, weil ein
-    // nicht übertragbarer Ref sichtbar bleiben soll, bis er aufgelöst ist.
+    // pushbar. Der `forget`-Fall landet hier nicht — ein verifizierter Tombstone
+    // geht als gezielter Force-Push mit (#102) —, hier bleibt echte Divergenz.
+    // Gezählt werden **Refs**, nicht Sessions. Der Hinweis geht auf stdout
+    // (sichtbar beim Push) **und** ins Log, weil ein nicht übertragbarer Ref
+    // sichtbar bleiben soll, bis er aufgelöst ist.
     if !deferred.is_empty() {
         ProgressLine::write(&format!(
             "minds: {} divergierte(r) Ref(s) nicht übertragen \
@@ -180,7 +186,7 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
         if job.updates.is_empty() {
             continue;
         }
-        if let Err(err) = job.execute(verbose) {
+        if let Err(err) = job.execute(&git_dir, verbose) {
             // Fail-soft: Der Push des Nutzers läuft weiter, die Refs bleiben
             // ungetrackt und werden beim nächsten Mal erneut angeboten.
             //
@@ -238,6 +244,11 @@ struct Update {
     destination: String,
     /// Der Tracking-Ref, der nach dem Erfolg auf `oid` gesetzt wird.
     tracking: String,
+    /// Ob dieser Ref mit einer `+`-Refspec geht — die eine Ausnahme vom
+    /// „nie `--force`": die Übertragung einer DSGVO-Löschung. Gesetzt wird das
+    /// Flag nur in [`due`], und nur wenn der zu pushende Stand nachweislich ein
+    /// Tombstone an einem session-exklusiven Ref ist (#102).
+    force: bool,
 }
 
 /// Ein Push: ein Repository, ein Remote, alle dorthin fälligen Refs.
@@ -300,8 +311,10 @@ fn merge_incoming(root: &Path, git_dir: &Path, remote: &str, verbose: bool) {
 
 /// Was zu tun ist — ohne eine einzige Netzoperation.
 ///
-/// Der zweite Rückgabewert nennt die Refs, die nur mit `--force` gingen (getilgte
-/// Sessions, #14) und deshalb übersprungen wurden — der Aufrufer meldet sie.
+/// Der zweite Rückgabewert nennt die Refs, die nur mit `--force` gingen, es aber
+/// nicht dürfen (echte Divergenz zweier Maschinen, #14) und deshalb übersprungen
+/// wurden — der Aufrufer meldet sie. Getilgte Sessions zählen seit #102 nicht
+/// mehr dazu: Ihr Tombstone reist als gezielter Force-Push mit den Updates.
 fn plan(root: &Path, repo: &Repo, remote: &str) -> Fallible<(Vec<Job>, Vec<String>)> {
     let store = config::load(root);
     let mut jobs = Vec::new();
@@ -355,19 +368,24 @@ fn plan(root: &Path, repo: &Repo, remote: &str) -> Fallible<(Vec<Job>, Vec<Strin
 }
 
 /// Alle Refs unter `prefix`, deren Stand noch nicht am `remote` vermerkt ist —
-/// und daneben die, die nur mit `--force` gingen.
+/// und daneben die, die nur mit `--force` gingen und es nicht dürfen.
 ///
 /// Ein Ref, dessen lokaler Stand **kein Fast-Forward** des zuletzt gepushten ist,
-/// landet nicht in den Updates: `minds sync` pusht nie mit `--force`, und ihn
-/// mitzuschicken ließe den ganzen (nicht-atomaren) Push scheitern und die übrigen
-/// Refs ungetrackt. Solche Refs kommen als zweiter Rückgabewert zurück, damit der
-/// Aufrufer sie melden kann.
+/// landet grundsätzlich nicht in den Updates: `minds sync` pusht nicht mit
+/// `--force`, und ihn mitzuschicken ließe den ganzen (nicht-atomaren) Push
+/// scheitern und die übrigen Refs ungetrackt. Solche Refs kommen als zweiter
+/// Rückgabewert zurück, damit der Aufrufer sie melden kann. Das ist das
+/// **Sicherheitsnetz** für echte Divergenz (zwei Maschinen).
 ///
-/// Das ist ein **Sicherheitsnetz** für echte Divergenz (zwei Maschinen). Der
-/// häufige `forget`-Fall landet hier bewusst *nicht*: `forget` setzt den
-/// Tracking-Ref auf den elternlosen Tombstone um (#14), sodass `tracked == local`
-/// gilt und der Ref gar nicht erst betrachtet wird — kein abgewiesener Push. Nur
-/// wo der getrackte Stand aus anderem Grund divergiert, greift die Zurückstellung.
+/// Die eine Ausnahme ist die DSGVO-Löschung (#102): Trägt der lokale Stand
+/// nachweislich einen Tombstone an einem session-exklusiven Ref
+/// ([`tombstone_at`], fail-closed) — und der zuletzt gepushte Stand keinen —,
+/// bekommt der Ref das `force`-Flag und geht mit `+`-Refspec. Der häufige Fall
+/// dahinter: `forget` hat den Tracking-Ref gelöscht (er ankerte den Klartext),
+/// der Ref erscheint hier als ungetrackt, seine Spitze ist der Tombstone — nur
+/// so erreicht die Löschung eine Forge, die den Klartext noch als Ref-Spitze
+/// trägt. Ein Force-Push geht damit nur „vorwärts zu einem Tombstone", nie
+/// Klartext über Klartext.
 fn due(
     repo: &Repo,
     remote: &str,
@@ -387,25 +405,42 @@ fn due(
             continue;
         }
         let tracking = tracking_ref(remote, &name);
-        match tracked.get(&tracking) {
+        let force = match tracked.get(&tracking) {
             // Schon auf diesem Stand vermerkt — nichts zu tun.
             Some(previous) if *previous == commit => continue,
-            // Abweichend und **kein** Fast-Forward: ohne `--force` nicht pushbar.
-            // Zurückstellen statt den ganzen Push reißen (#14). Ist der getrackte
-            // Commit lokal weggeprunt, liefert der Revwalk `false` → ebenfalls
-            // zurückgestellt; das ist die sichere Seite (nie ungefragt force).
+            // Abweichend und **kein** Fast-Forward: nur pushbar, wenn es die
+            // Übertragung einer Löschung ist — lokal ein Tombstone, der getrackte
+            // Stand keiner (#102). Alles andere wird zurückgestellt statt den
+            // ganzen Push zu reißen (#14). Ist der getrackte Commit lokal
+            // weggeprunt, liefert der Revwalk `false` und `tombstone_at` für ihn
+            // `None` — ein lokaler Tombstone geht dann trotzdem, denn die
+            // Schutzbedingung ist der nachgewiesene Tombstone auf der *eigenen*
+            // Seite; ein Nicht-Tombstone bleibt zurückgestellt (nie ungefragt
+            // force).
             Some(previous) if !repo.is_ancestor(*previous, commit)? => {
-                deferred.push(name);
-                continue;
+                if tombstone_at(repo, &name, commit).is_some()
+                    && tombstone_at(repo, &name, *previous).is_none()
+                {
+                    true
+                } else {
+                    deferred.push(name);
+                    continue;
+                }
             }
-            // Neu oder ein sauberes Fast-Forward — regulär pushen.
-            _ => {}
-        }
+            // Ein sauberes Fast-Forward — regulär pushen.
+            Some(_) => false,
+            // Ungetrackt. Trägt der Ref einen Tombstone, hat `forget` die
+            // Buchhaltung gelöscht und die Forge womöglich noch den Klartext:
+            // mit `+` schicken, damit die Löschung ankommt (#102). Für einen nie
+            // gepushten Ref ist die `+`-Refspec ein gewöhnliches Anlegen.
+            None => tombstone_at(repo, &name, commit).is_some(),
+        };
         updates.push(Update {
             local: name.clone(),
             oid: commit.to_string(),
             destination: destination(&name),
             tracking,
+            force,
         });
     }
     Ok((updates, deferred))
@@ -447,7 +482,7 @@ fn tracking_ref(remote: &str, local: &str) -> String {
 // ---------------------------------------------------------------------------
 
 impl Job {
-    fn execute(&self, verbose: bool) -> Fallible<()> {
+    fn execute(&self, git_dir: &Path, verbose: bool) -> Fallible<()> {
         // Fortschritt auf **stdout**: Git zeigt die Ausgabe des Hooks, und ein
         // Push, der zehn Sekunden schweigt, sieht aus wie ein hängender Push.
         //
@@ -469,12 +504,23 @@ impl Job {
             Ok(()) => {
                 line.finish(" fertig");
                 self.record(&self.updates, verbose);
+                self.report_erasures(git_dir);
                 Ok(())
             }
             Err(err) => {
                 // Die Zeile schließt sich beim Verlassen selbst; hier endet sie
                 // bewusst ohne Wort, weil der Aufrufer den Satz zu Ende bringt.
                 drop(line);
+                // Ein gescheiterter Push, der eine Löschung tragen sollte, darf
+                // nicht stumm bleiben — auch nicht, wenn `reconcile` den Rest
+                // des Jobs gleich rettet: Der `reconcile`-Umweg pusht nur den
+                // Review-Ref erneut, die Löschung stünde sonst ohne ein Wort
+                // aus, obwohl `forget` sie zugesagt hat. Gemeldet wird
+                // „nicht bestätigt": Der nicht-atomare Push kann einzelne
+                // Refspecs durchgebracht haben, ohne `record` wissen wir es
+                // nicht — der nächste Sync forciert idempotent nach und meldet
+                // dann den Erfolg.
+                self.report_failed_erasures(git_dir);
                 // Divergenz ist der eine Fehler, aus dem wir uns selbst
                 // befreien können — aber nur dort, wo der Inhalt vereinigbar
                 // ist. Für alles andere gilt: melden, nichts überschreiben.
@@ -495,11 +541,13 @@ impl Job {
             "--porcelain".into(),
             self.remote.clone(),
         ];
-        args.extend(
-            updates
-                .iter()
-                .map(|update| format!("{}:{}", update.oid, update.destination)),
-        );
+        args.extend(updates.iter().map(|update| {
+            // Die `+`-Refspec ist die eine, in `due` verifizierte Ausnahme
+            // (Tombstone-Übertragung, #102) — ein `--force`-Flag, das alle
+            // Refspecs beträfe, gibt es hier weiterhin nicht.
+            let sign = if update.force { "+" } else { "" };
+            format!("{sign}{}:{}", update.oid, update.destination)
+        }));
 
         let mut command = Command::new("git");
         let output = quiet_trace(&mut command)
@@ -529,6 +577,75 @@ impl Job {
             String::from_utf8_lossy(&output.stdout).trim()
         ))
         .into())
+    }
+
+    /// Meldet übertragene Löschungen — auf stdout **und** ins Log.
+    ///
+    /// Ein Force-Push ist die eine sicherheitssensible Ausnahme dieses Moduls;
+    /// dass er stattfand, gehört sichtbar zum Push (stdout) und dauerhaft in die
+    /// Akte (`hook.log`), mit den Ref-Namen — die tragen nur Hashes, keinen
+    /// Inhalt. Gemeldet wird nach `record`, also nur, was wirklich ankam: Der
+    /// `reconcile`-Umweg pusht ausschließlich den Review-Ref erneut und läuft
+    /// deshalb bewusst an dieser Meldung vorbei.
+    fn report_erasures(&self, git_dir: &Path) {
+        let erased: Vec<&str> = self
+            .updates
+            .iter()
+            .filter(|update| update.force)
+            .map(|update| update.local.as_str())
+            .collect();
+        if erased.is_empty() {
+            return;
+        }
+        ProgressLine::write(&format!(
+            "minds: {} getilgte(r) Ref(s) per Force-Push übertragen — die Löschung ist jetzt auch auf der Forge\n",
+            erased.len()
+        ));
+        hooklog::log_at(
+            git_dir,
+            Source::Sync,
+            &format!(
+                "DSGVO-Löschung übertragen ({}): Force-Push für {}",
+                display(&self.label),
+                erased.join(", ")
+            ),
+        );
+    }
+
+    /// Meldet Löschungen, deren Push scheiterte — bei **jedem** Lauf, bis sie
+    /// durch sind.
+    ///
+    /// Der Gegenpart zu [`report_erasures`](Self::report_erasures): Weist die
+    /// Forge die `+`-Refspec ab (Protected Branch auf `minds/session/*`,
+    /// `receive.denyNonFastForwards`, ein Hook auf einem Spiegel), bleibt der
+    /// Klartext dort die browsbare Ref-Spitze — und genau das darf nach der
+    /// Erfolgsmeldung von `forget` nicht lautlos passieren. Weil die
+    /// Tracking-Refs erst `record` schreibt, wiederholt sich diese Meldung bei
+    /// jedem Sync, bis der Tombstone bestätigt ankommt.
+    fn report_failed_erasures(&self, git_dir: &Path) {
+        let pending: Vec<&str> = self
+            .updates
+            .iter()
+            .filter(|update| update.force)
+            .map(|update| update.local.as_str())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+        ProgressLine::write(&format!(
+            "minds: DSGVO-Löschung NICHT bestätigt — {} getilgte(r) Ref(s) haben die Forge \
+             nicht erreicht, der nächste Sync versucht es erneut\n",
+            pending.len()
+        ));
+        hooklog::report_at(
+            git_dir,
+            Source::Sync,
+            &format!(
+                "Löschung nicht übertragen ({}): Force-Push scheiterte für {}",
+                display(&self.label),
+                pending.join(", ")
+            ),
+        );
     }
 
     /// Vermerkt den gepushten Stand in den Tracking-Refs.
@@ -611,6 +728,7 @@ impl Job {
             oid: commit.to_string(),
             destination: review.destination.clone(),
             tracking: review.tracking.clone(),
+            force: false,
         }];
         self.push(&retry)?;
         line.finish(&format!(" {merged} übernommen, fertig"));
@@ -639,12 +757,18 @@ fn is_rejected(text: &str) -> bool {
 /// mehr als „einer nach dem anderen" wird hier nicht gebraucht. Ein Lock, das
 /// älter ist als [`LOCK_STALE`], stammt von einem abgestürzten Lauf und wird
 /// übergangen — ein Rekorder darf sich nicht selbst dauerhaft aussperren.
-struct Lock {
+///
+/// `pub(crate)`, weil `minds forget` dasselbe Lock nimmt (#102): Tilgte es
+/// mitten in einem laufenden Sync, könnte dessen `record` den eben gelöschten
+/// Tracking-Ref am Klartext-Commit neu erschaffen — der nächste Sync heilte
+/// das zwar (lokal Tombstone, getrackt Klartext → Force), aber bis dahin
+/// ankerte die Buchhaltung wieder Klartext und die Forge trüge ihn weiter.
+pub(crate) struct Lock {
     path: PathBuf,
 }
 
 impl Lock {
-    fn acquire(git_dir: &Path) -> std::io::Result<Option<Self>> {
+    pub(crate) fn acquire(git_dir: &Path) -> std::io::Result<Option<Self>> {
         let dir = git_dir.join("minds");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join("sync.lock");
@@ -875,8 +999,9 @@ mod tests {
         // Das Sicherheitsnetz aus #14: Ein non-fast-forward Ref (hier per Hand als
         // divergierender Orphan gebaut) darf `minds sync` nicht reißen — er wird
         // zurückgestellt, die übrigen Refs (neu oder sauberes Fast-Forward) bleiben
-        // pushbar. (Nach `forget` selbst tritt der Fall dank des Tracking-
-        // Umsetzens nicht auf; dieser Test prüft die reine `due`-Weiche.)
+        // pushbar. Der Orphan trägt bewusst **keinen** Tombstone: Nur ein
+        // nachgewiesener Tombstone dürfte per Force mit (#102, nächster Test);
+        // alles andere bleibt auch dann liegen, wenn es elternlos ist.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path();
         let git = |args: &[&str]| -> String {
@@ -931,5 +1056,89 @@ mod tests {
                 .into_iter()
                 .collect()
         );
+        // Und keiner davon mit Force — hier ist nirgends ein Tombstone im Spiel.
+        assert!(updates.iter().all(|u| !u.force), "{updates:?}");
+    }
+
+    #[test]
+    fn only_a_verified_tombstone_travels_with_force() {
+        // Die eine Ausnahme vom „nie --force" (#102): Ein session-exklusiver Ref,
+        // dessen Spitze nachweislich ein Tombstone ist, geht mit `+`-Refspec —
+        // egal ob sein Tracking-Ref noch am Klartext hängt (Umsetzen schlug einst
+        // fehl) oder schon gelöscht ist (der reguläre `forget`-Pfad). Klartext
+        // dagegen bekommt das Flag nie, auch nicht als frischer Ref.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00")
+                .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+
+        git(&["init", "--quiet", "-b", "main"]);
+        git(&["commit", "--allow-empty", "--quiet", "-m", "a"]);
+        let a = git(&["rev-parse", "HEAD"]);
+
+        // Ein echter Tombstone-Commit und ein Klartext-Commit, beide elternlos.
+        let repo = Repo::open(path).unwrap();
+        let tomb_blob = repo
+            .write_blob(&minds_store::tombstone::bytes("DSGVO"))
+            .unwrap();
+        let tomb_tree = repo
+            .write_tree(None, [("session.json", tomb_blob)])
+            .unwrap();
+        let tomb = git(&["commit-tree", &tomb_tree.to_string(), "-m", "tombstone"]);
+        let plain_blob = repo.write_blob(br#"{"agent":{"name":"x"}}"#).unwrap();
+        let plain_tree = repo
+            .write_tree(None, [("session.json", plain_blob)])
+            .unwrap();
+        let plain = git(&["commit-tree", &plain_tree.to_string(), "-m", "klartext"]);
+
+        // erased: Tracking hängt noch am Klartext `a`, lokal der Tombstone → Force.
+        git(&["update-ref", "refs/minds/store/erased", &tomb]);
+        git(&["update-ref", "refs/minds/remotes/origin/store/erased", &a]);
+        // branch: ungetrackt (forget löschte die Buchhaltung), Tombstone → Force.
+        git(&["update-ref", "refs/minds/sessions/deadbeef", &tomb]);
+        // fresh: ungetrackt, Klartext → regulär, ohne Force.
+        git(&["update-ref", "refs/minds/store/fresh", &plain]);
+        // childed: Tombstone-Inhalt, aber **mit** Eltern — die Historie reiste
+        // beim Force mit. Divergiert (getrackt auf `a`) → zurückstellen.
+        let childed = git(&[
+            "commit-tree",
+            &tomb_tree.to_string(),
+            "-p",
+            &plain,
+            "-m",
+            "tombstone mit eltern",
+        ]);
+        git(&["update-ref", "refs/minds/store/childed", &childed]);
+        git(&["update-ref", "refs/minds/remotes/origin/store/childed", &a]);
+
+        let repo = Repo::open(path).unwrap();
+        let (updates, deferred) = due(&repo, "origin", MINDS_REF_NAMESPACE, identity).unwrap();
+
+        assert_eq!(deferred, vec!["refs/minds/store/childed".to_string()]);
+        let force: BTreeMap<&str, bool> = updates
+            .iter()
+            .map(|u| (u.local.as_str(), u.force))
+            .collect();
+        assert_eq!(force.get("refs/minds/store/erased"), Some(&true));
+        assert_eq!(force.get("refs/minds/sessions/deadbeef"), Some(&true));
+        assert_eq!(force.get("refs/minds/store/fresh"), Some(&false));
     }
 }

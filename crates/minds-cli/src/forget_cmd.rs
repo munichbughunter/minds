@@ -22,18 +22,21 @@
 //!   Standard-Konfiguration reflogged diese Refs nicht.)
 //! - Weil das die Ref-Kette neu schreibt, ist der Tombstone **kein**
 //!   Fast-Forward: Ein bereits auf die Forge **gepushter** Ref braucht einen
-//!   Force-Push, damit die Löschung dort ankommt. `minds sync` (das bewusst nie
-//!   mit `--force` pusht) überträgt einen solchen Ref deshalb noch nicht — der
-//!   gezielte Force-Push für Tombstones ist einem eigenen Schritt vorbehalten
-//!   (#102). Bis dahin trägt die Forge den alten Stand, und der Push ist von Hand
-//!   mit `--force` nachzuziehen.
+//!   Force-Push, damit die Löschung dort ankommt. Den erledigt `minds sync` beim
+//!   nächsten Push (oder von Hand aufgerufen) **gezielt** für die getilgten
+//!   Session-Refs — es prüft, dass der neue Stand ein Tombstone ist; jeder
+//!   andere Ref bleibt strikt fast-forward (#102). Nur der geteilte Kontext-Ref
+//!   eines Bestandsrepos bleibt außen vor: Er trägt auch die übrigen Sessions
+//!   und ist von Hand nachzuziehen, wenn seine Remote-Historie weichen soll.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use minds_core::SessionId;
-use minds_store::{Forget, tombstone};
+use minds_store::{Forget, ForgottenPlace, tombstone};
 
 use crate::context::Context;
+use crate::sync;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -58,6 +61,26 @@ fn forget(target: &str, reason: &str) -> Fallible<()> {
         .map_err(|err| format!("keine gültige Session-Id {target:?}: {err}"))?;
 
     let ctx = Context::open()?;
+    // Dasselbe Lock wie `minds sync` (#102): Tilgte `forget` mitten in einem
+    // laufenden Sync, könnte dessen `record` den eben gelöschten Tracking-Ref
+    // am Klartext-Commit neu erschaffen — die Forge trüge den Klartext dann
+    // bis zum übernächsten Sync weiter, obwohl hier Erfolg gemeldet wurde.
+    // Kurz warten ist billig; kommt das Lock nicht frei, lieber ehrlich
+    // abbrechen als mit offenem Fenster tilgen.
+    let git_dir = ctx.repo.git_dir().to_path_buf();
+    let mut lock = None;
+    for _ in 0..50 {
+        match sync::Lock::acquire(&git_dir)? {
+            Some(acquired) => {
+                lock = Some(acquired);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    let Some(_lock) = lock else {
+        return Err("ein `minds sync` läuft gerade — bitte gleich erneut versuchen".into());
+    };
     match ctx.store.forget(id, reason)? {
         forget @ Forget::Forgotten(id, _) => {
             println!("vergessen: {id}");
@@ -70,10 +93,29 @@ fn forget(target: &str, reason: &str) -> Fallible<()> {
                 "  Die Referenzen bleiben auflösbar; der Klartext ist als elternloser Tombstone \
                  gelöscht — auch aus der Historie, nicht nur aus dem aktuellen Stand."
             );
-            println!(
-                "  Ein bereits auf die Forge gepushter Ref braucht dafür einen Force-Push \
-                 (`minds sync` überträgt ihn noch nicht)."
-            );
+            // Die Remote-Zusage gilt nur für die session-exklusiven Orte, die
+            // `sync` per Force-Push nachziehen darf. Lag die Session (auch) im
+            // geteilten Kontext-Baum, wäre der Satz dort eine falsche
+            // Datenschutz-Zusage — der Kontext-Ref wird nie force-gepusht.
+            let places = forget.places();
+            if places
+                .iter()
+                .any(|p| matches!(p, ForgottenPlace::StoreRef | ForgottenPlace::SessionBranch))
+            {
+                println!(
+                    "  Ein bereits auf die Forge gepushter Session-Ref wird beim nächsten Push \
+                     (oder `minds sync`) gezielt per Force-Push nachgezogen."
+                );
+            }
+            if places
+                .iter()
+                .any(|p| matches!(p, ForgottenPlace::ContextTree))
+            {
+                println!(
+                    "  Der geteilte Kontext-Ref (Bestandsformat) wird nie force-gepusht; war er \
+                     schon auf der Forge, ist seine Remote-Historie von Hand nachzuziehen."
+                );
+            }
         }
         Forget::Absent(id) => {
             println!("nichts zu vergessen: {id}");

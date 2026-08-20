@@ -88,8 +88,13 @@ Exactly two network paths exist, both triggered by the user:
 
 1. **`git push`** — the `pre-push` hook transfers `refs/minds/*` to exactly
    the remote the user is pushing to anyway. If there is nothing new, no
-   connection is opened. It never pushes with `--force`. Can be disabled via
-   `git config minds.sync false`.
+   connection is opened. It never pushes with `--force` — with exactly one,
+   narrowly scoped exception: a session ref erased via `minds forget`
+   (verifiably a tombstone, never plain text) is force-pushed deliberately
+   so the deletion reaches the forge as well
+   ([#102](https://github.com/munichbughunter/minds/issues/102)); the
+   transfer is reported during the push and recorded in `hook.log`. Can be
+   disabled via `git config minds.sync false`.
 2. **`minds gitlab mirror`** — only on explicit invocation. What is
    transferred is a review verdict as a merge request note (decision,
    reviewer, summary, hash) — **no session content**, but the reviewer's
@@ -113,23 +118,28 @@ reachable even through the ref history (`~1`), and `git rev-list --objects
 same session is rejected; `show`/`why`/`fsck` keep working and name the
 session as forgotten instead of failing. Physical removal happens with the
 next `git gc`; until then the object is unreachable but present. In its
-default configuration Git keeps no reflog for `refs/minds/*`.
+default configuration Git keeps no reflog for `refs/minds/*`. A session ref
+already pushed to the forge is caught up by the next `git push` (or
+`minds sync`) via a targeted force-push — the deletion thereby reaches the
+ref tip on the forge as well (#102).
 
 ## 6. Known gaps — as of v0.1.3
 
 The list an approval decision needs. None of this is hidden; all of it is
 public as issues:
 
-- **Already-pushed sessions are not reached by `forget` automatically**
-  ([#102](https://github.com/munichbughunter/minds/issues/102)). The
-  deletion rewrites the ref chain and is therefore not a fast-forward;
-  `sync` never force-pushes as a matter of principle. A session ref already
-  pushed to the forge keeps its plain text there until someone runs
-  `git push --force` by hand — and after that it is subject to the
-  platform's object retention (backups, mirrors), which is outside Minds'
-  control. **Recommendation for the pilot:** `forget` before the first push
-  is fully effective; after a push, the force-push is part of the deletion
-  process.
+- **The forge retains erased objects by its own rules.** Since
+  [#102](https://github.com/munichbughunter/minds/issues/102), `sync`
+  transfers the deletion of an already-pushed session ref automatically (a
+  targeted force-push of the tombstone on the next push). The plain text
+  thereby leaves the forge's **ref tip**; the old objects, however, remain
+  subject to the platform's object retention (unreachable objects until
+  housekeeping, backups, mirrors), which is outside Minds' control. The
+  shared context ref of a legacy repository also stays out of scope: it
+  carries the other sessions too and is never force-pushed; its remote
+  history has to be caught up by hand if needed. **Recommendation for the
+  pilot:** `forget` before the first push is fully effective; after a push,
+  the housekeeping question to the forge is part of the deletion process.
 - **The raw-data journal is the one plain-text window.** Between capture and
   checkpoint, the unredacted raw data — including tool results such as the
   output of `cat .env` — sits under `.git/minds/journal/` (files 0600, local
@@ -172,7 +182,8 @@ before anything reaches the store, and stored exclusively locally in the
 repository. There is no outbound channel except the user's own `git push`
 and the explicitly invoked GitLab mirror (review verdicts only — their
 free-text summary is the reviewer's own responsibility; it is not redacted).
-GDPR deletion exists and is fully effective locally; its known limit is
-state that has already been pushed (#102). Confidential questions and
+GDPR deletion exists, is fully effective locally, and since #102 also
+reaches the ref tip of already-pushed session refs; its known limit is the
+forge's object retention. Confidential questions and
 findings containing session content go to the named contact, not to the
 public issue tracker.
