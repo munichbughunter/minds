@@ -522,6 +522,91 @@ fn gitlab_mirror_posts_the_note_through_the_cli() {
     );
 }
 
+// --- gitlab webhook: der verifizierte Pfad (#8) ------------------------------
+
+/// Eine Note-Nutzlast, wie GitLab sie schickt — Autor laut Payload „anna".
+fn webhook_payload(note: &str) -> String {
+    serde_json::json!({
+        "object_kind": "note",
+        "user": { "username": "anna", "email": "anna@example.org" },
+        "object_attributes": { "note": note, "noteable_type": "MergeRequest" }
+    })
+    .to_string()
+}
+
+#[test]
+fn gitlab_webhook_rejects_a_wrong_or_missing_token() {
+    // Der Kern von #8: Wer das Secret nicht kennt, erzeugt kein Audit-Objekt —
+    // auch nicht mit --write und einer ansonsten perfekten Nutzlast.
+    let Some(dir) = repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = dir.path();
+    let payload = webhook_payload(&format!("/minds approve I{} passt", "ab".repeat(20)));
+
+    let wrong = minds_with_env(
+        dir,
+        &["gitlab", "webhook", "--write"],
+        Some(&payload),
+        &[
+            ("MINDS_GITLAB_WEBHOOK_SECRET", "streng-geheim"),
+            ("MINDS_GITLAB_WEBHOOK_TOKEN", "geraten"),
+        ],
+    );
+    assert!(!wrong.status.success(), "{}", text(&wrong));
+    assert!(
+        stderr(&wrong).contains("Token-Verifikation"),
+        "{}",
+        text(&wrong)
+    );
+    assert!(!stdout(&wrong).contains("angelegt"), "{}", text(&wrong));
+
+    let missing = minds_with_env(
+        dir,
+        &["gitlab", "webhook", "--write"],
+        Some(&payload),
+        &[("MINDS_GITLAB_WEBHOOK_SECRET", "streng-geheim")],
+    );
+    assert!(!missing.status.success(), "{}", text(&missing));
+    assert!(
+        stderr(&missing).contains("MINDS_GITLAB_WEBHOOK_TOKEN"),
+        "der Empfänger muss erfahren, wie der Header durchzureichen ist: {}",
+        text(&missing)
+    );
+}
+
+#[test]
+fn gitlab_webhook_accepts_the_matching_token() {
+    // Über --secret-env, damit auch die Flag-Verdrahtung geprüft ist. Der
+    // Autor erscheint als Behauptung der Nutzlast, nicht als Faktum.
+    let Some(dir) = repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = dir.path();
+    let payload = webhook_payload(&format!("/minds approve I{} passt", "ab".repeat(20)));
+
+    let out = minds_with_env(
+        dir,
+        &[
+            "gitlab",
+            "webhook",
+            "--secret-env",
+            "MINDS_PILOT_HOOK_SECRET",
+        ],
+        Some(&payload),
+        &[
+            ("MINDS_PILOT_HOOK_SECRET", "streng-geheim"),
+            ("MINDS_GITLAB_WEBHOOK_TOKEN", "streng-geheim"),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = stdout(&out);
+    assert!(shown.contains("approve"), "{shown}");
+    assert!(shown.contains("(laut Payload)"), "{shown}");
+}
+
 #[test]
 fn gitlab_mirror_names_the_missing_token_variable() {
     // Der häufigste Konfigurationsfehler beim Partner — er muss die Variable

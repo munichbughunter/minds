@@ -12,6 +12,16 @@
 //! schlagen sie. Der Token kommt **nur** aus einer Umgebungsvariablen
 //! (`MINDS_GITLAB_TOKEN`, oder was `--token-env` nennt) — nie aus einem
 //! Argument, das in `ps` steht.
+//!
+//! # Webhook-Verifikation (#8)
+//!
+//! Auch das Webhook-Secret kommt nur aus der Umgebung: Steht in
+//! `MINDS_GITLAB_WEBHOOK_SECRET` (oder was `--secret-env` nennt) ein Wert, wird
+//! jede Nutzlast über den verifizierten Pfad gedeutet — der vorgeschaltete
+//! Empfänger reicht den `X-Gitlab-Token`-Header in `MINDS_GITLAB_WEBHOOK_TOKEN`
+//! durch, und ohne Übereinstimmung entsteht nichts. Ohne gesetztes Secret
+//! bleibt der unverifizierte Pfad: gedacht für lokal abgelegte Nutzlasten,
+//! deren Herkunft der Aufrufer selbst kennt.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,6 +37,14 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Die Umgebungsvariable, aus der der Token kommt, wenn keine genannt ist.
 const DEFAULT_TOKEN_ENV: &str = "MINDS_GITLAB_TOKEN";
 
+/// Die Umgebungsvariable mit dem Webhook-Secret, wenn keine genannt ist.
+const DEFAULT_SECRET_ENV: &str = "MINDS_GITLAB_WEBHOOK_SECRET";
+
+/// Die Umgebungsvariable, in der der vorgeschaltete Empfänger den Wert des
+/// `X-Gitlab-Token`-Headers durchreicht. Fester Name, kein Flag: Wer den
+/// Wrapper schreibt, setzt sie ohnehin explizit.
+const WEBHOOK_TOKEN_ENV: &str = "MINDS_GITLAB_WEBHOOK_TOKEN";
+
 /// Was `minds gitlab` tun soll.
 pub struct Options<'a> {
     pub subject: Option<&'a str>,
@@ -34,6 +52,7 @@ pub struct Options<'a> {
     pub url: Option<&'a str>,
     pub project: Option<&'a str>,
     pub token_env: Option<&'a str>,
+    pub secret_env: Option<&'a str>,
     pub approve: bool,
     pub write: bool,
 }
@@ -104,6 +123,26 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
     let mut payload = Vec::new();
     std::io::stdin().read_to_end(&mut payload)?;
 
+    let secret_env = options.secret_env.unwrap_or(DEFAULT_SECRET_ENV);
+    if let Ok(secret) = std::env::var(secret_env)
+        && !secret.is_empty()
+    {
+        // Das Secret ist gesetzt: Nur der verifizierte Pfad zählt. Ein
+        // falsches oder fehlendes Token ist kein „fremdes Ereignis", sondern
+        // eine Fälschung oder Fehlkonfiguration — beides scheitert laut,
+        // bevor die Nutzlast auch nur angesehen wird.
+        let provided = std::env::var(WEBHOOK_TOKEN_ENV).ok();
+        if !webhook::token_matches(provided.as_deref(), &secret) {
+            return Err(format!(
+                "Token-Verifikation fehlgeschlagen — Nutzlast verworfen \
+                 (der Empfänger reicht den X-Gitlab-Token-Header in {WEBHOOK_TOKEN_ENV} durch)"
+            )
+            .into());
+        }
+    }
+    // Ohne gesetztes Secret bleibt der unverifizierte Pfad — nur für
+    // Nutzlasten, deren Herkunft der Aufrufer selbst kennt (siehe Modul-Doku).
+
     let Some(incoming) = webhook::parse(&payload) else {
         // Der Normalfall: irgendein anderes Ereignis. Kein Fehler.
         println!("kein Verdict in dieser Nutzlast");
@@ -125,8 +164,10 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
     };
 
     let hash = review.content_hash()?;
+    // „laut Payload": Der Autor ist eine Behauptung der Nutzlast — auch mit
+    // geprüftem Token beweist er nur den Hook, nicht die Person.
     println!(
-        "{} · {} · {}",
+        "{} · {} (laut Payload) · {}",
         review.decision.as_str(),
         review.reviewer,
         review.subject.id()
