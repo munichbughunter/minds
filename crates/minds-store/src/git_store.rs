@@ -189,7 +189,13 @@ const SESSION_BRANCH_MD: &str = "session.md";
 /// Zusammenstoß bräuchte Milliarden Sessions, und der volle Hash steht ohnehin
 /// in der `session.json` des Branches. Ein (praktisch unmöglicher) Kollisions-
 /// fall überschriebe nur einen Browsing-Branch; der content-adressierte Store
-/// bleibt die maßgebliche Quelle und ist unberührt.
+/// bleibt die maßgebliche Quelle und ist unberührt. Und `forget` glaubt der
+/// Präfix-Adresse nicht: Die echte Session eines anderen am geteilten Ref
+/// bleibt stehen ([`branch_payload_to_erase`]), und ein kollidierender
+/// Schreiber setzt nie auf fremden Klartext auf
+/// ([`GitStore::write_session_branch`]) — die Kollision kostet also den
+/// überschriebenen Branch, nie einen kollateral getilgten und nie eine
+/// mitreisende fremde Historie (#100).
 const SESSION_BRANCH_HEX: usize = 16;
 
 /// Ein Kontext-Store in einem Git-Repository, unter einem Ref.
@@ -211,6 +217,16 @@ struct Site<'a> {
     place: ForgottenPlace,
     reference: &'a str,
     file: &'a str,
+    /// Ob der Ref den Ort nur über ein **Präfix** der ID adressiert (der
+    /// Session-Branch, [`SESSION_BRANCH_HEX`]): Dann prüft die Tilgung die
+    /// Identität der Nutzlast, statt der Adresse zu glauben — bei einer
+    /// Präfix-Kollision trüge der Ref die Nutzlast einer *anderen* Session,
+    /// und `forget` tilgte sonst den falschen Branch (#100). Voll adressierte
+    /// Orte lassen die Prüfung bewusst aus: Dort ist die Adresse die
+    /// Identität, und eine Inhaltsprüfung könnte eine fällige Tilgung nur
+    /// fälschlich verhindern (etwa bei Bestands-Bytes, die nicht byte-genau
+    /// kanonisch sind) — fail-closed heißt hier: im Zweifel tilgen.
+    prefix_addressed: bool,
 }
 
 impl GitStore {
@@ -301,12 +317,11 @@ impl GitStore {
     /// nackte Schreibvorgang darunter.
     ///
     /// Der Ref heißt `refs/minds/sessions/<hex>` — unter `refs/minds/`, damit
-    /// [`Repo::commit_tree_to_ref_unless`] ihn schreiben darf und `git branch` ihn
+    /// Minds ihn überhaupt schreiben darf und `git branch` ihn
     /// nicht zeigt. Sein Baum trägt die Session allein als [`SESSION_BRANCH_FILE`]
-    /// und [`SESSION_BRANCH_MD`] (nicht auf den Store-Baum aufgesetzt), und der
-    /// Commit ist elternlos: ein Branch, eine Session. `markdown` ist die
-    /// gerenderte `session.md`, die die Aufrufstelle beisteuert (der Store selbst
-    /// rendert nicht).
+    /// und [`SESSION_BRANCH_MD`] (nicht auf den Store-Baum aufgesetzt). `markdown`
+    /// ist die gerenderte `session.md`, die die Aufrufstelle beisteuert (der Store
+    /// selbst rendert nicht).
     ///
     /// Der Guard prüft [`SESSION_BRANCH_FILE`] am selben Parent, auf den der CAS
     /// aufsetzt: Trägt der Branch dort einen Tombstone, kommt `Ok(None)` und
@@ -314,6 +329,16 @@ impl GitStore {
     /// gesetzt, auch nicht, wenn ein `forget` zwischen Vor-Check und Commit landet
     /// (dann `RefRaced`, der Retry sieht den Tombstone). Zeigt der Ref schon auf
     /// diesen Baum, entsteht nichts, und ein wiederholter Push ist ein No-op.
+    ///
+    /// **Fremde Nutzlast wird nicht zum Elter (#100):** Trägt der Ref Bytes, die
+    /// nicht auf die zu schreibende ID hashen — die Präfix-Kollision, oder ein
+    /// extern veränderter Stand —, setzt der Commit nicht auf, sondern wurzelt
+    /// den Branch elternlos neu. Aufgesetzt bliebe der fremde Klartext unter
+    /// `<branch>~1` erreichbar, und das `forget` der anderen Session fände ihn
+    /// dort nie mehr (es prüft die Spitze). Erst dieser Schnitt macht
+    /// Last-Writer-wins am geteilten Ref wirklich wahr. Fortschreibungen
+    /// **derselben** Session (etwa eine neu gerenderte `session.md`) setzen
+    /// weiter auf — der Branch bleibt für `minds sync` fast-forward-pushbar.
     pub(crate) fn write_session_branch(
         &self,
         session: &SessionBytes,
@@ -325,13 +350,33 @@ impl GitStore {
         let tree = self
             .repo
             .write_tree(None, [(SESSION_BRANCH_FILE, json), (SESSION_BRANCH_MD, md)])?;
-        self.repo.commit_tree_to_ref_unless(
-            &reference,
-            tree,
-            SESSION_BRANCH_FILE,
-            |bytes| crate::tombstone::reason(bytes).is_some(),
-            &commit_message(session.id()),
-        )
+
+        // **Ein** beobachteter Stand für alles: Der Ref wird einmal aufgelöst,
+        // Tombstone-Guard und Fremd-Check lesen aus genau diesem Commit, und
+        // beide Schreibwege übergeben ihn als CAS-Erwartung. So kann kein
+        // paralleler Schreiber zwischen Prüfung und Commit einen Stand
+        // unterschieben, den keine der Prüfungen gesehen hat — bewegt sich der
+        // Ref, kommt `RefRaced`, und der Retry des Aufrufers entscheidet am
+        // neuen Stand von vorn.
+        let message = commit_message(session.id());
+        let current = self.repo.commit_at(&reference)?;
+        if let Some(parent) = current {
+            let tree_at_parent = self.repo.tree_of(parent)?;
+            if let Some(bytes) = self.repo.read_blob(tree_at_parent, SESSION_BRANCH_FILE)? {
+                if crate::tombstone::reason(&bytes).is_some() {
+                    return Ok(None);
+                }
+                if SessionId::from_canonical_bytes(&bytes) != session.id() {
+                    return self
+                        .repo
+                        .reset_ref_to_root(&reference, tree, current, &message)
+                        .map(Some);
+                }
+            }
+        }
+        self.repo
+            .commit_tree_onto_expected(&reference, tree, current, &message)
+            .map(Some)
     }
 
     /// Legt den browsbaren Session-Branch an — mit dem vollen Reanimations-Schutz
@@ -394,18 +439,23 @@ impl GitStore {
         Ok(())
     }
 
-    /// Tilgt den Session-Branch von `id`, falls er dort noch Klartext trägt.
+    /// Tilgt den Session-Branch von `id`, falls er dort noch Klartext **dieser**
+    /// Session trägt.
     ///
     /// Ein bereits getombsteinter oder gar nicht vorhandener Branch ist ein
-    /// No-op. Der `reason` landet im Tombstone, damit der Branch denselben Grund
-    /// nennt wie der maßgebliche Store-Ref.
+    /// No-op — und ebenso ein Branch, der die **echte Session eines anderen**
+    /// trägt ([`branch_payload_to_erase`]): Der Branch-Ref ist nur
+    /// präfix-adressiert, bei einer Kollision läge dort die Session eines
+    /// anderen, und die zu tilgen wäre Kollateral (#100). Alles Unzuordenbare
+    /// wird dagegen fail-closed getilgt. Der `reason` landet im Tombstone,
+    /// damit der Branch denselben Grund nennt wie der maßgebliche Store-Ref.
     fn tombstone_branch_if_plaintext(&self, id: SessionId, reason: &str) -> Result<()> {
         let reference = session_branch_ref(id);
         let stored = self
             .repo
             .read_blob_at(&reference, SESSION_BRANCH_FILE)
             .map_err(StoreError::backend)?;
-        if self.payload_at(stored) {
+        if stored.is_some_and(|bytes| branch_payload_to_erase(id, &bytes)) {
             let tomb = crate::tombstone::bytes(reason);
             let message = format!("minds: Session {id} vergessen");
             self.retry_write(|| self.overwrite_session_branch(&reference, &tomb, &message))?;
@@ -663,12 +713,17 @@ impl GitStore {
             place,
             reference,
             file,
+            prefix_addressed,
         } = site;
-        let has_payload = self.payload_at(
-            self.repo
-                .read_blob_at(reference, file)
-                .map_err(StoreError::backend)?,
-        );
+        let stored = self
+            .repo
+            .read_blob_at(reference, file)
+            .map_err(StoreError::backend)?;
+        let has_payload = if prefix_addressed {
+            stored.is_some_and(|bytes| branch_payload_to_erase(id, &bytes))
+        } else {
+            self.payload_at(stored)
+        };
         if has_payload {
             guard(place)
                 .and_then(|()| self.retry_write(write))
@@ -723,6 +778,7 @@ impl GitStore {
                 place: ForgottenPlace::StoreRef,
                 reference: &reference,
                 file: SESSION_FILE,
+                prefix_addressed: false,
             },
             &mut forgotten,
             &mut guard,
@@ -731,7 +787,8 @@ impl GitStore {
 
         // Der browsbare Branch. Ohne diesen Ort meldete `forget` „vergessen",
         // während `session.md` mit dem vollen Klartext weiter als Forge-Branch
-        // stünde. Geprüft an `session.json`, getilgt beide Dateien des Baums.
+        // stünde. Geprüft an `session.json` — samt Identität, denn der Ref trägt
+        // nur ein ID-Präfix (#100) —, getilgt beide Dateien des Baums.
         let branch = session_branch_ref(id);
         self.forget_one(
             id,
@@ -739,6 +796,7 @@ impl GitStore {
                 place: ForgottenPlace::SessionBranch,
                 reference: &branch,
                 file: SESSION_BRANCH_FILE,
+                prefix_addressed: true,
             },
             &mut forgotten,
             &mut guard,
@@ -755,6 +813,7 @@ impl GitStore {
                 place: ForgottenPlace::ContextTree,
                 reference: &self.reference,
                 file: &path,
+                prefix_addressed: false,
             },
             &mut forgotten,
             &mut guard,
@@ -810,6 +869,61 @@ fn session_branch_ref(id: SessionId) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     format!("{SESSION_BRANCH_PREFIX}{hex}")
+}
+
+/// Ob `bytes` am Session-Branch von `id` eine Nutzlast sind, die ein
+/// `forget(id)` tilgen muss.
+///
+/// Die Entscheidung für den einzigen nur **präfix-adressierten** Ort, den
+/// Session-Branch ([`SESSION_BRANCH_HEX`]): Bei einer Präfix-Kollision trüge
+/// sein Ref die Nutzlast einer *anderen* Session, und eine Tilgung, die der
+/// Adresse glaubt, träfe die falsche (#100). Sie fällt darum am Inhalt,
+/// fail-closed:
+///
+/// - Ein **Tombstone** ist schon getilgt — nichts zu tun.
+/// - Bytes, die auf `id` **hashen**, sind genau diese Session: tilgen. Die
+///   `session.json` ist die kanonische Byte-Form, deren blake3 per Definition
+///   die SessionId ist — der Abgleich braucht kein Parsen.
+/// - Eine **echte fremde** Session ([`is_canonical_session`] mit anderer ID)
+///   bleibt stehen: Der Branch ist dann von der Kollision überschrieben
+///   (Last-Writer-wins — seit #100 auch ohne Rest-Historie, siehe
+///   [`GitStore::write_session_branch`]), und sie zu tilgen wäre Kollateral.
+///   Der maßgebliche, voll adressierte Store-Ref jeder Session ist von alledem
+///   unberührt.
+/// - **Alles andere** — beschädigte oder extern veränderte Bytes, die keiner
+///   Session zuzuordnen sind — wird getilgt: Dahinter könnte auch ein
+///   mutierter Stand der angefragten Session stehen (die `session.md` daneben
+///   etwa unverändert im Klartext), und im Zweifel gilt über-tilgen, nie
+///   stehen lassen.
+///
+/// Zwei bewusste Grenzen: Wer mit Schreibzugriff auf `refs/minds/*` eine
+/// **byte-genau kanonische** Fremd-Session fälscht, hält damit auch die
+/// danebenliegende `session.md` am Leben — ein Akteur mit diesem Zugriff kann
+/// Klartext aber ohnehin beliebig re-publizieren, das liegt außerhalb des
+/// Modells. Und eine echte fremde Session mit **zukünftigem** Schema (Felder,
+/// die dieses Binary nicht kennt) überlebt die Re-Kanonisierung nicht
+/// byte-genau und würde bei einer Kollision kollateral getilgt — in Kauf
+/// genommen, denn die Richtung stimmt (über-tilgen, nie Klartext halten), und
+/// ihr voll adressierter Store-Ref bleibt unberührt.
+fn branch_payload_to_erase(id: SessionId, bytes: &[u8]) -> bool {
+    if crate::tombstone::reason(bytes).is_some() {
+        return false;
+    }
+    if SessionId::from_canonical_bytes(bytes) == id {
+        return true;
+    }
+    !is_canonical_session(bytes)
+}
+
+/// Ob `bytes` die kanonische Form irgendeiner echten Session sind: Sie parsen
+/// als [`minds_core::Session`], und die Re-Kanonisierung reproduziert sie
+/// byte-genau. Jede Abweichung — ein fremdes Format, ein einziges verändertes
+/// Byte — fällt durch, denn die kanonische Form (RFC 8785) ist eindeutig.
+fn is_canonical_session(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<minds_core::Session>(bytes)
+        .ok()
+        .and_then(|session| minds_core::to_canonical_json(&session).ok())
+        .is_some_and(|canonical| canonical == bytes)
 }
 
 /// Ob `rest` (der Ref-Name hinter `refs/minds/`) einen Ort bezeichnet, der genau
@@ -1638,6 +1752,206 @@ mod tests {
             &format!("{}:{SESSION_LINKS_FILE}", session_ref(id)),
         ]);
         assert!(links.contains(&commit), "Kante verloren:\n{links}");
+    }
+
+    /// Eine zweite ID mit demselben [`SESSION_BRANCH_HEX`]-Präfix wie `id`,
+    /// aber anderem Rest — der praktisch unerreichbare Kollisionsfall (er
+    /// bräuchte Milliarden echter Sessions), hier fabriziert. Jede Rest-Stelle
+    /// wird gekippt, damit die IDs sicher verschieden sind.
+    fn colliding_id(id: SessionId) -> SessionId {
+        let hex = hex_of(id);
+        let (prefix, rest) = hex.split_at(SESSION_BRANCH_HEX);
+        let flipped: String = rest
+            .chars()
+            .map(|c| if c == '0' { '1' } else { '0' })
+            .collect();
+        format!("{SESSION_ID_PREFIX}{prefix}{flipped}")
+            .parse()
+            .expect("die fabrizierte Kollisions-ID ist wohlgeformtes Hex")
+    }
+
+    #[test]
+    fn forget_leaves_the_branch_of_a_prefix_colliding_session_alone() {
+        // #100 (Akzeptanzkriterium): Der Branch-Ref trägt nur die ersten
+        // [`SESSION_BRANCH_HEX`] Zeichen der ID — zwei Sessions mit gleichem
+        // 64-Bit-Präfix teilen sich den Ref. `forget(A)` darf den Branch, der
+        // gerade B trägt, nicht kollateral tilgen: Seine `session.json` hasht
+        // nicht auf die angefragte ID.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+        store.put_session_branch_bytes(&bytes, &markdown).unwrap();
+        let branch = session_branch_ref(id);
+
+        let other = colliding_id(id);
+        assert_ne!(other, id);
+        assert_eq!(
+            session_branch_ref(other),
+            branch,
+            "Testaufbau: die IDs teilen sich keinen Branch-Ref"
+        );
+
+        // forget der Kollisions-ID: Sie liegt nirgends — auch der geteilte
+        // Branch-Ref zählt nicht, denn seine Nutzlast gehört der anderen.
+        let outcome = store.forget(other, "DSGVO").unwrap();
+        assert!(!outcome.was_forgotten(), "Kollision als Tilgung gemeldet");
+
+        // Der Branch trägt weiter den Klartext der eingetragenen Session …
+        let json = fixture.git(&[
+            "cat-file",
+            "blob",
+            &format!("{branch}:{SESSION_BRANCH_FILE}"),
+        ]);
+        assert!(json.contains("streng geheim"), "kollateral getilgt: {json}");
+
+        // … und das eigene forget trifft ihn nach wie vor.
+        store.forget(id, "DSGVO").unwrap();
+        let json = fixture.git(&[
+            "cat-file",
+            "blob",
+            &format!("{branch}:{SESSION_BRANCH_FILE}"),
+        ]);
+        assert!(
+            json.contains("minds_tombstone"),
+            "eigener forget wirkungslos: {json}"
+        );
+    }
+
+    #[test]
+    fn healing_a_branch_checks_the_identity_before_erasing() {
+        // #100, put-Pfad: `tombstone_branch_if_plaintext` tilgt zurückgebliebene
+        // Klartext-Branches vergessener Sessions — aber nur die eigenen. Trägt
+        // der geteilte Ref die Session des Kollisionspartners, bleibt sie stehen.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+        store.put_session_branch_bytes(&bytes, &markdown).unwrap();
+        let branch = session_branch_ref(id);
+
+        store
+            .tombstone_branch_if_plaintext(colliding_id(id), "DSGVO")
+            .unwrap();
+
+        let json = fixture.git(&[
+            "cat-file",
+            "blob",
+            &format!("{branch}:{SESSION_BRANCH_FILE}"),
+        ]);
+        assert!(
+            json.contains("streng geheim"),
+            "fremder Branch getilgt: {json}"
+        );
+    }
+
+    #[test]
+    fn a_branch_write_over_foreign_payload_does_not_carry_its_history_along() {
+        // #100, Schreibseite: Trägt der (geteilte) Branch-Ref fremde Bytes,
+        // darf der neue Commit nicht aufsetzen — sonst bliebe der fremde
+        // Klartext unter `<branch>~1` erreichbar, und dessen `forget` fände ihn
+        // nie mehr, weil es nur die Spitze prüft. Der Schreiber wurzelt den
+        // Branch stattdessen elternlos neu.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        let branch = session_branch_ref(id);
+
+        // Fremde Nutzlast am Branch-Ref von `id` — der Kollisionsfall, den ein
+        // echter Zusammenstoß bräuchte, hier direkt hingelegt.
+        let repo = store.context_repo();
+        let foreign = repo.write_blob(b"fremder Klartext").unwrap();
+        let tree = repo
+            .write_tree(
+                None,
+                [(SESSION_BRANCH_FILE, foreign), (SESSION_BRANCH_MD, foreign)],
+            )
+            .unwrap();
+        repo.commit_tree_to_ref(&branch, tree, "fremde Session")
+            .unwrap();
+        let foreign_blob = fixture
+            .git(&["rev-parse", &format!("{branch}:{SESSION_BRANCH_FILE}")])
+            .trim()
+            .to_owned();
+
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+        store.put_session_branch_bytes(&bytes, &markdown).unwrap();
+
+        // Die Spitze trägt die eigene Session, elternlos — genau ein Commit …
+        let json = fixture.git(&[
+            "cat-file",
+            "blob",
+            &format!("{branch}:{SESSION_BRANCH_FILE}"),
+        ]);
+        assert!(
+            json.contains("streng geheim"),
+            "eigener Stand fehlt: {json}"
+        );
+        assert_eq!(fixture.git(&["rev-list", "--count", &branch]).trim(), "1");
+        // … und der fremde Klartext ist über keinen Ref mehr erreichbar.
+        let reachable = fixture.git(&["rev-list", "--objects", "--all"]);
+        assert!(
+            !reachable.contains(&foreign_blob),
+            "fremder Klartext reist als Branch-Historie mit:\n{reachable}"
+        );
+    }
+
+    #[test]
+    fn forget_erases_a_branch_whose_payload_matches_no_session() {
+        // #100, fail-closed-Gegenprobe: Stehen bleibt nur die *echte* Session
+        // eines anderen. Extern veränderte Bytes — hier die `session.json` um
+        // ein Byte verlängert, die `session.md` mit vollem Klartext daneben
+        // unangetastet — sind keiner Session zuzuordnen und werden getilgt wie
+        // vor #100: im Zweifel über-tilgen, nie stehen lassen.
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+        let bytes = SessionBytes::of(&session).unwrap();
+        let markdown = minds_core::session_markdown(bytes.id(), session.session());
+        store.put_session_branch_bytes(&bytes, &markdown).unwrap();
+        let branch = session_branch_ref(id);
+
+        // Ein externer Schreiber mutiert die `session.json` (ein angehängtes
+        // Byte genügt: die kanonische Form ist eindeutig, der Hash passt nicht
+        // mehr) und lässt die `session.md` stehen.
+        let mut mutated = bytes.as_bytes().to_vec();
+        mutated.push(b'\n');
+        let repo = store.context_repo();
+        let json_blob = repo.write_blob(&mutated).unwrap();
+        let md_blob = repo.write_blob(markdown.as_bytes()).unwrap();
+        let tree = repo
+            .write_tree(
+                None,
+                [
+                    (SESSION_BRANCH_FILE, json_blob),
+                    (SESSION_BRANCH_MD, md_blob),
+                ],
+            )
+            .unwrap();
+        repo.commit_tree_to_ref(&branch, tree, "extern mutiert")
+            .unwrap();
+
+        store.forget(id, "DSGVO").unwrap();
+
+        // Beide Dateien des Branches sind Tombstone — insbesondere die
+        // `session.md`, die sonst als minds-geschriebener Klartext bliebe.
+        let json = fixture.git(&[
+            "cat-file",
+            "blob",
+            &format!("{branch}:{SESSION_BRANCH_FILE}"),
+        ]);
+        assert!(
+            json.contains("minds_tombstone"),
+            "json nicht getilgt: {json}"
+        );
+        let md = fixture.git(&["cat-file", "blob", &format!("{branch}:{SESSION_BRANCH_MD}")]);
+        assert!(
+            !md.contains("streng geheim"),
+            "session.md überlebt den forget: {md}"
+        );
     }
 
     #[test]
