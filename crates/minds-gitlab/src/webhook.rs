@@ -27,6 +27,16 @@
 //! Hex). Sonst nennt der Aufrufer den Commit des MR, und die CLI löst ihn lokal
 //! zu seiner Change-Id auf. Findet sich keine, entsteht **kein** Review: Lieber
 //! nichts als ein Verdict, das an nichts hängt.
+//!
+//! # Wem geglaubt wird
+//!
+//! Der Nutzlast selbst: niemandem. `user.email` ist ein JSON-Feld, keine
+//! Identität — wer die Nutzlast schreiben darf, schreibt hinein, was er will.
+//! Herkunft beweist GitLab über den `X-Gitlab-Token`-Header, und diese Prüfung
+//! gehört zur **Deutung**, nicht zum Transport: Ein Audit-Objekt unter fremdem
+//! Namen entsteht beim Parsen, nicht beim Empfangen. Nutzlasten aus dem Netz
+//! gehen deshalb durch [`parse_verified`]; das nackte [`parse`] bleibt für
+//! Nutzlasten, deren Herkunft der Aufrufer schon anders sichergestellt hat.
 
 use minds_core::{Decision, Review, Subject};
 use serde::Deserialize;
@@ -41,7 +51,12 @@ pub struct Incoming {
     pub decision: Decision,
     /// Die Zusammenfassung — der Rest der Kommandozeile.
     pub summary: String,
-    /// Wer kommentiert hat (E-Mail, sonst Benutzername).
+    /// Wer kommentiert hat, **laut Payload** (E-Mail, sonst Benutzername).
+    ///
+    /// Das Feld ist eine Behauptung der Nutzlast, keine geprüfte Identität.
+    /// Verlässlich wird es erst durch [`parse_verified`] — und auch dann sagt
+    /// es nur „kam über den Hook mit dem richtigen Secret", nicht „diese
+    /// Person war es".
     pub author: String,
     /// Die Change-Id, falls sie im Kommentar stand.
     pub change_id: Option<String>,
@@ -76,12 +91,65 @@ impl Incoming {
     }
 }
 
-/// Deutet eine GitLab-Webhook-Nutzlast.
+/// Deutet eine GitLab-Webhook-Nutzlast, nachdem der `X-Gitlab-Token`-Header
+/// gegen das konfigurierte Secret geprüft wurde.
+///
+/// `provided_token` ist, was der vorgeschaltete Empfänger aus dem Header
+/// übernommen hat; `None` heißt „der Header fehlte". `expected_token` ist das
+/// Secret, das beim Anlegen des Hooks in GitLab hinterlegt wurde. Stimmen sie
+/// nicht überein, wird die Nutzlast **gar nicht erst geparst** — es entsteht
+/// kein [`Incoming`], egal was drinsteht.
+///
+/// Der Vergleich läuft in konstanter Zeit über die volle Länge, damit ein
+/// Angreifer das Secret nicht byteweise über Antwortzeiten erraten kann.
+pub fn parse_verified(
+    payload: &[u8],
+    provided_token: Option<&str>,
+    expected_token: &str,
+) -> Option<Incoming> {
+    if !token_matches(provided_token, expected_token) {
+        return None;
+    }
+    parse(payload)
+}
+
+/// Vergleicht den mitgelieferten Token mit dem erwarteten — in konstanter Zeit.
+///
+/// Kein `==` auf `&str`: Das vergliche byteweise mit Kurzschluss, und die
+/// Antwortzeit verriete, wie viele führende Bytes schon stimmen. Hier wird
+/// stattdessen über die **volle** Länge beider Werte ge-XOR-t und jede
+/// Differenz nur eingesammelt; die Längendifferenz fließt genauso ein. Der
+/// `fold` kennt keinen frühen Ausstieg — kurzschließen kann das nicht.
+///
+/// Öffentlich, damit ein Aufrufer, der die Prüfung selbst orchestriert (etwa
+/// um bei falschem Token laut zu scheitern statt still nichts zu deuten),
+/// dasselbe timing-sichere Werkzeug benutzt und nicht doch zu `==` greift.
+pub fn token_matches(provided: Option<&str>, expected: &str) -> bool {
+    let provided = match provided {
+        Some(value) => value.as_bytes(),
+        None => return false,
+    };
+    let expected = expected.as_bytes();
+    let difference =
+        (0..provided.len().max(expected.len())).fold(provided.len() ^ expected.len(), |acc, i| {
+            let a = provided.get(i).copied().unwrap_or(0);
+            let b = expected.get(i).copied().unwrap_or(0);
+            acc | usize::from(a ^ b)
+        });
+    difference == 0
+}
+
+/// Deutet eine GitLab-Webhook-Nutzlast — **ohne** Herkunftsprüfung.
 ///
 /// `None` heißt „hier ist kein Verdict" und ist der **Normalfall** — die
 /// allermeisten Hooks sind etwas anderes oder gewöhnliche Kommentare. Ein
 /// Webhook-Empfänger, der bei jedem fremden Ereignis einen Fehler meldete, wäre
 /// nach einer Stunde abgeschaltet.
+///
+/// **Vertrauensannahme:** Diese Funktion glaubt der Nutzlast jedes Feld,
+/// insbesondere den Autor. Sie ist nur für Nutzlasten gedacht, deren Herkunft
+/// schon feststeht — etwa lokal abgelegte, die jemand bewusst hineinkippt. Was
+/// aus dem Netz kommt, gehört durch [`parse_verified`].
 pub fn parse(payload: &[u8]) -> Option<Incoming> {
     let hook: NoteHook = serde_json::from_slice(payload).ok()?;
     if hook.object_kind.as_deref() != Some("note") {
@@ -297,6 +365,48 @@ mod tests {
         let incoming = parse(&hook("/minds approve")).unwrap();
         assert!(incoming.clone().into_review(None, None).is_none());
         assert!(incoming.into_review(Some("Iaufgeloest"), None).is_some());
+    }
+
+    #[test]
+    fn a_wrong_or_missing_token_yields_no_incoming() {
+        // Die Nutzlast selbst wäre ein gültiges Verdict — aber ohne bewiesene
+        // Herkunft entsteht daraus kein Audit-Objekt (#8).
+        let payload = hook("/minds approve Backoff ist jetzt korrekt");
+        assert!(parse_verified(&payload, Some("falsch"), "geheim").is_none());
+        assert!(parse_verified(&payload, None, "geheim").is_none());
+        assert!(
+            parse_verified(&payload, Some("geheimX"), "geheim").is_none(),
+            "ein Präfix-Treffer ist kein Treffer"
+        );
+        assert!(
+            parse_verified(&payload, Some(""), "geheim").is_none(),
+            "ein leerer Header ist kein Token"
+        );
+        assert!(parse_verified(&payload, Some("geheim"), "geheim").is_some());
+    }
+
+    #[test]
+    fn the_token_comparison_collects_every_difference() {
+        // Kurzschließen hieße: Nach dem ersten Unterschied wird nicht mehr
+        // verglichen. Die Funktion faltet stattdessen über die volle Länge —
+        // eine Differenz an jeder einzelnen Position, auch der letzten, und
+        // ebenso jede Längendifferenz muss sie deshalb gleichermaßen sehen.
+        let expected = "streng-geheimes-secret";
+        for position in 0..expected.len() {
+            let mut provided = expected.as_bytes().to_vec();
+            provided[position] ^= 0x01;
+            let provided = String::from_utf8(provided).unwrap();
+            assert!(
+                !token_matches(Some(&provided), expected),
+                "Differenz an Position {position} übersehen"
+            );
+        }
+        assert!(!token_matches(
+            Some(&expected[..expected.len() - 1]),
+            expected
+        ));
+        assert!(!token_matches(Some(&format!("{expected}x")), expected));
+        assert!(token_matches(Some(expected), expected));
     }
 
     #[test]

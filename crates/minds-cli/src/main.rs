@@ -186,10 +186,14 @@ Verwendung:
         einweg und idempotent. Quelle bleibt das Repo. Token nur aus der
         Umgebung (Default MINDS_GITLAB_TOKEN), nie als Argument.
 
-  minds gitlab webhook [--write]
+  minds gitlab webhook [--write] [--secret-env <var>]
         Liest eine GitLab-Webhook-Nutzlast von stdin und deutet einen
         MR-Kommentar (/minds approve|reject|needs-work) als Verdict.
         Ohne --write wird nur gezeigt, was entstünde. Opt-in, kein Dienst.
+        Steht in MINDS_GITLAB_WEBHOOK_SECRET (oder was --secret-env nennt)
+        ein Secret, wird der X-Gitlab-Token-Header verlangt: Der Empfänger
+        reicht ihn in MINDS_GITLAB_WEBHOOK_TOKEN durch, verglichen wird
+        timing-sicher; ohne Treffer wird die Nutzlast verworfen.
 
   minds audit --export [--out <datei>] [--base <ref>]
         Bündelt die Provenienz-Kette (Change → Session → Attribution →
@@ -283,7 +287,7 @@ const SPECS: &[Spec] = &[
     spec("stack", &["--base"], &[], 0),
     spec(
         "gitlab",
-        &["--mr", "--url", "--project", "--token-env"],
+        &["--mr", "--url", "--project", "--token-env", "--secret-env"],
         &["--approve", "--write"],
         2,
     ),
@@ -643,6 +647,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 url: parsed.value("--url"),
                 project: parsed.value("--project"),
                 token_env: parsed.value("--token-env"),
+                secret_env: parsed.value("--secret-env"),
                 approve: parsed.has("--approve"),
                 write: parsed.has("--write"),
             },
