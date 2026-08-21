@@ -28,8 +28,8 @@
 //!
 //! Statt diese Liste von Hand zu pflegen (und die eine zu vergessen, die zählt),
 //! wird `escape_debug` selbst gefragt: Was es escapt, ist zu entschärfen. Es
-//! deckt `Cc`, `Cf`, `Zl`, `Zp` und `Zs` ab. Zwei Korrekturen daran, beide in
-//! [`is_escapeworthy`] und [`escape`] begründet:
+//! deckt `Cc`, `Cf`, `Zl`, `Zp` und `Zs` ab. Drei Korrekturen daran, in
+//! [`is_escapeworthy`], [`escape`] und [`INVISIBLE_CARRIERS`] begründet:
 //!
 //! - **Zurück**: Die ASCII-Anführungszeichen escapt `escape_debug` mit; in einem
 //!   Pfad wären sie nur unschön, gefährlich sind sie nicht.
@@ -37,6 +37,9 @@
 //!   ihre Pfade klammern. Sie gehören zur Struktur der Ausgabe, nicht zum
 //!   Inhalt — ein Pfad, der sie enthält, könnte die Klammer sonst früh schließen
 //!   und danach beliebigen Text anhängen.
+//! - **Dazu**: Die druckbaren Zeichen ohne Glyph, an denen der Kategorienblick
+//!   vorbeisieht — Hangul-Füller, Braille-Blank, kombinierende Träger. Das
+//!   Kriterium, aus dem diese Liste folgt, steht an [`INVISIBLE_CARRIERS`].
 
 /// Entschärft alles, was mehr kann, als ein Zeichen zu sein — für eine Zeile,
 /// die auch dann noch eine ist, wenn der Text von woanders kam.
@@ -80,6 +83,11 @@ fn escape(text: &str, escape_backslash: bool) -> String {
             }
         } else if DELIMITERS.contains(&c) {
             out.extend(c.escape_unicode());
+        } else if INVISIBLE_CARRIERS.iter().any(|range| range.contains(&c)) {
+            // Nicht `escape_debug`: Das ließe die *druckbaren* Träger — die
+            // Hangul-Füller (`Lo`), das Braille-Blank (`So`) — wörtlich
+            // stehen. Für die `Mn`-Träger ist `escape_unicode` deckungsgleich.
+            out.extend(c.escape_unicode());
         } else if is_escapeworthy(c) {
             out.extend(c.escape_debug());
         } else {
@@ -103,9 +111,6 @@ fn escape(text: &str, escape_backslash: bool) -> String {
 /// Folgeposition, kombinierende Akzente gehen durch, und `Cc`, `Cf`, `Zl`, `Zp`
 /// und `Zs` werden weiterhin alle escapt.
 fn is_escapeworthy(c: char) -> bool {
-    if INVISIBLE_CARRIERS.iter().any(|range| range.contains(&c)) {
-        return true;
-    }
     if matches!(c, '\'' | '"') {
         return false;
     }
@@ -127,23 +132,69 @@ fn is_escapeworthy(c: char) -> bool {
 
 /// Unsichtbare Zeichen, die der Sentinel-Trick *nicht* erwischt.
 ///
-/// Der Preis des Sentinels: In Folgeposition escapt `str::escape_debug` kein
-/// `Grapheme_Extend`-Zeichen — und ein Teil der `Cf`-Zeichen ist genau das.
-/// Diese hier rendern nichts und können deshalb Text verstecken, den ein
-/// Reviewer im Job-Log nicht sieht:
+/// Der Preis des Sentinels: In Folgeposition escapt `str::escape_debug` nur,
+/// was es für nicht druckbar hält. Druckbare Zeichen ohne Glyph — `Mn`-Träger,
+/// die Hangul-Füller (`Lo`), das leere Braille-Muster (`So`) — fallen durch.
+/// Damit der nächste Fall keine Einzelfallentscheidung wird, folgt die Liste
+/// aus einem Kriterium statt aus einer Aufzählung:
 ///
+/// **Unsichtbar ist, was Unicode als `Default_Ignorable_Code_Point` führt
+/// („render als nichts", `DerivedCoreProperties.txt`, Stand Unicode 16.0) oder
+/// dessen definierter Glyph leer ist („render als Leerzeichen": `Zs` — außer
+/// dem Leerzeichen `U+0020` selbst — und `U+2800`). Einzige Ausnahme:
+/// `U+FE00`–`U+FE0F`, wegen Häufigkeit.**
+///
+/// `Cc`/`Cf`/`Zl`/`Zp`/`Zs` und Unzugewiesenes escapt `escape_debug` selbst;
+/// hier steht der Rest — der Test `every_default_ignorable_is_escaped` misst
+/// die Behauptung gegen die komplette Property nach:
+///
+/// - `U+034F` — Combining Grapheme Joiner, der Klassiker zum Filter-Umgehen:
+///   `Mn`, mitten im String unsichtbar.
+/// - `U+115F`/`U+1160` — die Hangul-Conjoining-Füller. `Lo` ist ein Artefakt
+///   des Kodierungsmodells; die definierte Funktion ist „Platzhalter, der als
+///   nichts gerendert wird" — zusammen mit `U+3164`/`U+FFA0` die einzigen
+///   `Lo`-Einträge der ganzen Property.
 /// - `U+17B4`/`U+17B5` — Khmer-Vokale, die nichts darstellen.
-/// - `U+180B`–`U+180F` — mongolische Variantenselektoren.
+/// - `U+180B`–`U+180F` — mongolische Variantenselektoren und Vokaltrenner.
+/// - `U+2800` — Braille Pattern Blank. Nicht Default-Ignorable, aber per
+///   Definition leer (nicht per Font-Zufall) — und neben `U+3164` das
+///   gängigste „unsichtbare Zeichen" für leere Namen, gerade weil `So` von
+///   fast keinem Filter angefasst wird. Echte Braille-Zellen
+///   (`U+2801`–`U+28FF`) bleiben unberührt.
+/// - `U+3164`/`U+FFA0` — Hangul Filler und sein Halbbreit-Zwilling, beide
+///   NFKC-äquivalent zu `U+1160`: drei Schreibweisen desselben Platzhalters.
+///   Modernes Koreanisch besteht aus vorkomponierten Silben (`U+AC00`–`D7A3`)
+///   und bleibt unangetastet; der legitime Filler-Einsatz sind
+///   Jamo-Sequenzen für unvollständige Silben — in einem Pfad praktisch nie,
+///   und `\u{1160}` im Log ist verlustfrei und informativer als ein
+///   unsichtbarer Glyph.
+/// - `U+1D159` — Musical Symbol Null Notehead: außerhalb der BMP, aber
+///   derselbe Fall wie `U+2800` — ein `So`-Zeichen, dessen Glyph per
+///   Definition leer ist.
 /// - `U+E0100`–`U+E01EF` — der Variantenselektor-Nachtrag, 240 Codepoints und
 ///   der heute gebräuchlichere Bruder der Unicode-Tags aus dem Modulkopf.
 ///
 /// **Bewusst nicht dabei: `U+FE00`–`U+FE0F`.** Die Variantenselektoren 1–16
-/// stehen in echten Dateinamen (`❤\u{FE0F}`), und ein Entschärfer, der die
-/// zerlegt, wird abgeschaltet. Sie hängen an einem sichtbaren Basiszeichen und
-/// tragen keinen eigenen Inhalt.
-const INVISIBLE_CARRIERS: [std::ops::RangeInclusive<char>; 3] = [
+/// stehen in echten Dateinamen (`❤\u{FE0F}`) — Dauerrauschen, und ein
+/// Entschärfer, der die zerlegt, wird abgeschaltet. Sie hängen an einem
+/// sichtbaren Basiszeichen und tragen keinen eigenen Inhalt. Die Ausnahme
+/// überträgt sich nicht auf die Füller: Dort ist die Fehlalarmrate effektiv
+/// null, und die Kosten sind asymmetrisch — Fehlalarm heißt hässliche, aber
+/// korrekte Zeile; Durchlasser heißt Eintrag, den niemand lesen oder abtippen
+/// kann. Kippen würde das Urteil nur eine gemessene Fehlalarmrate wie bei
+/// `U+FE0F`.
+///
+/// Nicht der Weg: NFKC vor dem Entschärfen. Der Sanitizer darf die
+/// Darstellung ändern, nicht die Identität des Pfads.
+const INVISIBLE_CARRIERS: [std::ops::RangeInclusive<char>; 9] = [
+    '\u{034F}'..='\u{034F}',
+    '\u{115F}'..='\u{1160}',
     '\u{17B4}'..='\u{17B5}',
     '\u{180B}'..='\u{180F}',
+    '\u{2800}'..='\u{2800}',
+    '\u{3164}'..='\u{3164}',
+    '\u{FFA0}'..='\u{FFA0}',
+    '\u{1D159}'..='\u{1D159}',
     '\u{E0100}'..='\u{E01EF}',
 ];
 
@@ -383,6 +434,18 @@ mod tests {
         ("devanagari", "प्रोजेक्ट/हिन्दी.rs"),
         ("emoji_mit_variante", "❤\u{FE0F}/herz.rs"),
         ("cjk", "プロジェクト/日本語.rs"),
+        // Vorkomponierte Silben — modernes Koreanisch. Die Füller-Entschärfung
+        // (#72) darf hier nicht hineinkippen.
+        ("koreanisch", "프로젝트/한국어.rs"),
+        // Kompatibilitäts-Jamo ohne Füller (U+3131, U+314F) und Conjoining
+        // Jamo (U+1100, U+1161): pinnt die Füller-Regel auf vier Codepoints
+        // statt auf Blöcke.
+        ("jamo_ohne_fueller", "\u{3131}\u{314F}/\u{1100}\u{1161}.rs"),
+        // Braille mit Punkten — nur das leere Muster U+2800 ist ein Träger.
+        ("braille_mit_punkten", "\u{2801}\u{28FF}/braille.rs"),
+        // U+FFFC rendert ein sichtbares Ersatzsymbol — kein Durchrutscher,
+        // sondern Absicht.
+        ("objekt_ersatzzeichen", "a\u{FFFC}b.rs"),
         ("emoji", "🌱/wachstum.rs"),
         ("leerzeichen", "mein ordner/hooks"),
         ("anfuehrungszeichen", "der \"hook\" und 'das' andere"),
@@ -418,6 +481,21 @@ mod tests {
         // über `Cc`/`Cf`/`Zl`/`Zp` hinaus trägt.
         ("geschuetztes_leerzeichen", '\u{00A0}'),
         ("ideographisches_leerzeichen", '\u{3000}'),
+        // Lo, aber Default-Ignorable: die Hangul-Füller — Platzhalter, die als
+        // nichts gerendert werden (#72).
+        ("hangul_choseong_filler", '\u{115F}'),
+        ("hangul_jungseong_filler", '\u{1160}'),
+        ("hangul_filler", '\u{3164}'),
+        ("halfwidth_hangul_filler", '\u{FFA0}'),
+        // So, aber per Definition leer — neben U+3164 das gängigste
+        // „unsichtbare Zeichen" für leere Namen (#72).
+        ("braille_pattern_blank", '\u{2800}'),
+        // Mn, Default-Ignorable, in Folgeposition unsichtbar durch
+        // `str::escape_debug` — der Klassiker zum Filter-Umgehen (#72).
+        ("combining_grapheme_joiner", '\u{034F}'),
+        // So außerhalb der BMP, Glyph per Definition leer — derselbe Fall
+        // wie U+2800.
+        ("musical_null_notehead", '\u{1D159}'),
         // Die Klammer der Ausgabe selbst — sonst ließe sich „…“ fälschen.
         ("klammer_auf", '„'),
         ("klammer_zu", '“'),
@@ -445,6 +523,75 @@ mod tests {
                 !sanitize_path(&format!("davor{c}danach")).contains(*c),
                 "{name} (Pfad)"
             );
+        }
+    }
+
+    #[test]
+    fn a_filler_falls_per_codepoint_not_per_sequence() {
+        // `\u{115F}\u{1161}` — eine Jamo-Sequenz mit fehlendem Anlaut: Der
+        // Füller wird entschärft, der Vokal bleibt. Die Regel gilt pro
+        // Codepoint, nicht pro Sequenz.
+        let shown = sanitize("\u{115F}\u{1161}");
+        assert!(!shown.contains('\u{115F}'), "{shown:?}");
+        assert!(shown.contains('\u{1161}'), "{shown:?}");
+    }
+
+    #[test]
+    fn a_name_made_only_of_invisibles_does_not_arrive_empty() {
+        // Der klassische Angriff mit „leerem" Namen — nicht nur in
+        // Mittelposition, sondern als kompletter String.
+        for name in ["\u{3164}", "\u{2800}\u{2800}\u{2800}", "\u{115F}\u{1160}"] {
+            let shown = sanitize(name);
+            assert!(shown.starts_with("\\u{"), "{shown:?}");
+        }
+        // Der bewusste Durchlasser als gemessener Grenzfall: Ein Nur-VS-String
+        // bleibt wörtlich — die FE00–FE0F-Ausnahme aus `INVISIBLE_CARRIERS`.
+        assert_eq!(sanitize("\u{FE0F}"), "\u{FE0F}");
+    }
+
+    /// `Default_Ignorable_Code_Point`, Unicode 16.0 — die Bereiche aus
+    /// `DerivedCoreProperties.txt`, zusammenhängende verschmolzen. Die Liste
+    /// ist kurz und ändert sich selten; bei einem Unicode-Sprung hier
+    /// nachziehen.
+    const DEFAULT_IGNORABLE: &[std::ops::RangeInclusive<char>] = &[
+        '\u{00AD}'..='\u{00AD}',   // SOFT HYPHEN
+        '\u{034F}'..='\u{034F}',   // COMBINING GRAPHEME JOINER
+        '\u{061C}'..='\u{061C}',   // ARABIC LETTER MARK
+        '\u{115F}'..='\u{1160}',   // HANGUL CHOSEONG/JUNGSEONG FILLER
+        '\u{17B4}'..='\u{17B5}',   // KHMER VOWEL INHERENT AQ/AA
+        '\u{180B}'..='\u{180F}',   // MONGOLIAN FVS + VOWEL SEPARATOR
+        '\u{200B}'..='\u{200F}',   // ZWSP..RLM
+        '\u{202A}'..='\u{202E}',   // LRE..RLO
+        '\u{2060}'..='\u{206F}',   // WORD JOINER..NOMINAL DIGIT SHAPES
+        '\u{3164}'..='\u{3164}',   // HANGUL FILLER
+        '\u{FE00}'..='\u{FE0F}',   // VARIATION SELECTOR-1..16
+        '\u{FEFF}'..='\u{FEFF}',   // ZERO WIDTH NO-BREAK SPACE
+        '\u{FFA0}'..='\u{FFA0}',   // HALFWIDTH HANGUL FILLER
+        '\u{FFF0}'..='\u{FFF8}',   // <reserved>
+        '\u{1BCA0}'..='\u{1BCA3}', // SHORTHAND FORMAT CONTROLS
+        '\u{1D173}'..='\u{1D17A}', // MUSICAL SYMBOL BEGIN BEAM..END PHRASE
+        '\u{E0000}'..='\u{E0FFF}', // LANGUAGE TAG, TAGS, VS-17..256, <reserved>
+    ];
+
+    #[test]
+    fn every_default_ignorable_is_escaped() {
+        // Das Kriterium aus `INVISIBLE_CARRIERS`, nachgemessen gegen die
+        // komplette Property: „render als nichts" heißt entschärfen — egal ob
+        // `Cf`, `Mn`, `Lo` oder unzugewiesen. Einzige Ausnahme die
+        // Variantenselektoren 1–16, deren Begründung dort steht.
+        for range in DEFAULT_IGNORABLE {
+            for c in range.clone() {
+                if ('\u{FE00}'..='\u{FE0F}').contains(&c) {
+                    // Die Ausnahme positiv gemessen statt nur ausgespart:
+                    // Landet die Range je versehentlich in
+                    // `INVISIBLE_CARRIERS`, schlägt es hier fehl.
+                    let text = format!("davor{c}danach");
+                    assert_eq!(sanitize(&text), text, "U+{:04X}", c as u32);
+                    continue;
+                }
+                let shown = sanitize(&format!("davor{c}danach"));
+                assert!(!shown.contains(c), "U+{:04X} geht roh durch", c as u32);
+            }
         }
     }
 
