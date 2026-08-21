@@ -12,7 +12,6 @@ use std::process::{Command, ExitCode};
 use minds_core::SessionId;
 
 use crate::context::Context;
-use crate::signing;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -53,7 +52,7 @@ fn verify(
     signers: Option<&str>,
     identity: Option<&str>,
 ) -> Fallible<bool> {
-    if !signing::ssh_keygen_available() {
+    if !minds_attest::ssh_keygen_available() {
         return Err("ssh-keygen nicht gefunden".into());
     }
     let id: SessionId = target
@@ -72,7 +71,12 @@ fn verify(
     let signers = resolve_signers(signers, &ctx.root)?;
     let identity = resolve_identity(identity, &ctx.root)?;
 
-    signing::ssh_verify(&payload, &signature, Path::new(&signers), &identity)
+    Ok(minds_attest::ssh_verify(
+        &payload,
+        &signature,
+        Path::new(&signers),
+        &identity,
+    )?)
 }
 
 /// Die allowed_signers-Datei: `--signers`, sonst `git config

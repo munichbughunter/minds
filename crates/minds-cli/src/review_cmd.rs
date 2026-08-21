@@ -13,8 +13,6 @@ use minds_core::{Anchor, ChangeId, Comment, Decision, Review, SessionId, Subject
 use minds_git::Repo;
 use minds_store::ReviewStore;
 
-use crate::signing;
-
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Führt `minds review` aus — legt ein Verdict an.
@@ -75,7 +73,7 @@ fn review(
         // gibt es erst, wenn das Review steht. Scheitert das Signieren, bleibt
         // ein gültiges, unsigniertes Verdict zurück — kein halber Zustand.
         let key = resolve_key(key, &root)?;
-        let signature = signing::ssh_sign(&review_payload(&hash, &review)?, Path::new(&key))?;
+        let signature = minds_attest::ssh_sign(&review_payload(&hash, &review)?, Path::new(&key))?;
         store.put_signature(&hash, &signature)?;
         println!("  signiert mit {key}");
     }
@@ -172,7 +170,7 @@ fn signature_state(
         Ok(payload) => payload,
         Err(err) => return format!("· Signatur nicht prüfbar: {err}"),
     };
-    match signing::ssh_verify(&payload, &signature, Path::new(signers), identity) {
+    match minds_attest::ssh_verify(&payload, &signature, Path::new(signers), identity) {
         Ok(true) => format!("· Signatur gültig ({identity})"),
         Ok(false) => format!("· SIGNATUR UNGÜLTIG ({identity})"),
         Err(err) => format!("· Signatur nicht prüfbar: {err}"),

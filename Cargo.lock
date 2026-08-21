@@ -1415,6 +1415,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "minds-attest"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "minds-capture"
 version = "0.1.0"
 dependencies = [
@@ -1431,6 +1439,7 @@ dependencies = [
 name = "minds-cli"
 version = "0.1.2"
 dependencies = [
+ "minds-attest",
  "minds-capture",
  "minds-core",
  "minds-git",

@@ -15,7 +15,6 @@ use std::process::{Command, ExitCode};
 use minds_core::SessionId;
 
 use crate::context::Context;
-use crate::signing;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -35,7 +34,7 @@ pub fn run(target: Option<&str>, key: Option<&str>) -> ExitCode {
 }
 
 fn sign(target: &str, key: Option<&str>) -> Fallible<()> {
-    if !signing::ssh_keygen_available() {
+    if !minds_attest::ssh_keygen_available() {
         return Err("ssh-keygen nicht gefunden — für signierte Attribution nötig".into());
     }
     let id: SessionId = target
@@ -50,7 +49,7 @@ fn sign(target: &str, key: Option<&str>) -> Fallible<()> {
 
     let key = resolve_key(key, &ctx.root)?;
     let payload = minds_core::attestation_payload(id, &session)?;
-    let signature = signing::ssh_sign(&payload, Path::new(&key))?;
+    let signature = minds_attest::ssh_sign(&payload, Path::new(&key))?;
     print!("{signature}");
     Ok(())
 }

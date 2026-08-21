@@ -21,6 +21,20 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **Signieren legt keine vorhersagbaren, welt-lesbaren Dateien mehr in /tmp ab**
+  ([#26](https://github.com/munichbughunter/minds/issues/26)). Beim
+  Signieren/Verifizieren landeten Payloads und Signaturen mit vorhersagbarem
+  Namen (`minds-sign-<pid>-<nanos>`) und Default-Rechten (0644) direkt in
+  `/tmp` — auf Mehrbenutzer-Systemen welt-lesbar plus Symlink-Race, obwohl
+  Attestation-Payloads Intent-Text enthalten können, also genau die Daten, die
+  die Redaction sonst schützt. Jetzt entsteht alles in einem privaten
+  Temp-Verzeichnis (0700, zufälliger Name) mit Dateien im Modus 0600 und
+  `create_new`-Semantik. Der Verfügbarkeits-Check ruft `ssh-keygen` außerdem
+  nicht mehr argumentlos auf (das startete den interaktiven Keygen-Modus),
+  sondern prüft nicht-interaktiv, ob `-Y sign` unterstützt wird. Die ssh-sig-
+  Logik liegt dafür als eigene Crate `minds-attest` vor, damit CLI,
+  `minds-gitlab` und ein künftiger CI-Verifier dasselbe Vertrauensmodell
+  teilen, statt es zu duplizieren.
 - **Der Reconcile-Zweig von `minds sync` hört nicht mehr auf Server-Text**
   ([#71](https://github.com/munichbughunter/minds/issues/71)). Ob ein
   fehlgeschlagener Push eine Ref-Divergenz war — der einzige Fall, in dem
