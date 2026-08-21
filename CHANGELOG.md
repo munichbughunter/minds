@@ -21,6 +21,20 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **Der Reconcile-Zweig von `minds sync` hört nicht mehr auf Server-Text**
+  ([#71](https://github.com/munichbughunter/minds/issues/71)). Ob ein
+  fehlgeschlagener Push eine Ref-Divergenz war — der einzige Fall, in dem
+  `sync` fremde Review-Stände holt und in den lokalen Store vereinigt —,
+  entschied eine Substring-Suche im vermischten stdout+stderr von `git push`;
+  ein Remote konnte den Zweig mit einem „rejected" in einer beliebigen
+  `remote:`-Zeile öffnen. Jetzt fällt die Entscheidung auf der
+  `--porcelain`-Struktur von stdout: Nur eine von git selbst im lokalen
+  Vergleich festgestellte Abweisung (`[rejected]` mit
+  non-fast-forward/fetch first/stale info) gilt als Divergenz; ein
+  `[remote rejected]` — dessen Grund wörtlich vom Server stammt, etwa aus
+  einem pre-receive-Hook — nicht mehr. stdout und stderr werden dabei nicht
+  mehr vermischt; die Fehlermeldung kommt von stderr, Zugangsdaten werden
+  weiterhin entfernt.
 - **Die DSGVO-Löschung eines bereits gepushten Session-Refs erreicht jetzt die
   Forge** ([#102](https://github.com/munichbughunter/minds/issues/102)). Seit
   die Tombstones elternlos sind (#14), war ein getilgter Ref kein Fast-Forward

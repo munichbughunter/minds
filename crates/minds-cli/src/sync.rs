@@ -524,8 +524,10 @@ impl Job {
                 // Divergenz ist der eine Fehler, aus dem wir uns selbst
                 // befreien können — aber nur dort, wo der Inhalt vereinigbar
                 // ist. Für alles andere gilt: melden, nichts überschreiben.
-                if !is_rejected(&err.to_string()) {
-                    return Err(err);
+                // Ob es eine war, hat `push` aus der `--porcelain`-Struktur
+                // gelesen, nicht aus dem Wortlaut der Meldung (#71).
+                if !err.diverged {
+                    return Err(err.into());
                 }
                 self.reconcile(verbose)
             }
@@ -533,7 +535,7 @@ impl Job {
     }
 
     /// Ein einziger `git push` für alle Refspecs.
-    fn push(&self, updates: &[Update]) -> Fallible<()> {
+    fn push(&self, updates: &[Update]) -> Result<(), PushError> {
         let mut args: Vec<String> = vec![
             "push".into(),
             // Der eigene Push darf den pre-push-Hook nicht erneut auslösen.
@@ -559,11 +561,33 @@ impl Job {
             // hängen lassen, die er nicht sieht.
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(GUARD_ENV, "1")
-            .output()?;
+            .output()
+            .map_err(|err| PushError {
+                diverged: false,
+                // Ein io-Fehler trägt heute keine URL — redigiert wird er
+                // trotzdem: Die Invariante „nichts verlässt `push`
+                // unredigiert" soll lokal gelten, nicht per Fernargument.
+                message: crate::text::without_url_credentials(&format!("git push: {err}")),
+            })?;
 
         if output.status.success() {
             return Ok(());
         }
+        // stdout und stderr bleiben getrennt — das ist der Kern von #71: Auf
+        // stderr schreibt der Server frei (`remote: …`), auf stdout steht die
+        // `--porcelain`-Struktur, die git selbst erzeugt. Nur Letztere trägt
+        // die Reconcile-Entscheidung; vermischt man beide, genügt dem Server
+        // eine `remote:`-Zeile mit dem passenden Wortlaut, um sie zu steuern.
+        // Für die **Meldung** dagegen gehören beide hinein: stderr sagt, was
+        // der Server meint, die `!`-Zeilen sagen, welcher Ref aus welchem
+        // strukturellen Grund abgewiesen wurde.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let text = match (stderr.trim(), stdout.trim()) {
+            (err, "") => err.to_string(),
+            ("", out) => out.to_string(),
+            (err, out) => format!("{err}\n{out}"),
+        };
         // Zugangsdaten raus, **hier** und nicht bei der Ausgabe: Git schreibt
         // die Remote-URL in seine Fehlermeldung, und steht darin ein Token
         // (`https://glpat-…@gitlab.com/…`, die Username-Position redigiert Git
@@ -571,12 +595,10 @@ impl Job {
         // stderr, `hook.log`, und mit der Datei ein Bug-Report. An der Senke zu
         // filtern hieße, es an jeder Senke einzeln zu tun und die nächste zu
         // vergessen.
-        Err(crate::text::without_url_credentials(&format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stderr).trim(),
-            String::from_utf8_lossy(&output.stdout).trim()
-        ))
-        .into())
+        Err(PushError {
+            diverged: is_divergence(&stdout),
+            message: crate::text::without_url_credentials(&text),
+        })
     }
 
     /// Meldet übertragene Löschungen — auf stdout **und** ins Log.
@@ -737,14 +759,57 @@ impl Job {
     }
 }
 
-/// Ob die Ausgabe von `git push` eine Abweisung meldet (statt eines
-/// Netz-/Auth-Fehlers).
-fn is_rejected(text: &str) -> bool {
-    let text = text.to_ascii_lowercase();
-    text.contains("non-fast-forward")
-        || text.contains("rejected")
-        || text.contains("fetch first")
-        || text.contains("stale info")
+/// Ein gescheiterter `git push`, beim Scheitern strukturell gedeutet.
+///
+/// Ob der Fehlschlag eine Divergenz war, steht als Flag daran — entschieden
+/// aus der `--porcelain`-Struktur, nicht aus dem Wortlaut der Meldung. Der
+/// Aufrufer muss den Text damit nie wieder deuten (#71).
+#[derive(Debug)]
+struct PushError {
+    /// Mindestens ein Ref wurde als Divergenz abgewiesen — von git im lokalen
+    /// Vergleich festgestellt, nicht vom Server behauptet.
+    diverged: bool,
+    /// Die Meldung für Mensch und `hook.log`, Zugangsdaten bereits entfernt.
+    message: String,
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PushError {}
+
+/// Ob der `--porcelain`-stdout von `git push` eine **Divergenz**-Abweisung
+/// enthält — also eine, die `reconcile` durch Vereinigen auflösen kann.
+///
+/// Je Ref schreibt git eine Zeile `<flag>\t<from>:<to>\t<zusammenfassung>`;
+/// eine Abweisung trägt das Flag `!`. Entscheidend ist die Zusammenfassung:
+/// `[rejected] (<grund>)` stellt git im lokalen Vergleich selbst fest,
+/// `[remote rejected] (…)` zitiert dagegen wörtlich den Server — dessen Grund
+/// (die Ausgabe eines pre-receive-Hooks!) hier mitzulesen hieße, die
+/// Reconcile-Entscheidung wieder an server-kontrollierten Text zu hängen.
+/// Deshalb zählt nur Ersteres, und davon nur die Gründe, die tatsächlich
+/// „jemand anderes hat den Ref fortgeschrieben" bedeuten — ein „hook declined"
+/// oder ein Netz-/Auth-Fehler öffnet den Zweig nicht.
+fn is_divergence(porcelain: &str) -> bool {
+    porcelain.lines().any(|line| {
+        // Ref-Namen können weder Tab noch `!` enthalten — die zwei `\t` sind
+        // verlässliche Feldgrenzen.
+        let Some(rest) = line.strip_prefix("!\t") else {
+            return false;
+        };
+        let Some((_refspec, summary)) = rest.split_once('\t') else {
+            return false;
+        };
+        summary
+            .strip_prefix("[rejected] (")
+            .and_then(|reason| reason.strip_suffix(')'))
+            .is_some_and(|reason| {
+                matches!(reason, "non-fast-forward" | "fetch first" | "stale info")
+            })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -976,15 +1041,171 @@ mod tests {
     }
 
     #[test]
-    fn a_rejection_is_told_apart_from_a_network_error() {
-        assert!(is_rejected(
-            "! [rejected] refs/minds/reviews -> refs/minds/reviews (non-fast-forward)"
+    fn a_divergence_is_read_from_the_porcelain_structure() {
+        // Nur was git selbst im lokalen Vergleich feststellt, zählt.
+        assert!(is_divergence(
+            "To gitlab.com:x/y.git\n!\trefs/minds/reviews:refs/minds/reviews\t[rejected] (non-fast-forward)\nDone"
         ));
-        assert!(is_rejected("Updates were rejected because the remote…"));
-        assert!(!is_rejected(
+        assert!(is_divergence(
+            "!\tabc123:refs/minds/reviews\t[rejected] (fetch first)"
+        ));
+        assert!(is_divergence(
+            "!\tabc123:refs/minds/reviews\t[rejected] (stale info)"
+        ));
+        // Eine kaputte `!`-Zeile daneben stört die echte nicht — die
+        // Feldgrenzen-Annahme (`split_once('\t')`) ist fehlertolerant.
+        assert!(is_divergence(
+            "!\tkein zweites Tabfeld\n!\tabc123:refs/minds/reviews\t[rejected] (fetch first)"
+        ));
+    }
+
+    #[test]
+    fn the_reason_whitelist_stays_narrow() {
+        // Auch git-lokal festgestellt, aber keine vereinigbare Divergenz —
+        // reconcile könnte hier nichts retten.
+        assert!(!is_divergence(
+            "!\tabc123:refs/minds/reviews\t[rejected] (already exists)"
+        ));
+    }
+
+    #[test]
+    fn server_written_text_is_never_a_divergence() {
+        // Die Regression aus #71: `remote:`-Zeilen und der Grund hinter
+        // `[remote rejected]` kommen wörtlich vom Server — beides darf den
+        // Reconcile-Zweig nicht öffnen, auch nicht mit dem „richtigen"
+        // Wortlaut.
+        assert!(!is_divergence(
+            "remote: rejected — Updates were rejected (non-fast-forward)"
+        ));
+        assert!(!is_divergence(
+            "!\trefs/minds/reviews:refs/minds/reviews\t[remote rejected] (hook declined)"
+        ));
+        assert!(!is_divergence(
+            "!\trefs/minds/reviews:refs/minds/reviews\t[remote rejected] (non-fast-forward)"
+        ));
+        // Auch neben einer Erfolgszeile für einen anderen Ref bleibt das
+        // Server-Zitat wirkungslos.
+        assert!(!is_divergence(
+            "To gitlab.com:x/y.git\n*\tabc123:refs/minds/context\t[new reference]\n!\trefs/minds/reviews:refs/minds/reviews\t[remote rejected] (non-fast-forward)\nDone"
+        ));
+    }
+
+    #[test]
+    fn a_network_error_is_not_a_divergence() {
+        assert!(!is_divergence(
             "ssh: connect to host gitlab.com port 22: timeout"
         ));
-        assert!(!is_rejected("Permission denied (publickey)."));
+        assert!(!is_divergence("Permission denied (publickey)."));
+    }
+
+    /// Git mit fixierter Identität in `path` ausführen — für die Tests, die
+    /// echte Repositories brauchen.
+    fn run_git(path: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .env("GIT_AUTHOR_DATE", "2001-01-01T00:00:00")
+            .env("GIT_COMMITTER_DATE", "2001-01-01T00:00:00")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Ein Job, der genau den Review-Ref auf `oid` schieben will.
+    fn review_push_job(work: &Path, remote: &Path, oid: &str) -> Job {
+        Job {
+            dir: work.to_path_buf(),
+            remote: remote.display().to_string(),
+            label: "origin".into(),
+            updates: vec![Update {
+                local: DEFAULT_REVIEW_REF.to_string(),
+                oid: oid.to_string(),
+                destination: DEFAULT_REVIEW_REF.to_string(),
+                tracking: tracking_ref("origin", DEFAULT_REVIEW_REF),
+                force: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_real_non_fast_forward_still_opens_the_reconcile_path() {
+        // Akzeptanzkriterium aus #71: Eine echte Divergenz öffnet den
+        // Reconcile-Zweig weiterhin — jetzt über die Struktur statt über den
+        // Wortlaut.
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        let work = dir.path().join("work");
+        run_git(dir.path(), &["init", "--bare", "--quiet", "remote.git"]);
+        std::fs::create_dir(&work).unwrap();
+        run_git(&work, &["init", "--quiet", "-b", "main"]);
+        run_git(&work, &["commit", "--allow-empty", "--quiet", "-m", "a"]);
+        let a = run_git(&work, &["rev-parse", "HEAD"]);
+        let tree = run_git(&work, &["rev-parse", "HEAD^{tree}"]);
+        // Die Forge steht auf `a` …
+        run_git(
+            &work,
+            &[
+                "push",
+                "--quiet",
+                remote.to_str().unwrap(),
+                &format!("{a}:{DEFAULT_REVIEW_REF}"),
+            ],
+        );
+        // … lokal soll ein elternloser Stand hin — kein Nachfahre von `a`.
+        let orphan = run_git(&work, &["commit-tree", &tree, "-m", "b"]);
+
+        let job = review_push_job(&work, &remote, &orphan);
+        let err = job.push(&job.updates).unwrap_err();
+        assert!(
+            err.diverged,
+            "non-fast-forward muss als Divergenz gelten: {}",
+            err.message
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_shouting_rejected_does_not_open_the_reconcile_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Der Regressionstest aus #71: Der Server schreibt „rejected" in
+        // seine Meldung. Strukturell ist das ein `[remote rejected]` — und
+        // damit keine Divergenz, egal was der Text behauptet.
+        let dir = tempfile::tempdir().unwrap();
+        let remote = dir.path().join("remote.git");
+        let work = dir.path().join("work");
+        run_git(dir.path(), &["init", "--bare", "--quiet", "remote.git"]);
+        let hook = remote.join("hooks").join("pre-receive");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho 'rejected: non-fast-forward, fetch first' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        run_git(&work, &["init", "--quiet", "-b", "main"]);
+        run_git(&work, &["commit", "--allow-empty", "--quiet", "-m", "a"]);
+        let a = run_git(&work, &["rev-parse", "HEAD"]);
+
+        // Ohne den Hook ginge dieser Push glatt durch — neuer Ref, kein
+        // Konflikt. Abgewiesen wird er allein vom Server.
+        let job = review_push_job(&work, &remote, &a);
+        let err = job.push(&job.updates).unwrap_err();
+        assert!(
+            !err.diverged,
+            "server-kontrollierter Text darf keine Divergenz melden: {}",
+            err.message
+        );
     }
 
     #[test]
