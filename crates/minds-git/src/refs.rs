@@ -180,6 +180,33 @@ impl Repo {
         self.commit_tree_onto(reference, tree, parent, message)
     }
 
+    /// Wie [`commit_tree_to_ref`](Self::commit_tree_to_ref), aber der Aufrufer
+    /// benennt den Parent selbst, statt ihn hier frisch auflösen zu lassen —
+    /// als expliziten Erwartungswert für den Compare-and-Swap.
+    ///
+    /// Der Weg für Aufrufer, die am Stand `expected` eine **Entscheidung**
+    /// getroffen haben (`minds-store` etwa den Identitäts-Check am
+    /// Session-Branch, #100) und sicherstellen müssen, dass genau dieser
+    /// geprüfte Stand zum Elter wird: Ein frisches Auflösen sähe womöglich
+    /// schon den Commit eines parallelen Schreibers — und setzte auf einen
+    /// Stand auf, den keine Prüfung je gesehen hat. Hier dagegen meldet ein
+    /// bewegter Ref [`GitError::RefRaced`], und der Aufrufer entscheidet am
+    /// neuen Stand von vorn.
+    ///
+    /// # Fehler
+    ///
+    /// Wie bei [`commit_tree_to_ref`](Self::commit_tree_to_ref).
+    pub fn commit_tree_onto_expected(
+        &self,
+        reference: &str,
+        tree: TreeId,
+        expected: Option<CommitId>,
+        message: &str,
+    ) -> Result<RefUpdate> {
+        validate_minds_ref(reference)?;
+        self.commit_tree_onto(reference, tree, expected, message)
+    }
+
     /// Wie [`commit_tree_to_ref`](Self::commit_tree_to_ref), schreibt aber
     /// **nicht**, wenn der aktuelle Blob unter `guard_path` das Prädikat
     /// `reject` erfüllt — dann kommt `Ok(None)` zurück, kein Commit.

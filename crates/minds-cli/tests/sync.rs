@@ -428,15 +428,19 @@ fn a_forgotten_session_branch_in_the_child_repo_reaches_its_forge_as_tombstone()
     git(&work, &["config", "minds.backend", "child-repo"]);
     git(&work, &["config", "minds.childPath", "../kontext"]);
 
-    // Die Session liegt im Child: Store-Ref und browsbarer Branch.
-    let hex = "ab".repeat(32);
+    // Die Session liegt im Child: Store-Ref und browsbarer Branch. Die ID ist
+    // der blake3 der Bytes — wie beim echten `put`: Seit #100 prüft `forget`
+    // die Identität der Branch-Nutzlast; unter einer frei erfundenen ID bliebe
+    // der Branch als vermeintlich fremder stehen.
+    let payload = br#"{"agent":{"name":"x"}}"#;
+    let id = minds_core::SessionId::from_canonical_bytes(payload).to_string();
+    let hex = id
+        .strip_prefix(minds_core::SESSION_ID_PREFIX)
+        .unwrap()
+        .to_owned();
     let hex16 = &hex[..16];
-    session_store_ref(&child, &hex, br#"{"agent":{"name":"x"}}"#);
-    let json = git_stdin(
-        &child,
-        &["hash-object", "-w", "--stdin"],
-        br#"{"agent":{"name":"x"}}"#,
-    );
+    session_store_ref(&child, &hex, payload);
+    let json = git_stdin(&child, &["hash-object", "-w", "--stdin"], payload);
     let md = git_stdin(
         &child,
         &["hash-object", "-w", "--stdin"],
@@ -472,10 +476,7 @@ fn a_forgotten_session_branch_in_the_child_repo_reaches_its_forge_as_tombstone()
     );
 
     // forget im Arbeitsrepo tilgt im Child …
-    let forgotten = minds(
-        &work,
-        &["forget", &format!("b3-{hex}"), "--reason", "DSGVO"],
-    );
+    let forgotten = minds(&work, &["forget", &id, "--reason", "DSGVO"]);
     assert!(forgotten.status.success(), "{}", text(&forgotten));
 
     // … und der nächste Sync zieht den Branch per Force-Push nach.
