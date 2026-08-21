@@ -181,11 +181,35 @@ fn resolve_base(root: &Path, base: Option<&str>) -> Fallible<String> {
     if let Some(base) = base {
         return Ok(base.to_string());
     }
-    if let Some(upstream) = git(root, &["rev-parse", "--abbrev-ref", "@{upstream}"]) {
+    // `--verify` nicht nur der Ein-Ergebnis-Garantie wegen: Erst im
+    // Verify-Modus respektiert `rev-parse` das `--end-of-options` — im
+    // Filter-Modus reicht es die Marke wörtlich auf stdout durch, und die
+    // Basis hieße „--end-of-options\norigin/…".
+    if let Some(upstream) = git(
+        root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--abbrev-ref",
+            "--end-of-options",
+            "@{upstream}",
+        ],
+    ) {
         return Ok(upstream);
     }
     for candidate in FALLBACK_BASES {
-        if git(root, &["rev-parse", "--verify", "--quiet", candidate]).is_some() {
+        if git(
+            root,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "--end-of-options",
+                candidate,
+            ],
+        )
+        .is_some()
+        {
             return Ok(candidate.to_string());
         }
     }
@@ -198,20 +222,27 @@ fn resolve_base(root: &Path, base: Option<&str>) -> Fallible<String> {
 /// nicht zum Stapel, auch wenn die Basis inzwischen weitergelaufen ist.
 fn commits_since(root: &Path, base: &str) -> Fallible<Vec<String>> {
     let range = format!("{base}..HEAD");
-    let out = git(root, &["rev-list", "--reverse", &range])
+    let out = git(root, &["rev-list", "--reverse", "--end-of-options", &range])
         .ok_or_else(|| format!("{range} lässt sich nicht auflösen"))?;
     Ok(out.lines().map(str::to_owned).collect())
 }
 
 /// Die `Minds-Change-Id` aus der Message eines Commits.
 fn change_id_of(root: &Path, commit: &str) -> Option<String> {
-    let message = git(root, &["show", "-s", "--format=%B", commit])?;
+    let message = git(
+        root,
+        &["show", "-s", "--format=%B", "--end-of-options", commit],
+    )?;
     Trailer::change_id(&message).map(|id| id.to_string())
 }
 
 /// Die Betreffzeile eines Commits.
 fn subject_of(root: &Path, commit: &str) -> String {
-    git(root, &["show", "-s", "--format=%s", commit]).unwrap_or_default()
+    git(
+        root,
+        &["show", "-s", "--format=%s", "--end-of-options", commit],
+    )
+    .unwrap_or_default()
 }
 
 /// Die Kurzform einer Change-Id — genug zum Wiedererkennen, kurz genug für eine

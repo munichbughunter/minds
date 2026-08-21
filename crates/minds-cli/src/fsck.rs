@@ -145,7 +145,13 @@ fn commit_change_id(root: &Path, commit: CommitId) -> Option<ChangeId> {
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", "-s", "--format=%B", &commit.to_string()])
+        .args([
+            "show",
+            "-s",
+            "--format=%B",
+            "--end-of-options",
+            &commit.to_string(),
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use minds_core::{Decision, Trailer};
-use minds_git::Repo;
+use minds_git::{CommitId, Repo};
 use minds_gitlab::{Project, webhook};
 use minds_store::ReviewStore;
 
@@ -209,11 +209,29 @@ fn project(root: &Path, options: &Options<'_>) -> Fallible<Project> {
 
 /// Die `Minds-Change-Id` eines Commits — die Brücke von dem, was GitLab kennt
 /// (ein Hash), zu dem, woran ein Verdict hängt.
+///
+/// `commit` kommt verbatim aus der Webhook-Nutzlast und wird deshalb zuerst
+/// als voller Hex-Hash gelesen (#23): Was keine [`CommitId`] ist — etwa ein
+/// `--output=…`, das `git show` als Option parste und eine Datei anlegte —
+/// erreicht git gar nicht. Das `--end-of-options` dahinter ist die zweite
+/// Mauer derselben Sorte.
+///
+/// Dass Kurzhashes und Ref-Syntax (`HEAD`, `@{…}`) daran scheitern, ist
+/// **Absicht**, kein Bug: GitLab liefert in `last_commit.id` immer den vollen
+/// Hash, und alles Auflösbare wäre hier ein zweiter Weg für fremdgesteuerte
+/// Eingaben in git hinein.
 fn change_id_of(root: &Path, commit: &str) -> Option<String> {
+    let commit: CommitId = commit.parse().ok()?;
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", "-s", "--format=%B", commit])
+        .args([
+            "show",
+            "-s",
+            "--format=%B",
+            "--end-of-options",
+            &commit.to_string(),
+        ])
         .output()
         .ok()?;
     if !output.status.success() {

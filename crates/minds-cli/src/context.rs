@@ -224,6 +224,7 @@ fn resolve(root: &Path, rev: &str) -> Option<CommitId> {
             "rev-parse",
             "--verify",
             "--quiet",
+            "--end-of-options",
             &format!("{rev}^{{commit}}"),
         ])
         .output()
