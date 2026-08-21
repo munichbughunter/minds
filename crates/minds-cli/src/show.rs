@@ -68,7 +68,13 @@ fn commit_change_id(root: &Path, commit: CommitId) -> Option<minds_core::ChangeI
     let output = Command::new("git")
         .arg("-C")
         .arg(root)
-        .args(["show", "-s", "--format=%B", &commit.to_string()])
+        .args([
+            "show",
+            "-s",
+            "--format=%B",
+            "--end-of-options",
+            &commit.to_string(),
+        ])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -89,6 +95,7 @@ fn resolve(root: &Path, rev: &str) -> Option<CommitId> {
             "rev-parse",
             "--verify",
             "--quiet",
+            "--end-of-options",
             &format!("{rev}^{{commit}}"),
         ])
         .output()

@@ -159,10 +159,11 @@ fn gather_commits(root: &Path) -> Fallible<Vec<CommitInfo>> {
         .arg(root)
         .args([
             "log",
-            "HEAD",
             "--no-renames",
             "--name-only",
             "--format=%x01%H %at",
+            "--end-of-options",
+            "HEAD",
         ])
         .output()?;
     if !output.status.success() {

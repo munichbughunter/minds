@@ -95,6 +95,31 @@ fn commit_with_change(dir: &Path, file: &str, message: &str) -> String {
 }
 
 #[test]
+fn the_stack_follows_the_configured_upstream() {
+    // Der Blocker aus dem #23-Review: `rev-parse --abbrev-ref` ohne `--verify`
+    // reicht `--end-of-options` wörtlich auf stdout durch — die Basis hieße
+    // dann „--end-of-options\norigin/…", und `minds stack` bräche genau in dem
+    // Normalfall, in dem ein Upstream konfiguriert ist. Der Zweig war bis
+    // hierhin ungetestet: Alle anderen Tests laufen ohne Tracking-Branch und
+    // fallen auf `main`/`master` zurück.
+    let Some(dir) = repo() else { return };
+    let dir = dir.path();
+
+    // Upstream ohne Netz: Das Repo ist sein eigener Remote (`.`), der
+    // Tracking-Zweig ist der Stand vor dem neuen Commit.
+    git(dir, &["branch", "base"]);
+    git(dir, &["config", "branch.main.remote", "."]);
+    git(dir, &["config", "branch.main.merge", "refs/heads/base"]);
+    commit_with_change(dir, "b.txt", "feat: obendrauf");
+
+    let out = minds(dir, &["stack"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("Stapel auf base"), "{shown}");
+    assert!(shown.contains("1 Change"), "{shown}");
+}
+
+#[test]
 fn the_stack_shows_each_change_with_its_own_verdict() {
     let Some(dir) = repo() else { return };
     let dir = dir.path();

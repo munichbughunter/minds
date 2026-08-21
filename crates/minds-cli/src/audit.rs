@@ -337,14 +337,23 @@ fn verdict_record(store: &ReviewStore, review: &Review) -> Fallible<VerdictRecor
 
 fn commits_since(root: &Path, base: &str) -> Fallible<Vec<CommitId>> {
     let range = format!("{base}..HEAD");
-    let out = git(root, &["rev-list", &range]).unwrap_or_default();
+    let out = git(root, &["rev-list", "--end-of-options", &range]).unwrap_or_default();
     out.lines()
         .map(|line| line.parse::<CommitId>().map_err(Into::into))
         .collect()
 }
 
 fn change_id_of(root: &Path, commit: CommitId) -> Option<ChangeId> {
-    let message = git(root, &["show", "-s", "--format=%B", &commit.to_string()])?;
+    let message = git(
+        root,
+        &[
+            "show",
+            "-s",
+            "--format=%B",
+            "--end-of-options",
+            &commit.to_string(),
+        ],
+    )?;
     Trailer::change_id(&message)
 }
 

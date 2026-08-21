@@ -608,6 +608,90 @@ fn gitlab_webhook_accepts_the_matching_token() {
 }
 
 #[test]
+fn gitlab_webhook_commit_id_never_reaches_git_as_an_option() {
+    // Der Kern von #23: `merge_request.last_commit.id` kommt verbatim aus der
+    // Nutzlast. Ein Wert wie `--output=<pfad>` parste `git show` als Option
+    // und legte die Datei an — er muss an der Hex-Validierung scheitern,
+    // bevor git ihn je sieht.
+    let Some(dir) = repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = dir.path();
+    let target = dir.join("injiziert.txt");
+    // Neben der Options-Injection auch Kurzhash und Ref-Syntax: hex, aber
+    // nicht voll bzw. auflösbar statt wörtlich — beides darf git nie erreichen
+    // und muss ohne Change-Id im Kommentar in „kein Subjekt" enden.
+    let rejected = [
+        format!("--output={}", target.display()),
+        "-O/tmp/injiziert".to_string(),
+        "deadbeef".to_string(),
+        "HEAD".to_string(),
+    ];
+    for id in &rejected {
+        let payload = serde_json::json!({
+            "object_kind": "note",
+            "user": { "username": "anna" },
+            "object_attributes": { "note": "/minds approve passt", "noteable_type": "MergeRequest" },
+            "merge_request": { "iid": 4, "last_commit": { "id": id } }
+        })
+        .to_string();
+
+        // Das Secret ausdrücklich leer: Eine in der Entwickler-Umgebung
+        // gesetzte Variable schöbe den Lauf sonst auf den verifizierten Pfad.
+        let out = minds_with_env(
+            dir,
+            &["gitlab", "webhook", "--write"],
+            Some(&payload),
+            &[("MINDS_GITLAB_WEBHOOK_SECRET", "")],
+        );
+        assert!(!out.status.success(), "{id}: {}", text(&out));
+        assert!(
+            stderr(&out).contains("kein Subjekt"),
+            "{id}: {}",
+            text(&out)
+        );
+    }
+    assert!(
+        !target.exists(),
+        "die Commit-Id aus der Nutzlast hat git als Option erreicht"
+    );
+}
+
+#[test]
+fn gitlab_webhook_resolves_the_change_id_from_the_mr_commit() {
+    // Die Rückfallebene: keine Change-Id im Kommentar, aber der Commit des MR
+    // ist lokal bekannt — seine Change-Id wird das Subjekt. Der volle
+    // Hex-Hash ist zugleich der einzige Wert, den die Validierung aus #23
+    // durchlässt; der Test hält fest, dass sie den Gutfall nicht mitnimmt.
+    let Some(dir) = repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = dir.path();
+    let head = String::from_utf8_lossy(&git(dir, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_string();
+    let change = change_id_of_head(dir);
+    let payload = serde_json::json!({
+        "object_kind": "note",
+        "user": { "username": "anna" },
+        "object_attributes": { "note": "/minds approve passt", "noteable_type": "MergeRequest" },
+        "merge_request": { "iid": 4, "last_commit": { "id": head } }
+    })
+    .to_string();
+
+    let out = minds_with_env(
+        dir,
+        &["gitlab", "webhook"],
+        Some(&payload),
+        &[("MINDS_GITLAB_WEBHOOK_SECRET", "")],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(stdout(&out).contains(&change), "{}", text(&out));
+}
+
+#[test]
 fn gitlab_mirror_names_the_missing_token_variable() {
     // Der häufigste Konfigurationsfehler beim Partner — er muss die Variable
     // benennen, statt sich als HTTP-Fehler oder Stille zu zeigen. Kein Stub
