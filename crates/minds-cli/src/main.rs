@@ -60,7 +60,6 @@ mod review_cmd;
 mod search;
 mod show;
 mod sign_cmd;
-mod signing;
 mod stack;
 mod sync;
 mod text;
