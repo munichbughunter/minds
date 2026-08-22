@@ -19,6 +19,19 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+## [0.1.3] — 2026-08-22 — „Unsichtbar, auch unter Last"
+
+*Das Release nach dem ersten manuellen Testlauf. Die Befunde von dort haben
+eine Gemeinsamkeit: Nichts davon war ein Leck, aber alles war eine Zusage, die
+nur hielt, solange jemand daran dachte — die Redaktion an der Quelle statt an
+der Senke, die Terminal-Härtung, die es nur für das Log gab, und ein Push, der
+auf einen zweiten Transport wartete. Jetzt sind die Zusagen strukturell:
+`hook.log` und die Anzeige entschärfen **dort, wo geschrieben wird**, und der
+Kontext-Transport hängt nicht mehr am Push des Nutzers.*
+
+Der Preis des letzten Punkts steht unten unter „Bekannte Einschränkungen":
+Der Kontext kommt Sekunden nach dem Push an, nicht mehr garantiert mit ihm.
+
 ### Geändert
 
 - **`git push` wartet nicht mehr auf den Kontext-Transport**
@@ -263,10 +276,9 @@ gelesen als „gilt heute" wird nur diese hier.*
   Datei-Ebene noch nicht gedeutet.
 - **Die Review-Schicht braucht zwei Personen auf einem Repo** — allein
   bleiben Erfassung, `why` und `recall` testbar, Reviews nicht.
-- **`forget` erreicht bereits gepushte Refs nicht automatisch**
-  ([#102](https://github.com/munichbughunter/minds/issues/102)) — `sync`
-  force-pusht grundsätzlich nie; lokal wirkt die Tilgung vollständig.
-  Dazu der Kollisions-Randfall des Browse-Branches
+- **Rund um `forget` bleiben zwei Randfälle** — die Tilgung erreicht seit
+  0.1.3 auch bereits gepushte Refs (#102, oben unter Sicherheit), offen sind
+  der Kollisions-Randfall des Browse-Branches
   ([#100](https://github.com/munichbughunter/minds/issues/100), Richtung:
   über-tilgen, kein Leck) und das Rohdaten-Fenster im Journal
   ([#49](https://github.com/munichbughunter/minds/issues/49)) — Details in
@@ -274,9 +286,11 @@ gelesen als „gilt heute" wird nur diese hier.*
 - **`minds import` nutzt die eingebaute Standard-Policy**, nicht die
   repo-eigene `.minds/redact.json` — projektspezifische Denylists greifen
   beim Backfill nicht.
-- **Ein Push mit neuen Sessions öffnet zwei Verbindungen**
-  ([#85](https://github.com/munichbughunter/minds/issues/85)); ohne neue
-  Sessions kostet der Hook nichts.
+- **Der Kontext kommt Sekunden nach dem Push am Remote an, nicht mehr
+  garantiert mit ihm** ([#85](https://github.com/munichbughunter/minds/issues/85))
+  — der Transport läuft seit 0.1.3 im Hintergrund. Eine Pipeline, die dem
+  Push unmittelbar folgt, kann frische Reviews knapp verpassen; wer die
+  Garantie braucht, ruft `minds sync` vor dem Push von Hand auf.
 - **`minds gitlab webhook` hat keine Token-Verifikation**
   ([#8](https://github.com/munichbughunter/minds/issues/8)) — als lokales
   Kommando enthalten (Default: Dry-Run), aber nicht verwenden; das
