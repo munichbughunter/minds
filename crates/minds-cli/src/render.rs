@@ -4,9 +4,46 @@
 //! Beide Kommandos enden an derselben Stelle: eine [`Session`] liegt vor, sie
 //! soll lesbar auf stdout. Damit `show` und `why` nicht zwei Schreibweisen
 //! desselben pflegen, steht das Rendern hier — einmal.
+//!
+//! # Was hier entschärft wird — und was nicht
+//!
+//! Fast alles, was diese Schicht druckt, ist **fremder Text aus dem Store**:
+//! der Prompt, Constraints und verworfene Pfade, die Namen von Agent und
+//! Modell, die Dateipfade, die Endpunkte der Kanten, der Grund eines
+//! Vergessens. Nichts davon ist beim Anlegen auf Terminal-Sicherheit geprüft
+//! worden — die Kanten-Endpunkte liest `edges.rs` sogar wörtlich aus dem
+//! Hook-Payload der *Gegenseite*, und die Redaktion aus #35 sucht Geheimnisse,
+//! keine Steuerzeichen (#116). Eine ANSI-Sequenz darin löscht Zeilen im
+//! Terminal des Lesers, ein Bidi-Zeichen dreht die Leserichtung, ein
+//! Zero-Width-Zeichen versteckt Text.
+//!
+//! Deshalb gilt hier dieselbe Regel wie in [`crate::hooklog`]: **entschärft
+//! wird an der Senke**, in genau den Funktionen, die drucken — nicht bei den
+//! Aufrufern, und nicht beim Anlegen. Jeder fremde Wert geht durch
+//! [`crate::text::sanitize`] — Kennungen wie Agent, Modell, Endpunkte, der
+//! Vergessen-Grund. Pfade gehen durch [`crate::text::sanitize_path`] (der
+//! Backslash ist dort ein Trenner), und **Prosa** — Prompt, Constraints,
+//! Verworfenes — ebenfalls, siehe [`prose`]: Ein Mensch liest sie, niemand
+//! parst sie zurück, und die Verdopplung des Backslashs wäre in Code und
+//! Windows-Pfaden nur Lärm. Das schließt den `header` ein, den `show` und `why`
+//! mitbringen — er trägt die Change-Id aus der Commit-Message beziehungsweise
+//! den Pfad aus dem Aufruf.
+//!
+//! **Bewusst nicht** entschärft: die eigenen Konstanten dieser Schicht
+//! (Ast-Zeichen, Labels wie `spawned-by`, die ANSI-Codes von [`dim`] und
+//! [`bold`]) und die [`SessionId`], deren Textform beim Parsen auf Hex geprüft
+//! ist. Und eine Ausnahme in der *Form*: Der volle Prompt (`--full`) behält
+//! seine Zeilen — ein `\n` ist dort Inhalt, kein Angriff. Jede Zeile wird
+//! einzeln entschärft und unter dem Ast mit `»` als Zitat eingerückt, sodass
+//! der Baum auch bei einem mehrzeiligen Prompt ein Baum bleibt — und eine
+//! Prompt-Zeile, die wie ein Ast oder eine Kante *aussieht*, als Zitat
+//! erkennbar ist. Alles andere, was wie ein Zeilenumbruch aussieht (`\r`
+//! mitten in der Zeile, `U+2028`), wird sichtbar gemacht.
 
 use minds_core::{EdgeKind, Endpoint, Evidence, Session, SessionId};
 use minds_store::IndexLink;
+
+use crate::text::{sanitize, sanitize_path};
 
 /// Führt die Verweise eines Commits zusammen: die Trailer (verbindlich,
 /// [`Evidence::Observed`]) und die Kanten aus dem Store-Index (heuristisch). Der
@@ -48,7 +85,7 @@ pub struct Shown<'a> {
 /// Dateien). `full` klappt alles auf: ganzer Prompt, alle Dateien, Constraints,
 /// verworfene Pfade, Kanten.
 pub fn tree(header: &str, items: &[Shown], full: bool) {
-    println!("{}", bold(header));
+    println!("{}", bold(&sanitize_path(header)));
 
     let n = items.len();
     for (i, item) in items.iter().enumerate() {
@@ -57,13 +94,23 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
         let cont = if last { "   " } else { "│  " };
         let s = item.session;
 
-        // Der Intent ist der Blickfang.
-        let request = if full {
-            s.intent.request.clone()
+        // Der Intent ist der Blickfang. Im vollen Modus zeilenweise: die erste
+        // Zeile am Ast, die weiteren darunter eingerückt (siehe Modul-Doku).
+        let lines = if full {
+            prompt_lines(&s.intent.request)
         } else {
-            headline(&s.intent.request, 96)
+            vec![prose(&headline(&s.intent.request, 96))]
         };
-        println!("{branch} {}", bold(&format!("▸ {request}")));
+        let (first, rest) = lines
+            .split_first()
+            .map_or(("", &[][..]), |(f, r)| (f.as_str(), r));
+        println!("{branch} {}", bold(&format!("▸ {first}")));
+        // Mit Zitat-Marker: Eine Prompt-Zeile darf `╰─ ▸ …` oder `Kante: …`
+        // heißen — `sanitize` lässt das zu Recht stehen, und ohne Marker läse
+        // sich die Zeile wie ein eigener Knoten des Baums.
+        for line in rest {
+            println!("{cont}  » {}", bold(line));
+        }
 
         // Herkunft, dezent.
         let files = s.produced.files.len();
@@ -72,10 +119,10 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
             "{cont}{}",
             dim(&format!(
                 "{} {} · {}/{} · {}/{} Token · {files} {fileword}",
-                s.agent.name,
-                s.agent.version,
-                s.model.provider,
-                s.model.id,
+                sanitize(&s.agent.name),
+                sanitize(&s.agent.version),
+                sanitize(&s.model.provider),
+                sanitize(&s.model.id),
                 s.usage.input_tokens,
                 s.usage.output_tokens,
             ))
@@ -92,13 +139,13 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
 
         if full {
             for constraint in &s.intent.constraints {
-                println!("{cont}  Constraint: {constraint}");
+                println!("{cont}  Constraint: {}", prose(constraint));
             }
             for discarded in &s.intent.discarded {
-                println!("{cont}  Verworfen:  {discarded}");
+                println!("{cont}  Verworfen:  {}", prose(discarded));
             }
             for file in &s.produced.files {
-                println!("{cont}  {file}");
+                println!("{cont}  {}", sanitize_path(file));
             }
             for edge in &s.edges {
                 println!(
@@ -149,9 +196,9 @@ pub fn show_links(
     }
 
     if owned.is_empty() {
-        println!("{}", bold(header));
+        println!("{}", bold(&sanitize_path(header)));
         for reason in &forgotten {
-            println!("   {}", dim(&format!("vergessen ({reason})")));
+            println!("   {}", dim(&format!("vergessen ({})", sanitize(reason))));
         }
         if forgotten.is_empty() {
             let note = if orphans > 0 {
@@ -178,7 +225,7 @@ pub fn show_links(
         println!("   {}", dim(&format!("+ {orphans} Verweis(e) ins Leere")));
     }
     for reason in &forgotten {
-        println!("   {}", dim(&format!("+ vergessen ({reason})")));
+        println!("   {}", dim(&format!("+ vergessen ({})", sanitize(reason))));
     }
     Ok(())
 }
@@ -243,10 +290,51 @@ fn evidence(evidence: Evidence) -> &'static str {
     }
 }
 
+/// Der volle Prompt, zeilenweise entschärft.
+///
+/// Geteilt wird **nur** am `\n` (ein `\r` davor gehört zum Zeilenende — ein
+/// CRLF-Prompt soll nicht an jeder Zeile ein `\r` zeigen). Alles andere, was
+/// eine Zeile vortäuschen könnte, bleibt in [`prose`] und wird sichtbar: ein
+/// `\r` mitten in der Zeile als `\r`, `U+2028` als `\u{2028}`. Leere Zeilen am
+/// Ende fallen weg, ein leerer Prompt wird zu einer leeren Zeile — der Ast
+/// braucht immer eine erste.
+fn prompt_lines(request: &str) -> Vec<String> {
+    let mut lines: Vec<String> = request
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .map(prose)
+        .collect();
+    while lines.len() > 1 && lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// Text, den ein Mensch geschrieben hat — Prompt, Constraints, verworfene
+/// Pfade —, entschärft.
+///
+/// Ohne die Backslash-Verdopplung von [`sanitize`]: Die braucht `hook.log`, weil
+/// dort eine Zeile *eindeutig* rückführbar sein muss. Ein Prompt wird gelesen,
+/// nicht zurückgeparst, und er enthält oft Windows-Pfade, Regexe oder Code —
+/// `C:\\foo` und `\\d+` wären nur Lärm. Die Steuerzeichen entschärft
+/// [`sanitize_path`] genauso; der Backslash ist das einzige, was es durchlässt.
+fn prose(text: &str) -> String {
+    sanitize_path(text)
+}
+
+/// Ein Kanten-Endpunkt, entschärft.
+///
+/// Der `Session`-Fall ist der fremdeste Text dieser Schicht: `agent` und
+/// `local_id` stammen wörtlich aus dem Hook-Payload der Gegenseite und haben
+/// nie `SessionKey::new` gesehen (#116). Der Commit-Hash ist beim Anlegen
+/// validiert — entschärft wird er trotzdem, damit diese Funktion keine Ausnahme
+/// hat, die beim nächsten Endpunkt-Typ vergessen wird.
 fn endpoint(endpoint: &Endpoint) -> String {
     match endpoint {
-        Endpoint::Session { agent, local_id } => format!("{agent}/{local_id}"),
-        Endpoint::Commit { id } => format!("commit {id}"),
+        Endpoint::Session { agent, local_id } => {
+            format!("{}/{}", sanitize(agent), sanitize(local_id))
+        }
+        Endpoint::Commit { id } => format!("commit {}", sanitize(id)),
     }
 }
 
@@ -295,5 +383,66 @@ mod tests {
     #[test]
     fn nothing_in_nothing_out() {
         assert!(merge_links(&[], &[]).is_empty());
+    }
+
+    /// Was ein fremder Hook-Payload in einen Endpunkt legen kann: eine
+    /// ANSI-Sequenz, die die Zeile löscht, ein Bidi-Override, ein
+    /// Zero-Width-Zeichen und ein Unicode-Tag.
+    const HOSTILE: &str = "claude\u{1b}[2K\u{202e}\u{200b}\u{e0041}";
+
+    #[test]
+    fn a_hostile_edge_endpoint_does_not_reach_the_terminal_unchanged() {
+        // Akzeptanzkriterium aus #116: Der Endpunkt kommt wörtlich aus
+        // `edges[].to` des Envelopes, ohne je `SessionKey::new` gesehen zu
+        // haben. Was die Redaktion durchlässt, muss hier sichtbar werden.
+        let shown = endpoint(&Endpoint::Session {
+            agent: HOSTILE.to_string(),
+            local_id: format!("run-1{HOSTILE}"),
+        });
+
+        for raw in ['\u{1b}', '\u{202e}', '\u{200b}', '\u{e0041}'] {
+            assert!(!shown.contains(raw), "{raw:?} roh in {shown:?}");
+        }
+        assert!(shown.starts_with("claude\\u{1b}[2K"), "{shown:?}");
+        assert!(shown.contains("/run-1"), "{shown:?}");
+        // Und eine Zeile bleibt eine Zeile.
+        assert_eq!(shown.lines().count(), 1, "{shown:?}");
+    }
+
+    #[test]
+    fn a_commit_endpoint_is_not_exempt() {
+        let shown = endpoint(&Endpoint::Commit {
+            id: format!("abc123{HOSTILE}"),
+        });
+        assert!(!shown.contains('\u{1b}'), "{shown:?}");
+        assert!(shown.starts_with("commit abc123"), "{shown:?}");
+    }
+
+    #[test]
+    fn the_full_prompt_keeps_its_lines_but_nothing_else_that_looks_like_one() {
+        let lines = prompt_lines("erste\nzweite\r\u{2028}dritte\u{1b}[1m\n\n");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0], "erste");
+        // `\r`, `U+2028` und ESC werden sichtbar; nur `\n` trennt.
+        assert_eq!(lines[1], "zweite\\r\\u{2028}dritte\\u{1b}[1m");
+    }
+
+    #[test]
+    fn a_crlf_prompt_reads_like_a_lf_prompt() {
+        // Ein Windows-Agent oder kopierter Text: Das `\r` vor dem `\n` ist
+        // Zeilenende, kein Inhalt — und darf nicht an jeder Zeile kleben.
+        assert_eq!(prompt_lines("a\r\nb\r\n"), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn prose_keeps_its_backslashes_but_nothing_dangerous() {
+        assert_eq!(prose("C:\\foo und \\d+"), "C:\\foo und \\d+");
+        assert_eq!(prose("x\u{1b}[2K\u{202e}y"), "x\\u{1b}[2K\\u{202e}y");
+    }
+
+    #[test]
+    fn an_empty_prompt_still_yields_a_first_line() {
+        assert_eq!(prompt_lines(""), vec![String::new()]);
+        assert_eq!(prompt_lines("\n\n"), vec![String::new()]);
     }
 }

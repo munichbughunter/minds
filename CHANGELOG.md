@@ -21,6 +21,18 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **`minds show`/`minds why` entschärfen gespeicherten Fremdtext vor der
+  Terminal-Ausgabe** ([#116](https://github.com/munichbughunter/minds/issues/116)).
+  Die render-Schicht druckte Prompt, Agent- und Modell-Namen, Constraints,
+  Dateipfade und vor allem die Kanten-Endpunkte (`edges[].to`, wörtlich aus
+  dem Hook-Payload der Gegenseite) roh — die Redaktion aus #35 sucht
+  Geheimnisse, keine Steuerzeichen, und so erreichten ANSI-Sequenzen, Bidi-
+  und Zero-Width-Zeichen das Terminal des Lesers unverändert. Jetzt geht jeder
+  fremde Wert an der Senke durch dieselbe Härtung wie `hook.log`
+  (`text::sanitize`, Pfade über `sanitize_path`); welche Pfade entschärft werden
+  und welche bewusst nicht, steht in der Modul-Doku von `render.rs`. Der volle
+  Prompt (`--full`) behält dabei seine Zeilen und wird unter dem Ast
+  eingerückt, statt den Baum zu zerreißen.
 - **`hook.log` redigiert Zugangsdaten an der Senke, nicht mehr nur an der
   Quelle** ([#92](https://github.com/munichbughunter/minds/issues/92)). Bisher
   rief allein `minds sync` die URL-Redaktion auf, bevor ein Fehlertext ins Log
