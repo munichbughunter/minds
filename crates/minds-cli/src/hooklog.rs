@@ -24,6 +24,15 @@
 //! Fehler geht durch [`crate::text::sanitize`], sonst täuschte ein
 //! Zeilenumbruch in einer Meldung einen eigenen Eintrag vor.
 //!
+//! **Redigiert, und zwar hier.** Jede Zeile geht durch
+//! [`crate::text::without_url_credentials`], bevor sie geschrieben wird — nicht
+//! nur die aus `sync`, wo Git die Remote-URL samt Token in seine Fehlermeldung
+//! schreibt. Die Redaktion an der Quelle war eine Zusage, die nur hielt,
+//! solange jeder künftige Aufrufer an sie dachte; ein Dutzend Quellen, aber
+//! eine Senke — also gehört sie hierher (#92). Die Quellen in `sync` redigieren
+//! weiterhin, denn ihr Text geht auch an stderr und als Rückgabewert an den
+//! Aufrufer; der zweite Lauf hier ist idempotent und kostet nichts.
+//!
 //! **Begrenzt.** Der Auslöser aus #10 schreibt bei *jedem* Commit — ohne Grenze
 //! wüchse die Datei, solange der Fehler besteht, und das ist per Definition
 //! lange. Erreicht sie [`MAX_BYTES`], wird auf `hook.log.1` umgeschichtet; mehr
@@ -59,7 +68,7 @@ use std::path::{Path, PathBuf};
 
 use minds_capture::{Journal, clock};
 
-use crate::text::sanitize;
+use crate::text::{sanitize, without_url_credentials};
 
 /// Das Verzeichnis unter dem Git-Verzeichnis, in dem auch das Journal liegt.
 const LOG_DIR: &str = "minds";
@@ -77,6 +86,24 @@ const MAX_BYTES: u64 = 1024 * 1024;
 /// einen ganzen Dateiinhalt mitführen; eine Zeile, die niemand mehr liest, ist
 /// keine Diagnose.
 const MAX_MESSAGE: usize = 2000;
+
+/// Ab wie vielen Zeichen der **Eingabe** die Meldung als Ganzes verworfen wird.
+///
+/// Die Redaktion läuft über den ganzen Text, bevor [`entry`] ihn auf
+/// [`MAX_MESSAGE`] schneidet — und der Text ist fremd: Bei `sync` schreibt ein
+/// Remote die `remote:`-Zeilen in beliebiger Länge. Die Kosten sind linear
+/// (gemessen: 200 KB mit 50 000 `&`-Segmenten in ~10 ms), ein DoS ist das
+/// nicht; eine Obergrenze braucht es trotzdem, damit „linear" nicht „beliebig"
+/// heißt.
+///
+/// **Ganz oder gar nicht.** Die erste Fassung behielt ein Präfix und warf den
+/// Rest weg. Das zerschneidet Muster, die Leerraum überspannen — ein
+/// PEM-Schlüssel ohne seinen `-----END`-Marker ist für die Formerkennung kein
+/// Schlüssel mehr, und der Rumpf stünde wörtlich in der Datei. Ein Schnitt
+/// *vor* der Redaktion ist an keiner Stelle sicher; deshalb fällt jenseits der
+/// Grenze die Meldung komplett weg. Die Grenze liegt so hoch, dass sie kein
+/// echter Fehlertext erreicht, sondern nur ein Remote, das es darauf anlegt.
+const MAX_INPUT: usize = 256 * 1024;
 
 /// Der Hook-Pfad, aus dem ein Eintrag stammt.
 ///
@@ -516,7 +543,21 @@ fn restrict(file: &fs::File) {
 #[cfg(not(unix))]
 fn restrict(_file: &fs::File) {}
 
-/// Eine Meldung, wie sie in der Zeile erscheint: entschärft und gekürzt.
+/// Eine Meldung, wie sie in der Zeile erscheint: redigiert, entschärft und
+/// gekürzt.
+///
+/// **Redigiert zuerst, auf dem ganzen Text.** Der Schnitt auf [`MAX_MESSAGE`]
+/// darf nicht vor der Redaktion fallen: Er könnte ein Token halbieren, und ein
+/// halbes Token hat die Form, an der [`without_url_credentials`] es erkennt,
+/// nicht mehr — stünde dann aber trotzdem in der Datei. Deshalb sieht die
+/// Redaktion den Text **am Stück**, und erst danach wird gekürzt. Was länger
+/// ist als [`MAX_INPUT`], wird nicht angeschnitten, sondern verworfen — siehe
+/// dort, warum auch ein Schnitt am Leerraum nicht sicher wäre.
+///
+/// Der erste Aufruf im Prozess baut die Regex-Pipelines der Redaktion
+/// (gemessen ~80 ms im Release, einmalig). Das trifft nur Prozesse, die
+/// wirklich eine Zeile schreiben — Fehlerpfade und die wenigen Hinweise —,
+/// nie den stillen Normalbetrieb des Hooks.
 ///
 /// **Zeichenweise gebaut, nicht hinterher geschnitten.** Ein Schnitt am fertigen
 /// Text fiele mitten in eine Escape-Sequenz (`\u{1b}` sind sieben Zeichen) und
@@ -530,13 +571,18 @@ fn restrict(_file: &fs::File) {}
 /// ESC-Sequenzen wüchse sonst auf das Siebenfache — unlesbar, und lang genug,
 /// um die Atomarität des einen `write_all` wieder infrage zu stellen.
 fn entry(message: &str) -> String {
-    let mut line = String::with_capacity(message.len());
+    if exceeds_input_limit(message) {
+        return DROPPED.to_string();
+    }
+    let redacted = without_url_credentials(message);
+
+    let mut line = String::with_capacity(redacted.len());
     // Mitgezählt statt nachgezählt: `line.chars().count()` je Zeichen wäre
     // quadratisch, und eine Meldung darf nicht teurer sein als der Fehler.
     let mut written = 0usize;
     let mut cut = false;
 
-    for c in message.chars() {
+    for c in redacted.chars() {
         let piece = sanitize(&c.to_string());
         let length = piece.chars().count();
         if written + length > MAX_MESSAGE {
@@ -551,6 +597,17 @@ fn entry(message: &str) -> String {
         line.push('…');
     }
     line
+}
+
+/// Was statt einer Meldung in der Zeile steht, die länger als [`MAX_INPUT`] war.
+///
+/// Ein Marker und kein Präfix: Die Meldung ist mit Sicherheit keine lesbare
+/// Diagnose mehr, und ein Präfix hätte die Redaktion nie vollständig gesehen.
+const DROPPED: &str = "[Meldung verworfen: länger als die Eingabegrenze]";
+
+/// Ob die Meldung die Grenze reißt — ohne sie dafür ganz zu zählen.
+fn exceeds_input_limit(message: &str) -> bool {
+    message.chars().nth(MAX_INPUT).is_some()
 }
 
 /// Schichtet auf [`ROTATED_FILE`] um, wenn die Datei ihre Grenze erreicht hat.
@@ -1034,6 +1091,137 @@ mod tests {
             !read(dir.path()).contains('…'),
             "nichts abgeschnitten, nichts zu melden"
         );
+    }
+
+    /// Eine Remote-URL, wie `git push` sie in seine Fehlermeldung schreibt —
+    /// mit dem Token in der Username-Position, die Git selbst nicht redigiert.
+    const URL_WITH_TOKEN: &str =
+        "fatal: unable to access 'https://oauth2:glpat-AAAAAAAAAAAAAAAAAAAA@gitlab.com/x/y.git/'";
+
+    #[test]
+    fn a_remote_url_is_redacted_whoever_writes_it() {
+        // Das Versprechen aus #92: Die Redaktion hängt nicht davon ab, dass
+        // der Aufrufer an sie denkt. Eine **neue** Schreibstelle — hier jede
+        // Quelle, roh und ohne `without_url_credentials` davor — ist gefiltert,
+        // bevor ihr Autor davon weiß.
+        for source in [
+            Source::Hook,
+            Source::Checkpoint,
+            Source::PrepareCommitMsg,
+            Source::Sync,
+            Source::Brief,
+            Source::Import,
+        ] {
+            let dir = git_dir();
+            log_at(dir.path(), source, URL_WITH_TOKEN);
+
+            let content = read(dir.path());
+            assert!(!content.contains("glpat-"), "{source:?}: {content}");
+            // Host und Pfad bleiben — ohne sie wäre die Zeile keine Diagnose.
+            assert!(
+                content.contains("gitlab.com/x/y.git"),
+                "{source:?}: {content}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejection_marker_survives_the_redaction() {
+        // `sync::is_divergence` liest die `--porcelain`-Zeilen zwar **vor** der
+        // Redaktion; dass die Marker auch in der Datei wörtlich stehen, ist
+        // trotzdem die Zusage — wer das Log liest, soll den Grund sehen.
+        let dir = git_dir();
+        log_at(
+            dir.path(),
+            Source::Sync,
+            "To https://oauth2:glpat-AAAAAAAAAAAAAAAAAAAA@gitlab.com/x.git\n\
+             !\trefs/minds/reviews:refs/minds/reviews\t[rejected] (non-fast-forward)\n\
+             error: failed to push some refs — fetch first, stale info",
+        );
+
+        let content = read(dir.path());
+        assert!(!content.contains("glpat-"), "{content}");
+        for marker in ["[rejected] (non-fast-forward)", "fetch first", "stale info"] {
+            assert!(content.contains(marker), "{marker}: {content}");
+        }
+    }
+
+    #[test]
+    fn credentials_are_redacted_before_the_message_is_shortened() {
+        // Fiele der Schnitt zuerst, läge er mitten im Token: Das Fragment hat
+        // nicht mehr die Form, an der die Redaktion es erkennt — und stünde
+        // dann trotzdem in der Datei.
+        let dir = git_dir();
+        let message = format!("{}{URL_WITH_TOKEN}", "x".repeat(MAX_MESSAGE - 40));
+        log_at(dir.path(), Source::Sync, &message);
+
+        let content = read(dir.path());
+        assert!(!content.contains("glpat-"), "{content}");
+        assert!(content.contains("https://…@"), "{content}");
+    }
+
+    /// Ein Muster, das Leerraum **überspannt** — die Form, an der ein Schnitt
+    /// vor der Redaktion scheitert, wie auch immer er fällt.
+    fn private_key(lines: usize) -> String {
+        format!(
+            "-----BEGIN RSA PRIVATE KEY-----\n{}-----END RSA PRIVATE KEY-----",
+            "MIIEowIBAAKCAQEA0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL\n".repeat(lines)
+        )
+    }
+
+    #[test]
+    fn a_multiline_secret_is_caught_at_the_sink() {
+        // Das Auffangnetz an der Senke fängt auch, was keine URL ist: Ein
+        // Schlüssel im Fehlertext eines Hook-Pfads, der nie redigiert hat.
+        let dir = git_dir();
+        log_at(
+            dir.path(),
+            Source::Hook,
+            &format!("Konfiguration unlesbar: {}", private_key(4)),
+        );
+
+        let content = read(dir.path());
+        assert!(!content.contains("MIIEowIBAAKCAQEA"), "{content}");
+        assert!(content.contains("Konfiguration unlesbar"), "{content}");
+    }
+
+    #[test]
+    fn an_overlong_message_is_dropped_whole_instead_of_cut() {
+        // Der Befund aus dem Security-Review zur ersten Fassung: Ein Präfix-
+        // Schnitt — auch einer am Leerraum — trennt den `-----END`-Marker vom
+        // Schlüssel, und der Rumpf ist für die Formerkennung dann keiner mehr.
+        // Hier ist der Vorspann so gebaut, dass die Redaktion ihn stark
+        // schrumpft und ein behaltener Rumpf in die Zeile gepasst hätte.
+        let dir = git_dir();
+        let url = format!("https://oauth2:{}@h/ ", "A".repeat(200));
+        let body_lines = MAX_MESSAGE / 10;
+        let message = format!("{}{}", url.repeat(MAX_INPUT / 200), private_key(body_lines));
+        assert!(exceeds_input_limit(&message));
+        log_at(dir.path(), Source::Sync, &message);
+
+        let content = read(dir.path());
+        assert!(!content.contains("MIIEowIBAAKCAQEA"), "{content}");
+        assert!(!content.contains("-----BEGIN"), "{content}");
+        assert!(!content.contains("AAAA"), "{content}");
+        assert!(content.trim_end().ends_with(DROPPED), "{content}");
+        assert_eq!(content.lines().count(), 1, "{content}");
+    }
+
+    #[test]
+    fn a_message_just_under_the_input_limit_is_still_redacted_in_full() {
+        // Die Grenze ist eine Kante, kein Bereich: Direkt darunter läuft die
+        // Redaktion über den ganzen Text, und die Zeile bleibt eine Diagnose.
+        let dir = git_dir();
+        let key = private_key(4);
+        let pad = MAX_INPUT - key.chars().count() - 1;
+        let message = format!("{key} {}", "x ".repeat(pad / 2));
+        assert!(!exceeds_input_limit(&message));
+        log_at(dir.path(), Source::Sync, &message);
+
+        let content = read(dir.path());
+        assert!(!content.contains("MIIEowIBAAKCAQEA"), "{content}");
+        assert!(!content.contains(DROPPED), "{content}");
+        assert!(content.contains("x x x"), "{content}");
     }
 
     #[test]

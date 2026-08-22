@@ -588,13 +588,13 @@ impl Job {
             ("", out) => out.to_string(),
             (err, out) => format!("{err}\n{out}"),
         };
-        // Zugangsdaten raus, **hier** und nicht bei der Ausgabe: Git schreibt
-        // die Remote-URL in seine Fehlermeldung, und steht darin ein Token
+        // Zugangsdaten raus, schon **hier**: Git schreibt die Remote-URL in
+        // seine Fehlermeldung, und steht darin ein Token
         // (`https://glpat-…@gitlab.com/…`, die Username-Position redigiert Git
-        // selbst nicht), trüge es jeder Weg weiter, der diesen Fehler anfasst —
-        // stderr, `hook.log`, und mit der Datei ein Bug-Report. An der Senke zu
-        // filtern hieße, es an jeder Senke einzeln zu tun und die nächste zu
-        // vergessen.
+        // selbst nicht), trüge es jeder Weg weiter, der diesen Fehler anfasst.
+        // `hook.log` redigiert seit #92 selbst an der Senke; dieser Fehler geht
+        // aber auch an stderr und als Rückgabewert an den Aufrufer, und dort
+        // soll die Zusage „nichts verlässt `push` unredigiert" ebenso gelten.
         Err(PushError {
             diverged: is_divergence(&stdout),
             message: crate::text::without_url_credentials(&text),

@@ -204,7 +204,10 @@ const INVISIBLE_CARRIERS: [std::ops::RangeInclusive<char>; 9] = [
 /// steht darin ein Token (`https://glpat-…@gitlab.com/…`), landete es über den
 /// Umweg der Fehlermeldung in `hook.log` — einer Datei, auf die `minds fsck`
 /// aktiv verweist und die in einem Bug-Report mitgeschickt wird. Redigiert wird
-/// deshalb **an der Quelle**, bevor der Text zu einer Meldung wird.
+/// deshalb **an der Senke**: `hooklog::entry` ruft diese Funktion für jede
+/// Zeile auf, egal wer sie schreibt (#92). `sync` redigiert seine Push-Fehler
+/// zusätzlich an der Quelle, weil sie auch an stderr und an den Aufrufer
+/// gehen — ein zweiter Lauf ändert nichts mehr, die Funktion ist idempotent.
 ///
 /// Geschnitten wird nur der Autoritätsteil zwischen `://` und `@`. Host und
 /// Pfad bleiben stehen — ohne sie wäre die Diagnose wertlos, und genau dafür
