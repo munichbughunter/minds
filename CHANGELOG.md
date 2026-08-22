@@ -21,6 +21,19 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ### Sicherheit
 
+- **`hook.log` redigiert Zugangsdaten an der Senke, nicht mehr nur an der
+  Quelle** ([#92](https://github.com/munichbughunter/minds/issues/92)). Bisher
+  rief allein `minds sync` die URL-Redaktion auf, bevor ein Fehlertext ins Log
+  ging; die übrigen Schreibstellen (`checkpoint`, `hook`, `brief`,
+  `prepare-commit-msg`, die Parse-Fehler) verließen sich darauf, dass ihr Text
+  keine Remote-URL trägt — eine Zusage, die nur hielt, solange jeder künftige
+  Aufrufer daran dachte. Jetzt läuft jede Zeile durch dieselbe Redaktion, bevor
+  sie in die Datei kommt, und ein Test beweist das für jede Quelle ohne Zutun
+  des Autors. Redigiert wird **vor** dem Kürzen und immer über den ganzen
+  Text, damit kein halbiertes Token — und kein PEM-Schlüssel ohne seinen
+  `-----END`-Marker — die Formerkennung unterläuft; eine Meldung jenseits von
+  256 Ki Zeichen wird deshalb nicht angeschnitten, sondern als Ganzes durch
+  einen Marker ersetzt.
 - **Signieren legt keine vorhersagbaren, welt-lesbaren Dateien mehr in /tmp ab**
   ([#26](https://github.com/munichbughunter/minds/issues/26)). Beim
   Signieren/Verifizieren landeten Payloads und Signaturen mit vorhersagbarem
