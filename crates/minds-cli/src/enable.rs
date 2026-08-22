@@ -2089,7 +2089,30 @@ const PREPARE_MSG_BODY: &str =
 ///
 /// **stdout bleibt**: Was `minds sync` dort meldet, ist die Erfolgsmeldung, und
 /// die gehört an den Push, zu dem sie gehört.
-const PRE_PUSH_BODY: &str = hook_body!("\"$MINDS_BIN\" sync --remote \"$1\" 2>/dev/null || true");
+///
+/// # Warum `--detach` — und was es kostet
+///
+/// Regel „kein Netz, wenn nichts neu ist" machte den Push ohne fällige Refs
+/// billig. *Mit* fälligen Refs blieb ein zweiter voller Verbindungsaufbau vor
+/// dem Push des Nutzers: gegen GitHub ~1,5 s gemessen, gegen ein lokales
+/// Bare-Repo 0,01 s — der Preis ist TLS, Auth und Ref-Advertisement, und nach
+/// jeder Arbeitssession fällt er an (#85). In *einen* Transport lassen sich
+/// beide nicht legen: Ein pre-push kann dem laufenden Push keine Refs anhängen,
+/// und `remote.<name>.push` ersetzte dessen Refspecs (oben). Also übergibt
+/// `--detach` den Transport einem losgelösten Prozess; der Hook selbst plant
+/// nur noch lokal und ist in ~0,02 s zurück.
+///
+/// **Der Kontext kommt damit nicht mehr garantiert mit demselben Push an**,
+/// sondern Sekunden danach. Für `fsck --require-review` als CI-Gate heißt das:
+/// Ein Push, dem die Pipeline unmittelbar folgt, kann die Reviews knapp
+/// verpassen — der nächste Lauf sieht sie. Wer die alte Garantie braucht, ruft
+/// `minds sync` vor dem Push von Hand auf; ohne `--detach` läuft er synchron.
+///
+/// Was der Hintergrundprozess nicht kann — Passphrase, Security-Key —, fängt
+/// `sync` selbst: Nach einem gescheiterten Hintergrundlauf läuft der nächste
+/// Hook im Vordergrund, mit Terminal und sichtbarem Fehler (siehe dort).
+const PRE_PUSH_BODY: &str =
+    hook_body!("\"$MINDS_BIN\" sync --remote \"$1\" --detach 2>/dev/null || true");
 
 /// **Die** Liste der Git-Hooks, die `minds` schreibt — samt ihrer Rümpfe.
 ///
@@ -4960,6 +4983,13 @@ mod tests {
         assert!(PRE_PUSH_BODY.contains("|| true"));
         // Das Remote, an das gerade gepusht wird, muss durchgereicht werden.
         assert!(PRE_PUSH_BODY.contains("\"$1\""));
+        // Und der Transport gehört in den Hintergrund (#85): Ohne `--detach`
+        // stünde vor jedem Push mit fälligen Refs ein zweiter voller
+        // Verbindungsaufbau.
+        assert!(
+            PRE_PUSH_BODY.contains("--detach"),
+            "der Hook darf den Push nicht auf den Transport warten lassen: {PRE_PUSH_BODY}"
+        );
     }
 
     #[test]

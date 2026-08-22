@@ -19,6 +19,24 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Geändert
+
+- **`git push` wartet nicht mehr auf den Kontext-Transport**
+  ([#85](https://github.com/munichbughunter/minds/issues/85)). Mit fälligen
+  minds-Refs öffnete der pre-push-Hook vor dem Push des Nutzers einen zweiten
+  vollen Transport — gegen GitHub ~1,5 s gemessen, fast ausschließlich
+  Verbindungsaufbau. Jetzt ruft der Hook `minds sync --detach`: Die Planung
+  bleibt im Vordergrund (lokal, ~0,02 s), den Push übernimmt ein losgelöster
+  Prozess ohne Terminal. **Der Kontext kommt damit Sekunden nach dem Push am
+  Remote an, nicht mehr garantiert mit ihm** — wer das braucht, ruft
+  `minds sync` vor dem Push von Hand auf. Der Hintergrundprozess läuft in
+  eigener Session ohne Terminal; was darüber nicht geht — die SSH-Passphrase
+  eines Schlüssels ohne Agent, der Touch eines Security-Keys —, lässt ihn
+  scheitern, und er hinterlässt neben dem Log-Eintrag einen Marker: Der
+  nächste Push läuft dann wieder synchron im Vordergrund, wo der Fehler
+  sichtbar ist und die Anmeldung gelingen kann. Ohne fällige Refs bleibt es
+  bei null zusätzlichen Kosten.
+
 ### Sicherheit
 
 - **`minds show`/`minds why` entschärfen gespeicherten Fremdtext vor der

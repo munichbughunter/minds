@@ -20,6 +20,11 @@ minds-attest = { path = "../minds-attest" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 
+# Nur für `setsid` im losgelösten Sync (#85) — ohnehin transitiv über gix im
+# Graphen, hier nur noch direkt benannt.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile.workspace = true
 serde_json.workspace = true
