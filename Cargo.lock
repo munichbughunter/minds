@@ -1439,6 +1439,7 @@ dependencies = [
 name = "minds-cli"
 version = "0.1.2"
 dependencies = [
+ "libc",
  "minds-attest",
  "minds-capture",
  "minds-core",

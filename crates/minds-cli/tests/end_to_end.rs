@@ -1614,6 +1614,26 @@ fn hook_log(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join(".git/minds/hook.log")).ok()
 }
 
+/// Wartet auf den Log-Eintrag des **Hintergrund**-Syncs.
+///
+/// Seit #85 gibt der pre-push-Hook den Transport an einen losgelösten Prozess
+/// ab und ist zurück, bevor der gescheitert sein kann. Der Eintrag kommt
+/// deshalb *nach* dem Hook — Sekundenbruchteile später, gegen ein Remote, das
+/// es nicht gibt. Gepollt statt geschlafen, mit Obergrenze: Ein Test, der
+/// eine Sekunde wartet, ist langsam; einer, der ewig wartet, ist kaputt.
+fn wait_for_hook_log(dir: &Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(log) = hook_log(dir).filter(|log| log.contains('\n')) {
+            return Some(log);
+        }
+        if std::time::Instant::now() > deadline {
+            return hook_log(dir);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Ruft einen installierten Hook so auf, wie Git es täte: über `sh`, aus der
 /// Repo-Wurzel, mit `minds` im Pfad und ohne fremde Git-Config.
 fn run_hook(dir: &Path, name: &str, args: &[&str]) -> Output {
@@ -1785,7 +1805,7 @@ fn a_sync_error_never_carries_the_remote_credentials() {
     );
     assert!(hook.status.success());
 
-    let log = hook_log(dir).expect("der Sync-Fehler steht im Log");
+    let log = wait_for_hook_log(dir).expect("der Sync-Fehler steht im Log");
     assert!(log.contains("sync:"), "{log}");
     assert!(!log.contains(TOKEN), "Token im Log:\n{log}");
     // Der Host bleibt — ohne ihn wäre die Diagnose wertlos.
@@ -1831,7 +1851,7 @@ fn a_traced_git_does_not_dump_its_headers_into_the_log() {
         .expect("der Hook läuft");
     assert!(hook.status.success());
 
-    let log = hook_log(dir).expect("der Sync-Fehler steht im Log");
+    let log = wait_for_hook_log(dir).expect("der Sync-Fehler steht im Log");
     assert!(!log.contains(TOKEN), "Token im Log:\n{log}");
     assert!(!log.contains("Authorization"), "Header-Dump im Log:\n{log}");
     // Die Diagnose bleibt trotzdem brauchbar.
@@ -2150,25 +2170,58 @@ fn the_pre_push_hook_keeps_its_stderr_out_of_the_push_output() {
     // … aber der Fortschritt **überlebt**. Ohne diese Zusage wäre die
     // Umleitung ein Verschweigen: Ein `println!` → `eprintln!` in `sync.rs`
     // machte den Push wortlos, und der Test oben bliebe grün, weil `sh` das
-    // stderr ohnehin wegwirft.
+    // stderr ohnehin wegwirft. Seit #85 sagt die Zeile, dass der Transport
+    // abgegeben wurde — der Hook selbst öffnet keine Verbindung mehr.
     let visible = String::from_utf8_lossy(&hook.stdout);
     assert!(
         visible.contains("Ref(s)"),
         "der Fortschritt fehlt:\n{visible}"
     );
     assert!(
-        visible.contains("minds fsck"),
-        "der Fehlschlag muss sichtbar bleiben und den Weg nennen:\n{visible}"
+        visible.contains("im Hintergrund"),
+        "der Hook muss sagen, dass er den Transport abgibt:\n{visible}"
     );
 
-    // 2. Verschwunden ist der Fehler deshalb trotzdem nicht.
-    let log = hook_log(dir).expect("der Sync-Fehler steht im Log");
+    // 2. Verschwunden ist der Fehler deshalb trotzdem nicht — er kommt aus dem
+    //    Hintergrundprozess, also kurz nach dem Hook.
+    let log = wait_for_hook_log(dir).expect("der Sync-Fehler steht im Log");
     assert!(log.contains("sync:"), "{log}");
 
     // 3. Die mehrzeilige Meldung von `git push` bleibt *ein* Eintrag — sonst
     //    täuschte sie vier vor.
     assert_eq!(log.lines().count(), 1, "genau ein Eintrag:\n{log}");
     assert!(log.contains("\\n"), "die Umbrüche sind entschärft:\n{log}");
+
+    // 4. Und der Fehler bleibt nicht im Hintergrund verborgen: Der nächste
+    //    Push läuft im Vordergrund, mit Terminal — dort wird der Fehlschlag
+    //    sichtbar und nennt den Weg zum Wortlaut. Gewartet wird auf den
+    //    Marker, nicht auf das Log: Der Marker fällt erst nach dem Lock.
+    let marker = dir.join(".git/minds/sync.retry");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        marker.exists(),
+        "der Hintergrund muss seinen Fehlschlag markieren"
+    );
+    let again = run_hook(dir, "pre-push", &["kaputt", "/gibt/es/nicht.git"]);
+    assert!(
+        again.status.success(),
+        "auch im Vordergrund nie blockierend"
+    );
+    let visible = String::from_utf8_lossy(&again.stdout);
+    assert!(
+        visible.contains("im Vordergrund"),
+        "der Wechsel muss erklärt sein:\n{visible}"
+    );
+    assert!(
+        visible.contains("minds fsck"),
+        "der Fehlschlag muss sichtbar bleiben und den Weg nennen:\n{visible}"
+    );
+    assert!(again.stderr.is_empty());
+    let log = hook_log(dir).expect("Log");
+    assert_eq!(log.lines().count(), 2, "je Lauf ein Eintrag:\n{log}");
 }
 
 // ---------------------------------------------------------------------------

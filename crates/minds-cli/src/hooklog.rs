@@ -500,7 +500,7 @@ pub(crate) fn log_at(git_dir: &Path, source: Source, message: &str) {
 
 /// Ob an diesem Namen ein Symlink hängt. Ein Pfad, den es nicht gibt, ist
 /// keiner — dort legen wir gleich selbst an.
-fn is_symlink(path: &Path) -> bool {
+pub(crate) fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
 }
 

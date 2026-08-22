@@ -168,11 +168,13 @@ Verwendung:
         append-only Log content-adressierter Einträge — zwei Reviewer offline
         ergeben keinen Konflikt, sondern eine Vereinigung.
 
-  minds sync [--remote <name>] [-v]
+  minds sync [--remote <name>] [--detach] [-v]
         Schickt Kontext und Reviews an das Remote — alle fälligen Refs in
         einer Verbindung, nie mit --force; einzige Ausnahme ist die
         Übertragung einer DSGVO-Löschung (Tombstone-Ref). Ruft der
         pre-push-Hook; ohne neue Refs kostet der Aufruf keine Verbindung.
+        --detach (der Hook) übergibt den Transport einem Hintergrundprozess,
+        damit der Push des Nutzers nicht auf ihn wartet.
 
   minds stack [--base <ref>]
         Zeigt die abhängigen Changes ab der Basis und ihren jeweiligen
@@ -282,7 +284,7 @@ const SPECS: &[Spec] = &[
     ),
     spec("reviews", &["--signers", "--identity"], &[], 1),
     spec("comment", &["--on"], &[], 2),
-    spec("sync", &["--remote"], &["-v", "--verbose"], 0),
+    spec("sync", &["--remote"], &["-v", "--verbose", "--detach"], 0),
     spec("stack", &["--base"], &[], 0),
     spec(
         "gitlab",
@@ -684,6 +686,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "sync" => sync::run(
             parsed.value("--remote"),
             parsed.has("-v") || parsed.has("--verbose"),
+            parsed.has("--detach"),
         ),
 
         // Interner Git-Hook: sorgt für eine stabile Change-Id (nicht in USAGE).

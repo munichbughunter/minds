@@ -133,6 +133,105 @@ fn all_due_refs_travel_in_one_call() {
     );
 }
 
+/// Wartet, bis die minds-Refs am Remote liegen — der Hintergrundprozess aus
+/// `--detach` braucht dafür einen Moment. Mit Obergrenze, damit ein Test, der
+/// nie ankommt, rot wird statt zu hängen.
+fn wait_for_remote_refs(work: &Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let refs = remote_refs(work);
+        if refs.contains("refs/minds/reviews") || std::time::Instant::now() > deadline {
+            return refs;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn detached_sync_hands_the_transport_off_and_returns_at_once() {
+    // #85: Aus dem Hook darf der Push des Nutzers nicht auf einen zweiten
+    // Verbindungsaufbau warten. Der Vordergrund plant nur, meldet die Übergabe
+    // und ist zurück — der Transport folgt losgelöst, und die Refs kommen an.
+    let Some((_dir, work)) = repo_with_remote() else {
+        return;
+    };
+    minds(&work, &["review", &change_id("ef"), "--approve"]);
+
+    let out = minds(&work, &["sync", "--remote", "origin", "--detach"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        text(&out).contains("Ref(s) → origin im Hintergrund"),
+        "die Übergabe muss benannt sein: {}",
+        text(&out)
+    );
+    // Kein Push im Vordergrund — die Fertig-Meldung gehört dem Hintergrund.
+    // (Die Zeit selbst ist gegen ein lokales Bare-Repo nicht messbar: Auch der
+    // synchrone Push braucht dort 0,01 s. Gemessen wurde gegen GitHub, siehe
+    // die Modul-Doku von `sync`; hier zählt, *dass* nicht gewartet wird.)
+    assert!(!text(&out).contains("fertig"), "{}", text(&out));
+
+    let refs = wait_for_remote_refs(&work);
+    assert!(
+        refs.contains("refs/minds/reviews"),
+        "der Hintergrund muss die Refs ans Remote bringen: {refs}"
+    );
+
+    // Danach ist nichts mehr fällig — auch nicht für den Detach-Pfad, der
+    // sonst bei jedem Push einen Prozess starten würde.
+    let again = minds(&work, &["sync", "--remote", "origin", "--detach", "-v"]);
+    assert!(
+        text(&again).contains("nichts Neues"),
+        "der Hintergrund muss seinen Erfolg vermerkt haben: {}",
+        text(&again)
+    );
+}
+
+#[test]
+fn a_failed_background_sync_brings_the_next_one_to_the_foreground() {
+    // Das Gegenstück zur Zusage „synchron, weil ein Hintergrundprozess still
+    // scheitern könnte": Scheitert er, holt der nächste Lauf den Push ins
+    // Terminal — und räumt den Marker weg, sobald es klappt.
+    let Some((_dir, work)) = repo_with_remote() else {
+        return;
+    };
+    minds(&work, &["review", &change_id("ab"), "--approve"]);
+    git(&work, &["remote", "add", "kaputt", "/gibt/es/nicht.git"]);
+
+    let first = minds(&work, &["sync", "--remote", "kaputt", "--detach"]);
+    assert!(text(&first).contains("im Hintergrund"), "{}", text(&first));
+
+    let marker = work.join(".git/minds/sync.retry");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        marker.exists(),
+        "der Hintergrund muss seinen Fehlschlag markieren"
+    );
+
+    let second = minds(&work, &["sync", "--remote", "kaputt", "--detach"]);
+    assert!(second.status.success(), "fail-soft auch im Vordergrund");
+    assert!(
+        text(&second).contains("im Vordergrund"),
+        "{}",
+        text(&second)
+    );
+    assert!(
+        text(&second).contains("minds fsck"),
+        "der Fehler muss jetzt sichtbar sein: {}",
+        text(&second)
+    );
+    assert!(marker.exists(), "noch nicht geklappt, Marker bleibt");
+
+    // Gegen ein Remote, das es gibt, klappt es — und der Marker fällt.
+    let third = minds(&work, &["sync", "--remote", "origin", "--detach"]);
+    assert!(text(&third).contains("im Vordergrund"), "{}", text(&third));
+    assert!(text(&third).contains("fertig"), "{}", text(&third));
+    assert!(!marker.exists(), "nach Erfolg kein Marker mehr");
+    assert!(remote_refs(&work).contains("refs/minds/reviews"));
+}
+
 #[test]
 fn nothing_new_means_nothing_happens() {
     // Die eigentliche Beschleunigung: Der zweite Lauf darf das Remote nicht

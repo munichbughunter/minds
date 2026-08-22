@@ -27,15 +27,35 @@
 //!    Session als aktuelle, browsbare Ref-Spitze. Nie Klartext über Klartext;
 //!    jeder andere Ref bleibt strikt fast-forward.
 //!
-//! # Warum synchron und nicht im Hintergrund
+//! # Im Hintergrund — und wann doch im Vordergrund
 //!
-//! Ein abgelöster Hintergrundprozess wäre schneller — er hat aber **kein
-//! Terminal**. Credential-Helper, SSH-Passphrase und der Touch eines
-//! Security-Keys brauchen genau das. Ein Sync, der im Hintergrund still an der
-//! Authentifizierung scheitert, ist schlimmer als einer, der zwei Sekunden
-//! braucht und es sagt. Deshalb läuft der Push im Vordergrund, meldet seinen
-//! Fortschritt auf **stdout** (Git zeigt die Ausgabe des Hooks) — und tut in dem
-//! häufigen Fall, dass nichts neu ist, gar nichts.
+//! Regel 1 spart die Verbindung, wenn nichts neu ist. Ist etwas neu, kostete
+//! der Push dieses Moduls bis #85 trotzdem einen **zweiten vollen
+//! Verbindungsaufbau** vor dem eigentlichen Push des Nutzers — gegen GitHub
+//! ~1,5 s gemessen, gegen ein lokales Bare-Repo 0,01 s: Der Preis ist fast
+//! vollständig TLS, Auth und Ref-Advertisement, und genau das verdoppelt sich.
+//! Git gibt keinen Weg her, die Refs an den laufenden Transport des Nutzers
+//! anzuhängen (`remote.<name>.push` würde dessen Push ersetzen, siehe
+//! `enable::PRE_PUSH_BODY`). Also wird der Transport **verschoben**: Aus dem
+//! Hook (`--detach`) plant dieses Modul im Vordergrund — lokal, 0,02 s — und
+//! übergibt den Push an einen losgelösten Prozess ohne Terminal. Der Push des
+//! Nutzers wartet darauf nicht mehr; der Kontext kommt Sekunden später am
+//! Remote an, nicht mehr garantiert *mit* demselben Push.
+//!
+//! Der Einwand, der bis #85 für den Vordergrund sprach, bleibt gültig — genau
+//! genommen für zwei Fälle: die SSH-Passphrase eines Schlüssels ohne Agent
+//! und der Touch eines Security-Keys. Beides geht über `/dev/tty`, und das
+//! hat ein Prozess in eigener Session nicht. (Gits eigene Passwort-Prompts
+//! gab es auch im Vordergrund nie — `GIT_TERMINAL_PROMPT=0` galt schon immer;
+//! Agent, Keychain und Credential-Helper brauchen kein Terminal und tragen den
+//! häufigen Fall.) Wo das nicht reicht, darf der Sync nicht *still*
+//! scheitern. Deshalb hinterlässt ein gescheiterter Lauf neben
+//! dem Log-Eintrag einen Marker ([`RETRY_MARKER`]), und der **nächste** Hook
+//! läuft bei gesetztem Marker wieder synchron im Vordergrund — dort, wo ein
+//! Terminal ist, der Fehler auf stdout sichtbar wird und die Authentifizierung
+//! gelingen kann. Gelingt sie, fällt der Marker, und es geht zurück in den
+//! Hintergrund. Ohne `--detach` (von Hand aufgerufen) läuft alles wie bisher
+//! synchron, mit Fortschritt auf **stdout**.
 //!
 //! # Welche Meldung auf welchen Kanal geht
 //!
@@ -103,19 +123,37 @@ const LOCK_STALE: Duration = Duration::from_secs(300);
 /// Der Remote, wenn der Hook keinen nennt.
 const DEFAULT_REMOTE: &str = "origin";
 
+/// Die Datei unter `<git-dir>/minds`, die ein gescheiterter Lauf hinterlässt.
+///
+/// Solange sie liegt, läuft der Hook synchron im Vordergrund (siehe
+/// Modul-Doku): Der Fehler, den der Hintergrund nur ins Log schreiben konnte,
+/// bekommt so ein Terminal — und die Chance, dass es beim nächsten Mal klappt.
+/// Ein erfolgreicher Lauf nimmt sie wieder weg. Kein Inhalt, nur Existenz.
+///
+/// Bewusst **je Repo**, nicht je Remote: Der Name eines Remotes darf `/`
+/// enthalten, und `$1` des Hooks kann eine URL samt Token sein — beides
+/// taugt nicht als Dateiname. Der Preis: Ein dauerhaft kaputtes Zweit-Remote
+/// holt auch den Push an `origin` einmal in den Vordergrund, und dessen Erfolg
+/// nimmt den Marker wieder weg. Das wechselt ab, blockiert aber nichts.
+const RETRY_MARKER: &str = "sync.retry";
+
 /// Führt `minds sync` aus. Endet **immer** mit 0, wenn es aus dem Hook kommt —
 /// siehe Modul-Doku.
-pub fn run(remote: Option<&str>, verbose: bool) -> ExitCode {
+///
+/// `detach`: aus dem Hook. Fällige Refs gehen dann an einen losgelösten
+/// Prozess, statt den Push des Nutzers warten zu lassen — außer der letzte
+/// Hintergrundlauf ist gescheitert ([`RETRY_MARKER`]).
+pub fn run(remote: Option<&str>, verbose: bool, detach: bool) -> ExitCode {
     if std::env::var_os(GUARD_ENV).is_some() {
         return ExitCode::SUCCESS;
     }
     hooklog::guarded(Source::Sync, || {
-        sync_or_report(remote.unwrap_or(DEFAULT_REMOTE), verbose)
+        sync_or_report(remote.unwrap_or(DEFAULT_REMOTE), verbose, detach)
     })
 }
 
-fn sync_or_report(remote: &str, verbose: bool) -> ExitCode {
-    match sync(remote, verbose) {
+fn sync_or_report(remote: &str, verbose: bool, detach: bool) -> ExitCode {
+    match sync(remote, verbose, detach) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             // Seit der pre-push-Hook stderr nach `/dev/null` schickt (statt sie
@@ -127,7 +165,7 @@ fn sync_or_report(remote: &str, verbose: bool) -> ExitCode {
     }
 }
 
-fn sync(remote: &str, verbose: bool) -> Fallible<()> {
+fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::discover(&cwd)?;
     let git_dir = repo.git_dir().to_path_buf();
@@ -174,19 +212,50 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
         return Ok(());
     }
 
-    let Some(_lock) = Lock::acquire(&git_dir)? else {
+    // Aus dem Hook: Den Transport abgeben, statt den Push des Nutzers um einen
+    // zweiten Verbindungsaufbau zu verlängern (#85) — außer der letzte
+    // Hintergrundlauf ist gescheitert, dann braucht der Fehler ein Terminal.
+    // Die Planung oben war lokal; hier ist noch keine Verbindung offen.
+    let retry_in_foreground = detach && retry_marker_set(&git_dir);
+    if detach && !retry_in_foreground {
+        let due: usize = jobs.iter().map(|job| job.updates.len()).sum();
+        ProgressLine::write(&format!(
+            "minds: {due} Ref(s) → {} im Hintergrund\n",
+            crate::text::sanitize_path(display(remote))
+        ));
+        spawn_background(remote);
+        return Ok(());
+    }
+
+    let Some(lock) = Lock::acquire(&git_dir)? else {
         // Ein zweiter Agent pusht gerade. Der ist entweder schon weiter als wir
         // oder wird gleich neu planen; ein zweiter Verbindungsaufbau brächte
-        // nichts.
+        // nichts. Aus dem Hook gehört das auf stdout: Der Nutzer hat fällige
+        // Refs, und ohne die Zeile wüsste er nicht, warum nichts geschieht.
+        if detach {
+            ProgressLine::write("minds: Kontext-Sync läuft bereits\n");
+        }
         vln(verbose, "minds sync: läuft bereits");
         return Ok(());
     };
 
+    // Erst mit dem Lock in der Hand ankündigen — sonst stünde da ein
+    // Vordergrundlauf, der nie stattfand. Ohne Wortlaut: Der steht im Log.
+    // Aber der Wechsel soll erklärt sein, sonst wirkte der Push grundlos
+    // langsamer.
+    if retry_in_foreground {
+        ProgressLine::write(
+            "minds: letzter Hintergrund-Sync gescheitert — diesmal im Vordergrund\n",
+        );
+    }
+
+    let mut failed = false;
     for job in jobs {
         if job.updates.is_empty() {
             continue;
         }
         if let Err(err) = job.execute(&git_dir, verbose) {
+            failed = true;
             // Fail-soft: Der Push des Nutzers läuft weiter, die Refs bleiben
             // ungetrackt und werden beim nächsten Mal erneut angeboten.
             //
@@ -214,7 +283,107 @@ fn sync(remote: &str, verbose: bool) -> Fallible<()> {
             );
         }
     }
+    // Lock zuerst, Marker danach: Wer den Marker sieht, soll den Lock frei
+    // vorfinden — der nächste Hook startet seinen Vordergrundlauf daraufhin.
+    drop(lock);
+    set_retry_marker(&git_dir, failed);
     Ok(())
+}
+
+/// Der Pfad des [`RETRY_MARKER`].
+fn retry_marker(git_dir: &Path) -> PathBuf {
+    git_dir.join("minds").join(RETRY_MARKER)
+}
+
+/// Ob der [`RETRY_MARKER`] liegt — als **gewöhnliche Datei**. Ein Symlink an
+/// seiner Stelle zählt nicht: Den hat nicht dieses Modul angelegt, und
+/// `exists()` folgte ihm.
+fn retry_marker_set(git_dir: &Path) -> bool {
+    std::fs::symlink_metadata(retry_marker(git_dir)).is_ok_and(|meta| meta.is_file())
+}
+
+/// Legt den [`RETRY_MARKER`] an oder nimmt ihn weg — je nachdem, ob dieser
+/// Lauf gescheitert ist. Best effort: Ein Marker, der nicht geschrieben werden
+/// kann, kostet einen weiteren Hintergrundlauf, mehr nicht.
+///
+/// **Nicht durch einen Symlink hindurch** — dieselbe Regel wie in
+/// [`crate::hooklog::log_at`]: `<git-dir>/minds` legen wir selbst an, ein
+/// Link dort ist fremd. `fs::write` folgte einem Link am Blatt mit
+/// `O_TRUNC`, und wer `.git/minds` beschreiben darf, leerte damit eine
+/// beliebige Datei des Nutzers. Deshalb `create_new` wie beim Lock — es folgt
+/// dem letzten Glied nicht, und ein schon vorhandener Marker ist kein Fehler.
+/// `remove_file` entfernt höchstens den Link selbst, nie sein Ziel.
+fn set_retry_marker(git_dir: &Path, failed: bool) {
+    let marker = retry_marker(git_dir);
+    if !failed {
+        let _ = std::fs::remove_file(&marker);
+        return;
+    }
+    let Some(dir) = marker.parent() else {
+        return;
+    };
+    if hooklog::is_symlink(dir) || hooklog::is_symlink(&marker) {
+        return;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker);
+}
+
+/// Startet den Sync als **losgelösten** Prozess: dasselbe Binary, ohne
+/// `--detach`, ohne Terminal, kein `wait` — das Muster des Backfills in
+/// `enable`, plus `setsid`.
+///
+/// Ohne stdio, und zwar alle drei: Ein geerbter stdout wäre in einem
+/// `git push … | head` oder unter `Command::output()` eine Pipe, die der
+/// Leser erst geschlossen sähe, wenn dieser Prozess endet — genau das Warten,
+/// das hier wegfallen soll. Was der Prozess zu sagen hat, sagt er über
+/// [`crate::hooklog`]; ein Fehlschlag hinterlässt den [`RETRY_MARKER`].
+///
+/// **Und ohne Controlling-Terminal** (`setsid`, unter Unix). Null-stdio allein
+/// ließe es stehen: `ssh` fragt die Passphrase nicht über stdin, sondern über
+/// `/dev/tty` — und das wäre das Terminal, in dem gerade der Push des Nutzers
+/// läuft und womöglich selbst fragt. Zwei Leser an einem Terminal, und der
+/// Lock bliebe bis zum Stale-Timeout belegt. In einer eigenen Session gibt es
+/// kein `/dev/tty`; `ssh` scheitert sofort, der Lauf endet mit Marker, und der
+/// nächste Hook holt die Passphrase im Vordergrund. Das ist der Fall, den die
+/// Modul-Doku verspricht — deterministisch statt zufällig.
+///
+/// Die Umgebung erbt er ungekürzt: `SSH_AUTH_SOCK` und die Credential-Helper
+/// aus der Git-Config sind der Grund, warum der häufige Fall ohne Terminal
+/// auskommt. [`GUARD_ENV`] ist darin nicht gesetzt — das trägt nur das
+/// `git push`-Kind, und wir sind hier sein Elternprozess.
+///
+/// Best effort: Lässt sich der Prozess nicht starten, bleiben die Refs fällig
+/// und gehen beim nächsten Push mit.
+fn spawn_background(remote: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = Command::new(exe);
+    cmd.args(["sync", "--remote", remote])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `setsid` ist async-signal-safe und berührt keinen Zustand
+        // des Elternprozesses; zwischen `fork` und `exec` ist das alles, was
+        // hier geschieht. Ein Fehler (schon Gruppenführer) ist unerheblich —
+        // dann fehlt nur die Terminal-Trennung, nicht der Sync.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    // Absichtlich kein `wait`: Der Prozess überlebt den Hook und wird von init
+    // adoptiert.
+    let _ = cmd.spawn();
 }
 
 /// Ob der Sync eingeschaltet ist (`minds.sync`, Default `true`).
@@ -1028,6 +1197,53 @@ mod tests {
     #[test]
     fn the_identity_mapping_keeps_the_name() {
         assert_eq!(identity("refs/minds/context"), "refs/minds/context");
+    }
+
+    #[test]
+    fn the_retry_marker_comes_and_goes_with_the_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!retry_marker_set(dir.path()));
+        set_retry_marker(dir.path(), true);
+        assert!(retry_marker_set(dir.path()));
+        // Ein zweiter Fehlschlag ist kein Fehler — der Marker liegt schon.
+        set_retry_marker(dir.path(), true);
+        assert!(retry_marker_set(dir.path()));
+        set_retry_marker(dir.path(), false);
+        assert!(!retry_marker_set(dir.path()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_retry_marker_is_never_written_through_a_symlink() {
+        // Dieselbe Klasse wie `hooklog::nothing_is_written_through_a_symlink`:
+        // Wer `.git/minds` beschreiben darf, legt dort einen Link auf eine
+        // Datei des Nutzers — `fs::write` hätte sie mit `O_TRUNC` geleert.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("authorized_keys");
+        std::fs::write(&victim, "bleibt\n").unwrap();
+        let minds = dir.path().join("minds");
+        std::fs::create_dir_all(&minds).unwrap();
+        std::os::unix::fs::symlink(&victim, minds.join(RETRY_MARKER)).unwrap();
+
+        set_retry_marker(dir.path(), true);
+
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "bleibt\n");
+        // Und der Link gilt nicht als gesetzter Marker.
+        assert!(!retry_marker_set(dir.path()));
+
+        // Ein hängender Link darf sein Ziel nicht entstehen lassen …
+        let nowhere = dir.path().join("nirgendwo");
+        std::fs::remove_file(minds.join(RETRY_MARKER)).unwrap();
+        std::os::unix::fs::symlink(&nowhere, minds.join(RETRY_MARKER)).unwrap();
+        set_retry_marker(dir.path(), true);
+        assert!(!nowhere.exists(), "Datei durch hängenden Link angelegt");
+
+        // … und ein symlinktes `minds`-Verzeichnis ebenso wenig.
+        let other = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(other.path(), dir.path().join("minds")).unwrap();
+        set_retry_marker(dir.path(), true);
+        assert!(!other.path().join(RETRY_MARKER).exists());
     }
 
     #[test]
