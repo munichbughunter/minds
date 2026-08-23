@@ -37,6 +37,7 @@ fn card() -> serde_json::Value {
             {"name": "brief", "usage": "minds brief [<datei>...]", "summary": "Größenbegrenzter Kontext-Block für den Start einer Session."},
             {"name": "recap", "usage": "minds recap [--limit <n>] [--all]", "summary": "Die jüngsten Sessions auf einen Blick."},
             {"name": "search", "usage": "minds search <query>", "summary": "Prompts und Sessions durchsuchen."},
+            {"name": "inspect", "usage": "minds inspect [<suche> | <datei>:<zeile>]", "summary": "Terminal-Oberfläche: Sessions, Graph einer Session, Why-Kette einer Zeile. In einer Pipe: tab-separierte Zeilen."},
             {"name": "agent-help", "usage": "minds agent-help", "summary": "Diese maschinenlesbare Kommando-Karte."},
             {"name": "metrics", "usage": "minds metrics [--format prometheus|openmetrics|json]", "summary": "Kennzahlen aus dem Store — Prometheus, OpenMetrics oder JSON."},
             {"name": "fsck", "usage": "minds fsck [--require-review]", "summary": "Ist jeder Trailer auflösbar? Journal-Lücken? Mit --require-review: Policy-Gate."},

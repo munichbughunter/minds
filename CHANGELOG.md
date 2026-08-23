@@ -19,6 +19,40 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 
 ## [Unreleased]
 
+### Hinzugefügt
+
+- **`minds inspect`** — die Entstehung einer Änderung im Terminal. Eine
+  Activity-Liste der Sessions (Zeit, Absicht, Agent, Beleg, Verdict), der
+  Graph einer Session als Spur — Absicht → Agent → READ/EDIT/EXEC → Change →
+  Review — in drei Zoomstufen mit Details unter dem Cursor, und die Why-Kette
+  einer Zeile oder eines Commits mit einem Inspector, der jede Kante erklärt:
+  Trailer-Beleg oder nachgerechnete Vermutung (Datei-Schnittmenge,
+  Zeitfenster). Eine Vermutung sieht nie aus wie ein Beleg — Glyph **und**
+  Wort unterscheiden sich, nicht nur die Farbe. Strikt lesend; vergessene oder
+  defekte Sessions sind degradierte Zeilen, kein Absturz. Ist stdout kein
+  Terminal, kommen die Zeilen tab-separiert und ohne ANSI — `minds inspect
+  retry | grep` zeigt, was der Bildschirm zeigt. Eigenes Crate `minds-tui`
+  hinter dem Cargo-Feature `tui` (Default); `--no-default-features` baut die
+  CLI ohne.
+- **Lücken als eigene Aussage.** `WhyChain::gaps()` im Reader benennt, wo
+  die Kette nicht belegt ist — kein Commit, keine Change-Id, kein Kontext,
+  nur vermutete Zuordnung, vergessene Session, keine Bewertung. Die Oberfläche
+  markiert jedes Glied mit ✓ oder ⚠, zeigt den Block „N LÜCKEN" mit
+  Begründung, und erklärt den Beleg schon beim Fokus: Der Evidenz-Satz sagt
+  *warum* („rekonstruiert aus Datei-Überschneidung und zeitlicher Nähe — kein
+  expliziter Herkunftsnachweis"), nicht nur „irgendwie unsicher". In der Pipe
+  stehen die Lücken als `gap`-Zeilen.
+
+### Geändert
+
+- `minds-reader` trägt jetzt das Lese-Modell, das CLI und Oberfläche
+  gemeinsam nutzen: `Inspection` (einmal laden, dann fragen), Karten, Graph,
+  Why-Kette; der `Index` hält die Evidenz **je Kante**, die Change-Id je
+  Commit und degradierte Einträge mit Ursache statt eines bloßen Zählers.
+  `sanitize`/`sanitize_path` leben im Reader, damit jede Oberfläche fremden
+  Text gleich entschärft. `minds-git` liest die Autor-Zeit eines Commits
+  (`Repo::commit_time`).
+
 ## [0.1.3] — 2026-08-22 — „Unsichtbar, auch unter Last"
 
 *Das Release nach dem ersten manuellen Testlauf. Die Befunde von dort haben

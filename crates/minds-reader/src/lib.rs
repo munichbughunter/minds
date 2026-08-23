@@ -23,7 +23,7 @@ mod error;
 pub use error::{ReaderError, Result};
 
 mod index;
-pub use index::Index;
+pub use index::{Degradation, Degraded, Index};
 
 mod file;
 pub use file::{FileView, Line};
@@ -37,3 +37,15 @@ pub mod html;
 
 mod render;
 pub use render::{Site, render};
+
+pub mod text;
+pub use text::{sanitize, sanitize_path};
+
+pub mod model;
+
+pub mod graph;
+
+pub mod evidence;
+
+mod query;
+pub use query::{Inspection, touches};

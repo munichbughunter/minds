@@ -58,6 +58,7 @@ minds enable --agent claude-code   # registriert die Hooks, idempotent
 minds show                         # die Session hinter dem letzten Commit
 minds why src/retry.rs:42          # die Session hinter einer einzelnen Zeile
 minds recap                        # die letzten Sessions auf einen Blick
+minds inspect                      # dasselbe als Oberfläche: Liste, Graph, Why-Kette
 ```
 
 `minds enable` fasst fremde Konfiguration nicht an und lässt sich beliebig oft
@@ -67,7 +68,7 @@ aufrufen.
 
 | | |
 |---|---|
-| **Nachschlagen** | `show`, `why`, `blame`, `recap`, `search`, `render` |
+| **Nachschlagen** | `show`, `why`, `blame`, `recap`, `search`, `inspect`, `render` |
 | **Kontext zurückgeben** | `recall`, `brief`, `distill` — deterministisch, ohne LLM, 0 Tokens |
 | **Identität & Nachweis** | `sign`, `verify`, `audit --export` |
 | **Review** | `review`, `reviews`, `comment`, `stack`, `gitlab mirror` |

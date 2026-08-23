@@ -20,6 +20,10 @@ clap = { version = "4", features = ["derive"] }
 aho-corasick = "1"
 regex = "1"
 tempfile = "3"
+# Ohne Default-Features: kein termwiz/termion/palette/serde — nur das
+# crossterm-Backend in genau der hier gepinnten crossterm-Version.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache"] }
+crossterm = "0.29"
 
 [profile.release]
 strip = true
