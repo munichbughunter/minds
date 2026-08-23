@@ -70,6 +70,7 @@ mod walk;
 
 #[cfg(test)]
 mod fixture;
+mod time;
 
 pub use amend::TrailerUpdate;
 pub use blame::{AutoBlame, BlameLine, BlameProvider, GixBlame, ShellBlame};
