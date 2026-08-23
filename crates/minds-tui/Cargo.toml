@@ -1,0 +1,18 @@
+[package]
+name = "minds-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+minds-core = { path = "../minds-core" }
+minds-reader = { path = "../minds-reader" }
+minds-git = { path = "../minds-git" }
+minds-metrics = { path = "../minds-metrics" }
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

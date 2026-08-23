@@ -48,3 +48,8 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --locked
+
+      # Die Kern-CLI muss auch ohne die Oberfläche bauen — `tui` ist ein
+      # Default-Feature, kein Pflichtteil.
+      - name: cargo build ohne Default-Features
+        run: cargo build -p minds-cli --no-default-features --locked

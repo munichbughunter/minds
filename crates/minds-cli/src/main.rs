@@ -50,6 +50,8 @@ mod gitlab_cmd;
 mod hook;
 mod hooklog;
 mod import_cmd;
+#[cfg(feature = "tui")]
+mod inspect;
 mod metrics;
 mod prepare_commit_msg;
 mod recall;
@@ -128,6 +130,12 @@ Verwendung:
 
   minds search <query>
         Durchsucht Absicht, Verlauf und Dateien der erfassten Sessions.
+
+  minds inspect [<suche> | <datei>:<zeile>]
+        Die Entstehung einer Änderung, im Terminal: Session-Liste, Graph
+        einer Session (Absicht → Agent → Effekte → Change → Review) und die
+        Why-Kette einer Zeile. Rein lesend. Ist stdout keine Konsole, kommen
+        die Zeilen tab-separiert (für grep/fzf).
 
   minds agent-help
         Maschinenlesbare Kommando-Karte (JSON) — für Agents, nicht Menschen.
@@ -269,6 +277,7 @@ const SPECS: &[Spec] = &[
     spec("distill", &["--path", "--out"], &[], 0),
     spec("brief", &[], &["--hook"], usize::MAX),
     spec("recap", &["--limit"], &["--all"], 0),
+    spec("inspect", &[], &[], 1),
     spec("search", &[], &[], 1),
     spec("agent-help", &[], &[], 0),
     spec("metrics", &["--format"], &[], 0),
@@ -610,6 +619,16 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "recap" => recap::run(parsed.value("--limit"), parsed.has("--all")),
 
         "search" => search::run(parsed.positional(0)),
+
+        #[cfg(feature = "tui")]
+        "inspect" => inspect::run(parsed.positional(0)),
+        // Ohne Feature bleibt das Kommando in SPECS (agent-help und USAGE
+        // bleiben eine Quelle), sagt aber ehrlich, warum es nichts tut.
+        #[cfg(not(feature = "tui"))]
+        "inspect" => {
+            eprintln!("minds inspect: dieses Binary wurde ohne das Feature `tui` gebaut");
+            ExitCode::FAILURE
+        }
 
         "agent-help" => agent_help::run(),
 
