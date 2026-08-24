@@ -17,7 +17,14 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 > steigt nur bei einer brechenden Änderung an der Nutzlast, nie bei einem zusätzlichen
 > Feld.
 
-## [Unreleased]
+## [0.2.0] — 2026-08-24 — „Die Entstehung, sichtbar gemacht"
+
+*Das erste Release mit einer Oberfläche. Bisher beantwortete Minds die Frage
+nach dem Warum Zeile für Zeile — `why`, `show`, `recap`, jedes ein eigener
+Aufruf. Jetzt gibt es den einen Ort, an dem sich die Kette ansehen lässt:
+`minds inspect`. Eine MINOR-Version, weil die CLI-Oberfläche wächst (neues
+Kommando, neues Default-Feature `tui`); das Store-Layout und die Schemas
+bleiben unverändert — ein 0.1.3-Repo liest sich ohne Migration.*
 
 ### Hinzugefügt
 
@@ -52,6 +59,14 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   `sanitize`/`sanitize_path` leben im Reader, damit jede Oberfläche fremden
   Text gleich entschärft. `minds-git` liest die Autor-Zeit eines Commits
   (`Repo::commit_time`).
+
+### Bekannte Einschränkungen
+
+*Die Liste unter 0.1.3 gilt unverändert weiter — sie bleibt der Übergabestand.
+Neu hinzu kommt nichts: `minds inspect` ist strikt lesend, arbeitet nur auf
+gespeicherten, redigierten Daten und teilt die bekannten Grenzen von
+`why`/`show` (verlinkte Worktrees zeigen den Commit des Hauptbaums,
+[#20](https://github.com/munichbughunter/minds/issues/20)).*
 
 ## [0.1.3] — 2026-08-22 — „Unsichtbar, auch unter Last"
 
