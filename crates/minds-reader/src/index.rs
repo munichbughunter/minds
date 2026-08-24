@@ -34,7 +34,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use minds_core::{ChangeId, Evidence, Session, SessionId, Trailer};
+use minds_core::evidence::{Seal, SealOutcome};
+use minds_core::{
+    ChangeId, ContentHash, EvidenceMark, EvidenceSource, Session, SessionId, Trailer,
+};
 use minds_git::{CommitId, Repo};
 use minds_metrics::Coverage;
 use minds_store::{ContextStore, StoreError};
@@ -107,6 +110,35 @@ pub struct Degraded {
     pub cause: Degradation,
 }
 
+/// Eine Content-Übergabe zwischen zwei Sessions: `to` las exakt die Bytes,
+/// die `from` schrieb — festgestellt über identische [`ContentHash`]e am
+/// selben Pfad, nicht beobachtet und nicht behauptet. Die **Richtung** ist
+/// aus der Effekt-Art abgeleitet (Write → Read), nicht zeitlich belegt —
+/// belegt ist allein die Byte-Gleichheit. Genau dafür gibt es
+/// `(ContentDerived, Verified)`: eine **nachgerechnete** Beziehung
+/// (ADR-0011; die erste Stelle, die diesen Mark produziert).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentLink {
+    /// Die schreibende Session.
+    pub from: SessionId,
+    /// Die lesende Session.
+    pub to: SessionId,
+    /// Der gemeinsame Pfad, entschärft.
+    pub path: String,
+    /// Der übereinstimmende Inhalts-Hash.
+    pub hash: ContentHash,
+}
+
+impl ContentLink {
+    /// Der Beleg dieser Kante — per Konstruktion nachgerechnet.
+    pub fn mark(&self) -> EvidenceMark {
+        EvidenceMark {
+            source: EvidenceSource::ContentDerived,
+            status: minds_core::EvidenceStatus::Verified,
+        }
+    }
+}
+
 /// Das gesammelte Bild aus Store und Historie.
 ///
 /// Zwei Quellen verknüpfen Commits mit Sessions: die **Trailer** (verbindlich)
@@ -121,8 +153,26 @@ pub struct Index {
     /// Die Gegenrichtung zu `commits`, damit `commits_of` nicht die ganze
     /// Historie durchsucht.
     by_session: BTreeMap<SessionId, Vec<CommitId>>,
-    /// Woher jede Kante bekannt ist; bei mehreren Belegen gewinnt der beste.
-    evidence: BTreeMap<(CommitId, SessionId), Evidence>,
+    /// Woher jede Kante bekannt ist; bei mehreren Belegen gewinnt der beste
+    /// (Merge-Regel aus ADR-0011: erst Quelle, dann Status).
+    evidence: BTreeMap<(CommitId, SessionId), EvidenceMark>,
+    /// Die Seals je Session: `(seal_id, Seal, signiert?)`, in
+    /// Rückverweis-Reihenfolge.
+    seals: BTreeMap<SessionId, Vec<(ContentHash, Seal, bool)>>,
+    /// Sessions, deren Seal-Material beim Lesen als manipuliert auffiel.
+    seal_tampered: BTreeSet<SessionId>,
+    /// Sessionlose Block-Seals: zurückgehaltene Sessions, deren einziger
+    /// Beleg der Seal ist (`outcome=storage_policy_rejected_payload`).
+    rejected: Vec<(ContentHash, Seal)>,
+    /// Alle lesbaren Seals des Namensraums, für die `previous`-Auflösung und
+    /// die Epochen-Zählung: `seal_id → (stored?, root, previous)`.
+    all_seals: BTreeMap<ContentHash, (bool, ContentHash, Option<ContentHash>)>,
+    /// Der Evidence-DAG als **Projektion** (Phase 6): Content-Übergaben
+    /// zwischen Sessions, zur Ladezeit aus den gespeicherten Inhalts-Hashes
+    /// abgeleitet — nie gespeichert, jederzeit neu berechenbar. Die Chain
+    /// bleibt die temporale Wahrheit; das hier sind semantische Beziehungen
+    /// darüber.
+    content_links: Vec<ContentLink>,
     changes: BTreeMap<CommitId, ChangeId>,
     subjects: BTreeMap<CommitId, String>,
     /// `(agent, lineage.local_id)` → Id — für die symbolischen Endpunkte der
@@ -188,7 +238,7 @@ impl Index {
                 for id in Trailer::session_ids(&message) {
                     covered |= known.contains(&id);
                     if index.sessions.contains_key(&id) {
-                        index.link(commit, id, Evidence::Observed);
+                        index.link(commit, id, EvidenceMark::of(EvidenceSource::Observed));
                     }
                 }
                 if let Some(change) = Trailer::change_id(&message) {
@@ -217,6 +267,11 @@ impl Index {
             }
         }
 
+        // 3. Die Evidence-Chain (ADR-0011): Seals je Session und die
+        //    sessionlosen Block-Seals. Fail-soft — ein unlesbarer Seal wird
+        //    vermerkt, nie ein Absturz.
+        index.load_seals(store, &known);
+
         index.finish();
         Ok(index)
     }
@@ -242,7 +297,7 @@ impl Index {
             let mut any = false;
             for id in ids {
                 if index.sessions.contains_key(&id) {
-                    index.link(commit, id, Evidence::Observed);
+                    index.link(commit, id, EvidenceMark::of(EvidenceSource::Observed));
                     any = true;
                 }
             }
@@ -269,18 +324,167 @@ impl Index {
         self
     }
 
-    /// Trägt eine Kante ein; ein besserer Beleg ersetzt einen schwächeren,
-    /// ein schwächerer ändert nichts.
-    fn link(&mut self, commit: CommitId, id: SessionId, evidence: Evidence) {
-        let slot = self.evidence.entry((commit, id)).or_insert(evidence);
-        if evidence > *slot {
-            *slot = evidence;
+    /// Ergänzt Seals je Session — für Tests, die das Evidence-Verdikt ohne
+    /// Store prüfen. `(seal_id, Seal, signiert?)`, wie beim Laden.
+    pub fn with_seals(mut self, id: SessionId, seals: Vec<(ContentHash, Seal, bool)>) -> Self {
+        for (seal_id, seal, _) in &seals {
+            let stored = matches!(seal.outcome, SealOutcome::Stored { .. });
+            self.all_seals.insert(
+                seal_id.clone(),
+                (stored, seal.root.clone(), seal.previous.clone()),
+            );
         }
-        if evidence == Evidence::Observed {
+        self.seals.entry(id).or_default().extend(seals);
+        self
+    }
+
+    /// Trägt eine Kante ein; ein besserer Beleg ersetzt einen schwächeren,
+    /// ein schwächerer ändert nichts ([`EvidenceMark::merge`]).
+    fn link(&mut self, commit: CommitId, id: SessionId, evidence: EvidenceMark) {
+        let slot = self.evidence.entry((commit, id)).or_insert(evidence);
+        *slot = slot.merge(evidence);
+        if evidence.source == EvidenceSource::Observed {
             self.observed.insert(id);
         }
         push_unique(self.commits.entry(commit).or_default(), id);
         push_unique(self.by_session.entry(id).or_default(), commit);
+    }
+
+    /// Lädt die Seals aller bekannten Sessions und die sessionlosen
+    /// Block-Seals. Jeder Lesefehler degradiert sichtbar statt zu stürzen.
+    fn load_seals(&mut self, store: &dyn ContextStore, known: &BTreeSet<SessionId>) {
+        for id in known {
+            let Ok(seal_ids) = store.seals_of(*id) else {
+                continue;
+            };
+            for seal_id in seal_ids {
+                match store.seal_text(&seal_id) {
+                    Ok(Some(text)) => match Seal::parse(&text) {
+                        Ok(seal) => {
+                            let signed = matches!(store.seal_signature(&seal_id), Ok(Some(_)));
+                            self.seals
+                                .entry(*id)
+                                .or_default()
+                                .push((seal_id, seal, signed));
+                        }
+                        Err(_) => {
+                            self.seal_tampered.insert(*id);
+                        }
+                    },
+                    Ok(None) => {
+                        // Baumelnder Rückverweis: kein Beweis, keine
+                        // Manipulation — die Session gilt schlicht als (noch)
+                        // unversiegelt an dieser Stelle.
+                    }
+                    Err(StoreError::SealMismatch { .. }) => {
+                        self.seal_tampered.insert(*id);
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        // Einmal über den ganzen Namensraum: die Block-Seals (per
+        // Konstruktion sessionlos) und die Übersicht für die
+        // `previous`-Auflösung über Epochen-/Session-Grenzen hinweg.
+        if let Ok(all) = store.list_seals() {
+            for seal_id in all {
+                let Ok(Some(text)) = store.seal_text(&seal_id) else {
+                    continue;
+                };
+                let Ok(seal) = Seal::parse(&text) else {
+                    continue;
+                };
+                let stored = matches!(seal.outcome, SealOutcome::Stored { .. });
+                self.all_seals.insert(
+                    seal_id.clone(),
+                    (stored, seal.root.clone(), seal.previous.clone()),
+                );
+                if !stored {
+                    self.rejected.push((seal_id, seal));
+                }
+            }
+        }
+    }
+
+    /// Die sessionlosen Block-Seals — zurückgehaltene Sessions, deren
+    /// einziger Beleg der Seal ist.
+    pub fn rejected_seals(&self) -> &[(ContentHash, Seal)] {
+        &self.rejected
+    }
+
+    /// Das Evidence-Verdikt einer Session aus ihren Seals — `None`, wenn es
+    /// keinerlei Seal-Material gibt (vor Evidence-Chain erfasst).
+    pub fn evidence_state(&self, id: SessionId) -> Option<crate::model::EvidenceState> {
+        use crate::model::{EvidenceState, EvidenceVerdict};
+
+        let tampered = self.seal_tampered.contains(&id);
+        let seals = self.seals.get(&id);
+        if !tampered && seals.is_none_or(|s| s.is_empty()) {
+            return None;
+        }
+        let seals = seals.map(Vec::as_slice).unwrap_or(&[]);
+
+        let mut events = 0u64;
+        let mut gaps = 0u64;
+        let mut pre_chain = 0u64;
+        let mut signed = 0usize;
+        let mut rejected = false;
+        // Dieselbe Epochen-Logik wie `minds verify` (ADR-0011): Epochen sind
+        // eigene Sessions — ein `previous` auf einen auflösbaren
+        // `stored`-Seal SCHLIESST die Kette; ein Block-Seal als Vorgänger
+        // ist nur dann Geschichte, wenn sein Root identisch ist
+        // (Policy-Fix), sonst eine zurückgewiesene Epoche.
+        let in_set: BTreeSet<&ContentHash> = seals.iter().map(|(id, _, _)| id).collect();
+        let mut entry_points = 0usize;
+        let mut internal_targets: BTreeSet<&ContentHash> = BTreeSet::new();
+        let mut chain_closed = true;
+        for (_, seal, is_signed) in seals {
+            events += seal.events;
+            gaps += seal.gaps;
+            pre_chain += seal.pre_chain;
+            signed += usize::from(*is_signed);
+            match &seal.previous {
+                None => entry_points += 1,
+                Some(prev) if in_set.contains(prev) => {
+                    if !internal_targets.insert(prev) {
+                        chain_closed = false; // Fork
+                    }
+                }
+                Some(prev) => match self.all_seals.get(prev) {
+                    Some((true, _, _)) => entry_points += 1,
+                    Some((false, prev_root, _)) if prev_root == &seal.root => entry_points += 1,
+                    Some((false, _, _)) => {
+                        rejected = true;
+                        chain_closed = false;
+                    }
+                    None => chain_closed = false,
+                },
+            }
+        }
+        if entry_points != 1 {
+            chain_closed = false;
+        }
+        if seals.is_empty() {
+            chain_closed = false;
+        }
+
+        let verdict = if tampered {
+            EvidenceVerdict::Tampered
+        } else if gaps == 0 && pre_chain == 0 && !rejected && chain_closed {
+            EvidenceVerdict::Verified
+        } else {
+            EvidenceVerdict::Incomplete
+        };
+        Some(EvidenceState {
+            verdict,
+            seals: seals.len(),
+            events,
+            gaps,
+            pre_chain,
+            rejected,
+            chain_closed,
+            signed,
+        })
     }
 
     /// Leitet die abgeleiteten Tabellen ab, sobald alle Kanten stehen.
@@ -293,6 +497,130 @@ impl Index {
                 Some(((session.agent.name.clone(), lineage.local_id.clone()), *id))
             })
             .collect();
+        self.content_links = self.project_content_links();
+    }
+
+    /// Die DAG-Projektion: Write-Hash der einen Session == Read-Hash der
+    /// anderen, am selben Pfad. Deterministisch sortiert; Duplikate (mehrere
+    /// Aufrufe derselben Datei) fallen zusammen.
+    fn project_content_links(&self) -> Vec<ContentLink> {
+        use minds_core::EffectKind;
+
+        // (pfad, hash) → Schreiber bzw. Leser.
+        let mut writes: BTreeMap<(String, ContentHash), BTreeSet<SessionId>> = BTreeMap::new();
+        let mut reads: BTreeMap<(String, ContentHash), BTreeSet<SessionId>> = BTreeMap::new();
+        for (id, session) in &self.sessions {
+            for call in session.turns.iter().flat_map(|t| &t.tool_calls) {
+                let Some(effect) = &call.effect else { continue };
+                let (Some(path), Some(hash)) = (&effect.path, &effect.content) else {
+                    continue;
+                };
+                let key = (path.clone(), hash.clone());
+                match effect.kind {
+                    EffectKind::Write => {
+                        writes.entry(key).or_default().insert(*id);
+                    }
+                    EffectKind::Read => {
+                        reads.entry(key).or_default().insert(*id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut links = Vec::new();
+        for (key, writers) in &writes {
+            let Some(readers) = reads.get(key) else {
+                continue;
+            };
+            for from in writers {
+                for to in readers {
+                    if from == to {
+                        continue; // die eigene Datei zu lesen ist keine Übergabe
+                    }
+                    links.push(ContentLink {
+                        from: *from,
+                        to: *to,
+                        path: sanitize(&key.0),
+                        hash: key.1.clone(),
+                    });
+                }
+            }
+        }
+        links.sort_by(|a, b| {
+            (a.from, a.to, &a.path)
+                .cmp(&(b.from, b.to, &b.path))
+                .then_with(|| a.hash.cmp(&b.hash))
+        });
+        links.dedup();
+        links
+    }
+
+    /// Alle Content-Übergaben des Repos, deterministisch sortiert.
+    pub fn content_links(&self) -> &[ContentLink] {
+        &self.content_links
+    }
+
+    /// Die Content-Übergaben, an denen eine Session beteiligt ist.
+    pub fn content_links_of(&self, id: SessionId) -> Vec<&ContentLink> {
+        self.content_links
+            .iter()
+            .filter(|l| l.from == id || l.to == id)
+            .collect()
+    }
+
+    /// Die Epochen-Position einer Session: `(k, n)` — ihr letzter Seal hat
+    /// k−1 auflösbare Vorfahren und n−k transitive Nachfahren. Bei einer
+    /// linearen Kette ist das „Epoche k von n"; bei einem Fork zählt n
+    /// **alle** Zweige — eine Anzeige, keine Ketten-Garantie (die macht
+    /// `coverage_complete`). `None` ohne Seals oder bei trivialer Kette.
+    ///
+    /// Rein aus den Seals gerechnet (Projektion): Vorfahren über `previous`,
+    /// Nachfahren über die Umkehrung — mit Zyklus-Schutz, denn `previous`
+    /// ist Repo-Inhalt, kein Vertrauensanker.
+    pub fn epoch_position(&self, id: SessionId) -> Option<(usize, usize)> {
+        let (last_id, _, _) = self.seals.get(&id)?.last()?;
+
+        // Vorfahren zaehlen — nur AUFLOESBARE Glieder (ein baumelndes
+        // `previous` ist eine offene Kette, kein Vorfahr), mit Zyklus-Schutz
+        // inklusive des eigenen Seals: `previous` ist Repo-Inhalt, kein
+        // Vertrauensanker.
+        let mut seen: BTreeSet<&ContentHash> = BTreeSet::new();
+        seen.insert(last_id);
+        let mut ancestors = 0usize;
+        let mut cursor = self.all_seals.get(last_id).and_then(|(_, _, p)| p.as_ref());
+        while let Some(prev) = cursor {
+            if !self.all_seals.contains_key(prev) || !seen.insert(prev) {
+                break; // baumelnd oder Zyklus — nicht weiterzaehlen
+            }
+            ancestors += 1;
+            cursor = self.all_seals.get(prev).and_then(|(_, _, p)| p.as_ref());
+        }
+
+        // Nachfahren: wer setzt (transitiv) auf uns auf?
+        let mut children: BTreeMap<&ContentHash, Vec<&ContentHash>> = BTreeMap::new();
+        for (seal_id, (_, _, previous)) in &self.all_seals {
+            if let Some(prev) = previous {
+                children.entry(prev).or_default().push(seal_id);
+            }
+        }
+        let mut descendants = 0usize;
+        let mut frontier = vec![last_id];
+        // Gemeinsame Sicht mit dem Vorfahren-Walk: In einem Zyklus darf ein
+        // Glied nie doppelt zählen (als Vorfahr UND Nachfahr).
+        let mut visited: BTreeSet<&ContentHash> = seen;
+        visited.insert(last_id);
+        while let Some(node) = frontier.pop() {
+            for child in children.get(node).into_iter().flatten() {
+                if visited.insert(child) {
+                    descendants += 1;
+                    frontier.push(child);
+                }
+            }
+        }
+
+        let total = ancestors + 1 + descendants;
+        (total > 1).then_some((ancestors + 1, total))
     }
 
     /// `true`, wenn diese Session über mindestens einen Trailer belegt ist (im
@@ -303,13 +631,13 @@ impl Index {
 
     /// Woher die Kante Commit → Session bekannt ist; `None`, wenn es sie
     /// nicht gibt.
-    pub fn evidence_of(&self, commit: CommitId, id: SessionId) -> Option<Evidence> {
+    pub fn evidence_of(&self, commit: CommitId, id: SessionId) -> Option<EvidenceMark> {
         self.evidence.get(&(commit, id)).copied()
     }
 
     /// Der beste Beleg, mit dem diese Session an irgendeinem Commit hängt —
     /// `None`, wenn sie mit keinem Code verbunden ist.
-    pub fn evidence_for_session(&self, id: SessionId) -> Option<Evidence> {
+    pub fn evidence_for_session(&self, id: SessionId) -> Option<EvidenceMark> {
         self.by_session
             .get(&id)?
             .iter()
@@ -422,6 +750,285 @@ fn push_unique<T: PartialEq>(ids: &mut Vec<T>, id: T) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seal_for(
+        id: SessionId,
+        gaps: u64,
+        previous: Option<ContentHash>,
+    ) -> (ContentHash, Seal, bool) {
+        let seal = Seal {
+            root: ContentHash::from_bytes([7u8; 32]),
+            agent: "claude-code".into(),
+            scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+            first_seq: 0,
+            last_seq: 3,
+            events: 4,
+            gaps,
+            pre_chain: 0,
+            outcome: SealOutcome::Stored {
+                session: id.to_string(),
+            },
+            previous,
+            last_event_at: "2026-08-24T10:00:00Z".into(),
+        };
+        let seal_id = Seal::id_of_text(&seal.to_text().unwrap());
+        (seal_id, seal, false)
+    }
+
+    #[test]
+    fn content_links_are_a_projection_with_verified_content_marks() {
+        use minds_core::{Effect, EffectKind, ToolCall, Turn};
+
+        // A schreibt foo.rs mit Hash H, B liest foo.rs mit demselben H —
+        // die Uebergabe ist NACHGERECHNET, nicht beobachtet: der erste Ort,
+        // der (ContentDerived, Verified) produziert (ADR-0011, Phase 6).
+        let hash = ContentHash::from_bytes([5u8; 32]);
+        let mk = |req: &str, kind: EffectKind, h: &ContentHash| {
+            let mut s = minds_core::Session::new(
+                minds_core::Agent {
+                    name: "x".into(),
+                    version: "1".into(),
+                },
+                minds_core::Model {
+                    provider: "p".into(),
+                    id: "m".into(),
+                },
+                minds_core::Intent {
+                    request: req.into(),
+                    ..Default::default()
+                },
+            );
+            s.redaction.applied = true;
+            s.turns.push(Turn {
+                role: minds_core::Role::Assistant,
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    name: "T".into(),
+                    arguments: String::new(),
+                    capture: None,
+                    effect: Some(Effect {
+                        kind,
+                        path: Some("foo.rs".into()),
+                        content: Some(h.clone()),
+                    }),
+                }],
+                parent: None,
+                at: None,
+            });
+            s
+        };
+        let a: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let b: SessionId = format!("b3-{}", "b".repeat(64)).parse().unwrap();
+        let c: SessionId = format!("b3-{}", "c".repeat(64)).parse().unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(a, mk("schreibt", EffectKind::Write, &hash));
+        sessions.insert(b, mk("liest", EffectKind::Read, &hash));
+        // C liest denselben Pfad mit ANDEREM Hash: keine Uebergabe.
+        sessions.insert(
+            c,
+            mk(
+                "liest anderes",
+                EffectKind::Read,
+                &ContentHash::from_bytes([6u8; 32]),
+            ),
+        );
+
+        let index = Index::from_parts(sessions, BTreeMap::new());
+        let links = index.content_links();
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].from, a);
+        assert_eq!(links[0].to, b);
+        assert_eq!(links[0].path, "foo.rs");
+        assert_eq!(
+            links[0].mark(),
+            EvidenceMark {
+                source: EvidenceSource::ContentDerived,
+                status: minds_core::EvidenceStatus::Verified,
+            }
+        );
+        assert_eq!(index.content_links_of(c).len(), 0);
+
+        // Projektion: zweimal gebaut, identisch — nichts wird gespeichert.
+        let again = Index::from_parts(
+            index.sessions().map(|(id, s)| (*id, s.clone())).collect(),
+            BTreeMap::new(),
+        );
+        assert_eq!(again.content_links(), links);
+    }
+
+    #[test]
+    fn epoch_position_counts_a_linear_chain_and_survives_adversarial_previous() {
+        use minds_core::evidence::{Seal, SealOutcome};
+
+        let sid_a: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let sid_b: SessionId = format!("b3-{}", "b".repeat(64)).parse().unwrap();
+        let mk_session = |req: &str| {
+            let mut s = minds_core::Session::new(
+                minds_core::Agent {
+                    name: "claude-code".into(),
+                    version: "1".into(),
+                },
+                minds_core::Model {
+                    provider: "p".into(),
+                    id: "m".into(),
+                },
+                minds_core::Intent {
+                    request: req.into(),
+                    ..Default::default()
+                },
+            );
+            s.redaction.applied = true;
+            s
+        };
+        let mk_seal = |session: SessionId, root: u8, previous: Option<ContentHash>| {
+            let seal = Seal {
+                root: ContentHash::from_bytes([root; 32]),
+                agent: "claude-code".into(),
+                scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+                first_seq: 0,
+                last_seq: 0,
+                events: 1,
+                gaps: 0,
+                pre_chain: 0,
+                outcome: SealOutcome::Stored {
+                    session: session.to_string(),
+                },
+                previous,
+                last_event_at: "2026-08-24T10:00:00Z".into(),
+            };
+            let id = Seal::id_of_text(&seal.to_text().unwrap());
+            (id, seal, false)
+        };
+
+        // Lineare Kette: Epoche 1 (a) ← Epoche 2 (b).
+        let (id_a, seal_a, s) = mk_seal(sid_a, 1, None);
+        let (_, seal_b, s2) = mk_seal(sid_b, 2, Some(id_a.clone()));
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid_a, mk_session("erste"));
+        sessions.insert(sid_b, mk_session("zweite"));
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid_a, vec![(id_a.clone(), seal_a.clone(), s)])
+            .with_seals(
+                sid_b,
+                vec![(
+                    Seal::id_of_text(&seal_b.to_text().unwrap()),
+                    seal_b.clone(),
+                    s2,
+                )],
+            );
+        assert_eq!(index.epoch_position(sid_a), Some((1, 2)));
+        assert_eq!(index.epoch_position(sid_b), Some((2, 2)));
+
+        // Adversarial: previous zeigt ins Leere — kein Vorfahr, keine Panik.
+        let dangling = ContentHash::from_bytes([9u8; 32]);
+        let (id_c, seal_c, s3) = mk_seal(sid_a, 3, Some(dangling));
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid_a, vec![(id_c, seal_c, s3)]);
+        assert_eq!(
+            index.epoch_position(sid_a),
+            None,
+            "baumelnd = triviale Kette"
+        );
+
+        // Adversarial: 2-Zyklus A↔B — der eigene Seal wird nie mitgezaehlt,
+        // der Walk terminiert.
+        let (id_x, mut seal_x, _) = mk_seal(sid_a, 4, None);
+        let (id_y, seal_y, _) = mk_seal(sid_b, 5, Some(id_x.clone()));
+        seal_x.previous = Some(id_y.clone());
+        // seal_x wurde nach dem Setzen von previous nicht neu gehasht —
+        // fuer den Walk zaehlt nur die Struktur in all_seals.
+        let index = Index::from_parts(sessions, BTreeMap::new())
+            .with_seals(sid_a, vec![(id_x.clone(), seal_x, false)])
+            .with_seals(sid_b, vec![(id_y.clone(), seal_y, false)]);
+        let (k, n) = index
+            .epoch_position(sid_a)
+            .expect("Zyklus liefert etwas Endliches");
+        assert!(k <= n && n <= 2, "Zyklus zaehlt sich nicht selbst: {k}/{n}");
+    }
+
+    #[test]
+    fn invariant_legacy_stays_legacy() {
+        // Invariante 7 (ADR-0011): Eine Session ohne Seal-Material ist
+        // LEGACY — explizit, nicht ein leeres None. Und sie bekommt nie
+        // nachträglich eine Chain angedichtet: Auch beim zweiten Laden
+        // bleibt der Zustand derselbe.
+        let sid: SessionId = format!("b3-{}", "e".repeat(64)).parse().unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid, {
+            let mut s = minds_core::Session::new(
+                minds_core::Agent {
+                    name: "claude-code".into(),
+                    version: "1".into(),
+                },
+                minds_core::Model {
+                    provider: "p".into(),
+                    id: "m".into(),
+                },
+                minds_core::Intent {
+                    request: "alt".into(),
+                    ..Default::default()
+                },
+            );
+            s.redaction.applied = true;
+            s
+        });
+        let index = Index::from_parts(sessions, BTreeMap::new());
+        assert!(
+            index.evidence_state(sid).is_none(),
+            "Legacy hat kein Verdikt"
+        );
+        assert!(index.epoch_position(sid).is_none());
+    }
+
+    #[test]
+    fn evidence_state_judges_seals_like_verify_does() {
+        let sid: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid, {
+            let mut s = minds_core::Session::new(
+                minds_core::Agent {
+                    name: "claude-code".into(),
+                    version: "1".into(),
+                },
+                minds_core::Model {
+                    provider: "anthropic".into(),
+                    id: "opus".into(),
+                },
+                minds_core::Intent {
+                    request: "x".into(),
+                    ..Default::default()
+                },
+            );
+            s.redaction.applied = true;
+            s
+        });
+
+        // Sauber versiegelt ⇒ VERIFIZIERT.
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 0, None)]);
+        let state = index.evidence_state(sid).expect("Seal-Material");
+        assert_eq!(state.verdict, crate::model::EvidenceVerdict::Verified);
+        assert!(state.chain_closed);
+
+        // Mit versiegelter Luecke ⇒ UNVOLLSTAENDIG.
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 2, None)]);
+        let state = index.evidence_state(sid).unwrap();
+        assert_eq!(state.verdict, crate::model::EvidenceVerdict::Incomplete);
+        assert_eq!(state.gaps, 2);
+
+        // Offene Epochenkette (previous zeigt ins Leere) ⇒ UNVOLLSTAENDIG.
+        let dangling = ContentHash::from_bytes([1u8; 32]);
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 0, Some(dangling))]);
+        let state = index.evidence_state(sid).unwrap();
+        assert_eq!(state.verdict, crate::model::EvidenceVerdict::Incomplete);
+        assert!(!state.chain_closed);
+
+        // Und ganz ohne Seals: kein Verdikt — vor Evidence-Chain erfasst.
+        let index = Index::from_parts(sessions, BTreeMap::new());
+        assert!(index.evidence_state(sid).is_none());
+    }
     use minds_core::{Agent, Intent, Model};
 
     fn id(hex: char) -> SessionId {
@@ -515,12 +1122,12 @@ mod tests {
         let index = sample();
         assert_eq!(
             index.evidence_of(commit('1'), id('a')),
-            Some(Evidence::Observed)
+            Some(EvidenceMark::of(EvidenceSource::Observed))
         );
         assert_eq!(index.evidence_of(commit('1'), id('b')), None);
         assert_eq!(
             index.evidence_for_session(id('a')),
-            Some(Evidence::Observed)
+            Some(EvidenceMark::of(EvidenceSource::Observed))
         );
         // Ohne Kante: mit keinem Code verbunden, nicht „vermutet".
         let mut lonely = BTreeMap::new();
@@ -533,22 +1140,34 @@ mod tests {
     fn a_better_proof_replaces_a_weaker_one_never_the_reverse() {
         let mut index = Index::default();
         index.sessions.insert(id('a'), session("x"));
-        index.link(commit('1'), id('a'), Evidence::Inferred);
+        index.link(
+            commit('1'),
+            id('a'),
+            EvidenceMark::of(EvidenceSource::Heuristic),
+        );
         assert_eq!(
             index.evidence_of(commit('1'), id('a')),
-            Some(Evidence::Inferred)
+            Some(EvidenceMark::of(EvidenceSource::Heuristic))
         );
         assert!(!index.is_observed(id('a')));
-        index.link(commit('1'), id('a'), Evidence::Observed);
+        index.link(
+            commit('1'),
+            id('a'),
+            EvidenceMark::of(EvidenceSource::Observed),
+        );
         assert_eq!(
             index.evidence_of(commit('1'), id('a')),
-            Some(Evidence::Observed)
+            Some(EvidenceMark::of(EvidenceSource::Observed))
         );
         assert!(index.is_observed(id('a')));
-        index.link(commit('1'), id('a'), Evidence::Declared);
+        index.link(
+            commit('1'),
+            id('a'),
+            EvidenceMark::of(EvidenceSource::HumanDeclared),
+        );
         assert_eq!(
             index.evidence_of(commit('1'), id('a')),
-            Some(Evidence::Observed)
+            Some(EvidenceMark::of(EvidenceSource::Observed))
         );
         // Die Kante steht nur einmal in beiden Richtungen.
         assert_eq!(index.sessions_of(commit('1')).len(), 1);

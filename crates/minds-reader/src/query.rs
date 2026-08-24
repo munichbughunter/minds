@@ -23,8 +23,8 @@ use crate::evidence;
 use crate::graph::SessionGraph;
 use crate::index::{Degradation, Index};
 use crate::model::{
-    CardState, EvidenceExplanation, Header, LinkEvidence, ReviewNote, ReviewState, SessionCard,
-    Verdict, WhyChain, WhyStep,
+    CardState, EvidenceExplanation, Header, LinkEvidence, Provenance, ReviewNote, ReviewState,
+    SessionCard, Verdict, WhyChain, WhyStep,
 };
 use crate::summary::Summary;
 use crate::text::{sanitize, sanitize_path};
@@ -125,6 +125,12 @@ impl Inspection {
         &self.index
     }
 
+    /// Die sessionlosen Block-Seals: zurückgehaltene Sessions, deren einziger
+    /// Beleg der Seal ist (ADR-0011, Entscheidung 3).
+    pub fn rejected_seals(&self) -> &[(minds_core::ContentHash, minds_core::evidence::Seal)] {
+        self.index.rejected_seals()
+    }
+
     /// Die Kopfzeile.
     pub fn header(&self) -> Header {
         let mut changes: Vec<&minds_core::ChangeId> = self
@@ -184,6 +190,10 @@ impl Inspection {
                 started_at: None,
                 epoch: None,
                 evidence: None,
+                provenance: Provenance::Legacy,
+                uninterpreted_calls: 0,
+                epoch_position: None,
+                handovers: 0,
                 review: ReviewState::open(),
                 changes: Vec::new(),
                 commits: Vec::new(),
@@ -230,6 +240,22 @@ impl Inspection {
             started_at: started_at.map(|s| sanitize(&s)),
             epoch,
             evidence: self.index.evidence_for_session(id),
+            provenance: match self.index.evidence_state(id) {
+                Some(state) => Provenance::Chained(state),
+                None => Provenance::Legacy,
+            },
+            uninterpreted_calls: session
+                .turns
+                .iter()
+                .flat_map(|t| &t.tool_calls)
+                .filter(|c| {
+                    c.capture
+                        .as_ref()
+                        .is_some_and(|cap| cap.status == minds_core::CaptureStatus::Uninterpreted)
+                })
+                .count(),
+            epoch_position: self.index.epoch_position(id),
+            handovers: self.index.content_links_of(id).len(),
             review: self.review_state(id),
             changes: self.index.changes_of(id),
             commits: self.index.commits_of(id),
@@ -428,11 +454,11 @@ impl Inspection {
     fn link_unexplained(&self, commit: CommitId, id: SessionId) -> Option<LinkEvidence> {
         let evidence = self.index.evidence_of(commit, id)?;
         let session = self.index.session(id)?;
-        let why = match evidence {
-            minds_core::Evidence::Inferred => EvidenceExplanation::Unknown {
+        let why = match evidence.source {
+            minds_core::EvidenceSource::Heuristic => EvidenceExplanation::Unknown {
                 reason: "noch nicht nachgerechnet".into(),
             },
-            other => evidence::explain(other, commit, session, None, None),
+            _ => evidence::explain(evidence, commit, session, None, None),
         };
         Some(LinkEvidence {
             commit,
@@ -615,7 +641,12 @@ mod tests {
     fn a_card_carries_evidence_changes_and_commits() {
         let insp = sample();
         let a = insp.card(sid('a')).unwrap();
-        assert_eq!(a.evidence, Some(minds_core::Evidence::Observed));
+        assert_eq!(
+            a.evidence,
+            Some(minds_core::EvidenceMark::of(
+                minds_core::EvidenceSource::Observed
+            ))
+        );
         assert_eq!(a.commits, vec![commit('1')]);
         assert_eq!(a.changes.len(), 1);
         let c = insp.card(sid('c')).unwrap();

@@ -23,7 +23,7 @@ mod error;
 pub use error::{ReaderError, Result};
 
 mod index;
-pub use index::{Degradation, Degraded, Index};
+pub use index::{ContentLink, Degradation, Degraded, Index};
 
 mod file;
 pub use file::{FileView, Line};

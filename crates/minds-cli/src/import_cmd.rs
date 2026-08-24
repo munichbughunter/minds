@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use minds_capture::{CommitInfo, SessionInfo, match_sessions};
-use minds_core::Evidence;
+use minds_core::{EvidenceMark, EvidenceSource};
 use minds_git::Repo;
 use minds_redact::RedactionConfig;
 
@@ -135,7 +135,11 @@ fn import() -> Fallible<()> {
     //    verlieren.
     let mut index = store.index()?;
     for link in &links {
-        index.link(&link.commit, link.session, Evidence::Inferred);
+        index.link(
+            &link.commit,
+            link.session,
+            EvidenceMark::of(EvidenceSource::Heuristic),
+        );
     }
     store.set_index(&index)?;
 

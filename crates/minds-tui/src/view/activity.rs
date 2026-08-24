@@ -31,14 +31,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // nur, wenn das Terminal breit genug ist.
     let time_w = 13;
     let actor_w = 22;
-    let mark_w = 26;
+    let mark_w = 36;
     let show_size = width >= 120;
     let size_w = if show_size { 20 } else { 0 };
     let headline_w = width
         .saturating_sub(time_w + actor_w + size_w + mark_w + 4)
         .max(24);
 
-    let lines: Vec<Line> = cards
+    let mut lines: Vec<Line> = cards
         .iter()
         .enumerate()
         .skip(first)
@@ -90,9 +90,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             if degraded {
                 spans.push(Span::styled(state_word(card), theme::dim()));
             } else {
-                let (ev_glyph, ev_word, ev_style) = theme::evidence(card.evidence);
+                // Drei Spalten Beweiszustand (ADR-0011): das Seal-Verdikt der
+                // Session, der beste Kanten-Beleg (Glyph samt Status-Modifikator
+                // — das Wort erklärt die Fußzeile für die fokussierte Karte)
+                // und das Review-Verdict.
+                let (s_glyph, s_word, s_style) = theme::provenance(&card.provenance);
+                let (ev_glyph, _, ev_style) = theme::evidence(card.evidence);
                 let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
-                spans.push(Span::styled(format!("{ev_glyph} {ev_word}  "), ev_style));
+                spans.push(Span::styled(format!("{s_glyph} {s_word}  "), s_style));
+                spans.push(Span::styled(format!("{ev_glyph}  "), ev_style));
                 spans.push(Span::styled(format!("{v_glyph} {v_word}"), v_style));
             }
             let mut line = Line::from(spans);
@@ -102,6 +108,26 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             line
         })
         .collect();
+
+    // Zurückgehaltene Sessions (Block-Seals, ADR-0011): eine Zeile INNERHALB
+    // des Viewports — die Abwesenheit einer Session ist eine Aussage, und
+    // eine Aussage, die unter dem Scroll-Fenster hängt, sieht niemand.
+    // Details zeigt `minds fsck` bzw. `minds verify --evidence`.
+    let rejected = app.inspection.rejected_seals();
+    if app.query.is_empty() && !rejected.is_empty() {
+        lines.truncate(height.saturating_sub(1));
+        lines.push(Line::from(vec![
+            Span::styled("⛔ ", Style::default().fg(theme::DELETE)),
+            Span::styled(
+                format!(
+                    "{} Session(s) zurückgehalten (Redaction) — Coverage versiegelt, \
+                     Details: minds fsck",
+                    rejected.len()
+                ),
+                Style::default().fg(theme::REVIEW),
+            ),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), area);
 }
 

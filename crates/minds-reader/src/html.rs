@@ -1223,6 +1223,7 @@ mod tests {
             text: "Ok".into(),
             tool_calls: vec![
                 ToolCall {
+                    capture: None,
                     name: "Bash".into(),
                     arguments: r#"{"command":"cargo test"}"#.into(),
                     effect: Some(Effect {
@@ -1232,6 +1233,7 @@ mod tests {
                     }),
                 },
                 ToolCall {
+                    capture: None,
                     name: "Edit".into(),
                     arguments: "{}".into(),
                     effect: Some(Effect {

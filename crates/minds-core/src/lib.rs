@@ -7,15 +7,22 @@
 
 mod session;
 pub use session::{
-    Agent, Intent, Model, Produced, Redaction, RedactionCounts, Role, SCHEMA_VERSION, Session,
-    ToolCall, Turn, Usage,
+    Agent, Capture, CaptureStatus, Intent, Model, Produced, Redaction, RedactionCounts, Role,
+    SCHEMA_VERSION, Session, ToolCall, Turn, Usage,
 };
 
 mod lineage;
 pub use lineage::{
     CONTENT_HASH_PREFIX, ContentHash, ContentHashParseError, Edge, EdgeKind, Effect, EffectKind,
-    Endpoint, Evidence, Lineage,
+    Endpoint, Evidence, EvidenceMark, EvidenceSource, EvidenceStatus, Lineage,
 };
+
+/// Die Evidence-Chain-Primitive (ADR-0011): Hashes, Lücken, Fold.
+///
+/// Bewusst als Modul-Pfad (`minds_core::evidence::…`) statt flach re-exportiert
+/// — die Namen (`EventFacts`, `Coverage`) sind generisch und würden auf
+/// Crate-Ebene mit Nachbarn kollidieren.
+pub mod evidence;
 
 mod attribution;
 pub use attribution::{Attribution, AttributionError};

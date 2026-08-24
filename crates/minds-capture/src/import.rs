@@ -422,10 +422,20 @@ fn assistant_blocks(content: Option<&serde_json::Value>) -> (String, Vec<ToolCal
                 // Import ohnehin nicht (`claude_effect` setzt `content: None`).
                 let raw = effective.and_then(|i| RawValue::from_string(i.to_string()).ok());
                 let effect = normalize::claude_effect(&name, raw.as_deref());
+                let status = if normalize::claude_tool_is_interpreted(&name) {
+                    minds_core::CaptureStatus::Interpreted
+                } else {
+                    minds_core::CaptureStatus::Uninterpreted
+                };
                 tool_calls.push(ToolCall {
                     name,
                     arguments,
                     effect: Some(effect),
+                    capture: Some(minds_core::Capture {
+                        status,
+                        adapter: "claude-code".into(),
+                        adapter_version: normalize::CLAUDE_ADAPTER_VERSION,
+                    }),
                 });
             }
             _ => {}

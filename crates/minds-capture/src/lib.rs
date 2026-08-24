@@ -56,7 +56,7 @@ pub use error::{CaptureError, Result};
 pub mod hook_event;
 
 pub mod normalize;
-pub use normalize::{EventFacts, ToolFacts};
+pub use normalize::{EventFacts, StoredInterpretation, ToolAdapter, ToolFacts, adapter_for};
 
 pub mod secretwall;
 
@@ -72,6 +72,12 @@ pub use match_commits::{CommitInfo, Link, SessionInfo, match_sessions};
 pub mod edges;
 
 pub mod adapter;
+
+/// Journal → Evidence-Chain: Glieder-Reihenfolge und Fold (ADR-0011).
+pub mod chain;
+
+/// Der lokale Epochen-Zustand: letzter Seal je Session (ADR-0011).
+pub mod epoch;
 pub use adapter::{Checkpoint, build, build_one, checkpoint};
 
 pub mod clock;

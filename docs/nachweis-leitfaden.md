@@ -13,19 +13,43 @@ Die wichtigsten Punkte stehen deshalb auch **im Bündel selbst** (`proves` /
 
 ```
 Change ──▶ Commits ──▶ Sessions ──▶ Attribution ──▶ Verdicts (+ Signaturen)
-                                                └──▶ Thread (Kommentare)
+                          │                     └──▶ Thread (Kommentare)
+                          └──▶ Evidence-Seals (+ Signaturen)   [ADR-0011]
+
+rejected_seals ──▶ Block-Seals zurückgehaltener Sessions
 ```
 
 Pro Change-Id: die Commits, die Sessions dahinter (mit Agent, Modell und der
 Anweisung), der kanonische Attestation-Payload je Session, die Verdicts mit ihrem
 Review-Payload und — falls vorhanden — ihrer Signatur, und der Kommentar-Thread.
+Seit Schema 2 zusätzlich je Session ihre **Evidence-Seals** (der byte-genaue
+Seal-Text jeder Checkpoint-Epoche, samt Signatur) und unter `rejected_seals` die
+Block-Seals: Sessions, deren Nutzlast die Speicher-Policy zurückwies — der Seal
+beweist, dass sie existierten, ohne ihren Inhalt preiszugeben.
 
 Erzeugen:
 
 ```sh
-minds audit --export --out audit.json          # alles, ab HEAD erreichbar
-minds audit --export --base main --out mr.json # nur dieser Stapel
+minds audit --export --out audit.json           # alles, ab HEAD erreichbar
+minds audit --export --base main --out mr.json  # nur dieser Stapel
+minds audit --export --mode proof --out p.json  # nur das Beweisgerüst
 ```
+
+Zwei Zuschnitte: **`redacted`** (Default) trägt alles, was der Store hergibt —
+also die redigierten Intents, Verdicts, Kommentare, Seals. **`proof`** trägt
+nur das Beweisgerüst: Ids, kanonische Payload-Texte, Seals samt Signaturen,
+Verdict-Metadaten — kein Intent, keine Zusammenfassungen, keine Kommentare.
+Damit lässt sich extern prüfen, *dass* und *wie viel* passiert ist, ohne den
+Inhalt weiterzugeben. Ein Modus „full" existiert bewusst nicht: Der Store hält
+ausschließlich redigierte Sessions (fail-closed) — mehr als `redacted` gibt es
+nicht zu exportieren.
+
+Auch `proof` trägt weiterhin **Personenkennungen**: den Reviewer (nötig, um
+Signaturen einer Identität zuzuordnen) sowie Agent- und Modellnamen in den
+kanonischen Payloads. Wer das nicht weitergeben darf, redigiert das Bündel vor
+der Weitergabe selbst. Inhalts-Hashes an Lese-Effekten entstehen nur für von
+git **getrackte** Dateien — bloßes Lesen einer privaten Datei hinterlässt
+keinen Fingerabdruck im Bündel.
 
 ## Was es beweist
 
@@ -90,8 +114,75 @@ braucht, braucht einen Zeitstempeldienst — den gibt es hier nicht.
 3. **Signaturen prüfen** (siehe oben). Unsigniertes gesondert behandeln.
 4. **Hashes nachrechnen**, falls der Store mitgeliefert wird — der Klon reicht:
    `git cat-file blob refs/minds/store/<hash>:session.json | b3sum`.
-5. **Herkunft lesen.** `observed` und `inferred` unterscheiden. Wer beides gleich
-   behandelt, hat das Bündel nicht verstanden.
+5. **Herkunft lesen.** `observed` und `inferred` unterscheiden — und seit
+   ADR-0011 auch den Status: `beobachtet` heißt nicht `nachgerechnet`. Wer
+   beides gleich behandelt, hat das Bündel nicht verstanden.
+6. **Seals prüfen** (Abschnitt unten): Identität nachrechnen, Signatur
+   verifizieren, Coverage lesen. Ein Block-Seal in `rejected_seals` ist eine
+   Aussage, kein Fehler: Diese Session existierte, ihre Nutzlast wurde von der
+   Speicher-Policy zurückgewiesen.
+
+## Die Evidence-Chain ohne Minds nachrechnen
+
+Der Proof gehört nicht Minds: Alles im Seal ist mit Standard-Werkzeugen
+prüfbar. Die Hashes sind `blake3::derive_key` mit festen Kontext-Strings —
+hier als Python, weil `b3sum` keinen derive_key-Modus hat:
+
+```python
+# pip install blake3
+from blake3 import blake3
+
+def derive(context: str, material: bytes) -> str:
+    return blake3(material, derive_key_context=context).hexdigest()
+```
+
+**1. Die Seal-Identität.** Der Ref-Name muss der Hash des Textes sein:
+
+```sh
+git for-each-ref refs/minds/evidence/            # Seals auflisten
+git cat-file blob refs/minds/evidence/<id>:seal  # den Text holen
+```
+
+```python
+assert derive("minds/evidence/v1/seal", seal_text_bytes) == ref_name_hex
+```
+
+**2. Die Signatur** (falls `seal.sig` daneben liegt) — exakt die abgelegten
+Bytes, geprüft wie eine Git-SSH-Signatur:
+
+```sh
+git cat-file blob refs/minds/evidence/<id>:seal      > seal.txt
+git cat-file blob refs/minds/evidence/<id>:seal.sig  > seal.sig
+ssh-keygen -Y verify -n minds -I <identität> \
+  -f allowed_signers -s seal.sig < seal.txt
+```
+
+**3. Der Chain-Root** — nur **lokal** nachrechenbar, mit dem noch liegenden
+Journal **und** dem Session-Salt (`<git-dir>/minds/evidence/state/…/*.salt`;
+der Fold startet auf `derive("minds/evidence/v1/chain", salt)`). Das ist
+Absicht, kein Mangel: Ohne Salt wäre der Root ein Offline-Orakel — wer einen
+kurzen Payload rät, könnte ihn gegen den Root bestätigen. Nach dem Checkpoint
+ist das Journal weg; dann bindet der Root die damals gelesenen Events, und
+Manipulation am *Seal* fällt über Schritt 1 auf:
+
+```python
+payload_hash = derive("minds/evidence/v1/payload", payload_bytes)
+# event_hash: längenpräfixierte Felder (u64 LE) — Schema in
+# crates/minds-core/src/evidence.rs, Kontext "minds/evidence/v1/event".
+# Fold: state = derive("minds/evidence/v1/chain",
+#                      state ‖ tag ‖ glied)   # tag 0x01 Event, 0x02 Lücke,
+#                                             # 0x03 pre-chain; Start: 32 × 0x00
+```
+
+**4. Das Verdikt lesen.** `gaps=0`, `pre_chain=0`, `outcome=stored` und eine
+über `previous=` geschlossene Epochenkette ⇒ vollständig. Alles andere ist
+`VERIFIZIERT, UNVOLLSTÄNDIG` — und `minds verify <session-id>` sagt dasselbe
+mit Exit-Codes (0 verifiziert, 1 manipuliert, 2 unvollständig, 3 nicht
+verifizierbar), für CI-Gates zusätzlich `minds fsck --require-seal`.
+
+Was auch der Seal **nicht** beweist, steht im Bündel unter `does_not_prove` —
+insbesondere: nichts über Ereignisse außerhalb versiegelter Bereiche, und
+nichts über das Fenster zwischen Append und Seal.
 
 ## Aufbewahrung
 

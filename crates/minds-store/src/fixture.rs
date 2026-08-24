@@ -145,6 +145,36 @@ impl TempRepo {
     pub(crate) fn git(&self, args: &[&str]) -> String {
         git_in(self.path(), args)
     }
+
+    /// Wie [`git`](Self::git), aber mit Eingabe auf stdin — für Plumbing wie
+    /// `git mktree`.
+    pub(crate) fn git_with_stdin(&self, args: &[&str], stdin: &str) -> String {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(self.path())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("git starten");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(stdin.as_bytes())
+            .expect("stdin schreiben");
+        let out = child.wait_with_output().expect("git abwarten");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("git-Ausgabe ist UTF-8")
+    }
 }
 
 /// Legt ein bares Repository an einem festen Pfad an — für Fälle, in denen der

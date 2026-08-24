@@ -45,9 +45,30 @@ pub fn draw(
     ])
     .areas(area);
 
-    // Kopf: Id · Akteur · Umfang · Beleg · Verdict.
+    // Kopf: Id · Akteur · Umfang · Beleg · Verdicts — auch der
+    // Beweiszustand der Seals (ADR-0011) steht hier, nicht nur das Review.
     let (ev_glyph, ev_word, ev_style) = theme::evidence(card.evidence);
     let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
+    let (s_glyph, s_word, s_style) = theme::provenance(&card.provenance);
+    let mut seal_summary = card
+        .evidence_state()
+        .map(|s| format!(" · {}", s.summary()))
+        .unwrap_or_default();
+    // Die uebrigen Achsen und Beziehungen, wo vorhanden: Epoche, Deutung,
+    // Content-Uebergaben — der Kopf zeigt Beweiszustaende, nicht nur Logs.
+    if let Some((k, n)) = card.epoch_position {
+        seal_summary.push_str(&format!(" · Epoche {k}/{n}"));
+    }
+    if card.uninterpreted_calls > 0 {
+        seal_summary.push_str(&format!(" · ◐ {} nicht gedeutet", card.uninterpreted_calls));
+    }
+    if card.handovers > 0 {
+        seal_summary.push_str(&format!(" · ⇄ {} Übergabe(n)", card.handovers));
+    }
+    // Die Summary wächst — geclippt, damit die hinten stehenden Verdikte
+    // (Kanten-Beleg, Review) auf schmalen Terminals nicht abgeschnitten
+    // werden.
+    let seal_summary = clip(&seal_summary, 56);
     let short: String = card.id.to_string().chars().take(11).collect();
     frame.render_widget(
         Paragraph::new(vec![
@@ -70,6 +91,7 @@ pub fn draw(
                     card.summary.input_tokens,
                     card.summary.output_tokens
                 )),
+                Span::styled(format!("{s_glyph} {s_word}{seal_summary} · "), s_style),
                 Span::styled(format!("{ev_glyph} {ev_word}  "), ev_style),
                 Span::styled(format!("{v_glyph} {v_word}"), v_style),
             ]),

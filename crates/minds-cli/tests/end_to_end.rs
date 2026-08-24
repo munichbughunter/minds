@@ -2458,3 +2458,726 @@ fn a_corrupt_session_is_skipped_and_points_at_fsck() {
         "der Hinweis fehlt oder zeigt nicht auf fsck:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Evidence Chain (ADR-0011): Seals, Epochen, Redaction-Block
+// ---------------------------------------------------------------------------
+
+/// Die Seal-Refs eines Repos.
+fn seal_refs(dir: &Path) -> Vec<String> {
+    stdout(&git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/evidence/",
+        ],
+    ))
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+/// Der Seal-Text hinter einem Ref.
+fn seal_text(dir: &Path, reference: &str) -> String {
+    stdout(&git(dir, &["show", &format!("{reference}:seal")]))
+}
+
+/// Eine Zeile `schlüssel=wert` aus einem Seal-Text.
+fn seal_line<'a>(text: &'a str, key: &str) -> &'a str {
+    text.lines()
+        .find_map(|l| l.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("Seal ohne {key}-Zeile:\n{text}"))
+}
+
+#[test]
+fn two_checkpoints_of_one_session_chain_their_seals() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Epoche 1: Prompt + Stop, dann Commit (der post-commit-Hook checkpointet).
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"erste Epoche""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    git(dir, &["add", "a.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: erste Epoche"]);
+
+    let first = seal_refs(dir);
+    assert_eq!(first.len(), 1, "Epoche 1 hinterlässt genau einen Seal");
+    let first_text = seal_text(dir, &first[0]);
+    assert_eq!(seal_line(&first_text, "outcome"), "stored");
+    assert_eq!(seal_line(&first_text, "previous"), "-");
+    assert_eq!(seal_line(&first_text, "gaps"), "0");
+    assert_ne!(seal_line(&first_text, "session"), "-");
+    // Die seal_id ist der Hash über den Text — der Ref-Name muss dazu passen.
+    let first_id = first[0]
+        .strip_prefix("refs/minds/evidence/")
+        .unwrap()
+        .to_owned();
+
+    // Epoche 2: dieselbe Session (gleiche session_id) läuft weiter — die Seqs
+    // starten nach dem Discard wieder bei 0, genau dafür gibt es die Epochen.
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"zweite Epoche""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    git(dir, &["add", "b.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: zweite Epoche"]);
+
+    let mut second = seal_refs(dir);
+    assert_eq!(second.len(), 2, "Epoche 2 hinterlässt einen zweiten Seal");
+    second.retain(|r| !r.ends_with(&first_id));
+    let second_text = seal_text(dir, &second[0]);
+    // Die Kette: previous zeigt auf den Seal der ersten Epoche.
+    assert_eq!(
+        seal_line(&second_text, "previous"),
+        format!("b3-{first_id}"),
+        "Epochen sind nicht verkettet:\n{second_text}"
+    );
+
+    // Die per previous geschlossene Epochenkette ist VOLLSTÄNDIG: Epochen
+    // sind eigene Sessions, ein aufgelöster stored-Vorgänger ist keine Lücke
+    // (Review-Befund zu ADR-0011 E2 — vorher urteilte verify hier für immer
+    // „unvollständig").
+    let second_session = last_session_id(dir);
+    let out = minds(dir, &["verify", &second_session], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.trim().ends_with("VERIFIZIERT"), "{text}");
+
+    // Und der Rückverweis liegt bei der Session (evidence.json im Store-Ref).
+    let store_refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    let mut with_evidence = 0;
+    for reference in store_refs.lines() {
+        let tree = stdout(&git(dir, &["ls-tree", "-r", "--name-only", reference]));
+        if tree.contains("evidence.json") {
+            with_evidence += 1;
+        }
+    }
+    assert!(
+        with_evidence >= 2,
+        "evidence.json fehlt an den Session-Refs:\n{store_refs}"
+    );
+}
+
+#[test]
+fn a_rejected_session_still_leaves_a_sealed_trace() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Eine Policy, die instabil redigiert: Der Deny-Begriff steckt im eigenen
+    // Platzhalter (`[redacted:pii]`) — der Verify-Pass findet ihn erneut und
+    // bricht fail-closed ab (RedactionError::Unstable). Genau der Fall, der
+    // vor ADR-0011 spurlos blieb.
+    std::fs::create_dir_all(dir.join(".minds")).unwrap();
+    std::fs::write(
+        dir.join(".minds/redact.json"),
+        r#"{"deny_pii":["redacted"]}"#,
+    )
+    .unwrap();
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"das wort redacted steht hier""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+    git(dir, &["add", "c.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: geblockt"]);
+
+    // Kein Session-Payload im Store …
+    let store_refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    assert!(
+        store_refs.trim().is_empty(),
+        "die geblockte Session darf nicht im Store liegen:\n{store_refs}"
+    );
+
+    // … aber ein Block-Seal als Beweis, dass der Bereich existierte.
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 1, "der Block-Seal fehlt");
+    let text = seal_text(dir, &seals[0]);
+    assert_eq!(
+        seal_line(&text, "outcome"),
+        "storage_policy_rejected_payload"
+    );
+    assert_eq!(seal_line(&text, "session"), "-");
+    assert_eq!(seal_line(&text, "agent"), "claude-code");
+
+    // Leak-Prüfung: Nichts aus dem Prompt, kein Pfad, kein Feldname.
+    for verboten in ["redacted", "wort", "prompt", ".minds", "IntentRequest"] {
+        let hits = text
+            .lines()
+            .filter(|l| !l.starts_with("outcome=") && l.contains(verboten))
+            .count();
+        assert_eq!(hits, 0, "Seal leakt {verboten:?}:\n{text}");
+    }
+
+    // Das Journal blieb liegen (vertagt) — fsck sieht die Session weiterhin.
+    let fsck = stdout(&minds(dir, &["fsck"], None));
+    assert!(
+        fsck.contains("noch nicht eingecheckt"),
+        "die vertagte Session fehlt in fsck:\n{fsck}"
+    );
+
+    // Idempotenz: Ein zweiter Checkpoint-Lauf erzeugt keinen zweiten Seal.
+    minds(dir, &["checkpoint"], None);
+    assert_eq!(seal_refs(dir).len(), 1, "Block-Seal ist nicht idempotent");
+
+    // Policy-Fix: Danach wird gespeichert, und der Erfolgs-Seal verkettet auf
+    // den Block-Seal.
+    std::fs::remove_file(dir.join(".minds/redact.json")).unwrap();
+    minds(dir, &["checkpoint"], None);
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 2, "der Erfolgs-Seal fehlt nach dem Policy-Fix");
+    let block_id = text_id(&text);
+    let success = seals
+        .iter()
+        .map(|r| seal_text(dir, r))
+        .find(|t| seal_line(t, "outcome") == "stored")
+        .expect("ein stored-Seal");
+    assert_eq!(
+        seal_line(&success, "previous"),
+        block_id,
+        "der Erfolgs-Seal verkettet nicht auf den Block-Seal"
+    );
+
+    // Nach dem Policy-Fix ist die Session VOLLSTÄNDIG: Der Block-Seal als
+    // Vorgänger trägt denselben Root — dieselben Events wurden später doch
+    // gespeichert, er ist Geschichte, keine Lücke.
+    let stored_session = seal_line(&success, "session").to_string();
+    let out = minds(dir, &["verify", &stored_session], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.trim().ends_with("VERIFIZIERT"), "{text}");
+}
+
+/// Die `seal_id` eines Seal-Texts, wie sie in einer `previous`-Zeile stünde.
+fn text_id(text: &str) -> String {
+    minds_core::evidence::Seal::id_of_text(text).to_string()
+}
+
+#[test]
+fn a_configured_key_signs_the_seal_and_it_verifies_externally() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    if !minds_attest_available() {
+        eprintln!("kein ssh-keygen — Test übersprungen");
+        return;
+    }
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Wegwerf-Schlüssel, als user.signingkey konfiguriert.
+    let keydir = tempfile::tempdir().unwrap();
+    let key = keydir.path().join("id");
+    let generated = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-C", "test@minds", "-q", "-f"])
+        .arg(&key)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !generated {
+        eprintln!("ssh-keygen kann keinen Schlüssel erzeugen — Test übersprungen");
+        return;
+    }
+    git(dir, &["config", "user.signingkey", key.to_str().unwrap()]);
+
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"signiert""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("s.txt"), "s\n").unwrap();
+    git(dir, &["add", "s.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: signierter Seal"]);
+
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 1);
+    let text = seal_text(dir, &seals[0]);
+    let sig = stdout(&git(dir, &["show", &format!("{}:seal.sig", seals[0])]));
+    assert!(
+        sig.contains("BEGIN SSH SIGNATURE"),
+        "seal.sig fehlt oder ist keine ssh-sig:\n{sig}"
+    );
+
+    // Externe Verifikation — exakt so, wie es der Nachweis-Leitfaden ohne
+    // Minds beschreibt: die abgelegten Bytes + ssh-keygen.
+    let pubkey = std::fs::read_to_string(keydir.path().join("id.pub")).unwrap();
+    let signers = keydir.path().join("allowed_signers");
+    std::fs::write(&signers, format!("test@minds {}", pubkey.trim())).unwrap();
+    assert!(
+        minds_attest::ssh_verify(&text, &sig, &signers, "test@minds").unwrap(),
+        "die Seal-Signatur verifiziert nicht"
+    );
+    // Manipulierte Zeile fällt durch.
+    let forged = text.replacen("events=", "events=9", 1);
+    assert!(!minds_attest::ssh_verify(&forged, &sig, &signers, "test@minds").unwrap());
+}
+
+#[test]
+fn sign_seal_retrofits_a_signature_and_no_key_is_no_error() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    if !minds_attest_available() {
+        eprintln!("kein ssh-keygen — Test übersprungen");
+        return;
+    }
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // OHNE Schlüssel: Checkpoint läuft durch, Seal bleibt unsigniert — kein
+    // Fehler (ADR-0011, Entscheidung 5).
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"nachgerüstet""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("n.txt"), "n\n").unwrap();
+    git(dir, &["add", "n.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: unsignierter Seal"]);
+
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 1);
+    let sig = git(dir, &["show", &format!("{}:seal.sig", seals[0])]);
+    assert!(
+        !sig.status.success(),
+        "ohne Schlüssel darf keine seal.sig liegen"
+    );
+
+    // Nachrüsten mit `minds sign --seal`.
+    let keydir = tempfile::tempdir().unwrap();
+    let key = keydir.path().join("id");
+    let generated = Command::new("ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+        .arg(&key)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !generated {
+        return;
+    }
+    let seal_id = format!(
+        "b3-{}",
+        seals[0].strip_prefix("refs/minds/evidence/").unwrap()
+    );
+    let out = minds(
+        dir,
+        &["sign", "--seal", &seal_id, "--key", key.to_str().unwrap()],
+        None,
+    );
+    assert!(
+        out.status.success(),
+        "sign --seal scheitert: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sig = stdout(&git(dir, &["show", &format!("{}:seal.sig", seals[0])]));
+    assert!(sig.contains("BEGIN SSH SIGNATURE"), "{sig}");
+}
+
+/// `ssh-keygen -Y` verfügbar? (Testhilfe — Produktionscode fragt selbst.)
+fn minds_attest_available() -> bool {
+    minds_attest::ssh_keygen_available()
+}
+
+// ---------------------------------------------------------------------------
+// EV.12: die Verdikt-Matrix von `minds verify`
+// ---------------------------------------------------------------------------
+
+/// git mit stdin — für Plumbing (`mktree`).
+fn git_stdin(dir: &Path, args: &[&str], input: &str) -> Output {
+    use std::io::Write;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    cmd.env("PATH", path_with_minds());
+    without_user_config(&mut cmd);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("git startet");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().expect("git endet")
+}
+
+/// Die Session-Id aus dem Trailer des letzten Commits.
+fn last_session_id(dir: &Path) -> String {
+    let body = stdout(&git(dir, &["log", "-1", "--format=%B"]));
+    body.lines()
+        .find_map(|l| l.strip_prefix("Minds-Session-Id: "))
+        .unwrap_or_else(|| panic!("kein Session-Trailer:\n{body}"))
+        .trim()
+        .to_string()
+}
+
+/// Standard-Aufbau: eine Session, ein Commit — liefert (repo, session_id).
+fn sealed_repo() -> Option<(tempfile::TempDir, String)> {
+    let repo = scratch_repo()?;
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"verdikt""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("v.txt"), "v\n").unwrap();
+    git(dir, &["add", "v.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: verdikt"]);
+    let id = last_session_id(dir);
+    Some((repo, id))
+}
+
+#[test]
+fn verify_says_verified_for_a_clean_sealed_session() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let out = minds(repo.path(), &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.trim().ends_with("VERIFIZIERT"), "{text}");
+    assert!(text.contains("Seal      "), "{text}");
+    assert!(text.contains("unsigniert"), "{text}");
+    // Die drei Vertrauensachsen, getrennt — und Coverage nennt ihre Grenze:
+    // vollständig heißt vollständig INNERHALB der Agent-Hooks.
+    assert!(text.contains("Integrität intakt"), "{text}");
+    assert!(
+        text.contains("vollständig innerhalb der Grenze (Grenze: agent-hooks/v1"),
+        "{text}"
+    );
+    assert!(text.contains("Deutung    vollständig"), "{text}");
+}
+
+#[test]
+fn an_uninterpreted_call_dents_only_the_interpretation_axis() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Ein Fremd-Agent ohne Adapter: beobachtet, nicht gedeutet.
+    let payload = format!(
+        r#"{{"session_id":"sess-codex","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"wende patch an"}}"#,
+        dir.display()
+    );
+    minds(dir, &["hook", "--agent", "codex"], Some(&payload));
+    let tool = format!(
+        r#"{{"session_id":"sess-codex","cwd":"{}","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{{"diff":"x"}}}}"#,
+        dir.display()
+    );
+    minds(dir, &["hook", "--agent", "codex"], Some(&tool));
+    minds(dir, &["checkpoint"], None);
+
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 1);
+    let session = seal_line(&seal_text(dir, &seals[0]), "session").to_string();
+
+    let out = minds(dir, &["verify", &session], None);
+    let text = stdout(&out);
+    // Deutungslücke ≠ Integritäts- oder Coverage-Problem: Exit bleibt 0,
+    // die Deutungs-Achse benennt die Grenze eigenständig.
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("Integrität intakt"), "{text}");
+    assert!(text.contains("vollständig innerhalb der Grenze"), "{text}");
+    assert!(
+        text.contains("Deutung    teilweise — 1 von 1 Tool-Aufruf(en)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Gesamt    VERIFIZIERT — Deutung teilweise"),
+        "{text}"
+    );
+}
+
+#[test]
+fn verify_says_incomplete_when_an_event_went_missing() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"mit lücke""#,
+    );
+    event(
+        dir,
+        r#""hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"a.rs"}"#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    // Das mittlere Event verschwindet — der fail-open-Fall, den die Chain
+    // sichtbar machen soll.
+    let journal = dir.join(".git/minds/journal/claude-code");
+    let mut removed = false;
+    for bucket in std::fs::read_dir(&journal).unwrap() {
+        let victim = bucket.unwrap().path().join("0000000001.json");
+        if victim.exists() {
+            std::fs::remove_file(victim).unwrap();
+            removed = true;
+        }
+    }
+    assert!(removed, "Testaufbau: Event 1 nicht gefunden");
+
+    std::fs::write(dir.join("l.txt"), "l\n").unwrap();
+    git(dir, &["add", "l.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: lücke"]);
+    let id = last_session_id(dir);
+
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("VERIFIZIERT, UNVOLLSTÄNDIG"), "{text}");
+    assert!(text.contains("Lücke"), "{text}");
+}
+
+#[test]
+fn verify_says_tampered_for_a_forged_seal() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // Den Seal-Text im Ref austauschen — Plumbing, wie ein Angreifer mit
+    // Repo-Zugriff.
+    let seals = seal_refs(dir);
+    let forged = seal_text(dir, &seals[0]).replacen("events=", "events=9", 1);
+    let tmp = dir.join("forged");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("MANIPULIERT"), "{text}");
+}
+
+#[test]
+fn verify_says_unverifiable_without_any_material() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Eine Id, zu der es weder Payload noch Seal gibt — der Zustand einer
+    // Alt-Session bzw. eines fremden Verweises. Ein Zustand, kein Fehler.
+    let id = format!("b3-{}", "7".repeat(64));
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(3), "{text}");
+    assert!(text.contains("NICHT VERIFIZIERBAR"), "{text}");
+    assert!(text.contains("vor Evidence-Chain erfasst"), "{text}");
+}
+
+#[test]
+fn verify_evidence_judges_a_sessionless_block_seal() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    std::fs::create_dir_all(dir.join(".minds")).unwrap();
+    std::fs::write(
+        dir.join(".minds/redact.json"),
+        r#"{"deny_pii":["redacted"]}"#,
+    )
+    .unwrap();
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"redacted inhalt""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    git(dir, &["add", "b.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: block"]);
+
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 1);
+    let seal_id = format!(
+        "b3-{}",
+        seals[0].strip_prefix("refs/minds/evidence/").unwrap()
+    );
+    let out = minds(dir, &["verify", "--evidence", &seal_id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("VERIFIZIERT, UNVOLLSTÄNDIG"), "{text}");
+    assert!(text.contains("zurückgewiesen"), "{text}");
+}
+
+#[test]
+fn require_seal_gates_on_resolvable_seals() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // Versiegelt: das Gate ist zufrieden.
+    let out = minds(dir, &["fsck", "--require-seal"], None);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 Session(s) geprüft, 0 ohne Seal"), "{text}");
+
+    // Seal-Ref weg (simulierter Teil-Clone/Löschung): Der baumelnde
+    // Rückverweis zählt nicht — das Gate schlägt an.
+    let seals = seal_refs(dir);
+    git(dir, &["update-ref", "-d", &seals[0]]);
+    let out = minds(dir, &["fsck", "--require-seal"], None);
+    let text = stdout(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains(&format!("unversiegelt: {id}")), "{text}");
+
+    // Ohne das Gate bleibt dasselbe Repo grün — das Gate ist Politik, kein
+    // Default.
+    let out = minds(dir, &["fsck"], None);
+    assert!(out.status.success(), "{}", stdout(&out));
+}
+
+#[test]
+fn fsck_reports_a_blocked_session_and_a_forged_seal() {
+    let Some((repo, _id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // Ein Block-Seal dazu (zweite Session unter Blockade-Policy).
+    std::fs::create_dir_all(dir.join(".minds")).unwrap();
+    std::fs::write(
+        dir.join(".minds/redact.json"),
+        r#"{"deny_pii":["redacted"]}"#,
+    )
+    .unwrap();
+    let payload = format!(
+        r#"{{"session_id":"sess-blocked","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"redacted"}}"#,
+        dir.display()
+    );
+    minds(dir, &["hook", "--agent", "claude-code"], Some(&payload));
+    minds(dir, &["checkpoint"], None);
+    std::fs::remove_file(dir.join(".minds/redact.json")).unwrap();
+
+    let out = minds(dir, &["fsck"], None);
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "Block-Seal ist ein Hinweis, kein Befund:\n{text}"
+    );
+    assert!(text.contains("zurückgehalten"), "{text}");
+
+    // Jetzt einen Seal fälschen — das IST ein Befund.
+    let seals = seal_refs(dir);
+    let victim = &seals[0];
+    let forged = seal_text(dir, victim).replacen("events=", "events=4", 1);
+    let tmp = dir.join("forged2");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    git(dir, &["update-ref", victim, commit.trim()]);
+
+    let out = minds(dir, &["fsck"], None);
+    let text = stdout(&out);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("MANIPULIERT"), "{text}");
+}
+
+#[test]
+fn reinterpret_is_read_only_and_deterministic() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"deute neu""#,
+    );
+    event(
+        dir,
+        r#""hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"a.rs"}"#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    std::fs::write(dir.join("r.txt"), "r\n").unwrap();
+    git(dir, &["add", "r.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: reinterpret"]);
+    let id = last_session_id(dir);
+
+    let before: Vec<String> = ["refs/minds/store/", "refs/minds/evidence/"]
+        .iter()
+        .map(|ns| stdout(&git(dir, &["for-each-ref", ns])))
+        .collect();
+
+    let out = minds(dir, &["reinterpret", &id], None);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    // Interpretations-Protokoll: Evidenz-Adresse unverändert, gespeicherter
+    // und aktueller Stand nebeneinander.
+    assert!(text.contains("Adapter   claude-code v1"), "{text}");
+    assert!(text.contains("Evidenz"), "{text}");
+    assert!(
+        text.contains("gespeichert   claude-code v1 → READ a.rs"),
+        "{text}"
+    );
+    assert!(
+        text.contains("aktuell       claude-code v1 → READ a.rs (unverändert)"),
+        "{text}"
+    );
+    assert!(text.contains("0 mit neuerer Deutung"), "{text}");
+
+    // Deterministisch: zweiter Lauf, identische Ausgabe.
+    let again = stdout(&minds(dir, &["reinterpret", &id], None));
+    assert_eq!(text, again, "reinterpret ist nicht deterministisch");
+
+    // Strikt lesend: kein Ref hat sich bewegt — die Evidence ist unverändert.
+    let after: Vec<String> = ["refs/minds/store/", "refs/minds/evidence/"]
+        .iter()
+        .map(|ns| stdout(&git(dir, &["for-each-ref", ns])))
+        .collect();
+    assert_eq!(before, after, "reinterpret hat Refs verändert");
+}

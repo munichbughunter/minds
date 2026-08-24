@@ -171,6 +171,32 @@ struct MustRedact {
 fn must_redact() -> Vec<MustRedact> {
     vec![
         MustRedact {
+            // Der generische Fallback (ADR-0011) friert ganze
+            // Fremd-Agent-Payloads als `arguments` ein — der
+            // KeyValue-Detektor muss ein Credential auch in der
+            // verschachtelten JSON-Form fangen.
+            id: "generic-fallback-nested-basic-auth",
+            text: r#"{"tool_name":"http_request","tool_input":{"headers":{"Authorization":"Basic dXNlcjpwdw=="}}}"#.to_string(),
+            gone: &["dXNlcjpwdw=="],
+            kept: &["http_request", "headers"],
+        },
+        MustRedact {
+            // Der Blocker-Fall aus dem Audit-Bundle: eine Remote-URL mit
+            // eingebetteten Zugangsdaten. Die Senke (`without_url_credentials`)
+            // redigiert im Bundle; die Pipeline muss den Token auch fangen,
+            // wenn der Text anderswo auftaucht (Prompt, Log-Zitat).
+            id: "origin-remote-with-token",
+            text: concat!(
+                "origin  https://oauth2:glpat",
+                "-AbCdEf123456789012@gitlab.example.com/group/repo.git (fetch)"
+            )
+            .to_string(),
+            // Die Pipeline schwärzt die ganze Autorität samt Host mit —
+            // Over-Redaction, hier akzeptabel: Hauptsache, der Token fällt.
+            gone: &[concat!("glpat", "-AbCdEf123456789012")],
+            kept: &["origin", "(fetch)"],
+        },
+        MustRedact {
             id: "aws-access-key-id",
             text: format!("aws_access_key_id = {AWS_KEY}"),
             gone: &[AWS_KEY],
@@ -482,6 +508,29 @@ fn must_redact() -> Vec<MustRedact> {
 /// URL, die auch Zugangsdaten tragen könnte. Die Kommentare nennen den Detektor,
 /// der hier zu Recht schweigt.
 const MUST_SURVIVE: &[(&str, &str)] = &[
+    // --- Das Evidence-Chain-Vokabular (ADR-0011) bleibt lesbar --------------
+    // Ein voller Seal-Text, in Prosa zitiert (Log-Ausschnitt): Das
+    // Beweismittel darf die Redaction nicht anfressen.
+    (
+        "seal-text-in-prose",
+        "aus dem Log: minds-seal-v1 root=b3-1676980fced8f11c73cc9ed58294c90c9c141ad6fb0c1a8004c86c7dc666a685 agent=claude-code scope=agent-hooks/v1 outcome=storage_policy_rejected_payload session=- previous=-",
+    ),
+    // Die neue Kanten-Objektform: Vokabular, kein Geheimnis.
+    (
+        "evidence-mark-object",
+        r#"{"source":"observed","status":"unknown"}"#,
+    ),
+    // Der Capture-Stempel des generischen Fallbacks.
+    (
+        "capture-stamp",
+        r#"{"status":"uninterpreted","adapter":"generic","adapter_version":1}"#,
+    ),
+    // Eine Seal-Id in Freitext: Hex traegt hoechstens 4 bit je Zeichen und
+    // muss unter der Entropieschwelle bleiben — wie SessionIds.
+    (
+        "seal-id-in-prose",
+        "der Seal b3-4a6388a9ea6622b9e2dc77df88c85311890dc62b1fde9692b3211dc74e71e65f deckt Epoche 2",
+    ),
     // --- Bereits redigierte Platzhalter bleiben ein Fixpunkt ----------------
     // Zwei benachbarte Platzhalter verschiedener Kategorie ohne Trenner: Keiner
     // wird umgeschrieben, der Ein-Pass-Fixpunkt hält (Zähler bleibt null).
@@ -1199,6 +1248,7 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
             role: Role::Assistant,
             text: case.text.clone(),
             tool_calls: vec![ToolCall {
+                capture: None,
                 name: "bash".into(),
                 arguments: case.text.clone(),
                 effect: None,
@@ -1321,6 +1371,7 @@ fn a_secret_survives_json_serialization_as_a_tool_argument() {
             role: Role::Assistant,
             text: String::new(),
             tool_calls: vec![ToolCall {
+                capture: None,
                 name: "Bash".into(),
                 arguments: serde_json::json!({ "command": plaintext }).to_string(),
                 effect: None,

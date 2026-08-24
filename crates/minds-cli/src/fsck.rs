@@ -41,10 +41,11 @@ use crate::hooklog;
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Führt `minds fsck` aus. Rückgabewert ≠ 0 genau dann, wenn ein Trailer nicht
-/// auflösbar ist — oder, mit `require_review`, ein agent-authored Change kein
-/// Approve trägt (Policy-Gate, R5).
-pub fn run(require_review: bool) -> ExitCode {
-    match fsck(require_review) {
+/// auflösbar ist, die Evidence-Chain gebrochen ist (Hash-Mismatch im Journal,
+/// manipulierter Seal) — oder ein Policy-Gate greift (`--require-review`,
+/// `--require-seal`).
+pub fn run(require_review: bool, require_seal: bool) -> ExitCode {
+    match fsck(require_review, require_seal) {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,
         Err(err) => {
@@ -56,7 +57,7 @@ pub fn run(require_review: bool) -> ExitCode {
 
 /// Gibt `true` zurück, wenn kein Trailer verwaist ist (und, falls verlangt, jeder
 /// agent-authored Change ein Approve trägt).
-fn fsck(require_review: bool) -> Fallible<bool> {
+fn fsck(require_review: bool, require_seal: bool) -> Fallible<bool> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::discover(&cwd)?;
     let root = repo_root(&repo);
@@ -64,18 +65,23 @@ fn fsck(require_review: bool) -> Fallible<bool> {
 
     let orphans = check_trailers(&repo, store.as_ref())?;
     let index_orphans = check_index(store.as_ref())?;
-    check_journal(&repo, &root);
+    let journal_findings = check_journal(&repo, &root);
+    let (evidence_findings, evidence_hints) = check_evidence(store.as_ref());
     let hooks = hook_state(&root, repo.git_dir());
-    let hints = report_hooks(&root, &hooks)
+    let hints = evidence_hints
+        + report_hooks(&root, &hooks)
         + report_agents(&root)
         + report_binary(&root, &hooks)
         + report_log(&root, repo.git_dir());
 
-    let mut total = orphans + index_orphans;
+    let mut total = orphans + index_orphans + journal_findings + evidence_findings;
     if require_review {
         let reviews =
             ReviewStore::new(Repo::open(&root).map_err(minds_store::StoreError::backend)?);
         total += check_reviews(&repo, &root, &reviews)?;
+    }
+    if require_seal {
+        total += check_require_seal(&repo, store.as_ref())?;
     }
 
     if total == 0 {
@@ -241,14 +247,16 @@ fn check_trailers(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fallibl
 /// `fsck` das Werkzeug, das die vertagte Session sichtbar macht. Fail-closed
 /// ist stattdessen die Anzeige — ohne Pipeline werden die Kennungen
 /// ausgeblendet, nie roh gezeigt (#95).
-fn check_journal(repo: &Repo, root: &Path) {
+fn check_journal(repo: &Repo, root: &Path) -> usize {
     let journal = Journal::open(repo.git_dir());
     let pipeline = config::load_redaction(root)
         .ok()
         .and_then(|config| config.pipeline().ok());
-    for line in journal_report_lines(root, &journal, pipeline.as_ref()) {
+    let (lines, findings) = journal_report_lines(root, &journal, pipeline.as_ref());
+    for line in lines {
         println!("{line}");
     }
+    findings
 }
 
 /// Der Journal-Abschnitt des Berichts, Zeile für Zeile — reine Funktion, damit
@@ -265,15 +273,16 @@ fn journal_report_lines(
     root: &Path,
     journal: &Journal,
     pipeline: Option<&minds_redact::RedactionPipeline>,
-) -> Vec<String> {
+) -> (Vec<String>, usize) {
     let mut lines = Vec::new();
+    let mut findings = 0usize;
     let Ok(sessions) = journal.sessions() else {
-        return lines;
+        return (lines, findings);
     };
 
     if sessions.keys.is_empty() && sessions.unresolved.is_empty() {
         lines.push("Journal: leer".to_owned());
-        return lines;
+        return (lines, findings);
     }
 
     if !sessions.keys.is_empty() {
@@ -298,6 +307,18 @@ fn journal_report_lines(
             }
             if !outcome.damaged.is_empty() {
                 notes.push(format!("{} beschädigt", outcome.damaged.len()));
+            }
+            // Die Stempel nachrechnen (ADR-0011): Ein liegendes Journal, an dem
+            // Payload oder Fakten getauscht wurden, fällt hier auf — das ist
+            // ein Befund, keine Warnung. Alt-Events ohne Stempel sind dagegen
+            // nur ein Zustand.
+            let (tampered, unstamped) = recompute_stamps(&outcome.events);
+            if tampered > 0 {
+                notes.push(format!("{tampered} MANIPULIERT (Stempel passt nicht)"));
+                findings += tampered;
+            }
+            if unstamped > 0 {
+                notes.push(format!("{unstamped} ohne Stempel (pre-chain)"));
             }
             let suffix = if notes.is_empty() {
                 String::new()
@@ -328,7 +349,133 @@ fn journal_report_lines(
         }
     }
 
-    lines
+    (lines, findings)
+}
+
+/// Rechnet die Evidence-Stempel liegender Events nach. Liefert
+/// `(manipuliert, ohne Stempel)`.
+fn recompute_stamps(events: &[minds_capture::JournalEvent]) -> (usize, usize) {
+    use minds_core::evidence::{self, EventFacts};
+
+    let mut tampered = 0usize;
+    let mut unstamped = 0usize;
+    for event in events {
+        let (Some(payload_hash), Some(event_hash)) = (&event.payload_hash, &event.event_hash)
+        else {
+            unstamped += 1;
+            continue;
+        };
+        let payload = evidence::payload_hash(event.payload.get().as_bytes());
+        let facts = evidence::event_hash(&EventFacts {
+            seq: event.seq,
+            at: &event.at,
+            at_nanos: event.at_nanos,
+            raw_kind: &event.raw_kind,
+            cwd: event.cwd.as_deref(),
+            transcript_path: event.transcript_path.as_deref(),
+            payload_hash: &payload,
+        });
+        if payload != *payload_hash || facts != *event_hash {
+            tampered += 1;
+        }
+    }
+    (tampered, unstamped)
+}
+
+/// Der Evidence-Abschnitt: jeden Seal gegen seine Id nachrechnen (Befund bei
+/// Manipulation), Block-Seals sichtbar machen (Hinweis — eine zurückgehaltene
+/// Session ist ein Zustand, kein Defekt). Liefert `(Befunde, Hinweise)`.
+fn check_evidence(store: &dyn minds_store::ContextStore) -> (usize, usize) {
+    let seal_ids = match store.list_seals() {
+        Ok(ids) => ids,
+        Err(err) => {
+            println!("Evidence: nicht lesbar ({err})");
+            return (0, 1);
+        }
+    };
+    if seal_ids.is_empty() {
+        return (0, 0);
+    }
+
+    let mut findings = 0usize;
+    let mut hints = 0usize;
+    let mut blocked = 0usize;
+    for id in &seal_ids {
+        match store.seal_text(id) {
+            Ok(Some(text)) => match minds_core::evidence::Seal::parse(&text) {
+                Ok(seal) => {
+                    if matches!(seal.outcome, minds_core::evidence::SealOutcome::Rejected) {
+                        blocked += 1;
+                    }
+                }
+                Err(err) => {
+                    println!("  MANIPULIERT: Seal {id} — {err}");
+                    findings += 1;
+                }
+            },
+            Ok(None) => {
+                println!("  Seal-Ref {id} ohne Seal-Datei");
+                findings += 1;
+            }
+            Err(minds_store::StoreError::SealMismatch { .. }) => {
+                println!("  MANIPULIERT: Seal {id} hasht nicht auf seine Id");
+                findings += 1;
+            }
+            Err(err) => {
+                println!("  Seal {id} nicht lesbar ({err})");
+                findings += 1;
+            }
+        }
+    }
+    println!(
+        "Evidence: {} Seal(s), {findings} manipuliert, {blocked} zurückgehalten",
+        seal_ids.len()
+    );
+    if blocked > 0 {
+        println!(
+            "  Hinweis: {blocked} Session(s) durch die Speicher-Policy zurückgehalten — \
+             Coverage versiegelt, Nutzlast nicht gespeichert (Journal liegt noch, \
+             Policy prüfen)"
+        );
+        hints += blocked;
+    }
+    (findings, hints)
+}
+
+/// Das Seal-Gate (`--require-seal`): Jede Session, auf die ein erreichbarer
+/// Trailer zeigt, muss mindestens einen Seal tragen — das Gegenstück zu
+/// `--require-review`, für Repos, die die Evidence-Chain verbindlich machen.
+fn check_require_seal(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fallible<usize> {
+    let Some(head) = repo.head()?.commit() else {
+        println!("Seals: HEAD hat noch keinen Commit — nichts zu prüfen");
+        return Ok(0);
+    };
+
+    let mut seen: BTreeSet<SessionId> = BTreeSet::new();
+    let mut unsealed = 0usize;
+    for commit in repo.revwalk(head)? {
+        let commit = commit?;
+        for id in repo.session_ids_of(commit)? {
+            if !seen.insert(id) {
+                continue;
+            }
+            // Ein Rückverweis zählt nur, wenn der Seal auch auflösbar ist —
+            // eine baumelnde evidence.json ist kein Beleg.
+            let sealed = store
+                .seals_of(id)?
+                .iter()
+                .any(|seal_id| matches!(store.seal_text(seal_id), Ok(Some(_))));
+            if !sealed {
+                println!("  unversiegelt: {id}");
+                unsealed += 1;
+            }
+        }
+    }
+    println!(
+        "Seals: {} Session(s) geprüft, {unsealed} ohne Seal",
+        seen.len()
+    );
+    Ok(unsealed)
 }
 
 /// Die Hooks, ohne die nichts erfasst wird.
@@ -1793,7 +1940,7 @@ mod tests {
         // Genau der Fall aus #95: eine Session-Kennung in Token-Form darf
         // nach `minds fsck` nicht wörtlich in dessen Ausgabe stehen.
         let (root, journal) = journal_with_session("claude-code", "glpat-ABCDEFGHIJ1234567890");
-        let lines = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        let (lines, _) = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
         assert_eq!(
             lines,
             [
@@ -1808,7 +1955,7 @@ mod tests {
         // Die Redaktion trifft Token, nicht Diagnose-Komfort: Eine
         // gewöhnliche UUID bleibt, wie sie ist.
         let (root, journal) = journal_with_session("claude-code", "31f3f224-f440-41ac-9244");
-        let lines = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        let (lines, _) = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
         assert_eq!(
             lines,
             [
@@ -1829,7 +1976,7 @@ mod tests {
         };
         std::fs::write(dir.join(".key"), b"kein json").unwrap();
 
-        let lines = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        let (lines, _) = journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0],
@@ -1844,11 +1991,43 @@ mod tests {
     }
 
     #[test]
+    fn a_tampered_journal_event_is_a_finding_not_a_hint() {
+        // Payload nach dem Append austauschen — der Stempel passt nicht mehr,
+        // und das ist ein Befund mit Exit-Code, keine Warnung (ADR-0011).
+        let (root, journal) = journal_with_session("claude-code", "sess-1");
+
+        let mut victim = None;
+        for agent_dir in std::fs::read_dir(journal.root()).unwrap() {
+            for bucket in std::fs::read_dir(agent_dir.unwrap().path()).unwrap() {
+                let candidate = bucket.unwrap().path().join("0000000000.json");
+                if candidate.exists() {
+                    victim = Some(candidate);
+                }
+            }
+        }
+        let victim = victim.expect("Testaufbau: Event 0");
+        let text = std::fs::read_to_string(&victim).unwrap();
+        let forged = text.replace("\"payload\":{}", "\"payload\":{\"x\":1}");
+        assert_ne!(text, forged, "Testaufbau: nichts getauscht:\n{text}");
+        std::fs::write(&victim, forged).unwrap();
+
+        let (lines, findings) =
+            journal_report_lines(root.path(), &journal, Some(&strict_pipeline()));
+        assert_eq!(findings, 1, "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("1 MANIPULIERT (Stempel passt nicht)")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
     fn an_empty_journal_still_reads_as_empty() {
         let root = tempfile::tempdir().unwrap();
         let journal = Journal::open(&root.path().join(".git"));
         assert_eq!(
-            journal_report_lines(root.path(), &journal, Some(&strict_pipeline())),
+            journal_report_lines(root.path(), &journal, Some(&strict_pipeline())).0,
             ["Journal: leer".to_owned()]
         );
     }
@@ -1859,7 +2038,7 @@ mod tests {
         // muss `fsck` die vertagte Session noch zeigen — nur eben ohne
         // Kennung, denn ungeprüft anzeigen wäre das Leck aus #95.
         let (root, journal) = journal_with_session("claude-code", "glpat-ABCDEFGHIJ1234567890");
-        let lines = journal_report_lines(root.path(), &journal, None);
+        let (lines, _) = journal_report_lines(root.path(), &journal, None);
         assert_eq!(
             lines,
             [

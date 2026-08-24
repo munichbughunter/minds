@@ -56,6 +56,7 @@ mod metrics;
 mod prepare_commit_msg;
 mod recall;
 mod recap;
+mod reinterpret_cmd;
 mod render;
 mod render_cmd;
 mod review_cmd;
@@ -153,12 +154,24 @@ Verwendung:
         DSGVO-Löschung: ersetzt die Nutzlast einer Session durch einen Tombstone.
         Die Referenz bleibt auflösbar, der Inhalt verschwindet aus dem Store.
 
+  minds reinterpret <session>
+        Deutet die erhaltenen Tool-Aufrufe einer gespeicherten Session mit dem
+        aktuellen Adapter-Stand neu — strikt lesend, die Evidence bleibt
+        unverändert.
   minds sign <session> [--key <pfad>]
+  minds sign --seal <seal-id> [--key <pfad>]
         Signiert die Attribution einer Session (ssh-sig) nach stdout.
         Schlüssel aus --key oder git config user.signingkey.
 
+  minds verify <session> [--signers <datei>] [--identity <id>]
+        Das Evidence-Verdikt: Integrität × Coverage über die Seals der Session.
+        Exit-Codes: 0 VERIFIZIERT, 1 MANIPULIERT, 2 UNVOLLSTÄNDIG,
+        3 NICHT VERIFIZIERBAR.
   minds verify <session> --sig <datei> [--signers <datei>] [--identity <id>]
         Prüft eine signierte Attribution. Rückgabewert ist nicht 0 bei ungültig.
+  minds verify --evidence <seal-id>
+        Das Verdikt eines einzelnen Seals — auch ohne Session
+        (Redaction-Block).
 
   minds review <subject> --approve|--reject|--needs-work [--summary <text>]
                           [--sign] [--key <pfad>]
@@ -204,7 +217,7 @@ Verwendung:
         reicht ihn in MINDS_GITLAB_WEBHOOK_TOKEN durch, verglichen wird
         timing-sicher; ohne Treffer wird die Nutzlast verworfen.
 
-  minds audit --export [--out <datei>] [--base <ref>]
+  minds audit --export [--out <datei>] [--base <ref>] [--mode redacted|proof]
         Bündelt die Provenienz-Kette (Change → Session → Attribution →
         Verdict) als portable JSON-Datei. Enthält die kanonischen Payloads
         und Signaturen — prüfbar ohne dieses Werkzeug. Ohne --out nach stdout.
@@ -281,10 +294,16 @@ const SPECS: &[Spec] = &[
     spec("search", &[], &[], 1),
     spec("agent-help", &[], &[], 0),
     spec("metrics", &["--format"], &[], 0),
-    spec("fsck", &[], &["--require-review"], 0),
+    spec("fsck", &[], &["--require-review", "--require-seal"], 0),
     spec("forget", &["--reason"], &[], 1),
-    spec("sign", &["--key"], &[], 1),
-    spec("verify", &["--sig", "--signers", "--identity"], &[], 1),
+    spec("reinterpret", &[], &[], 1),
+    spec("sign", &["--key", "--seal"], &[], 1),
+    spec(
+        "verify",
+        &["--sig", "--signers", "--identity", "--evidence"],
+        &[],
+        1,
+    ),
     spec(
         "review",
         &["--summary", "--key"],
@@ -301,7 +320,7 @@ const SPECS: &[Spec] = &[
         &["--approve", "--write"],
         2,
     ),
-    spec("audit", &["--out", "--base"], &["--export"], 0),
+    spec("audit", &["--out", "--base", "--mode"], &["--export"], 0),
     spec("render", &["--out"], &[], 0),
     spec("prepare-commit-msg", &[], &[], 1),
 ];
@@ -657,6 +676,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.has("--export"),
             parsed.value("--out"),
             parsed.value("--base"),
+            parsed.value("--mode"),
         ),
 
         "gitlab" => gitlab_cmd::run(
@@ -687,17 +707,24 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--identity"),
         ),
 
-        "fsck" => fsck::run(parsed.has("--require-review")),
+        "fsck" => fsck::run(parsed.has("--require-review"), parsed.has("--require-seal")),
 
         "forget" => forget_cmd::run(parsed.positional(0), parsed.value("--reason")),
 
-        "sign" => sign_cmd::run(parsed.positional(0), parsed.value("--key")),
+        "reinterpret" => reinterpret_cmd::run(parsed.positional(0)),
+
+        "sign" => sign_cmd::run(
+            parsed.positional(0),
+            parsed.value("--key"),
+            parsed.value("--seal"),
+        ),
 
         "verify" => verify_cmd::run(
             parsed.positional(0),
             parsed.value("--sig"),
             parsed.value("--signers"),
             parsed.value("--identity"),
+            parsed.value("--evidence"),
         ),
 
         "render" => render_cmd::run(parsed.value("--out")),

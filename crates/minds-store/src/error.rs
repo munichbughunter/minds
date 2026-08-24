@@ -14,7 +14,8 @@
 
 use std::path::PathBuf;
 
-use minds_core::{CanonError, SessionId};
+use minds_core::evidence::SealParseError;
+use minds_core::{CanonError, ContentHash, SessionId};
 
 use crate::store::ForgottenPlace;
 
@@ -162,6 +163,29 @@ pub enum StoreError {
         /// Ursache aus dem Backend.
         #[source]
         source: Source,
+    },
+
+    /// Der Text ist kein gültiger Seal — er wird nicht abgelegt.
+    ///
+    /// Fail-closed am Schreibpfad: Ein Seal ist unser eigenes kanonisches
+    /// Artefakt; was nicht parst, versiegelt nichts.
+    #[error("kein gültiger Seal — nicht abgelegt")]
+    InvalidSeal {
+        /// Ursache aus dem Parser.
+        #[source]
+        source: SealParseError,
+    },
+
+    /// Der unter einer `seal_id` abgelegte Text hasht nicht auf diese Id.
+    ///
+    /// Dasselbe Gratis-Versprechen wie [`StoreError::Corrupt`] bei Sessions:
+    /// Wer den Seal im Ref nachträglich editiert, fliegt beim Lesen auf.
+    #[error("Seal unter {requested} hasht auf {actual} — der Seal wurde verändert")]
+    SealMismatch {
+        /// Die angefragte — und damit erwartete — Id.
+        requested: ContentHash,
+        /// Die Id, die der abgelegte Text tatsächlich ergibt.
+        actual: ContentHash,
     },
 
     /// Das Backend konnte nicht lesen oder schreiben.

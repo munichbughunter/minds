@@ -202,6 +202,7 @@ mod tests {
 
     fn exec(cmd: &str) -> ToolCall {
         ToolCall {
+            capture: None,
             name: "Bash".into(),
             arguments: format!(r#"{{"command":"{cmd}"}}"#),
             effect: Some(Effect {
@@ -214,6 +215,7 @@ mod tests {
 
     fn write(path: &str) -> ToolCall {
         ToolCall {
+            capture: None,
             name: "Edit".into(),
             arguments: "{}".into(),
             effect: Some(Effect {

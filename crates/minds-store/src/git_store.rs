@@ -90,7 +90,7 @@
 
 use std::collections::BTreeSet;
 
-use minds_core::{Evidence, SESSION_ID_PREFIX, SessionId};
+use minds_core::{EvidenceMark, SESSION_ID_PREFIX, SessionId};
 use minds_git::{CommitId, GitError, MINDS_REF_NAMESPACE, RefUpdate, Repo};
 
 use crate::bytes::SessionBytes;
@@ -171,6 +171,22 @@ const SESSION_FILE: &str = "session.json";
 /// konfliktfrei, die kalten Pfade (`fsck`, `render`, `show`) lesen dafür N
 /// kleine Blobs statt einen großen.
 const SESSION_LINKS_FILE: &str = "links.json";
+
+/// Namensraum der Seal-Refs: ein elternloser Commit je Seal, adressiert über
+/// die volle `seal_id` (ADR-0011). Von der Session-Payload entkoppelt — ein
+/// Seal überlebt `forget` als payload-freier Beweis und wird nie getilgt.
+const SEAL_REF_PREFIX: &str = "refs/minds/evidence/";
+
+/// Dateiname des Seal-Texts im Baum eines Seal-Refs.
+const SEAL_FILE: &str = "seal";
+
+/// Die `ssh-sig`-Signatur daneben — nie im Seal selbst (zirkulär).
+const SEAL_SIG_FILE: &str = "seal.sig";
+
+/// Rückverweise Session → Seals im Baum des Session-Refs, neben
+/// `session.json` und `links.json`. Veränderlich wie `links.json`, nie
+/// kanonisch; `forget` ersetzt nur `session.json`, die Rückverweise bleiben.
+const SESSION_EVIDENCE_FILE: &str = "evidence.json";
 
 /// Der Namensraum der browsbaren Session-Branches: `refs/minds/sessions/<hex>`
 /// (gekürzter Hash). Der Push mappt sie im Child-Backend auf Branches
@@ -840,6 +856,26 @@ fn session_ref(id: SessionId) -> String {
     format!("{SESSION_STORE_PREFIX}{}", hex_of(id))
 }
 
+/// Der Ref eines Seals.
+fn seal_ref(id: &minds_core::ContentHash) -> String {
+    format!("{SEAL_REF_PREFIX}{}", id.hex())
+}
+
+/// Die `seal_id` hinter einem Seal-Ref — `None` für Fremdes im Namensraum.
+fn seal_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(SEAL_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
+/// Die Form der `evidence.json`: ein Objekt, damit spätere Nachbarn (etwa
+/// Signatur-Verweise) additiv Platz finden.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct SessionEvidence {
+    #[serde(default)]
+    seals: Vec<String>,
+}
+
 /// Die ID hinter einem Session-Ref — `None` für alles, was nicht diesem Muster
 /// folgt (ein fremder Ref im Namensraum ist kein Defekt, nur keine Session).
 fn id_of_ref(name: &str) -> Option<SessionId> {
@@ -1078,7 +1114,7 @@ impl ContextStore for GitStore {
         Ok(ids.into_iter().collect())
     }
 
-    fn link(&self, session: SessionId, commit_hex: &str, evidence: Evidence) -> Result<()> {
+    fn link(&self, session: SessionId, commit_hex: &str, evidence: EvidenceMark) -> Result<()> {
         let reference = session_ref(session);
         let message = format!("minds: Kante {commit_hex} → {session}");
 
@@ -1112,9 +1148,9 @@ impl ContextStore for GitStore {
                             None => Vec::new(),
                         };
 
-                        // Idempotent, und stärkere Herkunft gewinnt — dieselbe
-                        // Regel wie in [`CommitIndex::link`], nur auf der Sicht
-                        // *einer* Session.
+                        // Idempotent, und der stärkere Beleg gewinnt —
+                        // dieselbe Merge-Regel wie in [`CommitIndex::link`]
+                        // (ADR-0011), nur auf der Sicht *einer* Session.
                         match links.iter_mut().find(|link| link.commit == commit_hex) {
                             Some(existing) => {
                                 if existing.evidence >= evidence {
@@ -1139,6 +1175,171 @@ impl ContextStore for GitStore {
                 Err(err) => return Err(StoreError::backend(err)),
             }
         }
+    }
+
+    fn put_seal(&self, text: &str) -> Result<minds_core::ContentHash> {
+        use minds_core::evidence::Seal;
+
+        // Fail-closed: Was nicht parst, versiegelt nichts.
+        Seal::parse(text).map_err(|source| StoreError::InvalidSeal { source })?;
+        let id = Seal::id_of_text(text);
+        let reference = seal_ref(&id);
+
+        // Content-adressiert: Existiert der Ref, MUSS derselbe Text darunter
+        // liegen — inhaltlich geprüft, nicht nur auf Existenz. Ein fremd
+        // vorbelegter Ref fällt hier als SealMismatch auf, statt still als
+        // „schon da" durchzugehen.
+        if self.seal_text(&id)?.is_some() {
+            return Ok(id);
+        }
+
+        let write = || -> minds_git::Result<()> {
+            let blob = self.repo.write_blob(text.as_bytes())?;
+            let tree = self.repo.write_tree(None, [(SEAL_FILE, blob)])?;
+            self.repo
+                .commit_tree_to_ref(&reference, tree, &format!("minds: Seal {id}"))?;
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(id),
+            // Ein paralleler Schreiber kann nur denselben Inhalt geschrieben
+            // haben — verifizieren statt raten.
+            Err(minds_git::GitError::RefRaced { .. }) => match self.seal_text(&id)? {
+                Some(_) => Ok(id),
+                None => Err(StoreError::backend(std::io::Error::other(
+                    "Seal-Ref bewegte sich, trägt aber keinen Seal",
+                ))),
+            },
+            Err(err) => Err(StoreError::backend(err)),
+        }
+    }
+
+    fn seal_text(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        use minds_core::evidence::Seal;
+
+        let Some(bytes) = self
+            .repo
+            .read_blob_at(&seal_ref(id), SEAL_FILE)
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(None);
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|e| StoreError::backend(std::io::Error::other(e)))?;
+        let actual = Seal::id_of_text(&text);
+        if actual != *id {
+            return Err(StoreError::SealMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        Ok(Some(text))
+    }
+
+    fn record_session_seal(
+        &self,
+        session: SessionId,
+        seal_id: &minds_core::ContentHash,
+    ) -> Result<()> {
+        let reference = session_ref(session);
+        let message = format!("minds: Seal-Verweis {seal_id} → {session}");
+        let mut attempts_left = PUT_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            let outcome = self.repo.update_blob_in_ref(
+                &reference,
+                SESSION_EVIDENCE_FILE,
+                &message,
+                |current| {
+                    // Tolerant lesen: Eine kaputte evidence.json wird beim
+                    // Schreiben durch eine frische ersetzt — anders als bei
+                    // links.json geht hier nichts verloren, was nicht aus
+                    // den Seal-Refs rekonstruierbar wäre (`list_seals`).
+                    let mut evidence: SessionEvidence = current
+                        .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                        .unwrap_or_default();
+                    let entry = seal_id.to_string();
+                    if evidence.seals.contains(&entry) {
+                        return None;
+                    }
+                    evidence.seals.push(entry);
+                    Some(serde_json::to_vec(&evidence).expect("Seal-Liste serialisiert immer"))
+                },
+            );
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
+    }
+
+    fn seals_of(&self, session: SessionId) -> Result<Vec<minds_core::ContentHash>> {
+        let Some(bytes) = self
+            .repo
+            .read_blob_at(&session_ref(session), SESSION_EVIDENCE_FILE)
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(Vec::new());
+        };
+        let evidence: SessionEvidence = serde_json::from_slice(&bytes).unwrap_or_default();
+        Ok(evidence
+            .seals
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect())
+    }
+
+    fn put_seal_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
+        // Erst pruefen, dass der Seal liegt — eine Signatur ohne Bytes
+        // darunter waere eine Behauptung ohne Gegenstand.
+        if self.seal_text(id)?.is_none() {
+            return Err(StoreError::backend(std::io::Error::other(
+                "Seal liegt nicht im Store — nichts zu signieren",
+            )));
+        }
+        let reference = seal_ref(id);
+        let message = format!("minds: Signatur für Seal {id}");
+        let mut attempts_left = PUT_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            let outcome =
+                self.repo
+                    .update_blob_in_ref(&reference, SEAL_SIG_FILE, &message, |current| {
+                        if current == Some(signature.as_bytes()) {
+                            return None; // schon signiert, idempotent
+                        }
+                        Some(signature.as_bytes().to_vec())
+                    });
+            match outcome {
+                Ok(_) => return Ok(()),
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
+    }
+
+    fn seal_signature(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        let Some(bytes) = self
+            .repo
+            .read_blob_at(&seal_ref(id), SEAL_SIG_FILE)
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| StoreError::backend(std::io::Error::other(e)))
+    }
+
+    fn list_seals(&self) -> Result<Vec<minds_core::ContentHash>> {
+        Ok(self
+            .repo
+            .refs_under(SEAL_REF_PREFIX)
+            .map_err(StoreError::backend)?
+            .iter()
+            .filter_map(|(name, _)| seal_id_of_ref(name))
+            .collect())
     }
 
     fn index(&self) -> Result<CommitIndex> {
@@ -1218,7 +1419,7 @@ impl ContextStore for GitStore {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SessionLink {
     commit: String,
-    evidence: Evidence,
+    evidence: EvidenceMark,
 }
 
 impl GitStore {
@@ -1271,7 +1472,7 @@ fn commit_message(id: SessionId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use minds_core::to_canonical_string;
+    use minds_core::{EvidenceSource, to_canonical_string};
     use minds_git::DEFAULT_CONTEXT_REF;
 
     use super::*;
@@ -1692,7 +1893,7 @@ mod tests {
 
         // Den geteilten Kontext-Ref über den Index fast-forward fortschreiben.
         let mut index = store.index().unwrap();
-        index.link("aaaa", id, Evidence::Inferred);
+        index.link("aaaa", id, EvidenceMark::of(EvidenceSource::Heuristic));
         store.set_index(&index).unwrap();
         let c1 = fixture
             .git(&["rev-parse", DEFAULT_CONTEXT_REF])
@@ -1702,7 +1903,7 @@ mod tests {
         let tracking = format!("{TRACKING_REF_PREFIX}origin/context");
         fixture.git(&["update-ref", &tracking, &c1]);
         // Kontext fast-forward weiter (eine andere Kante).
-        index.link("bbbb", id, Evidence::Inferred);
+        index.link("bbbb", id, EvidenceMark::of(EvidenceSource::Heuristic));
         store.set_index(&index).unwrap();
         let c2 = fixture
             .git(&["rev-parse", DEFAULT_CONTEXT_REF])
@@ -1722,6 +1923,121 @@ mod tests {
         );
     }
 
+    fn sample_seal(session: Option<SessionId>) -> minds_core::evidence::Seal {
+        use minds_core::evidence::{Seal, SealOutcome};
+        Seal {
+            root: minds_core::ContentHash::from_bytes([9u8; 32]),
+            agent: "claude-code".into(),
+            scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+            first_seq: 0,
+            last_seq: 3,
+            events: 4,
+            gaps: 0,
+            pre_chain: 0,
+            outcome: match session {
+                Some(id) => SealOutcome::Stored {
+                    session: id.to_string(),
+                },
+                None => SealOutcome::Rejected,
+            },
+            previous: None,
+            last_event_at: "2026-08-24T10:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_seal_roundtrips_and_a_second_put_is_a_noop() {
+        let (fixture, store) = fresh_store();
+        let text = sample_seal(None).to_text().unwrap();
+
+        let id = store.put_seal(&text).unwrap();
+        assert_eq!(id, minds_core::evidence::Seal::id_of_text(&text));
+        assert_eq!(
+            store.seal_text(&id).unwrap().as_deref(),
+            Some(text.as_str())
+        );
+        assert_eq!(store.list_seals().unwrap(), vec![id.clone()]);
+
+        // Idempotent: gleicher Text, gleicher Ref, ein Commit.
+        let again = store.put_seal(&text).unwrap();
+        assert_eq!(again, id);
+        let log = fixture.git(&["rev-list", "--count", &seal_ref(&id)]);
+        assert_eq!(log.trim(), "1");
+    }
+
+    #[test]
+    fn junk_is_not_sealed() {
+        let (_fixture, store) = fresh_store();
+        assert!(matches!(
+            store.put_seal("kein seal"),
+            Err(StoreError::InvalidSeal { .. })
+        ));
+        assert!(store.list_seals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tampered_seal_is_caught_on_read() {
+        let (fixture, store) = fresh_store();
+        let text = sample_seal(None).to_text().unwrap();
+        let id = store.put_seal(&text).unwrap();
+
+        // Manipulation von Hand: anderen Text unter denselben Ref legen —
+        // ueber git-Plumbing, wie es ein Angreifer mit Repo-Zugriff taete.
+        let forged_text = minds_core::evidence::Seal {
+            events: 999,
+            ..sample_seal(None)
+        }
+        .to_text()
+        .unwrap();
+        let tmp = fixture.path().join("forged-seal");
+        std::fs::write(&tmp, &forged_text).unwrap();
+        let blob = fixture.git(&["hash-object", "-w", tmp.to_str().unwrap()]);
+        let tree_input = format!("100644 blob {}\t{}\n", blob.trim(), SEAL_FILE);
+        let tree = fixture.git_with_stdin(&["mktree"], &tree_input);
+        let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "forged"]);
+        fixture.git(&["update-ref", &seal_ref(&id), commit.trim()]);
+
+        assert!(matches!(
+            store.seal_text(&id),
+            Err(StoreError::SealMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn session_seal_backlinks_are_recorded_and_survive_forget() {
+        let (fixture, store) = fresh_store();
+        let session = redacted("streng geheim");
+        let id = store.put(&session).unwrap().id();
+
+        let text = sample_seal(Some(id)).to_text().unwrap();
+        let seal_id = store.put_seal(&text).unwrap();
+        store.record_session_seal(id, &seal_id).unwrap();
+        // Idempotent.
+        store.record_session_seal(id, &seal_id).unwrap();
+        assert_eq!(store.seals_of(id).unwrap(), vec![seal_id.clone()]);
+
+        // forget tilgt nur session.json — Seal-Ref UND Rueckverweis bleiben:
+        // Der Seal ist der payload-freie Beweis (ADR-0011, Entscheidung 4).
+        store.forget(id, "DSGVO").unwrap();
+        assert_eq!(store.seals_of(id).unwrap(), vec![seal_id.clone()]);
+        assert_eq!(
+            store.seal_text(&seal_id).unwrap().as_deref(),
+            Some(text.as_str())
+        );
+        let tree = fixture.git(&["ls-tree", "-r", "--name-only", &session_ref(id)]);
+        assert!(tree.contains(SESSION_EVIDENCE_FILE), "{tree}");
+    }
+
+    #[test]
+    fn seal_refs_live_under_the_minds_namespace_so_sync_carries_them() {
+        // `minds sync` plant ueber `refs/minds/*` (MINDS_REF_NAMESPACE) — ein
+        // Seal-Ref, der dort liegt, reist ohne Sync-Aenderung mit.
+        let (_fixture, store) = fresh_store();
+        let text = sample_seal(None).to_text().unwrap();
+        let id = store.put_seal(&text).unwrap();
+        assert!(seal_ref(&id).starts_with(minds_git::MINDS_REF_NAMESPACE));
+    }
+
     #[test]
     fn forget_keeps_the_side_files_of_the_store_ref() {
         // Der elternlose Reset des Store-Refs nimmt den aktuellen Baum als Basis,
@@ -1732,7 +2048,9 @@ mod tests {
         let session = redacted("streng geheim");
         let id = store.put(&session).unwrap().id();
         let commit = "a".repeat(40);
-        store.link(id, &commit, Evidence::Inferred).unwrap();
+        store
+            .link(id, &commit, EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap();
         // Vorbedingung: die Kante liegt am Store-Ref.
         let before = fixture.git(&["ls-tree", "-r", "--name-only", &session_ref(id)]);
         assert!(before.contains(SESSION_LINKS_FILE), "Testaufbau:\n{before}");
@@ -2025,7 +2343,11 @@ mod tests {
         assert!(store.index().unwrap().is_empty());
 
         let mut index = crate::CommitIndex::new();
-        index.link("deadbeef", id, minds_core::Evidence::Inferred);
+        index.link(
+            "deadbeef",
+            id,
+            minds_core::EvidenceMark::of(minds_core::EvidenceSource::Heuristic),
+        );
         store.set_index(&index).unwrap();
 
         // Gelesen wie geschrieben, und die Session ist unversehrt daneben.
@@ -2038,7 +2360,11 @@ mod tests {
         assert!(store.get(id).unwrap().is_some());
 
         // Überschreiben ersetzt, dupliziert nicht.
-        index.link("cafe", id, minds_core::Evidence::Inferred);
+        index.link(
+            "cafe",
+            id,
+            minds_core::EvidenceMark::of(minds_core::EvidenceSource::Heuristic),
+        );
         store.set_index(&index).unwrap();
         assert_eq!(store.index().unwrap().len(), 2);
     }
@@ -2050,7 +2376,9 @@ mod tests {
         let (fixture, store) = fresh_store();
         let id = store.put(&redacted("Retry-Test reparieren")).unwrap().id();
 
-        store.link(id, "deadbeef", Evidence::Observed).unwrap();
+        store
+            .link(id, "deadbeef", EvidenceMark::of(EvidenceSource::Observed))
+            .unwrap();
 
         // Im Baum der Session, nicht in einer gemeinsamen Datei.
         let files = fixture.git(&["ls-tree", "-r", "--name-only", &session_ref(id)]);
@@ -2065,7 +2393,10 @@ mod tests {
         let index = store.index().unwrap();
         assert_eq!(index.links_of("deadbeef").len(), 1);
         assert_eq!(index.links_of("deadbeef")[0].session, id);
-        assert_eq!(index.links_of("deadbeef")[0].evidence, Evidence::Observed);
+        assert_eq!(
+            index.links_of("deadbeef")[0].evidence,
+            EvidenceMark::of(EvidenceSource::Observed)
+        );
     }
 
     #[test]
@@ -2077,8 +2408,12 @@ mod tests {
         let first = store.put(&redacted("Fall A")).unwrap().id();
         let second = store.put(&redacted("Fall B")).unwrap().id();
 
-        store.link(first, "cafe", Evidence::Observed).unwrap();
-        store.link(second, "cafe", Evidence::Inferred).unwrap();
+        store
+            .link(first, "cafe", EvidenceMark::of(EvidenceSource::Observed))
+            .unwrap();
+        store
+            .link(second, "cafe", EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap();
 
         // Beide Kanten stehen im selben Commit-Eintrag …
         assert_eq!(store.index().unwrap().links_of("cafe").len(), 2);
@@ -2094,27 +2429,55 @@ mod tests {
     }
 
     #[test]
+    fn a_legacy_links_json_with_string_evidence_still_reads() {
+        // Bestands-`links.json` (Schema 1) tragen den Legacy-String. `tolerant
+        // lesen` heisst: Sie parsen weiter — auf Status Unknown — und der
+        // naechste Schreibvorgang legt die Objektform ab.
+        let json = r#"[{"commit":"deadbeef","evidence":"observed"}]"#;
+        let links: Vec<SessionLink> = serde_json::from_str(json).unwrap();
+        assert_eq!(links[0].commit, "deadbeef");
+        assert_eq!(
+            links[0].evidence,
+            EvidenceMark::of(EvidenceSource::Observed)
+        );
+        // Kanonisch geschrieben wird nur noch die Objektform.
+        let out = serde_json::to_string(&links).unwrap();
+        assert!(
+            out.contains(r#""evidence":{"source":"observed","status":"unknown"}"#),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn linking_is_idempotent_and_the_stronger_evidence_wins() {
         let (fixture, store) = fresh_store();
         let id = store.put(&redacted("Retry-Test reparieren")).unwrap().id();
 
-        store.link(id, "cafe", Evidence::Inferred).unwrap();
+        store
+            .link(id, "cafe", EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap();
         let after_first = fixture.hash(&session_ref(id));
 
         // Dieselbe Kante nochmal: kein Commit.
-        store.link(id, "cafe", Evidence::Inferred).unwrap();
+        store
+            .link(id, "cafe", EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap();
         assert_eq!(fixture.hash(&session_ref(id)), after_first);
 
         // Schwächere Herkunft: ebenfalls kein Commit.
-        store.link(id, "cafe", Evidence::Inferred).unwrap();
+        store
+            .link(id, "cafe", EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap();
         assert_eq!(fixture.hash(&session_ref(id)), after_first);
 
         // Stärkere Herkunft gewinnt.
-        store.link(id, "cafe", Evidence::Observed).unwrap();
+        store
+            .link(id, "cafe", EvidenceMark::of(EvidenceSource::Observed))
+            .unwrap();
         assert_ne!(fixture.hash(&session_ref(id)), after_first);
         assert_eq!(
             store.index().unwrap().links_of("cafe")[0].evidence,
-            Evidence::Observed
+            EvidenceMark::of(EvidenceSource::Observed)
         );
     }
 
@@ -2135,7 +2498,11 @@ mod tests {
                     let store = GitStore::new(Repo::open(&path).unwrap(), DEFAULT_CONTEXT_REF);
                     for i in 0..3 {
                         store
-                            .link(id, &format!("c{writer}{i}"), Evidence::Inferred)
+                            .link(
+                                id,
+                                &format!("c{writer}{i}"),
+                                EvidenceMark::of(EvidenceSource::Heuristic),
+                            )
                             .unwrap();
                     }
                 })
@@ -2163,7 +2530,9 @@ mod tests {
         // benannt.
         let (_fixture, store) = fresh_store();
         let id = store.put(&redacted("kaputte Kanten")).unwrap().id();
-        store.link(id, "cafe", Evidence::Inferred).unwrap();
+        store
+            .link(id, "cafe", EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap();
 
         store
             .repo
@@ -2172,7 +2541,9 @@ mod tests {
             })
             .unwrap();
 
-        let err = store.link(id, "beef", Evidence::Inferred).unwrap_err();
+        let err = store
+            .link(id, "beef", EvidenceMark::of(EvidenceSource::Heuristic))
+            .unwrap_err();
         assert!(matches!(err, StoreError::CorruptLinks { .. }), "{err:?}");
         assert_eq!(
             store
@@ -2194,9 +2565,11 @@ mod tests {
         let new = store.put(&redacted("Fall B")).unwrap().id();
 
         let mut legacy = crate::CommitIndex::new();
-        legacy.link("cafe", old, Evidence::Inferred);
+        legacy.link("cafe", old, EvidenceMark::of(EvidenceSource::Heuristic));
         store.set_index(&legacy).unwrap();
-        store.link(new, "cafe", Evidence::Observed).unwrap();
+        store
+            .link(new, "cafe", EvidenceMark::of(EvidenceSource::Observed))
+            .unwrap();
 
         let index = store.index().unwrap();
         let sessions: BTreeSet<SessionId> = index

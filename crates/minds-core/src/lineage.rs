@@ -148,8 +148,10 @@ pub struct Edge {
     /// Das andere Ende.
     pub to: Endpoint,
 
-    /// Woher wir diese Kante wissen.
-    pub evidence: Evidence,
+    /// Woher wir diese Kante wissen — und ob es geprüft wurde. Liest tolerant
+    /// auch die Legacy-Stringform aus Schema-1-Sessions (siehe
+    /// [`EvidenceMark`]).
+    pub evidence: EvidenceMark,
 }
 
 /// Was für eine Beziehung.
@@ -226,6 +228,166 @@ pub enum Evidence {
 }
 
 // ---------------------------------------------------------------------------
+// Evidence in zwei Dimensionen (ADR-0011)
+// ---------------------------------------------------------------------------
+//
+// [`Evidence`] vermischt zwei Fragen: *Woher stammt die Aussage?* und *Wurde
+// sie geprüft?* „observed" klingt sicherer als „inferred" — aber auch eine
+// beobachtete Kante wurde vielleicht nie nachgerechnet. [`EvidenceMark`]
+// trennt die beiden Achsen. Das alte Enum bleibt für die Übergangszeit als
+// Legacy-Leseform bestehen; geschrieben wird ab Schema 2 nur noch die
+// Objektform.
+
+/// Woher eine Aussage stammt — aufsteigend nach Verlässlichkeit sortiert,
+/// dieselbe Vertrauensordnung wie beim alten [`Evidence`].
+///
+/// Die Variantenreihenfolge ist Teil des Vertrags (siehe
+/// `evidence_source_orders_by_trustworthiness`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    /// Heuristik — Datei-Überschneidung, zeitliche Nähe, Textähnlichkeit.
+    Heuristic,
+
+    /// Ein Mensch hat es erklärt. Eine Tatsache über den Menschen, nicht über
+    /// das Ereignis.
+    HumanDeclared,
+
+    /// Aus Inhalts-Hashes ableitbar: die gelesenen Bytes sind die
+    /// geschriebenen.
+    ContentDerived,
+
+    /// Direkt beobachtet — Hook-Event, Transkript, Trailer.
+    Observed,
+}
+
+/// Wurde die Aussage geprüft — aufsteigend sortiert.
+///
+/// `Verified` heißt strikt **nachgerechnet** (kryptographisch oder über
+/// Content-Evidence) und wird nur zur Verify-/Lesezeit vergeben, nie ungeprüft
+/// in Bytes eingefroren. Fehlende Prüfung ist [`Unknown`](Self::Unknown), nie
+/// Bestehen — der Grundsatz aus ADR-0011.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStatus {
+    /// Der Beleg müsste existieren, ist aber nicht auffindbar. Existiert nur
+    /// in Verify-/Reader-Ausgaben — **gespeicherte** Marks tragen nie
+    /// `Missing` (Invariante, siehe `stored_marks_never_carry_missing`).
+    Missing,
+
+    /// Nicht geprüft. Der Zustand jeder Aussage, solange niemand nachrechnet —
+    /// auch jeder Legacy-Kante.
+    Unknown,
+
+    /// Teilweise geprüft — etwa ein Bereich mit Lücken.
+    Partial,
+
+    /// Nachgerechnet und bestanden.
+    Verified,
+}
+
+/// Herkunft **und** Prüfzustand einer Aussage.
+///
+/// # Lesen tolerant, Schreiben kanonisch
+///
+/// Deserialisiert werden zwei Formen: der Legacy-String des alten
+/// [`Evidence`]-Enums (`"observed"`, …) und die Objektform
+/// `{"source":…,"status":…}`. Legacy-Werte landen auf
+/// [`EvidenceStatus::Unknown`] — keine Alt-Kante wurde je nachgerechnet, und
+/// das Fehlen der Prüfung darf nicht als Bestehen gelesen werden (ADR-0011,
+/// Entscheidung 6). Serialisiert wird ausschließlich die Objektform.
+///
+/// # Ordnung = Merge-Regel
+///
+/// `Ord` ist bewusst lexikographisch (erst `source`, dann `status`) und damit
+/// exakt die Merge-Regel aus ADR-0011: primär entscheidet die Quelle
+/// (bisherige Vertrauensordnung), bei gleicher Quelle der Status, und eine
+/// stärkere Quelle gewinnt mit ihrem **kompletten** Mark. `max()` über mehrere
+/// Belege bleibt dadurch das richtige Werkzeug. Das pathologische Paar
+/// `(Observed, Missing)` gegen `(ContentDerived, Verified)` entschärft die
+/// Invariante, dass gespeicherte Marks nie `Missing` tragen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub struct EvidenceMark {
+    /// Woher die Aussage stammt.
+    pub source: EvidenceSource,
+
+    /// Ob sie geprüft wurde.
+    pub status: EvidenceStatus,
+}
+
+impl EvidenceMark {
+    /// Die speicherbare Form: Quelle bekannt, Prüfung offen. Producer
+    /// schreiben genau das — `Verified` vergibt erst eine Nachrechnung.
+    pub fn of(source: EvidenceSource) -> Self {
+        Self {
+            source,
+            status: EvidenceStatus::Unknown,
+        }
+    }
+
+    /// Der stärkere von zwei Belegen — die Merge-Regel aus ADR-0011 (identisch
+    /// mit `max()`, als benannter Ort für die Begründung).
+    pub fn merge(self, other: Self) -> Self {
+        self.max(other)
+    }
+}
+
+impl From<Evidence> for EvidenceMark {
+    /// Legacy → zwei Dimensionen. Der Status ist immer
+    /// [`EvidenceStatus::Unknown`]: „observed" sagt, woher die Aussage stammt —
+    /// nicht, dass sie je geprüft wurde.
+    fn from(legacy: Evidence) -> Self {
+        let source = match legacy {
+            Evidence::Inferred => EvidenceSource::Heuristic,
+            Evidence::Declared => EvidenceSource::HumanDeclared,
+            Evidence::Content => EvidenceSource::ContentDerived,
+            Evidence::Observed => EvidenceSource::Observed,
+        };
+        Self::of(source)
+    }
+}
+
+impl From<EvidenceMark> for Evidence {
+    /// Zwei Dimensionen → Legacy, **verlustbehaftet**: der Status fällt weg.
+    ///
+    /// Nur für Anzeige-Schichten gedacht, die noch auf dem alten Enum
+    /// arbeiten (Reader/TUI bis Track EV.14/EV.15). Nie zum Speichern
+    /// verwenden — geschrieben wird ausschließlich die Objektform.
+    fn from(mark: EvidenceMark) -> Self {
+        match mark.source {
+            EvidenceSource::Heuristic => Evidence::Inferred,
+            EvidenceSource::HumanDeclared => Evidence::Declared,
+            EvidenceSource::ContentDerived => Evidence::Content,
+            EvidenceSource::Observed => Evidence::Observed,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for EvidenceMark {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Beide akzeptierten Formen. `untagged` probiert der Reihe nach: ein
+        /// JSON-String kann nie das Objekt treffen und umgekehrt.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Form {
+            Legacy(Evidence),
+            Split {
+                source: EvidenceSource,
+                status: EvidenceStatus,
+            },
+        }
+
+        Ok(match Form::deserialize(deserializer)? {
+            Form::Legacy(legacy) => legacy.into(),
+            Form::Split { source, status } => EvidenceMark { source, status },
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Beweismittel am Tool-Call
 // ---------------------------------------------------------------------------
 
@@ -250,7 +412,7 @@ pub struct Effect {
 
     /// blake3 über die **Rohbytes** des Gelesenen bzw. Geschriebenen.
     ///
-    /// Zwei Regeln, die beide fail-closed sind:
+    /// Drei Regeln, alle fail-closed:
     ///
     /// - Der Hash wird **vor** der Redaction gebildet. Danach gebildet würde er
     ///   nie matchen, und die ganze Kante wäre tot.
@@ -258,6 +420,10 @@ pub struct Effect {
     ///   `*.pem`), wird er **nicht** gebildet. Bei einer kurzen, ratbaren Datei
     ///   wäre ein Hash ein Orakel — man probiert Kandidaten durch, bis es
     ///   passt. Fail-closed gilt auch für Fingerabdrücke.
+    /// - **Lese**-Effekte werden nur für getrackte, repo-relative Pfade
+    ///   gehasht (die Read-Grenze, Phase 6): getrackter Inhalt ist für jeden
+    ///   Repo-Leser ohnehin sichtbar, sein Hash verrät nichts Neues — alles
+    ///   Private bleibt beim bloßen Lesen fingerabdruck-frei.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentHash>,
 }
@@ -321,6 +487,25 @@ impl ContentHash {
     /// Der Hex-Anteil ohne Präfix.
     pub fn hex(&self) -> &str {
         &self.0[CONTENT_HASH_PREFIX.len()..]
+    }
+
+    /// Die 32 Rohbytes zurück — die Umkehrung von [`from_bytes`](Self::from_bytes).
+    ///
+    /// Gebraucht von der Evidence-Chain ([`crate::evidence`]), deren Fold über
+    /// Rohbytes läuft, nicht über die Textform.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let hex = self.hex().as_bytes();
+        for (i, byte) in out.iter_mut().enumerate() {
+            let hi = (hex[2 * i] as char)
+                .to_digit(16)
+                .expect("Hex per Invariante");
+            let lo = (hex[2 * i + 1] as char)
+                .to_digit(16)
+                .expect("Hex per Invariante");
+            *byte = ((hi << 4) | lo) as u8;
+        }
+        out
     }
 
     /// Die kanonische Textform mit Präfix.
@@ -425,6 +610,12 @@ mod tests {
     }
 
     #[test]
+    fn content_hash_roundtrips_between_bytes_and_text() {
+        let digest: [u8; 32] = core::array::from_fn(|i| i as u8);
+        assert_eq!(ContentHash::from_bytes(digest).to_bytes(), digest);
+    }
+
+    #[test]
     fn content_hash_roundtrips_through_serde_as_a_plain_string() {
         let h = ContentHash::from_bytes([0x01; 32]);
         let json = serde_json::to_string(&h).unwrap();
@@ -442,6 +633,127 @@ mod tests {
         assert!(Evidence::Observed > Evidence::Content);
         assert!(Evidence::Content > Evidence::Declared);
         assert!(Evidence::Declared > Evidence::Inferred);
+    }
+
+    #[test]
+    fn evidence_source_orders_by_trustworthiness() {
+        // Dieselbe Vertragsregel wie beim alten Enum: `max()` liefert die
+        // staerkste Quelle.
+        assert!(EvidenceSource::Observed > EvidenceSource::ContentDerived);
+        assert!(EvidenceSource::ContentDerived > EvidenceSource::HumanDeclared);
+        assert!(EvidenceSource::HumanDeclared > EvidenceSource::Heuristic);
+    }
+
+    #[test]
+    fn evidence_status_orders_by_certainty() {
+        assert!(EvidenceStatus::Verified > EvidenceStatus::Partial);
+        assert!(EvidenceStatus::Partial > EvidenceStatus::Unknown);
+        assert!(EvidenceStatus::Unknown > EvidenceStatus::Missing);
+    }
+
+    #[test]
+    fn every_legacy_value_maps_to_its_source_with_status_unknown() {
+        // Der Kern des Legacy-Mappings aus ADR-0011: Herkunft bleibt erhalten,
+        // der Status ist Unknown — keine Alt-Kante wurde je nachgerechnet.
+        for (legacy, source) in [
+            (Evidence::Inferred, EvidenceSource::Heuristic),
+            (Evidence::Declared, EvidenceSource::HumanDeclared),
+            (Evidence::Content, EvidenceSource::ContentDerived),
+            (Evidence::Observed, EvidenceSource::Observed),
+        ] {
+            let mark = EvidenceMark::from(legacy);
+            assert_eq!(mark.source, source, "{legacy:?}");
+            assert_eq!(mark.status, EvidenceStatus::Unknown, "{legacy:?}");
+        }
+    }
+
+    #[test]
+    fn a_mark_reads_both_forms_and_writes_only_the_object_form() {
+        // Legacy-String (so stehen Kanten in Schema-1-Sessions und in alten
+        // links.json) …
+        let legacy: EvidenceMark = serde_json::from_str("\"observed\"").unwrap();
+        assert_eq!(legacy, EvidenceMark::of(EvidenceSource::Observed));
+
+        // … und Objektform lesen beide auf denselben Typ.
+        let split: EvidenceMark =
+            serde_json::from_str(r#"{"source":"observed","status":"unknown"}"#).unwrap();
+        assert_eq!(legacy, split);
+
+        // Geschrieben wird ausschliesslich die Objektform — golden, weil die
+        // Bytes ab Schema 2 in die kanonische Session eingehen.
+        assert_eq!(
+            serde_json::to_string(&legacy).unwrap(),
+            r#"{"source":"observed","status":"unknown"}"#
+        );
+    }
+
+    #[test]
+    fn every_legacy_string_deserializes_to_a_mark() {
+        for (raw, source) in [
+            ("\"inferred\"", EvidenceSource::Heuristic),
+            ("\"declared\"", EvidenceSource::HumanDeclared),
+            ("\"content\"", EvidenceSource::ContentDerived),
+            ("\"observed\"", EvidenceSource::Observed),
+        ] {
+            let mark: EvidenceMark = serde_json::from_str(raw).unwrap();
+            assert_eq!(mark, EvidenceMark::of(source), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_mark_roundtrips_through_serde() {
+        let mark = EvidenceMark {
+            source: EvidenceSource::ContentDerived,
+            status: EvidenceStatus::Verified,
+        };
+        let json = serde_json::to_string(&mark).unwrap();
+        let back: EvidenceMark = serde_json::from_str(&json).unwrap();
+        assert_eq!(mark, back);
+    }
+
+    #[test]
+    fn merge_prefers_the_stronger_source_with_its_complete_mark() {
+        let observed_unknown = EvidenceMark::of(EvidenceSource::Observed);
+        let heuristic_verified = EvidenceMark {
+            source: EvidenceSource::Heuristic,
+            status: EvidenceStatus::Verified,
+        };
+
+        // Staerkere Quelle gewinnt komplett — kein Mischstatus: Der geprüfte
+        // Heuristik-Beleg macht die beobachtete Kante nicht „verified".
+        assert_eq!(observed_unknown.merge(heuristic_verified), observed_unknown);
+        assert_eq!(heuristic_verified.merge(observed_unknown), observed_unknown);
+
+        // Gleiche Quelle: der Status entscheidet.
+        let observed_verified = EvidenceMark {
+            source: EvidenceSource::Observed,
+            status: EvidenceStatus::Verified,
+        };
+        assert_eq!(observed_unknown.merge(observed_verified), observed_verified);
+    }
+
+    #[test]
+    fn stored_marks_never_carry_missing() {
+        // Die Invariante aus ADR-0011: `Missing` existiert nur in
+        // Verify-/Reader-Ausgaben. Alles, was Producer speichern, entsteht
+        // ueber `of()` (Unknown) oder das Legacy-Mapping (Unknown) — beide
+        // Wege koennen kein `Missing` erzeugen.
+        for source in [
+            EvidenceSource::Heuristic,
+            EvidenceSource::HumanDeclared,
+            EvidenceSource::ContentDerived,
+            EvidenceSource::Observed,
+        ] {
+            assert_eq!(EvidenceMark::of(source).status, EvidenceStatus::Unknown);
+        }
+        for legacy in [
+            Evidence::Inferred,
+            Evidence::Declared,
+            Evidence::Content,
+            Evidence::Observed,
+        ] {
+            assert_ne!(EvidenceMark::from(legacy).status, EvidenceStatus::Missing);
+        }
     }
 
     #[test]

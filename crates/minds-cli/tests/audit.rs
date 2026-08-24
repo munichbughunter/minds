@@ -130,7 +130,7 @@ fn the_bundle_carries_the_whole_chain_and_its_limits() {
     assert!(out.status.success(), "{}", stdout(&out));
     let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
 
-    assert_eq!(bundle["schema_version"], 1);
+    assert_eq!(bundle["schema_version"], 2);
 
     // Die Grenzen stehen im Artefakt, nicht nur in der Doku.
     let limits = bundle["does_not_prove"].as_array().expect("does_not_prove");
@@ -214,4 +214,201 @@ fn a_forgotten_session_stays_visible_in_the_chain() {
         session["intent"].as_str().unwrap_or_default().is_empty(),
         "der Inhalt darf nicht mehr im Bündel stehen: {session:?}"
     );
+}
+
+/// Schickt ein Hook-Event über stdin — wie der Agent es täte.
+fn feed_hook(dir: &Path, payload: &str) {
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .args(["hook", "--agent", "claude-code"]);
+    let mut child = without_user_config(&mut cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+    }
+    child.wait().unwrap();
+}
+
+#[test]
+fn the_bundle_proves_a_rejected_session_without_leaking_its_content() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+
+    // Eine zurückgewiesene Session dazu: Der Deny-Begriff steckt im eigenen
+    // Platzhalter — der Verify-Pass der Redaction bricht fail-closed ab.
+    std::fs::create_dir_all(dir.join(".minds")).unwrap();
+    std::fs::write(
+        dir.join(".minds/redact.json"),
+        r#"{"deny_pii":["redacted"]}"#,
+    )
+    .unwrap();
+    let payload = format!(
+        r#"{{"session_id":"sess-blocked","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"redacted geheimnis"}}"#,
+        dir.display()
+    );
+    feed_hook(dir, &payload);
+    minds(dir, &["checkpoint"]);
+
+    let out = minds(dir, &["audit", "--export"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
+
+    // Die gespeicherte Session trägt ihren Seal, byte-genau.
+    let sessions = &bundle["changes"][0]["sessions"];
+    let seals = sessions[0]["seals"].as_array().expect("seals");
+    assert_eq!(seals.len(), 1, "{sessions}");
+    let text = seals[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("minds-seal-v1\n"), "{text}");
+    assert!(text.contains("outcome=stored"), "{text}");
+
+    // Der Block-Seal beweist die Existenz der zurückgewiesenen Session —
+    // ohne ein Wort ihres Inhalts.
+    let rejected = bundle["rejected_seals"].as_array().expect("rejected_seals");
+    assert_eq!(rejected.len(), 1, "{bundle}");
+    let text = rejected[0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("outcome=storage_policy_rejected_payload"),
+        "{text}"
+    );
+    assert!(text.contains("session=-"), "{text}");
+    for verboten in ["redacted", "geheimnis", "prompt"] {
+        assert!(
+            !text.contains(verboten),
+            "Block-Seal leakt {verboten:?}: {text}"
+        );
+    }
+
+    // Und die neuen Zusagen stehen im Artefakt.
+    let proves = bundle["proves"].as_array().unwrap();
+    assert!(
+        proves.iter().any(|l| l
+            .as_str()
+            .is_some_and(|t| t.contains("kryptographisch erkennbar"))),
+        "{proves:?}"
+    );
+    let limits = bundle["does_not_prove"].as_array().unwrap();
+    assert!(
+        limits.iter().any(|l| l
+            .as_str()
+            .is_some_and(|t| t.contains("zwischen Append und Seal"))),
+        "{limits:?}"
+    );
+}
+
+#[test]
+fn proof_mode_keeps_the_skeleton_and_drops_the_content() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    let change = change_id_of_head(dir);
+    minds(
+        dir,
+        &[
+            "review",
+            &change,
+            "--approve",
+            "--summary",
+            "geprüft und gut",
+        ],
+    );
+    minds(
+        dir,
+        &[
+            "comment",
+            &change,
+            "--on",
+            "a.txt:1",
+            "vertraulicher hinweis",
+        ],
+    );
+
+    let out = minds(dir, &["audit", "--export", "--mode", "proof"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let text = stdout(&out);
+    let bundle: serde_json::Value = serde_json::from_str(&text).expect("gültiges JSON");
+    assert_eq!(bundle["mode"], "proof");
+
+    // Das Beweisgerüst bleibt: Ids, Payload-Texte, Seals, Verdict-Metadaten.
+    let session = &bundle["changes"][0]["sessions"][0];
+    assert!(session["id"].as_str().unwrap().starts_with("b3-"));
+    assert!(
+        session["attestation_payload"]
+            .as_str()
+            .unwrap()
+            .starts_with("minds-attestation-v1\n")
+    );
+    assert!(session["seals"].as_array().is_some_and(|s| !s.is_empty()));
+    let verdict = &bundle["changes"][0]["verdicts"][0];
+    assert_eq!(verdict["decision"], "approve");
+
+    // Der Inhalt ist weg — nicht nur die Felder, auch als Text im Artefakt.
+    for verboten in [
+        "Retry-Test reparieren",
+        "geprüft und gut",
+        "vertraulicher hinweis",
+    ] {
+        assert!(!text.contains(verboten), "proof leakt {verboten:?}");
+    }
+    assert!(
+        bundle["changes"][0]["comments"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    // Und ein erfundener Modus wird abgelehnt, mit Begründung.
+    let out = minds(dir, &["audit", "--export", "--mode", "full"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("full gibt es bewusst nicht"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_bundle_never_carries_remote_credentials() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    // Eine Remote-URL mit eingebettetem Token — der CI-Klassiker.
+    git(
+        dir,
+        &[
+            "remote",
+            "add",
+            "origin",
+            concat!(
+                "https://oauth2:glpat",
+                "-AbCdEf123456789012@gitlab.example.com/group/repo.git"
+            ),
+        ],
+    );
+
+    let out = minds(dir, &["audit", "--export"]);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        !text.contains(concat!("glpat", "-AbCdEf123456789012")),
+        "das Bundle trägt den Remote-Token: {text}"
+    );
+    assert!(text.contains("gitlab.example.com"), "{text}");
+
+    // Und im Proof-Modus entfällt das Feld ganz.
+    let proof = stdout(&minds(dir, &["audit", "--export", "--mode", "proof"]));
+    let bundle: serde_json::Value = serde_json::from_str(&proof).unwrap();
+    assert!(bundle["repository"]["origin"].is_null(), "{proof}");
 }

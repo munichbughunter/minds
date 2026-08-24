@@ -14,10 +14,11 @@ use minds_reader::model::{SessionCard, WhyChain, WhyStep};
 pub fn cards(out: &mut impl Write, cards: &[SessionCard]) -> std::io::Result<()> {
     for card in cards {
         let (_, evidence, _) = crate::theme::evidence(card.evidence);
+        let (_, seal_verdict, _) = crate::theme::provenance(&card.provenance);
         let changes: Vec<String> = card.changes.iter().map(|c| c.to_string()).collect();
         writeln!(
             out,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             card.started_at.as_deref().unwrap_or("-"),
             card.id,
             card.summary.actor,
@@ -25,6 +26,7 @@ pub fn cards(out: &mut impl Write, cards: &[SessionCard]) -> std::io::Result<()>
             card.summary.input_tokens,
             card.summary.output_tokens,
             evidence,
+            seal_verdict,
             card.review.verdict.word(),
             if changes.is_empty() {
                 "-".to_string()

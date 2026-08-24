@@ -17,7 +17,9 @@
 use std::path::Path;
 
 use minds_capture::{Journal, adapter, clock, hook_event, secretwall};
-use minds_core::{EdgeKind, Effect, EffectKind, Endpoint, Evidence, Role, Session};
+use minds_core::{
+    EdgeKind, Effect, EffectKind, Endpoint, EvidenceMark, EvidenceSource, Role, Session,
+};
 
 /// Ein fester Zeitstempel, abgeleitet aus einer Sequenz — so ist jeder Testlauf
 /// derselbe, und `at`/`at_nanos` bleiben konsistent.
@@ -201,7 +203,10 @@ fn subagent_edges_are_observed_both_ways() {
     // Elternteil → Kind, Spawned, beobachtet.
     assert_eq!(parent.edges.len(), 1);
     assert_eq!(parent.edges[0].kind, EdgeKind::Spawned);
-    assert_eq!(parent.edges[0].evidence, Evidence::Observed);
+    assert_eq!(
+        parent.edges[0].evidence,
+        EvidenceMark::of(EvidenceSource::Observed)
+    );
     assert_eq!(
         parent.edges[0].to,
         Endpoint::Session {
@@ -213,7 +218,10 @@ fn subagent_edges_are_observed_both_ways() {
     // Kind → Elternteil, SpawnedBy, beobachtet.
     assert_eq!(child.edges.len(), 1);
     assert_eq!(child.edges[0].kind, EdgeKind::SpawnedBy);
-    assert_eq!(child.edges[0].evidence, Evidence::Observed);
+    assert_eq!(
+        child.edges[0].evidence,
+        EvidenceMark::of(EvidenceSource::Observed)
+    );
     assert_eq!(
         child.edges[0].to,
         Endpoint::Session {
@@ -275,6 +283,53 @@ fn two_agents_in_one_journal() {
     // codex hat (noch) keinen Normalisierer — der Prompt wird trotzdem erfasst,
     // weil das Feld agent-unabhängig heißt; das Journal verliert nichts.
     assert_eq!(sessions[1].lineage.as_ref().unwrap().local_id, "x1");
+}
+
+// ---------------------------------------------------------------------------
+// 3b) Ein Agent ohne Adapter verliert seine Tool-Ebene nicht mehr
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_foreign_agents_tool_call_survives_as_uninterpreted() {
+    let tmp = tempfile::tempdir().unwrap();
+    let journal = journal_in(tmp.path());
+
+    feed(
+        &journal,
+        "codex",
+        None,
+        r#"{"session_id":"x2","hook_event_name":"UserPromptSubmit","prompt":"wende den Patch an"}"#,
+        0,
+    );
+    let tool_payload = r#"{"session_id":"x2","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{"diff":"--- a/x"}}"#;
+    feed(&journal, "codex", None, tool_payload, 1);
+    feed(
+        &journal,
+        "codex",
+        None,
+        r#"{"session_id":"x2","hook_event_name":"Stop"}"#,
+        2,
+    );
+
+    let sessions = adapter::build(&journal).unwrap();
+    let session = &sessions[0];
+    assert_eq!(session.agent.name, "codex");
+
+    // Vor ADR-0011 entstand hier GAR KEIN ToolCall — stiller Verlust, denn
+    // das Journal wird nach dem Checkpoint geloescht. Jetzt: beobachtet,
+    // nicht gedeutet, Roh-Payload als Beweismittel erhalten.
+    let calls: Vec<_> = session
+        .turns
+        .iter()
+        .flat_map(|t| t.tool_calls.iter())
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "apply_patch");
+    assert_eq!(calls[0].arguments, tool_payload);
+    assert!(calls[0].effect.is_none());
+    let capture = calls[0].capture.as_ref().expect("Capture-Stempel");
+    assert_eq!(capture.status, minds_core::CaptureStatus::Uninterpreted);
+    assert_eq!(capture.adapter, "generic");
 }
 
 // ---------------------------------------------------------------------------

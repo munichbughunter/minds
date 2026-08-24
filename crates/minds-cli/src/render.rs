@@ -61,7 +61,8 @@ pub fn merge_links(
         .collect();
     for link in index_links {
         if !out.iter().any(|(id, _)| *id == link.session) {
-            out.push((link.session, link.evidence));
+            // Verlustbehaftete Sicht bis Track EV.14: nur die Quelle.
+            out.push((link.session, link.evidence.into()));
         }
     }
     out
@@ -152,7 +153,7 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
                     "{cont}  Kante: {} → {} ({})",
                     edge_kind(edge.kind),
                     endpoint(&edge.to),
-                    evidence(edge.evidence),
+                    evidence(edge.evidence.into()),
                 );
             }
         } else if files > 0 {
@@ -340,6 +341,8 @@ fn endpoint(endpoint: &Endpoint) -> String {
 
 #[cfg(test)]
 mod tests {
+    use minds_core::{EvidenceMark, EvidenceSource};
+
     use super::*;
 
     fn sid(hex: char) -> SessionId {
@@ -354,11 +357,11 @@ mod tests {
         let index = vec![
             IndexLink {
                 session: sid('a'),
-                evidence: Evidence::Inferred,
+                evidence: EvidenceMark::of(EvidenceSource::Heuristic),
             },
             IndexLink {
                 session: sid('b'),
-                evidence: Evidence::Inferred,
+                evidence: EvidenceMark::of(EvidenceSource::Heuristic),
             },
         ];
         let merged = merge_links(&trailers, &index);
@@ -374,7 +377,7 @@ mod tests {
             &[],
             &[IndexLink {
                 session: sid('c'),
-                evidence: Evidence::Inferred,
+                evidence: EvidenceMark::of(EvidenceSource::Heuristic),
             }],
         );
         assert_eq!(merged, vec![(sid('c'), Evidence::Inferred)]);

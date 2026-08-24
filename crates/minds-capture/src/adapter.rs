@@ -64,6 +64,17 @@ pub struct Checkpoint<'a> {
 
     /// Der Commit, den dieser Checkpoint begleitet (post-commit-Hook).
     pub commit: Option<&'a str>,
+
+    /// Die von git **getrackten**, repo-relativen Pfade — die Grenze für
+    /// Read-Hashes (Phase 6). Getrackter Inhalt ist für jeden Leser des
+    /// Repos ohnehin sichtbar; sein Hash verrät nichts Neues. Alles andere
+    /// (untracked, absolut, außerhalb des Worktrees) bekommt beim bloßen
+    /// **Lesen** nie einen Hash — ein ungesalzener Inhalts-Hash über eine
+    /// kurze, private Datei wäre ein Bestätigungsorakel; dieselbe
+    /// Bedrohungsklasse, gegen die der Chain-Root gesalzen ist. `None`
+    /// heißt: Grenze unbekannt ⇒ keine Read-Hashes (fail-closed in Richtung
+    /// „weniger Fingerabdruck").
+    pub tracked: Option<&'a std::collections::BTreeSet<String>>,
 }
 
 /// Baut aus allen Sessions eines Journals ihre [`Session`]-Records.
@@ -142,7 +153,7 @@ pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
 pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -> Session {
     let mut session = build_one(key, events);
 
-    hash_artifacts(&mut session, ctx.root);
+    hash_artifacts(&mut session, ctx.root, ctx.tracked);
 
     session.edges.extend(edges::subagent(key.agent(), events));
     if let Some(commit) = ctx.commit {
@@ -152,21 +163,34 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
     session
 }
 
-/// Füllt den Inhalts-Hash an jedem Schreib-Effekt, dessen Datei sich lesen
-/// lässt.
+/// Füllt die Inhalts-Hashes der Effekte, deren Datei sich lesen lässt.
 ///
-/// Zwei Regeln aus [`Effect`](minds_core::Effect), beide fail-closed:
-/// - Nur **Schreib**-Effekte: Der Hash ist der Fingerabdruck des *erzeugten*
-///   Artefakts. Für ihn wird die Datei gelesen, wie sie nach dem Schreiben auf
-///   der Platte liegt.
+/// Drei Regeln, alle fail-closed:
+/// - **Schreib**-Effekte immer: Der Hash ist der Fingerabdruck des vom
+///   Agenten *erzeugten* Artefakts.
+/// - **Lese**-Effekte nur innerhalb der Read-Grenze ([`Checkpoint::tracked`]):
+///   getrackte, repo-relative Pfade — als Beweismittel für Content-Übergaben
+///   (Phase 6). Bloßes Lesen einer privaten oder repo-fremden Datei erzeugt
+///   nie einen Fingerabdruck.
 /// - **Nie** für eine Zugangsdaten-Datei: Bei einer kurzen, ratbaren Datei wäre
 ///   ein Hash ein Orakel. Die Secretfile-Mauer gilt auch für Fingerabdrücke.
-fn hash_artifacts(session: &mut Session, root: Option<&Path>) {
+fn hash_artifacts(
+    session: &mut Session,
+    root: Option<&Path>,
+    tracked: Option<&std::collections::BTreeSet<String>>,
+) {
     for call in session.turns.iter_mut().flat_map(|t| &mut t.tool_calls) {
         let Some(effect) = call.effect.as_mut() else {
             continue;
         };
-        if effect.content.is_some() || effect.kind != EffectKind::Write {
+        // Seit Phase 6 (Evidence-DAG) auch Read-Effekte: Der Hash ist das
+        // Beweismittel für Content-Übergaben zwischen Agents — „B las exakt
+        // die Bytes, die A schrieb" braucht beide Seiten. Der Hash entsteht
+        // zum Checkpoint-Zeitpunkt: Hat sich die Datei seit dem Lesen
+        // geändert, entsteht schlicht kein Match (falsch-negativ, nie
+        // falsch-positiv — ein Match heißt immer „dieselben Bytes").
+        if effect.content.is_some() || !matches!(effect.kind, EffectKind::Write | EffectKind::Read)
+        {
             continue;
         }
         let Some(path) = effect.path.as_deref() else {
@@ -174,6 +198,19 @@ fn hash_artifacts(session: &mut Session, root: Option<&Path>) {
         };
         if minds_redact::is_secret_file(path) {
             continue;
+        }
+        // Read-Grenze (siehe [`Checkpoint::tracked`]): Nur getrackte,
+        // repo-relative Pfade — bloßes Lesen einer privaten Datei erzeugt
+        // keinen Fingerabdruck. Schreib-Effekte bleiben wie bisher: Was der
+        // Agent erzeugt hat, ist sein Artefakt.
+        if effect.kind == EffectKind::Read {
+            let inside = Path::new(path).is_relative()
+                && !Path::new(path)
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir));
+            if !inside || !tracked.is_some_and(|set| set.contains(path)) {
+                continue;
+            }
         }
         if let Some(bytes) = read_artifact(root, path) {
             let digest = blake3::hash(&bytes);
@@ -257,6 +294,7 @@ fn build_turns(agent: &str, events: &[JournalEvent], transcript: &Transcript) ->
                         name: tool.name,
                         arguments: tool.arguments,
                         effect: tool.effect,
+                        capture: Some(tool.capture),
                     });
                 }
             }
@@ -440,6 +478,8 @@ mod tests {
             cwd: Some("/home/anna/projects/minds".into()),
             transcript_path: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
+            payload_hash: None,
+            event_hash: None,
         }
     }
 
@@ -608,6 +648,7 @@ mod tests {
         let ctx = Checkpoint {
             root: Some(dir.path()),
             commit: None,
+            tracked: None,
         };
         let s = checkpoint(&key(), &events, &ctx);
 
@@ -633,6 +674,7 @@ mod tests {
         let ctx = Checkpoint {
             root: None,
             commit: Some("deadbeefcafe"),
+            tracked: None,
         };
         let s = checkpoint(&key(), &events, &ctx);
         assert_eq!(s.edges.len(), 1);
@@ -712,25 +754,71 @@ mod tests {
     }
 
     #[test]
-    fn a_read_effect_is_not_hashed_as_an_artifact() {
+    fn a_read_effect_is_hashed_but_a_secret_read_never() {
+        // Seit Phase 6 traegt auch ein Read-Effekt den Inhalts-Hash — das
+        // Beweismittel fuer Content-Uebergaben. Die Orakel-Regel gilt
+        // unveraendert: Secret-Dateien bekommen nie einen Hash.
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("read.rs"), b"content").unwrap();
-        let events = vec![ev(
-            0,
-            EventKind::ToolPre,
-            "PreToolUse",
-            "t0",
-            r#"{"tool_name":"Read","tool_input":{"file_path":"read.rs"}}"#,
-        )];
+        fs::write(dir.path().join(".env"), b"SECRET=x").unwrap();
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                r#"{"tool_name":"Read","tool_input":{"file_path":"read.rs"}}"#,
+            ),
+            ev(
+                1,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t1",
+                r#"{"tool_name":"Read","tool_input":{"file_path":".env"}}"#,
+            ),
+        ];
+        // Die Read-Grenze: nur getrackte Pfade bekommen einen Lese-Hash.
+        let tracked: std::collections::BTreeSet<String> = ["read.rs".to_string()].into();
         let ctx = Checkpoint {
             root: Some(dir.path()),
             commit: None,
+            tracked: Some(&tracked),
         };
         let s = checkpoint(&key(), &events, &ctx);
-        let effect = s.turns[0].tool_calls[0].effect.as_ref().unwrap();
-        assert!(
-            effect.content.is_none(),
-            "nur Schreib-Effekte sind Artefakte"
+        let calls: Vec<_> = s.turns.iter().flat_map(|t| t.tool_calls.iter()).collect();
+        let read = calls
+            .iter()
+            .find(|c| c.effect.as_ref().and_then(|e| e.path.as_deref()) == Some("read.rs"))
+            .unwrap();
+        let expected = ContentHash::from_bytes(*blake3::hash(b"content").as_bytes());
+        assert_eq!(
+            read.effect.as_ref().unwrap().content.as_ref(),
+            Some(&expected)
         );
+        // Ohne tracked-Set (Grenze unbekannt) entsteht fuer Reads NIE ein
+        // Hash — fail-closed in Richtung „weniger Fingerabdruck".
+        let ctx_unbounded = Checkpoint {
+            root: Some(dir.path()),
+            commit: None,
+            tracked: None,
+        };
+        let s2 = checkpoint(&key(), &events, &ctx_unbounded);
+        let read2 = s2
+            .turns
+            .iter()
+            .flat_map(|t| t.tool_calls.iter())
+            .find(|c| c.effect.as_ref().and_then(|e| e.path.as_deref()) == Some("read.rs"))
+            .unwrap();
+        assert!(read2.effect.as_ref().unwrap().content.is_none());
+
+        // Die Secretwall hat den .env-Aufruf schon auf dem heissen Pfad
+        // gewallt — hier darf so oder so nie ein Hash entstehen.
+        for call in &calls {
+            if let Some(effect) = &call.effect {
+                if effect.path.as_deref() == Some(".env") {
+                    assert!(effect.content.is_none(), "Hash-Orakel ueber Secret-Datei");
+                }
+            }
+        }
     }
 }

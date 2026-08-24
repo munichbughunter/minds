@@ -485,6 +485,7 @@ mod tests {
 
     fn call(name: &str, arguments: &str, kind: EffectKind, path: Option<&str>) -> ToolCall {
         ToolCall {
+            capture: None,
             name: name.into(),
             arguments: arguments.into(),
             effect: Some(Effect {
@@ -729,6 +730,7 @@ mod tests {
         // einen Fehler.
         let mut s = session("no effects");
         s.turns.push(assistant(vec![ToolCall {
+            capture: None,
             name: "Bash".into(),
             arguments: r#"{"command":"cargo test"}"#.into(),
             effect: None,

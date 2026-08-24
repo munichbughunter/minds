@@ -38,15 +38,56 @@ use crate::config;
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Schema-Version des Bündels. Ein Auditor liest sie zuerst.
-const BUNDLE_SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (ADR-0011): je Session ihre Evidence-Seals (byte-genauer Text plus
+/// Signatur), dazu die sessionlosen Block-Seals unter `rejected_seals` —
+/// zurückgehaltene Sessions sind Teil der Kette, nicht ihr blinder Fleck.
+const BUNDLE_SCHEMA_VERSION: u32 = 2;
+
+/// Der Zuschnitt des Bündels (Phase 7).
+///
+/// **`full` gibt es absichtlich nicht:** Der Store hält ausschließlich
+/// redigierte Sessions (fail-closed) — ein Modus, der „mehr als redacted"
+/// verspräche, wäre ein leeres Versprechen oder ein Leck. `redacted` ist
+/// deshalb das Maximum, `proof` das Minimum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Alles, was der Store hergibt: Intents, Payloads, Verdicts, Kommentare,
+    /// Seals. Der bisherige (und Default-)Zuschnitt.
+    Redacted,
+    /// Nur das Beweisgerüst: Ids, kanonische Payload-Texte, Seals samt
+    /// Signaturen, Verdict-Metadaten. Kein Intent, keine Zusammenfassungen,
+    /// keine Kommentare — prüfbar, ohne Inhalt weiterzugeben.
+    Proof,
+}
+
+impl Mode {
+    fn word(self) -> &'static str {
+        match self {
+            Mode::Redacted => "redacted",
+            Mode::Proof => "proof",
+        }
+    }
+}
 
 /// Führt `minds audit` aus.
-pub fn run(export: bool, out: Option<&str>, base: Option<&str>) -> ExitCode {
+pub fn run(export: bool, out: Option<&str>, base: Option<&str>, mode: Option<&str>) -> ExitCode {
     if !export {
         eprintln!("minds audit: erwartet --export");
         return ExitCode::FAILURE;
     }
-    match audit(out, base) {
+    let mode = match mode {
+        None | Some("redacted") => Mode::Redacted,
+        Some("proof") => Mode::Proof,
+        Some(other) => {
+            eprintln!(
+                "minds audit: unbekannter Modus {other:?} — redacted oder proof \
+                 (full gibt es bewusst nicht: der Store hält nur Redigiertes)"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    match audit(out, base, mode) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("minds audit: {err}");
@@ -60,6 +101,8 @@ pub fn run(export: bool, out: Option<&str>, base: Option<&str>) -> ExitCode {
 #[derive(Debug, Serialize)]
 struct Bundle {
     schema_version: u32,
+    /// Der Zuschnitt: `redacted` oder `proof`.
+    mode: &'static str,
     generated_at: String,
     repository: RepositoryInfo,
     /// Was dieses Bündel belegt — und was nicht. Im Artefakt selbst, nicht nur
@@ -67,6 +110,11 @@ struct Bundle {
     proves: Vec<String>,
     does_not_prove: Vec<String>,
     changes: Vec<ChangeRecord>,
+    /// Block-Seals (ADR-0011): Sessions, deren Nutzlast die Speicher-Policy
+    /// zurückwies. Es gibt keine Session-Id — der Seal ist der Beweis, dass
+    /// der Bereich existierte.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rejected_seals: Vec<SealRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -104,6 +152,21 @@ struct SessionRecord {
     /// bleibt in der Kette **sichtbar** — das ist der Punkt an einer redigierbaren
     /// Nutzlast: Die Referenz ist auflösbar, der Inhalt weg.
     payload: PayloadState,
+    /// Die Evidence-Seals der Session (ADR-0011), in Epochen-Reihenfolge.
+    /// Byte-genau — `seal_id = derive_key(\"minds/evidence/v1/seal\", text)`
+    /// lässt sich extern nachrechnen, eine Signatur dagegen prüfen.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    seals: Vec<SealRecord>,
+}
+
+/// Ein Seal, byte-genau, mit seiner Signatur.
+#[derive(Debug, Serialize)]
+struct SealRecord {
+    id: String,
+    /// Der Seal-Text, exakt wie abgelegt — die signierten Bytes.
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -149,7 +212,7 @@ struct CommentRecord {
 
 // --- Der Aufbau -------------------------------------------------------------
 
-fn audit(out: Option<&str>, base: Option<&str>) -> Fallible<()> {
+fn audit(out: Option<&str>, base: Option<&str>, mode: Mode) -> Fallible<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::discover(&cwd)?;
     let root = repo_root(&repo);
@@ -212,18 +275,42 @@ fn audit(out: Option<&str>, base: Option<&str>) -> Fallible<()> {
         }
     }
 
+    // Der Proof-Zuschnitt: das Beweisgerüst behalten, den Inhalt entfernen.
+    // Bewusst NACH dem vollen Aufbau — ein Filter über fertigen Records kann
+    // nichts vergessen, was ein zweiter Aufbau-Pfad vergessen könnte.
+    if mode == Mode::Proof {
+        for record in grouped.values_mut() {
+            for session in &mut record.sessions {
+                session.intent.clear();
+            }
+            for verdict in &mut record.verdicts {
+                verdict.summary.clear();
+            }
+            record.comments.clear();
+        }
+    }
+
     let (generated_at, _) = minds_capture::clock::now();
     let bundle = Bundle {
         schema_version: BUNDLE_SCHEMA_VERSION,
+        mode: mode.word(),
         generated_at,
         repository: RepositoryInfo {
             head: head.to_string(),
             branch: repo.head()?.branch().map(str::to_owned),
-            origin: git(&root, &["remote", "get-url", "origin"]),
+            // Eine Remote-URL kann eingebettete Zugangsdaten tragen
+            // (`https://oauth2:glpat-…@…`) — die Senken-Redaktion aus #92
+            // greift auch hier; im Proof-Modus entfällt das Feld ganz.
+            origin: match mode {
+                Mode::Proof => None,
+                Mode::Redacted => git(&root, &["remote", "get-url", "origin"])
+                    .map(|url| crate::text::without_url_credentials(&url)),
+            },
         },
         proves: proves(),
         does_not_prove: does_not_prove(),
         changes: grouped.into_values().collect(),
+        rejected_seals: rejected_seal_records(store.as_ref()),
     };
 
     let json = serde_json::to_string_pretty(&bundle)?;
@@ -252,6 +339,8 @@ fn proves() -> Vec<String> {
         "Der review_payload bindet den Hash des Verdicts; eine gültige Signatur darüber weist aus, wer geprüft hat.",
         "Verdicts hängen an der Change-Id und überleben damit Rebase und Force-Push.",
         "Eine getilgte Session bleibt als Referenz sichtbar (payload: forgotten) — Löschung ist nachweisbar, nicht spurlos.",
+        "Für versiegelte Bereiche sind Manipulation und Lücken kryptographisch erkennbar: seal_id = blake3::derive_key(\"minds/evidence/v1/seal\", text), der Root bindet jedes Event und jede Lücke (ADR-0011).",
+        "Ein Block-Seal (rejected_seals) beweist, dass eine Session existierte, deren Nutzlast die Speicher-Policy zurückwies — ohne ihren Inhalt preiszugeben.",
     ]
     .iter()
     .map(|line| line.to_string())
@@ -266,6 +355,11 @@ fn does_not_prove() -> Vec<String> {
         "Nicht, dass ein Modell das getan hat, was im Transkript steht — aufgezeichnet ist, was der Agent gemeldet hat.",
         "Nicht, wer die Signaturschlüssel kontrolliert. Ohne eine allowed_signers-Datei aus vertrauenswürdiger Quelle ist eine Signatur nur eine Selbstauskunft.",
         "Nicht, dass unsignierte Einträge echt sind: Sie sind content-adressiert, aber niemand steht mit einem Schlüssel dafür ein.",
+        "Nicht, dass außerhalb versiegelter Bereiche nichts geschah — ein Seal claimt nur den tatsächlich gelesenen Sequenzbereich seiner Epoche.",
+        "Nicht die Integrität zwischen Append und Seal: Bis zum Checkpoint schützt nur das Dateisystem; ein lokaler Schreibzugriff vor der Versiegelung ist nicht erkennbar (ADR-0011, Entscheidung 1).",
+        "Nicht, dass der Agent-Prozess der einzige Akteur war: Subprozesse, Netzwerkzugriffe und Plugins außerhalb der Hook-Grenze (scope im Seal) sind nicht erfasst — Coverage heißt vollständig innerhalb der Grenze, nie Systemaktivität.",
+        "Nicht die Wirkung ungedeuteter Tool-Aufrufe: capture=uninterpreted heißt beobachtet, aber die Effekte sind nicht normalisiert — die Deutungs-Achse ist von Integrität und Coverage getrennt.",
+        "Nicht die reale Uhrzeit: Zeitstempel stammen von der lokalen Uhr des Hooks, ohne externen Zeitanker.",
     ]
     .iter()
     .map(|line| line.to_string())
@@ -290,19 +384,20 @@ fn session_record(store: &dyn ContextStore, id: SessionId) -> Fallible<SessionRe
                 intent: session.intent.request.clone(),
                 attestation_payload: payload_text,
                 payload,
+                seals: seal_records_of(store, id),
             })
         }
         // Getilgt: Die Referenz bleibt in der Kette, der Inhalt fehlt. Genau das
         // soll ein Auditor sehen können.
         Err(minds_store::StoreError::Forgotten { .. }) => {
-            Ok(forgotten(id, PayloadState::Forgotten))
+            Ok(forgotten(store, id, PayloadState::Forgotten))
         }
-        Ok(None) => Ok(forgotten(id, PayloadState::Missing)),
+        Ok(None) => Ok(forgotten(store, id, PayloadState::Missing)),
         Err(err) => Err(err.into()),
     }
 }
 
-fn forgotten(id: SessionId, payload: PayloadState) -> SessionRecord {
+fn forgotten(store: &dyn ContextStore, id: SessionId, payload: PayloadState) -> SessionRecord {
     SessionRecord {
         id: id.to_string(),
         agent: String::new(),
@@ -310,7 +405,52 @@ fn forgotten(id: SessionId, payload: PayloadState) -> SessionRecord {
         intent: String::new(),
         attestation_payload: String::new(),
         payload,
+        // Auch eine getilgte Session behält ihre Seals — der payload-freie
+        // Beweis überlebt das forget (ADR-0011, Entscheidung 4).
+        seals: seal_records_of(store, id),
     }
+}
+
+/// Die Seals einer Session als Bündel-Einträge, best-effort: Was nicht lesbar
+/// ist, fehlt — das Bündel bricht an einem kaputten Seal nicht ab.
+fn seal_records_of(store: &dyn ContextStore, id: SessionId) -> Vec<SealRecord> {
+    let Ok(seal_ids) = store.seals_of(id) else {
+        return Vec::new();
+    };
+    seal_ids
+        .iter()
+        .filter_map(|seal_id| {
+            let text = store.seal_text(seal_id).ok().flatten()?;
+            let signature = store.seal_signature(seal_id).ok().flatten();
+            Some(SealRecord {
+                id: seal_id.to_string(),
+                text,
+                signature,
+            })
+        })
+        .collect()
+}
+
+/// Die sessionlosen Block-Seals des Repos.
+fn rejected_seal_records(store: &dyn ContextStore) -> Vec<SealRecord> {
+    let Ok(all) = store.list_seals() else {
+        return Vec::new();
+    };
+    all.iter()
+        .filter_map(|seal_id| {
+            let text = store.seal_text(seal_id).ok().flatten()?;
+            let seal = minds_core::evidence::Seal::parse(&text).ok()?;
+            if !matches!(seal.outcome, minds_core::evidence::SealOutcome::Rejected) {
+                return None;
+            }
+            let signature = store.seal_signature(seal_id).ok().flatten();
+            Some(SealRecord {
+                id: seal_id.to_string(),
+                text,
+                signature,
+            })
+        })
+        .collect()
 }
 
 fn verdict_record(store: &ReviewStore, review: &Review) -> Fallible<VerdictRecord> {

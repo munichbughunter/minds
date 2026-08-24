@@ -33,6 +33,10 @@ pub enum ToolKind {
     Delete,
     /// Unbekannt oder ohne Effekt.
     Other,
+    /// Beobachtet, aber von keinem Adapter gedeutet (ADR-0011):
+    /// `capture.status = uninterpreted`. Name und Roh-Argumente sind
+    /// erhalten, die Wirkung ist unbekannt — und genau das sagt der Knoten.
+    Uninterpreted,
 }
 
 impl ToolKind {
@@ -54,6 +58,7 @@ impl ToolKind {
             ToolKind::Exec => "EXEC",
             ToolKind::Delete => "DELETE",
             ToolKind::Other => "TOOL",
+            ToolKind::Uninterpreted => "BEOBACHTET",
         }
     }
 }
@@ -71,6 +76,16 @@ pub enum NodeKind {
     Tool(ToolKind),
     /// Ein gestarteter Sub-Agent.
     Subagent(SessionId),
+    /// Eine Content-Übergabe (Evidence-DAG, Phase 6): dieselben Bytes,
+    /// von der anderen Session geschrieben bzw. gelesen — nachgerechnet
+    /// über identische Inhalts-Hashes, nicht beobachtet.
+    Handover {
+        /// Die andere Session.
+        other: SessionId,
+        /// `true`: diese Session LAS, was `other` schrieb (eingehende
+        /// Übergabe); `false`: `other` las, was diese Session schrieb.
+        incoming: bool,
+    },
     /// Eine Änderung (Change-Id).
     Change(minds_core::ChangeId),
     /// Ein Commit ohne Change-Id.
@@ -183,7 +198,15 @@ impl SessionGraph {
             );
             turn_nodes.push(node);
             for call in &turn.tool_calls {
-                let kind = ToolKind::of(call.effect.as_ref().map(|e| e.kind));
+                let uninterpreted = call
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| c.status == minds_core::CaptureStatus::Uninterpreted);
+                let kind = if uninterpreted {
+                    ToolKind::Uninterpreted
+                } else {
+                    ToolKind::of(call.effect.as_ref().map(|e| e.kind))
+                };
                 let path = call
                     .effect
                     .as_ref()
@@ -199,6 +222,22 @@ impl SessionGraph {
                     ("Tool".into(), sanitize(&call.name)),
                     ("Argumente".into(), truncate(&sanitize(&call.arguments))),
                 ];
+                if let Some(capture) = &call.capture {
+                    let status = match capture.status {
+                        minds_core::CaptureStatus::Interpreted => "gedeutet",
+                        minds_core::CaptureStatus::Uninterpreted => {
+                            "beobachtet, nicht gedeutet — Wirkung unbekannt"
+                        }
+                    };
+                    detail.push((
+                        "Deutung".into(),
+                        format!(
+                            "{status} ({} v{})",
+                            sanitize(&capture.adapter),
+                            capture.adapter_version
+                        ),
+                    ));
+                }
                 if let Some(effect) = &call.effect {
                     detail.push(("Effekt".into(), kind.word().into()));
                     if let Some(p) = &path {
@@ -248,6 +287,36 @@ impl SessionGraph {
                     (
                         "Beleg".into(),
                         format!("{:?}", edge.evidence).to_lowercase(),
+                    ),
+                ],
+                None,
+                None,
+            );
+        }
+
+        // Content-Übergaben (Evidence-DAG): eine Projektion über den
+        // Inhalts-Hashes — hier hängen sie als Kinder des Agenten, denn sie
+        // sind semantische Beziehungen, keine Glieder der temporalen Kette.
+        for link in index.content_links_of(id) {
+            let incoming = link.to == id;
+            let other = if incoming { link.from } else { link.to };
+            let direction = if incoming {
+                "liest von"
+            } else {
+                "schreibt für"
+            };
+            let other_short: String = other.to_string().chars().take(11).collect();
+            graph.push(
+                Some(agent),
+                NodeKind::Handover { other, incoming },
+                format!("{} {} · {other_short}…", direction, link.path),
+                vec![
+                    ("Session".into(), other.to_string()),
+                    ("Pfad".into(), link.path.clone()),
+                    ("Inhalt".into(), link.hash.to_string()),
+                    (
+                        "Beleg".into(),
+                        "content [nachgerechnet] — dieselben Bytes, kein Zeitstempel nötig".into(),
                     ),
                 ],
                 None,
@@ -383,7 +452,9 @@ fn truncate(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use minds_core::{Agent, Edge, Effect, Evidence, Intent, Lineage, Model, ToolCall, Turn};
+    use minds_core::{
+        Agent, Edge, Effect, EvidenceMark, EvidenceSource, Intent, Lineage, Model, ToolCall, Turn,
+    };
     use std::collections::BTreeMap;
 
     fn sid(c: char) -> SessionId {
@@ -417,8 +488,111 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_content_handover_appears_as_its_own_node() {
+        use minds_core::ContentHash;
+
+        // A schreibt foo.rs, B liest dieselben Bytes — im Graphen von B
+        // steht die Uebergabe als eigener Knoten, mit Beleg-Satz.
+        let hash = ContentHash::from_bytes([3u8; 32]);
+        let mut a = session("schreibt foo");
+        a.redaction.applied = true;
+        a.turns.push(turn(
+            Role::Assistant,
+            "",
+            None,
+            vec![ToolCall {
+                capture: None,
+                name: "Write".into(),
+                arguments: String::new(),
+                effect: Some(Effect {
+                    kind: EffectKind::Write,
+                    path: Some("foo.rs".into()),
+                    content: Some(hash.clone()),
+                }),
+            }],
+        ));
+        let mut b = session("liest foo");
+        b.redaction.applied = true;
+        b.turns.push(turn(
+            Role::Assistant,
+            "",
+            None,
+            vec![ToolCall {
+                capture: None,
+                name: "Read".into(),
+                arguments: String::new(),
+                effect: Some(Effect {
+                    kind: EffectKind::Read,
+                    path: Some("foo.rs".into()),
+                    content: Some(hash),
+                }),
+            }],
+        ));
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid('a'), a);
+        sessions.insert(sid('b'), b);
+        let index = Index::from_parts(sessions, BTreeMap::new());
+
+        let g = SessionGraph::of(
+            sid('b'),
+            index.session(sid('b')).unwrap(),
+            &index,
+            &crate::model::ReviewState::open(),
+        );
+        let handover = g
+            .nodes
+            .iter()
+            .find(|n| matches!(n.kind, NodeKind::Handover { .. }))
+            .expect("Uebergabe-Knoten");
+        assert!(
+            handover.label.starts_with("liest von foo.rs"),
+            "{}",
+            handover.label
+        );
+        assert!(matches!(
+            handover.kind,
+            NodeKind::Handover { other, incoming: true } if other == sid('a')
+        ));
+        assert!(
+            handover
+                .detail
+                .iter()
+                .any(|(k, v)| k == "Beleg" && v.contains("nachgerechnet")),
+            "{:?}",
+            handover.detail
+        );
+
+        // Und im Graphen von A dieselbe Beziehung, auslaufend.
+        let g = SessionGraph::of(
+            sid('a'),
+            index.session(sid('a')).unwrap(),
+            &index,
+            &crate::model::ReviewState::open(),
+        );
+        let out = g
+            .nodes
+            .iter()
+            .find(|n| {
+                matches!(
+                    n.kind,
+                    NodeKind::Handover {
+                        incoming: false,
+                        ..
+                    }
+                )
+            })
+            .expect("auslaufende Uebergabe");
+        assert!(
+            out.label.starts_with("schreibt für foo.rs"),
+            "{}",
+            out.label
+        );
+    }
+
     fn call(name: &str, args: &str, kind: Option<EffectKind>, path: Option<&str>) -> ToolCall {
         ToolCall {
+            capture: None,
             name: name.into(),
             arguments: args.into(),
             effect: kind.map(|kind| Effect {
@@ -520,7 +694,7 @@ mod tests {
                 agent: "claude-code".into(),
                 local_id: "c".into(),
             },
-            evidence: Evidence::Observed,
+            evidence: EvidenceMark::of(EvidenceSource::Observed),
         });
         parent.edges.push(Edge {
             kind: EdgeKind::Spawned,
@@ -528,7 +702,7 @@ mod tests {
                 agent: "claude-code".into(),
                 local_id: "unbekannt".into(),
             },
-            evidence: Evidence::Observed,
+            evidence: EvidenceMark::of(EvidenceSource::Observed),
         });
         let mut child = session("Kind");
         child.lineage = Some(Lineage::new("c"));

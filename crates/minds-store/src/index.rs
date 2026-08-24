@@ -20,13 +20,13 @@
 //! ungekennzeichneter Pfeil wäre eine Behauptung, die wir nicht decken. Eine
 //! importierte Zuordnung ist heuristisch (die geschriebenen Dateien der Session,
 //! geschnitten mit denen eines Commits im Zeitfenster) — also
-//! [`Inferred`](minds_core::Evidence::Inferred). Ein Reader darf „vermutet" von
+//! [`Heuristic`](minds_core::EvidenceSource::Heuristic). Ein Reader darf „vermutet" von
 //! „beobachtet" unterscheiden; ohne das Feld müsste er beides gleich behandeln
 //! und wäre im Zweifel unehrlich.
 
 use std::collections::BTreeMap;
 
-use minds_core::{Evidence, SessionId};
+use minds_core::{EvidenceMark, SessionId};
 use serde::{Deserialize, Serialize};
 
 /// Eine Zuordnung Commit → Sessions, jede Kante mit ihrer Herkunft.
@@ -44,8 +44,10 @@ pub struct CommitIndex {
 pub struct IndexLink {
     /// Die verknüpfte Session.
     pub session: SessionId,
-    /// Woher die Verknüpfung stammt. Für Importe [`Evidence::Inferred`].
-    pub evidence: Evidence,
+    /// Woher die Verknüpfung stammt — und ob sie geprüft wurde. Für Importe
+    /// `(Heuristic, Unknown)`. Liest tolerant auch die Legacy-Stringform aus
+    /// Bestands-Indizes (siehe [`EvidenceMark`]).
+    pub evidence: EvidenceMark,
 }
 
 impl CommitIndex {
@@ -55,12 +57,18 @@ impl CommitIndex {
     }
 
     /// Trägt eine Kante ein — idempotent: dieselbe Session am selben Commit gibt
-    /// es nur einmal. Kommt sie mit stärkerer Herkunft erneut, gewinnt die
-    /// stärkere (`max` über [`Evidence`], das dafür geordnet ist).
-    pub fn link(&mut self, commit_hex: impl Into<String>, session: SessionId, evidence: Evidence) {
+    /// es nur einmal. Kommt sie mit stärkerem Beleg erneut, gewinnt der
+    /// stärkere ([`EvidenceMark::merge`], ADR-0011: erst die Quelle, dann der
+    /// Status).
+    pub fn link(
+        &mut self,
+        commit_hex: impl Into<String>,
+        session: SessionId,
+        evidence: EvidenceMark,
+    ) {
         let links = self.commits.entry(commit_hex.into()).or_default();
         if let Some(existing) = links.iter_mut().find(|l| l.session == session) {
-            existing.evidence = existing.evidence.max(evidence);
+            existing.evidence = existing.evidence.merge(evidence);
         } else {
             links.push(IndexLink { session, evidence });
         }
@@ -92,7 +100,17 @@ impl CommitIndex {
 
 #[cfg(test)]
 mod tests {
+    use minds_core::{EvidenceSource, EvidenceStatus};
+
     use super::*;
+
+    fn observed() -> EvidenceMark {
+        EvidenceMark::of(EvidenceSource::Observed)
+    }
+
+    fn inferred() -> EvidenceMark {
+        EvidenceMark::of(EvidenceSource::Heuristic)
+    }
 
     fn sid(hex: char) -> SessionId {
         format!("b3-{}", hex.to_string().repeat(64))
@@ -103,10 +121,10 @@ mod tests {
     #[test]
     fn a_link_is_recorded_and_found() {
         let mut index = CommitIndex::new();
-        index.link("deadbeef", sid('a'), Evidence::Inferred);
+        index.link("deadbeef", sid('a'), inferred());
         assert_eq!(index.links_of("deadbeef").len(), 1);
         assert_eq!(index.links_of("deadbeef")[0].session, sid('a'));
-        assert_eq!(index.links_of("deadbeef")[0].evidence, Evidence::Inferred);
+        assert_eq!(index.links_of("deadbeef")[0].evidence, inferred());
     }
 
     #[test]
@@ -117,42 +135,62 @@ mod tests {
     #[test]
     fn the_same_session_is_not_duplicated() {
         let mut index = CommitIndex::new();
-        index.link("c", sid('a'), Evidence::Inferred);
-        index.link("c", sid('a'), Evidence::Inferred);
+        index.link("c", sid('a'), inferred());
+        index.link("c", sid('a'), inferred());
         assert_eq!(index.links_of("c").len(), 1);
     }
 
     #[test]
     fn a_stronger_evidence_wins() {
         let mut index = CommitIndex::new();
-        index.link("c", sid('a'), Evidence::Inferred);
-        index.link("c", sid('a'), Evidence::Observed);
-        assert_eq!(index.links_of("c")[0].evidence, Evidence::Observed);
+        index.link("c", sid('a'), inferred());
+        index.link("c", sid('a'), observed());
+        assert_eq!(index.links_of("c")[0].evidence, observed());
         // Und nicht zurück:
-        index.link("c", sid('a'), Evidence::Inferred);
-        assert_eq!(index.links_of("c")[0].evidence, Evidence::Observed);
+        index.link("c", sid('a'), inferred());
+        assert_eq!(index.links_of("c")[0].evidence, observed());
     }
 
     #[test]
     fn several_sessions_at_one_commit() {
         let mut index = CommitIndex::new();
-        index.link("c", sid('a'), Evidence::Inferred);
-        index.link("c", sid('b'), Evidence::Inferred);
+        index.link("c", sid('a'), inferred());
+        index.link("c", sid('b'), inferred());
         assert_eq!(index.links_of("c").len(), 2);
     }
 
     #[test]
     fn serializes_as_a_plain_commit_map() {
         let mut index = CommitIndex::new();
-        index.link("deadbeef", sid('a'), Evidence::Inferred);
+        index.link("deadbeef", sid('a'), inferred());
         let json = serde_json::to_string(&index).unwrap();
         assert!(
             json.starts_with(r#"{"deadbeef":[{"session":"b3-"#),
             "{json}"
         );
-        assert!(json.contains(r#""evidence":"inferred""#));
+        // Ab Schema 2 die Objektform — golden, weil Fremdleser sie parsen.
+        assert!(
+            json.contains(r#""evidence":{"source":"heuristic","status":"unknown"}"#),
+            "{json}"
+        );
 
         let back: CommitIndex = serde_json::from_str(&json).unwrap();
         assert_eq!(back, index);
+    }
+
+    #[test]
+    fn a_legacy_index_with_string_evidence_still_reads() {
+        // So sehen Bestands-Indizes (Schema 1) aus: `tolerant lesen` heißt,
+        // dass der Legacy-String weiter verstanden wird — auf Status Unknown.
+        let json = format!(
+            r#"{{"deadbeef":[{{"session":"b3-{}","evidence":"observed"}}]}}"#,
+            "a".repeat(64)
+        );
+        let index: CommitIndex = serde_json::from_str(&json).unwrap();
+        assert_eq!(index.links_of("deadbeef")[0].evidence, observed());
+        assert_eq!(
+            index.links_of("deadbeef")[0].evidence.status,
+            EvidenceStatus::Unknown
+        );
     }
 }
