@@ -1,320 +1,325 @@
-# ADR-0011 — Evidence Chain: beweisbare Beobachtung, beweisbare Lücken
+# ADR-0011 — Evidence Chain: provable observation, provable gaps
 
-- Status: angenommen
-- Datum: 2026-08-24
-- Betrifft: `minds-core`, `minds-capture`, `minds-store`, `minds-cli`, `minds-reader`, `minds-tui`
-- Verwandt: ADR-0003 (Hooks statt Transkript-Parsing), ADR-0004 (Store-Index, Evidence-Klassen),
-  ADR-0008 (Signierte Attribution), ADR-0010 (Ein Ref je Session);
-  Umsetzungsplan: `briefing-evidence-chain.md` (Track EV)
+- Status: accepted
+- Date: 2026-08-24
+- Affects: `minds-core`, `minds-capture`, `minds-store`, `minds-cli`, `minds-reader`, `minds-tui`
+- Related: ADR-0003 (hooks over transcript parsing), ADR-0004 (store index, evidence classes),
+  ADR-0008 (signed attribution), ADR-0010 (one ref per session);
+  implementation plan: Track EV
 
-## Kontext
+## Context
 
-Minds ist kryptographisch **adressiert**: `SessionId = BLAKE3(kanonische Session)`, Sessions
-liegen content-adressiert unter `refs/minds/store/`, Attribution und Reviews sind signierbar.
-Was ein Auditor damit prüfen kann, ist die Integrität dessen, **was gespeichert wurde**.
+Minds is cryptographically **addressed**: `SessionId = BLAKE3(canonical session)`, sessions
+live content-addressed under `refs/minds/store/`, attribution and reviews are signable.
+What an auditor can check with that is the integrity of **what was stored**.
 
-Was er nicht prüfen kann, ist der **Erfassungsbereich**: Woher weiß er, dass zwischen zwei
-Events nichts fehlt? Dass ein Hook nicht ausgefallen ist? Dass eine Session nicht existierte,
-deren Speicherung die Redaction abgelehnt hat? Heute erkennt das Journal Sequenz-Lücken beim
-Lesen — aber `checkpoint` verwirft diese Erkenntnis, löscht das Journal danach, und ein
-Redaction-Block hinterlässt außer einer `hook.log`-Zeile nichts. Eine erkannte Lücke ist kein
-Beweis einer Lücke, und ein nicht vorhandenes Event kann nicht signiert werden.
+What they cannot check is the **capture scope**: how do they know that nothing is missing
+between two events? That a hook did not fail? That no session existed whose storage the
+redaction rejected? Today the journal detects sequence gaps on read — but `checkpoint`
+discards that finding, deletes the journal afterwards, and a redaction block leaves nothing
+behind except a `hook.log` line. A detected gap is not proof of a gap, and an event that
+does not exist cannot be signed.
 
-Das Audit-Bündel sagt es selbst ehrlich: „beweist keine Vollständigkeit". Dieses ADR macht aus
-dieser Einschränkung eine prüfbare Aussage.
+The audit bundle itself says so honestly: "proves no completeness". This ADR turns that
+limitation into a checkable statement.
 
-## Grundsatz
+## Principle
 
-> **Minds darf niemals aus dem Fehlen einer Evidence auf das Fehlen eines Ereignisses
-> schließen.** Kein Evidence-Record bedeutet *unbekannt* — außer der Beobachtungsbereich ist
-> versiegelt, und das Nichtvorhandensein ist damit selbst eine prüfbare Aussage.
+> **Minds must never infer the absence of an event from the absence of evidence.**
+> No evidence record means *unknown* — unless the observation scope is sealed, and the
+> absence is thereby itself a checkable statement.
 
-Daraus folgen drei Trennungen, die überall gelten:
+Three separations follow, valid everywhere:
 
-1. **VALID ≠ COMPLETE.** Integrität („die vorhandenen Records sind unverändert") und Coverage
-   („der Beobachtungsbereich ist ohne bekannte Lücken erfasst") sind getrennte Urteile.
-2. **Evidence is immutable. Interpretation is recomputable.** Gehasht und versiegelt wird nur
-   Beobachtetes (Rohdaten-Fakten); jede Deutung (Adapter-Normalisierung, Kanten-Heuristik,
-   Status-Hochstufung) ist versioniert und wiederholbar, ohne die Evidence anzufassen.
-3. **Hash every event, sign every checkpoint.** Jedes Journal-Event trägt Hashes; signiert
-   wird der Seal eines Bereichs, nie das einzelne Event — der Hot Path bleibt fail-open und
-   billig.
+1. **VALID ≠ COMPLETE.** Integrity ("the records that exist are unchanged") and coverage
+   ("the observation scope is captured without known gaps") are separate judgments.
+2. **Evidence is immutable. Interpretation is recomputable.** Only what was observed
+   (raw-data facts) is hashed and sealed; every interpretation (adapter normalization,
+   edge heuristics, status upgrades) is versioned and repeatable without touching the evidence.
+3. **Hash every event, sign every checkpoint.** Every journal event carries hashes; what
+   gets signed is the seal of a range, never the individual event — the hot path stays
+   fail-open and cheap.
 
-Genauer sind es **drei Vertrauensachsen**, die nie in einem Status vermischt werden:
+More precisely, there are **three trust axes** that are never blended into one status:
 
 ```text
               Evidence
                  │
     ┌────────────┼────────────┐
     ▼            ▼            ▼
- Integrität   Coverage     Deutung
- „verändert?" „fehlt was?" „was heißt es?"
+ Integrity    Coverage    Interpretation
+ "changed?"  "missing?"  "what does it mean?"
     │            │            │
- Hashes/Seals  Gaps/Scope/  Adapter,
- Chain         Epochen      capture, DAG
+ Hashes/seals  Gaps/scope/  Adapters,
+ chain         epochs       capture, DAG
 ```
 
-Ein unbekanntes Tool ist ein **Deutungs**-Problem, ein Hook-Ausfall ein **Coverage**-Problem,
-ein verändertes Journal ein **Integritäts**-Problem. `minds verify` spricht die drei Achsen
-getrennt aus (`Integrität` / `Coverage` / `Deutung` / `Gesamt`); die Exit-Codes bleiben der
-CI-Vertrag aus Integrität × Coverage — die Deutung wertet nie auf oder ab.
+An unknown tool is an **interpretation** problem, a hook failure a **coverage** problem, a
+modified journal an **integrity** problem. `minds verify` states the three axes separately
+(`Integrität` / `Coverage` / `Deutung` / `Gesamt` — integrity / coverage / interpretation /
+overall); the exit codes remain the CI contract from integrity × coverage — interpretation
+never upgrades or downgrades the verdict.
 
-## Entscheidung 1: Evidence-Hashes im Hot Path, Verkettung beim Seal
+## Decision 1: Evidence hashes in the hot path, chaining at seal time
 
-Jedes Journal-Event bekommt beim Append zwei additive Felder:
+Every journal event gets two additive fields on append:
 
-- `payload_hash = derive_key("minds/evidence/v1/payload", payload)` — über den Payload **nach**
-  der Secretwall (die Orakel-Regel aus `lineage.rs` gilt unverändert: für Secret-Dateien
-  entsteht nie ein Hash über geheimen Inhalt, weil die Wall den Inhalt vorher ersetzt).
+- `payload_hash = derive_key("minds/evidence/v1/payload", payload)` — over the payload
+  **after** the secretwall (the oracle rule from `lineage.rs` applies unchanged: for secret
+  files, no hash over secret content is ever produced, because the wall replaces the
+  content beforehand).
 - `event_hash = derive_key("minds/evidence/v1/event", encode(seq, at, at_nanos, raw_kind,
-  cwd, transcript_path, payload_hash))` — über eine **längenpräfixierte Binärkodierung**
-  (u64-LE-Länge je Feld, Option-Tags), nicht über JCS: `at_nanos` überschreitet 2^53, und die
-  kanonische JSON-Form lehnt das bewusst ab. Gehasht werden nur beobachtete Fakten — `kind`
-  (die Klassifikation) ist Interpretation und bleibt draußen.
+  cwd, transcript_path, payload_hash))` — over a **length-prefixed binary encoding**
+  (u64-LE length per field, option tags), not over JCS: `at_nanos` exceeds 2^53, and the
+  canonical JSON form deliberately rejects that. Only observed facts are hashed — `kind`
+  (the classification) is interpretation and stays out.
 
-**Kein `prev_event_hash` im Event.** Die Seq-Vergabe ist lock-frei (`create_new`); der
-Nachbar kann beim eigenen Append noch eine `.tmp`-Datei sein. Ein best-effort-prev-Link
-erzeugte legitime „prev unbekannt"-Marker, die von Manipulation nicht unterscheidbar wären —
-ein Prüfprimitive, das regulär falsch-positiv rauscht, ist wertlos. Die Verkettung entsteht
-deterministisch beim Seal über die sortierte Seq-Folge:
+**No `prev_event_hash` in the event.** Seq assignment is lock-free (`create_new`); the
+neighboring event may still be a `.tmp` file while our own append runs. A best-effort prev
+link would produce legitimate "prev unknown" markers indistinguishable from tampering — a
+verification primitive that regularly emits false positives is worthless. The chain is
+built deterministically at seal time over the sorted seq sequence:
 
 ```text
 h_0 = derive_key("minds/evidence/v1/chain", 0^32 ‖ tag ‖ item_hash_0)
 h_i = derive_key("minds/evidence/v1/chain", h_{i-1} ‖ tag ‖ item_hash_i)
 ```
 
-mit `tag 0x01` = Event (`item_hash` = `event_hash`) und `tag 0x02` = Lücke (`item_hash` =
-Hash des Gap-Records) — **eine Lücke ist selbst ein Kettenglied**, kein Schweigen.
+with `tag 0x01` = event (`item_hash` = `event_hash`) and `tag 0x02` = gap (`item_hash` =
+hash of the gap record) — **a gap is itself a chain link**, not silence.
 
-**Der Fold ist gesalzen.** Der Root reist im Seal auf die Forge, und `seq` und
-`last_event_at` stehen dort im Klartext daneben — ungesalzen wäre der Root für
-eine Ein-Event-Epoche ein Offline-Orakel: Wer den Payload rät (kurzes Passwort,
-PIN im Prompt), rechnet den Root nach und bestätigt die Vermutung. Deshalb
-startet der Fold auf `derive_key(ctx, salt)` mit einem zufälligen 32-Byte-Salt
-je Session, der **lokal** neben dem Epochen-Zustand liegt (0600, nie gepusht).
-Der Preis ist gewollt: Ein Externer rechnet den Root nicht aus geratenen
-Payloads nach — lokal (`fsck`, vor dem Discard) bleibt er nachrechenbar, denn
-dort ist der Salt lesbar.
+**The fold is salted.** The root travels to the forge in the seal, and `seq` and
+`last_event_at` sit next to it there in plaintext — unsalted, the root of a
+one-event epoch would be an offline oracle: anyone who guesses the payload (a
+short password, a PIN in the prompt) could recompute the root and confirm the guess.
+Therefore the fold starts on `derive_key(ctx, salt)` with a random 32-byte salt
+per session, stored **locally** next to the epoch state (0600, never pushed).
+The price is intentional: an outsider cannot recompute the root from guessed
+payloads — locally (`fsck`, before the discard) it remains recomputable, because
+the salt is readable there.
 
-**Der Salt heilt nicht.** Sobald eine Epoche versiegelt ist, wird ein fehlender
-oder beschädigter Salt **nicht** regeneriert: Ein neuer Salt versiegelte
-dieselbe Evidence unter einem zweiten, abweichenden Root — ein Epoch-Fork
-(same evidence, different cryptographic identity), der dem Determinismus-
-Anspruch „gleiche Events ⇒ gleicher Seal" widerspräche. Stattdessen ist der
-Verlust selbst der Befund: Der Checkpoint vertagt die Session sichtbar
-(`hook.log`), das Journal bleibt liegen, die Epoche gilt als nicht mehr
-reproduzierbar. Nur vor der ersten Versiegelung darf ein Salt entstehen oder
-ersetzt werden — dann hat noch kein Seal auf einen Root committed.
+**The salt does not heal.** Once an epoch is sealed, a missing or corrupted salt
+is **not** regenerated: a new salt would seal the same evidence under a second,
+diverging root — an epoch fork (same evidence, different cryptographic
+identity), contradicting the determinism claim "same events ⇒ same seal".
+Instead, the loss itself is the finding: the checkpoint visibly defers the
+session (`hook.log`), the journal stays put, the epoch is treated as no longer
+reproducible. Only before the first seal may a salt be created or replaced —
+at that point no seal has committed to a root yet.
 
-**Benannter Trade-off:** Zwischen Append und Seal schützt nur das Dateisystem (0700/0600,
-Symlink-Refusal) — exakt der heutige Zustand. Ein lokaler Angreifer mit Schreibrecht kann bis
-zum Checkpoint fälschen, was dann „sauber" versiegelt wird. Die selbstbeschreibenden
-event_hashes machen nachträglichen Payload-Tausch an *liegenden* Journalen erkennbar
-(`fsck` rechnet nach); mehr — signierende Hooks — verletzte das Hot-Path-Budget und bleibt
-Ausblick. Dieses Fenster steht im Nachweis-Leitfaden unter „beweist nicht".
+**Named trade-off:** Between append and seal, only the filesystem protects the journal
+(0700/0600, symlink refusal) — exactly today's state. A local attacker with write access can forge,
+up to the checkpoint, what then gets sealed "cleanly". The self-describing event hashes
+make after-the-fact payload swapping detectable on journals *at rest* (`fsck` recomputes);
+more — signing hooks — would violate the hot-path budget and remains an outlook item. This
+window is listed in the verification guide (`docs/verification-guide.md`) under
+"does not prove".
 
-## Entscheidung 2: Coverage als Epochen-Seals mit expliziten Lücken
+## Decision 2: Coverage as epoch seals with explicit gaps
 
-Ein **Seal** versiegelt genau den Bereich, den der Checkpoint tatsächlich gelesen hat — nie
-mehr. Zeilenbasiertes Format (wie `minds-attestation-v1`, Zeilenzahl fix = 12, Felder
-fail-closed validiert nach dem #12-Muster):
+A **seal** seals exactly the range the checkpoint actually read — never more. Line-based
+format (like `minds-attestation-v1`, line count fixed = 12, fields validated fail-closed
+following the #12 pattern):
 
 ```text
 minds-seal-v1
-root=b3-<64hex>          Chain-Root über Events und Gap-Records
+root=b3-<64hex>          chain root over events and gap records
 agent=<agent>
-first_seq=<n>            tatsächlich gelesener Bereich
+first_seq=<n>            range actually read
 last_seq=<n>
 events=<n>
-gaps=<n>                 fehlende/beschädigte Glieder, einzeln in der Chain
-pre_chain=<n>            Alt-Events ohne gestempelte Hashes (Bestand)
+gaps=<n>                 missing/corrupted links, each its own chain link
+pre_chain=<n>            legacy events without stamped hashes (pre-existing)
 outcome=stored | storage_policy_rejected_payload
 session=b3-<64hex> | -
-previous=b3-<64hex> | -  Seal der vorherigen Epoche derselben Session
-last_event_at=<RFC3339>  aus dem letzten Event, keine Wanduhr
+previous=b3-<64hex> | -  seal of the previous epoch of the same session
+last_event_at=<RFC3339>  from the last event, not a wall clock
 ```
 
-`seal_id = derive_key("minds/evidence/v1/seal", bytes)`. Der Seal ist deterministisch:
-gleiche Events ⇒ gleicher Seal ⇒ idempotente Ablage.
+`seal_id = derive_key("minds/evidence/v1/seal", bytes)`. The seal is deterministic:
+same events ⇒ same seal ⇒ idempotent storage.
 
-**Epochen:** Nach `journal.discard` beginnt dieselbe Session wieder bei `seq 0` — jede
-Checkpoint-Epoche wird eine eigene Session und ein eigener Seal, verkettet über `previous`
-(lokaler Zustand unter `<git-dir>/minds/evidence/state/`, wird nie gepusht). Fehlt der
-Zustand (frischer Clone), stehen Epochen unverbunden: Das Verdikt sagt dann ehrlich
-„unvollständig". `verify` darf Epochen zur Lesezeit über `lineage.local_id` heuristisch
-schließen — angezeigt als Heuristik, **niemals** verdikt-aufwertend. Was vor dem ersten
-gelesenen Event verloren ging (Absturz vor jedem Gap-Record), wird nicht behauptet: Der Seal
-claimt nur `first_seq..last_seq`; der Rest fällt unter „Epochenkette offen".
+**Epochs:** After `journal.discard` the same session starts again at `seq 0` — every
+checkpoint epoch becomes its own session and its own seal, chained via `previous`
+(local state under `<git-dir>/minds/evidence/state/`, never pushed). If the state is
+missing (fresh clone), epochs stand unconnected: the verdict then honestly says
+"incomplete". `verify` may close epochs heuristically at read time via `lineage.local_id` —
+shown as a heuristic, **never** upgrading the verdict. What was lost before the first read
+event (a crash before any gap record) is not claimed: the seal claims only
+`first_seq..last_seq`; the rest falls under "epoch chain open".
 
-## Entscheidung 3: Ein Redaction-Block hinterlässt einen Seal
+## Decision 3: A redaction block leaves a seal behind
 
-Lehnt die fail-closed-Redaction eine Session ab, entsteht **kein** Session-Objekt — aber ab
-jetzt ein Seal mit `outcome=storage_policy_rejected_payload` und `session=-`. Er enthält
-Chain-Root, Zählwerte, Agent, Zeitraum — **keinen** Intent, keine Pfade, nicht einmal den
-Namen des Feldes, an dem die Redaction scheiterte (der `RedactionAudit` bleibt lokal). Der
-Auditor sieht: Eine Session existierte, ihr Bereich ist versiegelt, die Speicher-Policy hat
-die Nutzlast zurückgewiesen — Integrität valide, Coverage unvollständig. Gelingt der
-Checkpoint nach einem Policy-Fix, verkettet der Erfolgs-Seal per `previous` auf den
-Block-Seal: Die Geschichte bleibt nachvollziehbar. Das Journal bleibt wie bisher liegen.
+If the fail-closed redaction rejects a session, **no** session object is created —
+but from now on there is a seal with `outcome=storage_policy_rejected_payload` and `session=-`. It
+contains chain root, counts, agent, time range — **no** intent, no paths, not even the name
+of the field the redaction failed on (the `RedactionAudit` stays local). The auditor sees:
+a session existed, its range is sealed, the storage policy rejected the payload — integrity
+valid, coverage incomplete. If the checkpoint succeeds after a policy fix, the success seal
+chains via `previous` onto the block seal: the history stays traceable. The journal stays
+put, as before.
 
-## Entscheidung 4: Seals leben in einem eigenen Namespace und überleben `forget`
+## Decision 4: Seals live in their own namespace and survive `forget`
 
 ```text
-refs/minds/evidence/<64hex seal_id>   elternloser Commit; Baum: seal [+ seal.sig]
-refs/minds/store/<64hex session>      session.json, links.json, neu: evidence.json
+refs/minds/evidence/<64hex seal_id>   parentless commit; tree: seal [+ seal.sig]
+refs/minds/store/<64hex session>      session.json, links.json, new: evidence.json
 ```
 
-`evidence.json` (veränderlich wie `links.json`, nie kanonisch) trägt die Rückverweise
-Session → Seals. Der Seal-Namespace ist von der Payload entkoppelt: `forget` tilgt
-`session.json`, der Seal bleibt als payload-freier Beweis stehen — er enthält nur Hashes und
-Zählwerte, nichts Tilgbares. Seals werden nie getilgt und nie force-gepusht; `minds sync`
-nimmt den Namespace automatisch mit (ein Push für alles, ADR-0010). Ref-Namen enthalten nie
-ein `local_id`-Derivat — kein Orakel für fremdbestimmte Kennungen auf der Forge.
+`evidence.json` (mutable like `links.json`, never canonical) carries the back-references
+session → seals. The seal namespace is decoupled from the payload: `forget` erases
+`session.json`, the seal remains as payload-free proof — it contains only hashes
+and counts, nothing erasable. Seals are never erased and never force-pushed; `minds sync`
+picks up the namespace automatically (one push for everything, ADR-0010). Ref names never
+contain a `local_id` derivative — no oracle for externally assigned identifiers on the forge.
 
-## Entscheidung 5: Signatur auf den Seal, optional und best-effort
+## Decision 5: Signature on the seal, optional and best-effort
 
-Ist `user.signingkey` konfiguriert, signiert der Checkpoint die exakt abgelegten Seal-Bytes
-(`ssh-keygen -Y sign -n minds`, ADR-0008) und legt `seal.sig` daneben — das Muster der
-Review-Signaturen. Ohne Schlüssel bleibt der Seal **hash-valide** (Integrität kommt aus dem
-content-adressierten Ref-Namen); die Signatur fügt die Urheber-Bindung hinzu. `minds sign
---seal <id>` rüstet nach. Ein Signaturfehler bricht den Checkpoint nicht.
+If `user.signingkey` is configured, the checkpoint signs the exact seal bytes as stored
+(`ssh-keygen -Y sign -n minds`, ADR-0008) and places `seal.sig` next to them — the pattern
+of the review signatures. Without a key, the seal remains **hash-valid** (integrity comes
+from the content-addressed ref name); the signature adds the authorship binding. `minds sign
+--seal <id>` retrofits it. A signature failure does not break the checkpoint.
 
-## Entscheidung 6: Evidence in zwei Dimensionen — Quelle × Status
+## Decision 6: Evidence in two dimensions — source × status
 
-Das bisherige `Evidence`-Enum (`Inferred < Declared < Content < Observed`) vermischt zwei
-Fragen: *Woher stammt die Aussage?* und *Wurde sie geprüft?* Es wird aufgeteilt:
+The previous `Evidence` enum (`Inferred < Declared < Content < Observed`) conflates two
+questions: *Where does the statement come from?* and *Was it checked?* It gets split:
 
 ```rust
-EvidenceSource { Heuristic, HumanDeclared, ContentDerived, Observed }   // Ord = Vertrauen
+EvidenceSource { Heuristic, HumanDeclared, ContentDerived, Observed }   // Ord = trust
 EvidenceStatus { Missing, Unknown, Partial, Verified }                  // Ord
 EvidenceMark   { source, status }
 ```
 
-- **Verified heißt nachgerechnet** — kryptographisch oder über Content-Evidence, zur
-  Verify-/Lesezeit. Es wird nie in gespeicherte Bytes eingefroren und nie ohne Prüfung
-  vergeben. Deshalb mappen Legacy-Werte auf `Unknown`: `observed→(Observed, Unknown)`,
+- **Verified means recomputed** — cryptographically or via content evidence, at
+  verify/read time. It is never frozen into stored bytes and never granted without a
+  check. That is why legacy values map to `Unknown`: `observed→(Observed, Unknown)`,
   `content→(ContentDerived, Unknown)`, `declared→(HumanDeclared, Unknown)`,
-  `inferred→(Heuristic, Unknown)`. Keine Alt-Kante wurde je nachgerechnet; der Grundsatz
-  verbietet, das Fehlen der Prüfung als Bestehen zu lesen.
-- **Tolerant lesen, kanonisch schreiben:** Der Deserializer akzeptiert den Legacy-String und
-  die Objektform; geschrieben wird immer die Objektform. `SCHEMA_VERSION = 2` — erstmals
-  trennt der Bump auch real Lesbarkeit: Neuere Binaries lesen alle älteren Versionen,
-  ältere Binaries lesen Schema 2 nicht. Bestand wird nicht migriert (content-adressiert =
-  unveränderlich); Alt-Sessions sind der darstellbare Zustand „vor Evidence-Chain erfasst".
-- **Merge statt `max()`:** Zwei Dimensionen haben keine Totalordnung. Regel: primär `source`
-  (bisherige Vertrauensordnung), bei gleicher Source entscheidet `status`; die stärkere
-  Source gewinnt mit ihrem kompletten Mark. Invariante: **gespeicherte** Marks tragen nie
-  `Missing` — `Missing` existiert nur in Verify-/Reader-Ausgaben.
-- Beobachtung und Deutung trennt zusätzlich `ToolCall.capture`
-  (`interpreted | uninterpreted`, mit `adapter` und `adapter_version`): Ein Tool-Aufruf, den
-  kein Adapter deutet, erscheint als „beobachtet, nicht gedeutet" statt still zu verschwinden
-  — auch für Agents ohne eigenen Adapter (generischer Fallback).
+  `inferred→(Heuristic, Unknown)`. No legacy edge was ever recomputed; the principle
+  forbids reading the absence of the check as passing it.
+- **Read tolerantly, write canonically:** The deserializer accepts the legacy string and
+  the object form; writes always use the object form. `SCHEMA_VERSION = 2` — for the
+  first time, the bump also genuinely separates readability: newer binaries read all
+  older versions, older binaries do not read schema 2. Existing data is not migrated
+  (content-addressed = immutable); legacy sessions are the representable state
+  "captured before Evidence Chain".
+- **Merge instead of `max()`:** Two dimensions have no total order. Rule: `source` first
+  (the previous trust order); with equal source, `status` decides; the stronger source
+  wins with its complete mark. Invariant: **stored** marks never carry `Missing` —
+  `Missing` exists only in verify/reader output.
+- Observation and interpretation are additionally separated by `ToolCall.capture`
+  (`interpreted | uninterpreted`, with `adapter` and `adapter_version`): a tool call that
+  no adapter interprets appears as "observed, not interpreted" instead of silently
+  vanishing — including for agents without an adapter of their own (generic fallback).
 
-## Entscheidung 7: Ein Verdikt in zwei Achsen, feste Exit-Codes
+## Decision 7: One verdict in two axes, fixed exit codes
 
-`minds verify <session-id>` (und `--evidence <seal-id>` für sessionlose Seals) urteilt in
-der Matrix Integrität × Coverage:
+`minds verify <session-id>` (and `--evidence <seal-id>` for sessionless seals) judges in
+the matrix integrity × coverage:
 
-| | Coverage vollständig | Coverage unvollständig/unbekannt |
+| | Coverage complete | Coverage incomplete/unknown |
 |---|---|---|
-| Integrität intakt | `VERIFIZIERT` | `VERIFIZIERT, UNVOLLSTÄNDIG` |
-| Integrität verletzt | `MANIPULIERT` | `MANIPULIERT` |
-| Kein Material | — | `NICHT VERIFIZIERBAR` |
+| Integrity intact | `VERIFIZIERT` (verified) | `VERIFIZIERT, UNVOLLSTÄNDIG` (verified, incomplete) |
+| Integrity violated | `MANIPULIERT` (tampered) | `MANIPULIERT` (tampered) |
+| No material | — | `NICHT VERIFIZIERBAR` (not verifiable) |
 
-Exit-Codes (CI-Vertrag): **0** VERIFIZIERT · **1** MANIPULIERT · **2** VERIFIZIERT,
-UNVOLLSTÄNDIG · **3** NICHT VERIFIZIERBAR. Coverage vollständig ⇔ `gaps=0 ∧ pre_chain=0 ∧
-outcome=stored ∧` Epochenkette geschlossen. Eine Alt-Session ohne Seal ist `NICHT
-VERIFIZIERBAR (vor Evidence-Chain erfasst)` — ein Zustand, kein Fehler. `fsck` erhält die
-Gegenstücke: Hash-Nachrechnung liegender Journale und Seal-Prüfung als **Befunde**,
-`--require-seal` als Gate analog `--require-review`.
+Exit codes (CI contract): **0** VERIFIZIERT · **1** MANIPULIERT · **2** VERIFIZIERT,
+UNVOLLSTÄNDIG · **3** NICHT VERIFIZIERBAR. Coverage complete ⇔ `gaps=0 ∧ pre_chain=0 ∧
+outcome=stored ∧` epoch chain closed. A legacy session without a seal is `NICHT
+VERIFIZIERBAR (vor Evidence-Chain erfasst)` — not verifiable, captured before the Evidence
+Chain: a state, not an error. `fsck` gets the counterparts: hash recomputation of journals
+at rest and seal checking as **findings**, `--require-seal` as a gate analogous to
+`--require-review`.
 
-## Entscheidung 8: Adapter sitzen ÜBER der Chain, Deutung ist deterministisch (Phase 5)
+## Decision 8: Adapters sit ABOVE the chain, interpretation is deterministic (phase 5)
 
-Der `ToolAdapter`-Trait (Registry, je Agent ein Adapter, `adapter_version` aus der
-Implementierung) deutet Journal-Events und gespeicherte Aufrufe — er verändert **nie** deren
-Bytes, Hashes oder Identität: `Raw Evidence → Chain → Adapter → Deutung`, niemals umgekehrt.
-Deutung ist deterministisch (gleiche Evidence + gleiche Adapter-Version ⇒ gleiche Deutung,
-testfixiert) — sonst wäre `minds reinterpret` wertlos. `minds reinterpret <session>` ist die
-Einlösung von „Interpretation is recomputable": strikt lesend, zeigt es je Aufruf die
-Evidenz-Adresse (unverändert), die gespeicherte und die aktuelle Deutung nebeneinander.
+The `ToolAdapter` trait (registry, one adapter per agent, `adapter_version` from the
+implementation) interprets journal events and stored calls — it **never** changes their
+bytes, hashes, or identity: `Raw evidence → Chain → Adapter → Interpretation`, never the
+other way around. Interpretation is deterministic (same evidence + same adapter version ⇒
+same interpretation, test-pinned) — otherwise `minds reinterpret` would be worthless.
+`minds reinterpret <session>` delivers on "Interpretation is recomputable":
+strictly read-only, it shows, for each call, the evidence address (unchanged) and the
+stored and current interpretations side by side.
 
-## Entscheidung 9: Der Evidence-DAG ist eine Projektion (Phase 6)
+## Decision 9: The evidence DAG is a projection (phase 6)
 
-Die Chain bleibt die temporale, append-only Provenance. Semantische Beziehungen darüber —
-Content-Übergaben: „B las exakt die Bytes, die A schrieb" — werden **zur Lesezeit** aus den
-gespeicherten Inhalts-Hashes projiziert (Write-Hash == Read-Hash am selben Pfad; dafür hashen
-seit Phase 6 auch Read-Effekte — aber nur für von git **getrackte**, repo-relative Pfade:
-Getrackter Inhalt ist für jeden Repo-Leser ohnehin sichtbar, sein Hash verrät nichts Neues.
-Bloßes Lesen einer privaten oder repo-fremden Datei erzeugt nie einen Fingerabdruck — ein
-ungesalzener Inhalts-Hash über eine kurze Datei wäre dasselbe Bestätigungsorakel, gegen das
-der Chain-Root gesalzen ist. Secret-Ausnahme unverändert). Nichts davon wird gespeichert:
-jederzeit neu berechenbar, deterministisch sortiert. Diese Kanten sind die erste Stelle, die
-`(ContentDerived, Verified)` produziert — nicht beobachtet, nicht behauptet, sondern
-**nachgerechnet**.
+The chain remains the temporal, append-only provenance. Semantic relationships above it —
+content handovers: "B read exactly the bytes A wrote" — are projected **at read time** from
+the stored content hashes (write hash == read hash at the same path; for this, since
+phase 6, read effects are hashed too — but only for repo-relative paths **tracked** by git:
+tracked content is visible to every repo reader anyway; its hash reveals nothing new.
+Merely reading a private or repo-external file never produces a fingerprint — an unsalted
+content hash over a short file would be the same confirmation oracle the chain root is
+salted against. The secret-file exception is unchanged). None of this is stored: recomputable at any
+time, deterministically sorted. These edges are the first place that produces
+`(ContentDerived, Verified)` — not observed, not claimed, but **recomputed**.
 
-## Entscheidung 10: Proof-Bündel — und warum es kein `full` gibt (Phase 7)
+## Decision 10: Proof bundles — and why there is no `full` (phase 7)
 
-`minds audit --export --mode proof` exportiert nur das Beweisgerüst (Ids, kanonische
-Payload-Texte, Seals samt Signaturen, Verdict-Metadaten — kein Intent, keine Kommentare):
-prüfbar, ohne Inhalt weiterzugeben. `redacted` bleibt der Default und das **Maximum** — ein
-`full`-Modus existiert bewusst nicht, denn der Store hält ausschließlich redigierte Sessions
-(fail-closed); mehr zu versprechen wäre leer oder ein Leck. `proves`/`does_not_prove` sind
-Teil des Produktmodells, nicht der Doku: Sie reisen im Artefakt und verhindern die Drift von
-„wir haben Evidence" zu „wir beweisen, dass nichts anderes geschah".
+`minds audit --export --mode proof` exports only the proof scaffold (ids, canonical
+payload texts, seals including signatures, verdict metadata — no intent, no comments):
+checkable without passing content along. `redacted` remains the default and the
+**maximum** — a `full` mode deliberately does not exist, because the store holds
+exclusively redacted sessions (fail-closed); promising more would be empty or a leak.
+`proves`/`does_not_prove` are part of the product model, not of the docs: they travel in
+the artifact and prevent the drift from "we have evidence" to "we prove that nothing else
+happened".
 
-## Die Invarianten (testfixiert)
+## The invariants (test-pinned)
 
-1. **Jedes Kettenglied hängt an genau einem Vorgänger** — im Fold: `h_i` deckt `h_{i-1}`
-   (`invariant_each_chained_link_is_bound_to_exactly_one_predecessor`). Bewusst KEIN
-   prev-Link im Event selbst (Entscheidung 1).
-2. **Der Fold-Zustand umfasst den Vorgänger** — dito.
-3. **Der Event-Hash umfasst die beobachteten Fakten** — und nur diese; `kind` ist Deutung
+1. **Every chain link is bound to exactly one predecessor** — in the fold: `h_i` covers
+   `h_{i-1}` (`invariant_each_chained_link_is_bound_to_exactly_one_predecessor`).
+   Deliberately NO prev link in the event itself (decision 1).
+2. **The fold state encompasses the predecessor** — ditto.
+3. **The event hash covers the observed facts** — and only those; `kind` is interpretation
    (`invariant_the_event_hash_covers_the_observed_facts_and_only_those`).
-4. **Eine Lücke ist selbst verifizierbare Evidence**
+4. **A gap is itself verifiable evidence**
    (`invariant_a_gap_is_itself_verifiable_evidence`).
-5. **Coverage ist immer gescoped** — ein Seal ohne `scope=` parst nicht; „vollständig" heißt
-   vollständig innerhalb der Grenze, nie „alle Systemaktivität"
+5. **Coverage is always scoped** — a seal without `scope=` does not parse; "complete"
+   means complete within the boundary, never "all system activity"
    (`invariant_coverage_is_always_scoped`).
-6. **Deutung verändert nie Raw Evidence** — `reinterpret` bewegt keinen Ref
+6. **Interpretation never changes raw evidence** — `reinterpret` moves no ref
    (`reinterpret_is_read_only_and_deterministic`).
-7. **Legacy bleibt Legacy** — expliziter Zustand statt `None`, nie nachträglich angedichtet
-   (`invariant_legacy_stays_legacy`, `Provenance::Legacy`).
-8. **„Nicht erfasst" ≠ „nicht passiert"** — der Grundsatz; Gap-Glieder, Block-Seals und die
-   `does_not_prove`-Liste sind seine Umsetzung.
+7. **Legacy stays legacy** — explicit state instead of `None`, never retroactively
+   embellished (`invariant_legacy_stays_legacy`, `Provenance::Legacy`).
+8. **"Not captured" ≠ "did not happen"** — the principle; gap links, block seals, and the
+   `does_not_prove` list are its implementation.
 
-Die Hash-Domänen sind versionierte Namensräume (`minds/evidence/v1/…`,
-`invariant_the_hash_domains_are_versioned_namespaces`): Ein künftiges `chain-v2` kann neben
-v1 existieren, ohne historische Daten umzudeuten.
+The hash domains are versioned namespaces (`minds/evidence/v1/…`,
+`invariant_the_hash_domains_are_versioned_namespaces`): a future `chain-v2` can exist
+alongside v1 without reinterpreting historical data.
 
-## Verworfene Alternativen
+## Rejected alternatives
 
-- **prev_hash im Event** (Vision §4): racy im lock-freien Journal, siehe Entscheidung 1.
-- **Per-Event-Signaturen / signierender Hook:** verletzt das Hot-Path-Budget (fail-open,
-  keine Wartezeit im Agenten); das Append-Seal-Fenster wird benannt statt wegsigniert.
-- **Merkle-Tree über Event-Ranges:** lineare Kette genügt der Session-Größenordnung;
-  selektive Teilbeweise einzelner Events sind kein aktueller Bedarf. Ausblick.
-- **Externe Zeitanker (RFC 3161, OpenTimestamps):** Minds bleibt offline-/air-gap-tauglich;
-  „wann wirklich" bleibt unbewiesen und steht im Nachweis-Leitfaden. Ausblick.
-- **Transparency Log / globale Konsistenz:** machte aus lokaler Provenance ein
-  Global-Consistency-Problem (Gossip, Witnesses, Fork Consistency, PKI) — massives
-  Overengineering für ein lokales Evidence-System.
-- **Rückwirkende Migration alter Sessions:** erzeugte falsche Sicherheit — eine heute
-  erzeugte Chain über gestern beweist nichts über gestern. Legacy bleibt Legacy.
-- **Seal nur als `seal.json` im Session-Ref:** scheitert am Redaction-Block (kein Session-Ref
-  existiert) und koppelte den Beweis an das forget-Schicksal der Payload.
-- **Legacy-Mapping auf `Verified`:** entwertete die Status-Dimension von Tag eins
-  (Verified ohne Prüfung) und widerspräche dem Grundsatz.
+- **prev_hash in the event** (vision §4): racy in the lock-free journal, see decision 1.
+- **Per-event signatures / a signing hook:** violates the hot-path budget (fail-open, no
+  wait time in the agent); the append-seal window is named instead of signed away.
+- **Merkle tree over event ranges:** a linear chain suffices at session scale; selective
+  partial proofs of individual events are not a current need. Outlook.
+- **External time anchors (RFC 3161, OpenTimestamps):** Minds stays offline-/air-gap-capable;
+  "when, really" remains unproven and is stated in the verification guide. Outlook.
+- **Transparency log / global consistency:** would turn local provenance into a
+  global-consistency problem (gossip, witnesses, fork consistency, PKI) — massive
+  overengineering for a local evidence system.
+- **Retroactive migration of old sessions:** would create false assurance — a chain
+  produced today over yesterday proves nothing about yesterday. Legacy stays legacy.
+- **Seal only as `seal.json` in the session ref:** fails at the redaction block (no
+  session ref exists) and would couple the proof to the payload's fate under `forget`.
+- **Mapping legacy to `Verified`:** would devalue the status dimension from day one
+  (Verified without a check) and contradict the principle.
 
-## Konsequenzen
+## Consequences
 
-Minds kann künftig vier Aussagen unterscheidbar machen: *beobachtet* (Event mit Hashes in
-versiegeltem Bereich), *nicht beobachtet* (Gap-Glied in der Chain bzw. offene Epochenkette),
-*abgeleitet* (Heuristik, als solche markiert, nie aufgewertet) und *nicht erfassbar*
-(Block-Seal, uninterpretierter Call). Das Audit-Bündel gewinnt die Aussage „für versiegelte
-Bereiche sind Manipulation und Lücken kryptographisch erkennbar" — und behält ehrlich, was
-weiterhin nicht bewiesen wird: die Integrität zwischen Append und Seal, Ereignisse außerhalb
-versiegelter Bereiche, die reale Uhrzeit. Externe Prüfer brauchen kein Minds: `git cat-file`,
-BLAKE3-`derive_key` und `ssh-keygen -Y verify` genügen (Rezept im Nachweis-Leitfaden).
+Minds can now keep four statements distinct: *observed* (event with hashes in
+a sealed range), *not observed* (gap link in the chain, or an open epoch chain), *inferred*
+(heuristic, marked as such, never upgraded), and *not capturable* (block seal,
+uninterpreted call). The audit bundle gains the statement "for sealed ranges, tampering and
+gaps are cryptographically detectable" — and honestly names what still remains unproven:
+integrity between append and seal, events outside sealed ranges, real wall-clock time.
+External verifiers do not need Minds: `git cat-file`, BLAKE3 `derive_key`, and `ssh-keygen -Y
+verify` suffice (recipe in the verification guide, `docs/verification-guide.md`).
 
-Der Preis: Schema 2 ist für alte Binaries unlesbar (zentrale Verteilung, keine Bestandsnutzer
-— akzeptiert), und die Verkettungs-Garantie beginnt erst am Seal, nicht am Append.
+The price: schema 2 is unreadable for old binaries (central distribution, no existing
+users — accepted), and the chaining guarantee begins only at the seal, not at the append.

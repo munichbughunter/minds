@@ -1,11 +1,9 @@
 # Minds — Pilot Guide
 
 *For the pilot at the partner. As of v0.1.3 — the handover state. What Minds
-is and why it exists is covered in [`fuer-tester.md`](fuer-tester.md) (in
-German); this document defines the scope: what the pilot tests, how to
-install, and what explicitly is not part of it.*
-
-*Deutsche Fassung: [pilot-leitfaden.md](pilot-leitfaden.md)*
+is and why it exists is covered in [`for-testers.md`](for-testers.md); this
+document defines the scope: what the pilot tests, how to install, and what
+explicitly is not part of it.*
 
 ---
 
@@ -14,14 +12,14 @@ install, and what explicitly is not part of it.*
 | | |
 |---|---|
 | **Size** | 1–2 repositories, 3–5 developers, 3–4 weeks |
-| **Agent** | Claude Code — only there is the tool level fully interpreted |
-| **Platform** | macOS or Linux; Windows only via WSL (there is no native Windows binary) |
+| **Agent** | Claude Code — the only agent whose tool level is fully interpreted |
+| **Platform** | macOS or Linux; Windows only via WSL (there is no native Windows binary — a native Windows build ships with v0.3.0; the pilot stays on WSL) |
 | **Version** | pinned to `v0.1.3` — not "latest", so everyone tests the same state |
 
 **The pilot's guiding question:** *After three weeks, does `minds why`
 answer a question that `git blame` cannot?* Everything else is a bonus.
 
-Before starting, the [privacy overview](privacy-overview.md) belongs to the
+Before starting, the [privacy overview](privacy-overview.md) belongs in the
 internal approval process — it is deliberately one page and names the known
 gaps outright.
 
@@ -45,7 +43,7 @@ minds enable --agent claude-code --recall
 
 Step 2 matters more than it looks: the hooks resolve `minds` first through
 the location remembered at `enable` time (`git config minds.binary`); the
-PATH is the fallback. If both fail, they run into the void **silently** —
+PATH is the fallback. If both fail, the calls go nowhere, **silently** —
 committing keeps working, nothing gets recorded. If `command -v minds`
 prints nothing, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or
 `~/.bashrc` and open a new shell.
@@ -114,7 +112,7 @@ The most important principle: a recorder must never make a commit fail.
 Outages are therefore silent — but not invisible:
 
 1. `minds fsck` — tells you whether the hooks are in the right place,
-   whether they stem from an older version, and whether the log has entries.
+   whether they date from an older version, and whether the log has entries.
 2. `.git/minds/hook.log` — everything the hooks had to report lands there
    (e.g. a broken `.minds/redact.json`, which stops capture fail-closed).
 3. `command -v minds` — the classic, see section 2.
@@ -127,11 +125,12 @@ The honest list — read it as "applies today"; it is part of the handover:
   `minds why` display the main tree's commit
   ([#20](https://github.com/munichbughunter/minds/issues/20)). Work in the
   main checkout until this is fixed.
-- **No native Windows binary** — Windows means WSL.
+- **No native Windows binary** — Windows means WSL (a native Windows build
+  ships with v0.3.0; the pilot stays on WSL).
 - **Tool level only for Claude Code** (see section 4).
 - **The review layer needs two people on one repository** — alone, you can
   test capture, `why`, and `recall`, but not reviews.
-- **`forget` and already-pushed sessions:** the next push catches up the
+- **`forget` and already-pushed sessions:** the next push propagates the
   deletion via a targeted force-push
   ([#102](https://github.com/munichbughunter/minds/issues/102)); what the
   forge retains as unreachable objects is covered in the privacy overview.
@@ -149,6 +148,6 @@ The honest list — read it as "applies today"; it is part of the handover:
   references:** to the named contact from the invitation, never into a
   public issue.
 - The three questions whose answers evaluate the pilot (from
-  [`fuer-tester.md`](fuer-tester.md)): Did the installation work without
+  [`for-testers.md`](for-testers.md)): Did the installation work without
   asking anyone? When did the first unprompted `minds why` happen? What did
   you look for and not find?

@@ -53,3 +53,21 @@ jobs:
       # Default-Feature, kein Pflichtteil.
       - name: cargo build ohne Default-Features
         run: cargo build -p minds-cli --no-default-features --locked
+
+  # Sichert das Windows-Release-Asset: Der Workspace muss auf Windows
+  # kompilieren. Bewusst nur `cargo check` — die Tests sind an vielen Stellen
+  # absichtlich unix-gated (Symlinks, Dateirechte), ein Windows-Testlauf wäre
+  # ein eigenes Vorhaben, kein Gate.
+  windows:
+    name: check windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Toolchain
+        run: rustup show && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets --locked

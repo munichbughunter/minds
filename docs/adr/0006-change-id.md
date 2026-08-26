@@ -1,56 +1,58 @@
-# ADR-0006 — Change-Id: stabile Änderungs-Identität
+# ADR-0006 — Change-Id: stable change identity
 
-- Status: angenommen
-- Datum: 2026-07-28
-- Betrifft: `minds-core`, `minds-cli`
-- Verwandt: ADR-0005 (Kontext-Rückführung); Schicht 2 in `Plan-v0.2.md`
+- Status: accepted
+- Date: 2026-07-28
+- Affects: `minds-core`, `minds-cli`
+- Related: ADR-0005 (context reinjection); layer 2 of the v0.2 plan
 
-## Kontext
+## Context
 
-Der Commit-Hash ist keine Identität für eine *logische* Änderung: `rebase`,
-`squash`, `amend` und `cherry-pick` erzeugen für dieselbe Absicht einen neuen
-Hash. Das bricht stabile Verweise, Review-Kontinuität über Force-Push hinweg und
-das Denken in „diese Änderung" vs. „diese Version dieser Änderung" — genau die
-Bruchstelle, die Gerrit und Jujutsu mit Change-IDs lösen. Minds braucht dieselbe
-stabile Klammer, damit später Reviews (Schicht 3) an *der Änderung* hängen können
-und nicht an einer vergänglichen Commit-Version.
+The commit hash is not an identity for a *logical* change: `rebase`, `squash`,
+`amend`, and `cherry-pick` produce a new hash for the same intent. That breaks
+stable references, review continuity across force-pushes, and thinking in terms
+of "this change" vs. "this version of this change" — exactly the fracture point
+Gerrit and Jujutsu solve with change ids. Minds needs the same stable bracket
+so that later reviews (layer 3) can hang off *the change* and not off a
+transient commit version.
 
-## Entscheidung 1: Gerrit-kompatibles Format
+## Decision 1: Gerrit-compatible format
 
-Eine Change-Id ist `I` + 40 Hex-Zeichen (`I<40 hex>`) — dieselbe Form, die Gerrits
-`commit-msg`-Hook erzeugt. So greifen vorhandene Erwartungen und Regexe
-(`I[0-9a-f]{40}`) ohne Anpassung. Der Trailer-Schlüssel bleibt im Minds-Namensraum:
-`Minds-Change-Id`, konsistent mit `Minds-Session-Id` und `Minds-Attribution`.
+A Change-Id is `I` + 40 hex characters (`I<40 hex>`) — the same form Gerrit's
+`commit-msg` hook produces. Existing expectations and regexes
+(`I[0-9a-f]{40}`) thus apply without adjustment. The trailer key stays in the
+Minds namespace: `Minds-Change-Id`, consistent with `Minds-Session-Id` and
+`Minds-Attribution`.
 
-Der Typ (`minds_core::ChangeId`) folgt derselben „lesen tolerant, schreiben
-kanonisch"-Linie wie `SessionId`/`ContentHash`.
+The type (`minds_core::ChangeId`) follows the same "read tolerantly, write
+canonically" line as `SessionId`/`ContentHash`.
 
-## Entscheidung 2: der Trailer trägt sie, nicht der Hash
+## Decision 2: the trailer carries it, not the hash
 
-Wie der `Minds-Session-Id`-Trailer steht die Change-Id im **Text** der
-Commit-Message. Damit überlebt sie genau die Operationen, die den Hash ändern —
-denn `rebase`/`squash`/`cherry-pick` führen die Message mit. Das teilt sich die
-gesamte, schon getestete Trailer-Maschinerie (`extract_all`, Squash-Toleranz mit
-eingerückten Rümpfen).
+Like the `Minds-Session-Id` trailer, the Change-Id lives in the **text** of the
+commit message. It thereby survives exactly the operations that change the
+hash — because `rebase`/`squash`/`cherry-pick` carry the message along. This
+shares the entire, already-tested trailer machinery (`extract_all`, squash
+tolerance with indented bodies).
 
-## Entscheidung 3: erzeugt im `prepare-commit-msg`-Hook
+## Decision 3: generated in the `prepare-commit-msg` hook
 
-`minds prepare-commit-msg` (vom `enable`-Hook aufgerufen) hängt eine Change-Id an,
-falls keine da ist, und lässt eine vorhandene unangetastet. So bekommt die erste
-Version einer Änderung ihre Id, und jede spätere (amend, rebase) behält sie.
+`minds prepare-commit-msg` (called by the `enable` hook) appends a Change-Id if
+none is present, and leaves an existing one untouched. Thus the first version
+of a change gets its id, and every later one (amend, rebase) keeps it.
 
-**Ehrliche Grenze:** Bei einem interaktiven Commit *ohne* `-m` ist die Message zum
-Hook-Zeitpunkt noch leer; dann wird nichts angehängt (der Trailer würde sonst zum
-Betreff). Sicher erfasst sind `-m`, `amend`, `rebase`, `cherry-pick`, `squash` —
-genau die Operationen, um deren Überleben es geht. Ein `commit-msg`-Hook wäre für
-den interaktiven Erst-Commit der genauere Ort und bleibt eine mögliche Ergänzung.
+**Honest limit:** For an interactive commit *without* `-m`, the message is
+still empty at hook time; then nothing is appended (the trailer would otherwise
+become the subject). `-m`, `amend`, `rebase`, `cherry-pick`, and `squash` are
+covered reliably — exactly the operations whose survival this is about.
+A `commit-msg` hook would be the more precise place for the interactive first
+commit and remains a possible addition.
 
-**Generierung:** aus Zeit + Prozess-Id, über splitmix64 gut verteilt. Eine
-Change-Id ist kein Geheimnis — sie braucht Eindeutigkeit, nicht Unvorhersehbarkeit.
-Eine Kollision bräuchte zwei Commits in derselben Nanosekunde aus demselben Prozess.
+**Generation:** from time + process id, well distributed via splitmix64. A
+Change-Id is no secret — it needs uniqueness, not unpredictability. A collision
+would take two commits in the same nanosecond from the same process.
 
-## Konsequenzen
+## Consequences
 
-`minds show` zeigt die Change-Id eines Commits an. Die Change-Id überlebt Rebase
-und Squash (end-to-end verifiziert). Sie ist die Voraussetzung für Schicht 3
-(Reviews hängen an der Change-Id, nicht am Commit) und für stacked changes.
+`minds show` displays a commit's Change-Id. The Change-Id survives rebase and
+squash (verified end to end). It is the prerequisite for layer 3 (reviews hang
+off the Change-Id, not the commit) and for stacked changes.

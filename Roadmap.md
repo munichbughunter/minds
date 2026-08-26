@@ -1,260 +1,294 @@
-# Minds — Roadmap & Strategie
+# Minds — Roadmap & Strategy
 
-*Das vorzeigbare Dokument: für Partner, Investoren, Contributor. Es erklärt die
-These, den Markt, die Verteidigbarkeit — und legt die vollständige technische
-Roadmap offen, inklusive der großen Wette (Reviews als Git-Objekte).*
+*The outward-facing document: for partners, investors, contributors. It explains
+the thesis, the market, the defensibility — and lays out the full technical
+roadmap, including the big bet (reviews as Git objects).*
 
-*Für die kommit-genaue Kurzfrist-Umsetzung siehe `Plan-v0.2.md`. Für die
-Ursprungs-Vision siehe `Plan.md`.*
+*Status: v0.3.0, August 2026. Progress per layer is marked inline; the
+decisions behind it live in the [ADRs](docs/adr/), the release-by-release
+record in the [CHANGELOG](CHANGELOG.md).*
 
 ---
 
-## 1. Der Einzeiler
+## 1. The one-liner
 
-**Git weiß, *was* sich geändert hat. Es weiß nicht, *warum*.** Solange Menschen den
-Code schrieben, war das egal — der Grund saß im Kopf des Autors und im MR-Text.
-Jetzt schreiben Agents den Code, und der Grund verdampft, sobald das Terminal-Fenster
-zugeht. Minds schreibt den Grund dorthin, wo er hingehört: **in Git selbst, neben
-den Code.**
+**Git knows *what* changed. It doesn't know *why*.** As long as humans wrote the
+code, that didn't matter — the reason lived in the author's head and in the MR
+description. Now agents write the code, and the reason evaporates the moment
+the terminal window closes. Minds writes the reason where it belongs: **into
+Git itself, next to the code.**
 
-## 2. Die Bruchstelle, die neu ist
+## 2. The new break point
 
-Wenn ein Agent 2.000 Zeilen in zwanzig Minuten produziert, ist „lies den Diff" kein
-Verfahren mehr, sondern eine Fiktion. Zeile-für-Zeile-Review skaliert nicht mit
-Agent-Flotten. Das Qualitätstor existiert dann nur noch formal und filtert nichts.
+When an agent produces 2,000 lines in twenty minutes, "read the diff" is no
+longer a procedure — it is a fiction. Line-by-line review does not scale with
+agent fleets. The quality gate becomes a formality and filters nothing.
 
-Die Antwort ist nicht, den Diff schöner darzustellen. Die Antwort ist, **die Absicht
-zum versionierten Artefakt zu machen und den Diff dagegen zu prüfen.** Der Reviewer
-liest, was verlangt wurde, und prüft dann, ob der Code das tut.
+The answer is not to make the diff prettier. The answer is to **make the
+intent a versioned artifact and check the diff against it.** The reviewer reads
+what was asked for, then checks whether the code does that.
 
-## 3. Die These: mehr ins Repo, weniger in die Plattform
+## 3. The thesis: more into the repo, less into the platform
 
-Betrachtet man die Schwächen des heutigen Git/GitLab-Modells nebeneinander, lösen
-sie sich fast alle in **dieselbe Richtung** auf. Das ist kein Zufall — es ist eine
-verwertbare Beobachtung.
+Put the weaknesses of today's Git/GitLab model side by side and they almost all
+resolve in **the same direction**. That is not a coincidence — it is an
+observation you can build on.
 
-| Heutige Bruchstelle | Wohin es gehört | Vorbild |
+| Today's break point | Where it belongs | Prior art |
 |---|---|---|
-| Commit-Identität hängt am Hash; Rebase/Squash zerstören sie | **Change-Id** ins Repo | Gerrit, Jujutsu |
-| Author ist ein unsigniertes Freitextfeld | **Signierte Attribution** ins Repo | sigstore, ssh-sig |
-| Kontext einer Änderung verdampft mit der Session | **Kontext als Git-Objekt** | *Minds heute* |
-| Reviews/Approvals/Diskussion liegen in Postgres | **Reviews als Git-Objekte** | Radicle, git-bug |
-| Der MR ist zu grob (pro Branch statt pro Change) | **Review pro Change** | Gerrit |
-| Secret/PII in der History sind für immer drin (DSGVO ⊥ Merkle) | **Redigierbare Nutzlast** | — |
-| Der Zeilendiff ist die falsche Einheit | **Struktureller/AST-Diff** | Difftastic, Darcs/Pijul |
-| YAML als Programmiersprache für CI | **Policy als Binary** | — |
+| Commit identity is tied to the hash; rebase/squash destroy it | **Change id** in the repo | Gerrit, Jujutsu |
+| Author is an unsigned free-text field | **Signed attribution** in the repo | sigstore, ssh-sig |
+| The context of a change evaporates with the session | **Context as a Git object** | *Minds today* |
+| Reviews/approvals/discussion live in Postgres | **Reviews as Git objects** | Radicle, git-bug |
+| The MR is too coarse (per branch instead of per change) | **Review per change** | Gerrit |
+| Secrets/PII in history stay forever (GDPR ⊥ Merkle) | **Redactable payload** | — |
+| The line diff is the wrong unit | **Structural/AST diff** | Difftastic, Darcs/Pijul |
+| YAML as a programming language for CI | **Policy as a binary** | — |
 
-Git ist nicht zu wenig — es wird **zu wenig benutzt**, weil die Plattformen kein
-Interesse an einem repo-nativen Gedächtnis haben. Ihr Geschäftsmodell *ist* die
-Datenhaltung in der eigenen Datenbank. Genau hier entsteht die Lücke.
+Git does not do too little — it is **used too little**, because the platforms have
+no interest in a repo-native memory. Their business model *is* keeping the data
+in their own database. That is exactly where the gap opens.
 
-**Leitlinie, aus der These abgeleitet:**
-> Jedes neue Artefakt fragt zuerst „geht das als **Git-Objekt**?", erst dann „geht
-> das als Plattform-Feature?". Ein Git-Objekt wandert mit dem Repo, überlebt
-> Migration, funktioniert offline und im Air-Gap.
+**Guiding rule, derived from the thesis:**
+> For every new artifact, ask first "does this work as a **Git object**?" and
+> only then "does this work as a platform feature?". A Git object travels with the
+> repo, survives migration, works offline and air-gapped.
 
-## 4. Warum das eine verteidigbare Position ist
+## 4. Why this is a defensible position
 
-- **GitLab ist da, wo die regulierten Läden sitzen** — Banken, Versicherer,
-  öffentliche Hand, Automotive. Self-Managed, oft on-prem, teils air-gapped. Genau
-  die Kundschaft, für die Nachweisbarkeit von KI-Beteiligung am Code demnächst
-  Pflicht ist.
-- **Diese Kundschaft kann keine SaaS-Lösung nehmen.** Das Tooling *muss*
-  self-hostable sein. Das ist kein Feature, das ist ein struktureller Zwang.
-- **Der Git-native Ansatz passt exakt darauf.** Liegen die Daten im Repo, ist
-  Self-Hosting keine Portierungsarbeit, sondern der Normalfall. Das Dashboard ist
-  ein Reader, kein Dienst mit eigenem Zustand.
-- **Ein Plattform-Anbieter baut das ungern nach.** Wer aus dem Cloud-Modell kommt
-  und auf die eigene Datenhaltung optimiert, hat kein Interesse an einem Modell,
-  das die Daten bewusst *aus* der Plattform heraus ins Repo verlagert. Das ist der
-  Graben.
+- **GitLab is where the regulated shops live** — banks, insurers, public
+  sector, automotive. Self-managed, often on-prem, sometimes air-gapped.
+  Exactly the customers who will soon have to prove AI involvement in their
+  code.
+- **These customers cannot adopt a SaaS solution.** The tooling *must* be
+  self-hostable. That is not a feature — it is a structural constraint.
+- **The Git-native approach fits that exactly.** If the data lives in the
+  repo, self-hosting is not a porting effort but the default. The dashboard is
+  a reader, not a service with its own state.
+- **A platform vendor is reluctant to copy this.** Anyone coming from the
+  cloud model and optimizing for their own data custody has no interest in a
+  model that deliberately moves the data *out* of the platform and into the
+  repo. That is the moat.
 
-### Warum nicht entire's Weg — die Hosting-Falle
+### Why not entire's path — the hosting trap
 
-Der nächstgrößere Spieler in diesem Feld, **entire.io** ($60M Seed), ist von
-„Git-Companion" zu einem **eigenen, gehosteten, verteilten Git-Netzwerk** gekippt
-(„agent-scale cloning without rate limits", „India's fastest Git hosting"). Das ist
-für uns bewusst **kein** Vorbild: Ein gehosteter Dienst ist genau das, was
-self-managed, on-prem und air-gapped arbeitende, regulierte Kunden nicht nehmen
-dürfen. entire's Stärke ist unsere verbotene Zone — und unsere (repo-nativ,
-self-hostable, plattform-fungibel) ist die, die ein SaaS-first-Anbieter mit viel
-Kapital ungern baut. Wir schlagen sie nicht beim Hosting und versuchen es nicht; wir
-besetzen das andere Ufer.
+The next-bigger player in this field, **entire.io** ($60M seed), has tipped
+from "Git companion" into **its own hosted, distributed Git network**
+("agent-scale cloning without rate limits", "India's fastest Git hosting").
+For us that is deliberately **not** a model to follow: a hosted service is
+exactly what self-managed, on-prem and air-gapped regulated customers are not
+allowed to adopt. entire's strength is off-limits to us — and ours (repo-native,
+self-hostable, platform-fungible) is the one a well-funded SaaS-first vendor
+is reluctant to build. We won't beat them at hosting and don't try; we
+occupy the other shore.
 
-Bestätigung fällt trotzdem ab: entire speichert Checkpoints **ref-basiert** und
-integriert Agents über **Hooks** — dieselben zwei Grundentscheidungen wie Minds. Der
-Pfad stimmt, nur der Zielpunkt ist ein anderer. Und ihr Ökosystem zeigt den Wert
-reicher, offener Daten: Dritt-Werkzeuge wie **Grain** (`scan` → `AGENTS.md`,
-`audit` → Provenienz) bauen auf dem erfassten Session-Verlauf auf. Genau solche
-Aufsätze wollen wir ermöglichen — repo-nativ statt an einen Host gebunden.
+Still, there is confirmation here: entire stores checkpoints **in refs**
+and integrates agents via **hooks** — the same two foundational decisions as
+Minds. The path is right; only the destination differs. And their ecosystem
+shows the value of rich, open data: third-party tools like **Grain**
+(`scan` → `AGENTS.md`, `audit` → provenance) build on the captured session
+history. Exactly this kind of layer on top is what we want to enable —
+repo-native instead of tied to a host.
 
-## 5. Wo Minds heute steht (ehrlich)
+## 5. Where Minds stands today (honestly)
 
-Ein Rust-Workspace (ein statisches Binary, harte Abhängigkeit nur `git`), der die
-v0.1-Kette schließt:
+A Rust workspace (one static binary, the only hard dependency is `git`) that
+has long since closed the v0.1 chain — as of v0.3.0 it covers:
 
-- **Capture** hook-basiert: `minds enable` installiert Agent- + Git-Hooks; der heiße
-  Pfad (`minds hook`) schreibt jedes Event ins lokale Journal, der kalte Pfad
-  (`minds checkpoint`) redigiert → speichert → hängt einen Trailer an.
-- **Redaction** fail-closed: Secrets/PII raus, *bevor* ein Byte in den Store geht.
-- **Store** content-adressiert (`SessionId = blake3(canonical_json)`), zwei Backends
-  hinter einem Trait: In-Repo (`refs/minds/context`) und Child-Repo. Jede Session
-  erscheint zusätzlich als eigener, browserbarer Branch `minds/session/<hash>`.
-- **Reader**: `minds render` baut eine zustandslose HTML-Seite — Zeile anklicken →
-  Prompt dahinter. `minds show`/`why`/`fsck` schließen den Bug-Retrieval-Loop.
+- **Capture**, hook-based: `minds enable` installs agent + Git hooks; the hot
+  path (`minds hook`) writes every event to the local journal, the cold path
+  (`minds checkpoint`) redacts → stores → appends a trailer. Agents without a
+  dedicated adapter no longer lose their tool level: the generic fallback
+  keeps the name and raw arguments as redacted evidence.
+- **Redaction**, fail-closed: secrets/PII are removed *before* a byte reaches
+  the store; a rejected session leaves an auditable block seal instead of a
+  silent gap.
+- **Store**, content-addressed (`SessionId = blake3(canonical_json)`), two
+  backends behind one trait: in-repo (`refs/minds/context`) and child repo.
+  One ref per session ([ADR-0010](docs/adr/0010-one-ref-per-session.md));
+  `minds sync` ships all due refs in one connection.
+- **Context return**: `recall`, `brief` and `distill` hand the captured
+  context back to the next agent — deterministic, 0 tokens.
+- **Reviews as Git objects** (layer 3, R1–R6 complete): verdicts, threads,
+  stacks, the GitLab one-way mirror, `fsck --require-review` as a CI gate,
+  and `minds audit --export` as a portable provenance bundle.
+- **The Evidence Chain** ([ADR-0011](docs/adr/0011-evidence-chain.md)):
+  journal events are folded into sealed hash chains — gaps included — and
+  `minds verify` renders a verdict on the integrity × coverage matrix.
+  Optionally ssh-signed; verifiable without Minds
+  ([verification guide](docs/verification-guide.md)).
+- **Surfaces**: `minds inspect` (TUI with session list, graph, why chain and
+  evidence report), `minds render` (a stateless HTML page), `minds metrics`
+  (Prometheus/OpenMetrics for the customer's Grafana).
+- **Releases** for macOS (Apple Silicon and Intel), Linux (x86_64/ARM64,
+  static musl) and, since v0.3.0, native Windows (x86_64).
 
-**Bekannte Baustellen** (in `Plan-v0.2.md` adressiert): die Tool-Interpretation ist
-noch Claude-only, die Secret-Wall auf dem heißen Pfad kennt nur Claude-Feldnamen,
-und der Reader zeigt den erfassten Gesprächsverlauf noch nicht.
+**Known gaps:** tool-call *interpretation* is still Claude-Code-only (other
+agents capture raw evidence via the generic fallback); the reader shows
+sessions and history but no overview tiles or charts yet, although
+`minds metrics` already supplies the numbers; the CLI output is
+German today — English output is on the list.
 
-## 6. Die Roadmap in Schichten
+## 6. The roadmap in layers
 
-### Schicht 1 — Das Fundament real machen *(Kurzfrist, kommit-genau in `Plan-v0.2.md`)*
-Multi-Agent-Capture (Gemini/Codex/OpenAI echt, nicht nur Claude) + der Session-Branch
-als GitLab-nativ lesbares Artefakt (`session.md`). Vorgeschaltet: der Secret-Wall-Fix,
-damit fail-closed für *alle* Agents gilt.
+### Layer 1 — Make the foundation real ✅ *(capture)* / ◐ *(interpretation)*
+Multi-agent capture beyond Claude: done for prompts, and since v0.3.0 no agent
+loses its tool level — the generic fallback stores uninterpreted calls as
+redacted evidence. Still open: *interpreting* the tool level for Codex,
+Cursor, Gemini and opencode; which one comes first follows user demand. The
+secret wall applies fail-closed to all agents.
 
-### Schicht 2 — Die These schärfen *(Kurzfrist, kommit-genau in `Plan-v0.2.md`)*
-Die drei Bausteine, die Minds von „Kontext-Tool" zu „repo-nativer Vertrauensschicht"
-heben — und die zugleich das Fundament für Schicht 3 legen:
+### Layer 2 — Sharpen the thesis ✅
+The three building blocks that lift Minds from "context tool" to "repo-native
+trust layer" — and that laid the foundation for layer 3:
 
-- **Change-Id** — stabile Änderungs-Identität, überlebt Force-Push/Rebase/Squash.
-- **Signierte Attribution** — „Agent X, Modell Y schrieb diese Zeilen", verifizierbar
-  statt behauptet.
-- **`minds forget`** — redigierbare Nutzlast: DSGVO-Löschung des Inhalts, während die
-  Hash-Referenz auflösbar bleibt. Das, was reines Git strukturell nicht kann.
+- **Change id** — stable change identity, survives force-push/rebase/squash.
+- **Signed attribution** — "agent X, model Y wrote these lines", verifiable
+  instead of claimed.
+- **`minds forget`** — redactable payload: GDPR deletion of the content while
+  the hash reference stays resolvable. The thing plain Git structurally
+  cannot do.
 
-### Schicht 2b — CLI-Vollständigkeit & Kontext-Rückführung *(vor jeder UI)*
-Die CLI muss vollständig sein, bevor eine UI kommt. Kern ist die
-**Kontext-Rückführung**: `minds recall`/`distill` gibt den erfassten Kontext als
-AGENTS.md-artigen Brief an den nächsten Agenten zurück und schließt damit
-**Vision-Problem #3** („kein Agent lernt aus dem letzten"), das v0.1 offenließ. Dazu
-Parität mit dem, was entire/Grain zeigen: `blame`, `log`, `search`, `recap`,
-`agent-help`. Kommit-Zerlegung in `Plan-v0.2.md`.
+### Layer 2b — CLI completeness & context return ✅ *(before any UI)*
+The CLI had to be complete before any UI. The core is **context return**:
+`minds recall`/`distill` hands the captured context back to the next agent as
+an AGENTS.md-style brief, closing vision problem #3 ("no agent learns from the
+last one") that v0.1 left open. Alongside it, parity with what entire/Grain
+demonstrate: `blame`, `search`, `recap`, `agent-help`.
 
-### Schicht 2c — Metriken & Observability *(opt-in)*
-`minds metrics` projiziert die schon erfassten Daten (Tokens, Schritte,
-Session-Länge, Agent-Anteil, Redaction-Treffer, Kontext-Abdeckung) in ein
-Standardformat (Prometheus/OpenMetrics) — für **Grafana beim Kunden**. Kein doppelter
-Zustand, kein selbst betriebener Dienst: wir emittieren in Infrastruktur, die
-reguliert arbeitende Teams ohnehin betreiben. Das ist zugleich die billigste
-sichtbare Oberfläche, lange bevor eine eigene UI existiert.
+### Layer 2c — Metrics & observability ✅ *(opt-in)*
+`minds metrics` projects the data already captured (tokens, steps, session
+length, agent share, redaction hits, context coverage) into a standard format
+(Prometheus/OpenMetrics) — for **the customer's Grafana**. No duplicated
+state, no service we operate: we emit into infrastructure that regulated teams
+run anyway. It is also the cheapest visible surface, long before a UI of our own
+exists.
 
-### Schicht 3 — Reviews als Git-Objekte *(die große Wette — hier voll ausgearbeitet)*
-Siehe Abschnitt 7.
+### Layer 3 — Reviews as Git objects ✅ *(the big bet — spelled out below)*
+See section 7. Implemented R1–R6; since then extended with the Evidence Chain
+([ADR-0011](docs/adr/0011-evidence-chain.md)), which turns the stored record
+into a sealed, verifiable one.
 
-### Schicht 4 — Struktureller Diff & AST-Attribution *(später)*
-Der Zeilendiff ist die falsche Einheit. Difftastic-artiger struktureller Diff im
-Reader; Attribution von der Zeile auf Symbol/AST-Knoten verfeinert. Löst einen
-Großteil der „Konflikte", die in Wahrheit Artefakte des zeilenbasierten Modells sind.
+### Layer 4 — Structural diff & AST attribution *(later)*
+The line diff is the wrong unit. Difftastic-style structural diff in the
+reader; attribution refined from the line to symbol/AST node. Dissolves a
+large share of the "conflicts" that are in fact artifacts of the line-based
+model.
 
-### Schicht 5 — Sync & Mirror *(Transport, kein Ort)*
-Ein Sync-Primitiv im git-sync-Stil spiegelt den `refs/minds/*`-Namespace zwischen
-Remotes (SSH-Creds wiederverwenden), damit Kontext über eine Agent-Flotte/ein Team
-und über Air-Gaps wandert — ohne das Code-Remote zu verschmutzen und **ohne dass wir
-irgendetwas hosten**. Verallgemeinert das bestehende Child-Repo-Backend. Eine
-optionale, self-hostable Aggregations-/Reader-Fläche über viele Repos ist denkbar,
-läuft dann aber **beim Kunden**. Bewusst nach der CLI-Vollständigkeit (Schicht 2b).
+### Layer 5 — Sync & mirror ◐ *(transport, not a place)*
+The foundation is in place: one ref per session
+([ADR-0010](docs/adr/0010-one-ref-per-session.md)), `minds sync` as the
+transport primitive, and the child-repo backend for keeping context out of
+the code remote. Still open: mirroring the `refs/minds/*` namespace between
+*multiple* remotes so context travels across an agent fleet/team and across
+air gaps — **without us hosting anything**. An optional, self-hostable
+aggregation/reader surface across many repos is conceivable, but it would run
+**on the customer's infrastructure**.
 
 ---
 
-## 7. Schicht 3 im Detail — Reviews als Git-Objekte
+## 7. Layer 3 in detail — reviews as Git objects
 
-**Das Ziel:** Der Review eines Change — Verdict, Kommentare, Approval — liegt
-content-adressiert und signiert unter `refs/minds/reviews/`, wandert mit dem Repo und
-überlebt jede Plattform-Migration. GitLab wird zum *Cache* der Wahrheit, nicht zu
-ihrer Quelle. Damit wird aus der These ein Produkt.
+**The goal:** the review of a change — verdict, comments, approval — lives
+content-addressed and signed under `refs/minds/reviews/`, travels with the
+repo and survives every platform migration. GitLab becomes a *cache* of the
+truth, not its source. This is where the thesis becomes a product.
 
-Baut direkt auf Schicht 2 auf: signierte Identität (wer reviewt) und stabile
-Change-Ids (was wird reviewt) sind die Voraussetzung.
+Builds directly on layer 2: signed identity (who reviews) and stable change
+ids (what is reviewed) are the prerequisites.
 
-> **Stand 29.07.2026: R1–R6 umgesetzt.** Die Zerlegung unten bleibt als Beleg
-> stehen, was jeweils gemeint war; die Entscheidungen stehen in
-> [ADR-0009](docs/adr/0009-reviews-als-git-objekte.md), der Transport in
-> [ADR-0010](docs/adr/0010-ein-ref-je-session.md).
+> **Status 2026-07-29: R1–R6 implemented.** The breakdown below stands as a
+> record of what each phase meant; the decisions live in
+> [ADR-0009](docs/adr/0009-reviews-as-git-objects.md), the transport in
+> [ADR-0010](docs/adr/0010-one-ref-per-session.md).
 
-### Phase R1 — Das Review-Objekt ✅
-- `docs: ADR — Review als content-adressiertes, signiertes Git-Objekt`
-- `feat(core): Review-Envelope (schema_version, subject: Change-Id|SessionId, reviewer: signierte Identität, decision: approve|reject|needs-work, summary, at)`
-- `feat(store): put_review/get_review unter refs/minds/reviews/ (gleiches Layout wie Sessions, dedup per Hash)`
+### Phase R1 — The review object ✅
+- `docs: ADR — review as a content-addressed, signed Git object`
+- `feat(core): review envelope (schema_version, subject: change id|session id, reviewer: signed identity, decision: approve|reject|needs-work, summary, at)`
+- `feat(store): put_review/get_review under refs/minds/reviews/ (same layout as sessions, dedup by hash)`
 - `feat(cli): minds review <change> --approve|--reject|--needs-work [--summary]`
-- `feat(cli): minds reviews <change|commit> — Verdicts auflisten, Signaturen prüfen`
-- `test: Review-Roundtrip + Signaturprüfung + Rebase-Überleben (subject = Change-Id)`
+- `feat(cli): minds reviews <change|commit> — list verdicts, check signatures`
+- `test: review roundtrip + signature check + rebase survival (subject = change id)`
 
-### Phase R2 — Der Review-Thread (git-bug-Muster) ✅
-Diskussion muss mergebar sein — zwei Reviewer offline, beide kommentieren, kein
-Konflikt.
-- `feat(core): Comment als append-only Operation (content-adressiert), Anker auf datei:zeile ODER Turn`
-- `feat(store): Thread als Operations-Log; deterministischer Merge zweier Logs (kommutativ, konfliktfrei)`
-- `feat(cli): minds comment <change> --on <datei:zeile|turn> "<text>"`
-- `test: zwei divergente Threads mergen konfliktfrei zum selben Zustand`
+### Phase R2 — The review thread (git-bug pattern) ✅
+Discussion must be mergeable — two reviewers offline, both comment, no
+conflict.
+- `feat(core): comment as an append-only operation (content-addressed), anchored to file:line OR turn`
+- `feat(store): thread as an operation log; deterministic merge of two logs (commutative, conflict-free)`
+- `feat(cli): minds comment <change> --on <file:line|turn> "<text>"`
+- `test: two divergent threads merge conflict-free to the same state`
 
-### Phase R3 — Review pro Change, nicht pro Branch (Gerrit-Lehre) ✅
-- `feat: Verdicts hängen an der Change-Id → stacked changes einzeln reviewbar, Kontinuität über Force-Push`
-- `feat(cli): minds stack — abhängige Changes und ihren jeweiligen Review-Stand zeigen`
-- `test: Force-Push eines Stacks erhält Verdicts pro Change`
+### Phase R3 — Review per change, not per branch (the Gerrit lesson) ✅
+- `feat: verdicts hang on the change id → stacked changes reviewable individually, continuity across force-push`
+- `feat(cli): minds stack — show dependent changes and their review state`
+- `test: force-pushing a stack preserves verdicts per change`
 
-### Phase R4 — Die Plattform wird zum Cache ✅
-Einweg-Brücke: Git-native Verdicts in GitLab-MR-Notes/Approvals spiegeln, für Teams,
-die in der GitLab-UI leben. Quelle der Wahrheit bleibt Git. Migriert man weg, kommt
-die Review-Historie mit.
-- `feat(minds-gitlab): Verdict → MR-Note/Approval (einweg, idempotent)`
-- `feat(minds-gitlab): Webhook-Empfänger (zustandslos) — MR-Kommentar → Review-Objekt (optional, opt-in)`
-- `docs: Betriebsmodell — Git ist Quelle, GitLab ist Projektion`
+### Phase R4 — The platform becomes a cache ✅
+One-way bridge: mirror Git-native verdicts into GitLab MR notes/approvals, for
+teams that live in the GitLab UI. The source of truth stays Git. Migrate away
+and the review history comes along.
+- `feat(minds-gitlab): verdict → MR note/approval (one-way, idempotent)`
+- `feat(minds-gitlab): webhook receiver (stateless) — MR comment → review object (optional, opt-in)`
+- `docs: operating model — Git is the source, GitLab is the projection`
 
-### Phase R5 — Policy als Binary, nicht als YAML ✅
-- `feat(cli): minds fsck --require-review — kein agent-authored Change ohne signiertes Verdict`
-- `feat(ci): wiederverwendbarer .gitlab-ci.yml-Include, der nur das Binary aufruft (keine YAML-Logik)`
-- `test: Gate rot bei fehlendem/ungültigem Verdict, grün sonst`
+### Phase R5 — Policy as a binary, not as YAML ✅
+- `feat(cli): minds fsck --require-review — no agent-authored change without a signed verdict`
+- `feat(ci): reusable .gitlab-ci.yml include that only calls the binary (no YAML logic)`
+- `test: gate red on missing/invalid verdict, green otherwise`
 
-### Phase R6 — Audit-Export für regulierte Umgebungen ✅
-- `feat(cli): minds audit --export — signierte Provenienz-Kette (Change → Session → Attribution → Verdict) als portables Bundle`
-- `docs: Nachweis-Leitfaden (was das Bundle beweist, was nicht)`
+### Phase R6 — Audit export for regulated environments ✅
+- `feat(cli): minds audit --export — signed provenance chain (change → session → attribution → verdict) as a portable bundle`
+- `docs: verification guide (what the bundle proves, what it doesn't)`
 
-**Ergebnis von Schicht 3:** Ein Repo trägt seine eigene, kryptografisch nachweisbare
-Antwort auf „Wer hat das geschrieben, auf welche Anweisung, wer hat es geprüft, und
-warum wurde es gemerged?" — ohne Plattform, ohne Datenbank, offline verifizierbar.
+**The result of layer 3:** a repo carries its own, cryptographically provable
+answer to "who wrote this, on whose instruction, who checked it, and why was
+it merged?" — without a platform, without a database, verifiable offline.
 
-**Nachtrag aus der Umsetzung (29.07.2026).** Beim Testen fiel auf, dass `git push`
-mit aktiviertem Minds ~1,9 s länger dauerte — auf *jedem* Push, auch ohne neuen
-Kontext. Die Ursache war nicht der Hook, sondern die Datenstruktur: Der ganze Store
-hing an einem Ref, und der war damit Serialisierungspunkt für Schreiben *und*
-Pushen. Aufgelöst in [ADR-0010](docs/adr/0010-ein-ref-je-session.md): ein Ref je
-Session, Kanten bei ihrer Session, ein Push für alle Refs. Ein Repo, das nur
-eincheckt, hat danach **keinen gemeinsam beschriebenen Ref mehr**; der Hook kostet
-ohne neuen Kontext 0,02 s statt 1,86 s. Dieselbe Lehre, die `entireio/cli` beim
-Umstieg von `entire/checkpoints/v1` auf `refs/entire/` gezogen hat.
+**Postscript from the implementation (2026-07-29).** Testing revealed that
+`git push` with Minds enabled took ~1.9 s longer — on *every* push, even
+without new context. The cause was not the hook but the data structure: the
+whole store hung off one ref, which made that ref the serialization point for
+writing *and* pushing. Resolved in
+[ADR-0010](docs/adr/0010-one-ref-per-session.md): one ref per session, edges
+stored with their session, one push for all refs. Afterwards a repo that only commits
+writes to **no shared ref** at all; without new context the hook costs
+0.02 s instead of 1.86 s. The same lesson `entireio/cli` drew when moving from
+`entire/checkpoints/v1` to `refs/entire/`.
 
-Nebenbei behoben: `refs/minds/reviews` wurde vorher nie gepusht — Schicht 3 war
-damit nicht teamfähig.
+Fixed along the way: `refs/minds/reviews` was never pushed before — layer 3
+was not team-ready until then.
 
 ---
 
-## 8. Der ehrliche Teil (die Risiken)
+## 8. The risks, honestly
 
-- **Die Agent-Adapter sind Fleißarbeit ohne Ende.** Jeder Agent hat sein eigenes
-  Format, und die ändern sich ständig. Gegenmittel: ein Adapter-Trait mit
-  Golden-Fixtures pro Agent, versioniertes Schema, toleranter Reader (Schicht 1).
-- **GitLab könnte es selbst bauen.** Gegenargument: Git-nativ und self-hostable ist
-  strukturell schwer für einen Anbieter, der auf die eigene Datenhaltung optimiert.
-- **Adoption braucht das Team, nicht den Einzelnen.** Der Wert entsteht im Review.
-  Ein Solo-Dev braucht Schicht 3 nicht. Gegenmittel: Schicht 1+2 liefern schon
-  Einzelwert (sicherer, signierter, durchsuchbarer Record).
-- **Die These könnte zu früh sein.** Heute schmerzt es Teams, die aggressiv mit
-  Agent-Flotten arbeiten. Das sind noch nicht viele — aber es werden schnell mehr,
-  und die Regulierungs-Welle kommt ohnehin.
+- **The agent adapters are a treadmill.** Every agent has its own format,
+  and they change constantly. Antidote: an adapter trait with golden fixtures
+  per agent, a versioned schema, a tolerant reader — in place since v0.3.0;
+  the treadmill itself remains.
+- **GitLab could build this itself.** The counter: Git-native and
+  self-hostable is structurally hard for a vendor that optimizes for its own
+  data custody.
+- **Adoption takes a team, not an individual.** The value emerges in
+  review. A solo dev doesn't need layer 3. Antidote: layers 1+2 already
+  deliver individual value (a safer, signed, searchable record).
+- **The thesis could be early.** Today the pain is felt by teams that work
+  aggressively with agent fleets. There are not many of them yet — but they
+  are multiplying fast,
+  and the regulation wave is coming regardless.
 
-## 9. Der Pitch in drei Sätzen
+## 9. The pitch in three sentences
 
-> Zwanzig Jahre lang hatte Softwareentwicklung eine Form: Diff, Review, Merge. Diese
-> Form hält gerade nicht mehr, weil Agents mehr Code produzieren, als ein Mensch
-> lesen kann — und weil der Grund für jede Änderung verschwindet, sobald die Session
-> endet.
+> For twenty years software development had one shape: diff, review, merge.
+> That shape is breaking right now, because agents produce more code than a
+> human can read — and because the reason for every change disappears the
+> moment the session ends.
 >
-> Minds schreibt den Kontext, die Identität und am Ende auch den Review dorthin, wo
-> sie hingehören: in Git, neben den Code — als signierte, redigierbare, mit dem Repo
-> wandernde Objekte. Nicht in eine fremde Cloud, nicht in eine Plattform-Datenbank.
+> Minds writes the context, the identity and ultimately the review itself
+> where they belong: into Git, next to the code — as signed, redactable
+> objects that travel with the repo. Not into someone else's cloud, not into
+> a platform database.
 >
-> Und GitLab ist der richtige Einstiegspunkt, weil dort die Leute sitzen, die KI-
-> Beteiligung am Code nachweisen müssen — und die nichts nehmen können, was in
-> fremder Cloud läuft.
+> And GitLab is the right entry point, because that is where you find the
+> people who must prove AI involvement in their code — and who cannot adopt
+> anything that runs in someone else's cloud.

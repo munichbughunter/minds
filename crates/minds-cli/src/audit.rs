@@ -20,7 +20,7 @@
 //! Hash und jede Signatur ohne dieses Werkzeug nachrechnen — mit `blake3` und
 //! `ssh-keygen -Y verify`.
 //!
-//! Was das Bündel **nicht** kann, steht in `docs/nachweis-leitfaden.md`. Ein
+//! Was das Bündel **nicht** kann, steht in `docs/verification-guide.md`. Ein
 //! Export, dessen Grenzen nicht mitgeliefert werden, lädt zur Überinterpretation
 //! ein, und das wäre bei einem Nachweis-Artefakt der schlimmste Fehler.
 

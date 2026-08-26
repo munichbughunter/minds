@@ -17,6 +17,11 @@ jobs:
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
+    # Auch auf dem Windows-Runner laufen die Skript-Steps unter Git Bash —
+    # eine Shell-Sprache für alle Targets statt einer pwsh-Zweitfassung.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +44,13 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-latest
             cross: true
+          # Windows nativ (MSVC): Der Runner ist selbst das Target, blake3s
+          # C-Toolchain bringt er mit. Nur x64 — Windows-on-ARM führt
+          # x64-Binaries per Emulation aus, ein eigener ARM-Runner wäre nur
+          # ein weiteres Ausfallrisiko.
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            cross: false
 
     steps:
       - uses: actions/checkout@v7
@@ -86,7 +98,8 @@ jobs:
 
       # Layout und Namensschema sind das, was `install.sh` erwartet: Das Archiv
       # enthält ein Verzeichnis `minds-<version>-<target>/` mit dem Binary darin.
-      # Ändert sich das hier, muss der Installer mit.
+      # Ändert sich das hier, muss der Installer mit. Windows bekommt dasselbe
+      # Layout als `.zip` (dort die Konvention; `install.sh` zielt nur auf Unix).
       - name: Archiv packen
         id: pack
         run: |
@@ -96,17 +109,27 @@ jobs:
           pkg="minds-${version}-${target}"
 
           mkdir -p "dist/${pkg}"
-          cp "target/${target}/dist/minds" "dist/${pkg}/"
           cp README.md CHANGELOG.md "dist/${pkg}/"
-          tar -czf "dist/${pkg}.tar.gz" -C dist "$pkg"
+          case "$target" in
+            *-windows-*)
+              cp "target/${target}/dist/minds.exe" "dist/${pkg}/"
+              (cd dist && 7z a -bd "${pkg}.zip" "$pkg" >/dev/null)
+              ;;
+            *)
+              cp "target/${target}/dist/minds" "dist/${pkg}/"
+              tar -czf "dist/${pkg}.tar.gz" -C dist "$pkg"
+              ;;
+          esac
           rm -rf "dist/${pkg}"
 
-          ls -l "dist/${pkg}.tar.gz"
+          ls -l dist/
 
       - uses: actions/upload-artifact@v7
         with:
           name: archive-${{ matrix.target }}
-          path: dist/*.tar.gz
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
           if-no-files-found: error
           retention-days: 7
 
@@ -128,7 +151,7 @@ jobs:
       - name: Prüfsummen
         working-directory: dist
         run: |
-          sha256sum ./*.tar.gz | sed 's|\./||' | sort -k2 > SHA256SUMS
+          sha256sum ./*.tar.gz ./*.zip | sed 's|\./||' | sort -k2 > SHA256SUMS
           cat SHA256SUMS
 
       # Die Release-Notes stehen im CHANGELOG, nicht im Workflow. Hier wird nur

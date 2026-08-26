@@ -1,1205 +1,1253 @@
 # Changelog
 
-Alle nennenswerten Änderungen an Minds stehen hier.
+All notable changes to Minds are recorded here.
 
-Das Format folgt [Keep a Changelog](https://keepachangelog.com/de/1.1.0/), die
-Versionierung [Semantic Versioning](https://semver.org/lang/de/).
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+versioning follows [Semantic Versioning](https://semver.org/).
 
-> **Noch keine 1.0.** Solange die Führungsziffer `0` ist, gibt es keine
-> Kompatibilitätszusage: Jede MINOR-Version (`0.1` → `0.2`) darf die CLI-Oberfläche
-> und das Store-Layout brechen. PATCH-Versionen (`0.1.0` → `0.1.1`) enthalten nur
-> Korrekturen.
+> **No 1.0 yet.** As long as the leading digit is `0`, there is no compatibility
+> promise: any MINOR version (`0.1` → `0.2`) may break the CLI surface and the
+> store layout. PATCH versions (`0.1.0` → `0.1.1`) contain fixes only.
 >
-> **Davon getrennt zu betrachten ist `schema_version`** in den abgelegten Objekten
-> (Session, Review). Die Version des Binaries versioniert die *Oberfläche*, das
-> Schema versioniert das *gespeicherte Objekt* — und ein Objekt lebt so lange wie das
-> Repo. Es gilt: ein neueres Binary liest alle älteren Schema-Versionen; das Schema
-> steigt nur bei einer brechenden Änderung an der Nutzlast, nie bei einem zusätzlichen
-> Feld.
+> **`schema_version` in the stored objects (session, review) is a separate
+> matter.** The binary's version versions the *surface*; the schema versions the
+> *stored object* — and an object lives as long as the repo. The rule: a newer
+> binary reads all older schema versions; the schema only increments on a
+> breaking change to the payload, never for an additional field.
 
-## [Unreleased]
+## [0.3.0] — 2026-08-26 — "A Gap Is a Link in the Chain"
 
-### Hinzugefügt
+*Until now, Minds proved what was stored. Now it also proves which scope it
+was observing at the time — and that a gap is something other than silence.
+A MINOR version, because the surface grows (`verify`, `sign --seal`,
+`reinterpret`, evidence mode in the TUI) and schema 2 means a read break for
+older binaries. Minds also leaves the Unix world for the first time: the
+release includes a native Windows binary.*
 
-- **Die Evidence Chain** ([ADR-0011](docs/adr/0011-evidence-chain.md)) — Minds
-  beweist nicht mehr nur, was gespeichert wurde, sondern auch, **welchen
-  Bereich es beobachtet hat**: Jedes Journal-Event trägt beim Append zwei
-  gestempelte Hashes (Payload und beobachtete Fakten, `blake3::derive_key`
-  mit Domain-Trennung); der Checkpoint faltet Events **und Lücken** zu einer
-  Kette und legt sie als **Seal** unter `refs/minds/evidence/<seal_id>` ab —
-  content-adressiert, epochen-verkettet (`previous=`), optional
-  ssh-signiert (`user.signingkey`, nachrüstbar mit `minds sign --seal`).
-  Eine Lücke ist ein Kettenglied, kein Schweigen; ein Seal überlebt
-  `minds forget` als payload-freier Beweis. Weist die Redaction eine Session
-  zurück, entsteht erstmals eine auditierbare Spur: ein **Block-Seal**
-  (`outcome=storage_policy_rejected_payload`) ohne Intent, Pfade oder
-  Feldnamen. `minds verify <session-id>` urteilt in der Matrix
-  **Integrität × Coverage** (Exit-Codes: 0 VERIFIZIERT, 1 MANIPULIERT,
-  2 VERIFIZIERT/UNVOLLSTÄNDIG, 3 NICHT VERIFIZIERBAR), `minds verify
-  --evidence <seal-id>` prüft sessionlose Seals, `minds fsck` rechnet
-  liegende Journale nach (Manipulation = Befund) und bekommt
-  `--require-seal` als Gate. `minds audit --export` (Bundle-Schema 2) trägt
-  die Seals byte-genau samt `rejected_seals`; das externe Rezept ohne Minds
-  steht im [Nachweis-Leitfaden](docs/nachweis-leitfaden.md).
-- **Beobachtet heißt nicht gedeutet:** Tool-Aufrufe tragen `capture`
-  (`interpreted`/`uninterpreted`, Adapter samt Version). Ein Agent ohne
-  eigenen Adapter verliert seine Tool-Ebene nicht mehr — der generische
-  Fallback erhält Name und Roh-Argumente als redigiertes Beweismittel. In
-  `minds inspect` erscheint so ein Aufruf als `◐ BEOBACHTET`.
-- **`minds inspect` zeigt Beweiszustände:** Verdikt-Spalte in der Activity
-  (`◈ versiegelt · ! unvollständig · ✗ MANIPULIERT · · unversiegelt`),
-  Seal-Verdikt und Coverage im Session-Kopf, zurückgehaltene Sessions als
-  eigene Zeilen, neue Lücken-Arten in der Why-Kette (`SealedGap`,
-  `UnsealedRange`, `PayloadRejected`) — samt dem Satz, der das System trägt:
-  *Fehlende Evidence beweist nicht, dass nichts geschah.* Die Pipe bekommt
-  eine Verdikt-Spalte (11 Felder — **Achtung:** bestehende `awk`/`cut`-
-  Consumer müssen die neue Spalte 8 berücksichtigen).
+### Added
 
-- **Drei Vertrauensachsen statt eines Status:** `minds verify` spricht
-  Integrität („wurde es verändert?"), Coverage („wissen wir, ob etwas
-  fehlt?") und Deutung („was bedeutet es?") getrennt aus — ein unbekanntes
-  Tool ist ein Deutungs-, kein Integritätsproblem. Coverage ist **immer
-  gescoped**: Der Seal trägt seine Beobachtungsgrenze (`scope=agent-hooks/v1`),
-  und „vollständig" heißt vollständig innerhalb dieser Grenze, nie „alle
-  Systemaktivität". Exit-Codes bleiben der CI-Vertrag aus
-  Integrität × Coverage.
-- **`ToolAdapter`-Trait und `minds reinterpret`** — Adapter sitzen über der
-  Chain (Registry je Agent, `adapter_version` aus der Implementierung) und
-  deuten deterministisch: gleiche Evidence + gleiche Version ⇒ gleiche
-  Deutung, testfixiert. `minds reinterpret <session>` zeigt strikt lesend je
-  Aufruf die Evidenz-Adresse, die gespeicherte und die aktuelle Deutung —
-  Interpretation ist rekonstruierbar, Evidence unveränderlich.
-- **Der Evidence-DAG als Projektion:** Read-Effekte tragen jetzt ebenfalls
-  Inhalts-Hashes (Secret-Ausnahme unverändert), und der Reader projiziert
-  daraus Content-Übergaben — „B las exakt die Bytes, die A schrieb" — als
-  erste Producer von `(content_derived, verified)`: nachgerechnet, nicht
-  beobachtet. Im Session-Graphen als `⇄ ÜBERGABE`-Knoten, nichts davon wird
-  gespeichert.
-- **`minds audit --export --mode proof`** — nur das Beweisgerüst (Ids,
-  kanonische Payloads, Seals samt Signaturen, Verdict-Metadaten), kein
-  Intent, keine Kommentare. `redacted` bleibt Default und Maximum; ein
-  `full`-Modus existiert bewusst nicht (der Store hält nur Redigiertes).
-  `does_not_prove` benennt jetzt auch: fremde Akteure außerhalb der
-  Hook-Grenze, Wirkungen ungedeuteter Tools, die reale Uhrzeit.
-- **Legacy ist ein Zustand, kein `None`:** `Provenance::{Legacy, Chained}`
-  im Lesemodell; alte Sessions zeigen `· legacy` statt einer Leerstelle und
-  bekommen nie nachträglich eine Chain angedichtet. Der Session-Kopf im TUI
-  zeigt Epoche `k/n` und Deutungs-/Übergabe-Zähler. Die acht
-  Chain-Invarianten aus ADR-0011 sind als benannte Tests fixiert.
+- **The Evidence Chain** ([ADR-0011](docs/adr/0011-evidence-chain.md)) — Minds
+  no longer proves just what was stored; it proves **which scope it
+  observed**: on append, every journal event carries two stamped hashes
+  (payload and observed facts, `blake3::derive_key` with domain separation);
+  the checkpoint folds events **and gaps** into a chain and stores it as a
+  **seal** under `refs/minds/evidence/<seal_id>` — content-addressed,
+  epoch-chained (`previous=`), optionally ssh-signed (`user.signingkey`,
+  retrofittable with `minds sign --seal`). A gap is a link in the chain, not
+  silence; a seal survives `minds forget` as payload-free proof. When
+  redaction rejects a session, an auditable trace exists for the first time:
+  a **block seal** (`outcome=storage_policy_rejected_payload`) without
+  intent, paths, or field names. `minds verify <session-id>` renders its
+  verdict from the **integrity × coverage** matrix (exit codes: 0 VERIFIED,
+  1 TAMPERED, 2 VERIFIED/INCOMPLETE, 3 NOT VERIFIABLE), `minds verify
+  --evidence <seal-id>` checks sessionless seals, `minds fsck` recomputes
+  journals still on disk (tampering = a finding) and gains
+  `--require-seal` as a gate. `minds audit --export` (bundle schema 2)
+  carries the seals byte-for-byte, `rejected_seals` included; the recipe
+  for verifying without Minds is in the
+  [verification guide](docs/verification-guide.md).
+- **Observed does not mean interpreted:** tool calls carry `capture`
+  (`interpreted`/`uninterpreted`, adapter including version). An agent
+  without its own adapter no longer loses its tool level — the generic
+  fallback receives name and raw arguments as redacted evidence. In
+  `minds inspect`, such a call appears as `◐ OBSERVED`.
+- **`minds inspect` shows evidence states:** a verdict column in the
+  activity view (`◈ sealed · ! incomplete · ✗ TAMPERED · · unsealed`),
+  seal verdict and coverage in the session header, withheld sessions as
+  rows of their own, new gap kinds in the why chain (`SealedGap`,
+  `UnsealedRange`, `PayloadRejected`) — together with the sentence that
+  carries the system: *Missing evidence does not prove that nothing
+  happened.* The pipe gains a verdict column (11 fields — **caution:**
+  existing `awk`/`cut` consumers must account for the new column 8).
 
-- **Evidence-Modus in `minds inspect` (`e`)** — der Evidence-Report einer
-  Session in drei Ebenen: das **Verdikt** (Integrität, Coverage, Epochen,
-  Signatur, Deutung, Grenzen — je Achse eine Zeile), die **Erklärung**
-  unter dem Fokus (Beobachtungsgrenze mit `✓ erfasst` vs. `— nicht
-  erfasst, keine Lücke`; Epochen als Zeitleiste mit Seal-Status und
-  `previous`-Auflösung; `○ NICHT SIGNIERT` als eigener Zustand — unsigniert
-  ≠ ungültig) und die **Kryptographie** (Seal-Ids, Roots, Algorithmus).
-  Der Leitsatz spricht die Grenze immer mit: *„Kryptographisch verifiziert
-  innerhalb der aufgezeichneten Beobachtungsgrenze."* Legacy-Sessions
-  zeigen ihren ehrlichen Satz statt eines leeren Gerüsts. Getragen wird
-  alles vom neuen **`EvidenceReport`-Read-Model** in `minds-reader` —
-  dieselbe Verdikt-Rechnung wie `minds verify`, die TUI rechnet nichts
-  nach; `proves`/`does_not_prove` sind als kanonisches Vokabular nach
-  `minds-core::evidence` gezogen (eine Quelle für Audit-Bundle, TUI, Doku).
-- **Evidence-Kanten in der Why-Kette sind fokussierbar (#132)** — ↑/↓
-  wandern erst über die Kanten des EVIDENCE-Glieds, Enter auf einer Kante
-  springt in die Why-Kette genau dieses Commits (Esc trägt zurück), und der
-  Inspector erklärt die fokussierte Kante statt alle. Der „Enter ↵"-Hinweis
-  steht damit an der Kante und verspricht wieder eine echte Aktion (#131).
+- **Three axes of trust instead of one status:** `minds verify` speaks to
+  integrity ("was it altered?"), coverage ("do we know whether something is
+  missing?"), and interpretation ("what does it mean?") separately — an
+  unknown tool is an interpretation problem, not an integrity problem.
+  Coverage is **always scoped**: the seal carries its observation boundary
+  (`scope=agent-hooks/v1`), and "complete" means complete within that
+  boundary, never "all system activity". Exit codes remain the CI contract
+  of integrity × coverage.
+- **`ToolAdapter` trait and `minds reinterpret`** — adapters sit above the
+  chain (registry per agent, `adapter_version` from the implementation) and
+  interpret deterministically: same evidence + same version ⇒ same
+  interpretation, test-pinned. `minds reinterpret <session>` shows — strictly
+  read-only — each call's evidence address, its stored interpretation, and
+  the current one: interpretation is reconstructible, evidence immutable.
+- **The evidence DAG as a projection:** read effects now carry content
+  hashes as well (secret exception unchanged), and the reader projects
+  content handovers from them — "B read exactly the bytes A wrote" — as the
+  first producers of `(content_derived, verified)`: recomputed, not
+  observed. In the session graph as `⇄ HANDOVER` nodes; none of it is
+  stored.
+- **`minds audit --export --mode proof`** — only the proof skeleton (ids,
+  canonical payloads, seals including signatures, verdict metadata), no
+  intent, no comments. `redacted` remains the default and the maximum; a
+  `full` mode deliberately does not exist (the store holds only redacted
+  data). `does_not_prove` now also names actors outside the hook
+  boundary, the effects of uninterpreted tools, and the real wall-clock time.
+- **Legacy is a state, not a `None`:** `Provenance::{Legacy, Chained}` in
+  the read model; old sessions show `· legacy` instead of a blank and are
+  never retroactively attributed a chain. The session header in the TUI
+  shows epoch `k/n` and interpretation/handover counters. The eight chain
+  invariants from ADR-0011 are pinned as named tests.
 
-### Geändert
+- **Evidence mode in `minds inspect` (`e`)** — a session's evidence report
+  on three levels: the **verdict** (integrity, coverage, epochs, signature,
+  interpretation, limits — one line per axis), the **explanation** beneath
+  the focus (observation boundary with `✓ captured` vs. `— not captured,
+  no gap`; epochs as a timeline with seal status and `previous` resolution;
+  `○ NOT SIGNED` as a state of its own — unsigned ≠ invalid), and the
+  **cryptography** (seal ids, roots, algorithm). The guiding sentence
+  always states the boundary: *"Cryptographically verified within the
+  recorded observation boundary."* Legacy sessions show their honest
+  sentence instead of an empty skeleton. All of it is carried by the new
+  **`EvidenceReport` read model** in `minds-reader` — the same verdict
+  computation as `minds verify`, the TUI recomputes nothing;
+  `proves`/`does_not_prove` are pulled into `minds-core::evidence` as
+  canonical vocabulary (one source for audit bundle, TUI, docs).
+- **Evidence edges in the why chain are focusable (#132)** — ↑/↓ first walk
+  the edges of the EVIDENCE link, Enter on an edge jumps into the why chain
+  of exactly that commit (Esc carries back), and the inspector explains the
+  focused edge instead of all of them. The "Enter ↵" hint thus sits at the
+  edge and once again promises a real action (#131).
 
-- **Salt-Verlust heilt nicht mehr:** Fehlt oder korrumpiert der Session-Salt,
-  nachdem bereits eine Epoche versiegelt wurde, erzeugt der Checkpoint
-  **keinen** neuen Salt mehr — ein regenerierter Salt versiegelte dieselbe
-  Evidence unter einem zweiten, abweichenden Root (Epoch-Fork) und bräche
-  „gleiche Events ⇒ gleicher Seal". Stattdessen ist der Verlust selbst der
-  Befund: Die Session wird sichtbar vertagt (`hook.log`), das Journal bleibt
-  liegen, die Epoche gilt als nicht mehr reproduzierbar. Vor der ersten
-  Versiegelung bleibt die Salt-Erzeugung unverändert. Zudem präzisieren
-  `proves`/`does_not_prove` im Audit-Bundle und der Nachweis-Leitfaden das
-  Proof-Modell: Seal-Identität und -Signatur sind extern prüfbar; der Seal
-  committed auf Chain-Root und Coverage, die zugrunde liegende Chain ist nur
-  mit lokalem Journal und Session-Salt reproduzierbar.
-- **Schema 2 — Evidence in zwei Dimensionen:** `Edge.evidence` (und die
-  Kanten in `links.json`/Store-Index) ist jetzt ein `EvidenceMark` aus
-  **Quelle** (`heuristic < human_declared < content_derived < observed`) und
-  **Status** (`missing < unknown < partial < verified`). „Verified" heißt
-  strikt *nachgerechnet* — Legacy-Werte lesen tolerant auf Status `unknown`:
-  Das Fehlen der Prüfung ist kein Bestehen. Glyphen tragen den Status als
-  Modifikator (`● ?` beobachtet-ungeprüft, `● ✓` nachgerechnet). **Bruch:**
-  Ein Schema-1-Binary liest Schema-2-Sessions nicht (neuere Binaries lesen
-  alle älteren Versionen; Bestand wird nicht migriert).
+- **Native Windows binary (x86_64):** the release additionally builds
+  `minds-<version>-x86_64-pc-windows-msvc.zip` — same archive layout as the
+  Unix targets, just as a zip with `minds.exe`. `install.sh` stays
+  Unix-only; on Windows, installation means unpacking and putting
+  `minds.exe` on the PATH (under WSL, the Linux route still applies). A new
+  CI gate (`cargo check` on `windows-latest`) keeps the Windows build
+  green going forward.
 
-## [0.2.0] — 2026-08-24 — „Die Entstehung, sichtbar gemacht"
+### Changed
 
-*Das erste Release mit einer Oberfläche. Bisher beantwortete Minds die Frage
-nach dem Warum Zeile für Zeile — `why`, `show`, `recap`, jedes ein eigener
-Aufruf. Jetzt gibt es den einen Ort, an dem sich die Kette ansehen lässt:
-`minds inspect`. Eine MINOR-Version, weil die CLI-Oberfläche wächst (neues
-Kommando, neues Default-Feature `tui`); das Store-Layout und die Schemas
-bleiben unverändert — ein 0.1.3-Repo liest sich ohne Migration.*
+- **Salt loss no longer heals:** if the session salt is missing or corrupted
+  after an epoch has already been sealed, the checkpoint no longer creates
+  a new salt — a regenerated salt would seal the same evidence under a
+  second, diverging root (epoch fork) and break "same events ⇒ same seal".
+  Instead, the loss itself is the finding: the session is visibly deferred
+  (`hook.log`), the journal stays on disk, the epoch counts as no longer
+  reproducible. Before the first sealing, salt creation remains unchanged.
+  In addition, `proves`/`does_not_prove` in the audit bundle and the
+  verification guide sharpen the proof model: seal identity and signature
+  are externally checkable; the seal commits to chain root and coverage,
+  the underlying chain is only reproducible with the local journal and
+  session salt.
+- **Schema 2 — evidence in two dimensions:** `Edge.evidence` (and the edges
+  in `links.json`/store index) is now an `EvidenceMark` made of a
+  **source** (`heuristic < human_declared < content_derived < observed`)
+  and a **status** (`missing < unknown < partial < verified`). "Verified"
+  strictly means *recomputed* — legacy values read leniently as status
+  `unknown`: the absence of the check is not a pass. Glyphs carry the
+  status as a modifier (`● ?` observed-unchecked, `● ✓` recomputed).
+  **Break:** a schema-1 binary does not read schema-2 sessions (newer
+  binaries read all older versions; existing data is not migrated).
 
-### Hinzugefügt
+## [0.2.0] — 2026-08-24 — "The Making, Made Visible"
 
-- **`minds inspect`** — die Entstehung einer Änderung im Terminal. Eine
-  Activity-Liste der Sessions (Zeit, Absicht, Agent, Beleg, Verdict), der
-  Graph einer Session als Spur — Absicht → Agent → READ/EDIT/EXEC → Change →
-  Review — in drei Zoomstufen mit Details unter dem Cursor, und die Why-Kette
-  einer Zeile oder eines Commits mit einem Inspector, der jede Kante erklärt:
-  Trailer-Beleg oder nachgerechnete Vermutung (Datei-Schnittmenge,
-  Zeitfenster). Eine Vermutung sieht nie aus wie ein Beleg — Glyph **und**
-  Wort unterscheiden sich, nicht nur die Farbe. Strikt lesend; vergessene oder
-  defekte Sessions sind degradierte Zeilen, kein Absturz. Ist stdout kein
-  Terminal, kommen die Zeilen tab-separiert und ohne ANSI — `minds inspect
-  retry | grep` zeigt, was der Bildschirm zeigt. Eigenes Crate `minds-tui`
-  hinter dem Cargo-Feature `tui` (Default); `--no-default-features` baut die
-  CLI ohne.
-- **Lücken als eigene Aussage.** `WhyChain::gaps()` im Reader benennt, wo
-  die Kette nicht belegt ist — kein Commit, keine Change-Id, kein Kontext,
-  nur vermutete Zuordnung, vergessene Session, keine Bewertung. Die Oberfläche
-  markiert jedes Glied mit ✓ oder ⚠, zeigt den Block „N LÜCKEN" mit
-  Begründung, und erklärt den Beleg schon beim Fokus: Der Evidenz-Satz sagt
-  *warum* („rekonstruiert aus Datei-Überschneidung und zeitlicher Nähe — kein
-  expliziter Herkunftsnachweis"), nicht nur „irgendwie unsicher". In der Pipe
-  stehen die Lücken als `gap`-Zeilen.
+*The first release with an interface. Until now, Minds answered the question
+of why line by line — `why`, `show`, `recap`, each its own invocation. Now
+there is the one place where the chain can be looked at: `minds inspect`. A
+MINOR version, because the CLI surface grows (new command, new default
+feature `tui`); the store layout and the schemas remain unchanged — a 0.1.3
+repo reads without migration.*
 
-### Geändert
+### Added
 
-- `minds-reader` trägt jetzt das Lese-Modell, das CLI und Oberfläche
-  gemeinsam nutzen: `Inspection` (einmal laden, dann fragen), Karten, Graph,
-  Why-Kette; der `Index` hält die Evidenz **je Kante**, die Change-Id je
-  Commit und degradierte Einträge mit Ursache statt eines bloßen Zählers.
-  `sanitize`/`sanitize_path` leben im Reader, damit jede Oberfläche fremden
-  Text gleich entschärft. `minds-git` liest die Autor-Zeit eines Commits
-  (`Repo::commit_time`).
+- **`minds inspect`** — the making of a change, in the terminal. An
+  activity list of sessions (time, intent, agent, evidence, verdict), a
+  session's graph as a trace — intent → agent → READ/EDIT/EXEC → change →
+  review — in three zoom levels with details under the cursor, and the why
+  chain of a line or a commit with an inspector that explains every edge:
+  trailer evidence or a recomputed conjecture (file intersection, time
+  window). A conjecture never looks like evidence — glyph **and** word
+  differ, not just the color. Strictly read-only; forgotten or broken
+  sessions are degraded rows, not a crash. If stdout is not a terminal, the
+  lines come tab-separated and without ANSI — `minds inspect retry | grep`
+  shows what the screen shows. Its own crate `minds-tui` behind the Cargo
+  feature `tui` (default); `--no-default-features` builds the CLI without
+  it.
+- **Gaps as a statement of their own.** `WhyChain::gaps()` in the reader
+  names where the chain is not substantiated — no commit, no change-id, no
+  context, only conjectured attribution, forgotten session, no verdict. The
+  interface marks every link with ✓ or ⚠, shows the "N GAPS" block with
+  reasoning, and explains the evidence already on focus: the evidence
+  sentence says *why* ("reconstructed from file overlap and temporal
+  proximity — no explicit provenance record"), not just "somehow
+  uncertain". In the pipe, the gaps appear as `gap` lines.
 
-### Bekannte Einschränkungen
+### Changed
 
-*Die Liste unter 0.1.3 gilt unverändert weiter — sie bleibt der Übergabestand.
-Neu hinzu kommt nichts: `minds inspect` ist strikt lesend, arbeitet nur auf
-gespeicherten, redigierten Daten und teilt die bekannten Grenzen von
-`why`/`show` (verlinkte Worktrees zeigen den Commit des Hauptbaums,
+- `minds-reader` now carries the read model that the CLI and the interface
+  share:
+  `Inspection` (load once, then ask), cards, graph, why chain; the `Index`
+  holds the evidence **per edge**, the change-id per commit, and degraded
+  entries with a cause instead of a bare counter. `sanitize`/`sanitize_path`
+  live in the reader so that every interface defuses untrusted text the same
+  way. `minds-git` reads a commit's author time (`Repo::commit_time`).
+
+### Known limitations
+
+*The list under 0.1.3 continues to apply unchanged — it remains the handover
+state. Nothing new is added: `minds inspect` is strictly read-only, works
+only on stored, redacted data, and shares the known limits of `why`/`show`
+(linked worktrees show the main tree's commit,
 [#20](https://github.com/munichbughunter/minds/issues/20)).*
 
-## [0.1.3] — 2026-08-22 — „Unsichtbar, auch unter Last"
+## [0.1.3] — 2026-08-22 — "Invisible, Even Under Load"
 
-*Das Release nach dem ersten manuellen Testlauf. Die Befunde von dort haben
-eine Gemeinsamkeit: Nichts davon war ein Leck, aber alles war eine Zusage, die
-nur hielt, solange jemand daran dachte — die Redaktion an der Quelle statt an
-der Senke, die Terminal-Härtung, die es nur für das Log gab, und ein Push, der
-auf einen zweiten Transport wartete. Jetzt sind die Zusagen strukturell:
-`hook.log` und die Anzeige entschärfen **dort, wo geschrieben wird**, und der
-Kontext-Transport hängt nicht mehr am Push des Nutzers.*
+*The release after the first manual test run. Its findings share
+one trait: none of them was a leak, but all of them were promises that only
+held as long as someone remembered them — redaction at the source instead of
+the sink, terminal hardening that existed only for the log, and a push that
+waited on a second transport. Now the promises are structural: `hook.log`
+and the display defuse **where the writing happens**, and the context
+transport no longer hinges on the user's push.*
 
-Der Preis des letzten Punkts steht unten unter „Bekannte Einschränkungen":
-Der Kontext kommt Sekunden nach dem Push an, nicht mehr garantiert mit ihm.
+The price of that last point is below under "Known limitations": the context
+arrives seconds after the push, no longer guaranteed with it.
 
-### Geändert
+### Changed
 
-- **`git push` wartet nicht mehr auf den Kontext-Transport**
-  ([#85](https://github.com/munichbughunter/minds/issues/85)). Mit fälligen
-  minds-Refs öffnete der pre-push-Hook vor dem Push des Nutzers einen zweiten
-  vollen Transport — gegen GitHub ~1,5 s gemessen, fast ausschließlich
-  Verbindungsaufbau. Jetzt ruft der Hook `minds sync --detach`: Die Planung
-  bleibt im Vordergrund (lokal, ~0,02 s), den Push übernimmt ein losgelöster
-  Prozess ohne Terminal. **Der Kontext kommt damit Sekunden nach dem Push am
-  Remote an, nicht mehr garantiert mit ihm** — wer das braucht, ruft
-  `minds sync` vor dem Push von Hand auf. Der Hintergrundprozess läuft in
-  eigener Session ohne Terminal; was darüber nicht geht — die SSH-Passphrase
-  eines Schlüssels ohne Agent, der Touch eines Security-Keys —, lässt ihn
-  scheitern, und er hinterlässt neben dem Log-Eintrag einen Marker: Der
-  nächste Push läuft dann wieder synchron im Vordergrund, wo der Fehler
-  sichtbar ist und die Anmeldung gelingen kann. Ohne fällige Refs bleibt es
-  bei null zusätzlichen Kosten.
+- **`git push` no longer waits on the context transport**
+  ([#85](https://github.com/munichbughunter/minds/issues/85)). With minds
+  refs due, the pre-push hook opened a second full transport before the
+  user's push — measured at ~1.5 s against GitHub, almost entirely
+  connection setup. Now the hook calls `minds sync --detach`: the planning
+  stays in the foreground (local, ~0.02 s), the push is taken over by a
+  detached process without a terminal. **The context thus arrives at the
+  remote seconds after the push, no longer guaranteed with it** — whoever
+  needs that runs `minds sync` by hand before pushing. The background
+  process runs in its own session without a terminal; whatever cannot work
+  that way — the SSH passphrase of a key without an agent, the touch of a
+  security key — makes it fail; alongside the log entry, it leaves a
+  marker: the next push then runs synchronously in the foreground again,
+  where the error is visible and authentication can succeed. Without due
+  refs, the cost stays at zero.
 
-### Sicherheit
+### Security
 
-- **`minds show`/`minds why` entschärfen gespeicherten Fremdtext vor der
-  Terminal-Ausgabe** ([#116](https://github.com/munichbughunter/minds/issues/116)).
-  Die render-Schicht druckte Prompt, Agent- und Modell-Namen, Constraints,
-  Dateipfade und vor allem die Kanten-Endpunkte (`edges[].to`, wörtlich aus
-  dem Hook-Payload der Gegenseite) roh — die Redaktion aus #35 sucht
-  Geheimnisse, keine Steuerzeichen, und so erreichten ANSI-Sequenzen, Bidi-
-  und Zero-Width-Zeichen das Terminal des Lesers unverändert. Jetzt geht jeder
-  fremde Wert an der Senke durch dieselbe Härtung wie `hook.log`
-  (`text::sanitize`, Pfade über `sanitize_path`); welche Pfade entschärft werden
-  und welche bewusst nicht, steht in der Modul-Doku von `render.rs`. Der volle
-  Prompt (`--full`) behält dabei seine Zeilen und wird unter dem Ast
-  eingerückt, statt den Baum zu zerreißen.
-- **`hook.log` redigiert Zugangsdaten an der Senke, nicht mehr nur an der
-  Quelle** ([#92](https://github.com/munichbughunter/minds/issues/92)). Bisher
-  rief allein `minds sync` die URL-Redaktion auf, bevor ein Fehlertext ins Log
-  ging; die übrigen Schreibstellen (`checkpoint`, `hook`, `brief`,
-  `prepare-commit-msg`, die Parse-Fehler) verließen sich darauf, dass ihr Text
-  keine Remote-URL trägt — eine Zusage, die nur hielt, solange jeder künftige
-  Aufrufer daran dachte. Jetzt läuft jede Zeile durch dieselbe Redaktion, bevor
-  sie in die Datei kommt, und ein Test beweist das für jede Quelle ohne Zutun
-  des Autors. Redigiert wird **vor** dem Kürzen und immer über den ganzen
-  Text, damit kein halbiertes Token — und kein PEM-Schlüssel ohne seinen
-  `-----END`-Marker — die Formerkennung unterläuft; eine Meldung jenseits von
-  256 Ki Zeichen wird deshalb nicht angeschnitten, sondern als Ganzes durch
-  einen Marker ersetzt.
-- **Signieren legt keine vorhersagbaren, welt-lesbaren Dateien mehr in /tmp ab**
-  ([#26](https://github.com/munichbughunter/minds/issues/26)). Beim
-  Signieren/Verifizieren landeten Payloads und Signaturen mit vorhersagbarem
-  Namen (`minds-sign-<pid>-<nanos>`) und Default-Rechten (0644) direkt in
-  `/tmp` — auf Mehrbenutzer-Systemen welt-lesbar plus Symlink-Race, obwohl
-  Attestation-Payloads Intent-Text enthalten können, also genau die Daten, die
-  die Redaction sonst schützt. Jetzt entsteht alles in einem privaten
-  Temp-Verzeichnis (0700, zufälliger Name) mit Dateien im Modus 0600 und
-  `create_new`-Semantik. Der Verfügbarkeits-Check ruft `ssh-keygen` außerdem
-  nicht mehr argumentlos auf (das startete den interaktiven Keygen-Modus),
-  sondern prüft nicht-interaktiv, ob `-Y sign` unterstützt wird. Die ssh-sig-
-  Logik liegt dafür als eigene Crate `minds-attest` vor, damit CLI,
-  `minds-gitlab` und ein künftiger CI-Verifier dasselbe Vertrauensmodell
-  teilen, statt es zu duplizieren.
-- **Der Reconcile-Zweig von `minds sync` hört nicht mehr auf Server-Text**
-  ([#71](https://github.com/munichbughunter/minds/issues/71)). Ob ein
-  fehlgeschlagener Push eine Ref-Divergenz war — der einzige Fall, in dem
-  `sync` fremde Review-Stände holt und in den lokalen Store vereinigt —,
-  entschied eine Substring-Suche im vermischten stdout+stderr von `git push`;
-  ein Remote konnte den Zweig mit einem „rejected" in einer beliebigen
-  `remote:`-Zeile öffnen. Jetzt fällt die Entscheidung auf der
-  `--porcelain`-Struktur von stdout: Nur eine von git selbst im lokalen
-  Vergleich festgestellte Abweisung (`[rejected]` mit
-  non-fast-forward/fetch first/stale info) gilt als Divergenz; ein
-  `[remote rejected]` — dessen Grund wörtlich vom Server stammt, etwa aus
-  einem pre-receive-Hook — nicht mehr. stdout und stderr werden dabei nicht
-  mehr vermischt; die Fehlermeldung kommt von stderr, Zugangsdaten werden
-  weiterhin entfernt.
-- **Die DSGVO-Löschung eines bereits gepushten Session-Refs erreicht jetzt die
-  Forge** ([#102](https://github.com/munichbughunter/minds/issues/102)). Seit
-  die Tombstones elternlos sind (#14), war ein getilgter Ref kein Fast-Forward
-  mehr; `minds sync` (das nie mit `--force` pusht) ließ die Forge den Klartext
-  als aktuelle, browsbare Ref-Spitze behalten — lokal getilgt, remote sichtbar,
-  mit Erfolgsmeldung. Jetzt löscht `forget` die Push-Buchhaltung
-  (`refs/minds/remotes/*`) der getilgten Session-Refs, statt sie auf den
-  Tombstone umzusetzen, und `sync` überträgt genau diese Refs mit einer
-  `+`-Refspec: nur wenn der zu pushende Stand nachweislich ein Tombstone an
-  einem session-exklusiven Ref ist (fail-closed geprüft am Inhalt) und der
-  zuletzt gepushte Stand keiner war — nie Klartext über Klartext, jeder andere
-  Ref bleibt strikt fast-forward und echte Divergenz weiterhin zurückgestellt.
-  Zur Verifikation gehört der Nachweis der Elternlosigkeit — ein Tombstone mit
-  Historie reiste sonst samt Inhalt. Die Übertragung wird beim Push gemeldet
-  und in `hook.log` vermerkt; weist die Forge den Force-Push ab (Protected
-  Branch, Server-Hook), wird auch **das** bei jedem Lauf gemeldet, bis die
-  Löschung durch ist — statt stumm Erfolg zu suggerieren. `forget` nimmt jetzt
-  dasselbe Lock wie `sync`, damit ein laufender Push den eben gelöschten
-  Tracking-Ref nicht am Klartext neu erschafft, und verspricht den Force-Push
-  nur noch für die Orte, die ihn bekommen. Die `--force`-Zusage in
-  `agent-help`, `--help` und der Datenschutz-Übersicht ist entsprechend
-  präzisiert. Bewusst unverändert: Der geteilte Kontext-Ref eines Bestandsrepos
-  wird nie force-gepusht (er trägt auch die übrigen Sessions), und der
-  Store-Ref-Tombstone behält wie seit #14 seine `links.json` (Kanten
-  `commit → Session`, keine Nutzlast) — sie reist mit dem Erasure-Push mit.
-- **Der Backfill aus `minds enable` schreibt in `hook.log`, nicht mehr roh in
-  `import.log` daneben** ([#69](https://github.com/munichbughunter/minds/issues/69)).
-  Der Hintergrund-Import hängte stdout und stderr unverändert an eine zweite
-  Datei im selben Verzeichnis — ohne die Zusagen, die `hook.log` seit #10 hat
-  und auf die `fsck` und `docs/fuer-tester.md` verweisen: Steuerzeichen wurden
-  durchgereicht, die Datei wuchs unbegrenzt und lag mit Umask-Rechten da. Jetzt
-  ist der Backfill ein Hook-Pfad wie `checkpoint` (`Source::Import`): Seine
-  Fehler gehen entschärft, gedeckelt, rotiert und mit 0600 in dieselbe Datei,
-  `fsck` verweist darauf, ein Panic hinterlässt nur seinen Ort (der Prozess
-  hält die rohen Transkripte im Speicher), und `import.log` entsteht nicht
-  mehr — eine vorhandene aus älteren Ständen räumt `enable` weg. Dabei
-  aufgefallen: Ein Transkript ohne Leserechte war bisher nur eine *Notiz*
-  neben „kein Importer" und damit ebenfalls stumm; jetzt ist es ein Befund
-  und steht im Log. Der Gutfall bleibt still — sonst zeigte `fsck` nach
-  jedem `enable` einen Hinweis auf eine Datei, in der nichts Behebbares
-  steht.
+- **`minds show`/`minds why` defuse stored untrusted text before terminal
+  output** ([#116](https://github.com/munichbughunter/minds/issues/116)).
+  The render layer printed prompt, agent and model names, constraints, file
+  paths, and above all the edge endpoints (`edges[].to`, verbatim from the
+  other side's hook payload) raw — the redaction from #35 looks for
+  secrets, not control characters, and so ANSI sequences, bidi and
+  zero-width characters reached the reader's terminal unchanged. Now every
+  untrusted value goes through the same hardening at the sink as `hook.log`
+  (`text::sanitize`, paths via `sanitize_path`); which paths get defused
+  and which deliberately do not is in the module docs of `render.rs`. The
+  full prompt (`--full`) keeps its lines and is indented under the branch
+  instead of tearing the tree apart.
+- **`hook.log` redacts credentials at the sink, no longer only at the
+  source** ([#92](https://github.com/munichbughunter/minds/issues/92)).
+  Until now, only `minds sync` invoked URL redaction before an error text
+  went to the log; the other write sites (`checkpoint`, `hook`, `brief`,
+  `prepare-commit-msg`, the parse errors) relied on their text carrying no
+  remote URL — a promise that only held as long as every future caller
+  remembered it. Now every line runs through the same redaction before it
+  reaches the file, and a test proves that for every source without the
+  author's involvement. Redaction happens **before** truncation and always
+  over the whole text, so that no halved token — and no PEM key without its
+  `-----END` marker — slips past shape detection; a message beyond 256 Ki
+  characters is therefore not cut midway but replaced wholesale with a
+  marker.
+- **Signing no longer drops predictable, world-readable files into /tmp**
+  ([#26](https://github.com/munichbughunter/minds/issues/26)). During
+  signing/verifying, payloads and signatures landed directly in `/tmp` with
+  a predictable name (`minds-sign-<pid>-<nanos>`) and default permissions
+  (0644) — world-readable on multi-user systems plus a symlink race, even
+  though attestation payloads can contain intent text, exactly the data the
+  redaction otherwise protects. Now everything is created in a private temp
+  directory (0700, random name) with files in mode 0600 and `create_new`
+  semantics. The availability check also no longer calls `ssh-keygen`
+  without arguments (which started the interactive keygen mode) but checks
+  non-interactively whether `-Y sign` is supported. The ssh-sig logic now
+  lives as its own crate `minds-attest`, so that the CLI, `minds-gitlab`,
+  and a future CI verifier share the same trust model instead of
+  duplicating it.
+- **The reconcile branch of `minds sync` no longer listens to server text**
+  ([#71](https://github.com/munichbughunter/minds/issues/71)). Whether a
+  failed push was a ref divergence — the only case in which `sync` fetches
+  remote review states and merges them into the local store — was decided
+  by a substring search in the mixed stdout+stderr of `git push`; a remote
+  could force that branch with a "rejected" in any `remote:` line. Now the
+  decision rests on the `--porcelain` structure of stdout: only a rejection
+  determined by git itself in the local comparison (`[rejected]` with
+  non-fast-forward/fetch first/stale info) counts as divergence; a
+  `[remote rejected]` — whose reason comes verbatim from the server, say
+  from a pre-receive hook — no longer does. stdout and stderr are no longer
+  mixed; the error message comes from stderr, credentials are still
+  removed.
+- **The GDPR erasure of an already-pushed session ref now reaches the
+  forge** ([#102](https://github.com/munichbughunter/minds/issues/102)).
+  Since the tombstones became parentless (#14), an erased ref was no longer
+  a fast-forward; `minds sync` (which never pushes with `--force`) let the
+  forge keep the plaintext as the current, browsable ref tip — erased
+  locally, visible remotely, with a success message. Now `forget` deletes
+  the push bookkeeping (`refs/minds/remotes/*`) of the erased session refs
+  instead of moving it to the tombstone, and `sync` transfers exactly these
+  refs with a `+` refspec: only if the state to be pushed is demonstrably a
+  tombstone on a session-exclusive ref (fail-closed, checked against the
+  content) and the last-pushed state was not one — never plaintext over
+  plaintext, every other ref stays strictly fast-forward and real
+  divergence remains deferred. Verification includes the proof of
+  parentlessness — a tombstone with history would otherwise travel with its
+  content. The transfer is reported at push time and noted in `hook.log`;
+  if the forge rejects the force-push (protected branch, server hook),
+  **that** too is reported on every run until the erasure is through —
+  instead of silently suggesting success. `forget` now takes the same lock
+  as `sync`, so that a running push does not recreate the just-deleted
+  tracking ref at the plaintext, and only promises the force-push for the
+  places that actually get it. The `--force` promise in `agent-help`,
+  `--help`, and the privacy overview is sharpened accordingly. Deliberately
+  unchanged: the shared context ref of an existing repo is never
+  force-pushed (it also carries the other sessions), and the store-ref
+  tombstone keeps its `links.json` as it has since #14 (edges
+  `commit → session`, no payload) — it travels along with the erasure
+  push.
+- **The backfill from `minds enable` writes to `hook.log`, no longer raw
+  into an `import.log` next to it**
+  ([#69](https://github.com/munichbughunter/minds/issues/69)). The
+  background import appended stdout and stderr unchanged to a second file
+  in the same directory — without the promises `hook.log` has had since #10
+  and that `fsck` and `docs/for-testers.md` point to: control characters
+  were passed through, the file grew without bound, and it sat there with
+  umask permissions. Now the backfill is a hook path like `checkpoint`
+  (`Source::Import`): its errors go into the same file defused, capped,
+  rotated, and with 0600, `fsck` points to it, a panic leaves only its
+  location (the process holds the raw transcripts in memory), and
+  `import.log` is no longer created — an existing one from older
+  states gets cleaned up by `enable`. Noticed along the way: a transcript
+  without read permission was previously a mere *note*, like "no
+  importer", and thus equally silent; now it is a finding and appears in the
+  log. The happy path stays quiet — otherwise `fsck` would show a hint after
+  every `enable` pointing at a file containing nothing fixable.
 
-- **Das Rohdaten-Journal hält sein Rechte-Versprechen auf jeder Ebene**
-  ([#49](https://github.com/munichbughunter/minds/issues/49)). Die
-  Ereignisdateien waren 0600, aber `create_dir_all` legte die Verzeichnisse
-  darüber mit Umask-Rechten an — andere lokale Nutzer sahen Agentnamen und
-  Session-Kennungen. Jetzt entsteht jede Journal-Ebene direkt mit 0700
-  (kein Umask-Fenster), jeder Append heilt Bestandsjournale mit — testbelegt
-  — und der `.next`-Hinweis liegt mit 0600. Nach dem `rename` eines Events
-  wird auch das **Verzeichnis** synchronisiert — ohne das konnte ein
-  Stromausfall ein Event verschwinden lassen, obwohl der Hook Erfolg
-  gemeldet hatte (Kostenabwägung im Code; Dateisysteme ohne
-  Verzeichnis-fsync bleiben funktionsfähig). Zwei Schärfungen aus den
-  Reviews: Gehärtet wird ab `journal/`, nicht ab `minds/` — sonst entzöge
-  die Härtung in einem gruppen-geteilten Repo dem zweiten Nutzer Lock und
-  Fehlerkanal —, und eine per Symlink umgelenkte Journal-Ebene wird
-  verweigert statt beschrieben oder chmodded, dieselbe Invariante, die das
-  `hook.log` bereits verteidigt.
+- **The raw-data journal keeps its permissions promise on every level**
+  ([#49](https://github.com/munichbughunter/minds/issues/49)). The event
+  files were 0600, but `create_dir_all` created the directories above them
+  with umask permissions — other local users saw agent names and session
+  identifiers. Now every journal level is created directly with 0700 (no
+  umask window), every append heals existing journals along the way —
+  test-backed — and the `.next` hint sits at 0600. After the `rename` of an
+  event, the **directory** is synced too — without that, a power failure
+  could make an event vanish even though the hook had reported success
+  (cost trade-off in the code; filesystems without directory fsync remain
+  functional). Two refinements from the reviews: hardening starts at
+  `journal/`, not at `minds/` — otherwise, in a group-shared repo, the
+  hardening would strip the second user of the lock and the error
+  channel — and a
+  journal level redirected via symlink is refused rather than written to or
+  chmodded, the same invariant `hook.log` already defends.
 
-- **Signierbare Payloads sind nicht mehr über Freitextfelder fälschbar**
-  ([#12](https://github.com/munichbughunter/minds/issues/12)). Die
-  zeilenbasierten Klartexte, über die `minds sign` und `review --sign`
-  signieren, bauten sich aus unvalidierten Feldern — ein `reviewer` von
-  `anna@example.org\ndecision=approve` erzeugte einen Payload mit zwei
-  `decision=`-Zeilen: Die menschenlesbare Zusage war fälschbar, obwohl der
-  Hash korrekt bindet. Beide Payload-Funktionen sind jetzt fail-closed und
-  lehnen neben allen Zeilenumbrüchen (inkl. NEL) auch die Versteck- und
-  Umdeutungszeichen ab (Bidi-Overrides, Unicode-Tags, Zero-Width, BOM —
-  dasselbe Sentinel-Prädikat wie die Log-Entschärfung, NFD-Namen wie
-  `Müller` in Zerlegungsform bleiben gültig). Die Zeilenzahl ist als
-  Invariante testfixiert. Der Fehler benennt das Feld und zitiert nie den
-  Wert. Dazu aus den Reviews: `minds audit` degradiert einen betroffenen
-  Eintrag sichtbar (`unsignable`) statt repo-weit abzubrechen, die
-  `reviews`-Statuszeile meldet „Signatur nicht prüfbar" statt „gültig", und
-  `gitlab webhook --write` lehnt eine Netz-Nutzlast ab, deren Felder keinen
-  signierbaren Payload ergäben — vergifteter Bestand entsteht gar nicht
-  erst.
+- **Signable payloads can no longer be forged via free-text fields**
+  ([#12](https://github.com/munichbughunter/minds/issues/12)). The
+  line-based plaintexts over which `minds sign` and `review --sign` sign
+  were built from unvalidated fields — a `reviewer` of
+  `anna@example.org\ndecision=approve` produced a payload with two
+  `decision=` lines: the human-readable promise was forgeable even though
+  the hash binds correctly. Both payload functions are now fail-closed and
+  reject not just line breaks (incl. NEL) but also the characters that hide
+  or reinterpret text (bidi overrides, Unicode tags, zero-width, BOM — the
+  same sentinel predicate as the log defusing; NFD names like `Müller` in
+  decomposed form stay valid). The line count is test-pinned as an
+  invariant. The error names the field and never quotes the value. Also
+  from the reviews: `minds audit` visibly degrades an affected entry
+  (`unsignable`) instead of aborting repo-wide, the `reviews` status line
+  reports "signature not checkable" instead of "valid", and
+  `gitlab webhook --write` rejects a network payload whose fields would not
+  yield a signable payload — poisoned data never comes into existence in
+  the first place.
 
-### Hinzugefügt
+### Added
 
-- **Integrationstests für die Kommandos des Pilot-Zuschnitts**
-  (Teil von [#51](https://github.com/munichbughunter/minds/issues/51)).
-  Bewusst nicht alle zwölf ungedeckten Kommandos — genau die Pfade, die beim
-  Pilot-Partner nicht selbst debuggbar sind: `prepare-commit-msg` über einen
-  echten `git commit` (inklusive Amend, der weder eine neue noch eine zweite
-  Change-Id erzeugen darf), `blame`/`recap`/`search` je mit Happy-Path und
-  benanntem Fehlerfall, das `brief --hook`-JSON-Envelope als Vertragsfläche
-  (Schema **und** Session-Inhalt — Claude Code parst es stumm) und
-  `gitlab mirror` über die ganze CLI-Strecke gegen einen lokalen HTTP-Stub
-  mit echtem `curl`: Flags landen im richtigen URL-Segment, die Note im Body,
-  der Token als Header — und eine fehlende Token-Variable wird beim Namen
-  genannt. Der Rest von #51 (u. a. `verify`, `gitlab webhook`, `distill`)
-  bleibt offen und im Issue dokumentiert.
+- **Integration tests for the pilot-scope commands**
+  (part of [#51](https://github.com/munichbughunter/minds/issues/51)).
+  Deliberately not all twelve uncovered commands — exactly the paths the
+  pilot partner cannot debug themselves: `prepare-commit-msg` through a
+  real `git commit` (including amend, which must create neither a new nor a
+  second change-id), `blame`/`recap`/`search` each with happy path and a
+  named failure case, the `brief --hook` JSON envelope as a contract
+  surface (schema **and** session content — Claude Code parses it
+  silently), and `gitlab mirror` across the whole CLI route against a local
+  HTTP stub with real `curl`: flags land in the right URL segment, the note
+  in the body, the token as a header — and a missing token variable is
+  called out by name. The rest of #51 (incl. `verify`, `gitlab webhook`,
+  `distill`) remains open and documented in the issue.
 
-- **Pilot-Leitfaden und Datenschutz-Übersicht**
-  (`docs/pilot-leitfaden.md`, `docs/datenschutz-uebersicht.md`). Die eine
-  Seite für die interne Freigabe beim Pilotpartner und der Leitfaden für den
-  Pilot-Zuschnitt — jede belastbare Zusage gegen den Code verifiziert, die
-  bekannten Lücken mit Issue-Nummern benannt statt versteckt.
+- **Pilot guide and privacy overview**
+  (`docs/pilot-guide.md`, `docs/privacy-overview.md`). The one page for the
+  pilot partner's internal approval and the guide for the pilot scope —
+  every load-bearing promise verified against the code, the known gaps
+  named with issue numbers instead of hidden.
 
-### Entfernt
+### Removed
 
-- **Die eingecheckte `site/` ist raus aus dem Repository**
-  ([#60](https://github.com/munichbughunter/minds/issues/60)). 58 generierte
-  HTML-Dateien — die Default-Ausgabe von `minds render` — veralteten mit
-  jedem Commit gegenüber dem Code und widersprachen der eigenen Definition
-  des Readers als „bei jedem Lauf neu gebaut, zustandslos". `site/` steht
-  jetzt in der `.gitignore`; `minds render` erzeugt die Ausgabe weiterhin
-  lokal. Die übrigen Streu-Dateien aus dem Issue (`hello.txt`, `test.txt`,
-  `retest_szenario_1.txt`, `test-szenario-3`) waren bereits untracked und
-  ignoriert.
+- **The checked-in `site/` is out of the repository**
+  ([#60](https://github.com/munichbughunter/minds/issues/60)). 58 generated
+  HTML files — the default output of `minds render` — went stale against
+  the code with every commit and contradicted the reader's own
+  self-description: "rebuilt on every run, stateless". `site/` is now in
+  the `.gitignore`;
+  `minds render` still produces the output locally. The remaining stray
+  files from the issue (`hello.txt`, `test.txt`, `retest_szenario_1.txt`,
+  `test-szenario-3`) were already untracked and ignored.
 
-### Behoben
+### Fixed
 
-- **Nebenläufige Kanten-Schreiber verlieren einander nicht mehr**
-  ([#4](https://github.com/munichbughunter/minds/issues/4)). Zwei
-  gleichzeitige Checkpoints derselben Session — der `post-commit`-Hook und
-  ein Aufruf von Hand reichen — konnten eine Kante `Commit → Session`
-  still verlieren: `why`/`show` fanden die Session über diesen Commit
-  danach nicht mehr, obwohl beide Aufrufe Erfolg meldeten. Der Fix ging
-  tiefer als das Issue: `GitStore::link` mergte außerhalb der
-  CAS-Schleife (das beschriebene Lost Update), aber der Test gegen echte
-  Threads zeigte, dass auch der Compare-and-Swap darunter nicht hielt —
-  gix (0.85) verifiziert den Erwartungswert einer Ref-Transaktion gegen
-  einen **vor** dem Lock gelesenen Stand, zwei Schreiber bekamen beide
-  `Ok`. Jetzt teilen sich Lesen, Mergen und Schreiben einen beobachteten
-  Commit (`update_blob_in_ref`), und der Ref-Wechsel verifiziert unter
-  einem eigenen, prozessübergreifenden Lock — Staleness wird zu
-  `RefRaced` und einem frischen Versuch, nie zu stillem Überschreiben.
-  Das schützt denselben Pfad auch für `put` und `forget`. Die
-  Wiederholungsgrenze steigt von drei auf zehn Versuche, weil verlorene
-  Wettläufe seit der echten Durchsetzung der Normalfall unter Last sind.
-  Drei Befunde aus den Reviews im selben Commit: Das Lock lebt im
-  **geteilten** Git-Verzeichnis (`common_dir`), damit verlinkte Worktrees
-  dasselbe nehmen — sonst wäre die Serialisierung genau in der Topologie
-  wirkungslos, für die es sie braucht; eine nach hartem Prozessende
-  liegengebliebene Lock-Datei nennt in der Fehlermeldung ihren Pfad samt
-  Abhilfe; und eine unlesbare `links.json` wird beim Schreiben nicht mehr
-  still durch eine frische Liste ersetzt, sondern scheitert benannt —
-  Lesen bleibt tolerant.
+- **Concurrent edge writers no longer lose each other's writes**
+  ([#4](https://github.com/munichbughunter/minds/issues/4)). Two
+  simultaneous checkpoints of the same session — the `post-commit` hook and
+  one call by hand suffice — could silently lose a `commit → session`
+  edge: `why`/`show` no longer found the session through that commit
+  afterwards, even though both calls reported success. The fix went deeper
+  than the issue: `GitStore::link` merged outside the CAS loop (the
+  described lost update), but the test against real threads showed that
+  even the compare-and-swap beneath it did not hold — gix (0.85) verifies
+  the expected value of a ref transaction against a state read **before**
+  the lock — two writers both got `Ok`. Now reading, merging, and writing
+  share one observed commit (`update_blob_in_ref`), and the ref switch
+  verifies under its own cross-process lock — staleness becomes `RefRaced`
+  and a fresh attempt, never a silent overwrite. That protects the same
+  path for `put` and `forget` as well. The retry limit rises from three to
+  ten attempts — now that the check actually holds, lost races are the
+  normal case under load. Three findings from the reviews in the same
+  commit: the lock lives in the **shared** git directory (`common_dir`) so
+  linked worktrees take the same one — otherwise the serialization would be
+  ineffective in exactly the topology it is needed for; a lock file left
+  behind after a hard process end names its path plus the remedy in the
+  error message; and an unreadable `links.json` is no longer silently
+  replaced by a fresh list on write, but fails with a name — reading stays
+  tolerant.
 
-- **`gitlab mirror` sendet den Body wieder — Header und Body getrennt**
-  ([#7](https://github.com/munichbughunter/minds/issues/7)). Token-Header
-  (`--header @-`) und JSON-Body (`--data-binary @-`) teilten sich dasselbe
-  stdin — curl liest `-H @-` aber bis EOF: Der POST ging mit leerem Body raus
-  (GitLab: „body is missing"), das Spiegeln funktionierte schlicht nicht, und
-  der Notiz-Inhalt wanderte als kaputter HTTP-Header über die Leitung. Der
-  Body geht jetzt über eine kurzlebige Tempdatei (unter Unix 0600), stdin
-  gehört allein dem Token — der weiterhin nie in der Argumentliste und nie
-  auf der Platte steht. Dazu zitiert die Fehlermeldung jetzt die
-  Server-Antwort (`--fail-with-body` legt GitLabs `message` auf stdout,
-  gekürzt auf 500 Zeichen) — vorher blieb die eigentliche Ursache, etwa
-  „404 Project Not Found", unsichtbar. Vier neue Tests fahren echtes `curl`
-  gegen einen lokalen HTTP-Stub und sichern den Pfad erstmals ab, darunter
-  die Invariante „der Token taucht in keiner Fehlermeldung auf".
+- **`gitlab mirror` sends the body again — header and body separated**
+  ([#7](https://github.com/munichbughunter/minds/issues/7)). Token header
+  (`--header @-`) and JSON body (`--data-binary @-`) shared the same
+  stdin — but curl reads `-H @-` until EOF: the POST went out with an empty
+  body (GitLab: "body is missing"), mirroring simply did not work, and the
+  note content traveled over the wire as a broken HTTP header. The body now
+  goes through a short-lived temp file (0600 on Unix), stdin belongs to the
+  token alone — which still never appears in the argument list and never
+  touches the disk. On top of that, the error message now quotes the server
+  response (`--fail-with-body` puts GitLab's `message` on stdout, trimmed
+  to 500 characters) — before, the actual cause, say "404 Project Not
+  Found", stayed invisible. Four new tests drive real `curl` against a
+  local HTTP stub and cover the path for the first time, among them the
+  invariant "the token appears in no error message".
 
-### Bekannte Einschränkungen
+### Known limitations
 
-*Die Liste des Übergabestands. Sie ersetzt für den heutigen Stand die
-älteren Listen unter v0.1.1 und v0.1.0 — die bleiben historisch stehen,
-gelesen als „gilt heute" wird nur diese hier.*
+*The handover-state list. It supersedes the older lists under v0.1.1 and
+v0.1.0 — those stand as history; only this one reads as "applies
+today".*
 
-- **Verlinkte Git-Worktrees:** Die Erfassung und `fsck` stimmen dort, aber
-  `minds show` und `minds why` zeigen den Commit des Hauptbaums
+- **Linked git worktrees:** capture and `fsck` are correct there, but
+  `minds show` and `minds why` show the main tree's commit
   ([#20](https://github.com/munichbughunter/minds/issues/20)).
-- **Kein natives Windows-Binary** — der unterstützte Weg ist WSL.
-- **Tool-Ebene vollständig nur für Claude Code.** Andere Agents (Codex,
-  Cursor, Gemini, opencode): Der Prompt wird erfasst, die Tool- und
-  Datei-Ebene noch nicht gedeutet.
-- **Die Review-Schicht braucht zwei Personen auf einem Repo** — allein
-  bleiben Erfassung, `why` und `recall` testbar, Reviews nicht.
-- **Rund um `forget` bleiben zwei Randfälle** — die Tilgung erreicht seit
-  0.1.3 auch bereits gepushte Refs (#102, oben unter Sicherheit), offen sind
-  der Kollisions-Randfall des Browse-Branches
-  ([#100](https://github.com/munichbughunter/minds/issues/100), Richtung:
-  über-tilgen, kein Leck) und das Rohdaten-Fenster im Journal
-  ([#49](https://github.com/munichbughunter/minds/issues/49)) — Details in
-  der [Datenschutz-Übersicht](docs/datenschutz-uebersicht.md).
-- **`minds import` nutzt die eingebaute Standard-Policy**, nicht die
-  repo-eigene `.minds/redact.json` — projektspezifische Denylists greifen
-  beim Backfill nicht.
-- **Der Kontext kommt Sekunden nach dem Push am Remote an, nicht mehr
-  garantiert mit ihm** ([#85](https://github.com/munichbughunter/minds/issues/85))
-  — der Transport läuft seit 0.1.3 im Hintergrund. Eine Pipeline, die dem
-  Push unmittelbar folgt, kann frische Reviews knapp verpassen; wer die
-  Garantie braucht, ruft `minds sync` vor dem Push von Hand auf.
-- **`minds gitlab webhook` hat keine Token-Verifikation**
-  ([#8](https://github.com/munichbughunter/minds/issues/8)) — als lokales
-  Kommando enthalten (Default: Dry-Run), aber nicht verwenden; das
-  CI-Gate (`fsck --require-review`) wird als Pipeline-Tor noch nicht
-  empfohlen.
-- **Kein Self-Update** — Versionswechsel laufen über `install.sh` mit
+- **No native Windows binary** — the supported route is WSL.
+- **Tool level complete only for Claude Code.** Other agents (Codex,
+  Cursor, Gemini, opencode): the prompt is captured, the tool and file
+  levels are not yet interpreted.
+- **The review layer needs two people on one repo** — solo, capture,
+  `why`, and `recall` remain testable; reviews do not.
+- **Two edge cases remain around `forget`** — since 0.1.3 the erasure also
+  reaches already-pushed refs (#102, above under Security); still open are
+  the collision edge case of the browse branch
+  ([#100](https://github.com/munichbughunter/minds/issues/100), direction:
+  over-erase, no leak) and the raw-data window in the journal
+  ([#49](https://github.com/munichbughunter/minds/issues/49)) — details in
+  the [privacy overview](docs/privacy-overview.md).
+- **`minds import` uses the built-in default policy**, not the repo's own
+  `.minds/redact.json` — project-specific denylists do not apply during
+  backfill.
+- **The context arrives at the remote seconds after the push, no longer
+  guaranteed with it**
+  ([#85](https://github.com/munichbughunter/minds/issues/85)) — the
+  transport has run in the background since 0.1.3. A pipeline that
+  immediately follows the push can narrowly miss fresh reviews; whoever
+  needs the guarantee runs `minds sync` by hand before pushing.
+- **`minds gitlab webhook` has no token verification**
+  ([#8](https://github.com/munichbughunter/minds/issues/8)) — it ships as
+  a local command (default: dry run), but do not use it; the CI gate
+  (`fsck --require-review`) is not yet recommended as a pipeline gate.
+- **No self-update** — version changes go through `install.sh` with
   `MINDS_VERSION`.
 
-## [0.1.2] — 2026-08-12 — „Die Mauer hält — vorne und hinten"
+## [0.1.2] — 2026-08-12 — "The Wall Holds — Front and Back"
 
-*Das Release, das über die Freigabe entscheidet — nicht über die Begeisterung.
-Die Redaktion ist das eine Versprechen, bei dem ein Fehlschlag nicht ärgerlich,
-sondern schädlich ist; und was doch durchrutscht, muss entfernbar bleiben.
-Deshalb zwei Hälften: **vorne** die Mauer — kein Geheimnis erreicht den Store,
-auf keinem der beiden Eingangswege —, **hinten** die Tilgung — `minds forget`
-hält, was die erste README-Seite verspricht, und lässt die Rückführung danach
-weiterarbeiten.*
+*The release on which approval turns — not enthusiasm. Redaction is the
+one promise where a failure is not annoying but harmful; and whatever slips
+through must remain removable. Hence two halves: **at the front** the wall —
+no secret reaches the store, on neither of the two entry paths — **at the
+back** the erasure — `minds forget` keeps what the first README page
+promises, and lets reinjection keep working afterwards.*
 
-Fast jeder Fix hier ist im Code- oder Security-Review um eigene Folge-Befunde
-gewachsen — dreimal waren es Regressionen, die erst durch den Fix entstanden
-wären. Wo es zählte, wurde zusätzlich empirisch gegen das gebaute Binary
-gemessen, nicht nur gegen die Testsuite.
+Almost every fix here grew its own follow-up findings in code or security
+review — three times they were regressions the fix itself would have
+introduced. Where it counted, the numbers were measured against the built
+binary, not just the test suite.
 
-### Sicherheit
+### Security
 
-**Vorne — die Redaktion:**
+**At the front — redaction:**
 
-- **Kein Panic mehr bei Multibyte-Zeichen im Wert**
+- **No more panic on multibyte characters in the value**
   ([#1](https://github.com/munichbughunter/minds/issues/1)).
-  `PASSWORD=hunter€2` stürzte in der Windows-Pfad-Erkennung ab, weil mitten im
-  UTF-8-Zeichen byte-indiziert wurde. Die Prüfung arbeitet jetzt auf
-  char-Grenzen.
+  `PASSWORD=hunter€2` crashed in the Windows path detection because it was
+  byte-indexed in the middle of a UTF-8 character. The check now works on
+  char boundaries.
 
-- **`curl -u user:pass` wird redigiert**
-  ([#2](https://github.com/munichbughunter/minds/issues/2)). Neuer
-  Short-Flag-Detektor für Authentifizierungs-Flags, in beiden Formen
-  (`-u user:pass` und `-uuser:pass`), als eigener Schalter `short_flags` in
-  der Policy — per Default an.
+- **`curl -u user:pass` gets redacted**
+  ([#2](https://github.com/munichbughunter/minds/issues/2)). New short-flag
+  detector for authentication flags, in both forms (`-u user:pass` and
+  `-uuser:pass`), as its own switch `short_flags` in the policy — on by
+  default.
 
-- **JSON-escapte Secrets leaken nicht mehr teilweise**
-  ([#3](https://github.com/munichbughunter/minds/issues/3)). Tool-Argumente
-  liegen im Envelope immer JSON-serialisiert vor — genau die Eingabeklasse,
-  die die Muster nicht abdeckten: Ein escaptes Quote im Wert ließ `ter2` aus
-  `hun\"ter2` stehen, ein PEM mit literalem `\n` matchte gar nicht. Die
-  Reviews fanden vier Folge-Befunde derselben Klasse; drei davon wären erst
-  durch den Fix entstanden — unter anderem kippte die Pfad-Ausnahme von einem
-  Teil- auf ein Total-Leck.
+- **JSON-escaped secrets no longer leak partially**
+  ([#3](https://github.com/munichbughunter/minds/issues/3)). Tool arguments
+  always sit JSON-serialized in the envelope — exactly the input class the
+  patterns did not cover: an escaped quote in the value left `ter2` of
+  `hun\"ter2` behind, and a PEM with a literal `\n` did not match at all.
+  The reviews found four follow-up findings of the same class; three of
+  them the fix itself would have introduced — among other things, the path
+  exception flipped from a partial to a total leak.
 
-- **Die Token-Regeln kennen jetzt die wahrscheinlichsten Formen**
+- **The token rules now know the most likely shapes**
   ([#33](https://github.com/munichbughunter/minds/issues/33)). Anthropic
-  (`sk-ant-`), OpenAI (`sk-proj-`, `sk-svcacct-`, `sk-admin-`), SendGrid und
-  die **GitLab-Familie** (`glcbt-`, `glptt-`, `glft-`, `glimt-`, `glagent-`,
-  `glsoat-`) — Letztere fehlte fast vollständig, in einem Produkt, das auf
-  GitLab zielt. Zwei gemessene Funde dazu: Die nicht-überlappende
-  Vorfilter-Suche ließ ausgerechnet den Anthropic-Key komplett durchrutschen
-  (`sk-` gewann gegen `sk-ant-`), und die Längen-Caps lagen unter der Realität,
-  sodass Token-Schwänze stehen blieben. Gegen Fehlalarme verlangen die neuen
-  Regeln Struktur (Typ-Sektion, Ziffern-Sektion, Wortanfang) — Prosa *über*
-  Keys bleibt lesbar.
+  (`sk-ant-`), OpenAI (`sk-proj-`, `sk-svcacct-`, `sk-admin-`), SendGrid,
+  and the **GitLab family** (`glcbt-`, `glptt-`, `glft-`, `glimt-`,
+  `glagent-`, `glsoat-`) — the latter was almost entirely missing, in a
+  product that targets GitLab. Two measured findings along the way: the
+  non-overlapping prefilter search let the Anthropic key of all things slip
+  through completely (`sk-` won against `sk-ant-`), and the length caps sat
+  below reality, so token tails survived. Against false positives, the new
+  rules demand structure (type section, digit section, word start) — prose
+  *about* keys stays readable.
 
-- **Tokens in URL-Queries erreichen das hook.log nicht mehr**
-  ([#73](https://github.com/munichbughunter/minds/issues/73)). Die bei GitLab
-  dokumentierte Form `?private_token=…` hat kein `@` und kam wörtlich in eine
-  Datei, die nie gelöscht wird. Die Diagnose-Senke wendet die Redaction-Policy
-  jetzt gezielt je `name=wert`-Paar an — plus den formbasierten
-  Token-Detektor über den ganzen Text —, sodass Host und Fehlerursache lesbar
-  bleiben. `token` zählt in dieser Senke zum Strict-Tier, damit auch
-  präfixlose Tokens (self-hosted GitLab vor 16.x) fallen.
+- **Tokens in URL queries no longer reach `hook.log`**
+  ([#73](https://github.com/munichbughunter/minds/issues/73)). The form
+  documented at GitLab, `?private_token=…`, has no `@` and went verbatim
+  into a file that is never deleted. The diagnostics sink now applies the
+  redaction policy to each `name=value` pair individually — plus the
+  shape-based token detector over the whole text — so that host and error
+  cause stay readable. `token` falls into the strict tier in this sink, so
+  that prefix-less tokens (self-hosted GitLab before 16.x) are caught too.
 
-- **Die secretfile-Mauer kennt die gängigen Zugangsdaten-Dateien**
+- **The secretfile wall knows the common credentials files**
   ([#34](https://github.com/munichbughunter/minds/issues/34)).
-  GCP-Service-Accounts, `credentials.json`, FIDO-SSH-Keys, `htpasswd`,
-  `.netrc.gpg`, die Verzeichnisse `gcloud` und `/etc/wireguard/` — und
-  Dateien, für die die Mauer die **einzige** Schicht ist, weil kein Detektor
-  ihre Inhalte fangen kann: Ansible-Vault-Passwortdateien, `.dockercfg`,
-  `rclone.conf`, `.s3cfg`, `.boto`. Der schwerste Befund kam aus dem Review
-  und betraf den eigenen Fix: Die Segmentgrenzen-Prüfung ließ dekorierte
-  Varianten (`credentials.bak`, `config-prod`) durchfallen — byte-gleiche
-  Zugangsdaten. Die Regel ist umgedreht: Der Rest hinter dem Muster
-  disqualifiziert nur noch, wenn er die Datei zu etwas anderem macht.
+  GCP service accounts, `credentials.json`, FIDO SSH keys, `htpasswd`,
+  `.netrc.gpg`, the directories `gcloud` and `/etc/wireguard/` — and files
+  for which the wall is the **only** layer because no detector can catch
+  their contents: Ansible vault password files, `.dockercfg`,
+  `rclone.conf`, `.s3cfg`, `.boto`. The most severe finding came from the
+  review and concerned the fix itself: the segment-boundary check let
+  decorated variants (`credentials.bak`, `config-prod`) fall through —
+  byte-identical credentials. The rule is inverted: the remainder behind
+  the pattern only disqualifies if it turns the file into something else.
 
-- **Die Redaktion prüft jetzt wirklich jedes Textfeld des Envelopes**
+- **Redaction now truly checks every text field of the envelope**
   ([#35](https://github.com/munichbughunter/minds/issues/35)).
-  Ausgenommen waren bislang die Zeitstempel (`turns[].at`,
-  `lineage.started_at`, `lineage.ended_at`), die Kennung `lineage.local_id`
-  und die Endpunkte der Herkunftskanten — mit der Begründung, dort könne
-  nichts stehen. Auf dem Hook-Pfad stimmte das; beim **Import** stammen diese
-  Werte aus einer fremden Transkriptdatei, und der Endpunkt einer Kante kommt
-  direkt aus dem Payload der Gegenseite.
+  Until now, the timestamps (`turns[].at`,
+  `lineage.started_at`, `lineage.ended_at`), the identifier
+  `lineage.local_id`, and the endpoints of the provenance edges were
+  exempt — on the grounds that nothing could be there. On the hook path
+  that was true; on **import** these values come from an external
+  transcript file, and the
+  endpoint of an edge comes directly from the other side's payload.
 
-  Sichtbare Folge: In seltenen Fällen kann dort jetzt `[redacted:…]` stehen,
-  wo vorher ein Wert stand, und der Nenner in der Redaction-Meldung wächst.
-  Wo dabei erstmals etwas gefunden wird, ändert sich der Envelope und damit
-  die `SessionId` — ein erneuter Import derselben Session legt sie dann unter
-  einer zweiten Kennung ab.
+  Visible consequence: in rare cases `[redacted:…]` can now stand where a
+  value stood before, and the denominator in the redaction message grows.
+  Where something is found there for the first time, the envelope changes
+  and with it the `SessionId` — a repeated import of the same session then
+  stores it under a second identifier.
 
-- **Die Mauer gilt auf beiden Eingangswegen**
-  ([#93](https://github.com/munichbughunter/minds/issues/93)). `minds import`
-  baute die Tool-Argumente direkt aus dem Transkript — ein `Write` auf eine
-  Zugangsdaten-Datei trug den vollen Inhalt im `input`, und der stand wörtlich
-  im Store. Prüfung, Heuristik und Ersatz-Form stehen jetzt an genau einer
-  Stelle (`secretwall`), mit byte-gleicher Envelope-Form auf Hook- und
-  Import-Weg. Drei Zusatzbefunde im selben Commit: Der Hook-Weg verlor Marker
-  und Auslass-Grund im Envelope schon immer; die Pipeline redigierte den
-  eigenen Auslass-Grund (`secret` im Feldnamen); doppelt serialisierter Input
-  schlüpfte an der Mauer vorbei, während die Verbatim-Kopie den Inhalt
-  mitnahm. `minds import` weist jetzt aus, wie viele Tool-Calls hinter der
-  Mauer ausgelassen wurden.
+- **The wall applies on both entry paths**
+  ([#93](https://github.com/munichbughunter/minds/issues/93)).
+  `minds import` built the tool arguments directly from the transcript — a
+  `Write` to a credentials file carried the full content in `input`, and it
+  sat verbatim in the store. Check, heuristic, and replacement form now
+  live in exactly one place (`secretwall`), with a byte-identical envelope
+  form on the hook and import paths. Three additional findings in the same
+  commit: the hook path had always lost the marker and the omission reason
+  in the envelope; the pipeline redacted its own omission reason (`secret`
+  in the field name); doubly serialized input slipped past the wall while
+  the verbatim copy carried the content through. `minds import` now reports
+  how many tool calls were omitted behind the wall.
 
-- **Ein envelope-realistischer Korpus und zwei Property-Tests sichern die
-  Regressionsgrenze** ([#36](https://github.com/munichbughunter/minds/issues/36)).
-  Je 30.000 deterministische Eingaben, ohne neue Dependency: kein Panic auf
-  beliebigem UTF-8, ein injiziertes Geheimnis überlebt nie, und
-  `redact(redact(x)) == redact(x)`. Genau die Idempotenz-Invariante fand einen
-  Bug, den 1037 bestehende Tests nicht sahen: Ein JSON-serialisierter
-  `.env`-Inhalt kippte zwischen zwei Läufen die Kategorie
-  (`secret` → `pii`), `redact_session` lehnte die Session als `Unstable` ab —
-  ein stiller Erfassungsausfall. Ein bereits redigierter Platzhalter wird
-  jetzt nicht ein zweites Mal getroffen.
+- **A corpus of realistic envelopes and two property tests guard the
+  regression boundary**
+  ([#36](https://github.com/munichbughunter/minds/issues/36)).
+  30,000 deterministic inputs each, without a new dependency: no panic on
+  arbitrary UTF-8, an injected secret never survives, and
+  `redact(redact(x)) == redact(x)`. It was the idempotence invariant, of all
+  things, that found a bug 1037 existing tests did not see: a JSON-serialized
+  `.env` content flipped the category between two runs (`secret` → `pii`),
+  `redact_session` rejected the session as `Unstable` — a silent capture
+  outage. An already-redacted placeholder is no longer hit a second time.
 
-**Hinten — die Tilgung:**
+**At the back — erasure:**
 
-- **`forget` tilgt auch den Session-Branch**
-  ([#5](https://github.com/munichbughunter/minds/issues/5)). Der browsbare
-  Branch (`refs/minds/sessions/<hex>`) trägt `session.json` **und** eine
-  gerenderte `session.md` — und blieb bei der Löschung stehen: „vergessen"
-  gemeldet, Klartext weiter auf der Forge, für jeden mit Repo-Zugriff lesbar.
-  `forget` prüft und tilgt jetzt alle drei Orte (Store-Ref, Session-Branch,
-  Kontext-Baum), ersetzt den Branch-Baum vollständig und benennt in seiner
-  Ausgabe jeden getilgten Ort.
+- **`forget` also erases the session branch**
+  ([#5](https://github.com/munichbughunter/minds/issues/5)). The browsable
+  branch (`refs/minds/sessions/<hex>`) carries `session.json` **and** a
+  rendered `session.md` — and was left in place on deletion: "forgotten"
+  reported, plaintext still on the forge, readable by anyone with repo
+  access. `forget` now checks and erases all three places (store ref,
+  session branch, context tree), replaces the branch tree completely, and
+  names every erased place in its output.
 
-- **Ein erneuter `put` reanimiert keine vergessene Session mehr**
-  ([#6](https://github.com/munichbughunter/minds/issues/6)). Ein Capture auf
-  einer zweiten Maschine oder ein Import überschrieb den Tombstone mit
-  Klartext — eine DSGVO-Löschung mit Erfolgsmeldung, die nicht hielt. Der
-  Store-Ref wird jetzt mit einem atomaren Guard geschrieben (ein `forget` im
-  Fenster gewinnt), der Session-Branch dreifach gestaffelt geprüft; Import und
-  Checkpoint überspringen Vergessene, ohne zu scheitern.
+- **A repeated `put` no longer revives a forgotten session**
+  ([#6](https://github.com/munichbughunter/minds/issues/6)). A capture on a
+  second machine or an import overwrote the tombstone with plaintext — a
+  GDPR erasure with a success message that did not hold. The store ref is
+  now written with an atomic guard (a `forget` in the window wins), the
+  session branch checked in three stages; import and checkpoint skip
+  forgotten ones without failing.
 
-- **Der Tombstone ist ein elternloser Wurzel-Commit**
-  ([#14](https://github.com/munichbughunter/minds/issues/14)). Vorher blieb
-  der Klartext über `<ref>~1` regulär erreichbar und reiste bei jedem Sync auf
-  alle Clones. Jetzt ist er über **keinen** Ref mehr erreichbar und nach
-  `git gc` endgültig fort; auch die eigene Push-Buchhaltung
-  (`refs/minds/remotes/*`) wird vom Klartext gelöst, sonst hielte sie ihn
-  gc-immun. Bricht die Mehr-Ort-Tilgung ab, benennt `ForgetIncomplete` die
-  getilgten und die offenen Orte — ein erneuter `forget` vollendet idempotent.
-  Ein bereits auf die Forge **gepushter** Ref braucht weiterhin einen
-  Force-Push ([#102](https://github.com/munichbughunter/minds/issues/102)).
+- **The tombstone is a parentless root commit**
+  ([#14](https://github.com/munichbughunter/minds/issues/14)). Before, the
+  plaintext remained reachable via `<ref>~1` and traveled to all
+  clones on every sync. Now **no** ref reaches it anymore, and it is
+  definitively gone after `git gc`; the push bookkeeping
+  (`refs/minds/remotes/*`) is also detached from the plaintext — otherwise
+  it would keep it gc-immune. If the multi-place erasure aborts,
+  `ForgetIncomplete` names the erased and the still-open places — a repeated
+  `forget` completes idempotently. A ref already **pushed** to the forge
+  still needs a force-push
+  ([#102](https://github.com/munichbughunter/minds/issues/102)).
 
-### Behoben
+### Fixed
 
-- **Die Rückführung überlebt getilgte und defekte Sessions**
-  ([#83](https://github.com/munichbughunter/minds/issues/83)). Eine einzige
-  vergessene Session brach `brief`, `distill` und `recall` dauerhaft ab — wer
-  die DSGVO-Löschung benutzte, verlor die Kontext-Rückführung vollständig,
-  und der SessionStart-Hook scheiterte bei jedem Sitzungsstart. Jetzt gilt der
-  Degrade-Vertrag von `show`/`why` auch hier: Übersprungen wird gezählt statt
-  abgebrochen, jedes betroffene Kommando nennt die Zahl vor der Ausgabe
-  (`minds brief: 1 vergessene Session übersprungen`; nur Defekte verweisen auf
-  `minds fsck`), und `brief --hook` schreibt den Hinweis ins hook.log statt in
-  die Sitzung.
+- **Reinjection survives erased and broken sessions**
+  ([#83](https://github.com/munichbughunter/minds/issues/83)). A single
+  forgotten session aborted `brief`, `distill`, and `recall` permanently —
+  whoever used the GDPR erasure lost context reinjection entirely, and the
+  SessionStart hook failed at every session start. Now the degrade contract
+  of `show`/`why` applies here too: skips are counted instead of aborting,
+  every affected command names the number before its output
+  (`minds brief: 1 forgotten session skipped`; only broken ones point to
+  `minds fsck`), and `brief --hook` writes the hint to the hook.log instead
+  of into the session.
 
-## [0.1.1] — 2026-08-10 — „Der Hook feuert wirklich"
+## [0.1.1] — 2026-08-10 — "The Hook Actually Fires"
 
-*Elf Reparaturen an dem einen Versprechen, das alle anderen trägt: dass ein
-Commit erfasst wird. Keine neue Funktionalität — und trotzdem das Release, ohne
-das jedes Feature unsichtbar geblieben wäre.*
+*Eleven repairs to the one promise that carries all the others: that a
+commit gets captured. No new functionality — and still the release without
+which every feature would have stayed invisible.*
 
-Der rote Faden ist die **stille Falschheit**. Fast jeder Fehler hier meldete
-Erfolg und tat nichts: `enable` schrieb Hooks in ein Verzeichnis, aus dem Git
-nie liest; die Hooks fanden `minds` nicht und schwiegen; ein Tippfehler
-schaltete das CI-Gate ab und ließ die Pipeline grün; ein eingecheckter
-Fremdeintrag verhinderte die Registrierung, ohne dass es jemand sah. Was diese
-Fälle verbindet, ist nicht ihre Ursache, sondern ihre Bauart — sie brechen
-nichts, sie hören nur auf zu arbeiten.
+The common thread is **silent falsehood**. Almost every bug here reported
+success and did nothing: `enable` wrote hooks into a directory Git never
+reads from; the hooks could not find `minds` and kept quiet; a typo switched
+off the CI gate and left the pipeline green; a checked-in third-party entry
+prevented registration without anyone seeing it. What connects these cases
+is not their cause but their construction — they break nothing, they just
+stop working.
 
-`minds fsck` ist deshalb das Kommando, das in diesem Release am meisten
-gewachsen ist: Es benennt inzwischen jeden dieser Zustände.
+`minds fsck` is therefore the command that grew the most in this release: it
+now names every one of these states.
 
-### Behoben
+### Fixed
 
-- Die Agent-Registrierungen haben eine **Soll-Quelle** bekommen, und die
-  Erkennung liest zwei Wörter statt einer Teilzeichenkette. Daran hingen zwei
-  Fehlklassen. Erstens: Ein eingecheckter Eintrag, der `minds hook` nur
-  zufällig im Text trägt — `echo "minds hook ist nett"` —, galt als
-  Registrierung; der echte Capture-Hook entstand nie, lautlos, bei jedem
-  Kollegen, der das Repo klonte
-  ([#78](https://github.com/munichbughunter/minds/issues/78)). Zweitens: Ein
-  geänderter Aufruf erreichte **bestehende Installationen nie**, weil jede
-  vorhandene Registrierung als „schon da" durchging
-  ([#68](https://github.com/munichbughunter/minds/issues/68)). Beide sind
-  dieselbe Codestelle, und ein halber Umbau wäre schlimmer als keiner gewesen:
-  Ein exakter Vergleich ohne verlässlichen Besitztest hätte fremde
-  Nutzerkonfiguration überschrieben.
+- The agent registrations have gained a **source of truth**, and detection
+  reads two words instead of a substring. Two failure classes traced back
+  to it. First: a checked-in entry that merely mentions `minds hook` in
+  its text — `echo "minds hook is nice"` — counted as a registration; the
+  real capture hook was never installed — silently, for every
+  colleague who cloned the repo
+  ([#78](https://github.com/munichbughunter/minds/issues/78)). Second: a
+  changed invocation **never reached existing installations**, because
+  every existing registration passed as "already there"
+  ([#68](https://github.com/munichbughunter/minds/issues/68)). Both live at
+  the same spot in the code, and a halfway fix would have been worse than
+  none: an exact comparison without a reliable ownership test would have
+  overwritten configuration minds does not own.
 
-  Jetzt gilt: Das erste Wort muss auf `minds` enden — nackt oder als Pfad —,
-  das zweite genau `hook` bzw. `brief` sein; beim Recall-Eintrag zusätzlich
-  `--hook`, denn `minds brief docs/ > brief.md` ist ein legitimer eigener
-  SessionStart-Hook und gehört dem Nutzer. Verglichen wird der **Argumentteil**:
-  Ein von Hand gepinnter Pfad bleibt stehen — `minds` hat dort nie einen
-  geschrieben, und für die Agent-Registrierungen ist er die einzige Abhilfe
-  gegen die PATH-Blindheit aus
-  [#25](https://github.com/munichbughunter/minds/issues/25). Ein eigener Eintrag mit altem
-  Wortlaut wird **an Ort und Stelle** korrigiert (Reihenfolge, `matcher` und
-  Zusatzschlüssel des Nutzers bleiben), Fremdes bleibt unangetastet, und der
-  Ersatz wird gemeldet — auch ohne `-v`, denn diese Zeile kann jemand von Hand
-  geändert haben. Ein vorhandener Recall-Eintrag wird auch **ohne** `--recall`
-  gepflegt: Der Schalter regiert das Anlegen, nicht die Wartung, sonst bliebe
-  ein `fsck`-Hinweis stehen, den kein `minds enable` behebt.
-- Ein **eigenes, aber veraltetes OpenCode-Plugin** wird wieder aktualisiert.
-  Es trägt die Marke hinter `//`, verglichen wurde aber gegen die Shell-Fassung
-  mit `#` — der Test war damit *immer* falsch, das Plugin galt als fremde
-  Datei und blieb für immer auf dem alten Stand.
+  Now the rule is: the first word must end in `minds` — bare or as a path —
+  and the second must be exactly `hook` or `brief`; for the recall entry
+  additionally `--hook`, because `minds brief docs/ > brief.md` is a
+  legitimate SessionStart hook the user wrote — it belongs to them. What
+  gets compared is the **argument part**: a hand-pinned path stays — `minds`
+  never wrote one there, and for the agent registrations it is the only
+  remedy against the PATH blindness from
+  [#25](https://github.com/munichbughunter/minds/issues/25). An entry minds
+  owns but with old wording is corrected **in place** (order, `matcher`,
+  and the user's extra keys remain), entries it does not own stay
+  untouched, and the replacement is reported — even without `-v`, because
+  someone may have changed that line by hand. An existing recall entry is maintained even
+  **without** `--recall`: the switch governs creation, not maintenance —
+  otherwise an `fsck` hint would remain that no `minds enable` fixes.
+- An **outdated OpenCode plugin of minds' own** gets updated again. It
+  carries the mark behind `//`, but the comparison ran against the shell
+  variant with `#` — the test was thus *always* wrong: the plugin counted
+  as someone else's file and stayed stale forever.
   ([#68](https://github.com/munichbughunter/minds/issues/68))
-- `minds enable` sagt jetzt, wenn es an einer Stelle **nichts registrieren
-  konnte**, weil dort Fremdes steht: ein `hooks`, das kein Objekt ist, ein
-  Event, das kein Array ist, ein fremdes `minds.ts`. Bisher gingen diese Fälle
-  als „unverändert" durch — eine Beruhigung, die nicht stimmte, denn der Agent
-  journaliert dann nicht. Und ein kaputtes Event reißt die übrigen sechs nicht
-  mehr mit. ([#68](https://github.com/munichbughunter/minds/issues/68),
+- `minds enable` now says when it **could not register anything** at a
+  spot because something it does not own is there: a `hooks` that is not an
+  object, an event that is not an array, a `minds.ts` it did not write.
+  Until now these cases passed as "unchanged" — a reassurance that was not
+  true, because the agent then does not journal. And a broken event no longer drags the
+  other six down with it.
+  ([#68](https://github.com/munichbughunter/minds/issues/68),
   [#78](https://github.com/munichbughunter/minds/issues/78))
 
-- **`minds brief --hook` verliert seine Fehler nicht mehr.** Der von
-  `minds enable --recall` registrierte SessionStart-Hook lautet
-  `minds brief --hook 2>/dev/null || true`: stderr ging ins Nichts, der
-  Rückgabewert wurde verschluckt. Scheiterte `brief`, startete die Sitzung
-  **ohne** den Kontext, den minds ihr mitgeben wollte — derselbe Stillausfall
-  wie [#10](https://github.com/munichbughunter/minds/issues/10), nur auf dem
-  Lese- statt dem Capture-Pfad. Die Fehler gehen jetzt nach
-  `<git-dir>/minds/hook.log`, und ein Panic ebenfalls: Bisher schaltete der
-  Prozess seit [#54](https://github.com/munichbughunter/minds/issues/54) zwar
-  den Panic-Handler still, hatte aber keine Klammer, die ihn auffing — er war
-  unterdrückt *und* nirgends aufgezeichnet. Vom Log bekommt dieser Pfad nur
-  den **Ort**, nicht die Meldung: `brief` hält redigierte Sessions im
-  Speicher. Ohne `--hook` bleibt alles beim Alten — dort steht ein Mensch
-  davor, und der Fehler gehört auf stderr.
+- **`minds brief --hook` no longer loses its errors.** The SessionStart
+  hook registered by `minds enable --recall` reads
+  `minds brief --hook 2>/dev/null || true`: stderr went nowhere and the exit
+  code was swallowed. If `brief` failed, the session started **without**
+  the context minds wanted to hand it — the same silent outage as
+  [#10](https://github.com/munichbughunter/minds/issues/10), only on the
+  read path instead of the capture path. The errors now go to
+  `<git-dir>/minds/hook.log`, and a panic does too: since
+  [#54](https://github.com/munichbughunter/minds/issues/54) the process
+  silenced the panic handler but had nothing in place to catch the panic —
+  it was suppressed *and* recorded nowhere. This path gives the log only the
+  **location**, not the message: `brief` holds redacted sessions in memory.
+  Without `--hook` everything stays as it was — a human is at the terminal,
+  and the error belongs on stderr.
   ([#68](https://github.com/munichbughunter/minds/issues/68))
 
-- `minds enable` funktioniert in **verlinkten Worktrees** (`git worktree add`).
-  Dort ist `.git` eine Datei mit einem `gitdir:`-Verweis; sie wurde nicht
-  aufgelöst, und `enable` meldete „kein Git-Repository gefunden" — in einem
-  offensichtlichen Repository, mit einer Meldung, die faktisch falsch war.
-  Agents arbeiten zunehmend in Worktrees. Die Hooks landen im **gemeinsamen**
-  Git-Verzeichnis, wo Git sie für alle Arbeitsbäume ausführt; `enable` sagt das
-  auch, weil es niemand aus einem Pfad herausliest. Ein Commit im Worktree
-  erzeugt damit einen Checkpoint, und `minds fsck` meldet ihn dort als heil.
-  Dieselbe Auflösung macht `minds enable` nebenbei in **Submodulen**
-  brauchbar — auch dort ist `.git` eine Datei; die Hooks landen im
-  `.git/modules/<name>` des Submoduls, das Super-Repo bleibt unberührt.
+- `minds enable` works in **linked worktrees** (`git worktree add`). There,
+  `.git` is a file with a `gitdir:` reference; it was not resolved, and
+  `enable` reported "no git repository found" — inside what was plainly a
+  repository, with a message that was factually wrong. Agents increasingly
+  work in worktrees. The hooks land in the **shared** git directory, where Git
+  executes them for all working trees; `enable` says so, too, because
+  nobody reads that out of a path. A commit in the worktree thus produces a
+  checkpoint, and `minds fsck` reports it as healthy there. The same
+  resolution incidentally makes `minds enable` usable in **submodules** —
+  there, too, `.git` is a file; the hooks land in the submodule's
+  `.git/modules/<name>`, the super-repo stays untouched.
   ([#21](https://github.com/munichbughunter/minds/issues/21))
 
-  > *Was das noch nicht abdeckt:* `minds show` und `minds why` zeigen im
-  > Worktree den Commit des **Hauptbaums**, weil die Wurzel dort über
-  > `<git-dir>/..` bestimmt wird und das in einem Worktree
-  > `…/.git/worktrees` ergibt. Erfassung und Prüfung stimmen, das Nachschlagen
-  > noch nicht — der Weg dahin ist
-  > [#20](https://github.com/munichbughunter/minds/issues/20), das dieselbe
-  > Berechnung an elf Stellen zusammenführt.
+  > *What this does not yet cover:* `minds show` and `minds why` show the
+  > **main tree's** commit in a worktree, because the root there is
+  > determined via `<git-dir>/..` and in a worktree that yields
+  > `…/.git/worktrees`. Capture and checking are correct, the lookup is not
+  > yet — the path there is
+  > [#20](https://github.com/munichbughunter/minds/issues/20), which unifies
+  > the same computation across eleven call sites.
 
-- Ein **Panic in `minds hook`** schreibt nichts mehr auf stderr. `catch_unwind`
-  fing ihn zwar, aber zu spät: Der Standard-Handler von Rust hatte
-  `thread 'main' panicked at …` samt Backtrace-Hinweis vorher schon
-  ausgegeben — und stderr des Hooks gehört dem Agenten, Claude Code reicht ihn
-  dem Modell zurück. Ein Rust-Backtrace mitten in der Sitzung des Nutzers ist
-  genau das Rauschen, das der Hook vermeiden soll. Jetzt ist der Handler still,
-  und der **Ort** des Panics (`hook.rs:99:9`) steht in
-  `<git-dir>/minds/hook.log`, wo Diagnose hingehört — der Ort allein, nicht
-  die Panic-Meldung: Sie könnte Nutzlast einbetten, und `hook.log` ist die
-  Datei, die in einen Bug-Report wandert. Der kalte Pfad
-  (`checkpoint`, `sync`, `prepare-commit-msg`) gewinnt dasselbe, behält aber
-  die Meldung — dort liegt kein Mitschnitt im Speicher; und wer eines dieser
-  Kommandos im **Terminal** aufruft, sieht seinen Panic weiterhin.
+- A **panic in `minds hook`** no longer writes anything to stderr.
+  `catch_unwind` did catch it, but too late: Rust's default handler had
+  already printed `thread 'main' panicked at …` plus the backtrace hint —
+  and the hook's stderr belongs to the agent — Claude Code hands it back to
+  the model. A Rust backtrace in the middle of the user's session is
+  exactly the noise the hook is supposed to avoid. Now the handler is
+  silent, and the **location** of the panic (`hook.rs:99:9`) goes to
+  `<git-dir>/minds/hook.log`, where diagnostics belong — the location
+  alone, not the panic message: it could embed payload, and `hook.log` is
+  the file that ends up in a bug report. The cold path
+  (`checkpoint`, `sync`, `prepare-commit-msg`) gains the same but keeps the
+  message — no recorded data sits in memory there; and whoever calls one of
+  these commands in the **terminal** still sees their panic.
   ([#54](https://github.com/munichbughunter/minds/issues/54))
-- Ein Argument, das **kein UTF-8** ist, lässt `minds` nicht mehr abstürzen.
-  `std::env::args()` panickt daran — in der ersten Zeile, vor jeder eigenen
-  Vorkehrung, mit Backtrace auf stderr und Exit 101. Für `minds hook` war das
-  der schlimmste denkbare Ort: Die Agent-Registrierung ruft ihn ohne
-  `2>/dev/null` auf. Solche Argumente werden jetzt verlustbehaftet gewandelt
-  und laufen in die gewöhnliche „unbekanntes Flag"-Meldung.
+- An argument that is **not UTF-8** no longer crashes `minds`.
+  `std::env::args()` panics on it — in the first line, before any
+  precaution of minds' own, with a backtrace on stderr and exit 101. For
+  `minds hook`
+  that was the worst conceivable place: the agent registration calls it
+  without `2>/dev/null`. Such arguments are now converted lossily and run
+  into the ordinary "unknown flag" message.
   ([#54](https://github.com/munichbughunter/minds/issues/54))
 
-- Ein Git-Hook, dem das **Execute-Bit** abhandengekommen ist, wird von `minds
-  enable` wieder repariert — und von `minds fsck` benannt. Git überspringt eine
-  nicht ausführbare Hook-Datei **stillschweigend**: kein Fehler, keine Meldung,
-  nur kein Checkpoint. Das Bit geht auf gewöhnlichen Wegen verloren (ein
-  `git archive`/Tarball, eine Kopie über ein Dateisystem ohne Modusbits, ein zu
-  breites `chmod -R`), und bisher blieb der Hook danach für immer tot: `enable`
-  kehrte bei textgleichem Inhalt zurück, bevor es die Datei überhaupt öffnete,
-  und meldete „unverändert"; `fsck` verglich nur den Blocktext und meldete
-  „installiert". Beide sehen jetzt hin. Die Reparatur wird **gemeldet**, auch
-  ohne `-v`: `chmod -x` ist auch der Weg, einen Hook absichtlich stillzulegen,
-  und diese Entscheidung wortlos zurückzunehmen wäre eine Überraschung. Kennt
-  das Dateisystem gar keine Execute-Bits (CIFS, exFAT), bricht `enable` mit
-  dieser Begründung ab, statt bei jedem Lauf dieselbe Reparatur zu melden.
+- A git hook that has lost its **execute bit** is repaired again by `minds
+  enable` — and named by `minds fsck`. Git skips a non-executable hook file
+  **silently**: no error, no message, just no checkpoint. The bit gets lost
+  in ordinary ways (a `git archive`/tarball, a copy across a filesystem
+  without mode bits, an overly broad `chmod -R`), and until now the hook
+  stayed dead forever afterwards: `enable` returned on text-identical
+  content before it even opened the file and reported "unchanged"; `fsck`
+  compared only the block text and reported "installed". Both now actually
+  look. The
+  repair is **reported**, even without `-v`: `chmod -x` is also the way to
+  deliberately silence a hook, and revoking that decision wordlessly would
+  be a surprise. If the filesystem knows no execute bits at all (CIFS,
+  exFAT), `enable` aborts with that reason instead of reporting the same
+  repair on every run.
   ([#52](https://github.com/munichbughunter/minds/issues/52))
-- `minds enable` hängt seine Shell-Zeilen nicht mehr an einen Hook mit
-  **fremdem Interpreter**. An eine Datei mit `#!/usr/bin/env python3` wurde der
-  minds-Block bisher einfach angehängt — der Hook warf ab da Syntaxfehler, und
-  das `|| true` im Block fängt in Python nichts. Jetzt bricht `enable` mit
-  Begründung ab und nennt den Interpreter, statt einen fremden Hook zu
-  beschädigen; Bourne-Verwandte (`sh`, `bash`, `dash`, `ksh`, `zsh` …), die
-  Wrapper `env` und `busybox` sowie Dateien ohne Shebang werden weiterhin
-  ergänzt. Geprüft wird **vor** der ersten Änderung: Ein fremder Hook an einer
-  der drei Stellen lässt den Lauf nicht mehr mittendrin abbrechen, mit
-  Agent-Konfiguration auf der Platte und ohne Store-Config. Und `minds fsck`
-  meldet dieselbe Datei als abgelehnt — samt Grund —, statt „installiert" zu
-  sagen oder zu einem `minds enable` zu raten, das garantiert abbräche.
+- `minds enable` no longer appends its shell lines to a hook with a
+  **non-shell interpreter**. To a file with `#!/usr/bin/env python3` the
+  minds block was previously simply appended — the hook threw syntax
+  errors from then on, and the `|| true` in the block catches nothing in
+  Python. Now `enable` aborts with a reason and names the interpreter
+  instead of damaging a hook it does not own; Bourne relatives (`sh`, `bash`,
+  `dash`, `ksh`, `zsh` …), the wrappers `env` and `busybox`, and files
+  without a shebang continue to be amended. The check runs **before** the
+  first change: an unowned hook at one of the three places no longer aborts
+  the run midway, with agent configuration on disk and no store config. And
+  `minds fsck` reports the same file as rejected — including the reason —
+  instead of saying "installed" or advising a `minds enable` that would be
+  guaranteed to abort.
   ([#52](https://github.com/munichbughunter/minds/issues/52))
-- Der Codex-Schalter `codex_hooks = true` wird **exakt** gesetzt. Der Abgleich
-  lief über einen Präfix-Vergleich und traf damit auch einen fremden Schlüssel
-  wie `codex_hooks_timeout = 30` — dessen Zeile wurde durch `codex_hooks = true`
-  *ersetzt*: Nutzerkonfiguration zerstört, und der eigentliche Schalter fehlte
-  trotzdem. Zusätzlich gilt der Schalter jetzt als das, was er ist — top-level:
-  Eine `codex_hooks`-Zeile unter `[profiles.test]` gehört einer anderen Tabelle
-  und bleibt unangetastet, und ein fehlender Schalter wird **vor** der ersten
-  Tabelle eingefügt statt ans Dateiende, wo er in der letzten Tabelle gelandet
-  wäre. Und wo die Zeilenlogik an ihre Grenze kommt — mehrzeilige Werte,
-  Arrays über mehrere Zeilen —, wird nicht geraten: `enable` sagt, dass der
-  Schalter von Hand gehört, statt ihn womöglich in ein Literal zu schreiben.
+- The Codex switch `codex_hooks = true` is set with an **exact match**. The
+  matching ran on a prefix comparison and thus also hit an unrelated key like
+  `codex_hooks_timeout = 30` — whose line was *replaced* by
+  `codex_hooks = true`: user configuration destroyed, and the actual
+  switch still missing. In addition, the switch now counts as what it is —
+  top-level: a `codex_hooks` line under `[profiles.test]` belongs to a
+  different table and stays untouched, and a missing switch is inserted
+  **before** the first table instead of at the end of the file, where it
+  would have landed inside the last table. And where the line logic reaches
+  its limit — multi-line values, arrays across several lines — there is no
+  guessing: `enable` says the switch needs setting by hand instead of
+  possibly writing it into a literal.
   ([#52](https://github.com/munichbughunter/minds/issues/52))
 
-- `minds enable` schreibt nicht mehr ungefragt in ein Hook-Verzeichnis
-  **außerhalb des Repos** — und ein eingecheckter Symlink kann es nicht mehr
-  unbemerkt dorthin umlenken. Entschieden wird über den **aufgelösten Ort**,
-  nicht über Schreibweisen: Ob `core.hooksPath` direkt nach draußen zeigt
-  (global gesetzt, `init.templateDir`) oder ein Symlink in der Arbeitskopie
-  (`.husky` → anderswo, auch mit nachgestelltem Schrägstrich, Pfad-Alias oder
-  Link im Vorfahren) — liegt das Ziel außerhalb von Arbeitskopie und
-  Git-Verzeichnis, fragt `enable` nach, denn Hooks dort gelten für **alle**
-  Repositories, die das Verzeichnis benutzen. Interaktiv als Rückfrage
-  (Default: Nein), in Skripten per `--global-hooks`; ohne Zustimmung bricht
-  `enable` ab, **bevor** irgendetwas geschrieben ist. Ein symlinktes `.git`
-  und ein geteiltes `.git/hooks` bleiben dagegen ohne Rückfrage — dorthin
-  kann ein Checkout nichts legen. `minds fsck` benennt ein Verzeichnis
-  außerhalb des Repos jetzt ebenfalls.
-  ([#66](https://github.com/munichbughunter/minds/issues/66),
+- `minds enable` no longer writes into a hook directory **outside
+  the repo** without asking — and a checked-in symlink can no longer redirect
+  it there unnoticed. The decision is made on the **resolved location**, not
+  on how the path is spelled: whether `core.hooksPath` points outside
+  directly (set globally, `init.templateDir`) or a symlink in the working copy
+  (`.husky` → elsewhere, also with a trailing slash, path alias, or a link
+  in an ancestor) — if the target lies outside the working copy and the git
+  directory, `enable` asks, because hooks there apply to **all**
+  repositories that use the directory. Interactively as a prompt (default:
+  no), in scripts via `--global-hooks`; without consent, `enable` aborts
+  **before** anything is written. A symlinked `.git` and a shared
+  `.git/hooks`, by contrast, stay prompt-free — a checkout cannot place
+  anything there. `minds fsck` now also names a directory outside the
+  repo. ([#66](https://github.com/munichbughunter/minds/issues/66),
   [#64](https://github.com/munichbughunter/minds/issues/64))
-- Der Argument-Parser ist **strikt** geworden. Ein unbekanntes Flag war bisher
-  Rauschen: `minds fsck --require-reviews` (Tippfehler) lief als nacktes `fsck`
-  durch und lieferte Exit 0 — das CI-Policy-Gate war damit lautlos
-  abgeschaltet, die Pipeline grün. Und ein Wert-Flag nahm blind das nächste
-  Argument: `minds review I… --summary --sign` legte das Review mit der
-  Zusammenfassung „--sign" an — **unsigniert**, mit Erfolgsmeldung. Jetzt
-  bricht jedes Unterkommando bei einem Flag ab, das es nicht kennt, und nennt
-  die bekannten; ein Wert-Flag, dem ein weiteres Flag folgt, ist ein Fehler
-  statt einer Verwechslung. Positionale Argumente und Flags sind
-  reihenfolgeunabhängig — `minds verify --sig s.sig b3-…` findet das Subjekt,
-  nicht die Signatur-Datei. `--help` funktioniert jetzt auch hinter einem
-  Unterkommando. Die Ausnahme bleibt `minds hook`: Ein Rekorder bricht nicht
-  wegen eines Konfigurationsfehlers ab — der Fehler geht in
-  `<git-dir>/minds/hook.log`, der Lauf macht mit dem Verwertbaren weiter.
+- The argument parser has become **strict**. An unknown flag used to be
+  noise: `minds fsck --require-reviews` (typo) ran through as a bare `fsck`
+  and returned exit 0 — the CI policy gate was thus silently switched off,
+  the pipeline green. And a value flag blindly took the next argument:
+  `minds review I… --summary --sign` created the review with the summary
+  "--sign" — **unsigned**, with a success message. Now every subcommand
+  aborts on a flag it does not know and names the known ones; a value flag
+  followed by another flag is an error instead of a mix-up. Positional
+  arguments and flags are order-independent — `minds verify --sig s.sig
+  b3-…` finds the subject, not the signature file. `--help` now also works
+  behind a subcommand. The exception remains `minds hook`: a recorder does
+  not abort over a configuration error — the error goes to
+  `<git-dir>/minds/hook.log`, the run continues with what is usable.
   ([#11](https://github.com/munichbughunter/minds/issues/11))
-- `minds agent-help` nennt jetzt **alle** öffentlichen Kommandos. Acht fehlten
+- `minds agent-help` now names **all** public commands. Eight were missing
   (`hook`, `checkpoint`, `blame`, `metrics`, `forget`, `sign`, `verify`,
-  `gitlab`) — für eine Karte, deren einziger Zweck Vollständigkeit ist. Ein
-  Test vergleicht sie künftig mit der Kommando-Tabelle des Parsers; wer ein
-  Kommando ergänzt, ohne die Karte zu pflegen, wird rot statt still
-  unvollständig. ([#11](https://github.com/munichbughunter/minds/issues/11))
-- Die von `minds enable` geschriebenen Git-Hooks hängen nicht mehr am `PATH`.
-  GUI-Clients (VS Code, Fork, Tower) und minimale CI-Shells starten Git ohne
-  das Profil der Shell — `~/.local/bin` fehlt dort, der Aufruf `minds …` lief
-  ins Leere, und `|| true` machte daraus einen **stillen Totalausfall**:
-  Committen ging, erfasst wurde nichts, dauerhaft und ohne Hinweis. `enable`
-  merkt sich jetzt den Ort des Binaries in der lokalen `.git/config`
-  (`minds.binary`); die Hooks lösen ihn zuerst auf und suchen erst dann im
-  `PATH`. Der gemerkte Ort **gewinnt** — damit kann auch eine veraltete
-  globale `minds` die Hooks nicht mehr beschatten; es läuft die Version, deren
-  `enable` die Hooks geschrieben hat. Zieht das Binary um, greift wieder die
-  PATH-Suche, und `minds fsck` sagt, dass ein `minds enable` den Eintrag
-  erneuert. Im Hook-Text selbst steht weiterhin **kein** absoluter Pfad: Seit
-  die Hook-Datei in der Arbeitskopie liegen kann, wäre ein Home-Pfad darin
-  versioniert — eingecheckt für alle, kaputt auf jeder anderen Maschine. Auch
-  hier gilt: Bestehende Installationen brauchen einmal `minds enable`.
+  `gitlab`) — for a map whose sole purpose is completeness. A test now
+  compares it against the parser's command table; whoever adds a command
+  without maintaining the map goes red instead of silently incomplete.
+  ([#11](https://github.com/munichbughunter/minds/issues/11))
+- The git hooks written by `minds enable` no longer depend on the `PATH`.
+  GUI clients (VS Code, Fork, Tower) and minimal CI shells start Git
+  without the shell's profile — `~/.local/bin` is missing there, the call
+  `minds …` went nowhere, and `|| true` turned that into a **silent total
+  outage**: committing worked, nothing was captured, permanently and
+  without a hint. `enable` now remembers the binary's location in the local
+  `.git/config` (`minds.binary`); the hooks resolve it first and only then
+  search the `PATH`. The remembered location **wins** — which means an
+  outdated global `minds` can no longer shadow the hooks either; the
+  version whose `enable` wrote the hooks is the one that runs. If the
+  binary moves, the PATH search takes over again, and `minds fsck` says
+  that a `minds enable` renews the entry. The hook text itself still
+  contains **no** absolute path: since the hook file can live in the
+  working copy, a home path in it would be versioned — checked in for
+  everyone, broken on every other machine. Here too: existing installations
+  need `minds enable` once.
   ([#25](https://github.com/munichbughunter/minds/issues/25))
-- Fehler aus dem **Hook-Pfad** verschwinden nicht mehr. `checkpoint`,
-  `prepare-commit-msg` und `sync` laufen aus Git-Hooks, die ihre Ausgabe wegwerfen —
-  ihre Fehler waren damit unsichtbar, obwohl die Doku ein Log versprach. Der
-  teuerste Fall: Ein Tippfehler in `.minds/redact.json` bricht `checkpoint`
-  *fail-closed* ab, ab da wird nie wieder eine Session eingecheckt, das Journal
-  wächst, und an keiner Stelle steht warum. Jetzt schreiben alle vier Hook-Pfade
-  ihre Fehler nach `<git-dir>/minds/hook.log` — dorthin, wo `minds hook` schon
-  immer geloggt hat. ([#10](https://github.com/munichbughunter/minds/issues/10))
-- Der `pre-push`-Hook kippt seine Fehlermeldungen nicht mehr roh in den
-  Push-Output. Als einziger der drei Hooks leitete er stderr nicht um; ein
-  unerreichbares Remote schrieb damit bei **jedem** Push fünf Zeilen zwischen die
-  Ausgabe von `git push`, für einen Vorgang, den der Nutzer gar nicht angestoßen
-  hat. Der Wortlaut steht jetzt im Log; stdout bleibt unangetastet, dort steht die
-  Erfolgsmeldung. ([#10](https://github.com/munichbughunter/minds/issues/10))
-- Ein **Panic** in `checkpoint`, `prepare-commit-msg` oder `sync` landet im Log,
-  statt mit der weggeworfenen stderr zu verschwinden. `minds hook` hatte diese
-  Klammer schon; für den kalten Pfad fehlte sie, und mit der stderr-Umleitung
-  wäre ein Absturz dort vollständig lautlos gewesen.
+- Errors from the **hook path** no longer disappear. `checkpoint`,
+  `prepare-commit-msg`, and `sync` run from git hooks that throw their
+  output away — their errors were thus invisible, even though the docs
+  promised a log. The most expensive case: a typo in `.minds/redact.json`
+  aborts `checkpoint` *fail-closed*, from then on no session is ever
+  checked in again, the journal grows, and nowhere does it say why. Now all
+  four hook paths write their errors to `<git-dir>/minds/hook.log` — where
+  `minds hook` has always logged.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+- The `pre-push` hook no longer dumps its error messages raw into the push
+  output. Alone among the three hooks, it did not redirect stderr;
+  an unreachable remote thus wrote five lines between the output of
+  `git push` on **every** push, for an operation the user never initiated.
+  The message now goes to the log; stdout stays untouched — that is where
+  the success message lives.
+  ([#10](https://github.com/munichbughunter/minds/issues/10))
+- A **panic** in `checkpoint`, `prepare-commit-msg`, or `sync` lands in the
+  log instead of vanishing with the discarded stderr. `minds hook` already
+  had this safety net; the cold path lacked it, and with the stderr
+  redirection a crash there would have been completely silent.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
 
-  > **Bestehende Installationen brauchen einmal `minds enable`.** Der Rumpf eines
-  > Hooks steht in der Hook-Datei, nicht im Binary — ein Update allein ersetzt ihn
-  > nicht. `minds fsck` sagt jetzt von sich aus, wenn ein Block aus einer älteren
-  > Version stammt, statt ihn als „installiert" durchgehen zu lassen.
-- `minds enable` installiert die Git-Hooks jetzt im **effektiven** Hook-Verzeichnis.
-  Repos mit `core.hooksPath` (husky, lefthook, pre-commit, globale Hooks über
-  `init.templateDir`) bekamen den Hook bisher nach `.git/hooks` geschrieben — ein
-  Verzeichnis, das Git dort nie liest. `enable` meldete Erfolg, und trotzdem entstand
-  bei keinem Commit ein Checkpoint. Ist das Verzeichnis verschoben, sagt `enable` das
-  auch ohne `-v` — und nennt es anders, wenn es *außerhalb* des Repos liegt, weil ein
-  `enable` dann alle Repositories des Nutzers erfasst.
+  > **Existing installations need `minds enable` once.** The body of a hook
+  > lives in the hook file, not in the binary — an update alone does not
+  > replace it. `minds fsck` now says on its own when a block comes from an
+  > older version, instead of letting it pass as "installed".
+- `minds enable` now installs the git hooks in the **effective** hook
+  directory. Repos with `core.hooksPath` (husky, lefthook, pre-commit,
+  global hooks via `init.templateDir`) previously had the hook written to
+  `.git/hooks` — a directory Git never reads there. `enable` reported
+  success, and yet no commit produced a checkpoint. If the directory is
+  relocated, `enable` says so even without `-v` — and says it differently
+  when it lies *outside* the repo, because an `enable` then affects all of
+  the user's repositories.
   ([#9](https://github.com/munichbughunter/minds/issues/9))
-- `minds enable` bricht ab, statt an einen unbrauchbaren Ort zu schreiben — und zwar
-  **bevor** die erste Datei entsteht, damit kein halb eingerichtetes Repo zurückbleibt.
-  Betroffen sind ein gesetztes, aber leeres `core.hooksPath` (Git führt dann gar keine
-  Hooks aus und meldet das nicht), ein Wert, der auf die Arbeitskopie-Wurzel auflöst
-  (die Hooks lägen als ausführbare Dateien zwischen dem Quellcode), und ein
-  Verzeichnis, in dem sich nicht schreiben lässt. Die Meldung nennt jeweils den Pfad
-  und was zu tun ist. ([#9](https://github.com/munichbughunter/minds/issues/9))
+- `minds enable` aborts instead of writing to an unusable place — and it
+  does so **before** the first file is created, so no
+  half-configured repo is left behind. The affected cases: a set-but-empty
+  `core.hooksPath` (Git then runs no hooks at all and does not report it),
+  a value that resolves to the working-copy root (the hooks would sit as
+  executable files among the source code), and a directory that cannot be
+  written to. The message names the path and what to do in each case.
+  ([#9](https://github.com/munichbughunter/minds/issues/9))
 
-### Sicherheit
+### Security
 
-- Die **Agent-Konfigurationen** (`.claude/settings.json`, `.cursor/hooks.json`,
-  `.gemini/settings.json`, `.codex/hooks.json`, `.codex/config.toml`,
-  `.opencode/plugin/minds.ts`) schreibt `enable` nicht mehr durch einen
-  Symlink hindurch. Diese Dateien liegen in der versionierten Arbeitskopie —
-  ein gemergter PR konnte an ihrer Stelle einen Link platzieren, im Diff
-  sichtbar nur als Moduswechsel auf `120000`, und `enable` überschrieb dann
-  die fremde Zieldatei vollständig. Geprüft wird jetzt **jedes Verzeichnis
-  zwischen Repo-Wurzel und Datei**, nicht nur die Datei selbst: `.claude` als
-  Link auf `~/.claude` war der wirksamere Angriff — das Blatt darunter ist
-  eine reguläre Datei, und `enable` hätte in die *globale* Konfiguration des
-  Nutzers geschrieben. Abgelehnt werden ebenso Sonderdateien (ein FIFO ließ
-  `enable` unbegrenzt hängen) und Dateien jenseits jeder Konfigurationsgröße.
-  Geschrieben wird über denselben Weg wie bei den Hooks — Nachbardatei mit
-  `create_new`, dann `rename` —, und die Prüfung läuft **vor** der ersten
-  Änderung: Ein Link auf die dritte Konfiguration bricht nicht mehr ab,
-  nachdem die ersten beiden geschrieben sind.
+- `enable` no longer writes the **agent configurations**
+  (`.claude/settings.json`, `.cursor/hooks.json`, `.gemini/settings.json`,
+  `.codex/hooks.json`, `.codex/config.toml`, `.opencode/plugin/minds.ts`)
+  through a symlink. These files live in the versioned working copy — a
+  merged PR could place a link in their stead, visible in the diff only as
+  a mode change to `120000`, and `enable` then overwrote the link's target
+  completely. Now **every directory between repo root and file** is
+  checked, not just the file itself: `.claude` as a link to `~/.claude` was
+  the more effective attack — the leaf below it is a regular file, and
+  `enable` would have written into the user's *global* configuration.
+  Special files are rejected as well (a FIFO left `enable` hanging
+  indefinitely), as are files beyond any plausible configuration size.
+  Writing goes
+  through the same route as for the hooks — sibling file with `create_new`,
+  then `rename` — and the check runs **before** the first change: a link on
+  the third configuration no longer aborts after the first two are written.
   ([#65](https://github.com/munichbughunter/minds/issues/65))
-- Eine bestehende Agent-Konfiguration **behält ihre Dateirechte**, und eine
-  schreibgeschützte wird nicht mehr ersetzt. Das Ersetzen über `rename`
-  tauscht den Inode und damit die Rechte: Eine `settings.json` mit `0600` —
-  weil dort ein API-Key steht — wäre sonst als `0644` zurückgekommen und auf
-  einer Mehrbenutzer- oder CI-Maschine für jeden lokalen Account lesbar
-  gewesen. ([#65](https://github.com/munichbughunter/minds/issues/65))
-- Fremder Text, den `minds` ausgibt oder protokolliert — Pfade aus der
-  Arbeitskopie, `core.hooksPath`, der Wortlaut fremder Fehler —, wird jetzt
-  vollständig entschärft. Bisher galt dafür `char::is_control`, und das ist nur
-  die Unicode-Kategorie `Cc`: **U+2028** (LINE SEPARATOR) und **U+2029**
-  (PARAGRAPH SEPARATOR) fielen durch. Rusts `str::lines` bricht daran nicht,
-  Browser und Pythons `splitlines()` schon — im Job-Log einer GitLab-Pipeline
-  ließ sich damit eine Zeile fälschen, etwa ein `fsck: in Ordnung`. Ebenfalls
-  durchgerutscht sind die unsichtbaren Formatzeichen (`Cf`), darunter die
-  Unicode-Tags `U+E0020`–`U+E007F`. Statt die Liste von Hand zu pflegen, wird
-  jetzt `char::escape_debug` selbst gefragt — es deckt `Cc`, `Cf`, `Zl`, `Zp` und
-  `Zs` ab, ergänzt um die unsichtbaren Variantenselektoren (`U+E0100`–`U+E01EF`
-  & Co.) und die typografischen Anführungszeichen, in die `fsck` seine Pfade
-  klammert. Ein Pfad kann damit weder eine Zeile öffnen, noch die Klammer
-  schließen, noch unsichtbaren Text tragen.
+- An existing agent configuration **keeps its file permissions**, and a
+  write-protected one is no longer replaced. Replacing via `rename` swaps
+  the inode and with it the permissions: a `settings.json` with `0600` —
+  because an API key sits in it — would otherwise have come back as `0644`,
+  readable by every local account on a multi-user or CI machine.
+  ([#65](https://github.com/munichbughunter/minds/issues/65))
+- Untrusted text that `minds` prints or logs — paths from the working copy,
+  `core.hooksPath`, the wording of errors from other tools — is now fully
+  defused.
+  Until now `char::is_control` governed this, and that is only the Unicode
+  category `Cc`: **U+2028** (LINE SEPARATOR) and **U+2029** (PARAGRAPH
+  SEPARATOR) fell through. Rust's `str::lines` does not break on them,
+  browsers and Python's `splitlines()` do — in the job log of a GitLab
+  pipeline a line could thus be forged, say an `fsck: all good`. The
+  invisible format characters (`Cf`) slipped through as well, among them
+  the Unicode tags `U+E0020`–`U+E007F`. Instead of a hand-maintained
+  list, `char::escape_debug` itself is now consulted — it covers `Cc`,
+  `Cf`, `Zl`, `Zp`, and `Zs`, supplemented by the invisible variation
+  selectors (`U+E0100`–`U+E01EF` & co.) and the typographic quotation
+  marks `fsck` brackets its paths in. A path can thus neither open a line,
+  nor close the bracket, nor carry invisible text.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
-- **Der Inhalt von `.minds/redact.json` erreicht das Log nicht.** In dieser Datei
-  stehen per Design literale Geheimnisse — `deny_secrets` für den internen
-  Hostnamen, `allow` für Werte, die fälschlich als Secret erkannt werden. Der
-  naheliegendste Tippfehler dort (vergessene Array-Klammern) ist kein Syntax-,
-  sondern ein Datenfehler, und `serde_json` zitiert dabei den Wert: `invalid
-  type: string "glpat-…", expected a sequence`. Solange das auf einer
-  weggeworfenen stderr landete, war es flüchtig; mit dem Log wäre es dauerhaft
-  geworden. Die Meldung nennt jetzt Art, Zeile und Spalte — genug zum Reparieren,
-  nichts zum Mitlesen. ([#10](https://github.com/munichbughunter/minds/issues/10))
-- **Zugangsdaten aus einer Remote-URL erreichen das Log nicht.** `git push`
-  schreibt die URL in seine Fehlermeldung, und in der **Username**-Position
-  redigiert Git ein Token nicht: Aus `https://glpat-…@gitlab.com/…` wurde so
-  `fatal: could not read Password for 'https://glpat-…@gitlab.com'` — und das
-  ging seit dem Log-Eintrag oben auf die Platte, in eine Datei, auf die `fsck`
-  verweist und die man in einen Bug-Report legt. Der Autoritätsteil wird jetzt
-  an der Quelle herausgeschnitten, bevor der Text zu einer Meldung wird; Host
-  und Pfad bleiben stehen, damit die Diagnose brauchbar bleibt.
+- **The content of `.minds/redact.json` does not reach the log.** By
+  design, this file holds literal secrets — `deny_secrets` for the internal
+  hostname, `allow` for values falsely detected as secrets. The most
+  obvious typo there (forgotten array brackets) is not a syntax error but a
+  data error, and `serde_json` quotes the value: `invalid type: string
+  "glpat-…", expected a sequence`. As long as that landed on a discarded
+  stderr, it was fleeting; with the log it would have become permanent. The
+  message now names kind, line, and column — enough to repair, nothing to
+  leak. ([#10](https://github.com/munichbughunter/minds/issues/10))
+- **Credentials from a remote URL do not reach the log.** `git push` writes
+  the URL into its error message, and in the **username** position Git does
+  not redact a token: `https://glpat-…@gitlab.com/…` thus became
+  `fatal: could not read Password for 'https://glpat-…@gitlab.com'` — and
+  since the log entry above, that went to disk, into a file `fsck` points
+  to and that gets attached to a bug report. The authority part is now cut
+  out at the source, before the text becomes a message; host and path
+  remain so the diagnosis stays usable.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
-- Ein `git`-Kindprozess erbt **keine Trace-Schalter** mehr (`GIT_TRACE`,
-  `GIT_TRACE_CURL`, `GIT_CURL_VERBOSE` …). Mit ihnen protokolliert Git seinen
-  ganzen Verkehr auf stderr — samt `Authorization: Basic …`, und das ist keine
-  URL, die sich herausschneiden ließe. Ein `GIT_TRACE=1` in der Shell des
-  Entwicklers hätte sonst genügt, um ein Token dauerhaft ins Log zu legen. Die
-  Variablen werden **entfernt**, nicht auf `0` gesetzt: `GIT_CURL_VERBOSE` prüft
-  Git auf Existenz, ein `=0` schaltete den Dump also ein.
+- A `git` child process no longer inherits **any trace switches**
+  (`GIT_TRACE`, `GIT_TRACE_CURL`, `GIT_CURL_VERBOSE` …). With them, Git
+  logs its entire traffic to stderr — including `Authorization: Basic …`,
+  and that is not a URL that could be cut out. A `GIT_TRACE=1` in the
+  developer's shell would otherwise have sufficed to put a token
+  permanently into the log. The variables are **removed**, not set to `0`:
+  Git checks `GIT_CURL_VERBOSE` for existence, so a `=0` switched the dump
+  on. ([#10](https://github.com/munichbughunter/minds/issues/10))
+- `hook.log` is not written through a symlink — neither when the file
+  itself is one, nor when `<git-dir>/minds` is. After opening, device and
+  inode of the file handle are checked against the name; only then are the
+  permissions touched.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
-- `hook.log` wird nicht durch einen Symlink hindurch beschrieben — weder wenn die
-  Datei selbst einer ist, noch wenn `<git-dir>/minds` es ist. Nach dem Öffnen
-  werden Gerät und Inode des Dateizeigers gegen den Namen geprüft; erst danach
-  werden die Rechte angefasst. ([#10](https://github.com/munichbughunter/minds/issues/10))
-- Beim Schreiben einer **Hook-Datei** folgt `minds enable` keinem Symlink mehr. Seit
-  das Hook-Verzeichnis an `core.hooksPath` hängt, kann es in der Arbeitskopie liegen
-  und damit **versioniert** sein — ein eingecheckter Symlink `.husky/post-commit →
-  ~/.aws/credentials` hätte bisher dazu geführt, dass `enable` den minds-Block durch
-  den Link in die private Datei schreibt und sie von `0600` auf `0755` setzt. Jetzt
-  wird ein Symlink an dieser Stelle abgelehnt; geschrieben wird über eine
-  Nachbardatei und `rename` (der Name wird ersetzt, nie durch ihn hindurch
-  geschrieben), die Rechte werden auf dem offenen Dateizeiger gesetzt, und Dateien
-  jenseits jeder Hook-Größe werden gar nicht erst eingelesen. `minds fsck` liest die
-  Hook-Dateien über denselben Weg und meldet einen abgelehnten Hook mit Grund.
+- When writing a **hook file**, `minds enable` no longer follows a symlink.
+  Since the hook directory follows `core.hooksPath`, it can live in the
+  working copy and thus be **versioned** — a checked-in symlink
+  `.husky/post-commit → ~/.aws/credentials` would previously have led to
+  `enable` writing the minds block through the link into the private file
+  and setting it from `0600` to `0755`. Now a symlink at this spot is
+  rejected; writing goes through a sibling file and `rename` (the name is
+  replaced, never written through), the permissions are set on the open
+  file handle, and files beyond any plausible hook size are not even read in.
+  `minds fsck` reads the hook files through the same route and reports a
+  rejected hook with its reason.
   ([#9](https://github.com/munichbughunter/minds/issues/9))
 
-  Die beiden damals ausdrücklich benannten Lücken sind inzwischen zu: Das über
-  einen Symlink umgelenkte Hook-**Verzeichnis** beantwortet die Ortsregel
+  The two gaps explicitly named back then have since been closed: the hook
+  **directory** redirected via a symlink is covered by the location rule
   ([#66](https://github.com/munichbughunter/minds/issues/66),
-  [#64](https://github.com/munichbughunter/minds/issues/64), siehe *Behoben*),
-  und die **Agent-Konfigurationen** gehen seit
-  [#65](https://github.com/munichbughunter/minds/issues/65) über denselben
-  geschützten Schreibweg wie die Hooks (siehe unten).
+  [#64](https://github.com/munichbughunter/minds/issues/64), see *Fixed*),
+  and the **agent configurations** have gone through the same protected
+  write path as the hooks since
+  [#65](https://github.com/munichbughunter/minds/issues/65) (see below).
 
-### Hinzugefügt
+### Added
 
-- `minds fsck` prüft jetzt auch die **Agent-Registrierungen**. Bisher sah es
-  nur auf die Git-Hooks; ob der Agent überhaupt journaliert, war für den
-  Bericht unsichtbar. Gemeldet werden drei Zustände: eine Konfiguration ganz
-  ohne minds-Eintrag (der Fall, den ein eingecheckter Fremdeintrag erzeugt —
-  [#78](https://github.com/munichbughunter/minds/issues/78)), Einträge aus
-  einer älteren Version, und eine unvollständige Registrierung. Der
-  Recall-Eintrag bekommt einen eigenen Satz, wenn er veraltet ist — sein
-  **Fehlen** dagegen nicht: `--recall` ist opt-in, und was niemand wollte,
-  fehlt nicht.
+- `minds fsck` now also checks the **agent registrations**. Until now it
+  only looked at the git hooks; whether the agent journals at all was
+  invisible to the report. Three states are reported: a configuration with
+  no minds entry at all (the case a checked-in third-party entry produces —
+  [#78](https://github.com/munichbughunter/minds/issues/78)), entries from
+  an older version, and an incomplete registration. The recall entry gets a
+  sentence of its own when it is outdated — its **absence**, however, does
+  not: `--recall` is opt-in, and what nobody wanted is not missing.
 
-  Höchstens eine Zeile je Agent, nie je Event, und eine Datei, die es gar
-  nicht gibt, bleibt still. Ein Hinweis, kein Befund: Der Rückgabewert bleibt
-  0, denn er ist das CI-Gate.
+  At most one line per agent, never per event, and a file that does not
+  exist at all stays quiet. A hint, not a finding: the exit code stays 0,
+  because it is the CI gate.
   ([#68](https://github.com/munichbughunter/minds/issues/68))
-- `minds fsck` prüft die Hooks vom effektiven Hook-Verzeichnis aus und meldet, wenn
-  `post-commit` oder `prepare-commit-msg` dort fehlen — samt Hinweis, wenn der
-  minds-Block stattdessen im ignorierten `.git/hooks` liegt. Ein Hinweis, kein Befund:
-  Der Rückgabewert bleibt 0, denn nicht jedes Repo will Hooks.
+- `minds fsck` checks the hooks from the effective hook directory and
+  reports when `post-commit` or `prepare-commit-msg` are missing there —
+  including a hint when the minds block sits in the ignored `.git/hooks`
+  instead. A hint, not a finding: the exit code stays 0, because not every
+  repo wants hooks.
   ([#9](https://github.com/munichbughunter/minds/issues/9))
-- `minds fsck` verweist auf `<git-dir>/minds/hook.log`, wenn dort Einträge stehen —
-  mit ihrer Zahl und dem Pfad, aber **ohne den Wortlaut**: Die Ausgabe von `fsck`
-  landet im CI-Log, ein Fehlertext aus dem Hook-Pfad kann einen Ausschnitt aus dem
-  noch nicht redigierten Mitschnitt tragen. Ein Hinweis, kein Befund — ein alter
-  Eintrag darf keine Pipeline anhalten.
+- `minds fsck` points to `<git-dir>/minds/hook.log` when entries are there
+  — with their count and the path, but **without the wording**: the output
+  of `fsck` lands in the CI log, and an error text from the hook path can
+  carry an excerpt from the not-yet-redacted recording. A hint, not a
+  finding — an old entry must not stop a pipeline.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
 
-  Das Log begrenzt sich selbst: Bei 1 MiB wird auf `hook.log.1` umgeschichtet, mehr
-  als zwei Dateien entstehen nie. Mehrzeilige Fehlermeldungen bleiben *ein* Eintrag
-  (Steuerzeichen werden als Escape-Sequenz geschrieben), und neu angelegt wird die
-  Datei mit `0600`; eine vorhandene mit lockereren Rechten wird beim nächsten
-  Schreiben nachgezogen, und durch einen Symlink hindurch wird nie geschrieben.
-- Der `pre-push`-Hook meldet seinen **Fortschritt** jetzt auf stdout statt auf
-  stderr — sonst hätte die stderr-Umleitung von oben mit den Fehlern auch die
-  Erfolgsmeldungen verschluckt: was geschickt wurde, und vor allem, wie viele
-  fremde Review-Verdicts ein Push übernommen hat. Letzteres wiegt schwer, weil
-  genau dieser Merge den Review-Store füllt, den `minds fsck --require-review`
-  als CI-Gate liest. Scheitert er, steht das jetzt im Log statt nirgendwo.
+  The log limits itself: at 1 MiB it rolls over to `hook.log.1`, and more
+  than two files never exist. Multi-line error messages stay *one*
+  entry (control characters are written as escape sequences), and the file
+  is created with `0600`; an existing one with looser permissions is
+  tightened on the next write, and writing never goes through a symlink.
+- The `pre-push` hook now reports its **progress** on stdout instead of
+  stderr — otherwise the stderr redirection from above would have
+  swallowed the success messages along with the errors: what was sent, and
+  above all how many review verdicts from others a push adopted. The latter
+  matters, because exactly this merge fills the review store that
+  `minds fsck --require-review` reads as a CI gate. If it fails, that now
+  goes to the log instead of nowhere.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
-- `minds fsck` unterscheidet einen **veralteten** minds-Block von einem heilen: Der
-  Rumpf zwischen den Marken wird gegen den verglichen, den diese Version schreiben
-  würde. Bisher zählte das bloße Vorhandensein der Marke als „installiert" — ein
-  Hook aus einer älteren `minds` sah damit heil aus, obwohl Git ihn ausführt und er
-  nicht mehr tut, was er soll. Der Rat ist `minds enable`; ein Hinweis, kein Befund.
+- `minds fsck` distinguishes an **outdated** minds block from a healthy
+  one: the body between the marks is compared against the one this version
+  would write. Until now, the mere presence of the mark counted as
+  "installed" — a hook from an older `minds` thus looked healthy even
+  though Git executes it and it no longer does what it should. The advice
+  is `minds enable`; a hint, not a finding.
   ([#10](https://github.com/munichbughunter/minds/issues/10))
 
-### Bekannte Einschränkungen
+### Known limitations
 
-*Der Stand von v0.1.1. Die Liste unter v0.1.0 beschreibt den damaligen Stand und
-wird nicht rückwirkend umgeschrieben — was dort steht, gilt heute teilweise nicht
-mehr (die PATH-Abhängigkeit etwa ist mit
-[#25](https://github.com/munichbughunter/minds/issues/25) weg).*
+*The state as of v0.1.1. The list under v0.1.0 describes the state back
+then and is not rewritten retroactively — parts of what it says no longer
+apply today (the PATH dependency, for instance, is gone with
+[#25](https://github.com/munichbughunter/minds/issues/25)).*
 
-- **Die Redaktion hat bekannte Lücken.** `curl -u user:pass` wird nicht redigiert
-  ([#2](https://github.com/munichbughunter/minds/issues/2)), JSON-escapte Secrets
-  und PEM-Schlüssel mit literalem `\n` leaken teilweise
-  ([#3](https://github.com/munichbughunter/minds/issues/3)), `sk-ant`/`sk-proj`
-  fehlen in den Token-Regeln
-  ([#33](https://github.com/munichbughunter/minds/issues/33)), und ein
-  Multibyte-Zeichen im Wert (`PASSWORD=hunter€2`) löst einen Panic aus
-  ([#1](https://github.com/munichbughunter/minds/issues/1)). **Das ist der
-  Schwerpunkt der nächsten Version.** Wer heute mit fremdem oder besonders
-  schutzbedürftigem Code arbeitet, sollte das wissen.
-- **`minds forget` tilgt nicht überall.** Der Session-Branch auf der Forge bleibt
-  ([#5](https://github.com/munichbughunter/minds/issues/5)), ein erneuter `put`
-  reanimiert die Session ([#6](https://github.com/munichbughunter/minds/issues/6)),
-  und der Klartext bleibt als Parent-Commit erreichbar
-  ([#14](https://github.com/munichbughunter/minds/issues/14)). Zusätzlich liefern
-  `recall`, `distill` und `brief` **nichts mehr**, sobald eine Session getilgt
-  wurde ([#83](https://github.com/munichbughunter/minds/issues/83)).
-- **`minds gitlab mirror` funktioniert nicht.** Der Notiz-Body geht als Header
-  über die Leitung, GitLab lehnt mit „body is missing" ab
+- **Redaction has known gaps.** `curl -u user:pass` is not redacted
+  ([#2](https://github.com/munichbughunter/minds/issues/2)), JSON-escaped
+  secrets and PEM keys with a literal `\n` leak partially
+  ([#3](https://github.com/munichbughunter/minds/issues/3)),
+  `sk-ant`/`sk-proj` are missing from the token rules
+  ([#33](https://github.com/munichbughunter/minds/issues/33)), and a
+  multibyte character in the value (`PASSWORD=hunter€2`) triggers a panic
+  ([#1](https://github.com/munichbughunter/minds/issues/1)). **That is the
+  focus of the next version.** Anyone working today with someone else's
+  code, or with particularly sensitive code, should know this.
+- **`minds forget` does not erase everywhere.** The session branch on the
+  forge remains ([#5](https://github.com/munichbughunter/minds/issues/5)),
+  a repeated `put` revives the session
+  ([#6](https://github.com/munichbughunter/minds/issues/6)), and the
+  plaintext stays reachable as a parent commit
+  ([#14](https://github.com/munichbughunter/minds/issues/14)). In addition,
+  `recall`, `distill`, and `brief` deliver **nothing at all** once a
+  session has been erased
+  ([#83](https://github.com/munichbughunter/minds/issues/83)).
+- **`minds gitlab mirror` does not work.** The note body goes over the wire
+  as a header, GitLab rejects with "body is missing"
   ([#7](https://github.com/munichbughunter/minds/issues/7)).
-- **Im verlinkten Worktree** zeigen `minds show` und `minds why` den Commit des
-  Hauptbaums. Erfassung und `fsck` stimmen dort, das Nachschlagen nicht
+- **In a linked worktree**, `minds show` and `minds why` show the main
+  tree's commit. Capture and `fsck` are correct there, the lookup is not
   ([#20](https://github.com/munichbughunter/minds/issues/20)).
-- **Ein `git push` öffnet zwei Netzwerkverbindungen**, wenn es neue Sessions zu
-  übertragen gibt: eine für den Kontext, eine für den Code. Spürbar gegen
-  entfernte Remotes ([#85](https://github.com/munichbughunter/minds/issues/85)).
-  Ohne neue Sessions kostet der Hook nichts.
-- **Kein Windows-Binary.** Gebaut werden macOS (Apple Silicon und Intel) und Linux
-  (x86_64 und ARM64, musl/statisch). Unter Windows über WSL oder aus dem Quelltext.
-- **Die Tool-Ebene ist Claude-Code-spezifisch.** Für Codex, Cursor, Gemini und
-  opencode wird der Prompt erfasst, aber Tool-Aufrufe, berührte Dateien und
-  Modell-/Token-Angaben werden nicht ausgewertet.
-- **Die Review-Schicht braucht zwei Personen auf einem Repo**, um beansprucht zu
-  werden.
+- **A `git push` opens two network connections** when there are new
+  sessions to transfer: one for the context, one for the code. Noticeable
+  against distant remotes
+  ([#85](https://github.com/munichbughunter/minds/issues/85)). Without new
+  sessions the hook costs nothing.
+- **No Windows binary.** The builds cover macOS (Apple Silicon and Intel)
+  and Linux (x86_64 and ARM64, musl/static). On Windows, use WSL or build
+  from source.
+- **The tool level is Claude-Code-specific.** For Codex, Cursor, Gemini,
+  and opencode the prompt is captured, but tool calls, touched files, and
+  model/token details are not interpreted.
+- **The review layer needs two people on one repo** to be exercised at
+  all.
 
 ## [0.1.0] — 2026-07-29
 
-Die erste veröffentlichte Version — und die erste, die über einen Installer
-ausgeliefert wird statt als handgebautes Archiv.
+The first published version — and the first delivered through an installer
+instead of as a hand-built archive.
 
-Minds schreibt den Kontext einer Agent-Session dorthin, wo er hingehört: in Git
-selbst, neben den Code. Was eine Änderung veranlasst hat, wer sie geschrieben hat und
-wer sie geprüft hat, liegt content-adressiert und signiert unter `refs/minds/` und
-wandert mit dem Repo — ohne Datenbank, ohne Cloud, offline und im Air-Gap
-verifizierbar.
+Minds writes the context of an agent session to where it belongs: into Git
+itself, next to the code. What prompted a change, who wrote it, and who
+reviewed it sits content-addressed and signed under `refs/minds/` and travels
+with the repo — no database, no cloud, verifiable offline and in an air gap.
 
-> Frühere, von Hand gebaute Archive trugen bereits dieselbe Versionsnummer, liegen
-> aber vor diesem Tag. `minds --version` meldet heute nur `0.1.0` und unterscheidet
-> die beiden nicht — wer noch ein altes Archiv im Pfad hat, installiert bitte neu.
+> Earlier, hand-built archives already carried the same version number but
+> predate this day. `minds --version` today reports only `0.1.0` and does
+> not distinguish the two — anyone who still has an old archive on the PATH,
+> please reinstall.
 
-### Hinzugefügt
+### Added
 
-**Erfassung**
+**Capture**
 
-- **Hook-basiertes Capture.** `minds enable` registriert Agent- und Git-Hooks;
-  idempotent und fremdschonend. Der heiße Pfad (`minds hook`) schreibt jedes Event
-  ins lokale Journal und endet immer mit 0, der kalte Pfad (`minds checkpoint`)
-  deutet, redigiert, speichert und hängt den Session-Id-Trailer an den Commit. Siehe
-  [ADR-0003](docs/adr/0003-hooks-statt-transkript-parsing.md).
-- **Fünf Agents registrierbar:** `claude-code`, `codex`, `cursor`, `gemini`,
-  `opencode`. Die Deutung der Tool-Ebene ist zunächst Claude Code vorbehalten (siehe
-  *Bekannte Einschränkungen*).
-- **Redaction, fail-closed.** Secrets und personenbezogene Daten gehen raus, *bevor*
-  ein Byte in den Store geht — im Zweifel blockiert Minds, statt zu riskieren. Regeln
-  erweiterbar über `.minds/redact.json`.
-- **Import bestehender Historie** mit heuristischer Zuordnung Session → Commit;
-  vermutete Zuordnungen werden als *vermutet* ausgewiesen statt als Tatsache. Siehe
-  [ADR-0004](docs/adr/0004-import-und-store-index.md).
+- **Hook-based capture.** `minds enable` registers agent and git hooks;
+  idempotent and careful with entries it does not own. The hot path
+  (`minds hook`)
+  writes every event to the local journal and always exits 0; the cold path
+  (`minds checkpoint`) interprets, redacts, stores, and appends the
+  session-id trailer to the commit. See
+  [ADR-0003](docs/adr/0003-hooks-over-transcript-parsing.md).
+- **Five agents registrable:** `claude-code`, `codex`, `cursor`, `gemini`,
+  `opencode`. Interpretation of the tool level is initially limited to
+  Claude Code (see *Known limitations*).
+- **Redaction, fail-closed.** Secrets and personal data are stripped
+  *before* a byte reaches the store — when in doubt, Minds blocks rather
+  than risks it. Rules extensible via `.minds/redact.json`.
+- **Import of existing history** with heuristic session → commit
+  attribution; conjectured attributions are marked as *conjectured* instead
+  of stated as fact. See
+  [ADR-0004](docs/adr/0004-import-and-store-index.md).
 
-**Speicherung**
+**Storage**
 
-- **Content-adressierter Store** (`SessionId = blake3(canonical_json)`) mit zwei
-  Backends hinter einem Trait: in-repo unter `refs/minds/` und als separates
-  Child-Repo.
-- **Ein Ref je Session.** Kein gemeinsam beschriebener Ref, damit kein
-  Serialisierungspunkt für Schreiben und Pushen: Der Ref-Name *ist* der Inhalts-Hash,
-  zwei Agents fassen verschiedene Refs an, und ein Repo, das nur eincheckt, zahlt für
-  den Hook 0,02 s. Siehe [ADR-0010](docs/adr/0010-ein-ref-je-session.md).
-- **Browserbare Session-Branches.** Jede Session erscheint als
-  `minds/session/<hash>` mit `session.json` (maßgeblich) und `session.md` (gerendert)
-  — GitLab zeigt den Branch damit ohne jeden Reader-Deploy als lesbare Seite.
-- **`minds forget <session> [--reason]`** — DSGVO-Löschung: Die Nutzlast wird durch
-  einen Tombstone ersetzt, die Hash-Referenz bleibt auflösbar, getilgt wird an allen
-  Ablageorten. `why`, `show` und `fsck` bleiben grün und degradieren ehrlich, statt zu
-  brechen. Siehe [ADR-0007](docs/adr/0007-forget-redigierbare-nutzlast.md).
+- **Content-addressed store** (`SessionId = blake3(canonical_json)`) with
+  two backends behind one trait: in-repo under `refs/minds/` and as a
+  separate child repo.
+- **One ref per session.** No jointly written ref, hence no serialization
+  point for writing and pushing: the ref name *is* the content hash, two
+  agents touch different refs, and a repo that only commits pays 0.02 s for
+  the hook. See [ADR-0010](docs/adr/0010-one-ref-per-session.md).
+- **Browsable session branches.** Every session appears as
+  `minds/session/<hash>` with `session.json` (authoritative) and
+  `session.md` (rendered) — GitLab thus shows the branch as a readable page
+  without any reader deploy.
+- **`minds forget <session> [--reason]`** — GDPR erasure: the payload is
+  replaced by a tombstone, the hash reference stays resolvable, erasure
+  happens at all storage locations. `why`, `show`, and `fsck` stay green
+  and degrade honestly instead of breaking. See
+  [ADR-0007](docs/adr/0007-forget-redactable-payload.md).
 
-**Nachschlagen**
+**Lookup**
 
-- **`minds why <datei>:<zeile>`** — die Session hinter einer einzelnen Zeile, über
-  blame und Trailer aufgelöst.
-- **`minds show [<commit>] [--full]`** — Absicht und Attribution hinter einem Commit.
-- **`minds blame <datei>`** — Attribution je Zeile, nach Session aggregiert, mit
-  Kontext-Abdeckung in Prozent.
-- **`minds recap`** und **`minds search <query>`** — die jüngsten Sessions auf einen
-  Blick; Absicht, Verlauf und Dateien durchsuchbar.
-- **`minds render`** baut eine zustandslose HTML-Seite: Zeile anklicken, Prompt
-  dahinter sehen, Gesprächsverlauf und Tool-Aufrufe aufklappbar.
-- **`minds fsck`** prüft, ob jeder Trailer auflösbar ist, und meldet Journal-Lücken.
+- **`minds why <file>:<line>`** — the session behind a single line,
+  resolved via blame and trailer.
+- **`minds show [<commit>] [--full]`** — intent and attribution behind a
+  commit.
+- **`minds blame <file>`** — attribution per line, aggregated by session,
+  with context coverage in percent.
+- **`minds recap`** and **`minds search <query>`** — the most recent
+  sessions at a glance; intent, conversation, and files searchable.
+- **`minds render`** builds a stateless HTML page: click a line, see the
+  prompt behind it, conversation and tool calls expandable.
+- **`minds fsck`** checks that every trailer resolves and reports journal
+  gaps.
 
-**Kontext-Rückführung**
+**Context reinjection**
 
-- **`minds recall <ziel>`**, **`minds brief [<datei>…]`** und
-  **`minds distill [--path] [--out]`** geben den erfassten Kontext an den nächsten
-  Agenten zurück — als Brief zu einer Zeile, als größenbegrenzter Startblock oder als
-  AGENTS.md-Entwurf aus der Repo-Historie. Deterministisch, ohne LLM-Aufruf, ohne
-  Tokens; gleiche Eingabe ergibt byte-gleiche Ausgabe. Optional automatisch beim
-  Session-Start über `minds enable --recall`. Siehe
-  [ADR-0005](docs/adr/0005-kontext-rueckfuehrung.md).
+- **`minds recall <target>`**, **`minds brief [<file>…]`**, and
+  **`minds distill [--path] [--out]`** hand the captured context back to
+  the next agent — as a brief for a line, as a size-capped start block, or
+  as an AGENTS.md draft from the repo history. Deterministic, no LLM call,
+  no tokens; same input yields byte-identical output. Optionally automatic
+  at session start via `minds enable --recall`. See
+  [ADR-0005](docs/adr/0005-context-reinjection.md).
 
-**Identität und Nachweis**
+**Identity and proof**
 
-- **Change-Id** als stabile Identität einer logischen Änderung, erzeugt und erhalten
-  über `prepare-commit-msg` (Trailer `Minds-Change-Id`). Überlebt Rebase, Squash,
-  Amend und Cherry-Pick. Siehe [ADR-0006](docs/adr/0006-change-id.md).
-- **Signierte Attribution.** `minds sign <session>` signiert die kanonische
-  Attribution per `ssh-sig` (kein Netz, air-gap-tauglich), `minds verify` prüft sie und
-  endet bei Manipulation mit einem Rückgabewert ≠ 0. Aus „Agent X, Modell Y schrieb
-  diese Zeilen" wird ein Nachweis statt einer Behauptung. Siehe
-  [ADR-0008](docs/adr/0008-signierte-attribution.md).
-- **`minds audit --export`** bündelt die Provenienz-Kette
-  (Change → Session → Attribution → Verdict) als portable JSON-Datei mit den
-  kanonischen Payloads und Signaturen — prüfbar ohne dieses Werkzeug. Was das Bundle
-  beweist und was nicht, steht in
-  [docs/nachweis-leitfaden.md](docs/nachweis-leitfaden.md).
+- **Change-Id** as the stable identity of a logical change, created and
+  preserved via `prepare-commit-msg` (trailer `Minds-Change-Id`). Survives
+  rebase, squash, amend, and cherry-pick. See
+  [ADR-0006](docs/adr/0006-change-id.md).
+- **Signed attribution.** `minds sign <session>` signs the canonical
+  attribution via `ssh-sig` (no network, air-gap-capable), `minds verify`
+  checks it and exits with a code ≠ 0 on tampering. "Agent X, model Y wrote
+  these lines" becomes a proof instead of a claim. See
+  [ADR-0008](docs/adr/0008-signed-attribution.md).
+- **`minds audit --export`** bundles the provenance chain
+  (change → session → attribution → verdict) as a portable JSON file with
+  the canonical payloads and signatures — checkable without this tool. What
+  the bundle proves and what it does not is in
+  [docs/verification-guide.md](docs/verification-guide.md).
 
 **Review**
 
-- **Reviews als Git-Objekte.** `minds review <subject> --approve|--reject|--needs-work`
-  legt ein content-adressiertes, optional signiertes Verdict unter
-  `refs/minds/reviews/` ab; `minds reviews <subject>` listet Verdicts und prüft
-  Signaturen. Das Verdict hängt an der Change-Id und überlebt damit Rebase, Squash und
-  Force-Push. Siehe [ADR-0009](docs/adr/0009-reviews-als-git-objekte.md).
-- **Review-Thread.** `minds comment <subject> --on <datei:zeile|turn:n> "<text>"` —
-  ein append-only Log content-adressierter Einträge. Zwei Reviewer, die offline
-  kommentieren, erzeugen keinen Konflikt, sondern eine Vereinigung.
-- **`minds stack`** zeigt die abhängigen Changes ab einer Basis mit ihrem jeweiligen
-  Review-Stand.
-- **GitLab-Brücke, einweg und idempotent.** `minds gitlab mirror <subject> --mr <nr>`
-  spiegelt Verdicts als MR-Note (optional als Approval); `minds gitlab webhook` deutet
-  einen MR-Kommentar (`/minds approve|reject|needs-work`) als Verdict — opt-in,
-  zustandslos, kein Dienst. Das Token kommt ausschließlich aus der Umgebung.
-  Betriebsmodell in [docs/betriebsmodell-gitlab.md](docs/betriebsmodell-gitlab.md).
-- **Policy als Binary statt YAML.** `minds fsck --require-review` verlangt für jeden
-  agent-geschriebenen Change ein gültiges Verdict und wird sonst rot. Dazu ein
-  wiederverwendbarer CI-Include (`ci/minds-review-gate.gitlab-ci.yml`), der nichts tut
-  als das Binary aufzurufen.
+- **Reviews as git objects.**
+  `minds review <subject> --approve|--reject|--needs-work` stores a
+  content-addressed, optionally signed verdict under `refs/minds/reviews/`;
+  `minds reviews <subject>` lists verdicts and checks signatures. The
+  verdict is anchored to the change-id and thus survives rebase, squash, and
+  force-push. See [ADR-0009](docs/adr/0009-reviews-as-git-objects.md).
+- **Review thread.**
+  `minds comment <subject> --on <file:line|turn:n> "<text>"` — an
+  append-only log of content-addressed entries. Two reviewers commenting
+  offline produce no conflict but a union.
+- **`minds stack`** shows the dependent changes from a base with their
+  respective review state.
+- **GitLab bridge, one-way and idempotent.**
+  `minds gitlab mirror <subject> --mr <nr>` mirrors verdicts as an MR note
+  (optionally as an approval); `minds gitlab webhook` interprets an MR
+  comment (`/minds approve|reject|needs-work`) as a verdict — opt-in,
+  stateless, no service. The token comes exclusively from the environment.
+  Operating model in
+  [docs/gitlab-operating-model.md](docs/gitlab-operating-model.md).
+- **Policy as a binary instead of YAML.** `minds fsck --require-review`
+  demands a valid verdict for every agent-written change and goes red
+  otherwise. Plus a reusable CI include
+  (`ci/minds-review-gate.gitlab-ci.yml`) that does nothing but call the
+  binary.
 
-**Betrieb**
+**Operations**
 
-- **`minds sync [--remote]`** schickt Kontext und Reviews in einer Verbindung ans
-  Remote — alle fälligen Refs auf einmal, nie mit `--force`. Ohne neue Refs kostet der
-  Aufruf keine Verbindung. Führt zusammen, was ein `git fetch` an fremden Verdicts
-  mitgebracht hat.
-- **`minds metrics [--format prometheus|openmetrics|json]`** projiziert den Store
-  on-demand ins Prometheus-Textformat — kein Daemon, kein Doppel-Speichern. Dazu ein
-  importierbares Grafana-Dashboard (`dashboards/minds.json`) und ein opt-in
-  CI-Include (`ci/minds-metrics.gitlab-ci.yml`).
-- **`minds agent-help`** gibt die Kommando-Karte maschinenlesbar als JSON aus — für
-  Agents, nicht für Menschen.
+- **`minds sync [--remote]`** sends context and reviews to the remote in
+  one connection — all due refs at once, never with `--force`. Without new
+  refs the call costs no connection. Merges whatever verdicts from others a
+  `git fetch` brought along.
+- **`minds metrics [--format prometheus|openmetrics|json]`** projects the
+  store on demand into the Prometheus text format — no daemon, no second
+  copy of the data. Plus an importable Grafana dashboard
+  (`dashboards/minds.json`)
+  and an opt-in CI include (`ci/minds-metrics.gitlab-ci.yml`).
+- **`minds agent-help`** outputs the command map as machine-readable JSON —
+  for agents, not for humans.
 
-### Sicherheit
+### Security
 
-- **Die Secret-Wall auf dem heißen Pfad ist agent-agnostisch.** Der Datei-Pfad wird
-  aus der Union bekannter Feldvarianten gezogen (`file_path`, `notebook_path`, `path`,
-  `absolute_path`, `filepath`, …) plus einer Heuristik über den Feldnamen. Fail-closed
-  gilt damit für alle Agents, nicht nur für den, dessen Feldnamen wir zuerst kannten.
+- **The secret wall on the hot path is agent-agnostic.** The file path is
+  drawn from the union of known field variants (`file_path`,
+  `notebook_path`, `path`, `absolute_path`, `filepath`, …) plus a heuristic
+  over the field name. Fail-closed thus applies to all agents, not just the
+  one whose field names we knew first.
 
-### Bekannte Einschränkungen
+### Known limitations
 
-- Die von `minds enable` eingetragenen Git-Hooks rufen `minds` **ohne Pfad** auf und
-  fangen jeden Fehlschlag mit `|| true` ab — ein Rekorder darf keinen Commit scheitern
-  lassen. Liegt das Binary **nicht im `PATH`**, laufen die Hooks deshalb **still** ins
-  Leere: Committen funktioniert weiter, es gibt keine Fehlermeldung, aber auch keine
-  Change-Id am Commit und keine erfasste Session. Dasselbe greift, wenn eine
-  **veraltete** `minds` im `PATH` liegt — sie bedient die Hooks und schreibt
-  gegebenenfalls ein älteres Store-Layout. `minds enable` prüft beides heute noch
-  nicht; nachsehen lässt es sich mit `command -v minds` und `minds --version`.
-- Die Deutung der **Tool-Ebene ist noch Claude-Code-spezifisch**. Für `gemini`,
-  `codex`, `cursor` und `opencode` wird der Prompt erfasst, aber Tool-Aufrufe,
-  berührte Dateien und Modell-/Token-Angaben werden noch nicht ausgewertet. Welcher
-  Agent als nächstes vollständig unterstützt wird, richtet sich nach dem Bedarf der
-  Testgruppe.
-- Die **Review-Schicht braucht mindestens zwei Personen auf einem Repo**, um
-  überhaupt beansprucht zu werden.
-- Der Reader (`minds render`) zeigt Sessions, Dateien und den Gesprächsverlauf;
-  **Übersichts-Kacheln und Diagramme fehlen noch**, obwohl `minds metrics` die
-  Kennzahlen bereits liefert.
-- Das Release enthält **Linux x86_64** (musl, statisch) und — sobald ein Mac-Runner
-  registriert ist — **macOS für Apple Silicon und Intel**. **Windows und ARM-Linux
-  werden derzeit nicht gebaut**; dort ist der Weg `cargo build --release --bin minds`.
+- The git hooks entered by `minds enable` call `minds` **without a path**
+  and catch every failure with `|| true` — a recorder must not make a
+  commit fail. If the binary is **not on the `PATH`**, the hooks therefore
+  run **silently** into the void: committing keeps working, there is no
+  error message, but also no change-id on the commit and no captured
+  session. The same applies when an **outdated** `minds` sits on the
+  `PATH` — it serves the hooks and may write an older store layout.
+  `minds enable` does not check either of these yet; it can be verified
+  with `command -v minds` and `minds --version`.
+- Interpretation of the **tool level is still Claude-Code-specific**. For
+  `gemini`, `codex`, `cursor`, and `opencode` the prompt is captured, but
+  tool calls, touched files, and model/token details are not yet
+  interpreted. Which agent gets full support next depends on the test
+  group's needs.
+- The **review layer needs at least two people on one repo** to be
+  exercised at all.
+- The reader (`minds render`) shows sessions, files, and the conversation;
+  **overview tiles and charts are still missing**, even though
+  `minds metrics` already delivers the numbers.
+- The release contains **Linux x86_64** (musl, static) and — as soon as a
+  Mac runner is registered — **macOS for Apple Silicon and Intel**.
+  **Windows and ARM Linux are currently not built**; there, the route is
+  `cargo build --release --bin minds`.

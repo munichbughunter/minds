@@ -4,8 +4,6 @@
 in this document can be traced to the code; the known gaps are listed at the
 end — with issue numbers, not in a footnote.*
 
-*Deutsche Fassung: [datenschutz-uebersicht.md](datenschutz-uebersicht.md)*
-
 ---
 
 ## 1. What is captured?
@@ -19,7 +17,7 @@ one as a structured object. That object contains:
   in plain text, and, for writing tools (`Write`/`Edit`), the content being
   written. All of it passes through redaction before anything is stored
   (section 3).
-- **Tool results do not**: whatever a tool returned — say, the content of a
+- **Tool results are not stored**: whatever a tool returned — say, the content of a
   file that was read — never reaches the stored object. The written file
   artifact itself is additionally referenced only as a BLAKE3 hash — and for
   credential files, not even that.
@@ -73,7 +71,7 @@ path is built on that:
   auth flags (`curl -u`), and e-mail addresses (PII). Query parameters such
   as `?private_token=…` are caught only when the value looks like a
   credential — a purely alphabetic value may survive (the diagnostic sink
-  `hook.log` applies a stricter rule there). Extendable per repository via
+  `hook.log` applies a stricter rule there). Extensible per repository via
   `.minds/redact.json` (denylist/allowlist).
 - **A broken configuration stops the write.** A typo in `redact.json` aborts
   with a line number — never a silent fallback to weaker protection. The
@@ -118,9 +116,9 @@ reachable even through the ref history (`~1`), and `git rev-list --objects
 same session is rejected; `show`/`why`/`fsck` keep working and name the
 session as forgotten instead of failing. Physical removal happens with the
 next `git gc`; until then the object is unreachable but present. In its
-default configuration Git keeps no reflog for `refs/minds/*`. A session ref
-already pushed to the forge is caught up by the next `git push` (or
-`minds sync`) via a targeted force-push — the deletion thereby reaches the
+default configuration Git keeps no reflog for `refs/minds/*`. For a session
+ref already pushed to the forge, the next `git push` (or `minds sync`)
+propagates the deletion via a targeted force-push — it thereby reaches the
 ref tip on the forge as well (#102).
 
 ## 6. Known gaps — as of v0.1.3
@@ -137,7 +135,7 @@ public as issues:
   housekeeping, backups, mirrors), which is outside Minds' control. The
   shared context ref of a legacy repository also stays out of scope: it
   carries the other sessions too and is never force-pushed; its remote
-  history has to be caught up by hand if needed. **Recommendation for the
+  history has to be cleaned up by hand if needed. **Recommendation for the
   pilot:** `forget` before the first push is fully effective; after a push,
   the housekeeping question to the forge is part of the deletion process.
 - **The raw-data journal is the one plain-text window.** Between capture and
