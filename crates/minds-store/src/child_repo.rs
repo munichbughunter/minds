@@ -51,7 +51,7 @@
 
 use std::path::Path;
 
-use minds_core::{Evidence, SessionId};
+use minds_core::{EvidenceMark, SessionId};
 use minds_git::{DEFAULT_CONTEXT_REF, Repo};
 use minds_redact::RedactedSession;
 
@@ -140,7 +140,39 @@ impl ContextStore for ChildRepoStore {
         self.0.index()
     }
 
-    fn link(&self, session: SessionId, commit_hex: &str, evidence: Evidence) -> Result<()> {
+    fn put_seal(&self, text: &str) -> Result<minds_core::ContentHash> {
+        self.0.put_seal(text)
+    }
+
+    fn seal_text(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        self.0.seal_text(id)
+    }
+
+    fn record_session_seal(
+        &self,
+        session: SessionId,
+        seal_id: &minds_core::ContentHash,
+    ) -> Result<()> {
+        self.0.record_session_seal(session, seal_id)
+    }
+
+    fn seals_of(&self, session: SessionId) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.seals_of(session)
+    }
+
+    fn list_seals(&self) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.list_seals()
+    }
+
+    fn put_seal_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
+        self.0.put_seal_signature(id, signature)
+    }
+
+    fn seal_signature(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        self.0.seal_signature(id)
+    }
+
+    fn link(&self, session: SessionId, commit_hex: &str, evidence: EvidenceMark) -> Result<()> {
         self.0.link(session, commit_hex, evidence)
     }
 

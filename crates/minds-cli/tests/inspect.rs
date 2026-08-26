@@ -137,19 +137,21 @@ fn piped_inspect_prints_one_tab_separated_line_per_session_without_ansi() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 1, "{text}");
     let cols: Vec<&str> = lines[0].split('\t').collect();
-    assert_eq!(cols.len(), 10, "{cols:?}");
+    assert_eq!(cols.len(), 11, "{cols:?}");
     assert_eq!(cols[1], session_id);
     assert!(cols[2].starts_with("claude-code"), "{cols:?}");
     assert_eq!(
-        cols[6], "observed",
+        cols[6], "observed [ungeprüft]",
         "der Trailer belegt die Kante: {cols:?}"
     );
-    assert_eq!(cols[7], "offen");
+    // Das Seal-Verdikt (ADR-0011): Der Checkpoint hat die Epoche versiegelt.
+    assert_eq!(cols[7], "versiegelt", "{cols:?}");
+    assert_eq!(cols[8], "offen");
     assert!(
-        cols[8].starts_with('I'),
+        cols[9].starts_with('I'),
         "Change-Id aus dem Trailer: {cols:?}"
     );
-    assert_eq!(cols[9], "Schreibe eine Grußfunktion");
+    assert_eq!(cols[10], "Schreibe eine Grußfunktion");
 
     // Die Suche filtert dieselbe Liste.
     let hit = minds(dir, &["inspect", "grußfunktion"], None);
@@ -186,7 +188,9 @@ fn piped_inspect_of_a_line_prints_the_chain_down_to_the_intent() {
         text.contains("\nintent\tSchreibe eine Grußfunktion\n"),
         "{text}"
     );
-    assert!(text.contains("\tobserved\n"), "{text}");
+    // Seit ADR-0011 traegt das Wort auch den Status: beobachtet heisst
+    // nicht geprueft.
+    assert!(text.contains("\tobserved [ungeprüft]\n"), "{text}");
     assert!(text.contains("\nreview\toffen\n"), "{text}");
     // Die Lücken zuletzt: hier genau eine — niemand hat bewertet.
     assert!(text.contains("\ngap\tNoReview\t"), "{text}");

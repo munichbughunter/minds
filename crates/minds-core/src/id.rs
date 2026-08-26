@@ -223,11 +223,16 @@ mod tests {
     /// Kanonische Form von [`sample()`] nach RFC 8785 (497 Bytes, reines ASCII).
     /// Raw-String, damit der Wert 1:1 gegen die Ausgabe von `to_canonical_string`
     /// diffbar bleibt (der JSON-Text enthält `"`, aber nie die Sequenz `"#`).
-    const GOLDEN_CANONICAL: &str = r#"{"agent":{"name":"claude-code","version":"1.0.0"},"intent":{"constraints":["keine neuen Dependencies"],"discarded":["Timeout einfach hochsetzen"],"request":"Flaky Retry-Test reparieren"},"model":{"id":"claude-opus-4","provider":"anthropic"},"produced":{"files":["src/retry.rs"]},"redaction":{"applied":true,"counts":{"pii":1,"secrets":0}},"schema_version":1,"turns":[{"role":"user","text":"Der Retry-Test flackert, bitte fixen.","tool_calls":[]}],"usage":{"input_tokens":1234,"output_tokens":567}}"#;
+    const GOLDEN_CANONICAL: &str = r#"{"agent":{"name":"claude-code","version":"1.0.0"},"intent":{"constraints":["keine neuen Dependencies"],"discarded":["Timeout einfach hochsetzen"],"request":"Flaky Retry-Test reparieren"},"model":{"id":"claude-opus-4","provider":"anthropic"},"produced":{"files":["src/retry.rs"]},"redaction":{"applied":true,"counts":{"pii":1,"secrets":0}},"schema_version":2,"turns":[{"role":"user","text":"Der Retry-Test flackert, bitte fixen.","tool_calls":[]}],"usage":{"input_tokens":1234,"output_tokens":567}}"#;
 
     /// `blake3(GOLDEN_CANONICAL)` in Textform — der sprachunabhängige KAV.
+    ///
+    /// Der Vorgänger-Vektor (Schema 1, `schema_version:1`) lautete
+    /// `b3-a20e4a60acb3c7973efd344b3f27e91bf3b21211dbb64fc965bc32b4a8140bbd` —
+    /// der Wechsel hier war der bewusste Bruch aus ADR-0011 (Schema 2), kein
+    /// Refactor.
     const GOLDEN_SESSION_ID: &str =
-        "b3-a20e4a60acb3c7973efd344b3f27e91bf3b21211dbb64fc965bc32b4a8140bbd";
+        "b3-4a6388a9ea6622b9e2dc77df88c85311890dc62b1fde9692b3211dc74e71e65f";
 
     #[test]
     fn golden_canonical_form_is_frozen() {

@@ -28,7 +28,7 @@
 //! Inhalts-Hash am [`Effect`](minds_core::Effect), den der Adapter beim
 //! Checkpoint bildet.
 
-use minds_core::{Edge, EdgeKind, Endpoint, Evidence};
+use minds_core::{Edge, EdgeKind, Endpoint, EvidenceMark, EvidenceSource};
 use serde::Deserialize;
 
 use crate::journal::{EventKind, JournalEvent};
@@ -40,7 +40,7 @@ pub fn commit(commit_id: &str) -> Edge {
         to: Endpoint::Commit {
             id: commit_id.to_string(),
         },
-        evidence: Evidence::Observed,
+        evidence: EvidenceMark::of(EvidenceSource::Observed),
     }
 }
 
@@ -72,7 +72,7 @@ pub fn subagent(agent: &str, events: &[JournalEvent]) -> Vec<Edge> {
                         Edge {
                             kind: EdgeKind::Spawned,
                             to: child,
-                            evidence: Evidence::Observed,
+                            evidence: EvidenceMark::of(EvidenceSource::Observed),
                         },
                     );
                 }
@@ -84,7 +84,7 @@ pub fn subagent(agent: &str, events: &[JournalEvent]) -> Vec<Edge> {
                         Edge {
                             kind: EdgeKind::SpawnedBy,
                             to: parent,
-                            evidence: Evidence::Observed,
+                            evidence: EvidenceMark::of(EvidenceSource::Observed),
                         },
                     );
                 }
@@ -161,6 +161,8 @@ mod tests {
             cwd: None,
             transcript_path: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
+            payload_hash: None,
+            event_hash: None,
         }
     }
 
@@ -168,7 +170,7 @@ mod tests {
     fn a_commit_edge_is_produced_and_observed() {
         let e = commit("deadbeef");
         assert_eq!(e.kind, EdgeKind::Produced);
-        assert_eq!(e.evidence, Evidence::Observed);
+        assert_eq!(e.evidence, EvidenceMark::of(EvidenceSource::Observed));
         assert_eq!(
             e.to,
             Endpoint::Commit {
@@ -186,7 +188,10 @@ mod tests {
         let edges = subagent("claude-code", &events);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].kind, EdgeKind::Spawned);
-        assert_eq!(edges[0].evidence, Evidence::Observed);
+        assert_eq!(
+            edges[0].evidence,
+            EvidenceMark::of(EvidenceSource::Observed)
+        );
         assert_eq!(
             edges[0].to,
             Endpoint::Session {

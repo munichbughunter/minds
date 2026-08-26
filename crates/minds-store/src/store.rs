@@ -33,7 +33,7 @@
 //! **gespeicherten Bytes**, nicht gegen das, was wir daraus wieder machen
 //! würden.
 
-use minds_core::{Evidence, Session, SessionId};
+use minds_core::{ContentHash, EvidenceMark, Session, SessionId};
 use minds_redact::RedactedSession;
 
 use crate::bytes::SessionBytes;
@@ -249,7 +249,7 @@ pub trait ContextStore {
     /// deshalb mit einem CAS-gestützten Read-Modify-Write
     /// (`update_blob_in_ref`); ein neues Backend, das nebenläufig beschrieben
     /// wird, muss dasselbe tun. Produktiv nutzt diesen Default heute niemand.
-    fn link(&self, session: SessionId, commit_hex: &str, evidence: Evidence) -> Result<()> {
+    fn link(&self, session: SessionId, commit_hex: &str, evidence: EvidenceMark) -> Result<()> {
         let mut index = self.index()?;
         index.link(commit_hex.to_owned(), session, evidence);
         self.set_index(&index)
@@ -281,6 +281,67 @@ pub trait ContextStore {
     /// Punkt 8 der Definition of Done („Wer Minds nicht nutzt, merkt nichts").
     fn put_session_branch(&self, _session: &RedactedSession) -> Result<()> {
         Ok(())
+    }
+
+    /// Legt einen Coverage-Seal ab, content-adressiert unter seiner
+    /// `seal_id` (ADR-0011, Entscheidung 4) — und gibt sie zurück.
+    ///
+    /// Idempotent: gleiche Bytes ⇒ gleiche Id ⇒ derselbe Ref, ein zweiter
+    /// Aufruf ist ein No-op. Fail-closed: Was nicht als Seal parst, wird
+    /// nicht abgelegt ([`StoreError::InvalidSeal`]).
+    ///
+    /// Der Default lehnt ab — ein Backend ohne Seal-Ablage soll das laut
+    /// sagen, statt Beweise still zu verlieren.
+    fn put_seal(&self, _text: &str) -> Result<ContentHash> {
+        Err(StoreError::backend(std::io::Error::other(
+            "dieses Backend legt keine Seals ab",
+        )))
+    }
+
+    /// Der Text des Seals unter `id` — `None`, wenn er hier nicht liegt.
+    ///
+    /// Prüft beim Lesen `id == derive_key(text)` und meldet Manipulation als
+    /// [`StoreError::SealMismatch`] — dasselbe Gratis-Versprechen wie bei
+    /// Sessions.
+    fn seal_text(&self, _id: &ContentHash) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Trägt den Rückverweis Session → Seal in die `evidence.json` der
+    /// Session ein. Idempotent; die Reihenfolge der Einträge ist die
+    /// Eintrag-Reihenfolge (Epochen-Ordnung kommt aus den `previous`-Zeilen
+    /// der Seals selbst).
+    fn record_session_seal(&self, _session: SessionId, _seal_id: &ContentHash) -> Result<()> {
+        Err(StoreError::backend(std::io::Error::other(
+            "dieses Backend kennt keine Seal-Rückverweise",
+        )))
+    }
+
+    /// Die Seals einer Session, in Eintrag-Reihenfolge. Tolerant gelesen —
+    /// eine kaputte `evidence.json` ist „keine Rückverweise", kein Fehler
+    /// (nachzugehen ist dem in `minds fsck`).
+    fn seals_of(&self, _session: SessionId) -> Result<Vec<ContentHash>> {
+        Ok(Vec::new())
+    }
+
+    /// Alle abgelegten Seals — für `fsck` und `verify --evidence`.
+    fn list_seals(&self) -> Result<Vec<ContentHash>> {
+        Ok(Vec::new())
+    }
+
+    /// Legt die `ssh-sig`-Signatur zu einem Seal neben ihn (`seal.sig`) —
+    /// dasselbe Muster wie bei Review-Signaturen: Die Signatur liegt **neben**
+    /// den signierten Bytes, nie darin (das wäre zirkulär). Der Seal muss
+    /// bereits liegen.
+    fn put_seal_signature(&self, _id: &ContentHash, _signature: &str) -> Result<()> {
+        Err(StoreError::backend(std::io::Error::other(
+            "dieses Backend legt keine Seal-Signaturen ab",
+        )))
+    }
+
+    /// Die Signatur zu einem Seal — `None`, wenn er unsigniert ist.
+    fn seal_signature(&self, _id: &ContentHash) -> Result<Option<String>> {
+        Ok(None)
     }
 
     /// Holt die Session unter `id` — `None`, wenn sie hier nicht liegt.

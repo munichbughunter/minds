@@ -169,9 +169,14 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
 /// `DD.MM. HH:MMZ` aus dem RFC-3339-Präfix; `—`, wenn keine Zeit erfasst ist.
 /// UTC, wie der Zeitstempel selbst — ohne Datums-Crate keine Ortszeit.
 pub fn when(ts: Option<&str>) -> String {
+    // `get` statt Index-Slicing: Der Wert kann fremdbestimmt sein (etwa die
+    // Zeitzeile eines handgebauten Seals) — ein Multi-Byte-Zeichen an der
+    // falschen Stelle darf die Oberfläche nicht panicken.
     match ts {
-        Some(ts) if ts.len() >= 16 => format!("{}.{}. {}Z", &ts[8..10], &ts[5..7], &ts[11..16]),
-        Some(ts) => ts.to_string(),
+        Some(ts) => match (ts.get(8..10), ts.get(5..7), ts.get(11..16)) {
+            (Some(d), Some(m), Some(hm)) => format!("{d}.{m}. {hm}Z"),
+            _ => ts.to_string(),
+        },
         None => "—".into(),
     }
 }

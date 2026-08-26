@@ -11,7 +11,7 @@
 //! Alles hier ist rein: Wer die Dateien des Commits und seine Zeit schon
 //! hat, braucht kein Repository.
 
-use minds_core::{Evidence, Session};
+use minds_core::{EvidenceMark, EvidenceSource, Session};
 use minds_git::CommitId;
 use minds_metrics::epoch_seconds;
 
@@ -32,17 +32,17 @@ pub const GRACE_AFTER: i64 = 3_600;
 /// ließen — dann wird die Vermutung ehrlich als nicht rekonstruierbar
 /// geführt statt mit leeren Listen als „kein Grund" vorgetäuscht.
 pub fn explain(
-    evidence: Evidence,
+    evidence: EvidenceMark,
     commit: CommitId,
     session: &Session,
     commit_files: Option<&[String]>,
     commit_time: Option<i64>,
 ) -> EvidenceExplanation {
-    match evidence {
-        Evidence::Observed => EvidenceExplanation::Trailer { commit },
-        Evidence::Declared => EvidenceExplanation::Declared,
-        Evidence::Content => EvidenceExplanation::Content,
-        Evidence::Inferred => {
+    match evidence.source {
+        EvidenceSource::Observed => EvidenceExplanation::Trailer { commit },
+        EvidenceSource::HumanDeclared => EvidenceExplanation::Declared,
+        EvidenceSource::ContentDerived => EvidenceExplanation::Content,
+        EvidenceSource::Heuristic => {
             let Some(files) = commit_files else {
                 return EvidenceExplanation::Unknown {
                     reason: "Commit-Diff nicht lesbar".into(),
@@ -139,15 +139,33 @@ mod tests {
     fn an_observed_edge_points_at_its_trailer_commit() {
         let s = session(&[], None, None);
         assert_eq!(
-            explain(Evidence::Observed, commit(), &s, None, None),
+            explain(
+                EvidenceMark::of(EvidenceSource::Observed),
+                commit(),
+                &s,
+                None,
+                None
+            ),
             EvidenceExplanation::Trailer { commit: commit() }
         );
         assert_eq!(
-            explain(Evidence::Declared, commit(), &s, None, None),
+            explain(
+                EvidenceMark::of(EvidenceSource::HumanDeclared),
+                commit(),
+                &s,
+                None,
+                None
+            ),
             EvidenceExplanation::Declared
         );
         assert_eq!(
-            explain(Evidence::Content, commit(), &s, None, None),
+            explain(
+                EvidenceMark::of(EvidenceSource::ContentDerived),
+                commit(),
+                &s,
+                None,
+                None
+            ),
             EvidenceExplanation::Content
         );
     }
@@ -156,7 +174,13 @@ mod tests {
     fn an_inferred_edge_without_a_diff_is_honestly_unknown() {
         let s = session(&["a.rs"], None, None);
         assert!(matches!(
-            explain(Evidence::Inferred, commit(), &s, None, None),
+            explain(
+                EvidenceMark::of(EvidenceSource::Heuristic),
+                commit(),
+                &s,
+                None,
+                None
+            ),
             EvidenceExplanation::Unknown { .. }
         ));
     }
@@ -171,7 +195,7 @@ mod tests {
         let files = vec!["src/a.rs".to_string(), "c\u{1b}[2K.rs".to_string()];
         let end = epoch_seconds("2026-07-25T10:00:00Z").unwrap();
         let got = explain(
-            Evidence::Inferred,
+            EvidenceMark::of(EvidenceSource::Heuristic),
             commit(),
             &s,
             Some(&files),
@@ -196,7 +220,13 @@ mod tests {
         );
         let (start, end) = session_window(&s).unwrap();
         let files = vec!["a".to_string()];
-        let at = |t: i64| match explain(Evidence::Inferred, commit(), &s, Some(&files), Some(t)) {
+        let at = |t: i64| match explain(
+            EvidenceMark::of(EvidenceSource::Heuristic),
+            commit(),
+            &s,
+            Some(&files),
+            Some(t),
+        ) {
             EvidenceExplanation::Heuristic { in_window, .. } => in_window,
             other => panic!("{other:?}"),
         };
@@ -212,7 +242,13 @@ mod tests {
         assert_eq!(session_window(&s), None);
         let files = vec!["a".to_string()];
         assert_eq!(
-            explain(Evidence::Inferred, commit(), &s, Some(&files), Some(5)),
+            explain(
+                EvidenceMark::of(EvidenceSource::Heuristic),
+                commit(),
+                &s,
+                Some(&files),
+                Some(5)
+            ),
             EvidenceExplanation::Heuristic {
                 shared_files: vec!["a".into()],
                 seconds_apart: None,

@@ -242,6 +242,14 @@ pub enum Field {
         /// Index des Tool-Calls im Zug.
         call: usize,
     },
+    /// `turns[t].tool_calls[c].capture.adapter`
+    ToolCallCaptureAdapter {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Aufrufs im Zug.
+        call: usize,
+    },
+
     /// `turns[t].tool_calls[c].effect.path`
     EffectPath {
         /// Index des Zugs.
@@ -286,6 +294,9 @@ impl fmt::Display for Field {
             }
             Field::ToolCallArguments { turn, call } => {
                 write!(f, "turns[{turn}].tool_calls[{call}].arguments")
+            }
+            Field::ToolCallCaptureAdapter { turn, call } => {
+                write!(f, "turns[{turn}].tool_calls[{call}].capture.adapter")
             }
             Field::EffectPath { turn, call } => {
                 write!(f, "turns[{turn}].tool_calls[{call}].effect.path")
@@ -547,10 +558,34 @@ impl RedactionPipeline {
                     name,
                     arguments,
                     effect,
+                    capture,
                 } = call;
                 let effect = self.redact_effect(effect, turn_index, call_index, &mut audit)?;
+                // `capture.adapter` ist unser eigenes Vokabular („claude-code",
+                // „generic") — aber die Ausnahmeliste bleibt leer (siehe
+                // Modul-Doku): gescannt wird jeder Text, auch dieser.
+                let capture = match capture {
+                    None => None,
+                    Some(minds_core::Capture {
+                        status,
+                        adapter,
+                        adapter_version,
+                    }) => Some(minds_core::Capture {
+                        status,
+                        adapter: self.redact_field(
+                            Field::ToolCallCaptureAdapter {
+                                turn: turn_index,
+                                call: call_index,
+                            },
+                            adapter,
+                            &mut audit,
+                        )?,
+                        adapter_version,
+                    }),
+                };
                 redacted_calls.push(ToolCall {
                     effect,
+                    capture,
                     // Der Tool-*Name* ist Vokabular des Agents und trägt
                     // normalerweise nichts Sensibles — normalerweise. Er kostet
                     // einen Scan über zehn Zeichen; die Ausnahme wäre teurer.
@@ -978,6 +1013,7 @@ mod tests {
             role: Role::Assistant,
             text: TERM.into(),
             tool_calls: vec![ToolCall {
+                capture: None,
                 name: TERM.into(),
                 arguments: TERM.into(),
                 effect: None,
@@ -1004,12 +1040,12 @@ mod tests {
                     agent: TERM.into(),
                     local_id: TERM.into(),
                 },
-                evidence: minds_core::Evidence::Declared,
+                evidence: minds_core::EvidenceMark::of(minds_core::EvidenceSource::HumanDeclared),
             },
             Edge {
                 kind: minds_core::EdgeKind::Produced,
                 to: Endpoint::Commit { id: TERM.into() },
-                evidence: minds_core::Evidence::Declared,
+                evidence: minds_core::EvidenceMark::of(minds_core::EvidenceSource::HumanDeclared),
             },
         ];
 
@@ -1110,14 +1146,14 @@ mod tests {
                     agent: "claude-code".into(),
                     local_id: "9c1e5f80-2a44-4d31-8bfa-abcdef012345".into(),
                 },
-                evidence: minds_core::Evidence::Declared,
+                evidence: minds_core::EvidenceMark::of(minds_core::EvidenceSource::HumanDeclared),
             },
             Edge {
                 kind: minds_core::EdgeKind::Produced,
                 to: Endpoint::Commit {
                     id: "356a192b7913b04c54574d18c28d46e6395428ab".into(),
                 },
-                evidence: minds_core::Evidence::Declared,
+                evidence: minds_core::EvidenceMark::of(minds_core::EvidenceSource::HumanDeclared),
             },
         ];
 
@@ -1157,6 +1193,7 @@ mod tests {
             role: Role::Assistant,
             text: "deploye".into(),
             tool_calls: vec![ToolCall {
+                capture: None,
                 name: "bash".into(),
                 arguments: r#"{"cmd":"deploy --token=ghp_012345678901234567890123456789012345"}"#
                     .into(),
@@ -1210,6 +1247,7 @@ mod tests {
             role: Role::User,
             text: "DB_PASSWORD=hunter2".into(),
             tool_calls: vec![ToolCall {
+                capture: None,
                 name: "bash".into(),
                 arguments: "psql postgres://admin:s3cr3t@db.internal/prod".into(),
                 effect: None,
@@ -1296,6 +1334,7 @@ mod tests {
         let mut s = session();
         let mut turn = user_turn("schreib was");
         turn.tool_calls.push(ToolCall {
+            capture: None,
             name: "Write".into(),
             arguments: "{}".into(),
             effect: Some(Effect {

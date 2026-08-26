@@ -20,10 +20,21 @@
 //! [`Session::lineage`], [`Session::edges`], [`Turn::parent`]/[`Turn::at`] und
 //! [`ToolCall::effect`]. Alle sind additiv und tragen `skip_serializing_if` —
 //! eine Session, die keines davon belegt, serialisiert **byte-identisch** wie
-//! vorher und behält ihre `SessionId`. Deshalb bleibt [`SCHEMA_VERSION`] bei 1;
-//! ein Bump wäre eine Aussage über Inkompatibilität, die hier nicht zutrifft.
+//! vorher und behält ihre `SessionId`. Deshalb blieb [`SCHEMA_VERSION`] damals
+//! bei 1; ein Bump wäre eine Aussage über Inkompatibilität gewesen, die dort
+//! nicht zutraf.
 //!
 //! Das Warum steht in [`crate::lineage`]; hier steht nur, wo es hängt.
+//!
+//! # Schema 2: Evidence in zwei Dimensionen (ADR-0011)
+//!
+//! `Edge.evidence` ist ab Schema 2 ein
+//! [`EvidenceMark`](crate::lineage::EvidenceMark) (Objektform
+//! `{"source":…,"status":…}`) statt des Legacy-Strings. Das ist die erste
+//! Änderung, bei der der Bump auch real Lesbarkeit trennt: Ein neueres Binary
+//! liest beide Formen (der Deserializer ist tolerant), ein Schema-1-Binary
+//! liest Schema-2-Sessions **nicht**. Bestand wird nicht migriert —
+//! content-adressierte Sessions sind unveränderlich und behalten ihre Bytes.
 //!
 //! # Ein Turn ist ein Knoten, keine Zeile
 //!
@@ -39,7 +50,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lineage::{Edge, Effect, Lineage};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -174,6 +185,16 @@ pub struct ToolCall {
     #[serde(default)]
     pub arguments: String,
 
+    /// Ob und durch wen dieser Aufruf gedeutet wurde (ADR-0011).
+    ///
+    /// `None` nur bei Bestand aus der Zeit vor der Evidence-Chain — dieselbe
+    /// Additiv-Regel wie bei [`Session::lineage`]. Ein beobachteter, aber
+    /// nicht gedeuteter Aufruf trägt [`CaptureStatus::Uninterpreted`] statt
+    /// still zu verschwinden: „Ich habe gesehen, dass ein Tool lief; seine
+    /// Wirkung konnte ich nicht deuten."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<Capture>,
+
     /// Was der Aufruf in der Welt getan hat, **normalisiert**.
     ///
     /// Der Pfad steckt zwar auch in `arguments` — aber dort in der Sprache des
@@ -183,6 +204,37 @@ pub struct ToolCall {
     /// bevor irgendetwas gespeichert wird.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<Effect>,
+}
+
+/// Ob und wie ein Tool-Aufruf gedeutet wurde — die Deutungsgrenze als
+/// Aussage statt als Schweigen (ADR-0011).
+///
+/// `adapter`/`adapter_version` machen die Deutung **wiederholbar**: Evidence
+/// ist unveränderlich, Interpretation ist rekonstruierbar — ein späterer
+/// Adapter v2 kann denselben erhaltenen Aufruf neu deuten, und ein Leser
+/// sieht, mit welchem Stand die vorliegende Deutung entstand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capture {
+    /// Gedeutet oder nur beobachtet.
+    pub status: CaptureStatus,
+
+    /// Wer gedeutet hat (`claude-code`, `generic`).
+    pub adapter: String,
+
+    /// Versionsstand dieser Deutung; Bump bei jeder Deutungsänderung.
+    pub adapter_version: u32,
+}
+
+/// Der Deutungszustand eines beobachteten Tool-Aufrufs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStatus {
+    /// Der Adapter kennt das Tool und hat seine Wirkung gedeutet.
+    Interpreted,
+
+    /// Beobachtet, aber nicht gedeutet — Name und Roh-Argumente bleiben
+    /// erhalten, die Wirkung ist unbekannt.
+    Uninterpreted,
 }
 
 /// Token-Verbrauch der Session.
@@ -224,7 +276,9 @@ pub struct RedactionCounts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lineage::{ContentHash, EdgeKind, Effect, EffectKind, Endpoint, Evidence};
+    use crate::lineage::{
+        ContentHash, EdgeKind, Effect, EffectKind, Endpoint, EvidenceMark, EvidenceSource,
+    };
 
     fn sample() -> Session {
         let mut s = Session::new(
@@ -253,6 +307,7 @@ mod tests {
             role: Role::Assistant,
             text: "Ich schaue mir die Backoff-Logik an.".into(),
             tool_calls: vec![ToolCall {
+                capture: None,
                 name: "read_file".into(),
                 arguments: r#"{"path":"src/retry.rs"}"#.into(),
                 effect: None,
@@ -277,7 +332,7 @@ mod tests {
 
     #[test]
     fn new_sets_current_schema_version() {
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
         assert_eq!(sample().schema_version, SCHEMA_VERSION);
     }
 
@@ -298,6 +353,33 @@ mod tests {
         assert!(s.turns.is_empty());
         assert!(s.lineage.is_none());
         assert!(s.edges.is_empty());
+    }
+
+    #[test]
+    fn a_schema_1_session_with_legacy_evidence_still_reads() {
+        // Rueckwaerts-Zusage aus ADR-0011: Ein neueres Binary liest alle
+        // aelteren Schema-Versionen. Der Legacy-String an der Kante wird auf
+        // `(source, Unknown)` gemappt — keine Alt-Kante war je nachgerechnet.
+        let json = r#"{
+            "schema_version": 1,
+            "agent": {"name": "a", "version": "1"},
+            "model": {"provider": "p", "id": "m"},
+            "intent": {"request": "mach x"},
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "produced": {"files": []},
+            "redaction": {"applied": true, "counts": {"secrets": 0, "pii": 0}},
+            "edges": [{
+                "kind": "produced",
+                "to": {"type": "commit", "id": "deadbeef"},
+                "evidence": "observed"
+            }]
+        }"#;
+        let s: Session = serde_json::from_str(json).unwrap();
+        assert_eq!(s.schema_version, 1);
+        assert_eq!(
+            s.edges[0].evidence,
+            EvidenceMark::of(EvidenceSource::Observed)
+        );
     }
 
     #[test]
@@ -391,7 +473,7 @@ mod tests {
                 agent: "claude-code".into(),
                 local_id: "a53626b".into(),
             },
-            evidence: Evidence::Observed,
+            evidence: EvidenceMark::of(EvidenceSource::Observed),
         });
         s.turns[1].parent = Some(0);
         s.turns[1].at = Some("2026-07-23T09:12:09.001Z".into());

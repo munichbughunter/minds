@@ -7,7 +7,27 @@
 //! ```text
 //!   Journal ──► adapter::checkpoint ──► Redaction ──► Store ──► Trailer an HEAD
 //!   (roh)        (Session)              (fail-closed)  (b3-…)    (Minds-Session-Id)
+//!      │
+//!      └──► chain::chain ──► Seal ──► refs/minds/evidence/<seal_id>   (ADR-0011)
+//!           (Root+Coverage)  (signierbar)
 //! ```
+//!
+//! # Der Seal kommt vor dem Discard
+//!
+//! Das volle [`ReadOutcome`](minds_capture::Journal::read) — Events, Lücken,
+//! Beschädigtes — wird zur Kette gefaltet und als Seal abgelegt, **bevor** das
+//! Journal verschwindet: Der Seal ist das, was die Journal-Löschung überlebt.
+//! Scheitert die Seal-Ablage, bleibt das Journal liegen (vertagt, wie bei
+//! jedem anderen Fehler) — die Ablage ist idempotent, der nächste Lauf holt
+//! sie nach. Epochen (dieselbe Session über mehrere Checkpoints; die Seqs
+//! starten nach dem Discard wieder bei 0) verkettet die `previous`-Zeile über
+//! den lokalen [`EpochState`].
+//!
+//! Weist die Redaction eine Session zurück, entsteht **trotzdem** ein Seal —
+//! `outcome=storage_policy_rejected_payload`, `session=-`: Für den Auditor
+//! existierte die Session, ihr Bereich ist versiegelt, nur die Nutzlast wurde
+//! zurückgewiesen. Der Seal trägt keinen Intent, keine Pfade, keinen
+//! Redaction-Feldnamen (ADR-0011, Entscheidung 3).
 //!
 //! # Der Trailer, nicht die Produced-Kante
 //!
@@ -46,8 +66,10 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use minds_capture::{Checkpoint, Journal, adapter};
+use minds_capture::epoch::EpochState;
+use minds_capture::{Checkpoint, Journal, adapter, chain};
 use minds_core::SessionId;
+use minds_core::evidence::{ChainResult, Seal, SealOutcome};
 use minds_git::{CommitId, Repo};
 use minds_store::ContextStore;
 
@@ -110,16 +132,79 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
             ),
         );
     }
+    let epochs = EpochState::open(git_dir);
+    // Die Read-Hash-Grenze, einmal je Lauf: die von git getrackten Pfade.
+    // Schlägt das fehl, gibt es schlicht keine Read-Hashes (fail-closed in
+    // Richtung „weniger Fingerabdruck") — Write-Hashes sind nicht betroffen.
+    let tracked = tracked_files(&root);
     for key in outcome.keys {
-        let events = journal.read(&key)?.events;
-        if events.is_empty() {
+        let read = journal.read(&key)?;
+        if read.events.is_empty() {
+            // Nur Beschädigtes ohne ein einziges Event: kein Zeitstempel, kein
+            // Bereich — nichts, was ein Seal ehrlich claimen könnte. fsck
+            // meldet den Schaden; das Verzeichnis bleibt liegen.
             continue;
         }
 
-        match store_one(&key, &events, &root, git_dir, &pipeline, store.as_ref()) {
+        // Die Kette über das VOLLE ReadOutcome: Lücken und Beschädigtes werden
+        // Glieder, nicht Schweigen (bis ADR-0011 wurden sie hier verworfen).
+        // Gefaltet wird mit dem Session-Salt: Der Root reist im Seal auf die
+        // Forge und wäre ungesalzen ein Payload-Orakel für Ein-Event-Epochen.
+        let salt = match epochs.salt(&key) {
+            Ok(salt) => salt,
+            Err(err) => {
+                // Ohne Salt kein Seal, ohne Seal kein Discard — vertagen,
+                // wie bei jedem anderen Fehler dieser Session.
+                hooklog::report_at(
+                    git_dir,
+                    Source::Checkpoint,
+                    &format!("{} übersprungen: {err}", key.display_redacted(&pipeline)),
+                );
+                continue;
+            }
+        };
+        let result = chain::chain_salted(&salt, &read);
+
+        match store_one(
+            &key,
+            &read.events,
+            &root,
+            git_dir,
+            &pipeline,
+            store.as_ref(),
+            tracked.as_ref(),
+        ) {
             Ok(id) => {
-                // Erst nach erfolgreicher Ablage verwerfen: Ein Absturz dazwischen
-                // darf Rohdaten nicht verlieren.
+                let sealed = seal_epoch(
+                    &epochs,
+                    &key,
+                    &read.events,
+                    &result,
+                    SealOutcome::Stored {
+                        session: id.to_string(),
+                    },
+                    store.as_ref(),
+                    &root,
+                    git_dir,
+                );
+                let Some(seal_id) = sealed else {
+                    // Ohne Seal kein Discard: Der Seal muss die
+                    // Journal-Löschung überleben. Session ist gespeichert
+                    // (idempotent), der nächste Lauf versiegelt nach.
+                    continue;
+                };
+                // Rückverweis Session → Seal, best-effort: aus `list_seals`
+                // jederzeit rekonstruierbar, darf den Checkpoint nicht kippen.
+                if let Err(err) = store.record_session_seal(id, &seal_id) {
+                    hooklog::report_at(
+                        git_dir,
+                        Source::Checkpoint,
+                        &format!("Seal-Verweis für {id} nicht eingetragen: {err}"),
+                    );
+                }
+                // Erst nach erfolgreicher Ablage UND Versiegelung verwerfen:
+                // Ein Absturz dazwischen darf weder Rohdaten noch Beweis
+                // verlieren.
                 journal.discard(&key)?;
                 println!("  {}: {id}", key.display_redacted(&pipeline));
                 stored.push(id);
@@ -130,11 +215,27 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 // die Redaktion, bevor es auf stderr und ins hook.log geht:
                 // Seit #35 gilt es als fremdbestimmter Wert, der auch ein
                 // Token sein kann (#95).
-                hooklog::report_at(
-                    git_dir,
-                    Source::Checkpoint,
-                    &format!("{} übersprungen: {err}", key.display_redacted(&pipeline)),
-                );
+                let mut note = format!("{} übersprungen: {err}", key.display_redacted(&pipeline));
+
+                // Nur der Policy-Fall bekommt einen Block-Seal: Eine
+                // zurückgewiesene Nutzlast ist eine Aussage über die Session;
+                // ein Store-Schluckauf wäre eine über die Infrastruktur — der
+                // versiegelte sonst irreführend „rejected".
+                if err.downcast_ref::<minds_redact::RedactionError>().is_some() {
+                    if let Some(seal_id) = seal_epoch(
+                        &epochs,
+                        &key,
+                        &read.events,
+                        &result,
+                        SealOutcome::Rejected,
+                        store.as_ref(),
+                        &root,
+                        git_dir,
+                    ) {
+                        note.push_str(&format!(" — Coverage versiegelt: {seal_id}"));
+                    }
+                }
+                hooklog::report_at(git_dir, Source::Checkpoint, &note);
             }
         }
     }
@@ -169,9 +270,164 @@ fn record_index(
     // Zwei gleichzeitige Checkpoints fassen verschiedene Refs an.
     let hex = commit.to_string();
     for id in sessions {
-        store.link(*id, &hex, minds_core::Evidence::Observed)?;
+        store.link(
+            *id,
+            &hex,
+            minds_core::EvidenceMark::of(minds_core::EvidenceSource::Observed),
+        )?;
     }
     Ok(())
+}
+
+/// Die von git getrackten, repo-relativen Pfade — `git ls-files -z`, einmal
+/// je Checkpoint-Lauf. `None`, wenn git nicht antwortet.
+fn tracked_files(root: &Path) -> Option<std::collections::BTreeSet<String>> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-z"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        output
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// Baut den Seal dieser Epoche, legt ihn ab und schreibt den Epochen-Zustand
+/// fort. Gibt die `seal_id` zurück — oder `None`, wenn die Ablage scheiterte
+/// (dann bleibt das Journal liegen und der nächste Lauf holt sie idempotent
+/// nach).
+#[allow(clippy::too_many_arguments)]
+fn seal_epoch(
+    epochs: &EpochState,
+    key: &minds_capture::SessionKey,
+    events: &[minds_capture::JournalEvent],
+    result: &ChainResult,
+    outcome: SealOutcome,
+    store: &dyn ContextStore,
+    root: &Path,
+    git_dir: &Path,
+) -> Option<minds_core::ContentHash> {
+    let previous = epochs.last_seal(key);
+
+    // Idempotenz über Läufe hinweg: Deckt der letzte Seal bereits genau diese
+    // Kette mit demselben Ausgang ab (ein Lauf, dessen Discard scheiterte;
+    // ein liegengebliebenes, unverändertes Journal nach einem Redaction-
+    // Block), wird er wiederverwendet — sonst verkettete jeder erneute
+    // Checkpoint einen inhaltsgleichen Seal auf seinen Vorgänger, und jeder
+    // Commit ließe die Kette grundlos wachsen.
+    if let Some(prev_id) = &previous {
+        if let Ok(Some(prev_text)) = store.seal_text(prev_id) {
+            if let Ok(prev) = Seal::parse(&prev_text) {
+                let same_outcome = match (&prev.outcome, &outcome) {
+                    (SealOutcome::Rejected, SealOutcome::Rejected) => true,
+                    (SealOutcome::Stored { session: a }, SealOutcome::Stored { session: b }) => {
+                        a == b
+                    }
+                    _ => false,
+                };
+                if prev.root == result.root && same_outcome {
+                    return Some(prev_id.clone());
+                }
+            }
+        }
+    }
+
+    let last_event_at = events.last().map(|e| e.at.clone()).unwrap_or_default();
+    let seal = Seal {
+        root: result.root.clone(),
+        agent: key.agent().to_string(),
+        // Die Beobachtungsgrenze steht IM Seal: „vollständig" heißt
+        // vollständig innerhalb der Agent-Hooks, nie „alle Systemaktivität".
+        scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.to_string(),
+        first_seq: result.coverage.first_seq,
+        last_seq: result.coverage.last_seq,
+        events: result.coverage.events,
+        gaps: result.coverage.gaps.len() as u64,
+        pre_chain: result.coverage.pre_chain,
+        outcome,
+        previous,
+        last_event_at,
+    };
+    let text = match seal.to_text() {
+        Ok(text) => text,
+        Err(err) => {
+            // #12-Fall am Agentnamen — benennt das Feld, zitiert nie den Wert.
+            hooklog::report_at(
+                git_dir,
+                Source::Checkpoint,
+                &format!("Seal nicht baubar: {err}"),
+            );
+            return None;
+        }
+    };
+    let seal_id = match store.put_seal(&text) {
+        Ok(id) => id,
+        Err(err) => {
+            hooklog::report_at(
+                git_dir,
+                Source::Checkpoint,
+                &format!("Seal nicht abgelegt: {err}"),
+            );
+            return None;
+        }
+    };
+
+    // Best-effort-Signatur (ADR-0011, Entscheidung 5): nur mit konfiguriertem
+    // Schlüssel, nie ein Grund zum Abbruch — ein unsignierter Seal bleibt
+    // hash-valide, `minds sign --seal` rüstet nach.
+    sign_seal_best_effort(store, &seal_id, &text, root, git_dir);
+    // Epochen-Zustand best-effort: Fehlt er künftig, ist die Kette offen —
+    // sichtbar und ehrlich, kein Grund, den Checkpoint zu kippen.
+    if let Err(err) = epochs.record(key, &seal_id) {
+        hooklog::report_at(
+            git_dir,
+            Source::Checkpoint,
+            &format!("Epochen-Zustand nicht fortgeschrieben: {err}"),
+        );
+    }
+    Some(seal_id)
+}
+
+/// Signiert einen frisch abgelegten Seal, wenn ein Schlüssel konfiguriert
+/// ist. Best-effort: Jeder Fehlschlag ist eine Log-Zeile, nie ein Abbruch —
+/// der Seal bleibt hash-valide, die Signatur ist die Urheber-Bindung obendrauf.
+fn sign_seal_best_effort(
+    store: &dyn ContextStore,
+    seal_id: &minds_core::ContentHash,
+    text: &str,
+    root: &Path,
+    git_dir: &Path,
+) {
+    let Some(key) = crate::sign_cmd::configured_key(root) else {
+        return;
+    };
+    if !minds_attest::ssh_keygen_available() {
+        return;
+    }
+    let outcome = minds_attest::ssh_sign(text, Path::new(&key))
+        .map_err(|err| err.to_string())
+        .and_then(|sig| {
+            store
+                .put_seal_signature(seal_id, &sig)
+                .map_err(|err| err.to_string())
+        });
+    if let Err(err) = outcome {
+        hooklog::report_at(
+            git_dir,
+            Source::Checkpoint,
+            &format!("Seal {seal_id} nicht signiert: {err}"),
+        );
+    }
 }
 
 /// Baut eine Session, redigiert sie und legt sie ab. Gibt ihre [`SessionId`]
@@ -183,13 +439,16 @@ fn store_one(
     git_dir: &Path,
     pipeline: &minds_redact::RedactionPipeline,
     store: &dyn ContextStore,
+    tracked: Option<&std::collections::BTreeSet<String>>,
 ) -> Fallible<SessionId> {
     // Kein Commit im Kontext: die Produced-Kante bliebe sonst am verwaisten
     // Vor-Amend-Commit hängen (siehe Modul-Doku). Der Artefakt-Hash braucht die
-    // Repo-Wurzel, um relative Pfade aufzulösen.
+    // Repo-Wurzel, um relative Pfade aufzulösen; das tracked-Set ist die
+    // Read-Hash-Grenze (nur getrackter, ohnehin sichtbarer Inhalt).
     let ctx = Checkpoint {
         root: Some(root),
         commit: None,
+        tracked,
     };
     let session = adapter::checkpoint(key, events, &ctx);
     let redacted = pipeline.redact_session(session)?;

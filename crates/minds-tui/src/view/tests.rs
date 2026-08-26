@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use minds_core::{
-    Agent, Decision, Effect, EffectKind, Evidence, Intent, Lineage, Model, Review, Role, Session,
-    SessionId, Subject, ToolCall, Turn,
+    Agent, Decision, Effect, EffectKind, EvidenceMark, EvidenceSource, Intent, Lineage, Model,
+    Review, Role, Session, SessionId, Subject, ToolCall, Turn,
 };
 use minds_git::{CommitId, Repo};
 use minds_reader::{Degradation, Degraded, Index, Inspection};
@@ -53,6 +53,7 @@ fn session(request: &str, started: &str) -> Session {
         text: "Ich lese und ändere.".into(),
         tool_calls: vec![
             ToolCall {
+                capture: None,
                 name: "Read".into(),
                 arguments: "{}".into(),
                 effect: Some(Effect {
@@ -62,6 +63,7 @@ fn session(request: &str, started: &str) -> Session {
                 }),
             },
             ToolCall {
+                capture: None,
                 name: "Edit".into(),
                 arguments: "{}".into(),
                 effect: Some(Effect {
@@ -71,6 +73,7 @@ fn session(request: &str, started: &str) -> Session {
                 }),
             },
             ToolCall {
+                capture: None,
                 name: "Bash".into(),
                 arguments: "{\"command\":\"cargo test\"}".into(),
                 effect: Some(Effect {
@@ -117,8 +120,28 @@ fn filled() -> Inspection {
     let change: minds_core::ChangeId = format!("I{}", "c".repeat(40)).parse().unwrap();
     let mut changes = BTreeMap::new();
     changes.insert(commit('1'), change.clone());
+    // Session a ist versiegelt (eine saubere Epoche) — Session b bewusst
+    // nicht: Der Unterschied gehört zum Fixture, weil die Oberfläche ihn
+    // aussprechen muss.
+    let seal = minds_core::evidence::Seal {
+        root: minds_core::ContentHash::from_bytes([9u8; 32]),
+        agent: "claude-code".into(),
+        scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 4,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: minds_core::evidence::SealOutcome::Stored {
+            session: sid('a').to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-07-25T14:10:00Z".into(),
+    };
+    let seal_id = minds_core::evidence::Seal::id_of_text(&seal.to_text().unwrap());
     let index = Index::from_parts(sessions, commits)
         .with_changes(changes)
+        .with_seals(sid('a'), vec![(seal_id, seal, false)])
         .with_degraded(vec![Degraded {
             id: sid('d'),
             cause: Degradation::Forgotten {
@@ -139,7 +162,7 @@ fn filled() -> Inspection {
 }
 
 fn render(app: &mut App) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+    let mut terminal = Terminal::new(TestBackend::new(124, 30)).unwrap();
     terminal.draw(|frame| super::draw(frame, app)).unwrap();
     terminal.backend().to_string()
 }
@@ -168,9 +191,14 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
         .find("vergessen: DSGVO")
         .unwrap_or_else(|| panic!("{out}"));
     assert!(fix < backoff && backoff < forgotten, "{out}");
-    assert!(out.contains("● observed"), "{out}");
+    // Die Verdikt-Spalte (ADR-0011): Session a ist versiegelt, b nicht.
+    assert!(out.contains("◈ versiegelt"), "{out}");
+    // Session b hat keine Seals: explizit LEGACY, kein leeres Nichts.
+    assert!(out.contains("· legacy"), "{out}");
+    // Der Kanten-Beleg als Glyph mit Status-Modifikator — beobachtet heisst
+    // nicht geprueft.
+    assert!(out.contains("● ?"), "{out}");
     assert!(out.contains("↻ needs work"), "{out}");
-    assert!(out.contains("· unverknüpft"), "{out}");
     assert!(out.contains("⌦ vergessen"), "{out}");
     assert!(out.contains("25.07. 14:10Z"), "{out}");
     assert!(out.contains("Kontext-Abdeckung"), "{out}");
@@ -263,7 +291,9 @@ fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
     app.reduce(Action::Why);
     assert!(matches!(app.top(), Some(View::Why { .. })));
     let out = render(&mut app);
-    assert!(out.contains("✓ SESSION"), "{out}");
+    // Session b ist nicht versiegelt — das Glied traegt seit ADR-0011 eine
+    // ehrliche Luecke (UnsealedRange), zusaetzlich zur fehlenden Bewertung.
+    assert!(out.contains("⚠ SESSION"), "{out}");
     assert!(out.contains("✓ AGENT"), "{out}");
     assert!(out.contains("✓ INTENT"), "{out}");
     assert!(out.contains("Add exponential backoff"), "{out}");
@@ -271,14 +301,14 @@ fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
     assert!(out.contains("keine Kante"), "{out}");
     assert!(out.contains("offen"), "{out}");
     // Lücken sind First-Class: je Glied ✓/⚠, unten der Block mit Begründung.
-    assert!(out.contains("✓ INTENT"), "{out}");
     assert!(out.contains("⚠ REVIEW"), "{out}");
-    assert!(out.contains(" 1 LÜCKE "), "{out}");
+    assert!(out.contains(" 2 LÜCKEN "), "{out}");
+    assert!(out.contains("nicht versiegelt"), "{out}");
     assert!(
         out.contains("Keine Bewertung — niemand hat diese Änderung entschieden."),
         "{out}"
     );
-    assert!(out.contains("⚠ 1 Lücke in der Kette"), "{out}");
+    assert!(out.contains("⚠ 2 Lücken in der Kette"), "{out}");
 }
 
 #[test]
@@ -330,7 +360,7 @@ fn a_change_node_in_the_graph_explains_its_proof() {
     app.reduce(Action::Up); // Review → Change
     let out = render(&mut app);
     assert!(out.contains(" CHANGE "), "{out}");
-    assert!(out.contains("Beleg      ● observed"), "{out}");
+    assert!(out.contains("Beleg      ● ? observed [ungeprüft]"), "{out}");
     assert!(out.contains("expliziter Herkunftsnachweis"), "{out}");
 }
 
@@ -346,8 +376,10 @@ fn the_inspector_explains_an_observed_edge() {
     app.reduce(Action::Enter);
     let out = render(&mut app);
     assert!(out.contains("WHY IS THIS LINKED?"), "{out}");
-    assert!(out.contains("● observed"), "{out}");
+    assert!(out.contains("● ? observed [ungeprüft]"), "{out}");
     assert!(out.contains("trägt den Trailer Minds-Session-Id"), "{out}");
+    // Der Satz kann am Zeilenumbruch brechen — kurzer, stabiler Anker.
+    assert!(out.contains("Status: nie"), "{out}");
     // Esc schließt den Inspector; weg vom Evidence-Glied bleibt er zu.
     app.reduce(Action::Back);
     app.reduce(Action::Up);
@@ -360,12 +392,23 @@ fn the_inspector_explains_an_observed_edge() {
 fn an_inferred_edge_never_looks_like_an_observed_one() {
     // Glyph **und** Wort unterscheiden sich — nicht nur die Farbe, die in
     // einem monochromen Terminal verloren geht.
-    let (glyph, word, _) = crate::theme::evidence(Some(Evidence::Inferred));
-    assert_eq!(glyph, "○");
+    let (glyph, word, _) =
+        crate::theme::evidence(Some(EvidenceMark::of(EvidenceSource::Heuristic)));
+    assert_eq!(glyph, "○ ?");
     assert!(word.contains("vermutet"));
-    let (glyph, word, _) = crate::theme::evidence(Some(Evidence::Observed));
-    assert_eq!(glyph, "●");
-    assert_eq!(word, "observed");
+    let (glyph, word, _) = crate::theme::evidence(Some(EvidenceMark::of(EvidenceSource::Observed)));
+    assert_eq!(glyph, "● ?");
+    assert_eq!(word, "observed [ungeprüft]");
+
+    // Und ein nachgerechneter Beleg unterscheidet sich vom ungeprüften —
+    // wieder in Glyph UND Wort.
+    let verified = EvidenceMark {
+        source: EvidenceSource::Observed,
+        status: minds_core::EvidenceStatus::Verified,
+    };
+    let (glyph, word, _) = crate::theme::evidence(Some(verified));
+    assert_eq!(glyph, "● ✓");
+    assert!(word.contains("nachgerechnet"));
 }
 
 #[test]
@@ -403,11 +446,12 @@ fn the_pipe_prints_tab_separated_lines_without_ansi() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 3);
     let first: Vec<&str> = lines[0].split('\t').collect();
-    assert_eq!(first.len(), 10, "{:?}", first);
+    assert_eq!(first.len(), 11, "{:?}", first);
     assert_eq!(first[0], "2026-07-25T14:10:00Z");
-    assert_eq!(first[6], "observed");
-    assert_eq!(first[7], "needs work");
-    assert_eq!(first[9], "Fix retry handling");
+    assert_eq!(first[6], "observed [ungeprüft]");
+    assert_eq!(first[7], "versiegelt");
+    assert_eq!(first[8], "needs work");
+    assert_eq!(first[10], "Fix retry handling");
     assert!(lines[2].contains("vergessen: DSGVO"));
 
     let chain = filled().why_commit(commit('1'));
@@ -429,4 +473,96 @@ fn the_pipe_prints_tab_separated_lines_without_ansi() {
         text.ends_with("niemand hat diese Änderung entschieden.\n"),
         "{text}"
     );
+}
+
+#[test]
+fn every_epistemic_state_differs_in_glyph_or_word_never_only_in_color() {
+    // Die Farbschwäche-Regel, testfixiert: Jeder Zustand des Alphabets muss
+    // sich in Glyph ODER Wort unterscheiden — Farbe trägt nie allein.
+    use minds_core::{EvidenceMark as M, EvidenceSource as S, EvidenceStatus};
+    use minds_reader::model::EvidenceVerdict;
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut check = |glyph: String, word: String| {
+        assert!(
+            seen.insert((glyph.clone(), word.clone())),
+            "doppelt: {glyph:?} {word:?}"
+        );
+    };
+
+    for source in [
+        S::Heuristic,
+        S::HumanDeclared,
+        S::ContentDerived,
+        S::Observed,
+    ] {
+        for status in [
+            EvidenceStatus::Missing,
+            EvidenceStatus::Unknown,
+            EvidenceStatus::Partial,
+            EvidenceStatus::Verified,
+        ] {
+            let (g, w, _) = crate::theme::evidence(Some(M { source, status }));
+            check(g, w);
+        }
+    }
+    let (g, w, _) = crate::theme::evidence(None);
+    check(g, w);
+    use minds_reader::model::{EvidenceState, Provenance};
+    let chained = |verdict| {
+        Provenance::Chained(EvidenceState {
+            verdict,
+            seals: 1,
+            events: 1,
+            gaps: 0,
+            pre_chain: 0,
+            rejected: false,
+            chain_closed: true,
+            signed: 0,
+        })
+    };
+    for provenance in [
+        chained(EvidenceVerdict::Verified),
+        chained(EvidenceVerdict::Incomplete),
+        chained(EvidenceVerdict::Tampered),
+        Provenance::Legacy,
+    ] {
+        let (g, w, _) = crate::theme::provenance(&provenance);
+        check(g.to_string(), w.to_string());
+    }
+
+    // Und die Uebergabe-Kante aus dem Evidence-DAG (ueber den Graph-Knoten).
+    let (g, w, _) = crate::theme::node(&minds_reader::graph::NodeKind::Handover {
+        other: sid('e'),
+        incoming: true,
+    });
+    check(g.to_string(), w.to_string());
+}
+
+#[test]
+fn an_uninterpreted_tool_call_shows_as_half_seen_not_as_a_plain_tool() {
+    // Ein Agent ohne Adapter: Der Aufruf ist beobachtet, seine Wirkung nicht
+    // gedeutet — ◐ statt ·, mit Wort (ADR-0011).
+    let mut sessions = BTreeMap::new();
+    let mut s = session("Wende den Patch an", "2026-07-25T14:10:00Z");
+    s.turns[0].tool_calls = vec![ToolCall {
+        capture: Some(minds_core::Capture {
+            status: minds_core::CaptureStatus::Uninterpreted,
+            adapter: "generic".into(),
+            adapter_version: 1,
+        }),
+        name: "apply_patch".into(),
+        arguments: r#"{"diff":"x"}"#.into(),
+        effect: None,
+    }];
+    sessions.insert(sid('a'), s);
+    let index = Index::from_parts(sessions, BTreeMap::new());
+    let inspection = Inspection::from_index(index, vec![], "repo");
+
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Enter);
+    let out = render(&mut app);
+    assert!(out.contains("◐"), "{out}");
+    assert!(out.contains("BEOBACHTET"), "{out}");
 }

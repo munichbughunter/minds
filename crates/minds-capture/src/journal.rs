@@ -103,6 +103,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use minds_core::ContentHash;
+use minds_core::evidence::{self, EventFacts};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -248,7 +250,7 @@ struct KeyRecord {
 
 /// Der Verzeichnisname zu einem `local_id`: `b3-` plus die ersten
 /// [`DIR_HASH_HEX_LEN`] Hex-Ziffern von `blake3(local_id)`.
-fn hashed_dir_name(local_id: &str) -> String {
+pub(crate) fn hashed_dir_name(local_id: &str) -> String {
     use std::fmt::Write as _;
     let digest = blake3::hash(local_id.as_bytes());
     let mut out = String::with_capacity(DIR_HASH_PREFIX.len() + DIR_HASH_HEX_LEN);
@@ -270,9 +272,15 @@ fn hashed_dir_name(local_id: &str) -> String {
 /// Journal agent-unabhängig lesbar, der Payload bleibt Beweismittel — was wir
 /// heute nicht zu deuten wissen, ist morgen noch da.
 ///
-/// Dieses Format wird **nie gehasht** und ist nicht Teil der
-/// Content-Adressierung. Die Beschränkungen der kanonischen Form (nur
-/// Ganzzahlen unter 2^53) gelten hier deshalb nicht.
+/// Der **Umschlag** wird nie kanonisch gehasht und ist nicht Teil der
+/// Content-Adressierung — die Beschränkungen der kanonischen Form (nur
+/// Ganzzahlen unter 2^53) gelten hier deshalb nicht. Seit ADR-0011 trägt
+/// jedes Event stattdessen zwei **gestempelte** Hashes über eine eigene,
+/// längenpräfixierte Kodierung (`minds_core::evidence`): den Hash des
+/// Payloads und den Hash der beobachteten Fakten. Beide sind
+/// selbstbeschreibend (kein prev-Link — die Verkettung entsteht beim Seal,
+/// ADR-0011 Entscheidung 1) und machen nachträglichen Payload-Tausch an
+/// liegenden Journalen erkennbar.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEvent {
     /// Laufende Nummer innerhalb dieser Session, lückenlos ab 0 — siehe
@@ -315,6 +323,22 @@ pub struct JournalEvent {
     /// keine Zahlen, die durch einen Parse/Serialize-Zyklus ihre Schreibweise
     /// ändern. Beweismittel werden nicht umformatiert.
     pub payload: Box<RawValue>,
+
+    /// `derive_key`-Hash über die Payload-Bytes, beim Append gestempelt.
+    ///
+    /// Über den Payload **nach** der Secretwall — für Secret-Dateien existiert
+    /// damit nie ein Hash über geheimen Inhalt (Orakel-Regel). `None` nur bei
+    /// Alt-Events aus der Zeit vor der Evidence-Chain (`pre_chain`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_hash: Option<ContentHash>,
+
+    /// Hash über die beobachteten Fakten (`seq`, Zeit, `raw_kind`, `cwd`,
+    /// Transkript-Pfad, `payload_hash`), beim Append gestempelt.
+    ///
+    /// Bewusst ohne [`kind`](Self::kind): Die Klassifikation ist
+    /// Interpretation und bleibt außerhalb der Evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_hash: Option<ContentHash>,
 }
 
 /// Ein Event, dem noch die Sequenznummer fehlt — die vergibt das Journal.
@@ -430,6 +454,21 @@ impl Journal {
 
         let (seq, claim) = self.reserve(&dir)?;
 
+        // Die zwei Stempel der Evidence-Chain (ADR-0011): billig (zwei
+        // blake3-Läufe im Speicher), ohne zusätzliche fsyncs — sie wandern in
+        // dieselbe Datei, die ohnehin geschrieben wird. Der `event_hash`
+        // braucht die Sequenznummer und entsteht deshalb erst nach `reserve`.
+        let payload_hash = evidence::payload_hash(event.payload.get().as_bytes());
+        let event_hash = evidence::event_hash(&EventFacts {
+            seq,
+            at: &event.at,
+            at_nanos: event.at_nanos,
+            raw_kind: &event.raw_kind,
+            cwd: event.cwd.as_deref(),
+            transcript_path: event.transcript_path.as_deref(),
+            payload_hash: &payload_hash,
+        });
+
         let event = JournalEvent {
             seq,
             at: event.at,
@@ -439,6 +478,8 @@ impl Journal {
             cwd: event.cwd,
             transcript_path: event.transcript_path,
             payload: event.payload,
+            payload_hash: Some(payload_hash),
+            event_hash: Some(event_hash),
         };
 
         let tmp = dir.join(format!("{seq:010}.json.tmp"));
@@ -1002,7 +1043,7 @@ fn scan_next_seq(dir: &Path) -> u64 {
 /// von vor dieser Härtung. Scheitert sie, ist das ein Fehler, kein
 /// Achselzucken: Rohdaten unter einer 0755-Ebene weiterzuschreiben wäre die
 /// stillere und schlechtere Wahl.
-fn create_dir_private(root: &Path, leaf: &Path) -> Result<()> {
+pub(crate) fn create_dir_private(root: &Path, leaf: &Path) -> Result<()> {
     refuse_symlinked_levels(root, leaf)?;
 
     #[cfg(unix)]
@@ -1124,7 +1165,7 @@ fn write_hint(path: &Path, next: u64) -> std::io::Result<()> {
     f.write_all(next.to_string().as_bytes())
 }
 
-fn write_private(path: &Path, bytes: &[u8], op: &'static str) -> Result<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8], op: &'static str) -> Result<()> {
     let mut opts = OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -1167,6 +1208,88 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let j = Journal::open(dir.path());
         (dir, j)
+    }
+
+    #[test]
+    fn every_appended_event_carries_recomputable_stamps() {
+        // Die zwei Stempel aus ADR-0011: vorhanden — und aus den abgelegten
+        // Feldern exakt nachrechenbar, so wie es spaeter fsck tut.
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "s1").unwrap();
+        let stored = j.append(&key, event(EventKind::ToolPost)).unwrap();
+
+        let payload = evidence::payload_hash(stored.payload.get().as_bytes());
+        assert_eq!(stored.payload_hash.as_ref(), Some(&payload));
+        let facts = EventFacts {
+            seq: stored.seq,
+            at: &stored.at,
+            at_nanos: stored.at_nanos,
+            raw_kind: &stored.raw_kind,
+            cwd: stored.cwd.as_deref(),
+            transcript_path: stored.transcript_path.as_deref(),
+            payload_hash: &payload,
+        };
+        assert_eq!(stored.event_hash, Some(evidence::event_hash(&facts)));
+
+        // Und auch nach dem Zurueck-Lesen von der Platte.
+        let read = j.read(&key).unwrap().events;
+        assert_eq!(read[0].payload_hash, stored.payload_hash);
+        assert_eq!(read[0].event_hash, stored.event_hash);
+    }
+
+    #[test]
+    fn a_pre_chain_event_without_stamps_still_reads() {
+        // Bestand aus der Zeit vor der Evidence-Chain: kein Fehler, die
+        // Stempel fehlen einfach — `pre_chain` ist ein darstellbarer Zustand.
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "alt").unwrap();
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+        let dir = j.session_dir(&key);
+
+        // Ein Alt-Event von Hand, ohne die neuen Felder.
+        let legacy = r#"{"seq":1,"at":"2026-01-01T00:00:00Z","at_nanos":1,"kind":"prompt","raw_kind":"UserPromptSubmit","payload":{"prompt":"x"}}"#;
+        fs::write(dir.join("0000000001.json"), legacy).unwrap();
+
+        let read = j.read(&key).unwrap();
+        assert!(read.gaps.is_empty());
+        assert!(read.events[0].payload_hash.is_some());
+        assert!(read.events[1].payload_hash.is_none());
+        assert!(read.events[1].event_hash.is_none());
+    }
+
+    #[test]
+    fn the_payload_stamp_covers_the_walled_payload_not_the_original() {
+        // Orakel-Regel: Trifft die Secretwall, wird der ersetzte Payload
+        // gehasht — der Stempel verraet nichts ueber den Originalinhalt und
+        // ist trotzdem nachrechenbar.
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "wall").unwrap();
+        let (at, at_nanos) = crate::clock::now();
+        let mut walled = NewEvent {
+            at,
+            at_nanos,
+            kind: EventKind::ToolPre,
+            raw_kind: "PreToolUse".into(),
+            cwd: None,
+            transcript_path: None,
+            payload: raw(r#"{"tool_name":"Read","tool_input":{"file_path":"/repo/.env"}}"#),
+        };
+        let reason = crate::secretwall::guard(&mut walled);
+        assert!(reason.is_some(), "die Wall muss greifen");
+        let walled_bytes = walled.payload.get().as_bytes().to_vec();
+
+        let stored = j.append(&key, walled).unwrap();
+        assert_eq!(
+            stored.payload_hash,
+            Some(evidence::payload_hash(&walled_bytes))
+        );
+        // Der gestempelte Hash ist NICHT der Hash des Originals.
+        assert_ne!(
+            stored.payload_hash,
+            Some(evidence::payload_hash(
+                br#"{"tool_name":"Read","tool_input":{"file_path":"/repo/.env"}}"#
+            ))
+        );
     }
 
     #[test]

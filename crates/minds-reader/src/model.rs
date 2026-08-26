@@ -13,7 +13,9 @@
 //! Kante hier ihre [`Evidence`] und jede Erklärung sagt, ob sie aus einem
 //! Trailer stammt oder nachgerechnet wurde ([`EvidenceExplanation`]).
 
-use minds_core::{ChangeId, Decision, Evidence, SessionId, Subject};
+use minds_core::{
+    ChangeId, Decision, EvidenceMark, EvidenceSource, EvidenceStatus, SessionId, Subject,
+};
 use minds_git::CommitId;
 use minds_metrics::Coverage;
 
@@ -68,7 +70,17 @@ pub struct SessionCard {
     pub epoch: Option<i64>,
     /// Der beste Beleg, mit dem die Session an Code hängt; `None`, wenn sie
     /// mit keinem Commit verbunden ist.
-    pub evidence: Option<Evidence>,
+    pub evidence: Option<EvidenceMark>,
+    /// Die Herkunftslage: Legacy oder versiegelt, mit Verdikt (ADR-0011).
+    pub provenance: Provenance,
+    /// Tool-Aufrufe, die beobachtet, aber nicht gedeutet sind (`◐`) — die
+    /// Deutungs-Achse, getrennt von Integrität und Coverage.
+    pub uninterpreted_calls: usize,
+    /// Die Epochen-Position `(k, n)` in der Seal-Kette; `None` bei einer
+    /// einzelnen Epoche.
+    pub epoch_position: Option<(usize, usize)>,
+    /// Content-Übergaben, an denen die Session beteiligt ist (Evidence-DAG).
+    pub handovers: usize,
     /// Der Stand des Reviews.
     pub review: ReviewState,
     /// Die Change-Ids der Commits, die die Session tragen.
@@ -87,6 +99,11 @@ impl SessionCard {
     /// `true`, wenn die Karte nur ein Platzhalter ist.
     pub fn is_degraded(&self) -> bool {
         !matches!(self.state, CardState::Ok)
+    }
+
+    /// Das Seal-Verdikt, falls versiegelt — Kurzform für Anzeigen.
+    pub fn evidence_state(&self) -> Option<&EvidenceState> {
+        self.provenance.state()
     }
 }
 
@@ -171,6 +188,87 @@ impl Default for ReviewState {
     }
 }
 
+/// Das Evidence-Verdikt einer Session — dieselbe Matrix wie `minds verify`
+/// (ADR-0011, Entscheidung 7), fürs Lesemodell verdichtet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceVerdict {
+    /// Integrität intakt, Coverage vollständig.
+    Verified,
+    /// Seal-Material wurde verändert.
+    Tampered,
+    /// Intakt, aber Lücken, offene Epochen oder eine zurückgewiesene
+    /// Nutzlast.
+    Incomplete,
+}
+
+impl EvidenceVerdict {
+    /// Das Wort der Matrix.
+    pub fn word(self) -> &'static str {
+        match self {
+            EvidenceVerdict::Verified => "VERIFIZIERT",
+            EvidenceVerdict::Tampered => "MANIPULIERT",
+            EvidenceVerdict::Incomplete => "VERIFIZIERT, UNVOLLSTÄNDIG",
+        }
+    }
+}
+
+/// Was die Seals einer Session über sie aussagen, verdichtet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceState {
+    /// Das Verdikt.
+    pub verdict: EvidenceVerdict,
+    /// Zahl der Seals (Epochen).
+    pub seals: usize,
+    /// Versiegelte Events über alle Epochen.
+    pub events: u64,
+    /// Versiegelte Lücken über alle Epochen.
+    pub gaps: u64,
+    /// Events ohne Stempel (vor Evidence-Chain erfasst).
+    pub pre_chain: u64,
+    /// Die Kette führt über einen Block-Seal — eine frühere Epoche wurde
+    /// von der Speicher-Policy zurückgewiesen.
+    pub rejected: bool,
+    /// Die `previous`-Kette der Epochen schließt sich.
+    pub chain_closed: bool,
+    /// Wie viele Seals eine Signatur tragen (Anwesenheit, hier ungeprüft).
+    pub signed: usize,
+}
+
+impl EvidenceState {
+    /// Die Kurzform für Listen: `2 Seals · 48 Events · 0 Lücken`.
+    pub fn summary(&self) -> String {
+        format!(
+            "{} Seal(s) · {} Event(s) · {} Lücke(n)",
+            self.seals, self.events, self.gaps
+        )
+    }
+}
+
+/// Die Herkunftslage einer Session — ein expliziter Zustand, kein `None`.
+///
+/// `None` wäre semantisch zu schwach: Es könnte „alte Session", „kaputt",
+/// „noch nicht verarbeitet" oder „Bug" heißen. Deshalb ein eigener Typ
+/// (Invariante: **Legacy bleibt Legacy** — eine Session ohne Chain bekommt
+/// nie nachträglich eine angedichtet; ihre ehrliche Auskunft ist `Legacy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provenance {
+    /// Vor der Evidence-Chain erfasst: kein Seal-Material. Kein Mangel,
+    /// ein historischer Zustand.
+    Legacy,
+    /// Versiegelt — mit dem Verdikt und der Coverage aus den Seals.
+    Chained(EvidenceState),
+}
+
+impl Provenance {
+    /// Das Verdikt, falls versiegelt.
+    pub fn state(&self) -> Option<&EvidenceState> {
+        match self {
+            Provenance::Legacy => None,
+            Provenance::Chained(state) => Some(state),
+        }
+    }
+}
+
 /// Warum eine Kante Commit ↔ Session im Index steht.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceExplanation {
@@ -212,7 +310,7 @@ pub struct LinkEvidence {
     /// Die Session.
     pub session: SessionId,
     /// Der Beleg.
-    pub evidence: Evidence,
+    pub evidence: EvidenceMark,
     /// Die Erklärung.
     pub why: EvidenceExplanation,
 }
@@ -288,25 +386,37 @@ pub enum WhyStep {
 
 /// Was eine Evidenz-Klasse bedeutet — der Satz, der neben Glyph und Wort
 /// steht, damit niemand nur lernt „○ heißt irgendwie unsicher", sondern
-/// **warum**.
-pub fn evidence_sentence(evidence: Option<Evidence>) -> &'static str {
-    match evidence {
-        Some(Evidence::Observed) => {
+/// **warum**. Seit ADR-0011 hat der Satz zwei Hälften: die **Quelle** (woher
+/// die Aussage stammt) und den **Status** (ob sie je geprüft wurde) — denn
+/// „beobachtet" klingt sicherer als „vermutet", sagt aber nichts darüber, ob
+/// jemand nachgerechnet hat.
+pub fn evidence_sentence(evidence: Option<EvidenceMark>) -> String {
+    let Some(mark) = evidence else {
+        return "Unverknüpft: Diese Session hängt an keinem Commit — erfasst, aber (noch) nicht mit Code verbunden.".into();
+    };
+    let source = match mark.source {
+        EvidenceSource::Observed => {
             "Beobachtet: Der Commit trägt den Trailer Minds-Session-Id — ein expliziter Herkunftsnachweis."
         }
-        Some(Evidence::Content) => {
-            "Nachgerechnet über den Inhalt: Die gelesenen Bytes sind die geschriebenen — kein Zeitstempel nötig."
+        EvidenceSource::ContentDerived => {
+            "Inhaltlich: Die gelesenen Bytes sind die geschriebenen — kein Zeitstempel nötig."
         }
-        Some(Evidence::Declared) => {
+        EvidenceSource::HumanDeclared => {
             "Erklärt: Ein Mensch hat die Verbindung behauptet (--after) — eine Tatsache über den Menschen, nicht über den Code."
         }
-        Some(Evidence::Inferred) => {
+        EvidenceSource::Heuristic => {
             "Vermutet: Von Minds rekonstruiert aus Datei-Überschneidung und zeitlicher Nähe — es gibt keinen expliziten Herkunftsnachweis."
         }
-        None => {
-            "Unverknüpft: Diese Session hängt an keinem Commit — erfasst, aber (noch) nicht mit Code verbunden."
+    };
+    let status = match mark.status {
+        EvidenceStatus::Verified => " Status: nachgerechnet und bestanden.",
+        EvidenceStatus::Partial => " Status: teilweise nachgerechnet.",
+        EvidenceStatus::Unknown => " Status: nie nachgerechnet — beobachtet heißt nicht geprüft.",
+        EvidenceStatus::Missing => {
+            " Status: der Beleg müsste existieren, ist aber nicht auffindbar."
         }
-    }
+    };
+    format!("{source}{status}")
 }
 
 /// Welche Art von Lücke eine Herkunftskette hat.
@@ -324,6 +434,15 @@ pub enum GapKind {
     DegradedContext,
     /// Niemand hat die Änderung bewertet.
     NoReview,
+    /// Kryptographisch versiegelte Sequenz-Lücken: Im Beobachtungsbereich
+    /// fehlen Events, und die Chain beweist es (ADR-0011).
+    SealedGap,
+    /// Der Beobachtungsbereich der Session ist nicht (vollständig)
+    /// versiegelt — vor Evidence-Chain erfasst oder offene Epochenkette.
+    UnsealedRange,
+    /// Eine Epoche der Session wurde von der Speicher-Policy zurückgewiesen;
+    /// der Block-Seal ist der Beleg.
+    PayloadRejected,
 }
 
 /// Eine benannte Lücke in der Kette — eine der wichtigsten Aussagen des
@@ -367,6 +486,58 @@ impl WhyChain {
                         .into(),
                 }),
                 WhyStep::Sessions { cards } => {
+                    for card in cards.iter().filter(|c| !c.is_degraded()) {
+                        let short: String = card.id.to_string().chars().take(11).collect();
+                        match &card.provenance {
+                            Provenance::Legacy => out.push(Gap {
+                                step: i,
+                                kind: GapKind::UnsealedRange,
+                                text: format!(
+                                    "Session {short}… ist nicht versiegelt — vor der Evidence-Chain erfasst; \
+                                     der Beobachtungsbereich ist nicht belegt."
+                                ),
+                            }),
+                            Provenance::Chained(state) => {
+                                if state.gaps > 0 {
+                                    out.push(Gap {
+                                        step: i,
+                                        kind: GapKind::SealedGap,
+                                        text: format!(
+                                            "Session {short}…: {} Sequenz-Lücke(n), kryptographisch versiegelt — \
+                                             im Beobachtungsbereich fehlen Events. Fehlende Evidence beweist nicht, \
+                                             dass nichts geschah.",
+                                            state.gaps
+                                        ),
+                                    });
+                                }
+                                if state.rejected {
+                                    out.push(Gap {
+                                        step: i,
+                                        kind: GapKind::PayloadRejected,
+                                        text: format!(
+                                            "Session {short}…: eine frühere Epoche wurde von der Speicher-Policy \
+                                             zurückgewiesen — der Block-Seal ist der Beleg, die Nutzlast fehlt."
+                                        ),
+                                    });
+                                }
+                                if !state.chain_closed || state.pre_chain > 0 {
+                                    out.push(Gap {
+                                        step: i,
+                                        kind: GapKind::UnsealedRange,
+                                        text: format!(
+                                            "Session {short}…: der Beobachtungsbereich ist nicht vollständig \
+                                             versiegelt ({}).",
+                                            if state.pre_chain > 0 {
+                                                format!("{} Event(s) ohne Stempel", state.pre_chain)
+                                            } else {
+                                                "Epochenkette offen".to_string()
+                                            }
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
                     for card in cards.iter().filter(|c| c.is_degraded()) {
                         out.push(Gap {
                             step: i,
@@ -384,7 +555,7 @@ impl WhyChain {
                 }
                 WhyStep::Evidence { links } if !links.is_empty() => {
                     let best = links.iter().map(|l| l.evidence).max();
-                    if best == Some(Evidence::Inferred) {
+                    if best.map(|m| m.source) == Some(EvidenceSource::Heuristic) {
                         let detail = links
                             .iter()
                             .find_map(|l| match &l.why {
@@ -431,6 +602,116 @@ impl WhyChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn card_with_state(state: Option<EvidenceState>) -> SessionCard {
+        let id: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        SessionCard {
+            id,
+            summary: crate::summary::Summary {
+                id,
+                headline: "x".into(),
+                actor: "a".into(),
+                files: 0,
+                constraints: 0,
+                discarded: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+            },
+            started_at: None,
+            epoch: None,
+            evidence: None,
+            provenance: match state {
+                Some(state) => Provenance::Chained(state),
+                None => Provenance::Legacy,
+            },
+            uninterpreted_calls: 0,
+            epoch_position: None,
+            handovers: 0,
+            review: ReviewState::open(),
+            changes: Vec::new(),
+            commits: Vec::new(),
+            subagents: Vec::new(),
+            parent: None,
+            state: CardState::Ok,
+        }
+    }
+
+    fn chain_with(card: SessionCard) -> WhyChain {
+        WhyChain {
+            steps: vec![WhyStep::Sessions { cards: vec![card] }],
+        }
+    }
+
+    fn clean_state() -> EvidenceState {
+        EvidenceState {
+            verdict: EvidenceVerdict::Verified,
+            seals: 1,
+            events: 4,
+            gaps: 0,
+            pre_chain: 0,
+            rejected: false,
+            chain_closed: true,
+            signed: 0,
+        }
+    }
+
+    #[test]
+    fn an_unsealed_session_is_an_honest_gap_not_silence() {
+        let gaps = chain_with(card_with_state(None)).gaps();
+        assert!(
+            gaps.iter().any(|g| g.kind == GapKind::UnsealedRange),
+            "{gaps:?}"
+        );
+        assert!(gaps[0].text.contains("nicht versiegelt"), "{gaps:?}");
+    }
+
+    #[test]
+    fn a_sealed_gap_carries_the_honesty_sentence() {
+        let state = EvidenceState {
+            verdict: EvidenceVerdict::Incomplete,
+            gaps: 2,
+            ..clean_state()
+        };
+        let gaps = chain_with(card_with_state(Some(state))).gaps();
+        let sealed = gaps
+            .iter()
+            .find(|g| g.kind == GapKind::SealedGap)
+            .expect("SealedGap");
+        // Der Satz, der das ganze System traegt: Abwesenheit von Evidence
+        // beweist nicht Abwesenheit des Ereignisses.
+        assert!(
+            sealed
+                .text
+                .contains("Fehlende Evidence beweist nicht, dass nichts geschah"),
+            "{}",
+            sealed.text
+        );
+    }
+
+    #[test]
+    fn a_rejected_epoch_and_an_open_chain_are_named() {
+        let state = EvidenceState {
+            verdict: EvidenceVerdict::Incomplete,
+            rejected: true,
+            chain_closed: false,
+            ..clean_state()
+        };
+        let gaps = chain_with(card_with_state(Some(state))).gaps();
+        assert!(
+            gaps.iter().any(|g| g.kind == GapKind::PayloadRejected),
+            "{gaps:?}"
+        );
+        assert!(
+            gaps.iter().any(|g| g.kind == GapKind::UnsealedRange),
+            "{gaps:?}"
+        );
+    }
+
+    #[test]
+    fn a_cleanly_sealed_session_adds_no_gap() {
+        let gaps = chain_with(card_with_state(Some(clean_state()))).gaps();
+        assert!(gaps.is_empty(), "{gaps:?}");
+    }
 
     fn commit() -> CommitId {
         "1".repeat(40).parse().unwrap()
@@ -491,7 +772,7 @@ mod tests {
             links: vec![LinkEvidence {
                 commit: commit(),
                 session: sid(),
-                evidence: Evidence::Inferred,
+                evidence: EvidenceMark::of(EvidenceSource::Heuristic),
                 why: EvidenceExplanation::Heuristic {
                     shared_files: vec!["a.rs".into(), "b.rs".into()],
                     seconds_apart: Some(287),
@@ -517,7 +798,7 @@ mod tests {
             links: vec![LinkEvidence {
                 commit: commit(),
                 session: sid(),
-                evidence: Evidence::Observed,
+                evidence: EvidenceMark::of(EvidenceSource::Observed),
                 why: EvidenceExplanation::Trailer { commit: commit() },
             }],
         }]);
@@ -528,15 +809,15 @@ mod tests {
     fn every_evidence_class_has_a_sentence_that_says_why() {
         for ev in [
             None,
-            Some(Evidence::Inferred),
-            Some(Evidence::Declared),
-            Some(Evidence::Content),
-            Some(Evidence::Observed),
+            Some(EvidenceMark::of(EvidenceSource::Heuristic)),
+            Some(EvidenceMark::of(EvidenceSource::HumanDeclared)),
+            Some(EvidenceMark::of(EvidenceSource::ContentDerived)),
+            Some(EvidenceMark::of(EvidenceSource::Observed)),
         ] {
             assert!(evidence_sentence(ev).contains(':'));
         }
         assert!(
-            evidence_sentence(Some(Evidence::Inferred))
+            evidence_sentence(Some(EvidenceMark::of(EvidenceSource::Heuristic)))
                 .contains("keinen expliziten Herkunftsnachweis")
         );
     }

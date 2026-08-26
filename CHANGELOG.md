@@ -17,6 +17,88 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
 > steigt nur bei einer brechenden Änderung an der Nutzlast, nie bei einem zusätzlichen
 > Feld.
 
+## [Unreleased]
+
+### Hinzugefügt
+
+- **Die Evidence Chain** ([ADR-0011](docs/adr/0011-evidence-chain.md)) — Minds
+  beweist nicht mehr nur, was gespeichert wurde, sondern auch, **welchen
+  Bereich es beobachtet hat**: Jedes Journal-Event trägt beim Append zwei
+  gestempelte Hashes (Payload und beobachtete Fakten, `blake3::derive_key`
+  mit Domain-Trennung); der Checkpoint faltet Events **und Lücken** zu einer
+  Kette und legt sie als **Seal** unter `refs/minds/evidence/<seal_id>` ab —
+  content-adressiert, epochen-verkettet (`previous=`), optional
+  ssh-signiert (`user.signingkey`, nachrüstbar mit `minds sign --seal`).
+  Eine Lücke ist ein Kettenglied, kein Schweigen; ein Seal überlebt
+  `minds forget` als payload-freier Beweis. Weist die Redaction eine Session
+  zurück, entsteht erstmals eine auditierbare Spur: ein **Block-Seal**
+  (`outcome=storage_policy_rejected_payload`) ohne Intent, Pfade oder
+  Feldnamen. `minds verify <session-id>` urteilt in der Matrix
+  **Integrität × Coverage** (Exit-Codes: 0 VERIFIZIERT, 1 MANIPULIERT,
+  2 VERIFIZIERT/UNVOLLSTÄNDIG, 3 NICHT VERIFIZIERBAR), `minds verify
+  --evidence <seal-id>` prüft sessionlose Seals, `minds fsck` rechnet
+  liegende Journale nach (Manipulation = Befund) und bekommt
+  `--require-seal` als Gate. `minds audit --export` (Bundle-Schema 2) trägt
+  die Seals byte-genau samt `rejected_seals`; das externe Rezept ohne Minds
+  steht im [Nachweis-Leitfaden](docs/nachweis-leitfaden.md).
+- **Beobachtet heißt nicht gedeutet:** Tool-Aufrufe tragen `capture`
+  (`interpreted`/`uninterpreted`, Adapter samt Version). Ein Agent ohne
+  eigenen Adapter verliert seine Tool-Ebene nicht mehr — der generische
+  Fallback erhält Name und Roh-Argumente als redigiertes Beweismittel. In
+  `minds inspect` erscheint so ein Aufruf als `◐ BEOBACHTET`.
+- **`minds inspect` zeigt Beweiszustände:** Verdikt-Spalte in der Activity
+  (`◈ versiegelt · ! unvollständig · ✗ MANIPULIERT · · unversiegelt`),
+  Seal-Verdikt und Coverage im Session-Kopf, zurückgehaltene Sessions als
+  eigene Zeilen, neue Lücken-Arten in der Why-Kette (`SealedGap`,
+  `UnsealedRange`, `PayloadRejected`) — samt dem Satz, der das System trägt:
+  *Fehlende Evidence beweist nicht, dass nichts geschah.* Die Pipe bekommt
+  eine Verdikt-Spalte (11 Felder — **Achtung:** bestehende `awk`/`cut`-
+  Consumer müssen die neue Spalte 8 berücksichtigen).
+
+- **Drei Vertrauensachsen statt eines Status:** `minds verify` spricht
+  Integrität („wurde es verändert?"), Coverage („wissen wir, ob etwas
+  fehlt?") und Deutung („was bedeutet es?") getrennt aus — ein unbekanntes
+  Tool ist ein Deutungs-, kein Integritätsproblem. Coverage ist **immer
+  gescoped**: Der Seal trägt seine Beobachtungsgrenze (`scope=agent-hooks/v1`),
+  und „vollständig" heißt vollständig innerhalb dieser Grenze, nie „alle
+  Systemaktivität". Exit-Codes bleiben der CI-Vertrag aus
+  Integrität × Coverage.
+- **`ToolAdapter`-Trait und `minds reinterpret`** — Adapter sitzen über der
+  Chain (Registry je Agent, `adapter_version` aus der Implementierung) und
+  deuten deterministisch: gleiche Evidence + gleiche Version ⇒ gleiche
+  Deutung, testfixiert. `minds reinterpret <session>` zeigt strikt lesend je
+  Aufruf die Evidenz-Adresse, die gespeicherte und die aktuelle Deutung —
+  Interpretation ist rekonstruierbar, Evidence unveränderlich.
+- **Der Evidence-DAG als Projektion:** Read-Effekte tragen jetzt ebenfalls
+  Inhalts-Hashes (Secret-Ausnahme unverändert), und der Reader projiziert
+  daraus Content-Übergaben — „B las exakt die Bytes, die A schrieb" — als
+  erste Producer von `(content_derived, verified)`: nachgerechnet, nicht
+  beobachtet. Im Session-Graphen als `⇄ ÜBERGABE`-Knoten, nichts davon wird
+  gespeichert.
+- **`minds audit --export --mode proof`** — nur das Beweisgerüst (Ids,
+  kanonische Payloads, Seals samt Signaturen, Verdict-Metadaten), kein
+  Intent, keine Kommentare. `redacted` bleibt Default und Maximum; ein
+  `full`-Modus existiert bewusst nicht (der Store hält nur Redigiertes).
+  `does_not_prove` benennt jetzt auch: fremde Akteure außerhalb der
+  Hook-Grenze, Wirkungen ungedeuteter Tools, die reale Uhrzeit.
+- **Legacy ist ein Zustand, kein `None`:** `Provenance::{Legacy, Chained}`
+  im Lesemodell; alte Sessions zeigen `· legacy` statt einer Leerstelle und
+  bekommen nie nachträglich eine Chain angedichtet. Der Session-Kopf im TUI
+  zeigt Epoche `k/n` und Deutungs-/Übergabe-Zähler. Die acht
+  Chain-Invarianten aus ADR-0011 sind als benannte Tests fixiert.
+
+### Geändert
+
+- **Schema 2 — Evidence in zwei Dimensionen:** `Edge.evidence` (und die
+  Kanten in `links.json`/Store-Index) ist jetzt ein `EvidenceMark` aus
+  **Quelle** (`heuristic < human_declared < content_derived < observed`) und
+  **Status** (`missing < unknown < partial < verified`). „Verified" heißt
+  strikt *nachgerechnet* — Legacy-Werte lesen tolerant auf Status `unknown`:
+  Das Fehlen der Prüfung ist kein Bestehen. Glyphen tragen den Status als
+  Modifikator (`● ?` beobachtet-ungeprüft, `● ✓` nachgerechnet). **Bruch:**
+  Ein Schema-1-Binary liest Schema-2-Sessions nicht (neuere Binaries lesen
+  alle älteren Versionen; Bestand wird nicht migriert).
+
 ## [0.2.0] — 2026-08-24 — „Die Entstehung, sichtbar gemacht"
 
 *Das erste Release mit einer Oberfläche. Bisher beantwortete Minds die Frage
