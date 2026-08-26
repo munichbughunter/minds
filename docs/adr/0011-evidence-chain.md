@@ -96,6 +96,16 @@ Der Preis ist gewollt: Ein Externer rechnet den Root nicht aus geratenen
 Payloads nach — lokal (`fsck`, vor dem Discard) bleibt er nachrechenbar, denn
 dort ist der Salt lesbar.
 
+**Der Salt heilt nicht.** Sobald eine Epoche versiegelt ist, wird ein fehlender
+oder beschädigter Salt **nicht** regeneriert: Ein neuer Salt versiegelte
+dieselbe Evidence unter einem zweiten, abweichenden Root — ein Epoch-Fork
+(same evidence, different cryptographic identity), der dem Determinismus-
+Anspruch „gleiche Events ⇒ gleicher Seal" widerspräche. Stattdessen ist der
+Verlust selbst der Befund: Der Checkpoint vertagt die Session sichtbar
+(`hook.log`), das Journal bleibt liegen, die Epoche gilt als nicht mehr
+reproduzierbar. Nur vor der ersten Versiegelung darf ein Salt entstehen oder
+ersetzt werden — dann hat noch kein Seal auf einen Root committed.
+
 **Benannter Trade-off:** Zwischen Append und Seal schützt nur das Dateisystem (0700/0600,
 Symlink-Refusal) — exakt der heutige Zustand. Ein lokaler Angreifer mit Schreibrecht kann bis
 zum Checkpoint fälschen, was dann „sauber" versiegelt wird. Die selbstbeschreibenden

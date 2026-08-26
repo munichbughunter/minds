@@ -124,9 +124,20 @@ braucht, braucht einen Zeitstempeldienst — den gibt es hier nicht.
 
 ## Die Evidence-Chain ohne Minds nachrechnen
 
-Der Proof gehört nicht Minds: Alles im Seal ist mit Standard-Werkzeugen
-prüfbar. Die Hashes sind `blake3::derive_key` mit festen Kontext-Strings —
-hier als Python, weil `b3sum` keinen derive_key-Modus hat:
+Der Proof gehört nicht Minds: Seal-Identität und Signatur sind mit
+Standard-Werkzeugen prüfbar. Die Grenze ist dabei klar gezogen:
+
+| Bestandteil    | Extern prüfbar?                                    |
+| -------------- | -------------------------------------------------- |
+| Seal-Identität | ja — `seal_id == derive_key(seal text)`            |
+| Seal-Signatur  | ja — `ssh-keygen -Y verify` gegen allowed_signers  |
+| Chain-Root     | nur mit lokalem Journal **und** Session-Salt       |
+
+Der Seal committed kryptographisch auf Chain-Root und Coverage; die
+zugrunde liegende Chain ist ausschließlich lokal reproduzierbar. Das
+Proof-Bündel allein rechnet also den versiegelten Claim nach — nicht die
+Chain selbst. Die Hashes sind `blake3::derive_key` mit festen
+Kontext-Strings — hier als Python, weil `b3sum` keinen derive_key-Modus hat:
 
 ```python
 # pip install blake3
@@ -173,6 +184,13 @@ payload_hash = derive("minds/evidence/v1/payload", payload_bytes)
 #                      state ‖ tag ‖ glied)   # tag 0x01 Event, 0x02 Lücke,
 #                                             # 0x03 pre-chain; Start: 32 × 0x00
 ```
+
+Der Salt ist deshalb selbst Teil der Integrität: Geht er verloren, nachdem
+eine Epoche versiegelt wurde, versiegelt Minds **nicht** mit neuem Salt neu —
+das erzeugte für dieselbe Evidence einen zweiten, abweichenden Root
+(Epoch-Fork). Stattdessen bricht der Checkpoint für diese Session sichtbar ab
+(`hook.log`), das Journal bleibt liegen, und die Epoche gilt als nicht mehr
+reproduzierbar. Der Verlust ist ein Befund, kein Heilungsfall.
 
 **4. Das Verdikt lesen.** `gaps=0`, `pre_chain=0`, `outcome=stored` und eine
 über `previous=` geschlossene Epochenkette ⇒ vollständig. Alles andere ist
