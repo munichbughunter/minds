@@ -73,6 +73,19 @@ pub enum CaptureError {
     #[error("Schlüssel-Datei bestätigt eine andere Session: {dir}")]
     KeyFileMismatch { dir: PathBuf },
 
+    /// Der Session-Salt fehlt oder ist beschädigt, obwohl bereits eine
+    /// versiegelte Epoche existiert. Ein neuer Salt würde für dieselbe
+    /// Evidence einen zweiten, abweichenden Root erzeugen — ein Epoch-Fork.
+    /// Deshalb wird hier **nicht** regeneriert: Der Verlust ist selbst der
+    /// Befund, die Epoche ist ohne den Salt nicht mehr reproduzierbar.
+    ///
+    /// Der Text nennt nur das Verzeichnis (gehashter Name), nie die rohe
+    /// `local_id` — die Meldung wandert ins `hook.log` (#95).
+    #[error(
+        "Session-Salt fehlt oder ist beschädigt, aber eine versiegelte Epoche existiert: {dir} — der Chain-Root ist nicht mehr reproduzierbar; es wird kein neuer Salt erzeugt (kein zweiter Seal für dieselbe Evidence)"
+    )]
+    SaltLost { dir: PathBuf },
+
     /// JSON ließ sich nicht lesen oder schreiben.
     #[error("JSON-Fehler")]
     Json(#[from] serde_json::Error),

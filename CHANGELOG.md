@@ -87,8 +87,40 @@ Versionierung [Semantic Versioning](https://semver.org/lang/de/).
   zeigt Epoche `k/n` und Deutungs-/Übergabe-Zähler. Die acht
   Chain-Invarianten aus ADR-0011 sind als benannte Tests fixiert.
 
+- **Evidence-Modus in `minds inspect` (`e`)** — der Evidence-Report einer
+  Session in drei Ebenen: das **Verdikt** (Integrität, Coverage, Epochen,
+  Signatur, Deutung, Grenzen — je Achse eine Zeile), die **Erklärung**
+  unter dem Fokus (Beobachtungsgrenze mit `✓ erfasst` vs. `— nicht
+  erfasst, keine Lücke`; Epochen als Zeitleiste mit Seal-Status und
+  `previous`-Auflösung; `○ NICHT SIGNIERT` als eigener Zustand — unsigniert
+  ≠ ungültig) und die **Kryptographie** (Seal-Ids, Roots, Algorithmus).
+  Der Leitsatz spricht die Grenze immer mit: *„Kryptographisch verifiziert
+  innerhalb der aufgezeichneten Beobachtungsgrenze."* Legacy-Sessions
+  zeigen ihren ehrlichen Satz statt eines leeren Gerüsts. Getragen wird
+  alles vom neuen **`EvidenceReport`-Read-Model** in `minds-reader` —
+  dieselbe Verdikt-Rechnung wie `minds verify`, die TUI rechnet nichts
+  nach; `proves`/`does_not_prove` sind als kanonisches Vokabular nach
+  `minds-core::evidence` gezogen (eine Quelle für Audit-Bundle, TUI, Doku).
+- **Evidence-Kanten in der Why-Kette sind fokussierbar (#132)** — ↑/↓
+  wandern erst über die Kanten des EVIDENCE-Glieds, Enter auf einer Kante
+  springt in die Why-Kette genau dieses Commits (Esc trägt zurück), und der
+  Inspector erklärt die fokussierte Kante statt alle. Der „Enter ↵"-Hinweis
+  steht damit an der Kante und verspricht wieder eine echte Aktion (#131).
+
 ### Geändert
 
+- **Salt-Verlust heilt nicht mehr:** Fehlt oder korrumpiert der Session-Salt,
+  nachdem bereits eine Epoche versiegelt wurde, erzeugt der Checkpoint
+  **keinen** neuen Salt mehr — ein regenerierter Salt versiegelte dieselbe
+  Evidence unter einem zweiten, abweichenden Root (Epoch-Fork) und bräche
+  „gleiche Events ⇒ gleicher Seal". Stattdessen ist der Verlust selbst der
+  Befund: Die Session wird sichtbar vertagt (`hook.log`), das Journal bleibt
+  liegen, die Epoche gilt als nicht mehr reproduzierbar. Vor der ersten
+  Versiegelung bleibt die Salt-Erzeugung unverändert. Zudem präzisieren
+  `proves`/`does_not_prove` im Audit-Bundle und der Nachweis-Leitfaden das
+  Proof-Modell: Seal-Identität und -Signatur sind extern prüfbar; der Seal
+  committed auf Chain-Root und Coverage, die zugrunde liegende Chain ist nur
+  mit lokalem Journal und Session-Salt reproduzierbar.
 - **Schema 2 — Evidence in zwei Dimensionen:** `Edge.evidence` (und die
   Kanten in `links.json`/Store-Index) ist jetzt ein `EvidenceMark` aus
   **Quelle** (`heuristic < human_declared < content_derived < observed`) und

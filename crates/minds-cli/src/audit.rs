@@ -331,39 +331,22 @@ fn bundle_len(changes: &[ChangeRecord]) -> usize {
     changes.len()
 }
 
-/// Was das Bündel belegt.
+/// Was das Bündel belegt — das kanonische Vokabular aus
+/// [`minds_core::evidence::PROVES`]: dieselben Sätze wie in der TUI.
 fn proves() -> Vec<String> {
-    [
-        "Jede Session-Id ist der blake3-Hash ihres kanonischen Inhalts — der Inhalt lässt sich gegen sie nachrechnen.",
-        "Der attestation_payload ist byte-genau der Text, über den `minds sign` signiert; eine mitgelieferte Signatur ist dagegen prüfbar.",
-        "Der review_payload bindet den Hash des Verdicts; eine gültige Signatur darüber weist aus, wer geprüft hat.",
-        "Verdicts hängen an der Change-Id und überleben damit Rebase und Force-Push.",
-        "Eine getilgte Session bleibt als Referenz sichtbar (payload: forgotten) — Löschung ist nachweisbar, nicht spurlos.",
-        "Für versiegelte Bereiche sind Manipulation und Lücken kryptographisch erkennbar: seal_id = blake3::derive_key(\"minds/evidence/v1/seal\", text), der Root bindet jedes Event und jede Lücke (ADR-0011).",
-        "Ein Block-Seal (rejected_seals) beweist, dass eine Session existierte, deren Nutzlast die Speicher-Policy zurückwies — ohne ihren Inhalt preiszugeben.",
-    ]
-    .iter()
-    .map(|line| line.to_string())
-    .collect()
+    minds_core::evidence::PROVES
+        .iter()
+        .map(|line| line.to_string())
+        .collect()
 }
 
-/// Was es nicht belegt. Gehört ins Artefakt, nicht nur in die Doku.
+/// Was es nicht belegt ([`minds_core::evidence::DOES_NOT_PROVE`]). Gehört
+/// ins Artefakt, nicht nur in die Doku.
 fn does_not_prove() -> Vec<String> {
-    [
-        "Nicht, dass der Record vollständig ist: Der heiße Pfad ist fail-open, ein verlorenes Event fehlt hier stillschweigend (`minds fsck` macht Lücken sichtbar).",
-        "Nicht, dass eine Session tatsächlich die genannten Zeilen erzeugt hat — die Zuordnung stammt aus Trailern (beobachtet) und Heuristik (vermutet); die Herkunft steht an jeder Kante.",
-        "Nicht, dass ein Modell das getan hat, was im Transkript steht — aufgezeichnet ist, was der Agent gemeldet hat.",
-        "Nicht, wer die Signaturschlüssel kontrolliert. Ohne eine allowed_signers-Datei aus vertrauenswürdiger Quelle ist eine Signatur nur eine Selbstauskunft.",
-        "Nicht, dass unsignierte Einträge echt sind: Sie sind content-adressiert, aber niemand steht mit einem Schlüssel dafür ein.",
-        "Nicht, dass außerhalb versiegelter Bereiche nichts geschah — ein Seal claimt nur den tatsächlich gelesenen Sequenzbereich seiner Epoche.",
-        "Nicht die Integrität zwischen Append und Seal: Bis zum Checkpoint schützt nur das Dateisystem; ein lokaler Schreibzugriff vor der Versiegelung ist nicht erkennbar (ADR-0011, Entscheidung 1).",
-        "Nicht, dass der Agent-Prozess der einzige Akteur war: Subprozesse, Netzwerkzugriffe und Plugins außerhalb der Hook-Grenze (scope im Seal) sind nicht erfasst — Coverage heißt vollständig innerhalb der Grenze, nie Systemaktivität.",
-        "Nicht die Wirkung ungedeuteter Tool-Aufrufe: capture=uninterpreted heißt beobachtet, aber die Effekte sind nicht normalisiert — die Deutungs-Achse ist von Integrität und Coverage getrennt.",
-        "Nicht die reale Uhrzeit: Zeitstempel stammen von der lokalen Uhr des Hooks, ohne externen Zeitanker.",
-    ]
-    .iter()
-    .map(|line| line.to_string())
-    .collect()
+    minds_core::evidence::DOES_NOT_PROVE
+        .iter()
+        .map(|line| line.to_string())
+        .collect()
 }
 
 fn session_record(store: &dyn ContextStore, id: SessionId) -> Fallible<SessionRecord> {

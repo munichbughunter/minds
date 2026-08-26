@@ -365,27 +365,115 @@ fn a_change_node_in_the_graph_explains_its_proof() {
 }
 
 #[test]
-fn the_inspector_explains_an_observed_edge() {
+fn the_inspector_explains_the_focused_edge() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Why);
-    // Zum Evidence-Glied: Session, Agent, Intent, Evidence.
+    // Zum Evidence-Glied: Session, Agent, Intent, Evidence — der Inspector
+    // folgt dem Fokus, kein Enter nötig (#131).
     for _ in 0..3 {
         app.reduce(Action::Down);
     }
-    app.reduce(Action::Enter);
     let out = render(&mut app);
     assert!(out.contains("WHY IS THIS LINKED?"), "{out}");
     assert!(out.contains("● ? observed [ungeprüft]"), "{out}");
     assert!(out.contains("trägt den Trailer Minds-Session-Id"), "{out}");
     // Der Satz kann am Zeilenumbruch brechen — kurzer, stabiler Anker.
     assert!(out.contains("Status: nie"), "{out}");
+    // Der Hinweis steht an der Kante und verspricht die echte Aktion.
+    assert!(out.contains("Enter ↵ Commit"), "{out}");
     // Esc schließt den Inspector; weg vom Evidence-Glied bleibt er zu.
     app.reduce(Action::Back);
     app.reduce(Action::Up);
     let out = render(&mut app);
     assert!(!out.contains("WHY IS THIS LINKED?"), "{out}");
     assert!(matches!(app.top(), Some(View::Why { .. })));
+}
+
+#[test]
+fn evidence_edges_are_focusable_and_enter_opens_the_commit() {
+    // #132: ↑/↓ wandern erst über die Kanten des Evidence-Glieds, Enter auf
+    // einer Kante springt in die Why-Kette genau dieses Commits.
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    let mut commits = BTreeMap::new();
+    commits.insert(commit('1'), vec![sid('a')]);
+    commits.insert(commit('2'), vec![sid('a')]);
+    let inspection = Inspection::from_index(Index::from_parts(sessions, commits), vec![], "repo");
+
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Why);
+    // Session, Agent, Intent → Evidence, Kante 0.
+    for _ in 0..3 {
+        app.reduce(Action::Down);
+    }
+    assert!(matches!(
+        app.top(),
+        Some(View::Why {
+            cursor: 3,
+            edge: 0,
+            ..
+        })
+    ));
+    // Down bleibt im Glied und rückt zur zweiten Kante vor …
+    app.reduce(Action::Down);
+    assert!(matches!(
+        app.top(),
+        Some(View::Why {
+            cursor: 3,
+            edge: 1,
+            ..
+        })
+    ));
+    // … erst das nächste Down verlässt es; Up kommt auf der letzten Kante an.
+    app.reduce(Action::Down);
+    assert!(matches!(
+        app.top(),
+        Some(View::Why {
+            cursor: 4,
+            edge: 0,
+            ..
+        })
+    ));
+    app.reduce(Action::Up);
+    assert!(matches!(
+        app.top(),
+        Some(View::Why {
+            cursor: 3,
+            edge: 1,
+            ..
+        })
+    ));
+
+    // Enter auf Kante 1 → Why-Kette des zweiten Commits.
+    app.reduce(Action::Enter);
+    match app.top() {
+        Some(View::Why { chain, .. }) => {
+            assert!(
+                matches!(
+                    chain.steps.first(),
+                    Some(minds_reader::model::WhyStep::Commit { id: Some(c), .. }) if *c == commit('2')
+                ),
+                "{:?}",
+                chain.steps.first()
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // Esc trägt über den View-Stack zurück auf die fokussierte Kante.
+    app.reduce(Action::Back);
+    assert!(matches!(
+        app.top(),
+        Some(View::Why {
+            cursor: 3,
+            edge: 1,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -409,6 +497,105 @@ fn an_inferred_edge_never_looks_like_an_observed_one() {
     let (glyph, word, _) = crate::theme::evidence(Some(verified));
     assert_eq!(glyph, "● ✓");
     assert!(word.contains("nachgerechnet"));
+}
+
+#[test]
+fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Evidence); // Session a: eine saubere, unsignierte Epoche
+    assert!(matches!(app.top(), Some(View::Evidence { cursor: 0, .. })));
+    let out = render(&mut app);
+    // Ebene 1: das Verdikt — und der Leitsatz, der die Grenze mitspricht.
+    assert!(out.contains("EVIDENCE b3-aaaaaaaa…"), "{out}");
+    assert!(out.contains("◈ versiegelt"), "{out}");
+    assert!(
+        out.contains("Kryptographisch verifiziert innerhalb der aufgezeichneten"),
+        "{out}"
+    );
+    assert!(out.contains("INTEGRITÄT"), "{out}");
+    assert!(
+        out.contains("VOLLSTÄNDIG · 4 Event(s) · innerhalb agent-hooks/v1"),
+        "{out}"
+    );
+    assert!(out.contains("Kette geschlossen · 1 Epoche(n)"), "{out}");
+    // Verified ≠ signed: unsigniert ist ein eigener Zustand, kein ✗.
+    assert!(out.contains("○"), "{out}");
+    assert!(
+        out.contains("NICHT SIGNIERT — unsigniert ≠ ungültig"),
+        "{out}"
+    );
+    // Ebene 3 unter dem Fokus (INTEGRITÄT): die Kryptographie — samt der
+    // ehrlichen Grenze des Proof-Modells.
+    assert!(out.contains("blake3 · derive_key"), "{out}");
+    assert!(
+        out.contains("Chain-Root: nur lokal mit Journal + Session-Salt"),
+        "{out}"
+    );
+
+    // COVERAGE: Die Boundary ist prominent — „nicht erfasst" ist keine Lücke.
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(out.contains("Beobachtungsgrenze"), "{out}");
+    assert!(out.contains("✓ Agent-Hook-Events"), "{out}");
+    assert!(out.contains("— Netzwerkaktivität"), "{out}");
+    assert!(out.contains("nicht erfasst, keine Lücke"), "{out}");
+    assert!(
+        out.contains("Fehlende Evidence beweist nicht, dass nichts geschah"),
+        "{out}"
+    );
+
+    // EPOCHEN: die Kette als Zeitleiste, nicht abstrakt.
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(out.contains("Epoche 1/1"), "{out}");
+    assert!(out.contains("#0–#3"), "{out}");
+    assert!(out.contains("Kettenanfang"), "{out}");
+
+    // SIGNATUR: unsigniert wird erklärt, nicht rot markiert.
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(out.contains("○ NICHT SIGNIERT"), "{out}");
+    assert!(out.contains("niemand steht mit einem Schlüssel"), "{out}");
+    assert!(out.contains("minds sign --seal"), "{out}");
+
+    // GRENZEN: does_not_prove gehört in die Oberfläche, nicht nur in die Doku.
+    app.reduce(Action::End);
+    let out = render(&mut app);
+    assert!(out.contains("Minds beweist NICHT:"), "{out}");
+    assert!(out.contains("fail-open"), "{out}");
+
+    app.reduce(Action::Back);
+    assert!(app.top().is_none());
+}
+
+#[test]
+fn evidence_mode_is_honest_about_a_legacy_session() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Down); // Session b: keine Seals
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(out.contains("· legacy"), "{out}");
+    assert!(
+        out.contains("kryptographische Verifikation nicht verfügbar"),
+        "{out}"
+    );
+    assert!(out.contains("nie nachträglich"), "{out}");
+    // Keine Sektionen, kein Verdikt-Panel — kein leeres Gerüst.
+    assert!(!out.contains("VERDIKT"), "{out}");
+}
+
+#[test]
+fn evidence_mode_opens_from_the_graph_too() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Enter);
+    app.reduce(Action::Evidence);
+    assert!(matches!(app.top(), Some(View::Evidence { .. })));
+    // Esc führt in den Graphen zurück, nicht auf die Liste.
+    app.reduce(Action::Back);
+    assert!(matches!(app.top(), Some(View::Graph { .. })));
 }
 
 #[test]

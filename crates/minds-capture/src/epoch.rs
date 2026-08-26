@@ -18,6 +18,12 @@
 //! frischer Clone hat ihn nicht. Fehlt er, schreibt der nächste Seal
 //! `previous=-`, und das Verdikt sagt ehrlich „Epochenkette nicht belegt" —
 //! nie wird eine Verkettung erfunden.
+//!
+//! Daneben liegt der **Session-Salt** (`*.salt`), mit dem der Chain-Root
+//! gefaltet wird. Für ihn gilt best-effort **nicht**: Sobald eine Epoche
+//! versiegelt ist, ist sein Verlust ein Fehler ([`salt`](EpochState::salt)) —
+//! ein regenerierter Salt würde dieselbe Evidence unter einer zweiten
+//! kryptographischen Identität neu versiegeln (Epoch-Fork).
 
 use std::fs;
 use std::path::PathBuf;
@@ -85,6 +91,18 @@ impl EpochState {
     /// er für Ein-Event-Epochen ein Offline-Orakel über den Payload (siehe
     /// [`minds_core::evidence::chain_salted`]). Der Salt bleibt lokal — 0600,
     /// nie gepusht — und macht den Root ohne lokalen Zugriff unnachrechenbar.
+    ///
+    /// **Fail-closed nach der ersten Epoche:** Fehlt der Salt oder ist er
+    /// beschädigt, obwohl bereits eine Epoche versiegelt wurde, ist das ein
+    /// [`SaltLost`](crate::error::CaptureError::SaltLost)-Fehler — **kein**
+    /// stiller Neuanfang. Ein regenerierter Salt erzeugte für dieselben
+    /// Events unter derselben Session einen zweiten, abweichenden Root und
+    /// damit einen Epoch-Fork (same evidence, different cryptographic
+    /// identity). Der Verlust selbst ist der sichtbare Befund: Die Epoche
+    /// ist nicht mehr reproduzierbar, der Checkpoint vertagt die Session.
+    /// Nur solange keine Epoche existiert, wird ein (fehlender oder
+    /// beschädigter) Salt erzeugt bzw. ersetzt — dann hat noch kein Seal
+    /// auf einen Root committed.
     pub fn salt(&self, key: &SessionKey) -> Result<[u8; 32]> {
         let file = self.file(key).with_extension(SALT_SUFFIX);
         if let Ok(bytes) = fs::read(&file) {
@@ -93,9 +111,19 @@ impl EpochState {
                 salt.copy_from_slice(&bytes);
                 return Ok(salt);
             }
-            // Falsche Laenge: kaputt — neu erzeugen (unten), alter Root ist
-            // dann nicht mehr reproduzierbar; der Seal-Reuse-Vergleich laeuft
-            // ins Leere und versiegelt schlicht neu.
+            // Falsche Laenge: kaputt. Ob neu erzeugt werden darf, entscheidet
+            // dieselbe Regel wie beim Fehlen — unten.
+        }
+        // Kein brauchbarer Salt. Existiert schon eine Epoche (die Zustands-
+        // Datei traegt die seal_id der letzten), hat ein Seal auf einen Root
+        // committed, den nur der alte Salt reproduziert — fail-closed.
+        if self.file(key).exists() {
+            return Err(crate::error::CaptureError::SaltLost {
+                dir: file
+                    .parent()
+                    .expect("Datei liegt unter state/")
+                    .to_path_buf(),
+            });
         }
         let dir = file.parent().expect("Datei liegt unter state/");
         journal::create_dir_private(&self.root, dir)?;
@@ -194,6 +222,82 @@ mod tests {
         let file = state.file(&key());
         fs::write(&file, b"kein hash").unwrap();
         assert_eq!(state.last_seal(&key()), None);
+    }
+
+    #[test]
+    fn the_salt_is_created_once_and_stays_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = EpochState::open(tmp.path());
+
+        let first = state.salt(&key()).unwrap();
+        assert_eq!(state.salt(&key()).unwrap(), first);
+    }
+
+    #[test]
+    fn without_an_epoch_a_lost_or_corrupt_salt_is_replaced() {
+        // Vor dem ersten Seal hat noch nichts auf den Root committed —
+        // Regeneration ist harmlos und darf den Checkpoint nicht aufhalten.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = EpochState::open(tmp.path());
+
+        let first = state.salt(&key()).unwrap();
+        let file = state.file(&key()).with_extension(SALT_SUFFIX);
+        fs::write(&file, b"zu kurz").unwrap();
+        let second = state.salt(&key()).unwrap();
+        assert_ne!(second, first);
+        // Und ab da wieder stabil.
+        assert_eq!(state.salt(&key()).unwrap(), second);
+    }
+
+    #[test]
+    fn after_an_epoch_a_missing_salt_is_an_error_not_a_new_salt() {
+        // Der Kern von „Salt-Verlust heilt nicht": Ein neuer Salt würde
+        // dieselbe Evidence unter neuem Root neu versiegeln (Epoch-Fork).
+        let tmp = tempfile::tempdir().unwrap();
+        let state = EpochState::open(tmp.path());
+
+        state.salt(&key()).unwrap();
+        state.record(&key(), &id(1)).unwrap();
+
+        let file = state.file(&key()).with_extension(SALT_SUFFIX);
+        fs::remove_file(&file).unwrap();
+
+        let err = state.salt(&key()).unwrap_err();
+        assert!(matches!(err, crate::error::CaptureError::SaltLost { .. }));
+        // Und der Fehler hat keinen neuen Salt hinterlassen.
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn after_an_epoch_a_corrupt_salt_is_an_error_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = EpochState::open(tmp.path());
+
+        state.salt(&key()).unwrap();
+        state.record(&key(), &id(1)).unwrap();
+
+        let file = state.file(&key()).with_extension(SALT_SUFFIX);
+        fs::write(&file, b"falsche laenge").unwrap();
+
+        let err = state.salt(&key()).unwrap_err();
+        assert!(matches!(err, crate::error::CaptureError::SaltLost { .. }));
+        // Der kaputte Inhalt bleibt liegen — nichts wird ueberschrieben.
+        assert_eq!(fs::read(&file).unwrap(), b"falsche laenge");
+    }
+
+    #[test]
+    fn the_salt_error_names_only_the_hashed_dir_never_the_local_id() {
+        // Dieselbe #95-Regel wie ueberall: Die Meldung wandert ins hook.log.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = EpochState::open(tmp.path());
+        let secret = SessionKey::new("claude-code", "glpat-abc123def").unwrap();
+
+        state.salt(&secret).unwrap();
+        state.record(&secret, &id(1)).unwrap();
+        fs::remove_file(state.file(&secret).with_extension(SALT_SUFFIX)).unwrap();
+
+        let msg = state.salt(&secret).unwrap_err().to_string();
+        assert!(!msg.contains("glpat"));
     }
 
     #[cfg(unix)]

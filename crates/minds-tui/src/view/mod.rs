@@ -13,6 +13,7 @@ use crate::app::{App, View};
 use crate::theme;
 
 pub mod activity;
+pub mod evidence;
 pub mod graph;
 pub mod help;
 pub mod why;
@@ -43,8 +44,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Some(View::Why {
             chain,
             cursor,
+            edge,
             inspector,
-        }) => why::draw(frame, body, chain, *cursor, inspector.as_deref()),
+        }) => why::draw(frame, body, chain, *cursor, *edge, inspector.as_deref()),
+        Some(View::Evidence {
+            id,
+            report,
+            uninterpreted,
+            cursor,
+        }) => evidence::draw(frame, body, *id, report.as_ref(), *uninterpreted, *cursor),
     }
     footer(frame, app, foot);
     if app.help {
@@ -126,6 +134,13 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 ))
             }
         }
+        Some(View::Evidence { report, .. }) => Line::from(Span::styled(
+            report
+                .as_ref()
+                .map(|r| r.sentence())
+                .unwrap_or(minds_reader::model::LEGACY_SENTENCE),
+            theme::dim(),
+        )),
     };
     let keys = if app.searching {
         Line::from(vec![
@@ -150,11 +165,14 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
         }
         let keys = match app.top() {
-            None => "↑↓ wählen  Enter Graph  w Why  / Suche  1·2·3 Zoom  ? Hilfe  q Ende",
+            None => {
+                "↑↓ wählen  Enter Graph  w Why  e Evidence  / Suche  1·2·3 Zoom  ? Hilfe  q Ende"
+            }
             Some(View::Graph { .. }) => {
-                "↑↓ wählen  Enter hinein  w Why  t Zeitleiste  1·2·3 Zoom  Esc zurück  ? Hilfe"
+                "↑↓ wählen  Enter hinein  w Why  e Evidence  t Zeitleiste  1·2·3 Zoom  Esc zurück  ? Hilfe"
             }
             Some(View::Why { .. }) => "↑↓ wählen  Enter öffnen  Esc zurück  ? Hilfe",
+            Some(View::Evidence { .. }) => "↑↓ Sektion  Esc zurück  ? Hilfe",
         };
         spans.push(Span::styled(keys, theme::dim()));
         spans.push(Span::styled(

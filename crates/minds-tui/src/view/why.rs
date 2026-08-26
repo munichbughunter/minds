@@ -17,12 +17,14 @@ use crate::view::{clip, offset, when};
 
 /// Zeichnet die Kette: jedes Glied mit ✓ oder ⚠, darunter die Lücken als
 /// eigener Block — und, sobald der Cursor auf dem Evidence-Glied steht, der
-/// Inspector, der jede Kante erklärt.
+/// Inspector, der die **fokussierte** Kante erklärt. `edge` ist der
+/// Sub-Cursor über die Kanten des Evidence-Glieds (#132).
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
     chain: &WhyChain,
     cursor: usize,
+    edge: usize,
     inspector: Option<&[LinkEvidence]>,
 ) {
     let gaps = chain.gaps();
@@ -72,8 +74,34 @@ pub fn draw(
                 theme::dim(),
             ),
         ]));
-        for t in text {
-            lines.push(Line::from(vec![Span::raw("     "), Span::raw(t)]));
+        if let WhyStep::Evidence { links } = step
+            && !links.is_empty()
+        {
+            // Die Kanten sind fokussierbar (#132): Der Sub-Cursor markiert
+            // eine, der Hinweis steht an ihr — Enter springt in die
+            // Why-Kette genau dieses Commits, nicht „irgendwohin".
+            for (j, link) in links.iter().enumerate() {
+                let (glyph, word, link_style) = theme::evidence(Some(link.evidence));
+                let short: String = link.commit.to_string().chars().take(10).collect();
+                let focused = selected && j == edge;
+                let row_style = if focused {
+                    link_style.patch(theme::cursor())
+                } else {
+                    link_style
+                };
+                let mut spans = vec![
+                    Span::raw("     "),
+                    Span::styled(format!("{glyph} {word}  {short}"), row_style),
+                ];
+                if focused {
+                    spans.push(Span::styled("   Enter ↵ Commit", theme::dim()));
+                }
+                lines.push(Line::from(spans));
+            }
+        } else {
+            for t in text {
+                lines.push(Line::from(vec![Span::raw("     "), Span::raw(t)]));
+            }
         }
         if i + 1 < chain.steps.len() {
             lines.push(Line::from(Span::styled("  │", theme::dim())));
@@ -81,7 +109,13 @@ pub fn draw(
         }
     }
     let height = body.height as usize;
-    let anchor = starts.get(cursor).copied().unwrap_or(0);
+    // Der Anker folgt dem Sub-Cursor: Auf dem Evidence-Glied zählt die
+    // fokussierte Kante (Kopfzeile + 1 + edge), damit sie im Fenster bleibt.
+    let anchor = starts.get(cursor).copied().unwrap_or(0)
+        + match chain.steps.get(cursor) {
+            Some(WhyStep::Evidence { links }) if !links.is_empty() => 1 + edge.min(links.len() - 1),
+            _ => 0,
+        };
     let first = offset(anchor, lines.len(), height);
     let shown: Vec<Line> = lines.into_iter().skip(first).take(height).collect();
     frame.render_widget(Paragraph::new(shown), body);
@@ -166,7 +200,11 @@ pub fn draw(
 
 fn enterable(step: &WhyStep) -> bool {
     match step {
-        WhyStep::Evidence { .. } => true,
+        // Das Evidence-Glied trägt den Hinweis nicht am Kopf: Enter wirkt
+        // auf der fokussierten **Kante**, und dort steht er auch (#131 —
+        // ein Hinweis, der eine längst passierte Aktion verspricht, ist
+        // schlimmer als keiner).
+        WhyStep::Evidence { .. } => false,
         WhyStep::Sessions { cards } => !cards.is_empty(),
         WhyStep::Commit { id, .. } => id.is_some(),
         _ => false,

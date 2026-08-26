@@ -289,12 +289,14 @@ fn the_bundle_proves_a_rejected_session_without_leaking_its_content() {
         );
     }
 
-    // Und die neuen Zusagen stehen im Artefakt.
+    // Und die neuen Zusagen stehen im Artefakt — samt der Grenze: Der Seal
+    // committed auf Root und Coverage, die Chain selbst bleibt nur lokal
+    // reproduzierbar. Das Bündel darf nie mehr behaupten.
     let proves = bundle["proves"].as_array().unwrap();
     assert!(
-        proves.iter().any(|l| l
-            .as_str()
-            .is_some_and(|t| t.contains("kryptographisch erkennbar"))),
+        proves.iter().any(|l| l.as_str().is_some_and(|t| t
+            .contains("committed kryptographisch auf Chain-Root und Coverage")
+            && t.contains("nur mit lokalem Journal und Session-Salt"))),
         "{proves:?}"
     );
     let limits = bundle["does_not_prove"].as_array().unwrap();
