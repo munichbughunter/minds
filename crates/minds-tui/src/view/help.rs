@@ -15,6 +15,7 @@ Esc / h            zurück; auf der Liste: Suche löschen, dann beenden
 
 /                  Suche (Terme UND-verknüpft, über Prompt, Agent, Pfade, Ids)
 w                  Why — die Herkunftskette
+e                  Evidence — Verdikt, Coverage, Epochen, Signatur, Grenzen
 t                  Graph ↔ Zeitleiste
 1 / 2 / 3          Zoom: Übersicht / normal / ausführlich
 ?                  diese Hilfe

@@ -31,6 +31,8 @@ pub enum Action {
     ToggleTimeline,
     /// Die Herkunftskette.
     Why,
+    /// Der Evidence-Report der Session.
+    Evidence,
     /// Die Detailstufe 1–3.
     Zoom(u8),
     /// Suche beginnen.
@@ -78,6 +80,7 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Esc | KeyCode::Char('h') => Action::Back,
         KeyCode::Char('t') => Action::ToggleTimeline,
         KeyCode::Char('w') => Action::Why,
+        KeyCode::Char('e') => Action::Evidence,
         KeyCode::Char('1') => Action::Zoom(1),
         KeyCode::Char('2') => Action::Zoom(2),
         KeyCode::Char('3') => Action::Zoom(3),
@@ -110,6 +113,7 @@ mod tests {
     fn every_command_key_has_its_action() {
         for (c, action) in [
             ('w', Action::Why),
+            ('e', Action::Evidence),
             ('t', Action::ToggleTimeline),
             ('1', Action::Zoom(1)),
             ('2', Action::Zoom(2)),

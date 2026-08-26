@@ -58,7 +58,7 @@ minds enable --agent claude-code   # registriert die Hooks, idempotent
 minds show                         # die Session hinter dem letzten Commit
 minds why src/retry.rs:42          # die Session hinter einer einzelnen Zeile
 minds recap                        # die letzten Sessions auf einen Blick
-minds inspect                      # dasselbe als Oberfläche: Liste, Graph, Why-Kette
+minds inspect                      # dasselbe als Oberfläche: Liste, Graph, Why-Kette, Evidence-Report (e)
 ```
 
 `minds enable` fasst fremde Konfiguration nicht an und lässt sich beliebig oft

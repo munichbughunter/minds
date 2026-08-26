@@ -13,7 +13,7 @@ use minds_core::SessionId;
 use minds_git::Repo;
 use minds_reader::Inspection;
 use minds_reader::graph::{NodeKind, SessionGraph};
-use minds_reader::model::{LinkEvidence, SessionCard, WhyChain, WhyStep};
+use minds_reader::model::{EvidenceReport, LinkEvidence, SessionCard, WhyChain, WhyStep};
 
 use crate::filter;
 use crate::input::{self, Action};
@@ -47,10 +47,32 @@ pub enum View {
         chain: WhyChain,
         /// Das Glied unter dem Cursor.
         cursor: usize,
-        /// Der geöffnete Evidence-Inspector, je Kante eine Erklärung.
+        /// Die Kante unter dem Cursor, wenn das Glied das Evidence-Glied
+        /// ist: ↑/↓ wandern erst über die Kanten, bevor sie das Glied
+        /// verlassen (#132). Auf allen anderen Gliedern ist das `0`.
+        edge: usize,
+        /// Der geöffnete Evidence-Inspector — er folgt der fokussierten
+        /// Kante und erklärt genau sie, nicht alle.
         inspector: Option<Vec<LinkEvidence>>,
     },
+    /// Der Evidence-Report einer Session: Verdikt, Erklärung, Kryptographie
+    /// — drei Ebenen über demselben, fertig gerechneten Read-Model. Die TUI
+    /// rechnet nichts nach ([`minds_reader::model::EvidenceReport`]).
+    Evidence {
+        /// Die Session.
+        id: SessionId,
+        /// Der Report; `None` heißt Legacy (vor Evidence-Chain erfasst).
+        report: Option<EvidenceReport>,
+        /// Beobachtete, aber nicht gedeutete Tool-Aufrufe — die
+        /// Deutungs-Achse neben Integrität und Coverage.
+        uninterpreted: usize,
+        /// Die Sektion unter dem Cursor; das Detail folgt dem Fokus.
+        cursor: usize,
+    },
 }
+
+/// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge.
+pub const EVIDENCE_SECTIONS: usize = 6;
 
 /// Der Zustand.
 pub struct App<'a> {
@@ -158,7 +180,23 @@ impl<'a> App<'a> {
         self.views.push(View::Why {
             chain,
             cursor: 0,
+            edge: 0,
             inspector: None,
+        });
+    }
+
+    fn push_evidence(&mut self, id: SessionId) {
+        let report = self.inspection.evidence_report(id);
+        let uninterpreted = self
+            .inspection
+            .card(id)
+            .map(|card| card.uninterpreted_calls)
+            .unwrap_or(0);
+        self.views.push(View::Evidence {
+            id,
+            report,
+            uninterpreted,
+            cursor: 0,
         });
     }
 
@@ -259,6 +297,17 @@ impl<'a> App<'a> {
                         }
                         return;
                     }
+                    Action::Evidence => {
+                        self.views.push(View::Graph {
+                            id,
+                            graph,
+                            rows,
+                            cursor,
+                            timeline,
+                        });
+                        self.push_evidence(id);
+                        return;
+                    }
                     Action::Enter => {
                         let target = rows.get(cursor).map(|r| r.kind.clone());
                         self.views.push(View::Graph {
@@ -302,9 +351,17 @@ impl<'a> App<'a> {
             Some(View::Why {
                 chain,
                 mut cursor,
+                mut edge,
                 mut inspector,
             }) => {
                 let last = chain.steps.len().saturating_sub(1);
+                // Wie viele Kanten das Glied unter `at` trägt — nur das
+                // Evidence-Glied hat welche; überall sonst ist der
+                // Sub-Cursor bedeutungslos (und bleibt 0).
+                let links_of = |at: usize| match chain.steps.get(at) {
+                    Some(WhyStep::Evidence { links }) => links.len(),
+                    _ => 0,
+                };
                 let mut keep = true;
                 // Der Inspector folgt dem Fokus: Bewegung schließt ihn und
                 // öffnet ihn nur auf dem Evidence-Glied neu; Esc schließt
@@ -313,19 +370,34 @@ impl<'a> App<'a> {
                 match action {
                     Action::Up => {
                         inspector = None;
-                        cursor = cursor.saturating_sub(1);
+                        // Erst über die Kanten des Evidence-Glieds, dann
+                        // hinaus (#132) — von unten kommend landet der
+                        // Fokus auf der letzten Kante.
+                        if edge > 0 {
+                            edge -= 1;
+                        } else if cursor > 0 {
+                            cursor -= 1;
+                            edge = links_of(cursor).saturating_sub(1);
+                        }
                     }
                     Action::Down => {
                         inspector = None;
-                        cursor = (cursor + 1).min(last);
+                        if edge + 1 < links_of(cursor) {
+                            edge += 1;
+                        } else if cursor < last {
+                            cursor += 1;
+                            edge = 0;
+                        }
                     }
                     Action::Home | Action::PageUp => {
                         inspector = None;
                         cursor = 0;
+                        edge = 0;
                     }
                     Action::End | Action::PageDown => {
                         inspector = None;
                         cursor = last;
+                        edge = 0;
                     }
                     Action::Back => {
                         follow = false;
@@ -336,8 +408,21 @@ impl<'a> App<'a> {
                         }
                     }
                     Action::Enter => match chain.steps.get(cursor) {
-                        Some(WhyStep::Evidence { links }) => {
-                            inspector = Some(self.inspection.explain_links(self.repo, links));
+                        // Enter auf einer Kante springt in die Why-Kette
+                        // ihres Commits — dieselbe Bewegung wie auf dem
+                        // COMMIT-Glied; Esc trägt über den View-Stack
+                        // zurück (#132).
+                        Some(WhyStep::Evidence { links }) if !links.is_empty() => {
+                            let commit = links[edge.min(links.len() - 1)].commit;
+                            self.views.push(View::Why {
+                                chain,
+                                cursor,
+                                edge,
+                                inspector,
+                            });
+                            let chain = self.inspection.why_commit(commit);
+                            self.push_why(chain);
+                            return;
                         }
                         Some(WhyStep::Sessions { cards }) => {
                             if let Some(card) = cards.first() {
@@ -345,6 +430,7 @@ impl<'a> App<'a> {
                                 self.views.push(View::Why {
                                     chain,
                                     cursor,
+                                    edge,
                                     inspector,
                                 });
                                 self.push_graph(id);
@@ -358,6 +444,7 @@ impl<'a> App<'a> {
                             self.views.push(View::Why {
                                 chain,
                                 cursor,
+                                edge,
                                 inspector,
                             });
                             let chain = self.inspection.why_commit(commit);
@@ -370,18 +457,54 @@ impl<'a> App<'a> {
                 }
                 if keep {
                     // Die Erklärung gehört zum Fokus, nicht zum Enter: Steht
-                    // der Cursor auf dem Evidence-Glied, wird jede Kante
-                    // erklärt — „?" soll nie nur „irgendwie unsicher" heißen.
+                    // der Cursor auf dem Evidence-Glied, wird die
+                    // **fokussierte** Kante erklärt — bei vielen Commits
+                    // bliebe das Panel sonst endlos (#132).
                     if follow
                         && inspector.is_none()
                         && let Some(WhyStep::Evidence { links }) = chain.steps.get(cursor)
                     {
-                        inspector = Some(self.inspection.explain_links(self.repo, links));
+                        let focused = links
+                            .get(edge.min(links.len().saturating_sub(1)))
+                            .map(std::slice::from_ref)
+                            .unwrap_or(&[]);
+                        inspector = Some(self.inspection.explain_links(self.repo, focused));
                     }
                     self.views.push(View::Why {
                         chain,
                         cursor,
+                        edge,
                         inspector,
+                    });
+                }
+            }
+            Some(View::Evidence {
+                id,
+                report,
+                uninterpreted,
+                mut cursor,
+            }) => {
+                // Legacy hat keine Sektionen — nur den einen ehrlichen Satz.
+                let last = if report.is_some() {
+                    EVIDENCE_SECTIONS - 1
+                } else {
+                    0
+                };
+                let mut keep = true;
+                match action {
+                    Action::Up => cursor = cursor.saturating_sub(1),
+                    Action::Down => cursor = (cursor + 1).min(last),
+                    Action::Home | Action::PageUp => cursor = 0,
+                    Action::End | Action::PageDown => cursor = last,
+                    Action::Back => keep = false,
+                    _ => {}
+                }
+                if keep {
+                    self.views.push(View::Evidence {
+                        id,
+                        report,
+                        uninterpreted,
+                        cursor,
                     });
                 }
             }
@@ -410,6 +533,11 @@ impl<'a> App<'a> {
                     && let Some(chain) = self.inspection.why_session(card.id)
                 {
                     self.push_why(chain);
+                }
+            }
+            Action::Evidence => {
+                if let Some(card) = self.selected().filter(|c| !c.is_degraded()) {
+                    self.push_evidence(card.id);
                 }
             }
             Action::SearchStart => self.searching = true,
