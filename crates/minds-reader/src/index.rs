@@ -414,8 +414,22 @@ impl Index {
 
     /// Das Evidence-Verdikt einer Session aus ihren Seals — `None`, wenn es
     /// keinerlei Seal-Material gibt (vor Evidence-Chain erfasst).
+    ///
+    /// Eine Projektion auf [`evidence_report`](Self::evidence_report) — es
+    /// gibt genau **eine** Verdikt-Rechnung, keine zwei Semantiken.
     pub fn evidence_state(&self, id: SessionId) -> Option<crate::model::EvidenceState> {
-        use crate::model::{EvidenceState, EvidenceVerdict};
+        self.evidence_report(id).map(|report| report.state)
+    }
+
+    /// Der volle Evidence-Report einer Session: Verdikt, Epochen mit
+    /// Coverage, Scope, Signatur-Lage und die Grenzen des Proof-Modells —
+    /// **ein** Read-Model für CLI, TUI und Audit. `None` heißt Legacy
+    /// (vor Evidence-Chain erfasst), nie „Bug".
+    pub fn evidence_report(&self, id: SessionId) -> Option<crate::model::EvidenceReport> {
+        use crate::model::{
+            EpochLink, EpochReport, EvidenceReport, EvidenceState, EvidenceVerdict,
+        };
+        use crate::text::sanitize;
 
         let tampered = self.seal_tampered.contains(&id);
         let seals = self.seals.get(&id);
@@ -438,28 +452,57 @@ impl Index {
         let mut entry_points = 0usize;
         let mut internal_targets: BTreeSet<&ContentHash> = BTreeSet::new();
         let mut chain_closed = true;
-        for (_, seal, is_signed) in seals {
+        let mut epochs = Vec::with_capacity(seals.len());
+        for (seal_id, seal, is_signed) in seals {
             events += seal.events;
             gaps += seal.gaps;
             pre_chain += seal.pre_chain;
             signed += usize::from(*is_signed);
-            match &seal.previous {
-                None => entry_points += 1,
+            let link = match &seal.previous {
+                None => {
+                    entry_points += 1;
+                    EpochLink::Start
+                }
                 Some(prev) if in_set.contains(prev) => {
                     if !internal_targets.insert(prev) {
                         chain_closed = false; // Fork
                     }
+                    EpochLink::Chained
                 }
                 Some(prev) => match self.all_seals.get(prev) {
-                    Some((true, _, _)) => entry_points += 1,
-                    Some((false, prev_root, _)) if prev_root == &seal.root => entry_points += 1,
+                    Some((true, _, _)) => {
+                        entry_points += 1;
+                        EpochLink::Chained
+                    }
+                    Some((false, prev_root, _)) if prev_root == &seal.root => {
+                        entry_points += 1;
+                        EpochLink::Chained
+                    }
                     Some((false, _, _)) => {
                         rejected = true;
                         chain_closed = false;
+                        EpochLink::RejectedBefore
                     }
-                    None => chain_closed = false,
+                    None => {
+                        chain_closed = false;
+                        EpochLink::Unresolved
+                    }
                 },
-            }
+            };
+            epochs.push(EpochReport {
+                seal_id: seal_id.clone(),
+                root: seal.root.clone(),
+                scope: sanitize(&seal.scope),
+                first_seq: seal.first_seq,
+                last_seq: seal.last_seq,
+                events: seal.events,
+                gaps: seal.gaps,
+                pre_chain: seal.pre_chain,
+                stored: matches!(seal.outcome, SealOutcome::Stored { .. }),
+                signed: *is_signed,
+                link,
+                last_event_at: sanitize(&seal.last_event_at),
+            });
         }
         if entry_points != 1 {
             chain_closed = false;
@@ -475,15 +518,23 @@ impl Index {
         } else {
             EvidenceVerdict::Incomplete
         };
-        Some(EvidenceState {
-            verdict,
-            seals: seals.len(),
-            events,
-            gaps,
-            pre_chain,
-            rejected,
-            chain_closed,
-            signed,
+        let scope = epochs
+            .first()
+            .map(|epoch: &EpochReport| epoch.scope.clone());
+        Some(EvidenceReport {
+            state: EvidenceState {
+                verdict,
+                seals: seals.len(),
+                events,
+                gaps,
+                pre_chain,
+                rejected,
+                chain_closed,
+                signed,
+            },
+            scope,
+            epochs,
+            limitations: minds_core::evidence::DOES_NOT_PROVE,
         })
     }
 
@@ -1028,6 +1079,87 @@ mod tests {
         // Und ganz ohne Seals: kein Verdikt — vor Evidence-Chain erfasst.
         let index = Index::from_parts(sessions, BTreeMap::new());
         assert!(index.evidence_state(sid).is_none());
+    }
+
+    #[test]
+    fn the_report_carries_epochs_scope_and_limitations() {
+        let sid: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid, session("x"));
+
+        let index = Index::from_parts(sessions, BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 0, None)]);
+        let report = index.evidence_report(sid).expect("Seal-Material");
+
+        assert_eq!(
+            report.state.verdict,
+            crate::model::EvidenceVerdict::Verified
+        );
+        assert_eq!(
+            report.scope.as_deref(),
+            Some(minds_core::evidence::SCOPE_AGENT_HOOKS_V1)
+        );
+        assert_eq!(report.epochs.len(), 1);
+        let epoch = &report.epochs[0];
+        assert_eq!(epoch.link, crate::model::EpochLink::Start);
+        assert!(epoch.stored);
+        assert!(!epoch.signed);
+        assert_eq!((epoch.first_seq, epoch.last_seq, epoch.events), (0, 3, 4));
+        // Die Grenzen sind Teil des Reports — dasselbe Vokabular wie das
+        // Audit-Bundle, nie eine eigene Liste.
+        assert_eq!(report.limitations, minds_core::evidence::DOES_NOT_PROVE);
+        assert!(report.sentence().contains("innerhalb der aufgezeichneten"));
+        // Und das Verdikt ist DASSELBE Objekt wie evidence_state.
+        assert_eq!(index.evidence_state(sid), Some(report.state));
+    }
+
+    #[test]
+    fn the_report_classifies_how_each_epoch_links() {
+        let sid: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid, session("x"));
+
+        // Zwei Epochen: B haengt an A ⇒ [Start, Chained], Kette geschlossen.
+        let (a_id, a_seal, a_signed) = seal_for(sid, 0, None);
+        let b = seal_for(sid, 0, Some(a_id.clone()));
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![(a_id, a_seal, a_signed), b]);
+        let report = index.evidence_report(sid).unwrap();
+        assert_eq!(
+            report.epochs.iter().map(|e| e.link).collect::<Vec<_>>(),
+            vec![
+                crate::model::EpochLink::Start,
+                crate::model::EpochLink::Chained
+            ]
+        );
+        assert!(report.state.chain_closed);
+
+        // Ein baumelndes previous ⇒ Unresolved, unvollstaendig — und der
+        // Leitsatz behauptet nichts.
+        let dangling = ContentHash::from_bytes([1u8; 32]);
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 0, Some(dangling))]);
+        let report = index.evidence_report(sid).unwrap();
+        assert_eq!(report.epochs[0].link, crate::model::EpochLink::Unresolved);
+        assert!(report.sentence().contains("unvollständig"));
+
+        // Ein Block-Seal mit anderem Root als Vorgaenger ⇒ RejectedBefore.
+        let other: SessionId = format!("b3-{}", "b".repeat(64)).parse().unwrap();
+        let block = Seal {
+            root: ContentHash::from_bytes([9u8; 32]),
+            outcome: SealOutcome::Rejected,
+            ..seal_for(other, 0, None).1
+        };
+        let block_id = Seal::id_of_text(&block.to_text().unwrap());
+        let index = Index::from_parts(sessions, BTreeMap::new())
+            .with_seals(other, vec![(block_id.clone(), block, false)])
+            .with_seals(sid, vec![seal_for(sid, 0, Some(block_id))]);
+        let report = index.evidence_report(sid).unwrap();
+        assert_eq!(
+            report.epochs[0].link,
+            crate::model::EpochLink::RejectedBefore
+        );
+        assert!(report.state.rejected);
     }
     use minds_core::{Agent, Intent, Model};
 

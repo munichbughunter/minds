@@ -269,6 +269,101 @@ impl Provenance {
     }
 }
 
+/// Der Leitsatz einer Legacy-Session — dasselbe Vokabular wie
+/// [`EvidenceReport::sentence`], für den Zustand ohne Report.
+pub const LEGACY_SENTENCE: &str =
+    "Vor der Evidence-Chain erfasst — kryptographische Verifikation nicht verfügbar.";
+
+/// Wie sich das `previous` einer Epoche auflöst — je Seal klassifiziert,
+/// mit exakt der Logik, die auch das Verdikt trägt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochLink {
+    /// `previous=-`: Epochenanfang oder ehrlich unbelegte Kette (frischer
+    /// Clone). Genau **ein** Anfang schließt die Kette.
+    Start,
+    /// Löst sich auf: interner Vorgänger, gespeicherter externer Seal oder
+    /// ein Block-Seal mit identischem Root (Policy-Fix).
+    Chained,
+    /// Der Vorgänger ist ein Block-Seal mit anderem Root — eine frühere
+    /// Epoche wurde von der Speicher-Policy zurückgewiesen.
+    RejectedBefore,
+    /// `previous` zeigt ins Leere — die Kette ist offen.
+    Unresolved,
+}
+
+/// Eine Epoche im [`EvidenceReport`]: ein Seal mit seiner Coverage — die
+/// Ebene, auf der die Kryptographie sichtbar werden darf (Seal-Id, Root),
+/// ohne dass eine Oberfläche sie selbst nachrechnet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpochReport {
+    /// Die `seal_id` — extern nachrechenbar aus dem Seal-Text.
+    pub seal_id: minds_core::ContentHash,
+    /// Der Chain-Root, auf den der Seal committed (nur lokal mit Journal
+    /// und Session-Salt reproduzierbar).
+    pub root: minds_core::ContentHash,
+    /// Die Beobachtungsgrenze der Coverage-Aussage (`agent-hooks/v1`).
+    pub scope: String,
+    /// Der tatsächlich gelesene Bereich.
+    pub first_seq: u64,
+    /// Ende des Bereichs.
+    pub last_seq: u64,
+    /// Events mit gestempeltem Hash.
+    pub events: u64,
+    /// Lücken-Glieder in der Kette.
+    pub gaps: u64,
+    /// Alt-Events ohne Stempel.
+    pub pre_chain: u64,
+    /// Gespeichert — oder ein Block-Seal (Nutzlast zurückgewiesen).
+    pub stored: bool,
+    /// Ob eine Signatur **vorliegt** (Anwesenheit; die Gültigkeit prüft
+    /// `minds verify`).
+    pub signed: bool,
+    /// Wie sich `previous` auflöst.
+    pub link: EpochLink,
+    /// Zeitstempel des letzten Events (RFC 3339), entschärft.
+    pub last_event_at: String,
+}
+
+/// Der Evidence-Report einer Session — **ein** Read-Model für CLI, TUI und
+/// Audit (dieselbe Semantik wie `minds verify`, ADR-0011 Entscheidung 7).
+///
+/// Drei Ebenen: das Verdikt ([`EvidenceState`]), die Erklärung (Epochen,
+/// Coverage, Signatur-Lage) und die kryptographischen Details (Seal-Ids,
+/// Roots je Epoche). Keine Oberfläche rechnet selbst — sie rendert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceReport {
+    /// Das verdichtete Verdikt — identisch mit `Provenance::Chained`.
+    pub state: EvidenceState,
+    /// Die Beobachtungsgrenze, sofern Seals vorliegen. Coverage ist immer
+    /// gescoped: „vollständig" heißt vollständig **innerhalb** dieser
+    /// Grenze, nie „alle Systemaktivität".
+    pub scope: Option<String>,
+    /// Die Epochen in Ablage-Reihenfolge.
+    pub epochs: Vec<EpochReport>,
+    /// Was das Proof-Modell **nicht** belegt — das kanonische Vokabular
+    /// ([`minds_core::evidence::DOES_NOT_PROVE`]), Teil des Reports, damit
+    /// die Grenze in jeder Oberfläche steht.
+    pub limitations: &'static [&'static str],
+}
+
+impl EvidenceReport {
+    /// Der Leitsatz über allem — nie mehr behaupten, als das Verdikt trägt:
+    /// „verifiziert" gilt immer nur **innerhalb** der Beobachtungsgrenze.
+    pub fn sentence(&self) -> &'static str {
+        match self.state.verdict {
+            EvidenceVerdict::Verified => {
+                "Kryptographisch verifiziert innerhalb der aufgezeichneten Beobachtungsgrenze."
+            }
+            EvidenceVerdict::Tampered => {
+                "Seal-Material verändert — die kryptographische Verifikation schlägt fehl."
+            }
+            EvidenceVerdict::Incomplete => {
+                "Evidence unvollständig — Minds kann nicht belegen, was in den fehlenden Bereichen geschah."
+            }
+        }
+    }
+}
+
 /// Warum eine Kante Commit ↔ Session im Index steht.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceExplanation {

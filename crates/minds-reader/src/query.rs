@@ -131,6 +131,14 @@ impl Inspection {
         self.index.rejected_seals()
     }
 
+    /// Der Evidence-Report einer Session — Verdikt, Epochen, Coverage,
+    /// Signatur-Lage und Grenzen, fertig gerechnet (Semantik von
+    /// `minds verify`). `None` heißt Legacy, nie „Bug". Die TUI rendert
+    /// das nur; sie rechnet nichts nach.
+    pub fn evidence_report(&self, id: SessionId) -> Option<crate::model::EvidenceReport> {
+        self.index.evidence_report(id)
+    }
+
     /// Die Kopfzeile.
     pub fn header(&self) -> Header {
         let mut changes: Vec<&minds_core::ChangeId> = self

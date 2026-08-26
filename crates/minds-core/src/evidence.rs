@@ -555,6 +555,42 @@ pub enum SealParseError {
 }
 
 // ---------------------------------------------------------------------------
+// Das Proof-Vokabular
+// ---------------------------------------------------------------------------
+
+/// Was das Proof-Modell belegt — das **kanonische Vokabular**, das
+/// `minds audit --export` (`proves`), die TUI und die Doku gemeinsam
+/// sprechen. Eine Quelle, drei Oberflächen: Wer hier einen Satz ändert,
+/// ändert die Zusage überall — und nirgends kann eine Oberfläche mehr
+/// behaupten als die andere.
+pub const PROVES: &[&str] = &[
+    "Jede Session-Id ist der blake3-Hash ihres kanonischen Inhalts — der Inhalt lässt sich gegen sie nachrechnen.",
+    "Der attestation_payload ist byte-genau der Text, über den `minds sign` signiert; eine mitgelieferte Signatur ist dagegen prüfbar.",
+    "Der review_payload bindet den Hash des Verdicts; eine gültige Signatur darüber weist aus, wer geprüft hat.",
+    "Verdicts hängen an der Change-Id und überleben damit Rebase und Force-Push.",
+    "Eine getilgte Session bleibt als Referenz sichtbar (payload: forgotten) — Löschung ist nachweisbar, nicht spurlos.",
+    "Seal-Identität und -Signatur sind extern prüfbar: seal_id = blake3::derive_key(\"minds/evidence/v1/seal\", text). Der Seal committed kryptographisch auf Chain-Root und Coverage; die zugrunde liegende Chain ist nur mit lokalem Journal und Session-Salt reproduzierbar (ADR-0011).",
+    "Ein Block-Seal (rejected_seals) beweist, dass eine Session existierte, deren Nutzlast die Speicher-Policy zurückwies — ohne ihren Inhalt preiszugeben.",
+];
+
+/// Was das Proof-Modell **nicht** belegt — dieselbe Quelle wie [`PROVES`].
+/// Die Grenzen gehören in jedes Artefakt (Audit-Bundle, TUI), nicht nur in
+/// die Doku, die beim Weiterreichen zurückbleibt.
+pub const DOES_NOT_PROVE: &[&str] = &[
+    "Nicht, dass der Record vollständig ist: Der heiße Pfad ist fail-open, ein verlorenes Event fehlt hier stillschweigend (`minds fsck` macht Lücken sichtbar).",
+    "Nicht, dass eine Session tatsächlich die genannten Zeilen erzeugt hat — die Zuordnung stammt aus Trailern (beobachtet) und Heuristik (vermutet); die Herkunft steht an jeder Kante.",
+    "Nicht, dass ein Modell das getan hat, was im Transkript steht — aufgezeichnet ist, was der Agent gemeldet hat.",
+    "Nicht, wer die Signaturschlüssel kontrolliert. Ohne eine allowed_signers-Datei aus vertrauenswürdiger Quelle ist eine Signatur nur eine Selbstauskunft.",
+    "Nicht, dass unsignierte Einträge echt sind: Sie sind content-adressiert, aber niemand steht mit einem Schlüssel dafür ein.",
+    "Nicht, dass das Bündel allein die Chain nachrechnen kann: Der Chain-Root ist nur mit lokalem Journal und Session-Salt reproduzierbar — das Bündel beweist den versiegelten Claim (Identität, Signatur, Coverage), nicht die Chain selbst.",
+    "Nicht, dass außerhalb versiegelter Bereiche nichts geschah — ein Seal claimt nur den tatsächlich gelesenen Sequenzbereich seiner Epoche.",
+    "Nicht die Integrität zwischen Append und Seal: Bis zum Checkpoint schützt nur das Dateisystem; ein lokaler Schreibzugriff vor der Versiegelung ist nicht erkennbar (ADR-0011, Entscheidung 1).",
+    "Nicht, dass der Agent-Prozess der einzige Akteur war: Subprozesse, Netzwerkzugriffe und Plugins außerhalb der Hook-Grenze (scope im Seal) sind nicht erfasst — Coverage heißt vollständig innerhalb der Grenze, nie Systemaktivität.",
+    "Nicht die Wirkung ungedeuteter Tool-Aufrufe: capture=uninterpreted heißt beobachtet, aber die Effekte sind nicht normalisiert — die Deutungs-Achse ist von Integrität und Coverage getrennt.",
+    "Nicht die reale Uhrzeit: Zeitstempel stammen von der lokalen Uhr des Hooks, ohne externen Zeitanker.",
+];
+
+// ---------------------------------------------------------------------------
 // Kodierung
 // ---------------------------------------------------------------------------
 
