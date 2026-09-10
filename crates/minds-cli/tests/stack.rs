@@ -115,8 +115,8 @@ fn the_stack_follows_the_configured_upstream() {
     let out = minds(dir, &["stack"]);
     assert!(out.status.success(), "{}", text(&out));
     let shown = text(&out);
-    assert!(shown.contains("Stapel auf base"), "{shown}");
-    assert!(shown.contains("1 Change"), "{shown}");
+    assert!(shown.contains("Stack on base"), "{shown}");
+    assert!(shown.contains("1 change(s)"), "{shown}");
 }
 
 #[test]
@@ -150,12 +150,12 @@ fn the_stack_shows_each_change_with_its_own_verdict() {
     let listing = text(&out);
 
     // Drei Changes, jeder mit seinem eigenen Stand.
-    assert!(listing.contains("3 Change(s)"), "{listing}");
+    assert!(listing.contains("3 change(s)"), "{listing}");
     assert!(listing.contains("approve"), "{listing}");
     assert!(listing.contains("needs-work"), "{listing}");
-    assert!(listing.contains("kein Verdict"), "{listing}");
-    assert!(listing.contains("1 Kommentar"), "{listing}");
-    assert!(listing.contains("1 von 3 approbiert"), "{listing}");
+    assert!(listing.contains("no verdict"), "{listing}");
+    assert!(listing.contains("1 comment"), "{listing}");
+    assert!(listing.contains("1 of 3 approved"), "{listing}");
 }
 
 #[test]
@@ -222,7 +222,7 @@ fn a_force_push_of_the_stack_keeps_every_verdict() {
     assert!(listing.contains("approve"), "{listing}");
     assert!(listing.contains("needs-work"), "{listing}");
     assert!(
-        !listing.contains("kein Verdict"),
+        !listing.contains("no verdict"),
         "ein Verdict ist beim Force-Push verloren gegangen:\n{listing}"
     );
 

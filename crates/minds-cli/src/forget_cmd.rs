@@ -43,7 +43,7 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Führt `minds forget` aus. `target` ist die volle Session-Id (`b3-…`).
 pub fn run(target: Option<&str>, reason: Option<&str>) -> ExitCode {
     let Some(target) = target else {
-        eprintln!("minds forget: erwartet <session-id> (b3-…, etwa aus `minds show`)");
+        eprintln!("minds forget: expected <session-id> (b3-…, e.g. from `minds show`)");
         return ExitCode::FAILURE;
     };
     match forget(target, reason.unwrap_or(tombstone::DEFAULT_REASON)) {
@@ -58,7 +58,7 @@ pub fn run(target: Option<&str>, reason: Option<&str>) -> ExitCode {
 fn forget(target: &str, reason: &str) -> Fallible<()> {
     let id: SessionId = target
         .parse()
-        .map_err(|err| format!("keine gültige Session-Id {target:?}: {err}"))?;
+        .map_err(|err| format!("not a valid session id {target:?}: {err}"))?;
 
     let ctx = Context::open()?;
     // Dasselbe Lock wie `minds sync` (#102): Tilgte `forget` mitten in einem
@@ -79,19 +79,19 @@ fn forget(target: &str, reason: &str) -> Fallible<()> {
         }
     }
     let Some(_lock) = lock else {
-        return Err("ein `minds sync` läuft gerade — bitte gleich erneut versuchen".into());
+        return Err("a `minds sync` is running right now — please try again shortly".into());
     };
     match ctx.store.forget(id, reason)? {
         forget @ Forget::Forgotten(id, _) => {
-            println!("vergessen: {id}");
-            println!("  Grund: {reason}");
-            println!("  Getilgt an:");
+            println!("forgotten: {id}");
+            println!("  Reason: {reason}");
+            println!("  Purged from:");
             for place in forget.places() {
                 println!("    - {}", place.label());
             }
             println!(
-                "  Die Referenzen bleiben auflösbar; der Klartext ist als elternloser Tombstone \
-                 gelöscht — auch aus der Historie, nicht nur aus dem aktuellen Stand."
+                "  The references remain resolvable; the plaintext is deleted as a parentless \
+                 tombstone — gone from history too, not just from the current state."
             );
             // Die Remote-Zusage gilt nur für die session-exklusiven Orte, die
             // `sync` per Force-Push nachziehen darf. Lag die Session (auch) im
@@ -103,8 +103,8 @@ fn forget(target: &str, reason: &str) -> Fallible<()> {
                 .any(|p| matches!(p, ForgottenPlace::StoreRef | ForgottenPlace::SessionBranch))
             {
                 println!(
-                    "  Ein bereits auf die Forge gepushter Session-Ref wird beim nächsten Push \
-                     (oder `minds sync`) gezielt per Force-Push nachgezogen."
+                    "  A session ref already pushed to the forge is brought up to date with a \
+                     targeted force-push on the next push (or `minds sync`)."
                 );
             }
             if places
@@ -112,14 +112,14 @@ fn forget(target: &str, reason: &str) -> Fallible<()> {
                 .any(|p| matches!(p, ForgottenPlace::ContextTree))
             {
                 println!(
-                    "  Der geteilte Kontext-Ref (Bestandsformat) wird nie force-gepusht; war er \
-                     schon auf der Forge, ist seine Remote-Historie von Hand nachzuziehen."
+                    "  The shared context ref (legacy format) is never force-pushed; if it was \
+                     already on the forge, its remote history must be updated by hand."
                 );
             }
         }
         Forget::Absent(id) => {
-            println!("nichts zu vergessen: {id}");
-            println!("  liegt nicht im Store oder wurde bereits vergessen.");
+            println!("nothing to forget: {id}");
+            println!("  not in the store, or already forgotten.");
         }
     }
     Ok(())

@@ -77,9 +77,9 @@ impl EpochState {
         let dir = file.parent().expect("Datei liegt unter state/");
         journal::create_dir_private(&self.root, dir)?;
         let tmp = file.with_extension("tmp");
-        journal::write_private(&tmp, format!("{seal_id}\n").as_bytes(), "Epoche schreiben")?;
+        journal::write_private(&tmp, format!("{seal_id}\n").as_bytes(), "writing epoch")?;
         fs::rename(&tmp, &file)
-            .map_err(|e| crate::error::CaptureError::io("Epoche umbenennen", &file, e))?;
+            .map_err(|e| crate::error::CaptureError::io("renaming epoch", &file, e))?;
         Ok(())
     }
 
@@ -129,9 +129,9 @@ impl EpochState {
         journal::create_dir_private(&self.root, dir)?;
         let salt = random_salt();
         let tmp = file.with_extension("salt.tmp");
-        journal::write_private(&tmp, &salt, "Salt schreiben")?;
+        journal::write_private(&tmp, &salt, "writing salt")?;
         fs::rename(&tmp, &file)
-            .map_err(|e| crate::error::CaptureError::io("Salt umbenennen", &file, e))?;
+            .map_err(|e| crate::error::CaptureError::io("renaming salt", &file, e))?;
         Ok(salt)
     }
 

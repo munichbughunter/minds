@@ -279,56 +279,56 @@ fn is_forbidden_in_model(c: char) -> bool {
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum AttributionError {
     /// Mehr Agent- als Gesamtzeilen — unmöglich.
-    #[error("agent-Zeilen ({agent}) übersteigen Gesamtzeilen ({total})")]
+    #[error("agent lines ({agent}) exceed total lines ({total})")]
     AgentExceedsTotal { agent: u32, total: u32 },
 
     /// Der Modell-Provider war leer.
-    #[error("Modell-Provider darf nicht leer sein")]
+    #[error("model provider must not be empty")]
     EmptyModelProvider,
 
     /// Die Modell-Id war leer.
-    #[error("Modell-Id darf nicht leer sein")]
+    #[error("model id must not be empty")]
     EmptyModelId,
 
     /// Der Provider enthielt ein `/` (die Textform trennt `provider/id` am
     /// ersten `/`, deshalb muss der Provider frei davon sein).
-    #[error("Modell-Provider darf kein '/' enthalten: {0:?}")]
+    #[error("model provider must not contain '/': {0:?}")]
     ProviderHasSlash(String),
 
     /// Ein Modell-Feld enthielt Leerraum oder Steuerzeichen.
-    #[error("Modell-Feld darf keinen Leerraum und keine Steuerzeichen enthalten: {0:?}")]
+    #[error("model field must not contain whitespace or control characters: {0:?}")]
     ModelHasWhitespace(String),
 
     /// Ein Token der Wertform hatte kein `=`.
-    #[error("Attribution-Token ohne '=': {0:?}")]
+    #[error("attribution token without '=': {0:?}")]
     MalformedToken(String),
 
     /// Ein Feldschlüssel war keiner der erwarteten (`session`, `model`, `agent`).
-    #[error("unbekanntes Attribution-Feld: {0:?}")]
+    #[error("unknown attribution field: {0:?}")]
     UnknownField(String),
 
     /// Ein Pflichtfeld kam mehr als einmal vor.
-    #[error("doppeltes Attribution-Feld: {0}")]
+    #[error("duplicate attribution field: {0}")]
     DuplicateField(&'static str),
 
     /// Ein Pflichtfeld fehlte.
-    #[error("fehlendes Attribution-Feld: {0}")]
+    #[error("missing attribution field: {0}")]
     MissingField(&'static str),
 
     /// Die Modell-Angabe war nicht `provider/id`.
-    #[error("ungültige Modell-Angabe (erwartet provider/id): {0:?}")]
+    #[error("invalid model spec (expected provider/id): {0:?}")]
     MalformedModel(String),
 
     /// Die Zeilen-Angabe war nicht `agent/total`.
-    #[error("ungültige Zeilen-Angabe (erwartet agent/total): {0:?}")]
+    #[error("invalid line spec (expected agent/total): {0:?}")]
     MalformedCounts(String),
 
     /// Ein Zeilen-Zähler war keine gültige u32.
-    #[error("ungültige Zahl in Zeilen-Angabe: {0:?}")]
+    #[error("invalid number in line spec: {0:?}")]
     InvalidCount(String),
 
     /// Die `session`-Angabe war keine gültige [`SessionId`].
-    #[error("ungültige SessionId in Attribution: {0}")]
+    #[error("invalid SessionId in attribution: {0}")]
     Session(#[from] SessionIdParseError),
 }
 

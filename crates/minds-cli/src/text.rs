@@ -276,7 +276,7 @@ mod tests {
         for message in [
             "fatal: Authentication failed for 'https://gitlab.com/team/repo.git/'",
             "fatal: '/gibt/es/nicht.git' does not appear to be a git repository",
-            "kein Doppelpunkt-Schrägstrich hier, aber ein @ mittendrin",
+            "kein Doppelpunkt-Strich hier, aber ein @ mittendrin",
             "https://gitlab.com/team/repo.git",
             // Query-Parameter, die keine Zugangsdaten sind.
             "GET https://gitlab.com/api/v4/projects?per_page=100&page=2 -> 200",

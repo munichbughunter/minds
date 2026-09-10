@@ -144,8 +144,8 @@ impl ContextStore for ChildRepoStore {
         self.0.put_seal(text)
     }
 
-    fn seal_text(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
-        self.0.seal_text(id)
+    fn seal_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.seal_bytes(id)
     }
 
     fn record_session_seal(
@@ -744,7 +744,7 @@ mod tests {
         // Die Meldung benennt den offenen Ort und rät zum erneuten forget.
         let message = err.to_string();
         assert!(
-            message.contains("Session-Branch") && message.contains("erneut"),
+            message.contains("session branch") && message.contains("again"),
             "Meldung ohne offenen Ort oder Rat: {message}"
         );
 

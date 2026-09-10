@@ -174,13 +174,13 @@ impl Inspection {
                     CardState::Forgotten {
                         reason: reason.clone(),
                     },
-                    format!("vergessen: {reason}"),
+                    format!("forgotten: {reason}"),
                 ),
                 cause => (
                     CardState::Unreadable {
                         cause: cause.clone(),
                     },
-                    format!("unlesbar ({})", degradation_word(cause)),
+                    format!("unreadable ({})", degradation_word(cause)),
                 ),
             };
             SessionCard {
@@ -504,12 +504,12 @@ impl Inspection {
 
 fn degradation_word(cause: &Degradation) -> &'static str {
     match cause {
-        Degradation::Forgotten { .. } => "vergessen",
-        Degradation::Corrupt => "Hash passt nicht",
-        Degradation::Malformed => "kein gültiges JSON",
-        Degradation::Unredacted => "nicht redigiert",
-        Degradation::Missing => "nicht auflösbar",
-        Degradation::Failed { .. } => "Lesefehler",
+        Degradation::Forgotten { .. } => "forgotten",
+        Degradation::Corrupt => "hash mismatch",
+        Degradation::Malformed => "not valid JSON",
+        Degradation::Unredacted => "not redacted",
+        Degradation::Missing => "unresolvable",
+        Degradation::Failed { .. } => "read error",
     }
 }
 
@@ -615,7 +615,7 @@ mod tests {
         let ids: Vec<SessionId> = cards.iter().map(|c| c.id).collect();
         assert_eq!(ids, vec![sid('b'), sid('a'), sid('c'), sid('d')]);
         assert!(cards[3].is_degraded());
-        assert_eq!(cards[3].summary.headline, "vergessen: DSGVO");
+        assert_eq!(cards[3].summary.headline, "forgotten: DSGVO");
         assert_eq!(cards[3].epoch, None);
     }
 

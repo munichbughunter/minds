@@ -193,7 +193,7 @@ loss is a finding, not something to repair.
 
 **4. Reading the verdict.** `gaps=0`, `pre_chain=0`, `outcome=stored`, and an
 epoch chain closed via `previous=` ⇒ complete. Everything else is
-`VERIFIZIERT, UNVOLLSTÄNDIG` (verified, incomplete) — and `minds verify
+`VERIFIED, INCOMPLETE` — and `minds verify
 <session-id>` says the same with exit codes (0 verified, 1 tampered,
 2 incomplete, 3 not verifiable); for CI gates additionally
 `minds fsck --require-seal`.

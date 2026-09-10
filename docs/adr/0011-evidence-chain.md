@@ -56,9 +56,9 @@ More precisely, there are **three trust axes** that are never blended into one s
 
 An unknown tool is an **interpretation** problem, a hook failure a **coverage** problem, a
 modified journal an **integrity** problem. `minds verify` states the three axes separately
-(`Integrität` / `Coverage` / `Deutung` / `Gesamt` — integrity / coverage / interpretation /
-overall); the exit codes remain the CI contract from integrity × coverage — interpretation
-never upgrades or downgrades the verdict.
+(`Integrity` / `Coverage` / `Interpretation` / `Overall`); the exit codes remain the CI
+contract from integrity × coverage — interpretation never upgrades or downgrades the
+verdict.
 
 ## Decision 1: Evidence hashes in the hot path, chaining at seal time
 
@@ -220,15 +220,14 @@ the matrix integrity × coverage:
 
 | | Coverage complete | Coverage incomplete/unknown |
 |---|---|---|
-| Integrity intact | `VERIFIZIERT` (verified) | `VERIFIZIERT, UNVOLLSTÄNDIG` (verified, incomplete) |
-| Integrity violated | `MANIPULIERT` (tampered) | `MANIPULIERT` (tampered) |
-| No material | — | `NICHT VERIFIZIERBAR` (not verifiable) |
+| Integrity intact | `VERIFIED` | `VERIFIED, INCOMPLETE` |
+| Integrity violated | `TAMPERED` | `TAMPERED` |
+| No material | — | `NOT VERIFIABLE` |
 
-Exit codes (CI contract): **0** VERIFIZIERT · **1** MANIPULIERT · **2** VERIFIZIERT,
-UNVOLLSTÄNDIG · **3** NICHT VERIFIZIERBAR. Coverage complete ⇔ `gaps=0 ∧ pre_chain=0 ∧
-outcome=stored ∧` epoch chain closed. A legacy session without a seal is `NICHT
-VERIFIZIERBAR (vor Evidence-Chain erfasst)` — not verifiable, captured before the Evidence
-Chain: a state, not an error. `fsck` gets the counterparts: hash recomputation of journals
+Exit codes (CI contract): **0** VERIFIED · **1** TAMPERED · **2** VERIFIED,
+INCOMPLETE · **3** NOT VERIFIABLE. Coverage complete ⇔ `gaps=0 ∧ pre_chain=0 ∧
+outcome=stored ∧` epoch chain closed. A legacy session without a seal is `NOT
+VERIFIABLE` (captured before the evidence chain): a state, not an error. `fsck` gets the counterparts: hash recomputation of journals
 at rest and seal checking as **findings**, `--require-seal` as a gate analogous to
 `--require-review`.
 

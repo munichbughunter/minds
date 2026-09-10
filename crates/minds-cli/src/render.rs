@@ -115,7 +115,7 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
 
         // Herkunft, dezent.
         let files = s.produced.files.len();
-        let fileword = if files == 1 { "Datei" } else { "Dateien" };
+        let fileword = if files == 1 { "file" } else { "files" };
         println!(
             "{cont}{}",
             dim(&format!(
@@ -143,24 +143,21 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
                 println!("{cont}  Constraint: {}", prose(constraint));
             }
             for discarded in &s.intent.discarded {
-                println!("{cont}  Verworfen:  {}", prose(discarded));
+                println!("{cont}  Discarded:  {}", prose(discarded));
             }
             for file in &s.produced.files {
                 println!("{cont}  {}", sanitize_path(file));
             }
             for edge in &s.edges {
                 println!(
-                    "{cont}  Kante: {} → {} ({})",
+                    "{cont}  Edge: {} → {} ({})",
                     edge_kind(edge.kind),
                     endpoint(&edge.to),
                     evidence(edge.evidence.into()),
                 );
             }
         } else if files > 0 {
-            println!(
-                "{cont}{}",
-                dim("minds show --full zeigt Dateien und Prompt")
-            );
+            println!("{cont}{}", dim("minds show --full shows files and prompt"));
         }
     }
 }
@@ -199,13 +196,13 @@ pub fn show_links(
     if owned.is_empty() {
         println!("{}", bold(&sanitize_path(header)));
         for reason in &forgotten {
-            println!("   {}", dim(&format!("vergessen ({})", sanitize(reason))));
+            println!("   {}", dim(&format!("forgotten ({})", sanitize(reason))));
         }
         if forgotten.is_empty() {
             let note = if orphans > 0 {
-                format!("{orphans} Verweis(e) ins Leere — siehe minds fsck")
+                format!("{orphans} dangling reference(s) — see minds fsck")
             } else {
-                "kein Minds-Kontext für diesen Commit".to_string()
+                "no Minds context for this commit".to_string()
             };
             println!("   {}", dim(&note));
         }
@@ -223,10 +220,10 @@ pub fn show_links(
     tree(header, &shown, full);
 
     if orphans > 0 {
-        println!("   {}", dim(&format!("+ {orphans} Verweis(e) ins Leere")));
+        println!("   {}", dim(&format!("+ {orphans} dangling reference(s)")));
     }
     for reason in &forgotten {
-        println!("   {}", dim(&format!("+ vergessen ({})", sanitize(reason))));
+        println!("   {}", dim(&format!("+ forgotten ({})", sanitize(reason))));
     }
     Ok(())
 }
@@ -284,10 +281,10 @@ fn edge_kind(kind: EdgeKind) -> &'static str {
 
 fn evidence(evidence: Evidence) -> &'static str {
     match evidence {
-        Evidence::Observed => "beobachtet",
-        Evidence::Content => "inhaltlich",
-        Evidence::Declared => "erklärt",
-        Evidence::Inferred => "vermutet",
+        Evidence::Observed => "observed",
+        Evidence::Content => "content",
+        Evidence::Declared => "declared",
+        Evidence::Inferred => "inferred",
     }
 }
 

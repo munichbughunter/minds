@@ -76,8 +76,8 @@ impl Degradation {
     /// Ein kurzes Wort für die Anzeige: `vergessen` oder `unlesbar`.
     pub fn word(&self) -> &'static str {
         match self {
-            Degradation::Forgotten { .. } => "vergessen",
-            _ => "unlesbar",
+            Degradation::Forgotten { .. } => "forgotten",
+            _ => "unreadable",
         }
     }
 
@@ -335,6 +335,14 @@ impl Index {
             );
         }
         self.seals.entry(id).or_default().extend(seals);
+        self
+    }
+
+    /// Markiert eine Session als seal-manipuliert — für Tests, die das
+    /// TAMPERED-Verdikt ohne Store prüfen (im Betrieb setzt das
+    /// ausschließlich `load_seals`, wenn der Store-Read scheitert).
+    pub fn with_tampered_seal(mut self, id: SessionId) -> Self {
+        self.seal_tampered.insert(id);
         self
     }
 
@@ -1108,7 +1116,11 @@ mod tests {
         // Die Grenzen sind Teil des Reports — dasselbe Vokabular wie das
         // Audit-Bundle, nie eine eigene Liste.
         assert_eq!(report.limitations, minds_core::evidence::DOES_NOT_PROVE);
-        assert!(report.sentence().contains("innerhalb der aufgezeichneten"));
+        assert!(
+            report
+                .sentence()
+                .contains("within the recorded observation boundary")
+        );
         // Und das Verdikt ist DASSELBE Objekt wie evidence_state.
         assert_eq!(index.evidence_state(sid), Some(report.state));
     }
@@ -1141,7 +1153,7 @@ mod tests {
             .with_seals(sid, vec![seal_for(sid, 0, Some(dangling))]);
         let report = index.evidence_report(sid).unwrap();
         assert_eq!(report.epochs[0].link, crate::model::EpochLink::Unresolved);
-        assert!(report.sentence().contains("unvollständig"));
+        assert!(report.sentence().contains("incomplete"));
 
         // Ein Block-Seal mit anderem Root als Vorgaenger ⇒ RejectedBefore.
         let other: SessionId = format!("b3-{}", "b".repeat(64)).parse().unwrap();
@@ -1336,9 +1348,9 @@ mod tests {
             },
         ]);
         assert_eq!(index.unreadable(), 2);
-        assert_eq!(index.degraded()[0].cause.word(), "vergessen");
+        assert_eq!(index.degraded()[0].cause.word(), "forgotten");
         assert!(index.degraded()[0].cause.is_forgotten());
-        assert_eq!(index.degraded()[1].cause.word(), "unlesbar");
+        assert_eq!(index.degraded()[1].cause.word(), "unreadable");
         // Degradierte sind keine Sessions.
         assert_eq!(index.len(), 2);
         assert!(index.session(id('d')).is_none());

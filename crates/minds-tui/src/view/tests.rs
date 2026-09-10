@@ -172,7 +172,7 @@ fn the_empty_state_points_to_enable() {
     let (_dir, repo) = repo();
     let mut app = App::new(Inspection::default(), &repo, None);
     let out = render(&mut app);
-    assert!(out.contains("Noch keine Sessions erfasst."), "{out}");
+    assert!(out.contains("No sessions captured yet."), "{out}");
     assert!(out.contains("minds enable"), "{out}");
     assert!(out.contains("0 Sessions"), "{out}");
 }
@@ -183,25 +183,31 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     let mut app = App::new(filled(), &repo, None);
     let out = render(&mut app);
     assert!(out.contains("MINDS payment-service"), "{out}");
+    // Die Tabelle traegt Spaltenkoepfe und Rahmen-Titel (Demo-Politur):
+    // die Beweisspalten sind ohne Legende lesbar.
+    assert!(out.contains(" SESSIONS "), "{out}");
+    for header in ["TIME", "AGENT", "SIZE", "SEAL", "VERDICT"] {
+        assert!(out.contains(header), "{header} fehlt: {out}");
+    }
     assert!(out.contains("2 Sessions · 1 Changes"), "{out}");
-    assert!(out.contains("1 degradiert"), "{out}");
+    assert!(out.contains("1 degraded"), "{out}");
     let fix = out.find("Fix retry handling").unwrap();
     let backoff = out.find("Add exponential backoff").unwrap();
     let forgotten = out
-        .find("vergessen: DSGVO")
+        .find("forgotten: DSGVO")
         .unwrap_or_else(|| panic!("{out}"));
     assert!(fix < backoff && backoff < forgotten, "{out}");
     // Die Verdikt-Spalte (ADR-0011): Session a ist versiegelt, b nicht.
-    assert!(out.contains("◈ versiegelt"), "{out}");
+    assert!(out.contains("◈ sealed"), "{out}");
     // Session b hat keine Seals: explizit LEGACY, kein leeres Nichts.
     assert!(out.contains("· legacy"), "{out}");
     // Der Kanten-Beleg als Glyph mit Status-Modifikator — beobachtet heisst
     // nicht geprueft.
     assert!(out.contains("● ?"), "{out}");
     assert!(out.contains("↻ needs work"), "{out}");
-    assert!(out.contains("⌦ vergessen"), "{out}");
+    assert!(out.contains("⌦ forgotten"), "{out}");
     assert!(out.contains("25.07. 14:10Z"), "{out}");
-    assert!(out.contains("Kontext-Abdeckung"), "{out}");
+    assert!(out.contains("context coverage"), "{out}");
 }
 
 #[test]
@@ -214,7 +220,7 @@ fn the_search_filters_live_and_shows_its_chip() {
     }
     let out = render(&mut app);
     assert!(out.contains("/backoff"), "{out}");
-    assert!(out.contains("1/3 Treffer"), "{out}");
+    assert!(out.contains("1/3 match(es)"), "{out}");
     assert!(out.contains("Add exponential backoff"), "{out}");
     assert!(!out.contains("Fix retry handling"), "{out}");
     app.reduce(Action::SearchCommit);
@@ -223,13 +229,13 @@ fn the_search_filters_live_and_shows_its_chip() {
     app.reduce(Action::Back);
     assert!(app.query.is_empty());
     assert_eq!(app.visible.len(), 3);
-    // Kein Treffer ist ein Zustand, kein Fehler.
+    // No match ist ein Zustand, kein Fehler.
     app.reduce(Action::SearchStart);
     for c in "nirgends".chars() {
         app.reduce(Action::SearchInput(c));
     }
     let out = render(&mut app);
-    assert!(out.contains("Kein Treffer"), "{out}");
+    assert!(out.contains("No match"), "{out}");
 }
 
 #[test]
@@ -278,7 +284,7 @@ fn the_timeline_is_the_same_rows_without_the_tree() {
     app.reduce(Action::Enter);
     app.reduce(Action::ToggleTimeline);
     let out = render(&mut app);
-    assert!(out.contains("ZEITLEISTE"), "{out}");
+    assert!(out.contains("TIMELINE"), "{out}");
     assert!(!out.contains("┣━"), "{out}");
     assert!(out.contains("25.07. 14:10Z"), "{out}");
 }
@@ -291,24 +297,30 @@ fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
     app.reduce(Action::Why);
     assert!(matches!(app.top(), Some(View::Why { .. })));
     let out = render(&mut app);
-    // Session b ist nicht versiegelt — das Glied traegt seit ADR-0011 eine
+    // Session b ist is not sealed — das Glied traegt seit ADR-0011 eine
     // ehrliche Luecke (UnsealedRange), zusaetzlich zur fehlenden Bewertung.
     assert!(out.contains("⚠ SESSION"), "{out}");
     assert!(out.contains("✓ AGENT"), "{out}");
     assert!(out.contains("✓ INTENT"), "{out}");
-    assert!(out.contains("Add exponential backoff"), "{out}");
-    assert!(out.contains("✓ EVIDENCE"), "{out}");
-    assert!(out.contains("keine Kante"), "{out}");
-    assert!(out.contains("offen"), "{out}");
-    // Lücken sind First-Class: je Glied ✓/⚠, unten der Block mit Begründung.
-    assert!(out.contains("⚠ REVIEW"), "{out}");
-    assert!(out.contains(" 2 LÜCKEN "), "{out}");
-    assert!(out.contains("nicht versiegelt"), "{out}");
+    // Aussage != Beweis (ADR-0011): der Intent-Text traegt das CLAIM-Label,
+    // die observed-Kanten daneben bleiben das einzige Beweismittel.
     assert!(
-        out.contains("Keine Bewertung — niemand hat diese Änderung entschieden."),
+        out.contains("◌ CLAIM — as recorded, not verified evidence"),
         "{out}"
     );
-    assert!(out.contains("⚠ 2 Lücken in der Kette"), "{out}");
+    assert!(out.contains("Add exponential backoff"), "{out}");
+    assert!(out.contains("✓ EVIDENCE"), "{out}");
+    assert!(out.contains("no edge"), "{out}");
+    assert!(out.contains("open"), "{out}");
+    // Lücken sind First-Class: je Glied ✓/⚠, unten der Block mit Begründung.
+    assert!(out.contains("⚠ REVIEW"), "{out}");
+    assert!(out.contains(" 2 GAPS "), "{out}");
+    assert!(out.contains("is not sealed"), "{out}");
+    assert!(
+        out.contains("No review — nobody has decided on this change."),
+        "{out}"
+    );
+    assert!(out.contains("⚠ 2 gaps in the chain"), "{out}");
 }
 
 #[test]
@@ -317,9 +329,9 @@ fn a_fully_backed_chain_says_so_and_focus_explains_the_evidence_without_enter() 
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Why); // „Fix retry handling" — Trailer, Change-Id, Review
     let out = render(&mut app);
-    assert!(out.contains(" KEINE LÜCKE "), "{out}");
+    assert!(out.contains(" NO GAP "), "{out}");
     assert!(out.contains("✓ EVIDENCE"), "{out}");
-    assert!(out.contains("✓ keine Lücke"), "{out}");
+    assert!(out.contains("✓ no gap"), "{out}");
     assert!(!out.contains("WHY IS THIS LINKED?"), "{out}");
     // Cursor auf das Evidence-Glied: Session, Agent, Intent, Evidence.
     for _ in 0..3 {
@@ -327,8 +339,11 @@ fn a_fully_backed_chain_says_so_and_focus_explains_the_evidence_without_enter() 
     }
     let out = render(&mut app);
     assert!(out.contains("WHY IS THIS LINKED?"), "{out}");
-    assert!(out.contains("expliziter Herkunftsnachweis"), "{out}");
-    assert!(out.contains("trägt den Trailer Minds-Session-Id"), "{out}");
+    assert!(out.contains("explicit provenance record"), "{out}");
+    assert!(
+        out.contains("carries the Minds-Session-Id trailer"),
+        "{out}"
+    );
 }
 
 #[test]
@@ -336,19 +351,16 @@ fn the_list_footer_says_what_the_focused_evidence_means() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     let out = render(&mut app);
-    assert!(
-        out.contains("Beobachtet: Der Commit trägt den Trailer"),
-        "{out}"
-    );
+    assert!(out.contains("Observed: the commit carries the"), "{out}");
     app.reduce(Action::Down);
     let out = render(&mut app);
     assert!(
-        out.contains("Unverknüpft: Diese Session hängt an keinem Commit"),
+        out.contains("Unlinked: this session is attached to no commit"),
         "{out}"
     );
     app.reduce(Action::End);
     let out = render(&mut app);
-    assert!(out.contains("Degradiert:"), "{out}");
+    assert!(out.contains("Degraded:"), "{out}");
 }
 
 #[test]
@@ -360,8 +372,8 @@ fn a_change_node_in_the_graph_explains_its_proof() {
     app.reduce(Action::Up); // Review → Change
     let out = render(&mut app);
     assert!(out.contains(" CHANGE "), "{out}");
-    assert!(out.contains("Beleg      ● ? observed [ungeprüft]"), "{out}");
-    assert!(out.contains("expliziter Herkunftsnachweis"), "{out}");
+    assert!(out.contains("Evidence   ● ? observed [unchecked]"), "{out}");
+    assert!(out.contains("explicit provenance record"), "{out}");
 }
 
 #[test]
@@ -376,10 +388,13 @@ fn the_inspector_explains_the_focused_edge() {
     }
     let out = render(&mut app);
     assert!(out.contains("WHY IS THIS LINKED?"), "{out}");
-    assert!(out.contains("● ? observed [ungeprüft]"), "{out}");
-    assert!(out.contains("trägt den Trailer Minds-Session-Id"), "{out}");
+    assert!(out.contains("● ? observed [unchecked]"), "{out}");
+    assert!(
+        out.contains("carries the Minds-Session-Id trailer"),
+        "{out}"
+    );
     // Der Satz kann am Zeilenumbruch brechen — kurzer, stabiler Anker.
-    assert!(out.contains("Status: nie"), "{out}");
+    assert!(out.contains("Status: never"), "{out}");
     // Der Hinweis steht an der Kante und verspricht die echte Aktion.
     assert!(out.contains("Enter ↵ Commit"), "{out}");
     // Esc schließt den Inspector; weg vom Evidence-Glied bleibt er zu.
@@ -483,10 +498,10 @@ fn an_inferred_edge_never_looks_like_an_observed_one() {
     let (glyph, word, _) =
         crate::theme::evidence(Some(EvidenceMark::of(EvidenceSource::Heuristic)));
     assert_eq!(glyph, "○ ?");
-    assert!(word.contains("vermutet"));
+    assert_eq!(word, "inferred [unchecked]");
     let (glyph, word, _) = crate::theme::evidence(Some(EvidenceMark::of(EvidenceSource::Observed)));
     assert_eq!(glyph, "● ?");
-    assert_eq!(word, "observed [ungeprüft]");
+    assert_eq!(word, "observed [unchecked]");
 
     // Und ein nachgerechneter Beleg unterscheidet sich vom ungeprüften —
     // wieder in Glyph UND Wort.
@@ -496,7 +511,7 @@ fn an_inferred_edge_never_looks_like_an_observed_one() {
     };
     let (glyph, word, _) = crate::theme::evidence(Some(verified));
     assert_eq!(glyph, "● ✓");
-    assert!(word.contains("nachgerechnet"));
+    assert!(word.contains("recomputed"));
 }
 
 #[test]
@@ -508,61 +523,65 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
     let out = render(&mut app);
     // Ebene 1: das Verdikt — und der Leitsatz, der die Grenze mitspricht.
     assert!(out.contains("EVIDENCE b3-aaaaaaaa…"), "{out}");
-    assert!(out.contains("◈ versiegelt"), "{out}");
+    // Die Seal-Karte: derselbe Wort-Stamm wie der CLI-Block aus
+    // `minds checkpoint` — SESSION SEALED.
+    assert!(out.contains(" SESSION SEALED "), "{out}");
     assert!(
-        out.contains("Kryptographisch verifiziert innerhalb der aufgezeichneten"),
+        out.contains("4 event(s) · 0 gap(s) · 1 epoch(s) · 0/1 signed"),
         "{out}"
     );
-    assert!(out.contains("INTEGRITÄT"), "{out}");
+    assert!(out.contains("◈ sealed"), "{out}");
     assert!(
-        out.contains("VOLLSTÄNDIG · 4 Event(s) · innerhalb agent-hooks/v1"),
+        out.contains("Cryptographically verified within the recorded"),
         "{out}"
     );
-    assert!(out.contains("Kette geschlossen · 1 Epoche(n)"), "{out}");
+    assert!(out.contains("INTEGRITY"), "{out}");
+    assert!(
+        out.contains("COMPLETE · 4 event(s) · within agent-hooks/v1"),
+        "{out}"
+    );
+    assert!(out.contains("chain closed · 1 epoch(s)"), "{out}");
     // Verified ≠ signed: unsigniert ist ein eigener Zustand, kein ✗.
     assert!(out.contains("○"), "{out}");
-    assert!(
-        out.contains("NICHT SIGNIERT — unsigniert ≠ ungültig"),
-        "{out}"
-    );
-    // Ebene 3 unter dem Fokus (INTEGRITÄT): die Kryptographie — samt der
+    assert!(out.contains("NOT SIGNED — unsigned ≠ invalid"), "{out}");
+    // Ebene 3 unter dem Fokus (INTEGRITY): die Kryptographie — samt der
     // ehrlichen Grenze des Proof-Modells.
     assert!(out.contains("blake3 · derive_key"), "{out}");
     assert!(
-        out.contains("Chain-Root: nur lokal mit Journal + Session-Salt"),
+        out.contains("Chain root: reproducible only locally with journal + session salt"),
         "{out}"
     );
 
     // COVERAGE: Die Boundary ist prominent — „nicht erfasst" ist keine Lücke.
     app.reduce(Action::Down);
     let out = render(&mut app);
-    assert!(out.contains("Beobachtungsgrenze"), "{out}");
-    assert!(out.contains("✓ Agent-Hook-Events"), "{out}");
-    assert!(out.contains("— Netzwerkaktivität"), "{out}");
-    assert!(out.contains("nicht erfasst, keine Lücke"), "{out}");
+    assert!(out.contains("Observation boundary"), "{out}");
+    assert!(out.contains("✓ agent hook events"), "{out}");
+    assert!(out.contains("— network activity"), "{out}");
+    assert!(out.contains("not captured, not a gap"), "{out}");
     assert!(
-        out.contains("Fehlende Evidence beweist nicht, dass nichts geschah"),
+        out.contains("Missing evidence does not prove that nothing happened"),
         "{out}"
     );
 
     // EPOCHEN: die Kette als Zeitleiste, nicht abstrakt.
     app.reduce(Action::Down);
     let out = render(&mut app);
-    assert!(out.contains("Epoche 1/1"), "{out}");
+    assert!(out.contains("Epoch 1/1"), "{out}");
     assert!(out.contains("#0–#3"), "{out}");
-    assert!(out.contains("Kettenanfang"), "{out}");
+    assert!(out.contains("chain start"), "{out}");
 
     // SIGNATUR: unsigniert wird erklärt, nicht rot markiert.
     app.reduce(Action::Down);
     let out = render(&mut app);
-    assert!(out.contains("○ NICHT SIGNIERT"), "{out}");
-    assert!(out.contains("niemand steht mit einem Schlüssel"), "{out}");
+    assert!(out.contains("○ NOT SIGNED"), "{out}");
+    assert!(out.contains("nobody vouches for them with a key"), "{out}");
     assert!(out.contains("minds sign --seal"), "{out}");
 
     // GRENZEN: does_not_prove gehört in die Oberfläche, nicht nur in die Doku.
     app.reduce(Action::End);
     let out = render(&mut app);
-    assert!(out.contains("Minds beweist NICHT:"), "{out}");
+    assert!(out.contains("Minds does NOT prove:"), "{out}");
     assert!(out.contains("fail-open"), "{out}");
 
     app.reduce(Action::Back);
@@ -577,13 +596,14 @@ fn evidence_mode_is_honest_about_a_legacy_session() {
     app.reduce(Action::Evidence);
     let out = render(&mut app);
     assert!(out.contains("· legacy"), "{out}");
+    assert!(out.contains(" SESSION · LEGACY "), "{out}");
     assert!(
-        out.contains("kryptographische Verifikation nicht verfügbar"),
+        out.contains("cryptographic verification is not available"),
         "{out}"
     );
-    assert!(out.contains("nie nachträglich"), "{out}");
+    assert!(out.contains("never gets a chain"), "{out}");
     // Keine Sektionen, kein Verdikt-Panel — kein leeres Gerüst.
-    assert!(!out.contains("VERDIKT"), "{out}");
+    assert!(!out.contains("VERDICT"), "{out}");
 }
 
 #[test]
@@ -604,8 +624,8 @@ fn the_help_overlays_and_closes() {
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Help);
     let out = render(&mut app);
-    assert!(out.contains(" Hilfe "), "{out}");
-    assert!(out.contains("inferred [vermutet]"), "{out}");
+    assert!(out.contains(" Help "), "{out}");
+    assert!(out.contains("○ inferred"), "{out}");
     app.reduce(Action::Help);
     assert!(!app.help);
     app.reduce(Action::Quit);
@@ -620,7 +640,7 @@ fn why_line_in_an_empty_repo_ends_at_the_commit_not_in_an_error() {
     let out = render(&mut app);
     assert!(out.contains("✓ LINE"), "{out}");
     assert!(out.contains("src/http/retry.rs:42"), "{out}");
-    assert!(out.contains("Blame kennt die Zeile nicht"), "{out}");
+    assert!(out.contains("Blame does not know this line"), "{out}");
 }
 
 #[test]
@@ -635,11 +655,11 @@ fn the_pipe_prints_tab_separated_lines_without_ansi() {
     let first: Vec<&str> = lines[0].split('\t').collect();
     assert_eq!(first.len(), 11, "{:?}", first);
     assert_eq!(first[0], "2026-07-25T14:10:00Z");
-    assert_eq!(first[6], "observed [ungeprüft]");
-    assert_eq!(first[7], "versiegelt");
+    assert_eq!(first[6], "observed [unchecked]");
+    assert_eq!(first[7], "sealed");
     assert_eq!(first[8], "needs work");
     assert_eq!(first[10], "Fix retry handling");
-    assert!(lines[2].contains("vergessen: DSGVO"));
+    assert!(lines[2].contains("forgotten: DSGVO"));
 
     let chain = filled().why_commit(commit('1'));
     let mut out = Vec::new();
@@ -657,7 +677,7 @@ fn the_pipe_prints_tab_separated_lines_without_ansi() {
     assert!(text.contains("\ngap\tNoChangeId\t"), "{text}");
     assert!(text.contains("\ngap\tNoContext\t"), "{text}");
     assert!(
-        text.ends_with("niemand hat diese Änderung entschieden.\n"),
+        text.ends_with("nobody has decided on this change.\n"),
         "{text}"
     );
 }
@@ -751,5 +771,115 @@ fn an_uninterpreted_tool_call_shows_as_half_seen_not_as_a_plain_tool() {
     app.reduce(Action::Enter);
     let out = render(&mut app);
     assert!(out.contains("◐"), "{out}");
-    assert!(out.contains("BEOBACHTET"), "{out}");
+    assert!(out.contains("OBSERVED"), "{out}");
+}
+
+/// Die Fußzeile isoliert — Badge-Assertions dürfen nicht versehentlich die
+/// SEAL-Spalte der Tabelle matchen.
+fn footer_of(out: &str) -> String {
+    out.lines().rev().take(2).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn the_footer_badge_tracks_the_focused_session_and_view() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    // Liste: Karte a (versiegelt) fokussiert.
+    let out = render(&mut app);
+    assert!(footer_of(&out).contains("◈ sealed"), "{out}");
+    // Naechste Karte: legacy — der Badge folgt dem Fokus.
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(footer_of(&out).contains("· legacy"), "{out}");
+    assert!(!footer_of(&out).contains("◈ sealed"), "{out}");
+    // Why: bewusst kein Badge (die Kette traegt mehrere Sessions).
+    app.reduce(Action::Why);
+    let out = render(&mut app);
+    assert!(!footer_of(&out).contains("· legacy"), "{out}");
+    assert!(!footer_of(&out).contains("◈ sealed"), "{out}");
+    app.reduce(Action::Back);
+    // Evidence: der Badge gehoert zur Karte hinter `id`, nicht zum Cursor.
+    app.reduce(Action::Up);
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(footer_of(&out).contains("◈ sealed"), "{out}");
+}
+
+/// Der Demo-Moment, testfixiert: Eine manipulierte Session traegt den roten
+/// Badge und die TAMPERED-Karte.
+#[test]
+fn a_tampered_session_shows_the_red_badge_and_card() {
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    let seal = minds_core::evidence::Seal {
+        root: minds_core::ContentHash::from_bytes([9u8; 32]),
+        agent: "claude-code".into(),
+        scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 4,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: minds_core::evidence::SealOutcome::Stored {
+            session: sid('a').to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-07-25T14:10:00Z".into(),
+    };
+    let seal_id = minds_core::evidence::Seal::id_of_text(&seal.to_text().unwrap());
+    let index = Index::from_parts(sessions, BTreeMap::new())
+        .with_seals(sid('a'), vec![(seal_id, seal, false)])
+        .with_tampered_seal(sid('a'));
+    let inspection = Inspection::from_index(index, vec![], "repo");
+
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    let out = render(&mut app);
+    assert!(out.contains("✗ TAMPERED"), "{out}");
+    assert!(footer_of(&out).contains("✗ TAMPERED"), "{out}");
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(out.contains(" SESSION TAMPERED "), "{out}");
+    assert!(footer_of(&out).contains("✗ TAMPERED"), "{out}");
+}
+
+/// Das CLAIM-Label ist GESTYLT (theme::claim: HUMAN + DIM) — nie Default:
+/// Eine Aussage, die aussieht wie der Text daneben, waere kein Label.
+#[test]
+fn the_claim_label_carries_its_theme_style() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Why);
+    let mut terminal = Terminal::new(TestBackend::new(124, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let cell = buffer
+        .content()
+        .iter()
+        .find(|cell| cell.symbol() == "◌")
+        .expect("CLAIM-Label sichtbar");
+    let style = cell.style();
+    assert_eq!(style.fg, Some(ratatui::style::Color::Cyan), "{style:?}");
+    assert!(
+        style.add_modifier.contains(ratatui::style::Modifier::DIM),
+        "{style:?}"
+    );
+}
+
+/// Unter 120 Spalten faellt die SIZE-Spalte weg — die Beweisspalten bleiben.
+#[test]
+fn a_narrow_terminal_drops_the_size_column_but_keeps_the_evidence() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+    let out = terminal.backend().to_string();
+    assert!(!out.contains("SIZE"), "{out}");
+    for header in ["TIME", "AGENT", "SEAL", "VERDICT"] {
+        assert!(out.contains(header), "{header} fehlt: {out}");
+    }
+    assert!(out.contains("◈ sealed"), "{out}");
 }

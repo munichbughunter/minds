@@ -103,9 +103,9 @@ impl ForgottenPlace {
     /// Eine menschenlesbare Bezeichnung für die CLI-Ausgabe.
     pub fn label(self) -> &'static str {
         match self {
-            ForgottenPlace::StoreRef => "Store-Referenz",
-            ForgottenPlace::SessionBranch => "Session-Branch (session.json und session.md)",
-            ForgottenPlace::ContextTree => "Kontext-Baum (Bestandsformat)",
+            ForgottenPlace::StoreRef => "store ref",
+            ForgottenPlace::SessionBranch => "session branch (session.json and session.md)",
+            ForgottenPlace::ContextTree => "context tree (legacy format)",
         }
     }
 }
@@ -294,17 +294,42 @@ pub trait ContextStore {
     /// sagen, statt Beweise still zu verlieren.
     fn put_seal(&self, _text: &str) -> Result<ContentHash> {
         Err(StoreError::backend(std::io::Error::other(
-            "dieses Backend legt keine Seals ab",
+            "this backend does not store seals",
         )))
+    }
+
+    /// Die rohen Bytes unter einer Seal-Id — **ungeprüft**: kein
+    /// Hash-Abgleich, kein Parsen. Das Gegenstück zu
+    /// [`get_bytes`](Self::get_bytes) für Seals: [`seal_text`](Self::seal_text)
+    /// weist einen manipulierten Ref korrekt mit [`StoreError::SealMismatch`]
+    /// ab; dieser Pfad lässt `minds verify` **benennen**, was der manipulierte
+    /// Text behauptet — als Aussage, nie als Beweis.
+    ///
+    /// Default `None` — ein Backend ohne Seal-Ablage hat nichts zu zeigen.
+    fn seal_bytes(&self, _id: &ContentHash) -> Result<Option<Vec<u8>>> {
+        Ok(None)
     }
 
     /// Der Text des Seals unter `id` — `None`, wenn er hier nicht liegt.
     ///
     /// Prüft beim Lesen `id == derive_key(text)` und meldet Manipulation als
     /// [`StoreError::SealMismatch`] — dasselbe Gratis-Versprechen wie bei
-    /// Sessions.
-    fn seal_text(&self, _id: &ContentHash) -> Result<Option<String>> {
-        Ok(None)
+    /// Sessions. Gebaut auf [`seal_bytes`](Self::seal_bytes): Ein Backend
+    /// liefert nur die Roh-Bytes, die Prüfung ist für alle identisch.
+    fn seal_text(&self, id: &ContentHash) -> Result<Option<String>> {
+        let Some(bytes) = self.seal_bytes(id)? else {
+            return Ok(None);
+        };
+        let text =
+            String::from_utf8(bytes).map_err(|e| StoreError::backend(std::io::Error::other(e)))?;
+        let actual = minds_core::evidence::Seal::id_of_text(&text);
+        if actual != *id {
+            return Err(StoreError::SealMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        Ok(Some(text))
     }
 
     /// Trägt den Rückverweis Session → Seal in die `evidence.json` der
@@ -313,7 +338,7 @@ pub trait ContextStore {
     /// der Seals selbst).
     fn record_session_seal(&self, _session: SessionId, _seal_id: &ContentHash) -> Result<()> {
         Err(StoreError::backend(std::io::Error::other(
-            "dieses Backend kennt keine Seal-Rückverweise",
+            "this backend does not support seal back-references",
         )))
     }
 
@@ -335,7 +360,7 @@ pub trait ContextStore {
     /// bereits liegen.
     fn put_seal_signature(&self, _id: &ContentHash, _signature: &str) -> Result<()> {
         Err(StoreError::backend(std::io::Error::other(
-            "dieses Backend legt keine Seal-Signaturen ab",
+            "this backend does not store seal signatures",
         )))
     }
 

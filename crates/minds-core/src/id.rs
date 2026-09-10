@@ -102,15 +102,15 @@ impl fmt::Debug for SessionId {
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SessionIdParseError {
     /// Der `b3-`-Präfix fehlt.
-    #[error("SessionId muss mit \"b3-\" beginnen")]
+    #[error("SessionId must start with \"b3-\"")]
     MissingPrefix,
 
     /// Nach dem Präfix stehen nicht genau 64 Hex-Zeichen.
-    #[error("SessionId braucht 64 Hex-Zeichen, gefunden: {0}")]
+    #[error("SessionId needs 64 hex characters, found: {0}")]
     WrongLength(usize),
 
     /// Ein Zeichen im Hex-Teil ist keine gültige Hex-Ziffer.
-    #[error("ungültiges Hex-Zeichen in SessionId: {0:?}")]
+    #[error("invalid hex character in SessionId: {0:?}")]
     InvalidHexDigit(char),
 }
 

@@ -24,11 +24,11 @@ pub fn run_review(
     key: Option<&str>,
 ) -> ExitCode {
     let Some(subject) = subject else {
-        eprintln!("minds review: erwartet <subject> (Change-Id I… oder Session-Id b3…)");
+        eprintln!("minds review: expected <subject> (Change-Id I… or Session-Id b3…)");
         return ExitCode::FAILURE;
     };
     let Some(decision) = decision else {
-        eprintln!("minds review: Entscheidung angeben: --approve | --reject | --needs-work");
+        eprintln!("minds review: specify a decision: --approve | --reject | --needs-work");
         return ExitCode::FAILURE;
     };
     match review(subject, decision, summary.unwrap_or(""), sign, key) {
@@ -50,7 +50,7 @@ fn review(
     let subject = parse_subject(subject)?;
     let (repo, root) = open()?;
     let reviewer =
-        git_config(&root, "user.email").ok_or("keine Identität: `git config user.email` setzen")?;
+        git_config(&root, "user.email").ok_or("no identity: set `git config user.email`")?;
 
     // Der Zeitstempel kommt von hier, nicht aus dem Modell — `minds-core` ruft
     // nie `now()`. Er macht „das jüngste Verdict" zu einer beantwortbaren Frage
@@ -75,7 +75,7 @@ fn review(
         let key = resolve_key(key, &root)?;
         let signature = minds_attest::ssh_sign(&review_payload(&hash, &review)?, Path::new(&key))?;
         store.put_signature(&hash, &signature)?;
-        println!("  signiert mit {key}");
+        println!("  signed with {key}");
     }
     Ok(())
 }
@@ -86,7 +86,7 @@ fn resolve_key(key: Option<&str>, root: &Path) -> Fallible<String> {
         return Ok(key.to_string());
     }
     git_config(root, "user.signingkey")
-        .ok_or_else(|| "kein Schlüssel: --key <pfad> oder `git config user.signingkey`".into())
+        .ok_or_else(|| "no key: --key <path> or `git config user.signingkey`".into())
 }
 
 /// Führt `minds reviews` aus — listet die Verdicts zu einem Subjekt.
@@ -96,7 +96,7 @@ pub fn run_reviews(
     identity: Option<&str>,
 ) -> ExitCode {
     let Some(subject) = subject else {
-        eprintln!("minds reviews: erwartet <subject>");
+        eprintln!("minds reviews: expected <subject>");
         return ExitCode::FAILURE;
     };
     match reviews(subject, signers, identity) {
@@ -115,9 +115,9 @@ fn reviews(subject: &str, signers: Option<&str>, identity: Option<&str>) -> Fall
     let found = store.for_subject(subject.id())?;
 
     if found.is_empty() {
-        println!("keine Verdicts für {}", subject.id());
+        println!("no verdicts for {}", subject.id());
     } else {
-        println!("{} Review(s) für {}:\n", found.len(), subject.id());
+        println!("{} review(s) for {}:\n", found.len(), subject.id());
     }
     for review in &found {
         println!("▸ {} · {}", review.decision.as_str(), review.reviewer);
@@ -129,7 +129,7 @@ fn reviews(subject: &str, signers: Option<&str>, identity: Option<&str>) -> Fall
 
     let thread = store.thread(subject.id())?;
     if !thread.is_empty() {
-        println!("\n{} Kommentar(e):\n", thread.len());
+        println!("\n{} comment(s):\n", thread.len());
         for comment in &thread {
             println!("▸ {} · {}", comment.anchor.as_text(), comment.author);
             for line in comment.body.lines() {
@@ -152,39 +152,39 @@ fn signature_state(
     identity: Option<&str>,
 ) -> String {
     let Ok(hash) = review.content_hash() else {
-        return "· Hash nicht berechenbar".into();
+        return "· hash not computable".into();
     };
     let signature = match store.signature(&hash) {
         Ok(Some(signature)) => signature,
-        Ok(None) => return "· nicht signiert".into(),
-        Err(err) => return format!("· Signatur nicht lesbar: {err}"),
+        Ok(None) => return "· not signed".into(),
+        Err(err) => return format!("· signature unreadable: {err}"),
     };
 
     let Some(signers) = signers else {
-        return "· signiert (ungeprüft — mit --signers <datei> prüfen)".into();
+        return "· signed (unverified — check with --signers <file>)".into();
     };
     let identity = identity.unwrap_or(&review.reviewer);
     // Fail-closed (#12): Ein Review, dessen Felder eine Zeile fälschen könnten,
     // bekommt keinen Payload — und damit hier kein „gültig".
     let payload = match review_payload(&hash, review) {
         Ok(payload) => payload,
-        Err(err) => return format!("· Signatur nicht prüfbar: {err}"),
+        Err(err) => return format!("· signature not verifiable: {err}"),
     };
     match minds_attest::ssh_verify(&payload, &signature, Path::new(signers), identity) {
-        Ok(true) => format!("· Signatur gültig ({identity})"),
-        Ok(false) => format!("· SIGNATUR UNGÜLTIG ({identity})"),
-        Err(err) => format!("· Signatur nicht prüfbar: {err}"),
+        Ok(true) => format!("· signature valid ({identity})"),
+        Ok(false) => format!("· SIGNATURE INVALID ({identity})"),
+        Err(err) => format!("· signature not verifiable: {err}"),
     }
 }
 
 /// Führt `minds comment` aus — hängt eine Anmerkung an den Thread.
 pub fn run_comment(subject: Option<&str>, on: Option<&str>, body: Option<&str>) -> ExitCode {
     let Some(subject) = subject else {
-        eprintln!("minds comment: erwartet <subject> (Change-Id I… oder Session-Id b3…)");
+        eprintln!("minds comment: expected <subject> (Change-Id I… or Session-Id b3…)");
         return ExitCode::FAILURE;
     };
     let Some(body) = body else {
-        eprintln!("minds comment: erwartet einen Text");
+        eprintln!("minds comment: expected a comment body");
         return ExitCode::FAILURE;
     };
     match comment(subject, on, body) {
@@ -201,7 +201,7 @@ fn comment(subject: &str, on: Option<&str>, body: &str) -> Fallible<()> {
     let anchor = parse_anchor(on)?;
     let (repo, root) = open()?;
     let author =
-        git_config(&root, "user.email").ok_or("keine Identität: `git config user.email` setzen")?;
+        git_config(&root, "user.email").ok_or("no identity: set `git config user.email`")?;
 
     // Der Zeitstempel kommt von hier, nicht aus dem Modell — `minds-core` ruft
     // nie `now()`, damit dieselbe Eingabe immer denselben Hash ergibt.
@@ -209,7 +209,7 @@ fn comment(subject: &str, on: Option<&str>, body: &str) -> Fallible<()> {
     let comment = Comment::new(subject, anchor, author, body, Some(at));
     let hash = ReviewStore::new(repo).put_comment(&comment)?;
 
-    println!("Kommentar {hash}");
+    println!("Comment {hash}");
     println!(
         "  {} · {} · {}",
         comment.anchor.as_text(),
@@ -228,18 +228,18 @@ fn parse_anchor(on: Option<&str>) -> Fallible<Anchor> {
     if let Some(index) = on.strip_prefix("turn:") {
         let index = index
             .parse()
-            .map_err(|_| format!("keine Turn-Nummer: {index:?}"))?;
+            .map_err(|_| format!("not a turn number: {index:?}"))?;
         return Ok(Anchor::Turn { index });
     }
     // Von rechts trennen: Ein Windows-Pfad trägt selbst einen Doppelpunkt.
     let (path, line) = on
         .rsplit_once(':')
-        .ok_or_else(|| format!("erwartet <datei>:<zeile> oder turn:<n>, war {on:?}"))?;
+        .ok_or_else(|| format!("expected <file>:<line> or turn:<n>, got {on:?}"))?;
     let line = line
         .parse()
-        .map_err(|_| format!("keine Zeilennummer: {line:?}"))?;
+        .map_err(|_| format!("not a line number: {line:?}"))?;
     if path.is_empty() {
-        return Err(format!("kein Dateipfad in {on:?}").into());
+        return Err(format!("no file path in {on:?}").into());
     }
     Ok(Anchor::File {
         path: path.to_owned(),
@@ -254,7 +254,7 @@ fn parse_subject(subject: &str) -> Fallible<Subject> {
     }
     let id: ChangeId = subject
         .parse()
-        .map_err(|err| format!("weder Change-Id noch Session-Id: {subject:?} ({err})"))?;
+        .map_err(|err| format!("neither a Change-Id nor a Session-Id: {subject:?} ({err})"))?;
     Ok(Subject::Change(id.to_string()))
 }
 
@@ -297,7 +297,7 @@ mod tests {
             .map(|status| status.success())
             .unwrap_or(false);
         if !ok {
-            eprintln!("kein git im Pfad — Test übersprungen");
+            eprintln!("git not on PATH — test skipped");
             return;
         }
         let store = ReviewStore::new(Repo::discover(dir.path()).unwrap());
@@ -312,9 +312,9 @@ mod tests {
         store.put(&forged).unwrap();
         store.put_signature(&hash, "keine-echte-signatur").unwrap();
 
-        let state = signature_state(&store, &forged, Some("egal"), None);
-        assert!(state.contains("Signatur nicht prüfbar"), "{state}");
-        assert!(!state.contains("Signatur gültig"), "{state}");
-        assert!(!state.contains("UNGÜLTIG"), "{state}");
+        let state = signature_state(&store, &forged, Some("irrelevant"), None);
+        assert!(state.contains("signature not verifiable"), "{state}");
+        assert!(!state.contains("signature valid"), "{state}");
+        assert!(!state.contains("INVALID"), "{state}");
     }
 }

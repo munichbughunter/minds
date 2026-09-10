@@ -216,7 +216,7 @@ fn the_core_loop_closes() {
     // 7. Alles auflösbar — und der ganze Durchlauf hatte nichts zu melden.
     let fsck = minds(dir, &["fsck"], None);
     assert!(fsck.status.success(), "fsck rot:\n{}", stdout(&fsck));
-    assert!(stdout(&fsck).contains("in Ordnung"));
+    assert!(stdout(&fsck).contains("fsck: OK"));
     assert!(
         !stdout(&fsck).contains("Log:"),
         "der Kern-Loop schreibt keinen Log-Eintrag:\n{}",
@@ -558,7 +558,7 @@ fn a_stale_recorded_binary_falls_back_to_the_path_and_fsck_says_so() {
     let fsck = minds(dir, &["fsck"], None);
     assert!(fsck.status.success(), "{}", stdout(&fsck));
     assert!(
-        stdout(&fsck).contains("minds.binary ist nicht gesetzt"),
+        stdout(&fsck).contains("minds.binary is not set"),
         "fsck verschweigt den fehlenden Eintrag:\n{}",
         stdout(&fsck)
     );
@@ -648,7 +648,7 @@ fn a_flag_typo_fails_loudly_instead_of_disarming_the_gate() {
         "der Tippfehler muss das Gate rot machen, nicht abschalten"
     );
     assert!(
-        stderr(&typo).contains("unbekanntes Flag"),
+        stderr(&typo).contains("unknown flag"),
         "die Meldung muss den Fehler benennen:\n{}",
         stderr(&typo)
     );
@@ -672,7 +672,7 @@ fn a_flag_typo_fails_loudly_instead_of_disarming_the_gate() {
         "vergessene Bindestriche dürfen das Gate nicht abschalten"
     );
     assert!(
-        stderr(&bare).contains("unerwartetes Argument"),
+        stderr(&bare).contains("unexpected argument"),
         "{}",
         stderr(&bare)
     );
@@ -726,7 +726,7 @@ fn the_hook_swallows_a_foreign_flag_without_losing_the_event() {
     );
 }
 
-/// #66/#64: Ein Hook-Verzeichnis außerhalb des Repos bekommt keine Hooks ohne
+/// #66/#64: Ein Hook-Verzeichnis outside the repo bekommt keine Hooks ohne
 /// Zustimmung — nicht-interaktiv heißt das: Abbruch mit Hinweis auf das Flag,
 /// und **nichts** ist halb eingerichtet.
 #[test]
@@ -794,7 +794,7 @@ fn the_global_hooks_flag_confirms_an_outside_dir_and_fsck_names_it() {
     let fsck = minds(dir, &["fsck"], None);
     assert!(fsck.status.success(), "{}", stdout(&fsck));
     assert!(
-        stdout(&fsck).contains("außerhalb des Repos"),
+        stdout(&fsck).contains("outside the repo"),
         "fsck muss den Ort benennen:\n{}",
         stdout(&fsck)
     );
@@ -905,7 +905,7 @@ fn a_panic_in_the_hook_reaches_neither_stdout_nor_stderr() {
     // Verschwunden ist er trotzdem nicht — samt Ort, sonst wüsste niemand, wo
     // nachzusehen ist.
     let log = std::fs::read_to_string(dir.join(".git/minds/hook.log")).expect("das Log existiert");
-    assert!(log.contains("Panic"), "{log}");
+    assert!(log.contains("panic"), "{log}");
     assert!(
         log.contains("hook.rs"),
         "der Ort des Panics fehlt im Log:\n{log}"
@@ -938,7 +938,7 @@ fn fsck_names_an_agent_config_without_any_registration() {
     let fsck = minds(dir, &["fsck"], None);
     assert!(fsck.status.success(), "ein Hinweis ist kein Befund");
     assert!(
-        stdout(&fsck).contains("trägt keine minds-Registrierung"),
+        stdout(&fsck).contains("carries no minds registration"),
         "fsck verschweigt die leere Konfiguration:\n{}",
         stdout(&fsck)
     );
@@ -951,12 +951,12 @@ fn fsck_names_an_agent_config_without_any_registration() {
     );
     let fsck = minds(dir, &["fsck"], None);
     assert!(
-        stdout(&fsck).contains("registriert für claude-code"),
+        stdout(&fsck).contains("registered for claude-code"),
         "fsck bestätigt die Registrierung nicht:\n{}",
         stdout(&fsck)
     );
     assert!(
-        !stdout(&fsck).contains("trägt keine minds-Registrierung"),
+        !stdout(&fsck).contains("carries no minds registration"),
         "der Hinweis bleibt stehen:\n{}",
         stdout(&fsck)
     );
@@ -976,14 +976,14 @@ fn what_enable_writes_fsck_calls_current() {
 
     let out = stdout(&minds(dir, &["fsck"], None));
     assert!(
-        !out.contains("älteren minds-Version"),
+        !out.contains("older minds version"),
         "frisch eingerichtet und schon veraltet:\n{out}"
     );
     assert!(
         !out.contains("fehlen") && !out.contains("fehlt 1"),
         "frisch eingerichtet und schon unvollständig:\n{out}"
     );
-    assert!(out.contains("Agents: registriert für"), "{out}");
+    assert!(out.contains("Agents: registered for"), "{out}");
 }
 
 /// #68: Ein scheiterndes `minds brief --hook` verschwindet nicht mehr. Die
@@ -1091,7 +1091,7 @@ fn a_panic_in_brief_hook_reaches_neither_channel_but_leaves_its_place() {
     );
 
     let log = std::fs::read_to_string(dir.join(".git/minds/hook.log")).expect("das Log existiert");
-    assert!(log.contains("brief: Panic"), "{log}");
+    assert!(log.contains("brief: panic"), "{log}");
     assert!(
         log.contains("brief_cmd.rs:"),
         "der Ort des Panics fehlt:\n{log}"
@@ -1237,7 +1237,7 @@ fn a_hook_without_its_execute_bit_is_named_by_fsck_and_repaired_by_enable() {
     // fsck sagt es — vorher galt der Hook als „installiert".
     let fsck = minds(dir, &["fsck"], None);
     assert!(
-        stdout(&fsck).contains("nicht ausführbar"),
+        stdout(&fsck).contains("not executable"),
         "fsck verschweigt den toten Hook:\n{}",
         stdout(&fsck)
     );
@@ -1253,7 +1253,7 @@ fn a_hook_without_its_execute_bit_is_named_by_fsck_and_repaired_by_enable() {
         std::fs::metadata(&hook).unwrap().permissions().mode() & 0o111 != 0,
         "das Execute-Bit wurde nicht wiederhergestellt"
     );
-    assert!(!stdout(&minds(dir, &["fsck"], None)).contains("nicht ausführbar"));
+    assert!(!stdout(&minds(dir, &["fsck"], None)).contains("not executable"));
 }
 
 /// #65, end-to-end: Ein Symlink auf **eine** Agent-Konfiguration bricht
@@ -1279,7 +1279,7 @@ fn a_symlinked_agent_config_stops_enable_before_anything_is_written() {
     let out = minds(dir, &["enable"], None);
     assert!(!out.status.success(), "{}", stdout(&out));
     assert!(
-        stderr(&out).contains("Symlink"),
+        stderr(&out).contains("symlink"),
         "die Meldung muss den Grund nennen:\n{}",
         stderr(&out)
     );
@@ -1330,7 +1330,7 @@ fn enable_works_in_a_linked_worktree_and_captures_there() {
     let enable = minds(&linked, &["enable", "--agent", "claude-code"], None);
     assert!(enable.status.success(), "{}", stderr(&enable));
     assert!(
-        stdout(&enable).contains("verlinkter Worktree"),
+        stdout(&enable).contains("linked worktree"),
         "der Worktree-Fall gehört benannt:\n{}",
         stdout(&enable)
     );
@@ -1389,7 +1389,7 @@ fn enable_works_in_a_linked_worktree_and_captures_there() {
     let fsck = minds(&linked, &["fsck"], None);
     assert!(fsck.status.success(), "{}", stdout(&fsck));
     assert!(
-        stdout(&fsck).contains("0 verwaist"),
+        stdout(&fsck).contains("0 orphaned"),
         "fsck im Worktree meldet Waisen:\n{}",
         stdout(&fsck)
     );
@@ -1397,7 +1397,7 @@ fn enable_works_in_a_linked_worktree_and_captures_there() {
 
 /// Die zweite Gegenprobe zu #66: In einem Linked Worktree liegt das effektive
 /// Hook-Verzeichnis im common dir des Haupt-Repos — von Git verwaltet, kein
-/// fremder Ort. `fsck` darf dort kein „außerhalb des Repos" behaupten.
+/// fremder Ort. `fsck` darf dort kein „outside the repo" behaupten.
 #[test]
 fn fsck_in_a_linked_worktree_claims_no_outside() {
     let Some(repo) = scratch_repo() else {
@@ -1420,7 +1420,7 @@ fn fsck_in_a_linked_worktree_claims_no_outside() {
     let fsck = minds(&linked, &["fsck"], None);
     assert!(fsck.status.success(), "{}", stdout(&fsck));
     assert!(
-        !stdout(&fsck).contains("außerhalb des Repos"),
+        !stdout(&fsck).contains("outside the repo"),
         "das common dir ist kein fremder Ort:\n{}",
         stdout(&fsck)
     );
@@ -1487,7 +1487,7 @@ fn an_empty_hookspath_aborts_instead_of_littering_the_worktree() {
     // Und `fsck` sagt dasselbe, statt ein leeres Verzeichnis zu melden.
     let fsck = minds(dir, &["fsck"], None);
     assert!(
-        stdout(&fsck).contains("core.hooksPath ist leer"),
+        stdout(&fsck).contains("core.hooksPath is empty"),
         "fsck benennt den Fall nicht:\n{}",
         stdout(&fsck)
     );
@@ -1697,7 +1697,7 @@ fn a_broken_redaction_policy_lands_in_the_log_instead_of_nowhere() {
     //    die Policy repariert ist.
     let fsck = stdout(&minds(dir, &["fsck"], None));
     assert!(
-        fsck.contains("Journal: 1 Session(s) noch nicht eingecheckt"),
+        fsck.contains("Journal: 1 session(s) not yet checked in"),
         "{fsck}"
     );
 }
@@ -1758,7 +1758,7 @@ fn a_hook_error_never_carries_the_raw_transcript() {
 
     let log = hook_log(dir).expect("der Fehler steht im Log");
     assert!(
-        log.contains("übersprungen"),
+        log.contains("skipped"),
         "der Fehler muss aus dem Session-Pfad kommen, sonst prüft der Test nichts:\n{log}"
     );
     assert!(!log.contains(TOKEN), "Token im Log:\n{log}");
@@ -1911,10 +1911,10 @@ fn fsck_points_at_the_log_but_does_not_quote_it() {
     let report = stdout(&fsck);
 
     // Verwiesen wird: auf die Zahl und auf den Pfad.
-    assert!(report.contains("Log: 1 Eintrag"), "{report}");
+    assert!(report.contains("Log: 1 entry"), "{report}");
     assert!(report.contains("hook.log"), "{report}");
     // Ein Hinweis, kein Befund — sonst hielte ein alter Eintrag das CI-Gate an.
-    assert!(report.contains("Hinweis(e)"), "{report}");
+    assert!(report.contains("note(s)"), "{report}");
     assert!(fsck.status.success(), "{report}");
 
     // Zitiert wird nicht: Die Ausgabe von `fsck` landet in CI-Logs, der Wortlaut
@@ -2022,7 +2022,7 @@ fn a_failing_background_import_lands_in_the_log_and_fsck_points_at_it() {
     let fsck = minds(dir, &["fsck"], None);
     let report = stdout(&fsck);
     assert!(fsck.status.success(), "{report}");
-    assert!(report.contains("Log: 1 Eintrag"), "{report}");
+    assert!(report.contains("Log: 1 entry"), "{report}");
     assert!(report.contains("hook.log"), "{report}");
     // Zitiert wird nicht — der Bericht landet in CI-Logs.
     assert!(
@@ -2121,7 +2121,7 @@ fn a_background_import_without_anything_to_do_leaves_no_log() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout(&out).contains("nichts zu importieren"),
+        stdout(&out).contains("nothing to import"),
         "der Hand-Aufrufer sieht das Ergebnis auf stdout:\n{}",
         stdout(&out)
     );
@@ -2174,11 +2174,11 @@ fn the_pre_push_hook_keeps_its_stderr_out_of_the_push_output() {
     // abgegeben wurde — der Hook selbst öffnet keine Verbindung mehr.
     let visible = String::from_utf8_lossy(&hook.stdout);
     assert!(
-        visible.contains("Ref(s)"),
+        visible.contains("ref(s)"),
         "der Fortschritt fehlt:\n{visible}"
     );
     assert!(
-        visible.contains("im Hintergrund"),
+        visible.contains("in the background"),
         "der Hook muss sagen, dass er den Transport abgibt:\n{visible}"
     );
 
@@ -2212,7 +2212,7 @@ fn the_pre_push_hook_keeps_its_stderr_out_of_the_push_output() {
     );
     let visible = String::from_utf8_lossy(&again.stdout);
     assert!(
-        visible.contains("im Vordergrund"),
+        visible.contains("in the foreground"),
         "der Wechsel muss erklärt sein:\n{visible}"
     );
     assert!(
@@ -2317,7 +2317,7 @@ fn a_forgotten_session_no_longer_starves_brief_distill_and_recall() {
         stdout(&brief)
     );
     assert!(
-        String::from_utf8_lossy(&brief.stderr).contains("1 vergessene Session übersprungen"),
+        String::from_utf8_lossy(&brief.stderr).contains("1 forgotten session skipped"),
         "der Hinweis fehlt:\n{}",
         String::from_utf8_lossy(&brief.stderr)
     );
@@ -2335,7 +2335,7 @@ fn a_forgotten_session_no_longer_starves_brief_distill_and_recall() {
         stdout(&distill)
     );
     assert!(
-        String::from_utf8_lossy(&distill.stderr).contains("1 vergessene Session übersprungen"),
+        String::from_utf8_lossy(&distill.stderr).contains("1 forgotten session skipped"),
         "der Hinweis fehlt:\n{}",
         String::from_utf8_lossy(&distill.stderr)
     );
@@ -2362,7 +2362,7 @@ fn a_forgotten_session_no_longer_starves_brief_distill_and_recall() {
         String::from_utf8_lossy(&recall_gone.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&recall_gone.stderr).contains("1 vergessene Session übersprungen"),
+        String::from_utf8_lossy(&recall_gone.stderr).contains("1 forgotten session skipped"),
         "der Hinweis fehlt:\n{}",
         String::from_utf8_lossy(&recall_gone.stderr)
     );
@@ -2383,7 +2383,7 @@ fn a_forgotten_session_no_longer_starves_brief_distill_and_recall() {
     assert!(stdout(&hook).contains("Grußfunktion"), "{}", stdout(&hook));
     let log = hook_log(dir).expect("der Hinweis steht im Log");
     assert!(
-        log.contains("1 vergessene Session übersprungen"),
+        log.contains("1 forgotten session skipped"),
         "der Hinweis fehlt im Log:\n{log}"
     );
 }
@@ -2454,7 +2454,7 @@ fn a_corrupt_session_is_skipped_and_points_at_fsck() {
     );
     let stderr = String::from_utf8_lossy(&brief.stderr);
     assert!(
-        stderr.contains("1 unlesbare Session übersprungen — siehe minds fsck"),
+        stderr.contains("1 unreadable session skipped — see minds fsck"),
         "der Hinweis fehlt oder zeigt nicht auf fsck:\n{stderr}"
     );
 }
@@ -2552,7 +2552,7 @@ fn two_checkpoints_of_one_session_chain_their_seals() {
     let out = minds(dir, &["verify", &second_session], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.trim().ends_with("VERIFIZIERT"), "{text}");
+    assert!(text.trim().ends_with("VERIFIED"), "{text}");
 
     // Und der Rückverweis liegt bei der Session (evidence.json im Store-Ref).
     let store_refs = stdout(&git(
@@ -2634,7 +2634,7 @@ fn a_rejected_session_still_leaves_a_sealed_trace() {
     // Das Journal blieb liegen (vertagt) — fsck sieht die Session weiterhin.
     let fsck = stdout(&minds(dir, &["fsck"], None));
     assert!(
-        fsck.contains("noch nicht eingecheckt"),
+        fsck.contains("not yet checked in"),
         "die vertagte Session fehlt in fsck:\n{fsck}"
     );
 
@@ -2667,7 +2667,7 @@ fn a_rejected_session_still_leaves_a_sealed_trace() {
     let out = minds(dir, &["verify", &stored_session], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.trim().ends_with("VERIFIZIERT"), "{text}");
+    assert!(text.trim().ends_with("VERIFIED"), "{text}");
 }
 
 /// Die `seal_id` eines Seal-Texts, wie sie in einer `previous`-Zeile stünde.
@@ -2853,6 +2853,66 @@ fn sealed_repo() -> Option<(tempfile::TempDir, String)> {
     Some((repo, id))
 }
 
+/// EV: Der manuelle Checkpoint quittiert mit der „SESSION SEALED"-
+/// Zusammenfassung — Identität, Root, Bereich, Grenze, Signatur-Anwesenheit
+/// und die Tatsachen-Zeilen. Der Hook-Pfad wirft stdout weg; dieser Block ist
+/// die Quittung für Menschen, und er behauptet nie mehr als das Schreiben
+/// („recorded", nie „valid" — Verifikation bleibt `minds verify`s Satz).
+#[test]
+fn a_manual_checkpoint_prints_the_session_sealed_summary() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    // Ein Commit VOR enable: Der Trailer-Amend braucht einen HEAD, und ohne
+    // installierte Hooks löst dieser Commit noch keinen Checkpoint aus.
+    std::fs::write(dir.join("init.txt"), "x\n").unwrap();
+    git(dir, &["add", "init.txt"]);
+    git(dir, &["commit", "-qm", "init"]);
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"seal block""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    let out = minds(dir, &["checkpoint"], None);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("SESSION SEALED"), "{text}");
+    assert!(text.contains("Seal       b3-"), "{text}");
+    assert!(text.contains("Root       b3-"), "{text}");
+    assert!(text.contains("2 event(s) · seq 0–1"), "{text}");
+    assert!(text.contains("Scope      agent-hooks/v1"), "{text}");
+    assert!(
+        text.contains("Signature  unsigned — `minds sign --seal` adds it"),
+        "{text}"
+    );
+    assert!(text.contains("✓ no gaps in the observed range"), "{text}");
+    assert!(
+        text.contains("✓ first epoch of this session (chain start)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("✓ seal recorded — check it with `minds verify <session-id>`"),
+        "{text}"
+    );
+    // Ehrlichkeits-Grenze: Der Block spricht nie ein Prüf-Urteil aus.
+    assert!(!text.contains("seal valid"), "{text}");
+    assert!(!text.contains("VERIFIED"), "{text}");
+
+    // Zweiter Lauf ohne neue Events: Das Journal ist verworfen, nichts zu
+    // versiegeln — und damit auch kein zweiter Block.
+    let again = minds(dir, &["checkpoint"], None);
+    assert!(again.status.success(), "{}", stdout(&again));
+    assert!(
+        !stdout(&again).contains("SESSION SEALED"),
+        "{}",
+        stdout(&again)
+    );
+}
+
 #[test]
 fn verify_says_verified_for_a_clean_sealed_session() {
     let Some((repo, id)) = sealed_repo() else {
@@ -2862,17 +2922,17 @@ fn verify_says_verified_for_a_clean_sealed_session() {
     let out = minds(repo.path(), &["verify", &id], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.trim().ends_with("VERIFIZIERT"), "{text}");
-    assert!(text.contains("Seal      "), "{text}");
-    assert!(text.contains("unsigniert"), "{text}");
+    assert!(text.trim().ends_with("VERIFIED"), "{text}");
+    assert!(text.contains("Seal           "), "{text}");
+    assert!(text.contains("unsigned"), "{text}");
     // Die drei Vertrauensachsen, getrennt — und Coverage nennt ihre Grenze:
     // vollständig heißt vollständig INNERHALB der Agent-Hooks.
-    assert!(text.contains("Integrität intakt"), "{text}");
+    assert!(text.contains("Integrity      intact"), "{text}");
     assert!(
-        text.contains("vollständig innerhalb der Grenze (Grenze: agent-hooks/v1"),
+        text.contains("complete within the boundary (boundary: agent-hooks/v1"),
         "{text}"
     );
-    assert!(text.contains("Deutung    vollständig"), "{text}");
+    assert!(text.contains("Interpretation complete"), "{text}");
 }
 
 #[test]
@@ -2906,14 +2966,14 @@ fn an_uninterpreted_call_dents_only_the_interpretation_axis() {
     // Deutungslücke ≠ Integritäts- oder Coverage-Problem: Exit bleibt 0,
     // die Deutungs-Achse benennt die Grenze eigenständig.
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.contains("Integrität intakt"), "{text}");
-    assert!(text.contains("vollständig innerhalb der Grenze"), "{text}");
+    assert!(text.contains("Integrity      intact"), "{text}");
+    assert!(text.contains("complete within the boundary"), "{text}");
     assert!(
-        text.contains("Deutung    teilweise — 1 von 1 Tool-Aufruf(en)"),
+        text.contains("Interpretation partial — 1 of 1 tool call(s)"),
         "{text}"
     );
     assert!(
-        text.contains("Gesamt    VERIFIZIERT — Deutung teilweise"),
+        text.contains("Overall        VERIFIED — interpretation partial"),
         "{text}"
     );
 }
@@ -2957,8 +3017,8 @@ fn verify_says_incomplete_when_an_event_went_missing() {
     let out = minds(dir, &["verify", &id], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(2), "{text}");
-    assert!(text.contains("VERIFIZIERT, UNVOLLSTÄNDIG"), "{text}");
-    assert!(text.contains("Lücke"), "{text}");
+    assert!(text.contains("VERIFIED, INCOMPLETE"), "{text}");
+    assert!(text.contains("Gap"), "{text}");
 }
 
 #[test]
@@ -2970,9 +3030,10 @@ fn verify_says_tampered_for_a_forged_seal() {
     let dir = repo.path();
 
     // Den Seal-Text im Ref austauschen — Plumbing, wie ein Angreifer mit
-    // Repo-Zugriff.
+    // Repo-Zugriff. Aus `events=2` wird ein glaubwürdiges `events=9`: eine
+    // wohlgeformte Fälschung, der Härtefall für die Benennung.
     let seals = seal_refs(dir);
-    let forged = seal_text(dir, &seals[0]).replacen("events=", "events=9", 1);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
     let tmp = dir.join("forged");
     std::fs::write(&tmp, &forged).unwrap();
     let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
@@ -2987,7 +3048,220 @@ fn verify_says_tampered_for_a_forged_seal() {
     let out = minds(dir, &["verify", &id], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
-    assert!(text.contains("MANIPULIERT"), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    // Seit dem Tamper-Report wird die Manipulation BENANNT: beide Hashes …
+    // (der Ref-Name trägt das nackte Hex, die Anzeige das b3-Präfix).
+    let expected_hex = seals[0]
+        .rsplit('/')
+        .next()
+        .expect("seal ref carries the id");
+    assert!(
+        text.contains(&format!("  expected     b3-{expected_hex}")),
+        "{text}"
+    );
+    assert!(text.contains("  found        b3-"), "{text}");
+    assert!(
+        !text.contains(&format!("  found        b3-{expected_hex}")),
+        "{text}"
+    );
+    // … der Claim des manipulierten Texts, klar als unverifiziert gelabelt …
+    assert!(text.contains("claimed      (UNVERIFIED"), "{text}");
+    assert!(text.contains("· 9 event(s)"), "{text}");
+    // … und der Kreuzcheck gegen die Session, um die es geht.
+    assert!(
+        text.contains("the claimed session matches the session under verification"),
+        "{text}"
+    );
+    // Ehrlichkeits-Grenze: Kein „erwartet 2, vorgefunden 9" — der Original-
+    // wert ist nach dem Journal-Discard nicht beweisbar, also steht er nicht da.
+    assert!(!text.contains("events=2"), "{text}");
+}
+
+/// Das Verdikt-Wort des Read-Models für eine Session — der Gegenrechner.
+fn read_model_verdict(dir: &Path, id: &str) -> Option<&'static str> {
+    let repo = minds_git::Repo::open(dir).expect("repo");
+    let store = minds_store::InRepoStore::open(dir).expect("store");
+    let index = minds_reader::Index::build(&repo, &store).expect("index");
+    let id: minds_core::SessionId = id.parse().expect("session id");
+    index
+        .evidence_report(id)
+        .map(|report| report.state.verdict.word())
+}
+
+/// Paritätstest (d127567): `minds verify` und das Read-Model rechnen bewusst
+/// getrennt — verify prüft zusätzlich Payload-Hash, Signaturen und den
+/// Einzel-Seal-Modus, das Read-Model kostet einen vollen Index-Build — aber
+/// das **Verdikt-Wort** muss identisch bleiben. Gewollte Abweichungen (und
+/// nur die): Payload-Korruption wertet nur verify; Legacy drückt der Reader
+/// als `Provenance::Legacy` (kein Report) statt als viertes Wort aus.
+#[test]
+fn verify_and_the_read_model_speak_the_same_verdict_word() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // Sauber versiegelt: beide sagen VERIFIED.
+    let out = minds(dir, &["verify", &id], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).trim().ends_with("VERIFIED"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(read_model_verdict(dir, &id), Some("VERIFIED"));
+
+    // Seal manipuliert: beide sagen TAMPERED.
+    let seals = seal_refs(dir);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
+    let tmp = dir.join("forged");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert_eq!(read_model_verdict(dir, &id), Some("TAMPERED"));
+}
+
+/// EV.12-Härtung (Security-Review-Befund): Fehlt der Rückverweis
+/// (evidence.json) UND ist der Seal manipuliert, muss der Namensraum-
+/// Fallback ihn trotzdem in die Prüfmenge nehmen — sonst schwächte
+/// ausgerechnet die Manipulation das Verdikt auf NOT VERIFIABLE ab, und der
+/// Angreifer bekäme das mildere Wort geschenkt.
+#[test]
+fn a_forged_seal_without_a_back_reference_still_reads_tampered() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // 1. Den Seal fälschen — wie in den EV.12-Nachbarn.
+    let seals = seal_refs(dir);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
+    let tmp = dir.join("forged");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    // 2. Den Rückverweis tilgen: evidence.json aus jedem Store-Ref entfernen
+    //    (Wurzelbaum ohne den Eintrag neu schreiben — Subtrees bleiben).
+    let store_refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    let mut removed = 0;
+    for reference in store_refs.lines() {
+        let listing = stdout(&git(dir, &["ls-tree", reference]));
+        if !listing.contains("evidence.json") {
+            continue;
+        }
+        let kept: String = listing
+            .lines()
+            .filter(|l| !l.ends_with("evidence.json"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let tree = stdout(&git_stdin(dir, &["mktree"], &kept));
+        let commit = stdout(&git(
+            dir,
+            &["commit-tree", tree.trim(), "-m", "no back-reference"],
+        ));
+        git(dir, &["update-ref", reference, commit.trim()]);
+        removed += 1;
+    }
+    assert!(removed >= 1, "kein evidence.json gefunden:\n{store_refs}");
+
+    // 3. Das Verdikt bleibt TAMPERED — nicht NOT VERIFIABLE.
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    assert!(!text.contains("NOT VERIFIABLE"), "{text}");
+    // Und der Report benennt die Manipulation wie auf dem Rückverweis-Pfad.
+    assert!(text.contains("claimed      (UNVERIFIED"), "{text}");
+}
+
+/// EV.12-Härtung: hash-invalide Bytes, die ein wohlgeformter Seal MIT
+/// ANSI-Sequenz im scope wären. `Seal::parse` lehnt das Feld ab
+/// (check_single_line), der Report sagt „unreadable" — und kein ESC-Byte
+/// erreicht Terminal oder CI-Log.
+#[test]
+fn a_tampered_seal_with_a_hostile_scope_never_reaches_the_terminal() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let seals = seal_refs(dir);
+    let forged =
+        seal_text(dir, &seals[0]).replacen("scope=agent-hooks/v1", "scope=agent-\x1b[2Jhooks", 1);
+    let tmp = dir.join("hostile");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "hostile"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    assert!(text.contains("claimed      unreadable"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+}
+
+/// EV.12-Nachbar: Sind die abgelegten Bytes nicht einmal ein wohlgeformter
+/// Seal, sagt der Report genau das — und behauptet keinen Claim.
+#[test]
+fn a_tampered_seal_with_garbage_bytes_is_named_without_a_claim() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let seals = seal_refs(dir);
+    let tmp = dir.join("garbage");
+    std::fs::write(&tmp, b"not a seal\n").unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "garbage"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    assert!(text.contains("  expected     b3-"), "{text}");
+    assert!(text.contains("  found        b3-"), "{text}");
+    assert!(
+        text.contains("claimed      unreadable — the stored bytes are not even a well-formed seal"),
+        "{text}"
+    );
+    assert!(!text.contains("cross-check"), "{text}");
 }
 
 #[test]
@@ -3005,8 +3279,11 @@ fn verify_says_unverifiable_without_any_material() {
     let out = minds(dir, &["verify", &id], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(3), "{text}");
-    assert!(text.contains("NICHT VERIFIZIERBAR"), "{text}");
-    assert!(text.contains("vor Evidence-Chain erfasst"), "{text}");
+    assert!(text.contains("NOT VERIFIABLE"), "{text}");
+    assert!(
+        text.contains("captured before the evidence chain"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -3041,8 +3318,8 @@ fn verify_evidence_judges_a_sessionless_block_seal() {
     let out = minds(dir, &["verify", "--evidence", &seal_id], None);
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(2), "{text}");
-    assert!(text.contains("VERIFIZIERT, UNVOLLSTÄNDIG"), "{text}");
-    assert!(text.contains("zurückgewiesen"), "{text}");
+    assert!(text.contains("VERIFIED, INCOMPLETE"), "{text}");
+    assert!(text.contains("rejected (payload)"), "{text}");
 }
 
 #[test]
@@ -3057,7 +3334,10 @@ fn require_seal_gates_on_resolvable_seals() {
     let out = minds(dir, &["fsck", "--require-seal"], None);
     let text = stdout(&out);
     assert!(out.status.success(), "{text}");
-    assert!(text.contains("1 Session(s) geprüft, 0 ohne Seal"), "{text}");
+    assert!(
+        text.contains("1 session(s) checked, 0 without a seal"),
+        "{text}"
+    );
 
     // Seal-Ref weg (simulierter Teil-Clone/Löschung): Der baumelnde
     // Rückverweis zählt nicht — das Gate schlägt an.
@@ -3066,7 +3346,7 @@ fn require_seal_gates_on_resolvable_seals() {
     let out = minds(dir, &["fsck", "--require-seal"], None);
     let text = stdout(&out);
     assert!(!out.status.success(), "{text}");
-    assert!(text.contains(&format!("unversiegelt: {id}")), "{text}");
+    assert!(text.contains(&format!("unsealed: {id}")), "{text}");
 
     // Ohne das Gate bleibt dasselbe Repo grün — das Gate ist Politik, kein
     // Default.
@@ -3103,7 +3383,7 @@ fn fsck_reports_a_blocked_session_and_a_forged_seal() {
         out.status.success(),
         "Block-Seal ist ein Hinweis, kein Befund:\n{text}"
     );
-    assert!(text.contains("zurückgehalten"), "{text}");
+    assert!(text.contains("withheld"), "{text}");
 
     // Jetzt einen Seal fälschen — das IST ein Befund.
     let seals = seal_refs(dir);
@@ -3123,7 +3403,7 @@ fn fsck_reports_a_blocked_session_and_a_forged_seal() {
     let out = minds(dir, &["fsck"], None);
     let text = stdout(&out);
     assert!(!out.status.success(), "{text}");
-    assert!(text.contains("MANIPULIERT"), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
 }
 
 #[test]
@@ -3159,16 +3439,16 @@ fn reinterpret_is_read_only_and_deterministic() {
     // Interpretations-Protokoll: Evidenz-Adresse unverändert, gespeicherter
     // und aktueller Stand nebeneinander.
     assert!(text.contains("Adapter   claude-code v1"), "{text}");
-    assert!(text.contains("Evidenz"), "{text}");
+    assert!(text.contains("Evidence"), "{text}");
     assert!(
-        text.contains("gespeichert   claude-code v1 → READ a.rs"),
+        text.contains("stored        claude-code v1 → READ a.rs"),
         "{text}"
     );
     assert!(
-        text.contains("aktuell       claude-code v1 → READ a.rs (unverändert)"),
+        text.contains("current       claude-code v1 → READ a.rs (unchanged)"),
         "{text}"
     );
-    assert!(text.contains("0 mit neuerer Deutung"), "{text}");
+    assert!(text.contains("0 with a newer interpretation"), "{text}");
 
     // Deterministisch: zweiter Lauf, identische Ausgabe.
     let again = stdout(&minds(dir, &["reinterpret", &id], None));

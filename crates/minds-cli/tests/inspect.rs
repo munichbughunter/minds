@@ -141,12 +141,12 @@ fn piped_inspect_prints_one_tab_separated_line_per_session_without_ansi() {
     assert_eq!(cols[1], session_id);
     assert!(cols[2].starts_with("claude-code"), "{cols:?}");
     assert_eq!(
-        cols[6], "observed [ungeprüft]",
+        cols[6], "observed [unchecked]",
         "der Trailer belegt die Kante: {cols:?}"
     );
     // Das Seal-Verdikt (ADR-0011): Der Checkpoint hat die Epoche versiegelt.
-    assert_eq!(cols[7], "versiegelt", "{cols:?}");
-    assert_eq!(cols[8], "offen");
+    assert_eq!(cols[7], "sealed", "{cols:?}");
+    assert_eq!(cols[8], "open");
     assert!(
         cols[9].starts_with('I'),
         "Change-Id aus dem Trailer: {cols:?}"
@@ -190,8 +190,8 @@ fn piped_inspect_of_a_line_prints_the_chain_down_to_the_intent() {
     );
     // Seit ADR-0011 traegt das Wort auch den Status: beobachtet heisst
     // nicht geprueft.
-    assert!(text.contains("\tobserved [ungeprüft]\n"), "{text}");
-    assert!(text.contains("\nreview\toffen\n"), "{text}");
+    assert!(text.contains("\tobserved [unchecked]\n"), "{text}");
+    assert!(text.contains("\nreview\topen\n"), "{text}");
     // Die Lücken zuletzt: hier genau eine — niemand hat bewertet.
     assert!(text.contains("\ngap\tNoReview\t"), "{text}");
     assert!(!text.contains("gap\tInferred"), "{text}");
@@ -233,7 +233,7 @@ fn an_empty_repo_prints_nothing_and_a_forgotten_session_stays_a_line() {
     let text = stdout(&out);
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains(&session_id), "{text}");
-    assert!(text.contains("vergessen: Testdaten"), "{text}");
+    assert!(text.contains("forgotten: Testdaten"), "{text}");
     assert!(
         !text.contains("Grußfunktion"),
         "Nutzlast nach forget sichtbar:\n{text}"

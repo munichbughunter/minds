@@ -162,7 +162,7 @@ impl fmt::Debug for BlobId {
 /// öffentlichen API (jemand tippt `minds show <sha>` auf der Kommandozeile) und
 /// soll sich nicht mit gix bewegen.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("kein gültiger Git-Objekt-Hash: {input:?}")]
+#[error("not a valid Git object hash: {input:?}")]
 pub struct CommitIdParseError {
     /// Der abgewiesene Text. Ein Commit-Hash ist öffentlich — hier steht nie
     /// etwas Sensibles.

@@ -62,8 +62,8 @@ pub fn run(command: Option<&str>, options: Options<'_>) -> ExitCode {
     let result = match command {
         Some("mirror") => mirror(&options),
         Some("webhook") => incoming(&options),
-        Some(other) => Err(format!("unbekannt: gitlab {other} (mirror | webhook)").into()),
-        None => Err("erwartet: minds gitlab mirror|webhook".into()),
+        Some(other) => Err(format!("unknown: gitlab {other} (mirror | webhook)").into()),
+        None => Err("expected: minds gitlab mirror|webhook".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -76,12 +76,12 @@ pub fn run(command: Option<&str>, options: Options<'_>) -> ExitCode {
 
 /// Spiegelt die Verdicts eines Subjekts an einen Merge Request.
 fn mirror(options: &Options<'_>) -> Fallible<()> {
-    let subject = options.subject.ok_or("erwartet <subject> (Change-Id I…)")?;
+    let subject = options.subject.ok_or("expected <subject> (Change-Id I…)")?;
     let mr: u64 = options
         .merge_request
-        .ok_or("erwartet --mr <nummer>")?
+        .ok_or("expected --mr <number>")?
         .parse()
-        .map_err(|_| "--mr erwartet eine Zahl")?;
+        .map_err(|_| "--mr expects a number")?;
 
     let (repo, root) = open()?;
     let project = project(&root, options)?;
@@ -89,7 +89,7 @@ fn mirror(options: &Options<'_>) -> Fallible<()> {
 
     let reviews = store.for_subject(subject)?;
     if reviews.is_empty() {
-        println!("keine Verdicts für {subject} — nichts zu spiegeln");
+        println!("no verdicts for {subject} — nothing to mirror");
         return Ok(());
     }
 
@@ -97,18 +97,18 @@ fn mirror(options: &Options<'_>) -> Fallible<()> {
     for review in &reviews {
         let hash = review.content_hash()?;
         if project.mirror(mr, &hash, review)? {
-            println!("  gespiegelt: {} · {hash}", review.decision.as_str());
+            println!("  mirrored: {} · {hash}", review.decision.as_str());
             mirrored += 1;
         } else {
-            println!("  steht schon: {} · {hash}", review.decision.as_str());
+            println!("  already there: {} · {hash}", review.decision.as_str());
         }
         if options.approve && review.decision == Decision::Approve {
             project.approve(mr)?;
-            println!("  Approval gesetzt");
+            println!("  approval set");
         }
     }
     println!(
-        "{mirrored} von {} Verdict(s) neu an MR !{mr} gespiegelt.",
+        "{mirrored} of {} verdict(s) newly mirrored to MR !{mr}.",
         reviews.len()
     );
     Ok(())
@@ -134,8 +134,8 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
         let provided = std::env::var(WEBHOOK_TOKEN_ENV).ok();
         if !webhook::token_matches(provided.as_deref(), &secret) {
             return Err(format!(
-                "Token-Verifikation fehlgeschlagen — Nutzlast verworfen \
-                 (der Empfänger reicht den X-Gitlab-Token-Header in {WEBHOOK_TOKEN_ENV} durch)"
+                "token verification failed — payload discarded \
+                 (the receiver passes the X-Gitlab-Token header through in {WEBHOOK_TOKEN_ENV})"
             )
             .into());
         }
@@ -145,7 +145,7 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
 
     let Some(incoming) = webhook::parse(&payload) else {
         // Der Normalfall: irgendein anderes Ereignis. Kein Fehler.
-        println!("kein Verdict in dieser Nutzlast");
+        println!("no verdict in this payload");
         return Ok(());
     };
 
@@ -160,14 +160,14 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
 
     let (at, _) = minds_capture::clock::now();
     let Some(review) = incoming.into_review(resolved.as_deref(), Some(at)) else {
-        return Err("kein Subjekt: weder eine Change-Id im Kommentar noch am Commit des MR".into());
+        return Err("no subject: no Change-Id in the comment or on the MR's commit".into());
     };
 
     let hash = review.content_hash()?;
     // „laut Payload": Der Autor ist eine Behauptung der Nutzlast — auch mit
     // geprüftem Token beweist er nur den Hook, nicht die Person.
     println!(
-        "{} · {} (laut Payload) · {}",
+        "{} · {} (claimed by payload) · {}",
         review.decision.as_str(),
         review.reviewer,
         review.subject.id()
@@ -177,7 +177,7 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
     }
 
     if !options.write {
-        println!("\n(nichts geschrieben — mit --write anlegen; Hash wäre {hash})");
+        println!("\n(nothing written — create with --write; hash would be {hash})");
         return Ok(());
     }
     // Ingest-Validierung (#12): Eine Netz-Nutzlast, deren Felder keinen
@@ -187,7 +187,7 @@ fn incoming(options: &Options<'_>) -> Fallible<()> {
     // niemand je signieren könnte.
     minds_core::review_payload(&hash, &review)?;
     let written = ReviewStore::new(repo).put(&review)?;
-    println!("\nReview {written} angelegt.");
+    println!("\nReview {written} created.");
     Ok(())
 }
 
@@ -197,12 +197,12 @@ fn project(root: &Path, options: &Options<'_>) -> Fallible<Project> {
         .url
         .map(str::to_owned)
         .or_else(|| git_config(root, "minds.gitlabUrl"))
-        .ok_or("keine Instanz: --url <basis> oder `git config minds.gitlabUrl`")?;
+        .ok_or("no instance: --url <base> or `git config minds.gitlabUrl`")?;
     let project = options
         .project
         .map(str::to_owned)
         .or_else(|| git_config(root, "minds.gitlabProject"))
-        .ok_or("kein Projekt: --project <id|pfad> oder `git config minds.gitlabProject`")?;
+        .ok_or("no project: --project <id|path> or `git config minds.gitlabProject`")?;
     let token_env = options.token_env.unwrap_or(DEFAULT_TOKEN_ENV);
     Ok(Project::new(&url, &project, token_env)?)
 }

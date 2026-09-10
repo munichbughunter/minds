@@ -1207,33 +1207,20 @@ impl ContextStore for GitStore {
             Err(minds_git::GitError::RefRaced { .. }) => match self.seal_text(&id)? {
                 Some(_) => Ok(id),
                 None => Err(StoreError::backend(std::io::Error::other(
-                    "Seal-Ref bewegte sich, trägt aber keinen Seal",
+                    "the seal ref moved but carries no seal",
                 ))),
             },
             Err(err) => Err(StoreError::backend(err)),
         }
     }
 
-    fn seal_text(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
-        use minds_core::evidence::Seal;
-
-        let Some(bytes) = self
-            .repo
+    fn seal_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        // Ungeprüft per Vertrag ([`ContextStore::seal_bytes`]): Der
+        // Hash-Abgleich liegt im Trait-Default von `seal_text` — eine
+        // Prüfung, nicht drei.
+        self.repo
             .read_blob_at(&seal_ref(id), SEAL_FILE)
-            .map_err(StoreError::backend)?
-        else {
-            return Ok(None);
-        };
-        let text =
-            String::from_utf8(bytes).map_err(|e| StoreError::backend(std::io::Error::other(e)))?;
-        let actual = Seal::id_of_text(&text);
-        if actual != *id {
-            return Err(StoreError::SealMismatch {
-                requested: id.clone(),
-                actual,
-            });
-        }
-        Ok(Some(text))
+            .map_err(StoreError::backend)
     }
 
     fn record_session_seal(
@@ -1299,7 +1286,7 @@ impl ContextStore for GitStore {
             )));
         }
         let reference = seal_ref(id);
-        let message = format!("minds: Signatur für Seal {id}");
+        let message = format!("minds: signature for seal {id}");
         let mut attempts_left = PUT_ATTEMPTS;
         loop {
             attempts_left -= 1;

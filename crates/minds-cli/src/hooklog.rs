@@ -259,7 +259,7 @@ fn guarded_into(
                     .downcast_ref::<&str>()
                     .map(|s| (*s).to_owned())
                     .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "ohne Meldung".to_owned())
+                    .unwrap_or_else(|| "no message".to_owned())
             });
             // Wo fremde Nutzlast im Speicher liegt, **nur der Ort**, nicht die
             // Meldung: Eine Panic-Meldung kann sie einbetten (`panic!("…
@@ -270,9 +270,9 @@ fn guarded_into(
             // Pfade behalten die Meldung: Dort steht kein Transkript im
             // Speicher, und sie war schon vorher drin.
             let note = if source.holds_payload() {
-                format!("Panic — Vorgang abgebrochen: {}", location_of(&note))
+                format!("panic — run aborted: {}", location_of(&note))
             } else {
-                format!("Panic — Vorgang abgebrochen: {note}")
+                format!("panic — run aborted: {note}")
             };
 
             match git_dir {
@@ -382,7 +382,7 @@ fn last_panic() -> Option<String> {
 fn location_of(text: &str) -> &str {
     match text.split_once('\n') {
         Some((location, _)) => location,
-        None => "ohne Ort",
+        None => "no location",
     }
 }
 
@@ -603,7 +603,7 @@ fn entry(message: &str) -> String {
 ///
 /// Ein Marker und kein Präfix: Die Meldung ist mit Sicherheit keine lesbare
 /// Diagnose mehr, und ein Präfix hätte die Redaktion nie vollständig gesehen.
-const DROPPED: &str = "[Meldung verworfen: länger als die Eingabegrenze]";
+const DROPPED: &str = "[message dropped: longer than the input limit]";
 
 /// Ob die Meldung die Grenze reißt — ohne sie dafür ganz zu zählen.
 fn exceeds_input_limit(message: &str) -> bool {
@@ -786,7 +786,7 @@ mod tests {
             format!("{:?}", std::process::ExitCode::FAILURE)
         );
         let content = read(dir.path());
-        assert!(content.contains("checkpoint: Panic"), "{content}");
+        assert!(content.contains("checkpoint: panic"), "{content}");
         // Und mit dem Wortlaut — sonst stünde da nur, *dass* etwas passiert ist.
         assert!(content.contains("etwas ging schief"), "{content}");
         // Samt **Ort** (#54): Ohne ihn weiß niemand, wo er nachsehen soll — und
@@ -812,7 +812,7 @@ mod tests {
             format!("{:?}", std::process::ExitCode::FAILURE)
         );
         let content = read(dir.path());
-        assert!(content.contains("import: Panic"), "{content}");
+        assert!(content.contains("import: panic"), "{content}");
         assert!(
             content.contains("hooklog.rs:"),
             "kein Ort im Log:\n{content}"
@@ -860,7 +860,7 @@ mod tests {
             "die Nutzlast ging verloren"
         );
         // Und der Slot bleibt leer: Was außerhalb passiert, gehört nicht ins Log.
-        assert!(last_panic().is_none(), "der Slot wurde außerhalb gefüllt");
+        assert!(last_panic().is_none(), "slot filled outside the guard");
     }
 
     #[test]
@@ -932,7 +932,7 @@ mod tests {
         // demselben Grund einen verlinkten Hook ab.
         let dir = git_dir();
         let victim = dir.path().join("opfer.txt");
-        fs::write(&victim, "unberührt\n").unwrap();
+        fs::write(&victim, "untouched\n").unwrap();
 
         let log = path(dir.path());
         fs::create_dir_all(log.parent().unwrap()).unwrap();
@@ -940,7 +940,7 @@ mod tests {
 
         log_at(dir.path(), Source::Checkpoint, "sollte nirgends landen");
 
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "unberührt\n");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched\n");
     }
 
     #[cfg(unix)]
@@ -952,13 +952,13 @@ mod tests {
         let dir = git_dir();
         let elsewhere = tempfile::tempdir().unwrap();
         let victim = elsewhere.path().join("hook.log");
-        fs::write(&victim, "unberührt\n").unwrap();
+        fs::write(&victim, "untouched\n").unwrap();
 
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("minds")).unwrap();
 
         log_at(dir.path(), Source::Checkpoint, "sollte nirgends landen");
 
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "unberührt\n");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched\n");
     }
 
     #[cfg(unix)]
@@ -972,7 +972,7 @@ mod tests {
         let dir = git_dir();
         let elsewhere = tempfile::tempdir().unwrap();
         let victim = elsewhere.path().join("hook.log");
-        fs::write(&victim, "unberührt\n").unwrap();
+        fs::write(&victim, "untouched\n").unwrap();
         fs::set_permissions(&victim, fs::Permissions::from_mode(0o644)).unwrap();
 
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("minds")).unwrap();
@@ -1026,7 +1026,7 @@ mod tests {
         let dir = git_dir();
         let log = path(dir.path());
         fs::create_dir_all(log.parent().unwrap()).unwrap();
-        fs::write(log.with_file_name(ROTATED_FILE), "alt\nälter\n").unwrap();
+        fs::write(log.with_file_name(ROTATED_FILE), "old\nolder\n").unwrap();
 
         let summary = summary(dir.path()).expect("der Vorgänger zählt");
         assert_eq!(summary.entries, 0);
@@ -1250,7 +1250,7 @@ mod tests {
         let content = read(dir.path());
         assert_eq!(content.lines().count(), WRITERS * EACH, "keine Zeile fehlt");
         for line in content.lines() {
-            assert!(line.contains(" hook: "), "zersägte Zeile: {line:?}");
+            assert!(line.contains(" hook: "), "torn line: {line:?}");
         }
         assert_eq!(
             summary(dir.path()).unwrap().entries,
@@ -1264,9 +1264,9 @@ mod tests {
         // Mehrbyte-Zeichen genau an der Grenze: Ein byteweiser Schnitt panickte
         // hier (derselbe Fehler wie in #1).
         let dir = git_dir();
-        let umlauts = "ä".repeat(MAX_MESSAGE + 10);
+        let umlauts = "\u{e9}".repeat(MAX_MESSAGE + 10);
         log_at(dir.path(), Source::Checkpoint, &umlauts);
-        assert!(read(dir.path()).contains('ä'));
+        assert!(read(dir.path()).contains('\u{e9}'));
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub enum AttestError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// `ssh-keygen` lief, meldete aber einen Fehler.
-    #[error("ssh-keygen {operation} fehlgeschlagen: {stderr}")]
+    #[error("ssh-keygen {operation} failed: {stderr}")]
     Keygen {
         /// Die Unteroperation (`sign` oder `verify`).
         operation: &'static str,
@@ -81,7 +81,7 @@ pub fn ssh_sign(payload: &str, key: &Path) -> Result<String, AttestError> {
     }
     std::fs::read_to_string(&sig).map_err(|_| AttestError::Keygen {
         operation: "sign",
-        stderr: "Exit 0, aber keine Signaturdatei geschrieben".to_string(),
+        stderr: "exit 0, but no signature file written".to_string(),
     })
 }
 
@@ -113,7 +113,7 @@ pub fn ssh_verify(
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| std::io::Error::other("ssh-keygen: kein stdin"))?;
+            .ok_or_else(|| std::io::Error::other("ssh-keygen: no stdin"))?;
         if let Err(err) = stdin.write_all(payload.as_bytes()) {
             if err.kind() != std::io::ErrorKind::BrokenPipe {
                 return Err(err.into());

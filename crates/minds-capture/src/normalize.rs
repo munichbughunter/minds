@@ -249,11 +249,11 @@ fn generic_tool(event: &JournalEvent) -> ToolFacts {
     let raw = event.payload.get();
     let arguments = if raw.len() > GENERIC_ARGUMENTS_CAP {
         format!(
-            "[minds: Payload nicht übernommen — {} Bytes über dem Deckel]",
+            "[minds: payload not captured — {} bytes over the cap]",
             raw.len()
         )
     } else if let Some(reason) = secret_path_anywhere(raw) {
-        format!("[minds: Payload nicht übernommen — Secretfile-Pfad im Inhalt ({reason})]")
+        format!("[minds: payload not captured — secretfile path in content ({reason})]")
     } else {
         raw.to_owned()
     };
@@ -526,8 +526,7 @@ mod tests {
         let ev = event(EventKind::ToolPre, "PreToolUse", payload);
         let got = facts("some-future-agent", &ev).tool.expect("Fallback");
         assert!(
-            got.arguments
-                .starts_with("[minds: Payload nicht übernommen"),
+            got.arguments.starts_with("[minds: payload not captured"),
             "{}",
             got.arguments
         );

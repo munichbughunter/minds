@@ -38,7 +38,7 @@ pub const ATTESTATION_VERSION: &str = "minds-attestation-v1";
 /// Der Fehler **benennt** das Feld, zitiert aber nie seinen Wert — der Wert
 /// ist genau das, was hier nicht in eine weitere Senke wandern soll.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("signierbarer Payload: Feld {field} enthält Zeilen- oder Steuerzeichen")]
+#[error("signable payload: field {field} contains line breaks or control characters")]
 pub struct PayloadError {
     /// Das betroffene Feld, z. B. `agent.version` oder `reviewer`.
     pub field: &'static str,

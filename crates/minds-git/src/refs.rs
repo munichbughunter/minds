@@ -813,7 +813,7 @@ mod tests {
             .update_blob_in_ref("refs/minds/test/lock", "f", "x", |_| Some(b"x".to_vec()))
             .unwrap_err();
         assert!(err.to_string().contains("refs-write.lock"), "{err}");
-        assert!(err.to_string().contains("von Hand"), "{err}");
+        assert!(err.to_string().contains("by hand"), "{err}");
     }
 
     #[test]

@@ -172,7 +172,7 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
     let root = repo_root(&repo);
 
     if !enabled(&root) {
-        vln(verbose, "minds sync: durch minds.sync abgeschaltet");
+        vln(verbose, "minds sync: disabled via minds.sync");
         return Ok(());
     }
 
@@ -191,15 +191,15 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
     // sichtbar bleiben soll, bis er aufgelöst ist.
     if !deferred.is_empty() {
         ProgressLine::write(&format!(
-            "minds: {} divergierte(r) Ref(s) nicht übertragen \
-             — non-fast-forward, ohne `--force` nicht pushbar\n",
+            "minds: {} diverged ref(s) not transferred \
+             — non-fast-forward, cannot be pushed without `--force`\n",
             deferred.len()
         ));
         hooklog::log_at(
             &git_dir,
             Source::Sync,
             &format!(
-                "{} divergierte(r) Ref(s) non-fast-forward, nicht synchronisiert: {}",
+                "{} diverged ref(s) non-fast-forward, not synced: {}",
                 deferred.len(),
                 deferred.join(", ")
             ),
@@ -208,7 +208,7 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
 
     if jobs.iter().all(|job| job.updates.is_empty()) {
         // Der häufige Fall. Bis hierher wurde keine Verbindung geöffnet.
-        vln(verbose, "minds sync: nichts Neues");
+        vln(verbose, "minds sync: nothing new");
         return Ok(());
     }
 
@@ -220,7 +220,7 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
     if detach && !retry_in_foreground {
         let due: usize = jobs.iter().map(|job| job.updates.len()).sum();
         ProgressLine::write(&format!(
-            "minds: {due} Ref(s) → {} im Hintergrund\n",
+            "minds: {due} ref(s) → {} in the background\n",
             crate::text::sanitize_path(display(remote))
         ));
         spawn_background(remote);
@@ -233,9 +233,9 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
         // nichts. Aus dem Hook gehört das auf stdout: Der Nutzer hat fällige
         // Refs, und ohne die Zeile wüsste er nicht, warum nichts geschieht.
         if detach {
-            ProgressLine::write("minds: Kontext-Sync läuft bereits\n");
+            ProgressLine::write("minds: context sync already running\n");
         }
-        vln(verbose, "minds sync: läuft bereits");
+        vln(verbose, "minds sync: already running");
         return Ok(());
     };
 
@@ -245,7 +245,7 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
     // langsamer.
     if retry_in_foreground {
         ProgressLine::write(
-            "minds: letzter Hintergrund-Sync gescheitert — diesmal im Vordergrund\n",
+            "minds: last background sync failed — running in the foreground this time\n",
         );
     }
 
@@ -264,10 +264,7 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
             // behandelt wird, endet `minds sync` trotzdem mit 0. Über den
             // Rückgabewert erfährt ihn niemand, über den pre-push-Hook seit der
             // stderr-Umleitung auch nicht.
-            let note = format!(
-                "Kontext-Sync ({}) nicht möglich: {err}",
-                display(&job.label)
-            );
+            let note = format!("context sync ({}) failed: {err}", display(&job.label));
             hooklog::report_at(&git_dir, Source::Sync, &note);
             // Und eine Zeile auf dem Kanal, der den Hook überlebt — ohne
             // Wortlaut, aber mit dem Weg dorthin. Sonst wäre der Unterschied
@@ -279,7 +276,7 @@ fn sync(remote: &str, verbose: bool, detach: bool) -> Fallible<()> {
             // panicken, `guarded` schriebe daraufhin einen Panic-Eintrag — ein
             // `fsck`-Hinweis aus einer völlig harmlosen Bedingung.
             ProgressLine::write(
-                "minds: Kontext-Sync nicht möglich — `minds fsck` sagt, wo der Grund steht\n",
+                "minds: context sync failed — `minds fsck` shows where the reason is recorded\n",
             );
         }
     }
@@ -448,7 +445,7 @@ fn merge_incoming(root: &Path, git_dir: &Path, remote: &str, verbose: bool) {
     // `fsck`-Hinweis, den man nur durch Löschen loswird und der sofort
     // wiederkommt. Genau das Rauschen, gegen das `log_report_lines` argumentiert.
     if !has_remote(root, remote) {
-        vln(verbose, "minds sync: kein benanntes Remote — kein Merge");
+        vln(verbose, "minds sync: no named remote — no merge");
         return;
     }
     let incoming = format!("{}reviews", tracking_prefix(remote));
@@ -461,9 +458,7 @@ fn merge_incoming(root: &Path, git_dir: &Path, remote: &str, verbose: bool) {
         });
     match merged {
         Ok(0) => {}
-        Ok(count) => {
-            ProgressLine::write(&format!("minds: {count} fremde(s) Verdict(s) übernommen\n"))
-        }
+        Ok(count) => ProgressLine::write(&format!("minds: {count} incoming verdict(s) merged\n")),
         Err(err) => {
             // Nicht nur `vln`: Ein fehlender Tracking-Ref ist hier **kein**
             // Fehler ([`ReviewStore::merge_from`] gibt dafür `Ok(0)` zurück),
@@ -471,7 +466,7 @@ fn merge_incoming(root: &Path, git_dir: &Path, remote: &str, verbose: bool) {
             // füllt den Review-Store, den `fsck --require-review` als CI-Gate
             // liest. Bliebe er beim Push still liegen, prüfte das Gate gegen
             // einen Stand, dem fremde Verdicts fehlen.
-            let note = crate::text::without_url_credentials(&format!("Merge übersprungen: {err}"));
+            let note = crate::text::without_url_credentials(&format!("merge skipped: {err}"));
             vln(verbose, &format!("minds sync: {note}"));
             hooklog::log_at(git_dir, Source::Sync, &note);
         }
@@ -527,7 +522,7 @@ fn plan(root: &Path, repo: &Repo, remote: &str) -> Fallible<(Vec<Job>, Vec<Strin
             jobs.push(Job {
                 dir: child.clone(),
                 remote: DEFAULT_REMOTE.to_string(),
-                label: format!("Child-Repo {}", child.display()),
+                label: format!("child repo {}", child.display()),
                 updates,
             });
         }
@@ -661,7 +656,7 @@ impl Job {
         // darauf, dass minds beim Push überhaupt eine Verbindung aufbaut. Ein
         // Fortschritt ist keine Fehlermeldung; er gehört ohnehin hierher.
         let line = ProgressLine::start(&format!(
-            "minds: {} Ref(s) → {} …",
+            "minds: {} ref(s) → {} …",
             self.updates.len(),
             // Auch hier entschärft: Das Label kommt aus `.git/config` bzw.
             // `minds.childPath`, und ein `\e[2K\e[A` darin überschriebe die
@@ -671,7 +666,7 @@ impl Job {
 
         match self.push(&self.updates) {
             Ok(()) => {
-                line.finish(" fertig");
+                line.finish(" done");
                 self.record(&self.updates, verbose);
                 self.report_erasures(git_dir);
                 Ok(())
@@ -789,14 +784,14 @@ impl Job {
             return;
         }
         ProgressLine::write(&format!(
-            "minds: {} getilgte(r) Ref(s) per Force-Push übertragen — die Löschung ist jetzt auch auf der Forge\n",
+            "minds: {} erased ref(s) transferred via force-push — the deletion has now reached the forge\n",
             erased.len()
         ));
         hooklog::log_at(
             git_dir,
             Source::Sync,
             &format!(
-                "DSGVO-Löschung übertragen ({}): Force-Push für {}",
+                "GDPR erasure transferred ({}): force-push for {}",
                 display(&self.label),
                 erased.join(", ")
             ),
@@ -824,15 +819,15 @@ impl Job {
             return;
         }
         ProgressLine::write(&format!(
-            "minds: DSGVO-Löschung NICHT bestätigt — {} getilgte(r) Ref(s) haben die Forge \
-             nicht erreicht, der nächste Sync versucht es erneut\n",
+            "minds: GDPR erasure NOT confirmed — {} erased ref(s) did not reach the forge, \
+             the next sync will retry\n",
             pending.len()
         ));
         hooklog::report_at(
             git_dir,
             Source::Sync,
             &format!(
-                "Löschung nicht übertragen ({}): Force-Push scheiterte für {}",
+                "erasure not transferred ({}): force-push failed for {}",
                 display(&self.label),
                 pending.join(", ")
             ),
@@ -854,7 +849,7 @@ impl Job {
                 // erneut angeboten — der Push ist idempotent.
                 vln(
                     verbose,
-                    &format!("  Tracking-Ref {} nicht gesetzt", update.tracking),
+                    &format!("  tracking ref {} not set", update.tracking),
                 );
             }
         }
@@ -876,10 +871,10 @@ impl Job {
             .iter()
             .find(|update| update.local == DEFAULT_REVIEW_REF)
         else {
-            return Err("Remote ist weiter als wir — bitte `git fetch` und erneut pushen".into());
+            return Err("the remote is ahead of us — run `git fetch` and push again".into());
         };
 
-        let line = ProgressLine::start("minds: Review-Log divergiert, vereinige …");
+        let line = ProgressLine::start("minds: review log diverged, merging …");
         let incoming = format!("{}incoming", tracking_prefix(&self.remote));
         // `output()` statt `status()`: Sonst erbte das Kind unsere stderr, und
         // die wirft der pre-push-Hook seit #10 weg — der Grund des Fehlschlags
@@ -899,7 +894,7 @@ impl Job {
             .output()?;
         if !fetched.status.success() {
             return Err(crate::text::without_url_credentials(&format!(
-                "fremder Review-Stand nicht abrufbar: {}",
+                "incoming review state could not be fetched: {}",
                 String::from_utf8_lossy(&fetched.stderr).trim()
             ))
             .into());
@@ -912,7 +907,7 @@ impl Job {
         // veraltet, also neu nachsehen.
         let repo = Repo::open(&self.dir)?;
         let Some(commit) = repo.commit_at(DEFAULT_REVIEW_REF)? else {
-            return Err("Review-Ref ist nach dem Merge verschwunden".into());
+            return Err("the review ref disappeared after the merge".into());
         };
         let retry = vec![Update {
             local: DEFAULT_REVIEW_REF.to_string(),
@@ -922,7 +917,7 @@ impl Job {
             force: false,
         }];
         self.push(&retry)?;
-        line.finish(&format!(" {merged} übernommen, fertig"));
+        line.finish(&format!(" {merged} merged, done"));
         self.record(&retry, verbose);
         Ok(())
     }
@@ -1076,7 +1071,7 @@ fn git_output(dir: &Path, args: &[&str]) -> std::io::Result<String> {
 /// geschrieben hat. Nur Namen anzeigen.
 fn display(label: &str) -> &str {
     if label.contains("://") || label.contains('@') {
-        "Remote"
+        "remote"
     } else {
         label
     }
@@ -1236,7 +1231,7 @@ mod tests {
         std::fs::remove_file(minds.join(RETRY_MARKER)).unwrap();
         std::os::unix::fs::symlink(&nowhere, minds.join(RETRY_MARKER)).unwrap();
         set_retry_marker(dir.path(), true);
-        assert!(!nowhere.exists(), "Datei durch hängenden Link angelegt");
+        assert!(!nowhere.exists(), "file created through a dangling link");
 
         // … und ein symlinktes `minds`-Verzeichnis ebenso wenig.
         let other = tempfile::tempdir().unwrap();
@@ -1427,8 +1422,8 @@ mod tests {
     #[test]
     fn a_url_label_is_not_printed() {
         assert_eq!(display("origin"), "origin");
-        assert_eq!(display("https://token@example.org/x.git"), "Remote");
-        assert_eq!(display("git@example.org:x.git"), "Remote");
+        assert_eq!(display("https://token@example.org/x.git"), "remote");
+        assert_eq!(display("git@example.org:x.git"), "remote");
     }
 
     #[test]

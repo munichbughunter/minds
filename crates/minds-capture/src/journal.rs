@@ -407,7 +407,7 @@ impl Journal {
     pub fn discover(start: &Path) -> Result<Self> {
         let start = start
             .canonicalize()
-            .map_err(|e| CaptureError::io("Arbeitsverzeichnis auflösen", start, e))?;
+            .map_err(|e| CaptureError::io("resolving working directory", start, e))?;
 
         for dir in start.ancestors() {
             let candidate = dir.join(".git");
@@ -415,7 +415,7 @@ impl Journal {
                 Ok(m) if m.is_dir() => return Ok(Self::open(&candidate)),
                 Ok(m) if m.is_file() => {
                     let text = fs::read_to_string(&candidate)
-                        .map_err(|e| CaptureError::io("gitdir-Datei lesen", &candidate, e))?;
+                        .map_err(|e| CaptureError::io("reading gitdir file", &candidate, e))?;
                     let target = text
                         .lines()
                         .find_map(|l| l.strip_prefix("gitdir:"))
@@ -483,8 +483,8 @@ impl Journal {
         };
 
         let tmp = dir.join(format!("{seq:010}.json.tmp"));
-        write_private(&tmp, &serde_json::to_vec(&event)?, "Event schreiben")?;
-        fs::rename(&tmp, &claim).map_err(|e| CaptureError::io("Event umbenennen", &claim, e))?;
+        write_private(&tmp, &serde_json::to_vec(&event)?, "writing event")?;
+        fs::rename(&tmp, &claim).map_err(|e| CaptureError::io("renaming event", &claim, e))?;
 
         // Auch das Verzeichnis synchronisieren (#49): `rename` ist ein Eintrag
         // im Verzeichnis, und ohne dessen fsync kann ein Stromausfall das
@@ -521,7 +521,7 @@ impl Journal {
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     seq += 1;
                 }
-                Err(e) => return Err(CaptureError::io("Event anlegen", &path, e)),
+                Err(e) => return Err(CaptureError::io("creating event", &path, e)),
             }
         }
 
@@ -547,7 +547,7 @@ impl Journal {
         let agents = match fs::read_dir(&self.root) {
             Ok(it) => it,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(CaptureError::io("Journal lesen", &self.root, e)),
+            Err(e) => return Err(CaptureError::io("reading journal", &self.root, e)),
         };
 
         for agent in agents.flatten() {
@@ -632,7 +632,13 @@ impl Journal {
             // sein; der Fehlertext nennt stattdessen den gehashten Pfad
             // derselben Session — er wandert über den Checkpoint ins
             // hook.log, und dort darf kein rohes local_id stehen (#95).
-            Err(e) => return Err(CaptureError::io("Session lesen", self.session_dir(key), e)),
+            Err(e) => {
+                return Err(CaptureError::io(
+                    "reading session",
+                    self.session_dir(key),
+                    e,
+                ));
+            }
         };
 
         for entry in entries.flatten() {
@@ -684,7 +690,7 @@ impl Journal {
             // Wie in `read`: nie den (möglicherweise rohen) Alt-Pfad in den
             // Fehlertext — der landet im hook.log (#95).
             Err(e) => Err(CaptureError::io(
-                "Session verwerfen",
+                "discarding session",
                 self.session_dir(key),
                 e,
             )),
@@ -787,7 +793,7 @@ impl Journal {
             // Der Fehlertext nennt das Ziel, nicht die Quelle: Der Quellname
             // ist das rohe `local_id`, und die Meldung wandert ins hook.log
             // (#95). Der gehashte Name bezeichnet dieselbe Session.
-            Err(e) => return Err(CaptureError::io("Bestandssession migrieren", hashed, e)),
+            Err(e) => return Err(CaptureError::io("migrating legacy session", hashed, e)),
         }
         // Das `rename` ist ein Eintrag im Agent-Verzeichnis — haltbar machen,
         // wie beim Event-`rename` (#49).
@@ -827,11 +833,7 @@ impl Journal {
                     dir: dir.to_path_buf(),
                 })
             }
-            Some(Err(e)) => Err(CaptureError::io(
-                "Schlüssel-Datei lesen",
-                dir.join(KEY_FILE),
-                e,
-            )),
+            Some(Err(e)) => Err(CaptureError::io("reading key file", dir.join(KEY_FILE), e)),
             None => {
                 let record = KeyRecord {
                     version: KEY_RECORD_VERSION,
@@ -849,11 +851,7 @@ impl Journal {
                 // gewordene `.key` unter dem Deskriptor weg.
                 let path = dir.join(KEY_FILE);
                 let tmp = dir.join(format!("{KEY_FILE}.{}.tmp", std::process::id()));
-                write_private(
-                    &tmp,
-                    &serde_json::to_vec(&record)?,
-                    "Schlüssel-Datei schreiben",
-                )?;
+                write_private(&tmp, &serde_json::to_vec(&record)?, "writing key file")?;
                 match fs::rename(&tmp, &path) {
                     Ok(()) => Ok(()),
                     Err(e) => {
@@ -868,7 +866,7 @@ impl Journal {
                             {
                                 Ok(())
                             }
-                            _ => Err(CaptureError::io("Schlüssel-Datei umbenennen", &path, e)),
+                            _ => Err(CaptureError::io("renaming key file", &path, e)),
                         }
                     }
                 }
@@ -1053,12 +1051,12 @@ pub(crate) fn create_dir_private(root: &Path, leaf: &Path) -> Result<()> {
             .recursive(true)
             .mode(0o700)
             .create(leaf)
-            .map_err(|e| CaptureError::io("Journal-Verzeichnis anlegen", leaf, e))?;
+            .map_err(|e| CaptureError::io("creating journal directory", leaf, e))?;
 
         let mut level = leaf;
         loop {
             fs::set_permissions(level, fs::Permissions::from_mode(0o700))
-                .map_err(|e| CaptureError::io("Journal-Verzeichnis härten", level, e))?;
+                .map_err(|e| CaptureError::io("hardening journal directory", level, e))?;
             if level == root {
                 break;
             }
@@ -1071,7 +1069,7 @@ pub(crate) fn create_dir_private(root: &Path, leaf: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         fs::create_dir_all(leaf)
-            .map_err(|e| CaptureError::io("Journal-Verzeichnis anlegen", leaf, e))?;
+            .map_err(|e| CaptureError::io("creating journal directory", leaf, e))?;
         let _ = root;
     }
     Ok(())
@@ -1093,9 +1091,9 @@ fn refuse_symlinked_levels(root: &Path, leaf: &Path) -> Result<()> {
         if let Ok(meta) = fs::symlink_metadata(level) {
             if meta.file_type().is_symlink() {
                 return Err(CaptureError::io(
-                    "Journal-Ebene ist ein Symlink — dorthin wird nicht geschrieben",
+                    "journal level is a symlink — refusing to write there",
                     level,
-                    std::io::Error::other("Symlink statt Verzeichnis"),
+                    std::io::Error::other("symlink instead of a directory"),
                 ));
             }
         }
@@ -1128,11 +1126,7 @@ fn sync_dir(dir: &Path) -> Result<()> {
         {
             Ok(())
         }
-        Err(e) => Err(CaptureError::io(
-            "Journal-Verzeichnis synchronisieren",
-            dir,
-            e,
-        )),
+        Err(e) => Err(CaptureError::io("syncing journal directory", dir, e)),
     }
 }
 
@@ -1722,7 +1716,7 @@ mod tests {
         let err = SessionKey::new("claude-code", &jwt).unwrap_err();
         assert!(!err.to_string().contains("eyJ"), "{err}");
         assert!(!err.to_string().contains("xxx"), "{err}");
-        assert!(err.to_string().contains("161 Zeichen"), "{err}");
+        assert!(err.to_string().contains("161 characters"), "{err}");
     }
 
     #[test]
@@ -1821,7 +1815,7 @@ mod tests {
         let j = Journal::open(git_dir.path());
         let key = SessionKey::new("claude-code", "symlink").unwrap();
         let err = j.append(&key, event(EventKind::Prompt)).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
 
         // Das Ziel blieb unberührt: keine Dateien, Rechte unverändert.
         assert!(fs::read_dir(target.path()).unwrap().next().is_none());

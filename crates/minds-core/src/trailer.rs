@@ -259,21 +259,21 @@ impl fmt::Display for Trailer {
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum TrailerParseError {
     /// Die Zeile enthält keinen Doppelpunkt, ist also keine `Key: Value`-Zeile.
-    #[error("Zeile ist kein Trailer (kein ':' gefunden)")]
+    #[error("line is not a trailer (no ':' found)")]
     NotATrailer,
 
     /// Ein `Key: Value` mit einem Schlüssel, der kein Minds-Trailer ist.
-    #[error("unbekannter Trailer-Schlüssel: {0:?}")]
+    #[error("unknown trailer key: {0:?}")]
     UnknownKey(String),
 
     /// Der Schlüssel war `Minds-Session-Id`, der Wert aber keine gültige
     /// [`SessionId`].
-    #[error("ungültige SessionId im Trailer: {0}")]
+    #[error("invalid SessionId in trailer: {0}")]
     SessionId(#[from] SessionIdParseError),
 
     /// Der Schlüssel war `Minds-Change-Id`, der Wert aber keine gültige
     /// [`ChangeId`].
-    #[error("ungültige Change-Id im Trailer: {0}")]
+    #[error("invalid change id in trailer: {0}")]
     ChangeId(#[from] ChangeIdParseError),
 }
 

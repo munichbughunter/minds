@@ -73,7 +73,7 @@ impl Mode {
 /// Führt `minds audit` aus.
 pub fn run(export: bool, out: Option<&str>, base: Option<&str>, mode: Option<&str>) -> ExitCode {
     if !export {
-        eprintln!("minds audit: erwartet --export");
+        eprintln!("minds audit: expected --export");
         return ExitCode::FAILURE;
     }
     let mode = match mode {
@@ -81,8 +81,8 @@ pub fn run(export: bool, out: Option<&str>, base: Option<&str>, mode: Option<&st
         Some("proof") => Mode::Proof,
         Some(other) => {
             eprintln!(
-                "minds audit: unbekannter Modus {other:?} — redacted oder proof \
-                 (full gibt es bewusst nicht: der Store hält nur Redigiertes)"
+                "minds audit: unknown mode {other:?} — redacted or proof \
+                 (there is deliberately no full: the store holds redacted content only)"
             );
             return ExitCode::FAILURE;
         }
@@ -219,7 +219,7 @@ fn audit(out: Option<&str>, base: Option<&str>, mode: Mode) -> Fallible<()> {
     let store = config::load(&root).open(&root)?;
     let reviews = ReviewStore::new(Repo::open(&root)?);
 
-    let head = repo.head()?.commit().ok_or("HEAD hat noch keinen Commit")?;
+    let head = repo.head()?.commit().ok_or("HEAD has no commit yet")?;
 
     // Commits einsammeln — ab der Basis, sonst die ganze erreichbare Historie.
     let commits: Vec<CommitId> = match base {
@@ -318,7 +318,7 @@ fn audit(out: Option<&str>, base: Option<&str>, mode: Mode) -> Fallible<()> {
         Some(path) => {
             std::fs::write(path, format!("{json}\n"))?;
             println!(
-                "{} Change(s) exportiert → {path}",
+                "{} change(s) exported → {path}",
                 bundle_len(&bundle.changes)
             );
         }

@@ -28,13 +28,13 @@ use serde_json::Value;
 #[derive(Debug, thiserror::Error)]
 pub enum CanonError {
     /// Der Wert ließ sich nicht nach JSON serialisieren.
-    #[error("Wert konnte nicht nach JSON serialisiert werden: {0}")]
+    #[error("value could not be serialized to JSON: {0}")]
     Serialize(#[from] serde_json::Error),
 
     /// Kanonisches JSON in Minds erlaubt nur Ganzzahlen. Gleitkommazahlen
     /// werden abgelehnt, weil ihre deterministische Formatierung (ECMAScript
     /// Number::toString) nicht Teil des Vertrags ist.
-    #[error("kanonisches JSON erlaubt keine Gleitkommazahlen")]
+    #[error("canonical JSON does not allow floating-point numbers")]
     NonIntegerNumber,
 
     /// Ganzzahl außerhalb des JCS-sicheren Bereichs (|n| > 2^53−1).
@@ -42,7 +42,7 @@ pub enum CanonError {
     /// double-basierten Formatierung ab, die RFC 8785 vorschreibt — ein
     /// JCS-Leser in einer anderen Sprache würde einen anderen Wert bilden und
     /// damit einen anderen Hash. Fail-closed statt still von JCS abweichen.
-    #[error("Ganzzahl außerhalb des JCS-sicheren Bereichs (|n| > 2^53-1): {0}")]
+    #[error("integer outside the JCS-safe range (|n| > 2^53-1): {0}")]
     IntegerOutOfSafeRange(i128),
 }
 

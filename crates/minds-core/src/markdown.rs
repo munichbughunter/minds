@@ -30,8 +30,8 @@ pub fn session_markdown(id: SessionId, session: &Session) -> String {
 
     let _ = writeln!(
         out,
-        "**Agent:** {} {} · **Modell:** {}/{}  \n\
-         **Tokens:** {} ein / {} aus · **Session:** `{}`\n",
+        "**Agent:** {} {} · **Model:** {}/{}  \n\
+         **Tokens:** {} in / {} out · **Session:** `{}`\n",
         session.agent.name,
         session.agent.version,
         session.model.provider,
@@ -41,19 +41,24 @@ pub fn session_markdown(id: SessionId, session: &Session) -> String {
         id,
     );
 
-    let _ = writeln!(out, "## Absicht\n");
+    let _ = writeln!(out, "## Intent\n");
     let request = session.intent.request.trim();
     if request.is_empty() {
-        let _ = writeln!(out, "_(kein Prompt erfasst)_\n");
+        let _ = writeln!(out, "_(no prompt captured)_\n");
     } else {
         let _ = writeln!(out, "{request}\n");
     }
 
     list_section(&mut out, "Constraints", &session.intent.constraints, 3);
-    list_section(&mut out, "Verworfene Ansätze", &session.intent.discarded, 3);
+    list_section(
+        &mut out,
+        "Discarded approaches",
+        &session.intent.discarded,
+        3,
+    );
 
     if !session.turns.is_empty() {
-        let _ = writeln!(out, "## Verlauf\n");
+        let _ = writeln!(out, "## Conversation\n");
         for turn in &session.turns {
             let _ = writeln!(out, "**{}**\n", role_label(&turn.role));
             let text = turn.text.trim();
@@ -70,7 +75,7 @@ pub fn session_markdown(id: SessionId, session: &Session) -> String {
     }
 
     if !session.produced.files.is_empty() {
-        let _ = writeln!(out, "## Berührte Dateien\n");
+        let _ = writeln!(out, "## Files touched\n");
         for file in &session.produced.files {
             let _ = writeln!(out, "- `{file}`");
         }
@@ -81,7 +86,7 @@ pub fn session_markdown(id: SessionId, session: &Session) -> String {
         let counts = &session.redaction.counts;
         let _ = writeln!(
             out,
-            "## Redaction\n\n{} Secret(s), {} PII entfernt.",
+            "## Redaction\n\n{} secret(s), {} PII removed.",
             counts.secrets, counts.pii
         );
     }
@@ -234,19 +239,19 @@ mod tests {
         assert!(md.starts_with("# Retry-Test reparieren"));
         assert!(md.contains("**Agent:** claude-code 1.4.2"));
         assert!(md.contains("anthropic/claude-opus-4"));
-        assert!(md.contains("900 ein / 120 aus"));
-        assert!(md.contains("## Absicht"));
+        assert!(md.contains("900 in / 120 out"));
+        assert!(md.contains("## Intent"));
         assert!(md.contains("### Constraints"));
         assert!(md.contains("keine neuen Dependencies"));
-        assert!(md.contains("### Verworfene Ansätze"));
-        assert!(md.contains("## Verlauf"));
+        assert!(md.contains("### Discarded approaches"));
+        assert!(md.contains("## Conversation"));
         assert!(md.contains("**User**"));
         assert!(md.contains("**Assistant**"));
         // Exec-Kommando entrauscht.
         assert!(md.contains("`Bash` (exec) `cargo test retry`"));
-        assert!(md.contains("## Berührte Dateien"));
+        assert!(md.contains("## Files touched"));
         assert!(md.contains("`src/retry.rs`"));
-        assert!(md.contains("## Redaction\n\n1 Secret(s), 2 PII entfernt."));
+        assert!(md.contains("## Redaction\n\n1 secret(s), 2 PII removed."));
     }
 
     #[test]
@@ -272,6 +277,6 @@ mod tests {
         );
         let md = session_markdown(sid(), &s);
         assert!(md.starts_with("# Session"));
-        assert!(md.contains("_(kein Prompt erfasst)_"));
+        assert!(md.contains("_(no prompt captured)_"));
     }
 }

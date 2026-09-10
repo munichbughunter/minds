@@ -133,7 +133,7 @@ impl Verdict {
     /// Das Wort für die Anzeige — neben der Farbe, nie nur die Farbe.
     pub fn word(&self) -> &'static str {
         match self {
-            Verdict::Open => "offen",
+            Verdict::Open => "open",
             Verdict::Approved => "approved",
             Verdict::Rejected => "rejected",
             Verdict::NeedsWork => "needs work",
@@ -202,12 +202,14 @@ pub enum EvidenceVerdict {
 }
 
 impl EvidenceVerdict {
-    /// Das Wort der Matrix.
+    /// Das Wort der Matrix — delegiert an die **eine** Wortquelle
+    /// ([`minds_core::evidence::Verdict`]), damit CLI und Lesemodell nie
+    /// auseinanderlaufen.
     pub fn word(self) -> &'static str {
         match self {
-            EvidenceVerdict::Verified => "VERIFIZIERT",
-            EvidenceVerdict::Tampered => "MANIPULIERT",
-            EvidenceVerdict::Incomplete => "VERIFIZIERT, UNVOLLSTÄNDIG",
+            EvidenceVerdict::Verified => minds_core::evidence::Verdict::Verified.word(),
+            EvidenceVerdict::Tampered => minds_core::evidence::Verdict::Tampered.word(),
+            EvidenceVerdict::Incomplete => minds_core::evidence::Verdict::Incomplete.word(),
         }
     }
 }
@@ -235,11 +237,20 @@ pub struct EvidenceState {
 }
 
 impl EvidenceState {
-    /// Die Kurzform für Listen: `2 Seals · 48 Events · 0 Lücken`.
+    /// Die Kurzform für Listen: `2 seal(s) · 48 event(s) · 0 gap(s)`.
     pub fn summary(&self) -> String {
         format!(
-            "{} Seal(s) · {} Event(s) · {} Lücke(n)",
+            "{} seal(s) · {} event(s) · {} gap(s)",
             self.seals, self.events, self.gaps
+        )
+    }
+
+    /// Die Kennzahlen-Zeile der Seal-Karte — **eine** Quelle, damit CLI und
+    /// TUI dieselbe Verdichtung tragen, statt je ein eigenes Vokabular.
+    pub fn metrics_line(&self) -> String {
+        format!(
+            "{} event(s) · {} gap(s) · {} epoch(s) · {}/{} signed",
+            self.events, self.gaps, self.seals, self.signed, self.seals
         )
     }
 }
@@ -272,7 +283,7 @@ impl Provenance {
 /// Der Leitsatz einer Legacy-Session — dasselbe Vokabular wie
 /// [`EvidenceReport::sentence`], für den Zustand ohne Report.
 pub const LEGACY_SENTENCE: &str =
-    "Vor der Evidence-Chain erfasst — kryptographische Verifikation nicht verfügbar.";
+    "Captured before the evidence chain — cryptographic verification is not available.";
 
 /// Wie sich das `previous` einer Epoche auflöst — je Seal klassifiziert,
 /// mit exakt der Logik, die auch das Verdikt trägt.
@@ -352,13 +363,13 @@ impl EvidenceReport {
     pub fn sentence(&self) -> &'static str {
         match self.state.verdict {
             EvidenceVerdict::Verified => {
-                "Kryptographisch verifiziert innerhalb der aufgezeichneten Beobachtungsgrenze."
+                "Cryptographically verified within the recorded observation boundary."
             }
             EvidenceVerdict::Tampered => {
-                "Seal-Material verändert — die kryptographische Verifikation schlägt fehl."
+                "Seal material was altered — cryptographic verification fails."
             }
             EvidenceVerdict::Incomplete => {
-                "Evidence unvollständig — Minds kann nicht belegen, was in den fehlenden Bereichen geschah."
+                "Evidence incomplete — Minds cannot attest what happened in the missing ranges."
             }
         }
     }
@@ -487,29 +498,27 @@ pub enum WhyStep {
 /// jemand nachgerechnet hat.
 pub fn evidence_sentence(evidence: Option<EvidenceMark>) -> String {
     let Some(mark) = evidence else {
-        return "Unverknüpft: Diese Session hängt an keinem Commit — erfasst, aber (noch) nicht mit Code verbunden.".into();
+        return "Unlinked: this session is attached to no commit — captured, but not (yet) connected to code.".into();
     };
     let source = match mark.source {
         EvidenceSource::Observed => {
-            "Beobachtet: Der Commit trägt den Trailer Minds-Session-Id — ein expliziter Herkunftsnachweis."
+            "Observed: the commit carries the Minds-Session-Id trailer — an explicit provenance record."
         }
         EvidenceSource::ContentDerived => {
-            "Inhaltlich: Die gelesenen Bytes sind die geschriebenen — kein Zeitstempel nötig."
+            "Content-derived: the bytes read are the bytes written — no timestamp needed."
         }
         EvidenceSource::HumanDeclared => {
-            "Erklärt: Ein Mensch hat die Verbindung behauptet (--after) — eine Tatsache über den Menschen, nicht über den Code."
+            "Declared: a human asserted the connection (--after) — a fact about the human, not about the code."
         }
         EvidenceSource::Heuristic => {
-            "Vermutet: Von Minds rekonstruiert aus Datei-Überschneidung und zeitlicher Nähe — es gibt keinen expliziten Herkunftsnachweis."
+            "Inferred: reconstructed by Minds from file overlap and temporal proximity — there is no explicit provenance record."
         }
     };
     let status = match mark.status {
-        EvidenceStatus::Verified => " Status: nachgerechnet und bestanden.",
-        EvidenceStatus::Partial => " Status: teilweise nachgerechnet.",
-        EvidenceStatus::Unknown => " Status: nie nachgerechnet — beobachtet heißt nicht geprüft.",
-        EvidenceStatus::Missing => {
-            " Status: der Beleg müsste existieren, ist aber nicht auffindbar."
-        }
+        EvidenceStatus::Verified => " Status: recomputed and passed.",
+        EvidenceStatus::Partial => " Status: partially recomputed.",
+        EvidenceStatus::Unknown => " Status: never recomputed — observed does not mean checked.",
+        EvidenceStatus::Missing => " Status: the evidence should exist, but cannot be found.",
     };
     format!("{source}{status}")
 }
@@ -566,18 +575,18 @@ impl WhyChain {
                 WhyStep::Commit { id: None, .. } => out.push(Gap {
                     step: i,
                     kind: GapKind::NoCommit,
-                    text: "Blame kennt die Zeile nicht — ohne Commit keine Herkunft.".into(),
+                    text: "Blame does not know this line — no commit, no provenance.".into(),
                 }),
                 WhyStep::Change { id: None } => out.push(Gap {
                     step: i,
                     kind: GapKind::NoChangeId,
-                    text: "Der Commit trägt keine Minds-Change-Id — Reviews können nur an der Session hängen, nicht an der Änderung."
+                    text: "The commit carries no Minds-Change-Id — reviews can only attach to the session, not to the change."
                         .into(),
                 }),
                 WhyStep::Sessions { cards } if cards.is_empty() => out.push(Gap {
                     step: i,
                     kind: GapKind::NoContext,
-                    text: "Kein Kontext erfasst — zu diesem Commit gibt es keine Session, die Absicht ist nicht nachlesbar."
+                    text: "No context captured — there is no session for this commit; the intent cannot be read back."
                         .into(),
                 }),
                 WhyStep::Sessions { cards } => {
@@ -588,8 +597,8 @@ impl WhyChain {
                                 step: i,
                                 kind: GapKind::UnsealedRange,
                                 text: format!(
-                                    "Session {short}… ist nicht versiegelt — vor der Evidence-Chain erfasst; \
-                                     der Beobachtungsbereich ist nicht belegt."
+                                    "Session {short}… is not sealed — captured before the evidence chain; \
+                                     the observed range is not attested."
                                 ),
                             }),
                             Provenance::Chained(state) => {
@@ -598,9 +607,9 @@ impl WhyChain {
                                         step: i,
                                         kind: GapKind::SealedGap,
                                         text: format!(
-                                            "Session {short}…: {} Sequenz-Lücke(n), kryptographisch versiegelt — \
-                                             im Beobachtungsbereich fehlen Events. Fehlende Evidence beweist nicht, \
-                                             dass nichts geschah.",
+                                            "Session {short}…: {} sequence gap(s), cryptographically sealed — \
+                                             events are missing within the observed range. Missing evidence does \
+                                             not prove that nothing happened.",
                                             state.gaps
                                         ),
                                     });
@@ -610,8 +619,8 @@ impl WhyChain {
                                         step: i,
                                         kind: GapKind::PayloadRejected,
                                         text: format!(
-                                            "Session {short}…: eine frühere Epoche wurde von der Speicher-Policy \
-                                             zurückgewiesen — der Block-Seal ist der Beleg, die Nutzlast fehlt."
+                                            "Session {short}…: an earlier epoch was rejected by the storage \
+                                             policy — the block seal is the evidence, the payload is absent."
                                         ),
                                     });
                                 }
@@ -620,12 +629,12 @@ impl WhyChain {
                                         step: i,
                                         kind: GapKind::UnsealedRange,
                                         text: format!(
-                                            "Session {short}…: der Beobachtungsbereich ist nicht vollständig \
-                                             versiegelt ({}).",
+                                            "Session {short}…: the observed range is not fully \
+                                             sealed ({}).",
                                             if state.pre_chain > 0 {
-                                                format!("{} Event(s) ohne Stempel", state.pre_chain)
+                                                format!("{} event(s) without a stamp", state.pre_chain)
                                             } else {
-                                                "Epochenkette offen".to_string()
+                                                "epoch chain open".to_string()
                                             }
                                         ),
                                     });
@@ -638,11 +647,11 @@ impl WhyChain {
                             step: i,
                             kind: GapKind::DegradedContext,
                             text: format!(
-                                "Session {}… ist {} — ihre Absicht ist nicht mehr nachlesbar.",
+                                "Session {}… is {} — its intent can no longer be read back.",
                                 card.id.to_string().chars().take(11).collect::<String>(),
                                 match &card.state {
-                                    CardState::Forgotten { reason } => format!("vergessen ({reason})"),
-                                    _ => "unlesbar".to_string(),
+                                    CardState::Forgotten { reason } => format!("forgotten ({reason})"),
+                                    _ => "unreadable".to_string(),
                                 }
                             ),
                         });
@@ -659,10 +668,10 @@ impl WhyChain {
                                     seconds_apart,
                                     ..
                                 } => Some(format!(
-                                    " Nachgerechnet: {} gemeinsame Datei(en){}.",
+                                    " Recomputed: {} shared file(s){}.",
                                     shared_files.len(),
                                     seconds_apart
-                                        .map(|s| format!(", {s} s zwischen Session-Ende und Commit"))
+                                        .map(|s| format!(", {s} s between session end and commit"))
                                         .unwrap_or_default()
                                 )),
                                 _ => None,
@@ -672,7 +681,7 @@ impl WhyChain {
                             step: i,
                             kind: GapKind::InferredAttribution,
                             text: format!(
-                                "Die Zuordnung Session ↔ Commit ist rekonstruiert aus Datei-Überschneidung und zeitlicher Nähe — kein expliziter Herkunftsnachweis.{detail}"
+                                "The session ↔ commit attribution is reconstructed from file overlap and temporal proximity — no explicit provenance record.{detail}"
                             ),
                         });
                     }
@@ -680,7 +689,7 @@ impl WhyChain {
                 WhyStep::Review { state } if state.verdict == Verdict::Open => out.push(Gap {
                     step: i,
                     kind: GapKind::NoReview,
-                    text: "Keine Bewertung — niemand hat diese Änderung entschieden.".into(),
+                    text: "No review — nobody has decided on this change.".into(),
                 }),
                 _ => {}
             }
@@ -757,7 +766,7 @@ mod tests {
             gaps.iter().any(|g| g.kind == GapKind::UnsealedRange),
             "{gaps:?}"
         );
-        assert!(gaps[0].text.contains("nicht versiegelt"), "{gaps:?}");
+        assert!(gaps[0].text.contains("is not sealed"), "{gaps:?}");
     }
 
     #[test]
@@ -777,7 +786,7 @@ mod tests {
         assert!(
             sealed
                 .text
-                .contains("Fehlende Evidence beweist nicht, dass nichts geschah"),
+                .contains("Missing evidence does not prove that nothing happened"),
             "{}",
             sealed.text
         );
@@ -879,12 +888,12 @@ mod tests {
         assert_eq!(gaps.len(), 1);
         assert_eq!(gaps[0].kind, GapKind::InferredAttribution);
         assert!(
-            gaps[0].text.contains("2 gemeinsame Datei(en)"),
+            gaps[0].text.contains("2 shared file(s)"),
             "{}",
             gaps[0].text
         );
         assert!(gaps[0].text.contains("287 s"), "{}", gaps[0].text);
-        assert!(gaps[0].text.contains("kein expliziter Herkunftsnachweis"));
+        assert!(gaps[0].text.contains("no explicit provenance record"));
     }
 
     #[test]
@@ -913,7 +922,7 @@ mod tests {
         }
         assert!(
             evidence_sentence(Some(EvidenceMark::of(EvidenceSource::Heuristic)))
-                .contains("keinen expliziten Herkunftsnachweis")
+                .contains("no explicit provenance record")
         );
     }
 }

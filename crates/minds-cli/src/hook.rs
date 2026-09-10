@@ -73,7 +73,7 @@ pub fn run(agent: Option<&str>, event_override: Option<&str>) -> ExitCode {
     let _ = hooklog::guarded(Source::Hook, || {
         let outcome = match agent {
             Some(agent) => record(agent, event_override),
-            None => Err("ohne --agent aufgerufen".into()),
+            None => Err("called without --agent".into()),
         };
         if let Err(err) = outcome {
             hooklog::log(Source::Hook, &format!("{err:#}"));
@@ -102,12 +102,12 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
     // Grund rot, der mit #54 nichts zu tun hat.
     #[cfg(debug_assertions)]
     match std::env::var(PANIC_FOR_TEST).as_deref() {
-        Ok("1") => panic!("absichtlicher Panic für den Test"),
+        Ok("1") => panic!("deliberate panic for the test"),
         // Der schlimmere Fall, den ein Test bewachen muss: ein Panic, der
         // Payload in seine Meldung einbettet. Er darf nicht im Log landen —
         // `hook.log` wird in Bug-Reports mitgeschickt.
         Ok("payload") => panic!(
-            "absichtlicher Panic mit Nutzlast: {}",
+            "deliberate panic with payload: {}",
             String::from_utf8_lossy(&bytes)
         ),
         _ => {}

@@ -63,7 +63,7 @@ fn stack(base: Option<&str>) -> Fallible<()> {
     let base = resolve_base(&root, base)?;
     let commits = commits_since(&root, &base)?;
     if commits.is_empty() {
-        println!("Stapel auf {base}: leer — HEAD ist nicht voraus.");
+        println!("Stack on {base}: empty — HEAD is not ahead.");
         return Ok(());
     }
 
@@ -102,13 +102,13 @@ fn stack(base: Option<&str>) -> Fallible<()> {
         });
     }
 
-    println!("Stapel auf {base} — {} Change(s):\n", entries.len());
+    println!("Stack on {base} — {} change(s):\n", entries.len());
     for (position, entry) in entries.iter().enumerate() {
         let change = entry
             .change
             .as_deref()
             .map(short)
-            .unwrap_or_else(|| "ohne Change-Id".to_string());
+            .unwrap_or_else(|| "no Change-Id".to_string());
         println!(
             "{:>2}. {}  {}",
             position + 1,
@@ -121,8 +121,8 @@ fn stack(base: Option<&str>) -> Fallible<()> {
             state(entry),
             match entry.comments {
                 0 => String::new(),
-                1 => " · 1 Kommentar".to_string(),
-                n => format!(" · {n} Kommentare"),
+                1 => " · 1 comment".to_string(),
+                n => format!(" · {n} comments"),
             }
         );
     }
@@ -131,11 +131,7 @@ fn stack(base: Option<&str>) -> Fallible<()> {
         .iter()
         .filter(|entry| entry.verdict != Some(Decision::Approve))
         .count();
-    println!(
-        "\n{} von {} approbiert.",
-        entries.len() - offen,
-        entries.len()
-    );
+    println!("\n{} of {} approved.", entries.len() - offen, entries.len());
     Ok(())
 }
 
@@ -150,8 +146,8 @@ fn state(entry: &Entry) -> String {
             };
             format!("{mark} {} · {reviewer}", decision.as_str())
         }
-        _ if entry.change.is_none() => "– kein Trailer (nicht reviewbar)".to_string(),
-        _ => "– kein Verdict".to_string(),
+        _ if entry.change.is_none() => "– no trailer (not reviewable)".to_string(),
+        _ => "– no verdict".to_string(),
     }
 }
 
@@ -173,7 +169,7 @@ fn newest(reviews: &[Review]) -> &Review {
                     .unwrap_or_default(),
             )
         })
-        .expect("die Liste entsteht nur mit mindestens einem Eintrag")
+        .expect("the list is only built with at least one entry")
 }
 
 /// Die Basis des Stapels: `--base`, sonst Upstream, sonst `main`/`master`.
@@ -213,7 +209,7 @@ fn resolve_base(root: &Path, base: Option<&str>) -> Fallible<String> {
             return Ok(candidate.to_string());
         }
     }
-    Err("keine Basis gefunden — mit --base <ref> angeben".into())
+    Err("no base found — specify one with --base <ref>".into())
 }
 
 /// Die Commits von der Basis bis HEAD, ältester zuerst.
@@ -223,7 +219,7 @@ fn resolve_base(root: &Path, base: Option<&str>) -> Fallible<String> {
 fn commits_since(root: &Path, base: &str) -> Fallible<Vec<String>> {
     let range = format!("{base}..HEAD");
     let out = git(root, &["rev-list", "--reverse", "--end-of-options", &range])
-        .ok_or_else(|| format!("{range} lässt sich nicht auflösen"))?;
+        .ok_or_else(|| format!("{range} cannot be resolved"))?;
     Ok(out.lines().map(str::to_owned).collect())
 }
 
@@ -301,7 +297,7 @@ mod tests {
     fn a_long_subject_is_cut_at_a_char_boundary() {
         // Nicht an Bytes schneiden: Ein Umlaut in der Betreffzeile darf nicht
         // zu einem Panic führen.
-        let subject = "füge größere Änderungen hinzu ".repeat(5);
+        let subject = "add café naïveté résumé changes ".repeat(5);
         let cut = truncate(&subject, 20);
         assert_eq!(cut.chars().count(), 20);
         assert!(cut.ends_with('…'));
@@ -321,9 +317,9 @@ mod tests {
 
         assert!(state(&entry(Some("I1"), Some(Decision::Approve))).contains("approve"));
         assert!(state(&entry(Some("I1"), Some(Decision::NeedsWork))).contains("needs-work"));
-        assert!(state(&entry(Some("I1"), None)).contains("kein Verdict"));
+        assert!(state(&entry(Some("I1"), None)).contains("no verdict"));
         // Ohne Trailer ist der Change gar nicht adressierbar — das ist ein
         // anderer Zustand als „noch niemand hat geschaut".
-        assert!(state(&entry(None, None)).contains("kein Trailer"));
+        assert!(state(&entry(None, None)).contains("no trailer"));
     }
 }

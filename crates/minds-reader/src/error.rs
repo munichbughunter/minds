@@ -15,15 +15,15 @@ pub type Result<T> = std::result::Result<T, ReaderError>;
 #[non_exhaustive]
 pub enum ReaderError {
     /// Ein Git-Zugriff schlug fehl (Historie lesen, Blame, Blob).
-    #[error("Git-Fehler beim Lesen des Repositories")]
+    #[error("Git error while reading the repository")]
     Git(#[from] minds_git::GitError),
 
     /// Der Store ließ sich nicht lesen.
-    #[error("Store-Fehler beim Auflösen einer Session")]
+    #[error("store error while resolving a session")]
     Store(#[from] minds_store::StoreError),
 
     /// Eine Datei ließ sich nicht schreiben.
-    #[error("{op} fehlgeschlagen: {path}")]
+    #[error("{op} failed: {path}")]
     Io {
         /// Was versucht wurde, im Klartext.
         op: &'static str,
@@ -34,7 +34,7 @@ pub enum ReaderError {
     },
 
     /// HEAD hat noch keinen Commit — es gibt nichts zu rendern.
-    #[error("HEAD hat noch keinen Commit; es gibt nichts zu rendern")]
+    #[error("HEAD has no commit yet; there is nothing to render")]
     UnbornHead,
 }
 

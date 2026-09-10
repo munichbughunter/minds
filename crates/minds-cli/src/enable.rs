@@ -94,10 +94,10 @@ enum Change {
 impl Change {
     fn word(self) -> &'static str {
         match self {
-            Change::Created => "angelegt",
-            Change::Updated => "ergänzt",
-            Change::Unchanged => "unverändert",
-            Change::Repaired => "wieder ausführbar gemacht",
+            Change::Created => "created",
+            Change::Updated => "updated",
+            Change::Unchanged => "unchanged",
+            Change::Repaired => "made executable again",
         }
     }
 }
@@ -132,8 +132,8 @@ pub fn run(
         "all" => Which::ALL,
         other => {
             eprintln!(
-                "minds enable: unbekannter Agent {other:?}\n\
-                 bekannt: claude-code, codex, cursor, gemini, opencode, all"
+                "minds enable: unknown agent {other:?}\n\
+                 known: claude-code, codex, cursor, gemini, opencode, all"
             );
             return ExitCode::FAILURE;
         }
@@ -317,8 +317,8 @@ fn enable_agents(
     // aus einem Pfad heraus.
     if !same_location(&paths.git_dir, &paths.common_git_dir) {
         println!(
-            "Hinweis: dies ist ein verlinkter Worktree — die Hooks gelten für alle \
-             Arbeitsbäume dieses Repositories"
+            "Note: this is a linked worktree — the hooks apply to all \
+             worktrees of this repository"
         );
     }
 
@@ -362,10 +362,10 @@ fn enable_agents(
     // der Stand vor #25, der in GUI-Clients still ausfällt. Deshalb ist ein
     // Scheitern von `current_exe` hier kein stiller Fall, sondern ein Hinweis.
     match config::record_binary(&paths.root)? {
-        Some(_) => vln(verbose, "  .git/config: minds.binary gesetzt"),
+        Some(_) => vln(verbose, "  .git/config: minds.binary set"),
         None => println!(
-            "Hinweis: der Ort dieses Binaries ließ sich nicht ermitteln — \
-             die Hooks suchen minds über den PATH"
+            "Note: the location of this binary could not be determined — \
+             the hooks look for minds via the PATH"
         ),
     }
 
@@ -408,7 +408,7 @@ fn enable_agents(
     // Die Store-Config gehört zum Setup: Ohne sie wüssten checkpoint/show/why
     // nicht, wo der Kontext liegt. `git config` setzt idempotent.
     config::write(&paths.root, store)?;
-    vln(verbose, "  .git/config: minds.backend/contextRef gesetzt");
+    vln(verbose, "  .git/config: minds.backend/contextRef set");
 
     // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
     // soll rückwirkend Kontext bekommen, ohne auf das Lesen (womöglich großer)
@@ -418,7 +418,7 @@ fn enable_agents(
     spawn_background_import();
     vln(
         verbose,
-        "  Backfill läuft im Hintergrund (Fehler → .git/minds/hook.log)",
+        "  backfill running in the background (errors → .git/minds/hook.log)",
     );
 
     Ok(())
@@ -601,18 +601,15 @@ fn configure_sync(
     if let Backend::ChildRepo { path } = store.backend() {
         let child = resolve_against(&paths.root, path);
         match ensure_child_repo(&paths.root, &child, child_remote) {
-            Ok(change) => report(verbose, &format!("Child-Repo {}", child.display()), change),
+            Ok(change) => report(verbose, &format!("child repo {}", child.display()), change),
             // Ein Fehler beim Child-Repo kommt immer durch — ohne das Repo
             // kann checkpoint nicht speichern.
-            Err(err) => eprintln!("  Child-Repo {}: {err}", child.display()),
+            Err(err) => eprintln!("  child repo {}: {err}", child.display()),
         }
     }
 
     for spec in ensure_fetch_refspecs(&paths.root)? {
-        vln(
-            verbose,
-            &format!("  .git/config: Fetch-Refspec {spec} gesetzt"),
-        );
+        vln(verbose, &format!("  .git/config: fetch refspec {spec} set"));
     }
     Ok(())
 }
@@ -683,7 +680,7 @@ fn git_init_bare(child: &Path) -> std::io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(std::io::Error::other("`git init --bare` schlug fehl"))
+        Err(std::io::Error::other("`git init --bare` failed"))
     }
 }
 
@@ -762,14 +759,14 @@ fn report_outcome(verbose: bool, label: &str, outcome: &Outcome) {
         println!("{}", blocked.sentence(label));
     }
     if outcome.refreshed {
-        println!("Hinweis: in „{label}“ wurde ein Eintrag aus einer älteren minds-Version ersetzt");
+        println!("Note: an entry from an older minds version was replaced in \"{label}\"");
     }
     report(verbose, label, outcome.change);
 }
 
 fn report(verbose: bool, label: &str, change: Change) {
     if change == Change::Repaired {
-        println!("Hinweis: {label} war nicht ausführbar und wurde wieder eingeschaltet");
+        println!("Note: {label} was not executable and has been switched back on");
         return;
     }
     vln(verbose, &format!("  {label}: {}", change.word()));
@@ -809,11 +806,11 @@ fn moved_hooks_note(root: &Path, git_dir: &Path, hooks_dir: &Path) -> Option<Str
     let where_ = label_for(root, if misleading { &resolved } else { hooks_dir });
 
     Some(if inside {
-        format!("Hinweis: core.hooksPath ist gesetzt — die Git-Hooks gehen nach „{where_}“")
+        format!("Note: core.hooksPath is set — the Git hooks go to \"{where_}\"")
     } else {
         format!(
-            "Hinweis: core.hooksPath zeigt aus dem Repo heraus („{where_}“) — \
-                 die Hooks gelten damit für alle deine Repositories"
+            "Note: core.hooksPath points outside the repo (\"{where_}\") — \
+                 the hooks therefore apply to all of your repositories"
         )
     })
 }
@@ -1013,25 +1010,23 @@ fn confirm_outside_hooks_dir(
     let where_ = label_for(root, &canonical_prefix(hooks_dir));
     if std::io::stdin().is_terminal() {
         eprintln!(
-            "core.hooksPath zeigt aus dem Repo heraus („{where_}“).\n\
-             Hooks dort gelten für ALLE Repositories, die dieses Verzeichnis benutzen."
+            "core.hooksPath points outside the repo (\"{where_}\").\n\
+             Hooks there apply to ALL repositories that use this directory."
         );
-        eprint!("Trotzdem einrichten? [j/N] ");
+        eprint!("Set up anyway? [y/N] ");
         let mut answer = String::new();
         // EOF (0 Bytes) lässt `answer` leer — und leer heißt Nein.
         std::io::stdin().read_line(&mut answer)?;
         let answer = answer.trim();
-        if answer.eq_ignore_ascii_case("j") || answer.eq_ignore_ascii_case("ja") {
+        if answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes") {
             return Ok(());
         }
-        return Err(std::io::Error::other(
-            "abgebrochen — es wurde nichts geschrieben",
-        ));
+        return Err(std::io::Error::other("aborted — nothing was written"));
     }
 
     Err(std::io::Error::other(format!(
-        "core.hooksPath zeigt aus dem Repo heraus („{where_}“) — die Hooks gälten für alle \
-         deine Repositories. Wenn das gewollt ist, bestätige mit: minds enable --global-hooks"
+        "core.hooksPath points outside the repo (\"{where_}\") — the hooks would apply to all \
+         of your repositories. If that is intended, confirm with: minds enable --global-hooks"
     )))
 }
 
@@ -1066,7 +1061,7 @@ fn ensure_writable(hooks_dir: &Path) -> std::io::Result<()> {
         std::io::Error::new(
             err.kind(),
             format!(
-                "das Hook-Verzeichnis {} lässt sich nicht anlegen oder beschreiben \
+                "the hooks directory {} cannot be created or written to \
                  (core.hooksPath): {err}",
                 display_path(hooks_dir)
             ),
@@ -1501,7 +1496,7 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
             Ok(text) if text == OPENCODE_PLUGIN => report.current = 1,
             Ok(text) if text.contains(MARK) => report.outdated = 1,
             Ok(_) => {
-                report.refused = Some("stammt nicht von minds".to_owned());
+                report.refused = Some("does not come from minds".to_owned());
             }
             Err(err) => report.refused = Some(err.to_string()),
         }
@@ -1525,7 +1520,7 @@ pub(crate) fn inspect_agent(root: &Path, which: Which) -> AgentReport {
         Some(value) => match value.as_object() {
             Some(map) => map,
             None => {
-                report.refused = Some("„hooks“ ist kein Objekt".to_owned());
+                report.refused = Some("\"hooks\" is not an object".to_owned());
                 return report;
             }
         },
@@ -1733,13 +1728,13 @@ impl Blocked {
     fn sentence(self, file: &str) -> String {
         match self {
             Blocked::HooksNotAnObject => format!(
-                "Hinweis: in „{file}“ ist „hooks“ kein Objekt — dort wurde nichts registriert"
+                "Note: in \"{file}\", \"hooks\" is not an object — nothing was registered there"
             ),
             Blocked::EventNotAnArray(event) => format!(
-                "Hinweis: in „{file}“ ist „{event}“ kein Array — dieses Event wird nicht erfasst"
+                "Note: in \"{file}\", \"{event}\" is not an array — this event is not captured"
             ),
             Blocked::ForeignPlugin => {
-                format!("Hinweis: „{file}“ stammt nicht von minds — die Datei bleibt unangetastet")
+                format!("Note: \"{file}\" does not come from minds — the file is left untouched")
             }
         }
     }
@@ -1827,8 +1822,8 @@ fn ensure_codex_hooks_flag(path: &Path) -> std::io::Result<Change> {
             return Ok(Change::Unchanged);
         }
         return Err(std::io::Error::other(format!(
-            "{} enthält mehrzeilige Werte — minds kann dort nicht sicher ergänzen. \
-             Trage `{FLAG}` von Hand ein (ohne den Schalter liest Codex die hooks.json nicht)",
+            "{} contains multi-line values — minds cannot safely amend it. \
+             Add `{FLAG}` by hand (without the switch Codex does not read hooks.json)",
             display_path(path)
         )));
     }
@@ -2248,8 +2243,8 @@ fn enable_git_hook(hooks_dir: &Path, name: &str, body: &str) -> std::io::Result<
     // überlesen, mitsamt den echten daneben.
     if !is_executable(&path) {
         return Err(std::io::Error::other(format!(
-            "{} lässt sich nicht ausführbar machen — dieses Dateisystem kennt \
-             keine Execute-Bits. Git führt den Hook dort nicht aus",
+            "{} cannot be made executable — this file system has no \
+             execute bits. Git will not run the hook there",
             display_path(&path)
         )));
     }
@@ -2317,8 +2312,8 @@ pub(crate) fn check_hook_content(path: &Path, content: &str) -> std::io::Result<
         short
     };
     Err(std::io::Error::other(format!(
-        "{} beginnt mit „{}“ — minds ergänzt nur sh-kompatible Hooks. \
-         Verschiebe den Hook oder rufe minds aus ihm selbst auf",
+        "{} starts with \"{}\" — minds only amends sh-compatible hooks. \
+         Move the hook or call minds from inside it",
         display_path(path),
         crate::text::sanitize(&short)
     )))
@@ -2344,9 +2339,9 @@ fn check_hook_repairable(path: &Path) -> std::io::Result<()> {
         };
         if meta.permissions().mode() & 0o200 == 0 {
             return Err(std::io::Error::other(format!(
-                "{} ist nicht ausführbar — Git überspringt den Hook stillschweigend —, \
-                 und schreibgeschützt, sodass minds das nicht beheben kann. \
-                 `chmod +x` von Hand",
+                "{} is not executable — Git silently skips the hook — \
+                 and write-protected, so minds cannot fix it. \
+                 Run `chmod +x` by hand",
                 display_path(path)
             )));
         }
@@ -2452,20 +2447,20 @@ pub(crate) fn read_existing_hook(path: &Path) -> std::io::Result<Option<String>>
 
     if meta.file_type().is_symlink() {
         return Err(std::io::Error::other(format!(
-            "{} ist ein Symlink — minds ergänzt keinen Hook, der woandershin zeigt. \
-             Entferne den Link oder wähle ein anderes core.hooksPath",
+            "{} is a symlink — minds does not amend a hook that points elsewhere. \
+             Remove the link or choose a different core.hooksPath",
             display_path(path)
         )));
     }
     if !meta.is_file() {
         return Err(std::io::Error::other(format!(
-            "{} ist keine reguläre Datei",
+            "{} is not a regular file",
             display_path(path)
         )));
     }
     if meta.len() > MAX_HOOK_BYTES {
         return Err(std::io::Error::other(format!(
-            "{} ist {} Bytes groß — das ist kein Hook-Skript",
+            "{} is {} bytes — that is no hook script",
             display_path(path),
             meta.len()
         )));
@@ -2475,7 +2470,7 @@ pub(crate) fn read_existing_hook(path: &Path) -> std::io::Result<Option<String>>
         Ok(text) => Ok(Some(text)),
         Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
             Err(std::io::Error::other(format!(
-                "{} ist kein Text — minds ergänzt nur Shell-Hooks",
+                "{} is not text — minds only amends shell hooks",
                 display_path(path)
             )))
         }
@@ -2534,7 +2529,7 @@ fn write_atomic_no_follow(path: &Path, content: &str, executable: bool) -> std::
         if meta.permissions().mode() & 0o200 == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!("{}: ist schreibgeschützt", display_path(path)),
+                format!("{}: is write-protected", display_path(path)),
             ));
         }
     }
@@ -2616,7 +2611,7 @@ fn check_agent_path(root: &Path, path: &Path) -> std::io::Result<()> {
         }
         if let Ok(meta) = fs::symlink_metadata(ancestor) {
             if meta.file_type().is_symlink() {
-                return Err(refuse_path(ancestor, "ein Symlink"));
+                return Err(refuse_path(ancestor, "a symlink"));
             }
         }
     }
@@ -2628,10 +2623,10 @@ fn check_agent_path(root: &Path, path: &Path) -> std::io::Result<()> {
 /// Vorlauf in [`enable_agents`] über [`check_agent_path`] ab.
 fn check_agent_leaf(path: &Path) -> std::io::Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(refuse_path(path, "ein Symlink")),
-        Ok(meta) if !meta.is_file() => Err(refuse_path(path, "keine reguläre Datei")),
+        Ok(meta) if meta.file_type().is_symlink() => Err(refuse_path(path, "a symlink")),
+        Ok(meta) if !meta.is_file() => Err(refuse_path(path, "not a regular file")),
         Ok(meta) if meta.len() > MAX_CONFIG_BYTES => Err(std::io::Error::other(format!(
-            "{} ist {} Bytes groß — das ist keine Agent-Konfiguration",
+            "{} is {} bytes — that is no agent configuration",
             display_path(path),
             meta.len()
         ))),
@@ -2645,8 +2640,8 @@ fn check_agent_leaf(path: &Path) -> std::io::Result<()> {
 
 fn refuse_path(at: &Path, what: &str) -> std::io::Error {
     std::io::Error::other(format!(
-        "{} ist {what} — minds schreibt weder durch Links noch in Sonderdateien; \
-         ersetze den Eintrag durch ein reguläres Verzeichnis bzw. eine reguläre Datei",
+        "{} is {what} — minds writes neither through links nor into special files; \
+         replace the entry with a regular directory or a regular file",
         display_path(at)
     ))
 }
@@ -2862,18 +2857,18 @@ impl HooksDir {
         match self {
             Self::At(dir) => Ok(dir),
             Self::Unusable(NoHooksDir::Empty) => Err(std::io::Error::other(
-                "core.hooksPath ist gesetzt, aber leer — Git führt dann gar keine Hooks aus. \
-                 Setze einen Pfad oder entferne den Schlüssel: git config --unset core.hooksPath",
+                "core.hooksPath is set but empty — Git then runs no hooks at all. \
+                 Set a path or remove the key: git config --unset core.hooksPath",
             )),
             Self::Unusable(NoHooksDir::Unanswered) => Err(std::io::Error::other(
-                "core.hooksPath ist gesetzt, aber `git rev-parse --git-path hooks` antwortet \
-                 nicht — dann lässt sich nicht sagen, aus welchem Verzeichnis Git die Hooks \
-                 ausführt. Prüfe die Git-Konfiguration",
+                "core.hooksPath is set, but `git rev-parse --git-path hooks` does not \
+                 answer — so there is no telling which directory Git runs the hooks \
+                 from. Check the Git configuration",
             )),
             Self::Unusable(NoHooksDir::WorktreeRoot) => Err(std::io::Error::other(
-                "core.hooksPath zeigt auf die Repo-Wurzel — dort würden die Hooks als \
-                 ausführbare Dateien zwischen deinem Quellcode liegen, und Git führt sie von \
-                 dort nicht aus. Setze core.hooksPath auf ein eigenes Verzeichnis, etwa .husky",
+                "core.hooksPath points at the repo root — the hooks would sit there as \
+                 executable files among your source code, and Git does not run them from \
+                 there. Set core.hooksPath to a dedicated directory, such as .husky",
             )),
         }
     }
@@ -2919,7 +2914,7 @@ fn locate() -> std::io::Result<RepoPaths> {
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
         format!(
-            "kein Git-Repository gefunden, ausgehend von {}",
+            "no Git repository found, starting from {}",
             display_path(&start)
         ),
     ))
@@ -2996,7 +2991,7 @@ fn read_json(path: &Path) -> std::io::Result<Value> {
         Ok(text) => serde_json::from_str(&text).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("{} ist kein gültiges JSON: {e}", display_path(path)),
+                format!("{} is not valid JSON: {e}", display_path(path)),
             )
         }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Map::new())),
@@ -3116,7 +3111,7 @@ mod tests {
         // die dieses Feature gebaut ist. (Die Integrationstests decken den Fall
         // hermetisch ab — dort lässt sich die Config der Kindprozesse setzen.)
         if git_config_value(root, "core.hooksPath").is_some() {
-            eprintln!("global gesetztes core.hooksPath — Test übersprungen");
+            eprintln!("global gesetztes core.hooksPath -- Test wird ausgelassen");
             return;
         }
 
@@ -3175,7 +3170,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(empty.contains("core.hooksPath"), "{empty}");
-        assert!(empty.contains("keine Hooks"), "{empty}");
+        assert!(empty.contains("no hooks"), "{empty}");
         assert!(empty.contains("--unset"), "die Abhilfe fehlt: {empty}");
 
         let root = HooksDir::Unusable(NoHooksDir::WorktreeRoot)
@@ -3183,7 +3178,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(root.contains("core.hooksPath"), "{root}");
-        assert!(root.contains("Repo-Wurzel"), "{root}");
+        assert!(root.contains("repo root"), "{root}");
         assert!(root.contains(".husky"), "die Abhilfe fehlt: {root}");
     }
 
@@ -3195,7 +3190,7 @@ mod tests {
         let root = dir.path();
         if git_config_value(root, "core.hooksPath").is_some() {
             // Global gesetzt — „nicht gesetzt" lässt sich hier nicht herstellen.
-            eprintln!("global gesetztes core.hooksPath — Test übersprungen");
+            eprintln!("global gesetztes core.hooksPath -- Test wird ausgelassen");
             return;
         }
 
@@ -3229,10 +3224,7 @@ mod tests {
                 Path::new("/repo/.git"),
                 Path::new("/repo/.husky")
             ),
-            Some(
-                "Hinweis: core.hooksPath ist gesetzt — die Git-Hooks gehen nach „.husky“"
-                    .to_owned()
-            )
+            Some("Note: core.hooksPath is set — the Git hooks go to \".husky\"".to_owned())
         );
     }
 
@@ -3255,7 +3247,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, hooks.join("post-commit")).unwrap();
 
         let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
 
         // Und das Opfer ist unangetastet — Inhalt wie Rechte.
         assert_eq!(
@@ -3315,7 +3307,7 @@ mod tests {
             std::os::unix::fs::symlink(&victim, &path).unwrap();
 
             let err = claude_style(dir.path(), which).unwrap_err();
-            assert!(err.to_string().contains("Symlink"), "{file}: {err}");
+            assert!(err.to_string().contains("symlink"), "{file}: {err}");
             assert_eq!(
                 fs::read_to_string(&victim).unwrap(),
                 "{\"fremd\":true}\n",
@@ -3897,7 +3889,7 @@ mod tests {
         std::os::unix::fs::symlink(&home, root.join(".claude")).unwrap();
 
         let err = check_agent_path(&root, &root.join(".claude/settings.json")).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert!(err.to_string().contains(".claude"), "{err}");
         assert_eq!(
             fs::read_to_string(&victim).unwrap(),
@@ -3961,7 +3953,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
 
         let err = check_agent_leaf(&path).unwrap_err();
-        assert!(err.to_string().contains("keine reguläre Datei"), "{err}");
+        assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
     /// Ein hängender Symlink wird ebenfalls erkannt — `path.exists()` wäre
@@ -3975,7 +3967,7 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("nirgendwo"), &path).unwrap();
 
         let err = check_agent_leaf(&path).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert!(!dir.path().join("nirgendwo").exists());
     }
 
@@ -3992,7 +3984,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
         let err = enable_recall_hook(dir.path(), true).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "{}\n");
     }
 
@@ -4008,7 +4000,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
         let err = ensure_codex_hooks_flag(&path).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "fremd = true\n");
     }
 
@@ -4024,7 +4016,7 @@ mod tests {
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
         let err = enable_opencode(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("Symlink"), "{err}");
+        assert!(err.to_string().contains("symlink"), "{err}");
         assert_eq!(fs::read_to_string(&victim).unwrap(), "// fremd\n");
     }
 
@@ -4055,7 +4047,7 @@ mod tests {
         assert_eq!(
             enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap(),
             Change::Repaired,
-            "die Reparatur ist weder „unverändert“ noch „ergänzt“"
+            "the repair is neither \"unchanged\" nor \"updated\""
         );
         assert!(is_executable(&path), "das Execute-Bit fehlt weiterhin");
         assert_eq!(
@@ -4085,7 +4077,7 @@ mod tests {
 
         let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
         assert!(err.to_string().contains("python3"), "{err}");
-        assert!(err.to_string().contains("sh-kompatible"), "{err}");
+        assert!(err.to_string().contains("sh-compatible"), "{err}");
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             original,
@@ -4181,7 +4173,7 @@ mod tests {
             "die Meldung ist {} Zeichen lang",
             err.len()
         );
-        assert!(err.contains("sh-kompatible"), "{err}");
+        assert!(err.contains("sh-compatible"), "{err}");
         assert!(!err.contains('\u{1}'), "rohes Steuerzeichen in der Meldung");
     }
 
@@ -4237,7 +4229,7 @@ mod tests {
             false,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("nicht ausführbar"), "{err}");
+        assert!(err.to_string().contains("not executable"), "{err}");
         assert!(
             !root.join(".claude/settings.json").exists(),
             "nichts halb Eingerichtetes"
@@ -4413,7 +4405,7 @@ mod tests {
             fs::write(&path, content).unwrap();
 
             let err = ensure_codex_hooks_flag(&path).unwrap_err();
-            assert!(err.to_string().contains("von Hand"), "{name}: {err}");
+            assert!(err.to_string().contains("by hand"), "{name}: {err}");
             assert_eq!(
                 fs::read_to_string(&path).unwrap(),
                 content,
@@ -4480,14 +4472,14 @@ mod tests {
     fn a_taken_temp_name_is_refused_instead_of_followed() {
         let dir = tmp();
         let victim = dir.path().join("opfer.txt");
-        fs::write(&victim, "unberührt\n").unwrap();
+        fs::write(&victim, "untouched\n").unwrap();
 
         let taken = dir.path().join("belegt");
         std::os::unix::fs::symlink(&victim, &taken).unwrap();
 
         let err = create_new_file(&taken).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "unberührt\n");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched\n");
     }
 
     /// Der Ersatz für den Symlink beim Schreiben: Selbst wenn zwischen Prüfung
@@ -4506,7 +4498,7 @@ mod tests {
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| name != "post-commit")
             .collect();
-        assert!(leftovers.is_empty(), "übrig geblieben: {leftovers:?}");
+        assert!(leftovers.is_empty(), "left over: {leftovers:?}");
     }
 
     /// Eine Datei jenseits jeder Hook-Größe wird nicht eingelesen. Ohne die
@@ -4524,18 +4516,18 @@ mod tests {
         .unwrap();
 
         let err = enable_git_hook(&hooks, "post-commit", POST_COMMIT_BODY).unwrap_err();
-        assert!(err.to_string().contains("kein Hook-Skript"), "{err}");
+        assert!(err.to_string().contains("no hook script"), "{err}");
     }
 
     /// Steuerzeichen aus der Config dürfen die Ausgabe nicht umschreiben.
     #[test]
     fn control_characters_in_a_path_are_defused() {
-        let shown = display_path(Path::new("\u{1b}[2K\u{1b}[Aböse"));
+        let shown = display_path(Path::new("\u{1b}[2K\u{1b}[Aevil"));
         assert!(
             !shown.contains('\u{1b}'),
             "roher Escape blieb stehen: {shown}"
         );
-        assert!(shown.contains("böse"), "{shown}");
+        assert!(shown.contains("evil"), "{shown}");
     }
 
     /// Ein Wert mit Leerzeichen ist ein zulässiger Verzeichnisname, und Git
@@ -4603,13 +4595,13 @@ mod tests {
 
         assert!(
             moved_hooks_note(&root, &root.join(".git"), &root.join("../global-hooks"))
-                .is_some_and(|note| note.contains("aus dem Repo heraus")),
+                .is_some_and(|note| note.contains("outside the repo")),
             "ein Pfad über `..` liegt außerhalb"
         );
         // Und innerhalb bleibt innerhalb.
         assert!(
             moved_hooks_note(&root, &root.join(".git"), &root.join(".husky"))
-                .is_some_and(|note| !note.contains("aus dem Repo heraus")),
+                .is_some_and(|note| !note.contains("outside the repo")),
             ".husky liegt im Repo"
         );
     }
@@ -4860,7 +4852,7 @@ mod tests {
             return;
         };
         if !status.success() {
-            eprintln!("git worktree add scheitert hier — Test übersprungen");
+            eprintln!("git worktree add scheitert hier -- Test wird ausgelassen");
             return;
         }
         let private = main.join(".git/worktrees/zweig");
@@ -4933,8 +4925,8 @@ mod tests {
                 Path::new("/home/anna/git-hooks")
             ),
             Some(
-                "Hinweis: core.hooksPath zeigt aus dem Repo heraus („/home/anna/git-hooks“) — \
-                 die Hooks gelten damit für alle deine Repositories"
+                "Note: core.hooksPath points outside the repo (\"/home/anna/git-hooks\") — \
+                 the hooks therefore apply to all of your repositories"
                     .to_owned()
             )
         );

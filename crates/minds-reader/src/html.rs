@@ -51,7 +51,7 @@ pub struct FileLink {
 pub fn page(title: &str, body: &str) -> String {
     format!(
         "<!doctype html>\n\
-         <html lang=\"de\">\n\
+         <html lang=\"en\">\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
@@ -71,16 +71,16 @@ pub fn file_page(view: &FileView, index: &Index) -> String {
     let pct = (attributed * 100).checked_div(total).unwrap_or(0);
     let body = format!(
         "<header class=\"top\">\n\
-           <a class=\"back\" href=\"index.html\">← Übersicht</a>\n\
+           <a class=\"back\" href=\"index.html\">← Overview</a>\n\
            <h1>{path}</h1>\n\
-           <div class=\"attrbar\" title=\"{pct}% der Zeilen mit erfasstem Agent-Kontext\">\
+           <div class=\"attrbar\" title=\"{pct}% of lines with captured agent context\">\
              <div class=\"attrbar-fill\" style=\"width:{pct}%\"></div></div>\n\
-           <p class=\"meta\">{attributed} von {total} Zeilen mit erfasstem Kontext · {pct}% Agent</p>\n\
+           <p class=\"meta\">{attributed} of {total} lines with captured context · {pct}% agent</p>\n\
          </header>\n\
          <main class=\"split\">\n\
            <div class=\"code\">{code}</div>\n\
            <aside class=\"panel\" id=\"panel\">\n\
-             <p class=\"hint\">Klick auf eine markierte Zeile zeigt die Session dahinter.</p>\n\
+             <p class=\"hint\">Click a highlighted line to show the session behind it.</p>\n\
              {panels}\n\
            </aside>\n\
          </main>\n",
@@ -108,9 +108,9 @@ fn code_block(view: &FileView) -> String {
         if line.is_attributed() {
             let count = line.sessions.len();
             let title = if count == 1 {
-                "Session hinter dieser Zeile anzeigen".to_string()
+                "Show the session behind this line".to_string()
             } else {
-                format!("{count} Sessions hinter dieser Zeile anzeigen")
+                format!("Show the {count} sessions behind this line")
             };
             out.push_str(&format!(
                 "<div class=\"line has-context\" data-sessions=\"{ids}\" tabindex=\"0\" \
@@ -286,7 +286,7 @@ fn panels_for(view: &FileView, index: &Index) -> String {
             None => out.push_str(&format!(
                 "<section class=\"session orphan\" id=\"s-{id}\">\n\
                    <h2>{id}</h2>\n\
-                   <p class=\"warn\">Diese Session liegt nicht im Store — der Verweis ist verwaist.</p>\n\
+                   <p class=\"warn\">This session is not in the store — the reference is orphaned.</p>\n\
                  </section>\n",
                 id = escape(&id.to_string()),
             )),
@@ -302,17 +302,17 @@ fn panels_for(view: &FileView, index: &Index) -> String {
 /// die Seite leer wirkt — progressive Verbesserung statt Voraussetzung.
 pub fn session_panel(id: SessionId, session: &Session, inferred: bool) -> String {
     let badge = if inferred {
-        "<p class=\"guess\">⚠ vermutet — heuristisch verknüpft, nicht über einen Trailer belegt</p>\n"
+        "<p class=\"guess\">⚠ inferred — linked heuristically, not evidenced by a trailer</p>\n"
     } else {
         ""
     };
     let mut out = format!(
         "<section class=\"session\" id=\"s-{id}\">\n\
            {badge}\
-           <h2>Absicht</h2>\n\
+           <h2>Intent</h2>\n\
            <p class=\"intent\">{request}</p>\n",
         id = escape(&id.to_string()),
-        request = escape(non_empty(&session.intent.request, "(kein Prompt erfasst)")),
+        request = escape(non_empty(&session.intent.request, "(no prompt captured)")),
     );
 
     if !session.intent.constraints.is_empty() {
@@ -324,7 +324,7 @@ pub fn session_panel(id: SessionId, session: &Session, inferred: bool) -> String
     }
 
     if !session.intent.discarded.is_empty() {
-        out.push_str("<h3>Verworfen</h3>\n<ul>\n");
+        out.push_str("<h3>Discarded</h3>\n<ul>\n");
         for discarded in &session.intent.discarded {
             out.push_str(&format!("<li>{}</li>\n", escape(discarded)));
         }
@@ -332,11 +332,11 @@ pub fn session_panel(id: SessionId, session: &Session, inferred: bool) -> String
     }
 
     out.push_str(&format!(
-        "<h3>Herkunft</h3>\n\
+        "<h3>Provenance</h3>\n\
          <dl>\n\
            <dt>Agent</dt><dd>{agent} {version}</dd>\n\
-           <dt>Modell</dt><dd>{provider} / {model}</dd>\n\
-           <dt>Tokens</dt><dd>{input} ein / {output} aus</dd>\n\
+           <dt>Model</dt><dd>{provider} / {model}</dd>\n\
+           <dt>Tokens</dt><dd>{input} in / {output} out</dd>\n\
            <dt>Session</dt><dd><code class=\"id\">{id}</code></dd>\n\
          </dl>\n",
         agent = escape(&session.agent.name),
@@ -349,7 +349,7 @@ pub fn session_panel(id: SessionId, session: &Session, inferred: bool) -> String
     ));
 
     if !session.produced.files.is_empty() {
-        out.push_str("<h3>Berührte Dateien</h3>\n<ul>\n");
+        out.push_str("<h3>Files touched</h3>\n<ul>\n");
         for file in &session.produced.files {
             out.push_str(&format!("<li><code>{}</code></li>\n", escape(file)));
         }
@@ -369,7 +369,7 @@ fn turns_html(session: &Session) -> String {
     if session.turns.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<h3>Verlauf</h3>\n<div class=\"timeline\">\n");
+    let mut out = String::from("<h3>Conversation</h3>\n<div class=\"timeline\">\n");
     for turn in &session.turns {
         let (role_cls, role_label) = match turn.role {
             Role::User => ("user", "User"),
@@ -400,7 +400,7 @@ fn turns_html(session: &Session) -> String {
 /// Exec.
 fn tool_calls_html(calls: &[ToolCall]) -> String {
     let n = calls.len();
-    let word = if n == 1 { "Tool-Call" } else { "Tool-Calls" };
+    let word = if n == 1 { "tool call" } else { "tool calls" };
     let mut out = format!(
         "<details class=\"tools\"><summary>{n} {word}</summary>\n<ul class=\"toollist\">\n"
     );
@@ -478,16 +478,16 @@ pub fn session_page(
 ) -> String {
     let summary = Summary::of(id, session);
     let changed: usize = diffs.iter().map(|d| d.files.len()).sum();
-    let fileword = if changed == 1 { "Datei" } else { "Dateien" };
+    let fileword = if changed == 1 { "file" } else { "files" };
     let body = format!(
         "<header class=\"top\">\n\
-           <a class=\"back\" href=\"index.html\">← Übersicht</a>\n\
+           <a class=\"back\" href=\"index.html\">← Overview</a>\n\
            <h1>{headline}</h1>\n\
-           <p class=\"meta\">{actor} · {changed} {fileword} geändert</p>\n\
+           <p class=\"meta\">{actor} · {changed} {fileword} changed</p>\n\
          </header>\n\
          <main class=\"session-view\">\n\
            {panel}\
-           <h2 class=\"changes-h\">Änderungen</h2>\n\
+           <h2 class=\"changes-h\">Changes</h2>\n\
            {changes}\n\
          </main>\n",
         headline = escape(&summary.headline),
@@ -502,8 +502,8 @@ pub fn session_page(
 fn changes_html(diffs: &[CommitDiff], file_href: &BTreeMap<String, String>) -> String {
     let total: usize = diffs.iter().map(|d| d.files.len()).sum();
     if total == 0 {
-        return "<p class=\"empty\">Keine dem Commit zugeordnete Änderung — \
-                die Session ist erfasst, aber (noch) nicht mit einem Commit verbunden.</p>\n"
+        return "<p class=\"empty\">No change attributed to a commit — \
+                the session is captured but not (yet) linked to a commit.</p>\n"
             .to_string();
     }
     let mut out = String::new();
@@ -529,7 +529,7 @@ fn diff_file_html(file: &DiffFile, file_href: &BTreeMap<String, String>) -> Stri
     // Große Dateien nicht sofort ausbreiten — wie in GitLab.
     let open = if file.lines.len() > 120 { "" } else { " open" };
     let inner = if file.binary {
-        "<p class=\"empty\">Binärdatei — nicht als Text darstellbar.</p>\n".to_string()
+        "<p class=\"empty\">Binary file — cannot be shown as text.</p>\n".to_string()
     } else {
         format!(
             "<div class=\"diff-body\"><table class=\"diff-table\">\n{rows}</table></div>\n",
@@ -599,15 +599,15 @@ pub fn index_page(
         format!(
             "<header class=\"top\">\n\
                <h1>Minds</h1>\n\
-               <p class=\"meta\">{sessions} Session(s) · {commits} Commit(s) mit Kontext · {files} Datei(en){damaged}</p>\n\
+               <p class=\"meta\">{sessions} session(s) · {commits} commit(s) with context · {files} file(s){damaged}</p>\n\
              </header>\n\
              <main class=\"overview\">\n\
                {tiles}\
                {activity}\
-               <h2>Absichten</h2>\n\
-               <input class=\"search\" type=\"search\" placeholder=\"Absichten durchsuchen …\" aria-label=\"Absichten durchsuchen\">\n\
+               <h2>Intents</h2>\n\
+               <input class=\"search\" type=\"search\" placeholder=\"Search intents …\" aria-label=\"Search intents\">\n\
                {session_list}\n\
-               <h2>Dateien</h2>\n\
+               <h2>Files</h2>\n\
                {file_list}\n\
              </main>\n",
             sessions = index.len(),
@@ -620,16 +620,16 @@ pub fn index_page(
             file_list = file_list(files),
         )
     };
-    page("Minds — Kontext", &body)
+    page("Minds — Context", &body)
 }
 
 /// Der Empty-State: kein Kontext erfasst. Ehrlich und mit dem nächsten Schritt.
 fn empty_state() -> String {
     "<header class=\"top\"><h1>Minds</h1></header>\n\
      <main class=\"overview\">\n\
-       <p class=\"empty\">Für dieses Repository ist noch kein Kontext erfasst.</p>\n\
-       <p class=\"hint\">Richte die Hooks mit <code>minds enable</code> ein; \
-        beim nächsten Commit legt <code>minds checkpoint</code> die erste Session an.</p>\n\
+       <p class=\"empty\">No context has been captured for this repository yet.</p>\n\
+       <p class=\"hint\">Set up the hooks with <code>minds enable</code>; \
+        on the next commit, <code>minds checkpoint</code> creates the first session.</p>\n\
      </main>\n"
         .to_string()
 }
@@ -639,7 +639,7 @@ fn damaged_note(unreadable: usize) -> String {
     if unreadable == 0 {
         String::new()
     } else {
-        format!(" · <span class=\"warn\">{unreadable} nicht lesbar</span>")
+        format!(" · <span class=\"warn\">{unreadable} unreadable</span>")
     }
 }
 
@@ -652,7 +652,7 @@ fn damaged_note(unreadable: usize) -> String {
 fn session_list(index: &Index, session_page: &BTreeMap<SessionId, String>) -> String {
     let mut items: Vec<(&SessionId, &Session)> = index.sessions().collect();
     if items.is_empty() {
-        return "<p class=\"empty\">Keine Session mit erfasster Absicht.</p>\n".to_string();
+        return "<p class=\"empty\">No session with a captured intent.</p>\n".to_string();
     }
 
     // Neueste zuerst: nach Endzeitpunkt absteigend. Minds-Zeitstempel sind
@@ -681,11 +681,11 @@ fn session_list(index: &Index, session_page: &BTreeMap<SessionId, String>) -> St
         let guess = if index.is_observed(*id) {
             ""
         } else {
-            " · <span class=\"guess\">vermutet</span>"
+            " · <span class=\"guess\">inferred</span>"
         };
         let inner = format!(
             "<p class=\"headline\">{headline} <span class=\"agent-badge\">{agent}</span></p>\n\
-             <p class=\"sub\">{actor} · {files} Datei(en) · {input} ein / {output} aus Token{guess}</p>\n\
+             <p class=\"sub\">{actor} · {files} file(s) · {input} in / {output} out tokens{guess}</p>\n\
              <p class=\"sub\"><code class=\"id\">{id}</code></p>\n",
             headline = escape(&summary.headline),
             agent = escape(&session.agent.name),
@@ -716,7 +716,7 @@ fn session_list(index: &Index, session_page: &BTreeMap<SessionId, String>) -> St
 fn day_of(time: &str) -> String {
     match time.get(..10) {
         Some(day) if !day.is_empty() => day.to_string(),
-        _ => "ohne Datum".to_string(),
+        _ => "no date".to_string(),
     }
 }
 
@@ -728,10 +728,10 @@ fn kpi_tiles(m: &minds_metrics::Metrics) -> String {
     let continuity = human_duration(m.continuity_seconds);
     format!(
         "<div class=\"tiles\">\
-           <div class=\"tile\"><span class=\"tval\">{throughput}</span><span class=\"tlbl\">Ø Token / Session</span></div>\
-           <div class=\"tile\"><span class=\"tval\">{iteration}</span><span class=\"tlbl\">Ø Tool-Calls / Session</span></div>\
-           <div class=\"tile\"><span class=\"tval\">{continuity}</span><span class=\"tlbl\">längste Session</span></div>\
-           <div class=\"tile\"><span class=\"tval\">{streak}</span><span class=\"tlbl\">Tage Streak</span></div>\
+           <div class=\"tile\"><span class=\"tval\">{throughput}</span><span class=\"tlbl\">Avg tokens / session</span></div>\
+           <div class=\"tile\"><span class=\"tval\">{iteration}</span><span class=\"tlbl\">Avg tool calls / session</span></div>\
+           <div class=\"tile\"><span class=\"tval\">{continuity}</span><span class=\"tlbl\">Longest session</span></div>\
+           <div class=\"tile\"><span class=\"tval\">{streak}</span><span class=\"tlbl\">Day streak</span></div>\
          </div>\n",
         streak = m.streak_current_days,
     )
@@ -773,8 +773,8 @@ fn activity_chart(sessions: &[Session]) -> String {
     }
     format!(
         "<div class=\"activity\">\
-           <svg viewBox=\"0 0 300 52\" preserveAspectRatio=\"none\" class=\"actsvg\" aria-label=\"Aktivität der letzten 30 Tage\">{bars}</svg>\
-           <p class=\"sub\">Aktivität der letzten 30 Tage</p>\
+           <svg viewBox=\"0 0 300 52\" preserveAspectRatio=\"none\" class=\"actsvg\" aria-label=\"Activity over the last 30 days\">{bars}</svg>\
+           <p class=\"sub\">Activity over the last 30 days</p>\
          </div>\n"
     )
 }
@@ -790,14 +790,14 @@ fn human_duration(secs: u64) -> String {
     }
 }
 
-/// Große Zahlen mit Tausenderpunkt (deutsch): `20.940.890`.
+/// Große Zahlen mit Tausendertrennzeichen (englisches Format): `20,940,890`.
 fn thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     let len = digits.len();
     for (i, ch) in digits.chars().enumerate() {
         if i > 0 && (len - i) % 3 == 0 {
-            out.push('.');
+            out.push(',');
         }
         out.push(ch);
     }
@@ -817,14 +817,14 @@ fn session_time(session: &Session) -> &str {
 /// Die Dateien mit Kontext, jede ein Link auf ihre Seite.
 fn file_list(files: &[FileLink]) -> String {
     if files.is_empty() {
-        return "<p class=\"empty\">Keine Datei mit erfasstem Kontext.</p>\n".to_string();
+        return "<p class=\"empty\">No file with captured context.</p>\n".to_string();
     }
 
     let mut out = String::from("<ul class=\"files\">\n");
     for file in files {
         out.push_str(&format!(
             "<li><a href=\"{href}\"><code>{path}</code></a> \
-             <span class=\"sub\">{attributed}/{total} Zeilen</span></li>\n",
+             <span class=\"sub\">{attributed}/{total} lines</span></li>\n",
             href = escape(&file.href),
             path = escape(&file.path),
             attributed = file.attributed,
@@ -855,7 +855,7 @@ pub fn slug(path: &str) -> String {
         }
     }
     if out.is_empty() {
-        out.push_str("datei");
+        out.push_str("file");
     }
     out.push_str(".html");
     out
@@ -1156,7 +1156,7 @@ mod tests {
         assert!(html.contains("claude-opus-4"));
         assert!(html.contains("keine neuen Dependencies"));
         assert!(html.contains("Timeout hochsetzen"));
-        assert!(html.contains("900 ein / 120 aus"));
+        assert!(html.contains("900 in / 120 out"));
     }
 
     #[test]
@@ -1190,21 +1190,21 @@ mod tests {
         );
         assert!(!view.is_attributed(), "der verwaiste Verweis ist gefiltert");
         let html = file_page(&view, &index);
-        assert!(!html.contains("verwaist"));
+        assert!(!html.contains("orphaned"));
     }
 
     #[test]
     fn a_missing_prompt_says_so() {
         let html = session_panel(sid('a'), &session(""), false);
-        assert!(html.contains("(kein Prompt erfasst)"));
+        assert!(html.contains("(no prompt captured)"));
     }
 
     #[test]
     fn an_inferred_panel_is_marked_a_guess() {
         let observed = session_panel(sid('a'), &session("x"), false);
-        assert!(!observed.contains("vermutet"));
+        assert!(!observed.contains("inferred"));
         let inferred = session_panel(sid('a'), &session("x"), true);
-        assert!(inferred.contains("vermutet"));
+        assert!(inferred.contains("inferred"));
     }
 
     #[test]
@@ -1247,7 +1247,7 @@ mod tests {
             at: None,
         });
         let html = session_panel(sid('a'), &s, false);
-        assert!(html.contains("Verlauf"));
+        assert!(html.contains("Conversation"));
         assert!(html.contains("class=\"turn user\""));
         assert!(html.contains("class=\"turn assistant\""));
         // Exec-Kommando entrauscht sichtbar, Write-Effekt als Badge mit Pfad.
@@ -1260,7 +1260,7 @@ mod tests {
     fn the_file_page_shows_an_attribution_bar() {
         let html = file_page(&view(), &index_with("egal"));
         assert!(html.contains("class=\"attrbar\""));
-        assert!(html.contains("% Agent"));
+        assert!(html.contains("% agent"));
     }
 
     // --- Session-Seite ------------------------------------------------------
@@ -1341,7 +1341,7 @@ mod tests {
         let empty = BTreeMap::new();
         let html = session_page(sid('a'), &session("nur Absicht"), &[], false, &empty);
         assert!(html.contains("nur Absicht"));
-        assert!(html.contains("Keine dem Commit zugeordnete Änderung"));
+        assert!(html.contains("No change attributed to a commit"));
     }
 
     #[test]
@@ -1388,7 +1388,7 @@ mod tests {
     fn the_overview_links_to_each_file() {
         let html = index_page(&index_with("egal"), &links(), &pages());
         assert!(html.contains("href=\"src-retry.rs.html\""));
-        assert!(html.contains("1/2 Zeilen"));
+        assert!(html.contains("1/2 lines"));
     }
 
     #[test]
@@ -1405,7 +1405,7 @@ mod tests {
     #[test]
     fn the_empty_state_names_the_next_step() {
         let html = index_page(&Index::default(), &[], &pages());
-        assert!(html.contains("noch kein Kontext erfasst"));
+        assert!(html.contains("No context has been captured"));
         assert!(html.contains("minds enable"));
         assert!(html.contains("minds checkpoint"));
     }
@@ -1449,7 +1449,7 @@ mod tests {
     fn the_overview_has_kpi_tiles_and_a_search_box() {
         let html = index_page(&index_with("egal"), &links(), &pages());
         assert!(html.contains("class=\"tiles\""));
-        assert!(html.contains("Ø Token / Session"));
+        assert!(html.contains("Avg tokens / session"));
         assert!(html.contains("class=\"search\""));
     }
 
@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(human_duration(75549), "20h 59m");
         assert_eq!(human_duration(600), "10m");
         assert_eq!(human_duration(45), "45s");
-        assert_eq!(thousands(20940890), "20.940.890");
+        assert_eq!(thousands(20940890), "20,940,890");
         assert_eq!(thousands(5), "5");
     }
 
@@ -1538,7 +1538,7 @@ mod tests {
 
     #[test]
     fn slug_never_produces_an_empty_name() {
-        assert_eq!(slug(""), "datei.html");
+        assert_eq!(slug(""), "file.html");
         assert_eq!(slug("///"), "---.html");
     }
 
@@ -1561,6 +1561,6 @@ mod tests {
     fn an_attributed_line_announces_itself() {
         let html = file_page(&view(), &index_with("egal"));
         assert!(html.contains("role=\"button\""));
-        assert!(html.contains("Session hinter dieser Zeile anzeigen"));
+        assert!(html.contains("Show the session behind this line"));
     }
 }

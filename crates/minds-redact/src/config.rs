@@ -269,11 +269,11 @@ impl Redactor for DenyListRedactor {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// Die Denylist ließ sich nicht in einen Automaten übersetzen.
-    #[error("Denylist konnte nicht übersetzt werden: {0}")]
+    #[error("denylist could not be compiled: {0}")]
     DenyList(#[from] aho_corasick::BuildError),
 
     /// Aus `secret_keys` ließ sich kein Muster bauen.
-    #[error("Schlüsselwörter konnten nicht übersetzt werden: {0}")]
+    #[error("secret keywords could not be compiled: {0}")]
     Pattern(#[from] regex::Error),
 }
 

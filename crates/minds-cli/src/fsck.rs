@@ -89,14 +89,14 @@ fn fsck(require_review: bool, require_seal: bool) -> Fallible<bool> {
         // Schlusszeile trotzdem nicht, sonst liest sich „in Ordnung" über einen
         // Hook hinweg, der nie feuert.
         match hints {
-            0 => println!("fsck: in Ordnung"),
-            n => println!("fsck: in Ordnung, {n} Hinweis(e)"),
+            0 => println!("fsck: OK"),
+            n => println!("fsck: OK, {n} note(s)"),
         }
         Ok(true)
     } else {
         match hints {
-            0 => println!("fsck: {total} Befund(e)"),
-            n => println!("fsck: {total} Befund(e), {n} Hinweis(e)"),
+            0 => println!("fsck: {total} finding(s)"),
+            n => println!("fsck: {total} finding(s), {n} note(s)"),
         }
         Ok(false)
     }
@@ -107,7 +107,7 @@ fn fsck(require_review: bool, require_seal: bool) -> Fallible<bool> {
 /// einer seiner Session-Ids. Gibt die Zahl der ungereviewten Commits zurück.
 fn check_reviews(repo: &Repo, root: &Path, reviews: &ReviewStore) -> Fallible<usize> {
     let Some(head) = repo.head()?.commit() else {
-        println!("Reviews: HEAD hat noch keinen Commit — nichts zu prüfen");
+        println!("Reviews: HEAD has no commit yet — nothing to check");
         return Ok(0);
     };
 
@@ -135,14 +135,14 @@ fn check_reviews(repo: &Repo, root: &Path, reviews: &ReviewStore) -> Fallible<us
         }
         if !subjects.iter().any(|subject| approved.contains(subject)) {
             println!(
-                "  ungereviewt: {commit} ({} Session(s), kein Approve)",
+                "  unreviewed: {commit} ({} session(s), no approve)",
                 sessions.len()
             );
             unreviewed += 1;
         }
     }
 
-    println!("Reviews: {checked} agent-authored Commit(s), {unreviewed} ohne Approve");
+    println!("Reviews: {checked} agent-authored commit(s), {unreviewed} without an approve");
     Ok(unreviewed)
 }
 
@@ -175,7 +175,7 @@ fn commit_change_id(root: &Path, commit: CommitId) -> Option<ChangeId> {
 fn check_index(store: &dyn minds_store::ContextStore) -> Fallible<usize> {
     let index = store.index()?;
     if index.is_empty() {
-        println!("Index: leer");
+        println!("Index: empty");
         return Ok(0);
     }
 
@@ -190,14 +190,14 @@ fn check_index(store: &dyn minds_store::ContextStore) -> Fallible<usize> {
                 continue;
             }
             if !store.exists(entry.session)? {
-                println!("  Waise: {commit} → {} (nicht im Store)", entry.session);
+                println!("  orphan: {commit} → {} (not in the store)", entry.session);
                 orphans += 1;
             }
         }
     }
 
     println!(
-        "Index: {links} vermutete Verknüpfung(en), {} eindeutig, {orphans} verwaist",
+        "Index: {links} inferred link(s), {} unique, {orphans} orphaned",
         seen.len()
     );
     Ok(orphans)
@@ -207,7 +207,7 @@ fn check_index(store: &dyn minds_store::ContextStore) -> Fallible<usize> {
 /// gegen den Store. Gibt die Zahl der Waisen zurück.
 fn check_trailers(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fallible<usize> {
     let Some(head) = repo.head()?.commit() else {
-        println!("Trailer: HEAD hat noch keinen Commit — nichts zu prüfen");
+        println!("Trailers: HEAD has no commit yet — nothing to check");
         return Ok(0);
     };
 
@@ -225,14 +225,14 @@ fn check_trailers(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fallibl
                 continue;
             }
             if !store.exists(id)? {
-                println!("  Waise: {commit} → {id} (nicht im Store)");
+                println!("  orphan: {commit} → {id} (not in the store)");
                 orphans += 1;
             }
         }
     }
 
     println!(
-        "Trailer: {total} Verweis(e), {} eindeutig, {orphans} verwaist",
+        "Trailers: {total} reference(s), {} unique, {orphans} orphaned",
         seen.len()
     );
     Ok(orphans)
@@ -281,19 +281,19 @@ fn journal_report_lines(
     };
 
     if sessions.keys.is_empty() && sessions.unresolved.is_empty() {
-        lines.push("Journal: leer".to_owned());
+        lines.push("Journal: empty".to_owned());
         return (lines, findings);
     }
 
     if !sessions.keys.is_empty() {
         lines.push(format!(
-            "Journal: {} Session(s) noch nicht eingecheckt",
+            "Journal: {} session(s) not yet checked in",
             sessions.keys.len()
         ));
         if pipeline.is_none() {
             lines.push(
-                "  Kennungen ausgeblendet — die Redaction-Policy ist nicht lesbar, \
-                 siehe „.minds/redact.json“"
+                "  identifiers hidden — the redaction policy cannot be read, \
+                 see \".minds/redact.json\""
                     .to_owned(),
             );
         }
@@ -303,10 +303,10 @@ fn journal_report_lines(
             };
             let mut notes = Vec::new();
             if !outcome.gaps.is_empty() {
-                notes.push(format!("{} Lücke(n)", outcome.gaps.len()));
+                notes.push(format!("{} gap(s)", outcome.gaps.len()));
             }
             if !outcome.damaged.is_empty() {
-                notes.push(format!("{} beschädigt", outcome.damaged.len()));
+                notes.push(format!("{} damaged", outcome.damaged.len()));
             }
             // Die Stempel nachrechnen (ADR-0011): Ein liegendes Journal, an dem
             // Payload oder Fakten getauscht wurden, fällt hier auf — das ist
@@ -314,11 +314,11 @@ fn journal_report_lines(
             // nur ein Zustand.
             let (tampered, unstamped) = recompute_stamps(&outcome.events);
             if tampered > 0 {
-                notes.push(format!("{tampered} MANIPULIERT (Stempel passt nicht)"));
+                notes.push(format!("{tampered} TAMPERED (stamp does not match)"));
                 findings += tampered;
             }
             if unstamped > 0 {
-                notes.push(format!("{unstamped} ohne Stempel (pre-chain)"));
+                notes.push(format!("{unstamped} unstamped (pre-chain)"));
             }
             let suffix = if notes.is_empty() {
                 String::new()
@@ -330,7 +330,7 @@ fn journal_report_lines(
                 None => format!("{}/…", key.agent()),
             };
             lines.push(format!(
-                "  {shown}: {} Event(s){suffix}",
+                "  {shown}: {} event(s){suffix}",
                 outcome.events.len()
             ));
         }
@@ -338,12 +338,12 @@ fn journal_report_lines(
 
     if !sessions.unresolved.is_empty() {
         lines.push(format!(
-            "Journal: {} Verzeichnis(se) ohne lesbare Schlüssel-Datei",
+            "Journal: {} directory(ies) without a readable key file",
             sessions.unresolved.len()
         ));
         for dir in &sessions.unresolved {
             lines.push(format!(
-                "  „{}“ — Session nicht zuordenbar, bleibt liegen",
+                "  \"{}\" — session cannot be attributed, left in place",
                 short(root, dir)
             ));
         }
@@ -389,7 +389,7 @@ fn check_evidence(store: &dyn minds_store::ContextStore) -> (usize, usize) {
     let seal_ids = match store.list_seals() {
         Ok(ids) => ids,
         Err(err) => {
-            println!("Evidence: nicht lesbar ({err})");
+            println!("Evidence: unreadable ({err})");
             return (0, 1);
         }
     };
@@ -409,33 +409,33 @@ fn check_evidence(store: &dyn minds_store::ContextStore) -> (usize, usize) {
                     }
                 }
                 Err(err) => {
-                    println!("  MANIPULIERT: Seal {id} — {err}");
+                    println!("  TAMPERED: seal {id} — {err}");
                     findings += 1;
                 }
             },
             Ok(None) => {
-                println!("  Seal-Ref {id} ohne Seal-Datei");
+                println!("  seal ref {id} without a seal file");
                 findings += 1;
             }
             Err(minds_store::StoreError::SealMismatch { .. }) => {
-                println!("  MANIPULIERT: Seal {id} hasht nicht auf seine Id");
+                println!("  TAMPERED: seal {id} does not hash to its id");
                 findings += 1;
             }
             Err(err) => {
-                println!("  Seal {id} nicht lesbar ({err})");
+                println!("  seal {id} unreadable ({err})");
                 findings += 1;
             }
         }
     }
     println!(
-        "Evidence: {} Seal(s), {findings} manipuliert, {blocked} zurückgehalten",
+        "Evidence: {} seal(s), {findings} tampered, {blocked} withheld",
         seal_ids.len()
     );
     if blocked > 0 {
         println!(
-            "  Hinweis: {blocked} Session(s) durch die Speicher-Policy zurückgehalten — \
-             Coverage versiegelt, Nutzlast nicht gespeichert (Journal liegt noch, \
-             Policy prüfen)"
+            "  Note: {blocked} session(s) withheld by the storage policy — \
+             coverage sealed, payload not stored (journal still present, \
+             check the policy)"
         );
         hints += blocked;
     }
@@ -447,7 +447,7 @@ fn check_evidence(store: &dyn minds_store::ContextStore) -> (usize, usize) {
 /// `--require-review`, für Repos, die die Evidence-Chain verbindlich machen.
 fn check_require_seal(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fallible<usize> {
     let Some(head) = repo.head()?.commit() else {
-        println!("Seals: HEAD hat noch keinen Commit — nichts zu prüfen");
+        println!("Seals: HEAD has no commit yet — nothing to check");
         return Ok(0);
     };
 
@@ -466,13 +466,13 @@ fn check_require_seal(repo: &Repo, store: &dyn minds_store::ContextStore) -> Fal
                 .iter()
                 .any(|seal_id| matches!(store.seal_text(seal_id), Ok(Some(_))));
             if !sealed {
-                println!("  unversiegelt: {id}");
+                println!("  unsealed: {id}");
                 unsealed += 1;
             }
         }
     }
     println!(
-        "Seals: {} Session(s) geprüft, {unsealed} ohne Seal",
+        "Seals: {} session(s) checked, {unsealed} without a seal",
         seen.len()
     );
     Ok(unsealed)
@@ -672,19 +672,17 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
     let (hooks_dir, missing, outdated, refused, stray, outside, not_executable) = match state {
         HookState::Unusable(why) => {
             let first = match why {
-                NoHooksDir::Empty => {
-                    "Hooks: core.hooksPath ist leer — Git führt gar keine Hooks aus"
-                }
+                NoHooksDir::Empty => "Hooks: core.hooksPath is empty — Git runs no hooks at all",
                 NoHooksDir::WorktreeRoot => {
-                    "Hooks: core.hooksPath zeigt auf die Repo-Wurzel — dort führt Git sie nicht aus"
+                    "Hooks: core.hooksPath points at the repo root — Git does not run hooks there"
                 }
                 NoHooksDir::Unanswered => {
-                    "Hooks: core.hooksPath ist gesetzt, aber Git nennt kein Hook-Verzeichnis"
+                    "Hooks: core.hooksPath is set, but Git names no hooks directory"
                 }
             };
             return vec![
                 first.to_owned(),
-                "  kein Commit erzeugt einen Checkpoint, solange das so ist".to_owned(),
+                "  no commit creates a checkpoint while this stands".to_owned(),
             ];
         }
         HookState::Checked {
@@ -714,7 +712,7 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
     // Rat muss dann `--global-hooks` nennen: Ein nacktes `minds enable` liefe
     // nicht-interaktiv genau in den Abbruch, vor dem der Rat stehen soll.
     let scope_note = outside.then(|| {
-        format!("  „{dir}“ liegt außerhalb des Repos — Hooks dort gelten für alle Repositories")
+        format!("  \"{dir}\" lies outside the repo — hooks there apply to all repositories")
     });
     let enable_cmd = if outside {
         "`minds enable --global-hooks`"
@@ -723,7 +721,7 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
     };
     if missing.is_empty() && outdated.is_empty() && refused.is_empty() && not_executable.is_empty()
     {
-        let mut lines = vec![format!("Hooks: installiert in „{dir}“")];
+        let mut lines = vec![format!("Hooks: installed in \"{dir}\"")];
         lines.extend(scope_note);
         return lines;
     }
@@ -733,35 +731,31 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
         // Ein fehlender Hook ist der häufigste Fall — der Satz muss auch im
         // Singular stimmen, in beiden Zeilen.
         let (verb, object) = if missing.len() == 1 {
-            ("fehlt", "ihn")
+            ("is missing", "it")
         } else {
-            ("fehlen", "sie")
+            ("are missing", "them")
         };
-        lines.push(format!("Hooks: {} {verb} in „{dir}“", missing.join(", ")));
+        lines.push(format!("Hooks: {} {verb} in \"{dir}\"", missing.join(", ")));
         if let Some(stray) = stray {
             lines.push(format!(
-                "  der minds-Block liegt in „{}“, aber core.hooksPath verweist auf „{dir}“ — \
-                 Git liest ihn dort nie",
+                "  the minds block sits in \"{}\", but core.hooksPath points at \"{dir}\" — \
+                 Git never reads it there",
                 short(root, stray)
             ));
         }
-        lines.push(format!("  {enable_cmd} installiert {object} (neu)"));
+        lines.push(format!("  {enable_cmd} installs {object} (fresh)"));
     }
 
     // Veraltet heißt: Git führt den Hook aus, er tut nur nicht mehr das, was
     // diese Version von ihm erwartet. Ein Update des Binaries heilt das nicht —
     // der Rumpf steht in der Hook-Datei, nicht im Binary.
     if !outdated.is_empty() {
-        let verb = if outdated.len() == 1 {
-            "stammt"
-        } else {
-            "stammen"
-        };
+        let verb = if outdated.len() == 1 { "comes" } else { "come" };
         lines.push(format!(
-            "Hooks: {} in „{dir}“ {verb} aus einer älteren minds-Version",
+            "Hooks: {} in \"{dir}\" {verb} from an older minds version",
             outdated.join(", ")
         ));
-        lines.push(format!("  {enable_cmd} bringt den Block auf den Stand"));
+        lines.push(format!("  {enable_cmd} brings the block up to date"));
     }
 
     // Der Inhalt stimmt, nur das Execute-Bit fehlt. Das ist der stillste der
@@ -769,25 +763,25 @@ fn hook_report_lines(root: &Path, state: &HookState) -> Vec<String> {
     // überspringt — von außen sieht das aus wie eine heile Installation.
     if !not_executable.is_empty() {
         let (verb, object) = if not_executable.len() == 1 {
-            ("ist", "ihn")
+            ("is", "it")
         } else {
-            ("sind", "sie")
+            ("are", "them")
         };
         lines.push(format!(
-            "Hooks: {} in „{dir}“ {verb} nicht ausführbar",
+            "Hooks: {} in \"{dir}\" {verb} not executable",
             not_executable.join(", ")
         ));
         lines.push(format!(
-            "  Git überspringt {object} stillschweigend — kein Commit erzeugt einen Checkpoint"
+            "  Git skips {object} silently — no commit creates a checkpoint"
         ));
-        lines.push(format!("  {enable_cmd} setzt das Recht wieder"));
+        lines.push(format!("  {enable_cmd} restores the permission"));
     }
 
     // Abgelehnte Hooks bekommen den Grund statt des Rats: `minds enable` würde
     // hier nicht installieren, sondern mit derselben Begründung abbrechen.
     for (name, reason) in refused {
         lines.push(format!(
-            "Hooks: {name} in „{dir}“ ist kein Hook, den minds ergänzt"
+            "Hooks: {name} in \"{dir}\" is not a hook minds amends"
         ));
         lines.push(format!("  {reason}"));
     }
@@ -840,10 +834,10 @@ fn report_binary(root: &Path, hooks: &HookState) -> usize {
                 return 0;
             }
             println!(
-                "Binary: minds.binary verweist auf „{}“ — dort liegt kein ausführbares minds",
+                "Binary: minds.binary points at \"{}\" — no executable minds lives there",
                 short(root, &recorded)
             );
-            println!("  die Hooks suchen im PATH; `minds enable` erneuert den Eintrag");
+            println!("  the hooks fall back to the PATH; `minds enable` renews the entry");
             1
         }
         None => {
@@ -855,10 +849,8 @@ fn report_binary(root: &Path, hooks: &HookState) -> usize {
             if !installed {
                 return 0;
             }
-            println!(
-                "Binary: minds.binary ist nicht gesetzt — die Hooks suchen minds über den PATH"
-            );
-            println!("  `minds enable` merkt sich den Ort des Binaries");
+            println!("Binary: minds.binary is not set — the hooks look for minds via the PATH");
+            println!("  `minds enable` records the binary's location");
             1
         }
     }
@@ -887,7 +879,7 @@ fn agent_report_lines(reports: &[crate::enable::AgentReport]) -> Vec<String> {
         }
         if let Some(reason) = &report.refused {
             lines.push(format!(
-                "Agents: „{file}“ ist keine Konfiguration, die minds ergänzt"
+                "Agents: \"{file}\" is not a configuration minds amends"
             ));
             lines.push(format!("  {reason}"));
             continue;
@@ -896,41 +888,39 @@ fn agent_report_lines(reports: &[crate::enable::AgentReport]) -> Vec<String> {
         let missing = report.missing();
         if report.outdated > 0 {
             lines.push(format!(
-                "Agents: „{file}“ trägt Einträge aus einer älteren minds-Version"
+                "Agents: \"{file}\" carries entries from an older minds version"
             ));
-            lines.push("  `minds enable` bringt sie auf den Stand".to_owned());
+            lines.push("  `minds enable` brings them up to date".to_owned());
         } else if report.current == 0 {
             // Der #78-Fall: Die Datei ist da, aber nichts von uns steht drin.
             lines.push(format!(
-                "Agents: „{file}“ trägt keine minds-Registrierung — kein Event wird erfasst"
+                "Agents: \"{file}\" carries no minds registration — no event is captured"
             ));
-            lines.push("  `minds enable` trägt sie ein".to_owned());
+            lines.push("  `minds enable` adds them".to_owned());
         } else if missing > 0 {
-            let verb = if missing == 1 { "fehlt" } else { "fehlen" };
             lines.push(format!(
-                "Agents: in „{file}“ {verb} {missing} von {} Registrierungen",
+                "Agents: \"{file}\" is missing {missing} of {} registrations",
                 report.total
             ));
-            lines.push("  `minds enable` trägt sie ein".to_owned());
+            lines.push("  `minds enable` adds them".to_owned());
         } else if report.codex_flag == Some(false) {
             // Vollständig registriert und trotzdem wirkungslos: Ohne den
             // Schalter liest Codex die `hooks.json` gar nicht.
             lines.push(format!(
-                "Agents: „{file}“ ist vollständig, aber „codex_hooks“ fehlt in „.codex/config.toml“"
+                "Agents: \"{file}\" is complete, but \"codex_hooks\" is missing in \".codex/config.toml\""
             ));
             lines.push(
-                "  ohne den Schalter liest Codex die Registrierung nicht — `minds enable`"
+                "  without the switch Codex does not read the registration — `minds enable`"
                     .to_owned(),
             );
         } else if report.codex_flag.is_none() {
             // Nicht feststellbar heißt nicht „in Ordnung": `enable` bricht in
             // diesem Fall laut ab, also darf `fsck` hier nicht beruhigen.
             lines.push(format!(
-                "Agents: „{file}“ ist vollständig, aber „.codex/config.toml“ lässt sich nicht deuten"
+                "Agents: \"{file}\" is complete, but \".codex/config.toml\" cannot be interpreted"
             ));
-            lines.push(
-                "  ob Codex die Registrierung liest, ist von hier aus nicht zu sagen".to_owned(),
-            );
+            lines
+                .push("  whether Codex reads the registration cannot be told from here".to_owned());
         } else {
             registered.push(report.which.name());
         }
@@ -939,9 +929,9 @@ fn agent_report_lines(reports: &[crate::enable::AgentReport]) -> Vec<String> {
         // Mangel (`--recall` ist opt-in), sein veralteter Wortlaut schon.
         if report.recall == Some(Match::Ours) {
             lines.push(format!(
-                "Agents: der Recall-Eintrag in „{file}“ stammt aus einer älteren minds-Version"
+                "Agents: the recall entry in \"{file}\" comes from an older minds version"
             ));
-            lines.push("  `minds enable` bringt ihn auf den Stand".to_owned());
+            lines.push("  `minds enable` brings it up to date".to_owned());
         }
     }
 
@@ -951,7 +941,7 @@ fn agent_report_lines(reports: &[crate::enable::AgentReport]) -> Vec<String> {
     if !registered.is_empty() {
         lines.insert(
             0,
-            format!("Agents: registriert für {}", registered.join(", ")),
+            format!("Agents: registered for {}", registered.join(", ")),
         );
     }
     lines
@@ -999,25 +989,25 @@ fn log_report_lines(root: &Path, git_dir: &Path) -> Vec<String> {
     // „hook.log““ schickte den Leser in eine Datei, in der nichts steht.
     let mut lines = if summary.entries == 0 {
         vec![format!(
-            "Log: ältere Einträge aus dem Hook-Pfad in „{}“",
+            "Log: older entries from the hook path in \"{}\"",
             short(root, &rotated_path)
         )]
     } else {
         // Auch im Singular ein richtiger Satz — der häufigste Fall ist der
         // erste Eintrag, und „1 Einträge" liest sich wie ein Fehler im Werkzeug.
         let noun = if summary.entries == 1 {
-            "Eintrag"
+            "entry"
         } else {
-            "Einträge"
+            "entries"
         };
         let mut lines = vec![format!(
-            "Log: {} {noun} aus dem Hook-Pfad in „{}“",
+            "Log: {} {noun} from the hook path in \"{}\"",
             summary.entries,
             short(root, &path)
         )];
         if summary.rotated {
             lines.push(format!(
-                "  ältere Einträge stehen daneben in „{}“",
+                "  older entries sit next to it in \"{}\"",
                 short(root, &rotated_path)
             ));
         }
@@ -1035,9 +1025,9 @@ fn log_report_lines(root: &Path, git_dir: &Path) -> Vec<String> {
     // „beide" nur, wenn es auch beide gibt: Nach dem Rat ist `hook.log` weg,
     // und dann zeigte der Plural auf eine Datei, die nicht mehr existiert.
     lines.push(if summary.rotated && summary.entries > 0 {
-        "  der Wortlaut steht nur dort — erledigt? beide Dateien löschen".to_owned()
+        "  the wording lives only there — resolved? delete both files".to_owned()
     } else {
-        "  der Wortlaut steht nur dort — erledigt? Datei löschen".to_owned()
+        "  the wording lives only there — resolved? delete the file".to_owned()
     });
     lines
 }
@@ -1268,13 +1258,13 @@ mod tests {
         assert!(
             refused
                 .iter()
-                .any(|(name, reason)| *name == "post-commit" && reason.contains("Symlink")),
+                .any(|(name, reason)| *name == "post-commit" && reason.contains("symlink")),
             "{state:?}"
         );
 
         // Und der Bericht rät nicht zu etwas, das scheitern würde.
         let lines = hook_report_lines(root, &state).join("\n");
-        assert!(lines.contains("kein Hook, den minds ergänzt"), "{lines}");
+        assert!(lines.contains("is not a hook minds amends"), "{lines}");
     }
 
     /// Dasselbe für die schlichte große Datei — die braucht keinen Symlink.
@@ -1306,7 +1296,7 @@ mod tests {
             hooks_dir: PathBuf::from("/repo/.husky"),
             missing: vec![],
             outdated: vec![],
-            refused: vec![("post-commit", "…/post-commit ist ein Symlink".to_owned())],
+            refused: vec![("post-commit", "…/post-commit is a symlink".to_owned())],
             stray: None,
             outside: false,
             not_executable: vec![],
@@ -1314,8 +1304,8 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: post-commit in „.husky“ ist kein Hook, den minds ergänzt",
-                "  …/post-commit ist ein Symlink",
+                "Hooks: post-commit in \".husky\" is not a hook minds amends",
+                "  …/post-commit is a symlink",
             ]
         );
     }
@@ -1379,7 +1369,7 @@ mod tests {
         ];
         assert_eq!(
             agent_report_lines(&reports),
-            ["Agents: registriert für claude-code, cursor"]
+            ["Agents: registered for claude-code, cursor"]
         );
     }
 
@@ -1392,8 +1382,8 @@ mod tests {
         assert_eq!(
             agent_report_lines(&reports),
             [
-                "Agents: „.claude/settings.json“ trägt keine minds-Registrierung — kein Event wird erfasst",
-                "  `minds enable` trägt sie ein",
+                "Agents: \".claude/settings.json\" carries no minds registration — no event is captured",
+                "  `minds enable` adds them",
             ]
         );
     }
@@ -1406,8 +1396,8 @@ mod tests {
         assert_eq!(
             agent_report_lines(&reports),
             [
-                "Agents: „.gemini/settings.json“ trägt Einträge aus einer älteren minds-Version",
-                "  `minds enable` bringt sie auf den Stand",
+                "Agents: \".gemini/settings.json\" carries entries from an older minds version",
+                "  `minds enable` brings them up to date",
             ]
         );
     }
@@ -1419,8 +1409,8 @@ mod tests {
         assert_eq!(
             agent_report_lines(&one),
             [
-                "Agents: in „.cursor/hooks.json“ fehlt 1 von 7 Registrierungen",
-                "  `minds enable` trägt sie ein",
+                "Agents: \".cursor/hooks.json\" is missing 1 of 7 registrations",
+                "  `minds enable` adds them",
             ]
         );
 
@@ -1428,8 +1418,8 @@ mod tests {
         assert_eq!(
             agent_report_lines(&many),
             [
-                "Agents: in „.cursor/hooks.json“ fehlen 4 von 7 Registrierungen",
-                "  `minds enable` trägt sie ein",
+                "Agents: \".cursor/hooks.json\" is missing 4 of 7 registrations",
+                "  `minds enable` adds them",
             ]
         );
     }
@@ -1443,9 +1433,9 @@ mod tests {
         assert_eq!(
             agent_report_lines(&[outdated]),
             [
-                "Agents: registriert für claude-code",
-                "Agents: der Recall-Eintrag in „.claude/settings.json“ stammt aus einer älteren minds-Version",
-                "  `minds enable` bringt ihn auf den Stand",
+                "Agents: registered for claude-code",
+                "Agents: the recall entry in \".claude/settings.json\" comes from an older minds version",
+                "  `minds enable` brings it up to date",
             ]
         );
 
@@ -1453,7 +1443,7 @@ mod tests {
         let absent = agent(crate::enable::Which::ClaudeCode, 7, 0, 7);
         assert_eq!(
             agent_report_lines(&[absent]),
-            ["Agents: registriert für claude-code"]
+            ["Agents: registered for claude-code"]
         );
     }
 
@@ -1462,12 +1452,12 @@ mod tests {
     #[test]
     fn golden_a_refused_agent_file_carries_its_reason() {
         let mut refused = agent(crate::enable::Which::OpenCode, 0, 0, 1);
-        refused.refused = Some("stammt nicht von minds".to_owned());
+        refused.refused = Some("does not come from minds".to_owned());
         assert_eq!(
             agent_report_lines(&[refused]),
             [
-                "Agents: „.opencode/plugin/minds.ts“ ist keine Konfiguration, die minds ergänzt",
-                "  stammt nicht von minds",
+                "Agents: \".opencode/plugin/minds.ts\" is not a configuration minds amends",
+                "  does not come from minds",
             ]
         );
     }
@@ -1492,7 +1482,7 @@ mod tests {
             outside: false,
             not_executable: vec![],
         };
-        assert_eq!(lines(&state), ["Hooks: installiert in „.husky“"]);
+        assert_eq!(lines(&state), ["Hooks: installed in \".husky\""]);
     }
 
     /// Ein Verzeichnis außerhalb des Repos (#66): Die Ortszeile steht **nach**
@@ -1513,10 +1503,10 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: post-commit fehlt in „/woanders/hooks“",
-                "  „/woanders/hooks“ liegt außerhalb des Repos — Hooks dort gelten für alle \
-                 Repositories",
-                "  `minds enable --global-hooks` installiert ihn (neu)",
+                "Hooks: post-commit is missing in \"/woanders/hooks\"",
+                "  \"/woanders/hooks\" lies outside the repo — hooks there apply to all \
+                 repositories",
+                "  `minds enable --global-hooks` installs it (fresh)",
             ]
         );
     }
@@ -1538,9 +1528,9 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: post-commit in „.git/hooks“ ist nicht ausführbar",
-                "  Git überspringt ihn stillschweigend — kein Commit erzeugt einen Checkpoint",
-                "  `minds enable` setzt das Recht wieder",
+                "Hooks: post-commit in \".git/hooks\" is not executable",
+                "  Git skips it silently — no commit creates a checkpoint",
+                "  `minds enable` restores the permission",
             ]
         );
     }
@@ -1593,9 +1583,9 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: installiert in „/woanders/hooks“",
-                "  „/woanders/hooks“ liegt außerhalb des Repos — Hooks dort gelten für alle \
-                 Repositories",
+                "Hooks: installed in \"/woanders/hooks\"",
+                "  \"/woanders/hooks\" lies outside the repo — hooks there apply to all \
+                 repositories",
             ]
         );
     }
@@ -1615,8 +1605,8 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: prepare-commit-msg fehlt in „.husky“",
-                "  `minds enable` installiert ihn (neu)",
+                "Hooks: prepare-commit-msg is missing in \".husky\"",
+                "  `minds enable` installs it (fresh)",
             ]
         );
     }
@@ -1635,10 +1625,10 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: post-commit, prepare-commit-msg fehlen in „.husky“",
-                "  der minds-Block liegt in „.git/hooks“, aber core.hooksPath verweist auf \
-                 „.husky“ — Git liest ihn dort nie",
-                "  `minds enable` installiert sie (neu)",
+                "Hooks: post-commit, prepare-commit-msg are missing in \".husky\"",
+                "  the minds block sits in \".git/hooks\", but core.hooksPath points at \
+                 \".husky\" — Git never reads it there",
+                "  `minds enable` installs them (fresh)",
             ]
         );
     }
@@ -1648,8 +1638,8 @@ mod tests {
         assert_eq!(
             lines(&HookState::Unusable(NoHooksDir::Empty)),
             [
-                "Hooks: core.hooksPath ist leer — Git führt gar keine Hooks aus",
-                "  kein Commit erzeugt einen Checkpoint, solange das so ist",
+                "Hooks: core.hooksPath is empty — Git runs no hooks at all",
+                "  no commit creates a checkpoint while this stands",
             ]
         );
     }
@@ -1659,8 +1649,8 @@ mod tests {
         assert_eq!(
             lines(&HookState::Unusable(NoHooksDir::WorktreeRoot)),
             [
-                "Hooks: core.hooksPath zeigt auf die Repo-Wurzel — dort führt Git sie nicht aus",
-                "  kein Commit erzeugt einen Checkpoint, solange das so ist",
+                "Hooks: core.hooksPath points at the repo root — Git does not run hooks there",
+                "  no commit creates a checkpoint while this stands",
             ]
         );
     }
@@ -1703,7 +1693,7 @@ mod tests {
         };
         assert_eq!(
             lines(&state)[0],
-            "Hooks: post-commit fehlt in „mein ordner/hooks“"
+            "Hooks: post-commit is missing in \"mein ordner/hooks\""
         );
     }
 
@@ -1785,8 +1775,8 @@ mod tests {
         assert_eq!(
             lines(&state),
             [
-                "Hooks: pre-push in „.husky“ stammt aus einer älteren minds-Version",
-                "  `minds enable` bringt den Block auf den Stand",
+                "Hooks: pre-push in \".husky\" comes from an older minds version",
+                "  `minds enable` brings the block up to date",
             ]
         );
     }
@@ -1804,7 +1794,7 @@ mod tests {
         };
         assert_eq!(
             lines(&state)[0],
-            "Hooks: post-commit, pre-push in „.husky“ stammen aus einer älteren minds-Version"
+            "Hooks: post-commit, pre-push in \".husky\" come from an older minds version"
         );
     }
 
@@ -1844,8 +1834,8 @@ mod tests {
         assert_eq!(
             log_report_lines(root.path(), &root.path().join(".git")),
             [
-                "Log: 1 Eintrag aus dem Hook-Pfad in „.git/minds/hook.log“",
-                "  der Wortlaut steht nur dort — erledigt? Datei löschen",
+                "Log: 1 entry from the hook path in \".git/minds/hook.log\"",
+                "  the wording lives only there — resolved? delete the file",
             ]
         );
     }
@@ -1855,7 +1845,7 @@ mod tests {
         let root = git_dir_with_log(3);
         assert_eq!(
             log_report_lines(root.path(), &root.path().join(".git"))[0],
-            "Log: 3 Einträge aus dem Hook-Pfad in „.git/minds/hook.log“"
+            "Log: 3 entries from the hook path in \".git/minds/hook.log\""
         );
     }
 
@@ -1868,9 +1858,9 @@ mod tests {
         assert_eq!(
             log_report_lines(root.path(), &root.path().join(".git")),
             [
-                "Log: 2 Einträge aus dem Hook-Pfad in „.git/minds/hook.log“",
-                "  ältere Einträge stehen daneben in „.git/minds/hook.log.1“",
-                "  der Wortlaut steht nur dort — erledigt? beide Dateien löschen",
+                "Log: 2 entries from the hook path in \".git/minds/hook.log\"",
+                "  older entries sit next to it in \".git/minds/hook.log.1\"",
+                "  the wording lives only there — resolved? delete both files",
             ]
         );
     }
@@ -1888,10 +1878,10 @@ mod tests {
         assert_eq!(
             log_report_lines(root.path(), &root.path().join(".git")),
             [
-                "Log: ältere Einträge aus dem Hook-Pfad in „.git/minds/hook.log.1“",
+                "Log: older entries from the hook path in \".git/minds/hook.log.1\"",
                 // Singular: `hook.log` ist in diesem Fall gerade gelöscht
                 // worden — der Plural zeigte auf eine Datei, die es nicht gibt.
-                "  der Wortlaut steht nur dort — erledigt? Datei löschen",
+                "  the wording lives only there — resolved? delete the file",
             ]
         );
     }
@@ -1944,8 +1934,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Journal: 1 Session(s) noch nicht eingecheckt",
-                "  claude-code/[redacted:secret]: 1 Event(s)",
+                "Journal: 1 session(s) not yet checked in",
+                "  claude-code/[redacted:secret]: 1 event(s)",
             ]
         );
     }
@@ -1959,8 +1949,8 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Journal: 1 Session(s) noch nicht eingecheckt",
-                "  claude-code/31f3f224-f440-41ac-9244: 1 Event(s)",
+                "Journal: 1 session(s) not yet checked in",
+                "  claude-code/31f3f224-f440-41ac-9244: 1 event(s)",
             ]
         );
     }
@@ -1980,10 +1970,10 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert_eq!(
             lines[0],
-            "Journal: 1 Verzeichnis(se) ohne lesbare Schlüssel-Datei"
+            "Journal: 1 directory(ies) without a readable key file"
         );
         assert!(
-            lines[1].contains("Session nicht zuordenbar"),
+            lines[1].contains("session cannot be attributed"),
             "{}",
             lines[1]
         );
@@ -2017,7 +2007,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("1 MANIPULIERT (Stempel passt nicht)")),
+                .any(|l| l.contains("1 TAMPERED (stamp does not match)")),
             "{lines:?}"
         );
     }
@@ -2028,7 +2018,7 @@ mod tests {
         let journal = Journal::open(&root.path().join(".git"));
         assert_eq!(
             journal_report_lines(root.path(), &journal, Some(&strict_pipeline())).0,
-            ["Journal: leer".to_owned()]
+            ["Journal: empty".to_owned()]
         );
     }
 
@@ -2042,10 +2032,10 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "Journal: 1 Session(s) noch nicht eingecheckt",
-                "  Kennungen ausgeblendet — die Redaction-Policy ist nicht lesbar, \
-                 siehe „.minds/redact.json“",
-                "  claude-code/…: 1 Event(s)",
+                "Journal: 1 session(s) not yet checked in",
+                "  identifiers hidden — the redaction policy cannot be read, \
+                 see \".minds/redact.json\"",
+                "  claude-code/…: 1 event(s)",
             ]
         );
     }

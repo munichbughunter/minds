@@ -197,13 +197,13 @@ fn a_signed_verdict_verifies_and_tampering_breaks_it() {
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("signiert"), "{}", text(&out));
+    assert!(text(&out).contains("signed with"), "{}", text(&out));
 
     // Ohne --signers wird nicht geprüft, sondern nur gemeldet — die beiden
     // dürfen nicht gleich aussehen.
     let unchecked = minds(dir, &["reviews", &change]);
     assert!(
-        text(&unchecked).contains("ungeprüft"),
+        text(&unchecked).contains("unverified"),
         "{}",
         text(&unchecked)
     );
@@ -214,7 +214,7 @@ fn a_signed_verdict_verifies_and_tampering_breaks_it() {
         &["reviews", &change, "--signers", signers.to_str().unwrap()],
     );
     assert!(
-        text(&checked).contains("Signatur gültig"),
+        text(&checked).contains("signature valid"),
         "{}",
         text(&checked)
     );
@@ -233,9 +233,9 @@ fn a_signed_verdict_verifies_and_tampering_breaks_it() {
         &["reviews", &change, "--signers", signers.to_str().unwrap()],
     );
     let listing = text(&both);
-    assert!(listing.contains("Signatur gültig"), "{listing}");
+    assert!(listing.contains("signature valid"), "{listing}");
     assert!(
-        listing.contains("nicht signiert"),
+        listing.contains("not signed"),
         "das untergeschobene Verdict darf nicht als signiert durchgehen: {listing}"
     );
 }
