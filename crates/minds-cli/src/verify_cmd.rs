@@ -257,8 +257,14 @@ fn verify_session(
         return Ok(Verdict::Unverifiable);
     }
 
-    let (checked, mut incomplete_reasons, seal_tampered) =
-        check_seals(ctx.store.as_ref(), &seal_ids, signers, identity, &ctx.root)?;
+    let (checked, mut incomplete_reasons, seal_tampered) = check_seals(
+        ctx.store.as_ref(),
+        &seal_ids,
+        signers,
+        identity,
+        &ctx.root,
+        Some(id),
+    )?;
     tampered |= seal_tampered;
 
     // 3. Jeder stored-Seal muss DIESE Session nennen — und wenn ein Seal
@@ -380,14 +386,79 @@ fn verify_session(
     Ok(verdict)
 }
 
+/// Benennt einen manipulierten Seal, so weit die Repo-Lage es hergibt:
+/// erwarteter vs. vorgefundener Hash, dann — falls die abgelegten Bytes noch
+/// als Seal parsen — ihre **behaupteten** Felder samt Kreuzchecks gegen noch
+/// intakte Daten. Mehr ist ehrlich nicht sagbar: Der Originaltext ist nach
+/// dem Journal-Discard nicht rekonstruierbar, und der Hash ist nicht
+/// invertierbar — welches Feld sich änderte, weiß nur der Angreifer.
+fn report_tampered_seal(
+    store: &dyn ContextStore,
+    requested: &ContentHash,
+    actual: &ContentHash,
+    target: Option<SessionId>,
+) {
+    println!("Seal           {requested}: TAMPERED — the stored text does not hash to this id");
+    println!("  expected     {requested}");
+    println!("  found        {actual}");
+    let claimed = store
+        .seal_bytes(requested)
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| Seal::parse(&text).ok());
+    let Some(claimed) = claimed else {
+        println!("  claimed      unreadable — the stored bytes are not even a well-formed seal");
+        return;
+    };
+    // `Seal::parse` erzwingt Einzeiligkeit und verbietet Steuer-/Versteck-
+    // zeichen in den Freitextfeldern — ein geparster Claim ist terminal-
+    // sicher; `sanitize` bleibt als zweite Schicht (wie beim Scope oben).
+    let session = match &claimed.outcome {
+        SealOutcome::Stored { session } => session.as_str(),
+        SealOutcome::Rejected => "-",
+    };
+    println!("  claimed      (UNVERIFIED — the tampered text's statement, not evidence)");
+    println!(
+        "               session={} scope={} seq {}–{} · {} event(s) · {} gap(s) · {}",
+        crate::text::sanitize(session),
+        crate::text::sanitize(&claimed.scope),
+        claimed.first_seq,
+        claimed.last_seq,
+        claimed.events,
+        claimed.gaps,
+        claimed.outcome.human_word()
+    );
+    if let Some(target) = target {
+        let word = if session == target.to_string() {
+            "matches"
+        } else {
+            "does NOT match"
+        };
+        println!("  cross-check  the claimed session {word} the session under verification");
+    }
+    if let Some(prev) = &claimed.previous {
+        let state = match store.seal_text(prev) {
+            Ok(Some(_)) => "hash-valid in the store",
+            Ok(None) => "not in the store",
+            Err(StoreError::SealMismatch { .. }) => "itself altered",
+            Err(_) => "unreadable",
+        };
+        println!("  cross-check  claimed previous {prev}: {state}");
+    }
+}
+
 /// Liest und prüft die genannten Seals. Liefert die lesbaren Seals, die
-/// Unvollständigkeits-Gründe und ob Manipulation vorliegt.
+/// Unvollständigkeits-Gründe und ob Manipulation vorliegt. `target` ist die
+/// Session, um die es geht — der Tamper-Report gleicht die Behauptung des
+/// manipulierten Texts gegen sie ab.
 fn check_seals(
     store: &dyn ContextStore,
     seal_ids: &[ContentHash],
     signers: Option<&str>,
     identity: Option<&str>,
     root: &Path,
+    target: Option<SessionId>,
 ) -> Fallible<(Vec<CheckedSeal>, Vec<String>, bool)> {
     let mut checked = Vec::new();
     let mut reasons = Vec::new();
@@ -400,8 +471,8 @@ fn check_seals(
                 reasons.push(format!("seal {id} is referenced but not in the store"));
                 continue;
             }
-            Err(StoreError::SealMismatch { .. }) => {
-                println!("Seal           {id}: TAMPERED — text does not hash to its id");
+            Err(StoreError::SealMismatch { actual, .. }) => {
+                report_tampered_seal(store, id, &actual, target);
                 tampered = true;
                 continue;
             }
@@ -646,8 +717,8 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
             println!("{}", Verdict::Unverifiable.word());
             return Ok(Verdict::Unverifiable);
         }
-        Err(StoreError::SealMismatch { .. }) => {
-            println!("Seal           {id}: text does not hash to its id");
+        Err(StoreError::SealMismatch { actual, .. }) => {
+            report_tampered_seal(ctx.store.as_ref(), &id, &actual, None);
             println!("{}", Verdict::Tampered.word());
             return Ok(Verdict::Tampered);
         }

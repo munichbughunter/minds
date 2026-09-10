@@ -3030,9 +3030,10 @@ fn verify_says_tampered_for_a_forged_seal() {
     let dir = repo.path();
 
     // Den Seal-Text im Ref austauschen — Plumbing, wie ein Angreifer mit
-    // Repo-Zugriff.
+    // Repo-Zugriff. Aus `events=2` wird ein glaubwürdiges `events=9`: eine
+    // wohlgeformte Fälschung, der Härtefall für die Benennung.
     let seals = seal_refs(dir);
-    let forged = seal_text(dir, &seals[0]).replacen("events=", "events=9", 1);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
     let tmp = dir.join("forged");
     std::fs::write(&tmp, &forged).unwrap();
     let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
@@ -3048,6 +3049,121 @@ fn verify_says_tampered_for_a_forged_seal() {
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(1), "{text}");
     assert!(text.contains("TAMPERED"), "{text}");
+    // Seit dem Tamper-Report wird die Manipulation BENANNT: beide Hashes …
+    // (der Ref-Name trägt das nackte Hex, die Anzeige das b3-Präfix).
+    let expected_hex = seals[0]
+        .rsplit('/')
+        .next()
+        .expect("seal ref carries the id");
+    assert!(
+        text.contains(&format!("  expected     b3-{expected_hex}")),
+        "{text}"
+    );
+    assert!(text.contains("  found        b3-"), "{text}");
+    assert!(
+        !text.contains(&format!("  found        b3-{expected_hex}")),
+        "{text}"
+    );
+    // … der Claim des manipulierten Texts, klar als unverifiziert gelabelt …
+    assert!(text.contains("claimed      (UNVERIFIED"), "{text}");
+    assert!(text.contains("· 9 event(s)"), "{text}");
+    // … und der Kreuzcheck gegen die Session, um die es geht.
+    assert!(
+        text.contains("the claimed session matches the session under verification"),
+        "{text}"
+    );
+    // Ehrlichkeits-Grenze: Kein „erwartet 2, vorgefunden 9" — der Original-
+    // wert ist nach dem Journal-Discard nicht beweisbar, also steht er nicht da.
+    assert!(!text.contains("events=2"), "{text}");
+}
+
+/// Das Verdikt-Wort des Read-Models für eine Session — der Gegenrechner.
+fn read_model_verdict(dir: &Path, id: &str) -> Option<&'static str> {
+    let repo = minds_git::Repo::open(dir).expect("repo");
+    let store = minds_store::InRepoStore::open(dir).expect("store");
+    let index = minds_reader::Index::build(&repo, &store).expect("index");
+    let id: minds_core::SessionId = id.parse().expect("session id");
+    index
+        .evidence_report(id)
+        .map(|report| report.state.verdict.word())
+}
+
+/// Paritätstest (d127567): `minds verify` und das Read-Model rechnen bewusst
+/// getrennt — verify prüft zusätzlich Payload-Hash, Signaturen und den
+/// Einzel-Seal-Modus, das Read-Model kostet einen vollen Index-Build — aber
+/// das **Verdikt-Wort** muss identisch bleiben. Gewollte Abweichungen (und
+/// nur die): Payload-Korruption wertet nur verify; Legacy drückt der Reader
+/// als `Provenance::Legacy` (kein Report) statt als viertes Wort aus.
+#[test]
+fn verify_and_the_read_model_speak_the_same_verdict_word() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // Sauber versiegelt: beide sagen VERIFIED.
+    let out = minds(dir, &["verify", &id], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(
+        stdout(&out).trim().ends_with("VERIFIED"),
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(read_model_verdict(dir, &id), Some("VERIFIED"));
+
+    // Seal manipuliert: beide sagen TAMPERED.
+    let seals = seal_refs(dir);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
+    let tmp = dir.join("forged");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert_eq!(read_model_verdict(dir, &id), Some("TAMPERED"));
+}
+
+/// EV.12-Nachbar: Sind die abgelegten Bytes nicht einmal ein wohlgeformter
+/// Seal, sagt der Report genau das — und behauptet keinen Claim.
+#[test]
+fn a_tampered_seal_with_garbage_bytes_is_named_without_a_claim() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let seals = seal_refs(dir);
+    let tmp = dir.join("garbage");
+    std::fs::write(&tmp, b"not a seal\n").unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "garbage"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    assert!(text.contains("  expected     b3-"), "{text}");
+    assert!(text.contains("  found        b3-"), "{text}");
+    assert!(
+        text.contains("claimed      unreadable — the stored bytes are not even a well-formed seal"),
+        "{text}"
+    );
+    assert!(!text.contains("cross-check"), "{text}");
 }
 
 #[test]

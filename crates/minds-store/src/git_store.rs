@@ -1214,26 +1214,13 @@ impl ContextStore for GitStore {
         }
     }
 
-    fn seal_text(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
-        use minds_core::evidence::Seal;
-
-        let Some(bytes) = self
-            .repo
+    fn seal_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        // Ungeprüft per Vertrag ([`ContextStore::seal_bytes`]): Der
+        // Hash-Abgleich liegt im Trait-Default von `seal_text` — eine
+        // Prüfung, nicht drei.
+        self.repo
             .read_blob_at(&seal_ref(id), SEAL_FILE)
-            .map_err(StoreError::backend)?
-        else {
-            return Ok(None);
-        };
-        let text =
-            String::from_utf8(bytes).map_err(|e| StoreError::backend(std::io::Error::other(e)))?;
-        let actual = Seal::id_of_text(&text);
-        if actual != *id {
-            return Err(StoreError::SealMismatch {
-                requested: id.clone(),
-                actual,
-            });
-        }
-        Ok(Some(text))
+            .map_err(StoreError::backend)
     }
 
     fn record_session_seal(

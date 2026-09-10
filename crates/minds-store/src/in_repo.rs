@@ -110,8 +110,8 @@ impl ContextStore for InRepoStore {
         self.0.put_seal(text)
     }
 
-    fn seal_text(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
-        self.0.seal_text(id)
+    fn seal_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.seal_bytes(id)
     }
 
     fn record_session_seal(
