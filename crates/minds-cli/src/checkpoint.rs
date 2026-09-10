@@ -69,7 +69,7 @@ use std::process::ExitCode;
 use minds_capture::epoch::EpochState;
 use minds_capture::{Checkpoint, Journal, adapter, chain};
 use minds_core::SessionId;
-use minds_core::evidence::{ChainResult, Seal, SealOutcome};
+use minds_core::evidence::{ChainResult, Seal, SealOutcome, SealSummary};
 use minds_git::{CommitId, Repo};
 use minds_store::ContextStore;
 
@@ -187,7 +187,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                     &root,
                     git_dir,
                 );
-                let Some(seal_id) = sealed else {
+                let Some(sealed) = sealed else {
                     // Ohne Seal kein Discard: Der Seal muss die
                     // Journal-Löschung überleben. Session ist gespeichert
                     // (idempotent), der nächste Lauf versiegelt nach.
@@ -195,7 +195,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 };
                 // Rückverweis Session → Seal, best-effort: aus `list_seals`
                 // jederzeit rekonstruierbar, darf den Checkpoint nicht kippen.
-                if let Err(err) = store.record_session_seal(id, &seal_id) {
+                if let Err(err) = store.record_session_seal(id, &sealed.seal_id) {
                     hooklog::report_at(
                         git_dir,
                         Source::Checkpoint,
@@ -207,6 +207,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 // verlieren.
                 journal.discard(&key)?;
                 println!("  {}: {id}", key.display_redacted(&pipeline));
+                print_session_sealed(&sealed);
                 stored.push(id);
             }
             Err(err) => {
@@ -222,7 +223,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 // ein Store-Schluckauf wäre eine über die Infrastruktur — der
                 // versiegelte sonst irreführend „rejected".
                 if err.downcast_ref::<minds_redact::RedactionError>().is_some() {
-                    if let Some(seal_id) = seal_epoch(
+                    if let Some(sealed) = seal_epoch(
                         &epochs,
                         &key,
                         &read.events,
@@ -232,7 +233,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                         &root,
                         git_dir,
                     ) {
-                        note.push_str(&format!(" — coverage sealed: {seal_id}"));
+                        note.push_str(&format!(" — coverage sealed: {}", sealed.seal_id));
                     }
                 }
                 hooklog::report_at(git_dir, Source::Checkpoint, &note);
@@ -303,9 +304,9 @@ fn tracked_files(root: &Path) -> Option<std::collections::BTreeSet<String>> {
 }
 
 /// Baut den Seal dieser Epoche, legt ihn ab und schreibt den Epochen-Zustand
-/// fort. Gibt die `seal_id` zurück — oder `None`, wenn die Ablage scheiterte
-/// (dann bleibt das Journal liegen und der nächste Lauf holt sie idempotent
-/// nach).
+/// fort. Gibt die [`SealSummary`] zurück — oder `None`, wenn die Ablage
+/// scheiterte (dann bleibt das Journal liegen und der nächste Lauf holt sie
+/// idempotent nach).
 #[allow(clippy::too_many_arguments)]
 fn seal_epoch(
     epochs: &EpochState,
@@ -316,7 +317,7 @@ fn seal_epoch(
     store: &dyn ContextStore,
     root: &Path,
     git_dir: &Path,
-) -> Option<minds_core::ContentHash> {
+) -> Option<SealSummary> {
     let previous = epochs.last_seal(key);
 
     // Idempotenz über Läufe hinweg: Deckt der letzte Seal bereits genau diese
@@ -336,7 +337,10 @@ fn seal_epoch(
                     _ => false,
                 };
                 if prev.root == result.root && same_outcome {
-                    return Some(prev_id.clone());
+                    // Signatur-Anwesenheit frisch nachsehen, nicht raten: Der
+                    // wiederverwendete Seal kann inzwischen signiert sein.
+                    let signed = store.seal_signature(prev_id).ok().flatten().is_some();
+                    return Some(SealSummary::new(prev_id.clone(), prev, signed));
                 }
             }
         }
@@ -385,7 +389,7 @@ fn seal_epoch(
     // Best-effort-Signatur (ADR-0011, Entscheidung 5): nur mit konfiguriertem
     // Schlüssel, nie ein Grund zum Abbruch — ein unsignierter Seal bleibt
     // hash-valide, `minds sign --seal` rüstet nach.
-    sign_seal_best_effort(store, &seal_id, &text, root, git_dir);
+    let signed = sign_seal_best_effort(store, &seal_id, &text, root, git_dir);
     // Epochen-Zustand best-effort: Fehlt er künftig, ist die Kette offen —
     // sichtbar und ehrlich, kein Grund, den Checkpoint zu kippen.
     if let Err(err) = epochs.record(key, &seal_id) {
@@ -395,24 +399,81 @@ fn seal_epoch(
             &format!("epoch state not advanced: {err}"),
         );
     }
-    Some(seal_id)
+    Some(SealSummary::new(seal_id, seal, signed))
+}
+
+/// Druckt die „SESSION SEALED"-Zusammenfassung eines frisch (oder idempotent
+/// wieder-)versiegelten Bereichs.
+///
+/// Nur für Menschen: Der post-commit-Hook leitet stdout nach `/dev/null`,
+/// sichtbar ist der Block allein beim manuellen `minds checkpoint`. Jede
+/// ✓-Zeile ist eine **Tatsache über das Schreiben**, nie ein Prüf-Ergebnis —
+/// „recorded", nicht „valid": Verifikation ist `minds verify`s Satz, nicht
+/// unserer (ADR-0011, „Heuristik bleibt Heuristik" gilt auch für Zusagen).
+fn print_session_sealed(sealed: &SealSummary) {
+    let seal = &sealed.seal;
+    println!("  SESSION SEALED");
+    println!("    Seal       {}", sealed.seal_id);
+    println!("    Root       {}", seal.root);
+    println!(
+        "    Events     {} event(s) · seq {}–{}",
+        seal.events, seal.first_seq, seal.last_seq
+    );
+    // Zweite Schicht neben der Parse-Härtung (wie in verify): Auf dem
+    // Wiederverwendungs-Pfad stammt der Scope aus dem Repo.
+    println!("    Scope      {}", crate::text::sanitize(&seal.scope));
+    println!(
+        "    Signature  {}",
+        if sealed.signed {
+            "signed (validity is checked by `minds verify`)"
+        } else {
+            "unsigned — `minds sign --seal` adds it"
+        }
+    );
+    if seal.gaps == 0 && seal.pre_chain == 0 {
+        println!("    ✓ no gaps in the observed range");
+    } else {
+        if seal.gaps > 0 {
+            println!("    ⚠ {} gap(s) in the observed range", seal.gaps);
+        }
+        if seal.pre_chain > 0 {
+            println!(
+                "    ⚠ {} event(s) captured before the evidence chain (unbound)",
+                seal.pre_chain
+            );
+        }
+    }
+    match &seal.previous {
+        Some(prev) => println!("    ✓ chained to the previous epoch ({prev})"),
+        None => println!("    ✓ first epoch of this session (chain start)"),
+    }
+    match &seal.outcome {
+        SealOutcome::Stored { .. } => {
+            println!("    ✓ seal recorded — check it with `minds verify <session-id>`");
+        }
+        SealOutcome::Rejected => {
+            println!("    ✓ block seal recorded — the payload was rejected, the range is attested");
+        }
+    }
 }
 
 /// Signiert einen frisch abgelegten Seal, wenn ein Schlüssel konfiguriert
 /// ist. Best-effort: Jeder Fehlschlag ist eine Log-Zeile, nie ein Abbruch —
 /// der Seal bleibt hash-valide, die Signatur ist die Urheber-Bindung obendrauf.
+/// Gibt zurück, ob am Ende eine Signatur **liegt** (Anwesenheit, keine
+/// Prüfung) — die Summary spricht sie sonst falsch aus.
 fn sign_seal_best_effort(
     store: &dyn ContextStore,
     seal_id: &minds_core::ContentHash,
     text: &str,
     root: &Path,
     git_dir: &Path,
-) {
+) -> bool {
     let Some(key) = crate::sign_cmd::configured_key(root) else {
-        return;
+        return false;
     };
     if !minds_attest::ssh_keygen_available() {
-        return;
+        return false;
     }
     let outcome = minds_attest::ssh_sign(text, Path::new(&key))
         .map_err(|err| err.to_string())
@@ -421,12 +482,16 @@ fn sign_seal_best_effort(
                 .put_seal_signature(seal_id, &sig)
                 .map_err(|err| err.to_string())
         });
-    if let Err(err) = outcome {
-        hooklog::report_at(
-            git_dir,
-            Source::Checkpoint,
-            &format!("seal {seal_id} not signed: {err}"),
-        );
+    match outcome {
+        Ok(()) => true,
+        Err(err) => {
+            hooklog::report_at(
+                git_dir,
+                Source::Checkpoint,
+                &format!("seal {seal_id} not signed: {err}"),
+            );
+            false
+        }
     }
 }
 

@@ -2853,6 +2853,66 @@ fn sealed_repo() -> Option<(tempfile::TempDir, String)> {
     Some((repo, id))
 }
 
+/// EV: Der manuelle Checkpoint quittiert mit der „SESSION SEALED"-
+/// Zusammenfassung — Identität, Root, Bereich, Grenze, Signatur-Anwesenheit
+/// und die Tatsachen-Zeilen. Der Hook-Pfad wirft stdout weg; dieser Block ist
+/// die Quittung für Menschen, und er behauptet nie mehr als das Schreiben
+/// („recorded", nie „valid" — Verifikation bleibt `minds verify`s Satz).
+#[test]
+fn a_manual_checkpoint_prints_the_session_sealed_summary() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    // Ein Commit VOR enable: Der Trailer-Amend braucht einen HEAD, und ohne
+    // installierte Hooks löst dieser Commit noch keinen Checkpoint aus.
+    std::fs::write(dir.join("init.txt"), "x\n").unwrap();
+    git(dir, &["add", "init.txt"]);
+    git(dir, &["commit", "-qm", "init"]);
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"seal block""#,
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+
+    let out = minds(dir, &["checkpoint"], None);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let text = stdout(&out);
+    assert!(text.contains("SESSION SEALED"), "{text}");
+    assert!(text.contains("Seal       b3-"), "{text}");
+    assert!(text.contains("Root       b3-"), "{text}");
+    assert!(text.contains("2 event(s) · seq 0–1"), "{text}");
+    assert!(text.contains("Scope      agent-hooks/v1"), "{text}");
+    assert!(
+        text.contains("Signature  unsigned — `minds sign --seal` adds it"),
+        "{text}"
+    );
+    assert!(text.contains("✓ no gaps in the observed range"), "{text}");
+    assert!(
+        text.contains("✓ first epoch of this session (chain start)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("✓ seal recorded — check it with `minds verify <session-id>`"),
+        "{text}"
+    );
+    // Ehrlichkeits-Grenze: Der Block spricht nie ein Prüf-Urteil aus.
+    assert!(!text.contains("seal valid"), "{text}");
+    assert!(!text.contains("VERIFIED"), "{text}");
+
+    // Zweiter Lauf ohne neue Events: Das Journal ist verworfen, nichts zu
+    // versiegeln — und damit auch kein zweiter Block.
+    let again = minds(dir, &["checkpoint"], None);
+    assert!(again.status.success(), "{}", stdout(&again));
+    assert!(
+        !stdout(&again).contains("SESSION SEALED"),
+        "{}",
+        stdout(&again)
+    );
+}
+
 #[test]
 fn verify_says_verified_for_a_clean_sealed_session() {
     let Some((repo, id)) = sealed_repo() else {

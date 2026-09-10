@@ -537,6 +537,35 @@ impl Seal {
     }
 }
 
+/// Ein Seal samt Identität und Signatur-Anwesenheit — die kleinste Einheit,
+/// aus der eine Oberfläche ihre „SESSION SEALED"-Zusammenfassung rendert.
+///
+/// Bewusst **ohne** Verdikt: Ein Verdikt braucht alle Epochen einer Session
+/// und lebt im Read-Model (`minds-reader`). Hier steht nur, was der
+/// Checkpoint über den gerade geschriebenen Seal selbst weiß — billig genug
+/// für den Hook-Pfad, ehrlich genug für die Anzeige.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SealSummary {
+    /// `seal_id = derive_key(CTX_SEAL, text)` — die Identität.
+    pub seal_id: ContentHash,
+    /// Der Seal selbst, mit allen Feldern.
+    pub seal: Seal,
+    /// Ob eine Signatur **vorliegt** (Anwesenheit, keine Prüfung —
+    /// Gültigkeit prüft `minds verify`).
+    pub signed: bool,
+}
+
+impl SealSummary {
+    /// Bündelt Identität, Seal und Signatur-Anwesenheit.
+    pub fn new(seal_id: ContentHash, seal: Seal, signed: bool) -> Self {
+        Self {
+            seal_id,
+            seal,
+            signed,
+        }
+    }
+}
+
 /// Warum ein Text kein Seal ist. Nennt Zeile bzw. Feld, zitiert nie den Wert.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SealParseError {
