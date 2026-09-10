@@ -197,7 +197,7 @@ fn a_signed_verdict_verifies_and_tampering_breaks_it() {
         ],
     );
     assert!(out.status.success(), "{}", text(&out));
-    assert!(text(&out).contains("signiert"), "{}", text(&out));
+    assert!(text(&out).contains("signed with"), "{}", text(&out));
 
     // Ohne --signers wird nicht geprüft, sondern nur gemeldet — die beiden
     // dürfen nicht gleich aussehen.
