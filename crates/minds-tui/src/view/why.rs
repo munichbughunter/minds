@@ -84,11 +84,16 @@ pub fn draw(
                 let (glyph, word, link_style) = theme::evidence(Some(link.evidence));
                 let short: String = link.commit.to_string().chars().take(10).collect();
                 let focused = selected && j == edge;
-                let row_style = if focused {
+                let mut row_style = if focused {
                     link_style.patch(theme::cursor())
                 } else {
                     link_style
                 };
+                // Beobachtete Kanten heben sich vom CLAIM-Block darüber ab —
+                // fett zusätzlich zu Glyph und Wort, Farbe trägt nie allein.
+                if link.evidence.source == minds_core::EvidenceSource::Observed {
+                    row_style = row_style.add_modifier(ratatui::style::Modifier::BOLD);
+                }
                 let mut spans = vec![
                     Span::raw("     "),
                     Span::styled(format!("{glyph} {word}  {short}"), row_style),
@@ -99,6 +104,21 @@ pub fn draw(
                 lines.push(Line::from(spans));
             }
         } else {
+            // Die Trennung, um die es geht (ADR-0011): Der Intent-Text ist
+            // eine AUSSAGE aus dem Record — aufgezeichnet, nicht beobachtet.
+            // Das Label steht GESTYLT vor dem Text (Stil aus `theme::claim`,
+            // nie Default), damit niemand die Zeilen darunter als
+            // Beweismittel liest; die ●-observed-Kanten stehen daneben.
+            if matches!(step, WhyStep::Intent { .. }) {
+                let (glyph, word, claim_style) = theme::claim();
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(
+                        format!("{glyph} {word} — as recorded, not verified evidence"),
+                        claim_style,
+                    ),
+                ]));
+            }
             for t in text {
                 lines.push(Line::from(vec![Span::raw("     "), Span::raw(t)]));
             }
@@ -294,6 +314,8 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             constraints,
             discarded,
         } => {
+            // Das CLAIM-Label rendert `draw` gestylt VOR diesen Zeilen —
+            // hier steht nur der Record-Text selbst.
             let mut text: Vec<String> = request.lines().take(4).map(|l| clip(l, width)).collect();
             if !constraints.is_empty() {
                 text.push(format!("Constraints: {}", constraints.len()));

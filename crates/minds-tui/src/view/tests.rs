@@ -183,6 +183,12 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     let mut app = App::new(filled(), &repo, None);
     let out = render(&mut app);
     assert!(out.contains("MINDS payment-service"), "{out}");
+    // Die Tabelle traegt Spaltenkoepfe und Rahmen-Titel (Demo-Politur):
+    // die Beweisspalten sind ohne Legende lesbar.
+    assert!(out.contains(" SESSIONS "), "{out}");
+    for header in ["TIME", "AGENT", "SIZE", "SEAL", "VERDICT"] {
+        assert!(out.contains(header), "{header} fehlt: {out}");
+    }
     assert!(out.contains("2 Sessions · 1 Changes"), "{out}");
     assert!(out.contains("1 degraded"), "{out}");
     let fix = out.find("Fix retry handling").unwrap();
@@ -296,6 +302,12 @@ fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
     assert!(out.contains("⚠ SESSION"), "{out}");
     assert!(out.contains("✓ AGENT"), "{out}");
     assert!(out.contains("✓ INTENT"), "{out}");
+    // Aussage != Beweis (ADR-0011): der Intent-Text traegt das CLAIM-Label,
+    // die observed-Kanten daneben bleiben das einzige Beweismittel.
+    assert!(
+        out.contains("◌ CLAIM — as recorded, not verified evidence"),
+        "{out}"
+    );
     assert!(out.contains("Add exponential backoff"), "{out}");
     assert!(out.contains("✓ EVIDENCE"), "{out}");
     assert!(out.contains("no edge"), "{out}");
@@ -511,6 +523,13 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
     let out = render(&mut app);
     // Ebene 1: das Verdikt — und der Leitsatz, der die Grenze mitspricht.
     assert!(out.contains("EVIDENCE b3-aaaaaaaa…"), "{out}");
+    // Die Seal-Karte: derselbe Wort-Stamm wie der CLI-Block aus
+    // `minds checkpoint` — SESSION SEALED.
+    assert!(out.contains(" SESSION SEALED "), "{out}");
+    assert!(
+        out.contains("4 event(s) · 0 gap(s) · 1 epoch(s) · 0/1 signed"),
+        "{out}"
+    );
     assert!(out.contains("◈ sealed"), "{out}");
     assert!(
         out.contains("Cryptographically verified within the recorded"),
@@ -577,6 +596,7 @@ fn evidence_mode_is_honest_about_a_legacy_session() {
     app.reduce(Action::Evidence);
     let out = render(&mut app);
     assert!(out.contains("· legacy"), "{out}");
+    assert!(out.contains(" SESSION · LEGACY "), "{out}");
     assert!(
         out.contains("cryptographic verification is not available"),
         "{out}"
@@ -752,4 +772,114 @@ fn an_uninterpreted_tool_call_shows_as_half_seen_not_as_a_plain_tool() {
     let out = render(&mut app);
     assert!(out.contains("◐"), "{out}");
     assert!(out.contains("OBSERVED"), "{out}");
+}
+
+/// Die Fußzeile isoliert — Badge-Assertions dürfen nicht versehentlich die
+/// SEAL-Spalte der Tabelle matchen.
+fn footer_of(out: &str) -> String {
+    out.lines().rev().take(2).collect::<Vec<_>>().join("\n")
+}
+
+#[test]
+fn the_footer_badge_tracks_the_focused_session_and_view() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    // Liste: Karte a (versiegelt) fokussiert.
+    let out = render(&mut app);
+    assert!(footer_of(&out).contains("◈ sealed"), "{out}");
+    // Naechste Karte: legacy — der Badge folgt dem Fokus.
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(footer_of(&out).contains("· legacy"), "{out}");
+    assert!(!footer_of(&out).contains("◈ sealed"), "{out}");
+    // Why: bewusst kein Badge (die Kette traegt mehrere Sessions).
+    app.reduce(Action::Why);
+    let out = render(&mut app);
+    assert!(!footer_of(&out).contains("· legacy"), "{out}");
+    assert!(!footer_of(&out).contains("◈ sealed"), "{out}");
+    app.reduce(Action::Back);
+    // Evidence: der Badge gehoert zur Karte hinter `id`, nicht zum Cursor.
+    app.reduce(Action::Up);
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(footer_of(&out).contains("◈ sealed"), "{out}");
+}
+
+/// Der Demo-Moment, testfixiert: Eine manipulierte Session traegt den roten
+/// Badge und die TAMPERED-Karte.
+#[test]
+fn a_tampered_session_shows_the_red_badge_and_card() {
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    let seal = minds_core::evidence::Seal {
+        root: minds_core::ContentHash::from_bytes([9u8; 32]),
+        agent: "claude-code".into(),
+        scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 4,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: minds_core::evidence::SealOutcome::Stored {
+            session: sid('a').to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-07-25T14:10:00Z".into(),
+    };
+    let seal_id = minds_core::evidence::Seal::id_of_text(&seal.to_text().unwrap());
+    let index = Index::from_parts(sessions, BTreeMap::new())
+        .with_seals(sid('a'), vec![(seal_id, seal, false)])
+        .with_tampered_seal(sid('a'));
+    let inspection = Inspection::from_index(index, vec![], "repo");
+
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    let out = render(&mut app);
+    assert!(out.contains("✗ TAMPERED"), "{out}");
+    assert!(footer_of(&out).contains("✗ TAMPERED"), "{out}");
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(out.contains(" SESSION TAMPERED "), "{out}");
+    assert!(footer_of(&out).contains("✗ TAMPERED"), "{out}");
+}
+
+/// Das CLAIM-Label ist GESTYLT (theme::claim: HUMAN + DIM) — nie Default:
+/// Eine Aussage, die aussieht wie der Text daneben, waere kein Label.
+#[test]
+fn the_claim_label_carries_its_theme_style() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Why);
+    let mut terminal = Terminal::new(TestBackend::new(124, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let cell = buffer
+        .content()
+        .iter()
+        .find(|cell| cell.symbol() == "◌")
+        .expect("CLAIM-Label sichtbar");
+    let style = cell.style();
+    assert_eq!(style.fg, Some(ratatui::style::Color::Cyan), "{style:?}");
+    assert!(
+        style.add_modifier.contains(ratatui::style::Modifier::DIM),
+        "{style:?}"
+    );
+}
+
+/// Unter 120 Spalten faellt die SIZE-Spalte weg — die Beweisspalten bleiben.
+#[test]
+fn a_narrow_terminal_drops_the_size_column_but_keeps_the_evidence() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+    let out = terminal.backend().to_string();
+    assert!(!out.contains("SIZE"), "{out}");
+    for header in ["TIME", "AGENT", "SEAL", "VERDICT"] {
+        assert!(out.contains(header), "{header} fehlt: {out}");
+    }
+    assert!(out.contains("◈ sealed"), "{out}");
 }

@@ -244,6 +244,15 @@ impl EvidenceState {
             self.seals, self.events, self.gaps
         )
     }
+
+    /// Die Kennzahlen-Zeile der Seal-Karte — **eine** Quelle, damit CLI und
+    /// TUI dieselbe Verdichtung tragen, statt je ein eigenes Vokabular.
+    pub fn metrics_line(&self) -> String {
+        format!(
+            "{} event(s) · {} gap(s) · {} epoch(s) · {}/{} signed",
+            self.events, self.gaps, self.seals, self.signed, self.seals
+        )
+    }
 }
 
 /// Die Herkunftslage einer Session — ein expliziter Zustand, kein `None`.

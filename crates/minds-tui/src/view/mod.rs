@@ -31,7 +31,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     header(frame, app, head);
-    app.page = (body.height as usize).saturating_sub(2).max(1);
+    // Eine Seite = sichtbare Zeilen: Die Liste verliert an Rahmen und
+    // Kopfzeile drei Zeilen, die übrigen Ebenen zwei.
+    app.page = (body.height as usize)
+        .saturating_sub(if app.top().is_none() { 3 } else { 2 })
+        .max(1);
     match app.top() {
         None => activity::draw(frame, app, body),
         Some(View::Graph {
@@ -158,6 +162,25 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         ])
     } else {
         let mut spans = Vec::new();
+        // Der Verdikt-Badge: der Beweiszustand der fokussierten Session als
+        // invertierter Block, immer an derselben Stelle unten links — auf
+        // einer manipulierten Session springt er sichtbar auf ✗ TAMPERED.
+        // Glyph UND Wort, nie nur Farbe (Farbschwäche-Regel aus `theme`).
+        let focused = match app.top() {
+            None => app.selected().map(|card| card.provenance),
+            Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => {
+                app.inspection.card(*id).map(|card| card.provenance)
+            }
+            Some(View::Why { .. }) => None,
+        };
+        if let Some(provenance) = focused {
+            let (glyph, word, style) = theme::provenance(&provenance);
+            spans.push(Span::styled(
+                format!(" {glyph} {word} "),
+                style.add_modifier(ratatui::style::Modifier::REVERSED),
+            ));
+            spans.push(Span::raw("  "));
+        }
         if !app.query.is_empty() {
             spans.push(Span::styled(
                 format!("[{}] ", app.query),

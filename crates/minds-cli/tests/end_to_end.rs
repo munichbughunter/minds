@@ -3131,6 +3131,104 @@ fn verify_and_the_read_model_speak_the_same_verdict_word() {
     assert_eq!(read_model_verdict(dir, &id), Some("TAMPERED"));
 }
 
+/// EV.12-Härtung (Security-Review-Befund): Fehlt der Rückverweis
+/// (evidence.json) UND ist der Seal manipuliert, muss der Namensraum-
+/// Fallback ihn trotzdem in die Prüfmenge nehmen — sonst schwächte
+/// ausgerechnet die Manipulation das Verdikt auf NOT VERIFIABLE ab, und der
+/// Angreifer bekäme das mildere Wort geschenkt.
+#[test]
+fn a_forged_seal_without_a_back_reference_still_reads_tampered() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    // 1. Den Seal fälschen — wie in den EV.12-Nachbarn.
+    let seals = seal_refs(dir);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
+    let tmp = dir.join("forged");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    // 2. Den Rückverweis tilgen: evidence.json aus jedem Store-Ref entfernen
+    //    (Wurzelbaum ohne den Eintrag neu schreiben — Subtrees bleiben).
+    let store_refs = stdout(&git(
+        dir,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/store/"],
+    ));
+    let mut removed = 0;
+    for reference in store_refs.lines() {
+        let listing = stdout(&git(dir, &["ls-tree", reference]));
+        if !listing.contains("evidence.json") {
+            continue;
+        }
+        let kept: String = listing
+            .lines()
+            .filter(|l| !l.ends_with("evidence.json"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let tree = stdout(&git_stdin(dir, &["mktree"], &kept));
+        let commit = stdout(&git(
+            dir,
+            &["commit-tree", tree.trim(), "-m", "no back-reference"],
+        ));
+        git(dir, &["update-ref", reference, commit.trim()]);
+        removed += 1;
+    }
+    assert!(removed >= 1, "kein evidence.json gefunden:\n{store_refs}");
+
+    // 3. Das Verdikt bleibt TAMPERED — nicht NOT VERIFIABLE.
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    assert!(!text.contains("NOT VERIFIABLE"), "{text}");
+    // Und der Report benennt die Manipulation wie auf dem Rückverweis-Pfad.
+    assert!(text.contains("claimed      (UNVERIFIED"), "{text}");
+}
+
+/// EV.12-Härtung: hash-invalide Bytes, die ein wohlgeformter Seal MIT
+/// ANSI-Sequenz im scope wären. `Seal::parse` lehnt das Feld ab
+/// (check_single_line), der Report sagt „unreadable" — und kein ESC-Byte
+/// erreicht Terminal oder CI-Log.
+#[test]
+fn a_tampered_seal_with_a_hostile_scope_never_reaches_the_terminal() {
+    let Some((repo, id)) = sealed_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+
+    let seals = seal_refs(dir);
+    let forged =
+        seal_text(dir, &seals[0]).replacen("scope=agent-hooks/v1", "scope=agent-\x1b[2Jhooks", 1);
+    let tmp = dir.join("hostile");
+    std::fs::write(&tmp, &forged).unwrap();
+    let blob = stdout(&git(dir, &["hash-object", "-w", tmp.to_str().unwrap()]));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "hostile"]));
+    git(dir, &["update-ref", &seals[0], commit.trim()]);
+
+    let out = minds(dir, &["verify", &id], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("TAMPERED"), "{text}");
+    assert!(text.contains("claimed      unreadable"), "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+}
+
 /// EV.12-Nachbar: Sind die abgelegten Bytes nicht einmal ein wohlgeformter
 /// Seal, sagt der Report genau das — und behauptet keinen Claim.
 #[test]

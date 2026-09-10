@@ -338,6 +338,14 @@ impl Index {
         self
     }
 
+    /// Markiert eine Session als seal-manipuliert — für Tests, die das
+    /// TAMPERED-Verdikt ohne Store prüfen (im Betrieb setzt das
+    /// ausschließlich `load_seals`, wenn der Store-Read scheitert).
+    pub fn with_tampered_seal(mut self, id: SessionId) -> Self {
+        self.seal_tampered.insert(id);
+        self
+    }
+
     /// Trägt eine Kante ein; ein besserer Beleg ersetzt einen schwächeren,
     /// ein schwächerer ändert nichts ([`EvidenceMark::merge`]).
     fn link(&mut self, commit: CommitId, id: SessionId, evidence: EvidenceMark) {

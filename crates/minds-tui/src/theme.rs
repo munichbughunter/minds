@@ -82,6 +82,18 @@ pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style
     }
 }
 
+/// Glyph, Wort und Stil einer **Aussage** aus dem Session-Record (Intent,
+/// Begründung): aufgezeichnet, nie beobachtet, nie geprüft. Ein eigenes Wort
+/// neben [`evidence`], damit eine Aussage nie wie ein Beleg liest — die
+/// Trennung, an der Evidence-Systeme sonst leise scheitern.
+pub fn claim() -> (&'static str, &'static str, Style) {
+    (
+        "◌",
+        "CLAIM",
+        Style::default().fg(HUMAN).add_modifier(Modifier::DIM),
+    )
+}
+
 /// Glyph, Wort und Stil eines Verdicts.
 pub fn verdict(verdict: Verdict) -> (&'static str, &'static str, Style) {
     match verdict {

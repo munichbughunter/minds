@@ -50,16 +50,19 @@ pub fn draw(
 
     let verdict_h = 2 + SECTIONS.len() as u16;
     let [head, verdict_area, detail_area] = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(5),
         Constraint::Length(verdict_h),
         Constraint::Min(1),
     ])
     .areas(area);
 
-    // Kopf: Session, Verdikt-Wort — und der Leitsatz, der nie mehr
-    // behauptet, als das Verdikt trägt.
+    // Kopf: die Seal-Karte — Titel trägt den Zustand als EIN Wort
+    // (SEALED/INCOMPLETE/TAMPERED, dieselbe Familie wie der CLI-Block aus
+    // `minds checkpoint`), darin Session, Verdikt-Wort, Leitsatz und die
+    // Kennzahlen. Der Leitsatz behauptet nie mehr, als das Verdikt trägt.
     let (v_glyph, v_word, v_style) =
         theme::provenance(&minds_reader::model::Provenance::Chained(report.state));
+    let state = &report.state;
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
@@ -70,7 +73,14 @@ pub fn draw(
                 Span::styled(format!("{v_glyph} {v_word}"), v_style.patch(theme::title())),
             ]),
             Line::from(Span::styled(report.sentence(), theme::dim())),
-        ]),
+            Line::from(Span::raw(state.metrics_line())),
+        ])
+        .block(
+            Block::bordered()
+                .title(format!(" SESSION {} ", v_word.to_uppercase()))
+                .title_style(v_style.patch(theme::title()))
+                .border_style(v_style),
+        ),
         head,
     );
 
@@ -131,7 +141,15 @@ fn legacy(frame: &mut Frame, area: Rect, short: &str) {
             theme::dim(),
         )),
     ];
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+            Block::bordered()
+                .title(" SESSION · LEGACY ")
+                .title_style(theme::dim().patch(theme::title()))
+                .border_style(theme::dim()),
+        ),
+        area,
+    );
 }
 
 /// Glyph, Statustext und Stil je Sektion — die Verdikt-Zeilen.

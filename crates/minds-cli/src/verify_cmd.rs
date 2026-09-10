@@ -400,13 +400,25 @@ fn report_tampered_seal(
 ) {
     println!("Seal           {requested}: TAMPERED — the stored text does not hash to this id");
     println!("  expected     {requested}");
-    println!("  found        {actual}");
-    let claimed = store
+    // „found" und Claim aus DERSELBEN Lesung: Der Mismatch-Fehler stammt aus
+    // einer früheren; bewegt sich der Ref dazwischen, beschrieben Hash und
+    // Claim sonst verschiedene Bytes (TOCTOU der Diagnose — das Verdikt
+    // selbst trägt weiterhin der Fehler, nicht diese Zweitlesung).
+    let text = store
         .seal_bytes(requested)
         .ok()
         .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| Seal::parse(&text).ok());
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+    let found = text.as_deref().map(Seal::id_of_text);
+    println!("  found        {}", found.as_ref().unwrap_or(actual));
+    if let Some(found) = &found
+        && found != actual
+    {
+        println!(
+            "  note         the ref moved during verification — hash and claim describe the current bytes"
+        );
+    }
+    let claimed = text.as_deref().and_then(|text| Seal::parse(text).ok());
     let Some(claimed) = claimed else {
         println!("  claimed      unreadable — the stored bytes are not even a well-formed seal");
         return;
@@ -430,7 +442,10 @@ fn report_tampered_seal(
         claimed.outcome.human_word()
     );
     if let Some(target) = target {
-        let word = if session == target.to_string() {
+        // Geparste Ids vergleichen, nicht Strings: `SessionId::from_str`
+        // normalisiert (Groß-Hex) — ein String-Vergleich meldete sonst
+        // „does NOT match" für die semantisch identische Session.
+        let word = if session.parse::<SessionId>().ok() == Some(target) {
             "matches"
         } else {
             "does NOT match"
@@ -641,11 +656,39 @@ fn coverage_complete(
 
 /// Fallback, wenn der Rückverweis fehlt: alle Seals des Namensraums lesen und
 /// die behalten, deren `session=`-Zeile diese Session nennt.
+///
+/// Auch ein **manipulierter** Seal zählt hier, wenn sein (unverifizierter)
+/// Text diese Session behauptet: Er wandert in die Prüfmenge, wo
+/// `check_seals` ihn als TAMPERED meldet. Ihn still zu überspringen hieße,
+/// dass ausgerechnet die Manipulation das Verdikt auf „NOT VERIFIABLE"
+/// abschwächte — der Angreifer bekäme das mildere Wort geschenkt.
 fn seals_naming(store: &dyn ContextStore, id: SessionId) -> Fallible<Vec<ContentHash>> {
     let mut found = Vec::new();
     for seal_id in store.list_seals()? {
-        let Ok(Some(text)) = store.seal_text(&seal_id) else {
-            continue;
+        let text = match store.seal_text(&seal_id) {
+            Ok(Some(text)) => text,
+            Err(StoreError::SealMismatch { .. }) => {
+                // Die behauptete Zuordnung aus den Roh-Bytes lesen — nur zur
+                // AUFNAHME in die Prüfmenge, nie als Beleg (das Verdikt
+                // spricht check_seals).
+                let claims_this = store
+                    .seal_bytes(&seal_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .and_then(|text| Seal::parse(&text).ok())
+                    .is_some_and(|claimed| match &claimed.outcome {
+                        SealOutcome::Stored { session } => {
+                            session.parse::<SessionId>().ok() == Some(id)
+                        }
+                        SealOutcome::Rejected => false,
+                    });
+                if claims_this {
+                    found.push(seal_id);
+                }
+                continue;
+            }
+            Ok(None) | Err(_) => continue,
         };
         let Ok(seal) = Seal::parse(&text) else {
             continue;
