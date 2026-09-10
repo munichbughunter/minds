@@ -83,8 +83,8 @@ pub fn note_body(hash: &ContentHash, review: &Review) -> String {
         "{}\n\n\
          {symbol} **{}** — {}\n\n\
          {subject}{summary}\n\n\
-         <sub>Gespiegelt aus `refs/minds/reviews` · `{hash}` · \
-         Quelle ist das Repository, nicht diese Note.</sub>",
+         <sub>Mirrored from `refs/minds/reviews` · `{hash}` · \
+         The repository is the source of truth, not this note.</sub>",
         marker(hash),
         review.decision.as_str(),
         review.reviewer,
@@ -114,7 +114,7 @@ impl Project {
         let token = std::env::var(token_env)
             .ok()
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("Umgebungsvariable {token_env} ist nicht gesetzt"))?;
+            .ok_or_else(|| format!("environment variable {token_env} is not set"))?;
         Ok(Self::with_token(base_url, project, token))
     }
 
@@ -211,9 +211,9 @@ impl Project {
                 // `NamedTempFile` legt unter Unix mit 0600 an; niemand außer
                 // dem Besitzer liest mit, solange die Datei lebt.
                 let mut file = tempfile::NamedTempFile::new()
-                    .map_err(|err| format!("curl: Body-Datei nicht anlegbar: {err}"))?;
+                    .map_err(|err| format!("curl: cannot create body file: {err}"))?;
                 file.write_all(body.as_bytes())
-                    .map_err(|err| format!("curl: Body nicht schreibbar: {err}"))?;
+                    .map_err(|err| format!("curl: cannot write body: {err}"))?;
                 // Als `OsString`, nicht über `format!`: Ein Nicht-UTF-8-TMPDIR
                 // würde lossy konvertiert auf eine Datei zeigen, die es nicht
                 // gibt — und der Body käme wieder leer an.
@@ -233,15 +233,15 @@ impl Project {
 
         let mut child = command
             .spawn()
-            .map_err(|err| format!("curl lässt sich nicht starten: {err}"))?;
+            .map_err(|err| format!("curl cannot be started: {err}"))?;
         {
-            let mut stdin = child.stdin.take().ok_or("curl: kein stdin")?;
+            let mut stdin = child.stdin.take().ok_or("curl: no stdin")?;
             writeln!(stdin, "PRIVATE-TOKEN: {}", self.token)
-                .map_err(|err| format!("curl: Header nicht schreibbar: {err}"))?;
+                .map_err(|err| format!("curl: cannot write header: {err}"))?;
         }
         let output = child
             .wait_with_output()
-            .map_err(|err| format!("curl endet nicht: {err}"))?;
+            .map_err(|err| format!("curl did not finish: {err}"))?;
         // Erst wenn curl fertig ist, darf die Body-Datei verschwinden.
         drop(body_file);
 
@@ -251,14 +251,14 @@ impl Project {
             // GitLabs `{"message": …}`. Der Token kann in beidem nicht stehen,
             // er ging über stdin.
             let mut message = format!(
-                "GitLab-Aufruf fehlgeschlagen ({}): {}",
+                "GitLab call failed ({}): {}",
                 path,
                 String::from_utf8_lossy(&output.stderr).trim()
             );
             let response = String::from_utf8_lossy(&output.stdout);
             let response = response.trim();
             if !response.is_empty() {
-                message.push_str(" — Antwort: ");
+                message.push_str(" — response: ");
                 let mut chars = response.chars();
                 message.extend(chars.by_ref().take(500));
                 if chars.next().is_some() {
@@ -297,7 +297,7 @@ mod tests {
         assert!(body.contains("anna@example.org"));
         assert!(body.contains("Backoff ist jetzt korrekt"));
         // Die Note sagt selbst, dass sie nicht die Quelle ist.
-        assert!(body.contains("Quelle ist das Repository"));
+        assert!(body.contains("The repository is the source of truth"));
     }
 
     #[test]

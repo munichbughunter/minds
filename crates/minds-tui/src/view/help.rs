@@ -7,23 +7,23 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use crate::theme;
 
 const TEXT: &str = "\
-j / k  ↑ / ↓      eine Zeile
-PgUp / PgDn        eine Seite
-g / G              Anfang / Ende
-Enter / l          öffnen, hinein
-Esc / h            zurück; auf der Liste: Suche löschen, dann beenden
+j / k  ↑ / ↓      one line
+PgUp / PgDn        one page
+g / G              start / end
+Enter / l          open, descend
+Esc / h            back; on the list: clear the search, then quit
 
-/                  Suche (Terme UND-verknüpft, über Prompt, Agent, Pfade, Ids)
-w                  Why — die Herkunftskette
-e                  Evidence — Verdikt, Coverage, Epochen, Signatur, Grenzen
-t                  Graph ↔ Zeitleiste
-1 / 2 / 3          Zoom: Übersicht / normal / ausführlich
-?                  diese Hilfe
-q / Ctrl-C         beenden
+/                  search (terms AND-combined, over prompt, agent, paths, ids)
+w                  why — the provenance chain
+e                  evidence — verdict, coverage, epochs, signature, limits
+t                  graph ↔ timeline
+1 / 2 / 3          zoom: summary / normal / verbose
+?                  this help
+q / Ctrl-C         quit
 
-Belege:  ● observed   ◆ content   ◇ declared   ○ inferred [vermutet]   · unverknüpft
-Review:  ⚠ offen   ✓ approved   ↻ needs work   ✕ rejected
-Effekte: ◇ READ   ✎ EDIT   ▶ EXEC   ✕ DELETE";
+Evidence: ● observed   ◆ content   ◇ declared   ○ inferred   · unlinked
+Review:   ⚠ open   ✓ approved   ↻ needs work   ✕ rejected
+Effects:  ◇ READ   ✎ EDIT   ▶ EXEC   ✕ DELETE";
 
 /// Zeichnet die Hilfe mittig.
 pub fn draw(frame: &mut Frame, area: Rect) {
@@ -39,7 +39,7 @@ pub fn draw(frame: &mut Frame, area: Rect) {
     frame.render_widget(
         Paragraph::new(TEXT).block(
             Block::bordered()
-                .title(" Hilfe ")
+                .title(" Help ")
                 .title_style(theme::title()),
         ),
         rect,

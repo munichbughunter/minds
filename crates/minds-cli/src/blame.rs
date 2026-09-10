@@ -23,7 +23,7 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Führt `minds blame` aus. `target` ist ein repo-relativer Dateipfad.
 pub fn run(target: Option<&str>) -> ExitCode {
     let Some(path) = target else {
-        eprintln!("minds blame: erwartet <datei>");
+        eprintln!("minds blame: expected <file>");
         return ExitCode::FAILURE;
     };
     match blame(path) {
@@ -38,12 +38,12 @@ pub fn run(target: Option<&str>) -> ExitCode {
 fn blame(path: &str) -> Fallible<()> {
     let ctx = Context::open()?;
     let Some(head) = ctx.repo.head()?.commit() else {
-        return Err("HEAD hat noch keinen Commit".into());
+        return Err("HEAD has no commit yet".into());
     };
 
     let lines = ctx.repo.blame().blame_file(head, path)?;
     if lines.is_empty() {
-        return Err(format!("{path} ist im Blame nicht auflösbar (nicht im Commit?)").into());
+        return Err(format!("{path} cannot be resolved in blame (not in the commit?)").into());
     }
     let total = lines.len();
 
@@ -87,7 +87,7 @@ fn blame(path: &str) -> Fallible<()> {
 
     let with_context = total as u32 - without;
     let pct = with_context as usize * 100 / total;
-    println!("{path} — {total} Zeilen, {with_context} mit erfasstem Kontext ({pct}%)\n");
+    println!("{path} — {total} lines, {with_context} with captured context ({pct}%)\n");
 
     let mut ranked: Vec<(SessionId, u32)> = lines_per_session.into_iter().collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -97,7 +97,7 @@ fn blame(path: &str) -> Fallible<()> {
         let headline = minds_reader::summary::headline(&session.intent.request, 70);
         println!("▸ {headline}");
         println!(
-            "  {count} Zeile(n) · {} · {} · {}",
+            "  {count} line(s) · {} · {} · {}",
             session.agent.name,
             session.model.id,
             short_id(*id),
@@ -105,7 +105,7 @@ fn blame(path: &str) -> Fallible<()> {
     }
 
     if without > 0 {
-        println!("\n{without} Zeile(n) ohne erfassten Kontext");
+        println!("\n{without} line(s) without captured context");
     }
     Ok(())
 }

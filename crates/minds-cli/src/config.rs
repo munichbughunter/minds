@@ -117,7 +117,7 @@ pub fn load_redaction(repo_root: &Path) -> Result<RedactionConfig, Box<dyn std::
     match std::fs::read_to_string(&path) {
         Ok(text) => Ok(serde_json::from_str(&text).map_err(|err| policy_error(&path, &err))?),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RedactionConfig::default()),
-        Err(err) => Err(format!("{}: nicht lesbar: {err}", path.display()).into()),
+        Err(err) => Err(format!("{}: cannot be read: {err}", path.display()).into()),
     }
 }
 
@@ -137,13 +137,13 @@ pub fn load_redaction(repo_root: &Path) -> Result<RedactionConfig, Box<dyn std::
 /// wo er nachsehen muss — mehr braucht er nicht, und mehr darf hier nicht stehen.
 fn policy_error(path: &Path, err: &serde_json::Error) -> String {
     format!(
-        "{}: ungültige Redaction-Policy — {} in Zeile {}, Spalte {}",
+        "{}: invalid redaction policy — {} at line {}, column {}",
         path.display(),
         match err.classify() {
-            serde_json::error::Category::Syntax => "Syntaxfehler",
-            serde_json::error::Category::Data => "unerwarteter Wert oder unbekanntes Feld",
-            serde_json::error::Category::Eof => "unerwartetes Dateiende",
-            serde_json::error::Category::Io => "Lesefehler",
+            serde_json::error::Category::Syntax => "syntax error",
+            serde_json::error::Category::Data => "unexpected value or unknown field",
+            serde_json::error::Category::Eof => "unexpected end of file",
+            serde_json::error::Category::Io => "read error",
         },
         err.line(),
         err.column()
@@ -160,7 +160,7 @@ fn set(repo_root: &Path, key: &str, value: &str) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::other(format!(
-            "`git config --local {key}` schlug fehl"
+            "`git config --local {key}` failed"
         )))
     }
 }
@@ -346,7 +346,7 @@ mod tests {
             assert!(!err.contains(secret), "Wert in der Meldung:\n{err}");
             // Brauchbar bleiben muss sie trotzdem — sonst löscht jemand die
             // Datei, statt sie zu reparieren.
-            assert!(err.contains("Zeile"), "{err}");
+            assert!(err.contains("line"), "{err}");
             assert!(err.contains(REDACT_CONFIG), "{err}");
         }
     }

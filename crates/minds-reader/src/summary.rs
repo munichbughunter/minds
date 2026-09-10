@@ -71,7 +71,7 @@ pub fn headline(request: &str, max: usize) -> String {
         .unwrap_or("");
 
     if first.is_empty() {
-        return "(kein Prompt erfasst)".to_string();
+        return "(no prompt captured)".to_string();
     }
 
     // `chars().count()` statt `len()`: gekürzt wird nach Zeichen, nicht nach
@@ -129,8 +129,8 @@ mod tests {
 
     #[test]
     fn an_empty_request_says_so_instead_of_being_blank() {
-        assert_eq!(headline("", HEADLINE_MAX), "(kein Prompt erfasst)");
-        assert_eq!(headline("   \n\t ", HEADLINE_MAX), "(kein Prompt erfasst)");
+        assert_eq!(headline("", HEADLINE_MAX), "(no prompt captured)");
+        assert_eq!(headline("   \n\t ", HEADLINE_MAX), "(no prompt captured)");
     }
 
     #[test]

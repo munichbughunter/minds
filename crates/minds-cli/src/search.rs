@@ -15,7 +15,7 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Führt `minds search` aus.
 pub fn run(query: Option<&str>) -> ExitCode {
     let Some(query) = query else {
-        eprintln!("minds search: erwartet <query>");
+        eprintln!("minds search: expected <query>");
         return ExitCode::FAILURE;
     };
     match search(query) {
@@ -41,16 +41,16 @@ fn search(query: &str) -> Fallible<()> {
         .collect();
 
     if hits.is_empty() {
-        println!("Keine Treffer für {query:?}.");
+        println!("No matches for {query:?}.");
         return Ok(());
     }
 
-    println!("{} Treffer für {query:?}:\n", hits.len());
+    println!("{} match(es) for {query:?}:\n", hits.len());
     for session in &hits {
         let headline = minds_reader::summary::headline(&session.intent.request, 90);
         println!("▸ {headline}");
         println!(
-            "  {} · {} · {} Datei(en)",
+            "  {} · {} · {} file(s)",
             session.agent.name,
             session.model.id,
             session.produced.files.len()

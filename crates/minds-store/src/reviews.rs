@@ -221,7 +221,7 @@ impl ReviewStore {
             return Ok(0);
         }
         let taken = entries.len();
-        let message = format!("minds: {taken} Eintrag/Einträge aus {other} vereinigt");
+        let message = format!("minds: {taken} entry/entries merged from {other}");
 
         let mut attempts_left = PUT_ATTEMPTS;
         loop {

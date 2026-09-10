@@ -56,17 +56,17 @@ impl Skipped {
         fn part(n: usize, adjective: &str) -> Option<String> {
             match n {
                 0 => None,
-                1 => Some(format!("1 {adjective} Session")),
-                n => Some(format!("{n} {adjective} Sessions")),
+                1 => Some(format!("1 {adjective} session")),
+                n => Some(format!("{n} {adjective} sessions")),
             }
         }
-        let forgotten = part(self.forgotten.len(), "vergessene");
-        let unreadable = part(self.unreadable.len(), "unlesbare");
+        let forgotten = part(self.forgotten.len(), "forgotten");
+        let unreadable = part(self.unreadable.len(), "unreadable");
         Some(match (forgotten, unreadable) {
             (None, None) => return None,
-            (Some(f), None) => format!("{f} übersprungen"),
-            (None, Some(u)) => format!("{u} übersprungen — siehe minds fsck"),
-            (Some(f), Some(u)) => format!("{f} und {u} übersprungen — siehe minds fsck"),
+            (Some(f), None) => format!("{f} skipped"),
+            (None, Some(u)) => format!("{u} skipped — see minds fsck"),
+            (Some(f), Some(u)) => format!("{f} and {u} skipped — see minds fsck"),
         })
     }
 }
@@ -262,7 +262,7 @@ mod tests {
     fn forgotten_sessions_are_named_without_an_fsck_hint() {
         assert_eq!(
             skipped(&['a'], &[]).note().as_deref(),
-            Some("1 vergessene Session übersprungen")
+            Some("1 forgotten session skipped")
         );
     }
 
@@ -270,7 +270,7 @@ mod tests {
     fn unreadable_sessions_point_to_fsck() {
         assert_eq!(
             skipped(&[], &['a', 'b']).note().as_deref(),
-            Some("2 unlesbare Sessions übersprungen — siehe minds fsck")
+            Some("2 unreadable sessions skipped — see minds fsck")
         );
     }
 
@@ -278,7 +278,7 @@ mod tests {
     fn both_causes_are_counted_separately() {
         assert_eq!(
             skipped(&['a', 'b'], &['c']).note().as_deref(),
-            Some("2 vergessene Sessions und 1 unlesbare Session übersprungen — siehe minds fsck")
+            Some("2 forgotten sessions and 1 unreadable session skipped — see minds fsck")
         );
     }
 

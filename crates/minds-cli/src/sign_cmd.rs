@@ -25,8 +25,8 @@ pub fn run(target: Option<&str>, key: Option<&str>, seal: Option<&str>) -> ExitC
     let result = match (seal, target) {
         (Some(seal_id), None) => sign_seal(seal_id, key),
         (None, Some(target)) => sign(target, key),
-        (Some(_), Some(_)) => Err("entweder <session-id> oder --seal, nicht beides".into()),
-        (None, None) => Err("erwartet <session-id> (b3-…) oder --seal <seal-id>".into()),
+        (Some(_), Some(_)) => Err("either <session-id> or --seal, not both".into()),
+        (None, None) => Err("expected <session-id> (b3-…) or --seal <seal-id>".into()),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -44,38 +44,38 @@ pub fn run(target: Option<&str>, key: Option<&str>, seal: Option<&str>) -> ExitC
 /// wurde. Signiert werden exakt die abgelegten Bytes.
 fn sign_seal(seal_id: &str, key: Option<&str>) -> Fallible<()> {
     if !minds_attest::ssh_keygen_available() {
-        return Err("ssh-keygen nicht gefunden — für Signaturen nötig".into());
+        return Err("ssh-keygen not found — required for signatures".into());
     }
     let id: minds_core::ContentHash = seal_id
         .parse()
-        .map_err(|err| format!("keine gültige Seal-Id {seal_id:?}: {err}"))?;
+        .map_err(|err| format!("not a valid seal id {seal_id:?}: {err}"))?;
 
     let ctx = Context::open()?;
     let text = ctx
         .store
         .seal_text(&id)?
-        .ok_or_else(|| format!("Seal {id} liegt nicht im Store"))?;
+        .ok_or_else(|| format!("seal {id} is not in the store"))?;
 
     let key = resolve_key(key, &ctx.root)?;
     let signature = minds_attest::ssh_sign(&text, Path::new(&key))?;
     ctx.store.put_seal_signature(&id, &signature)?;
-    println!("Seal {id} signiert");
+    println!("Seal {id} signed");
     Ok(())
 }
 
 fn sign(target: &str, key: Option<&str>) -> Fallible<()> {
     if !minds_attest::ssh_keygen_available() {
-        return Err("ssh-keygen nicht gefunden — für signierte Attribution nötig".into());
+        return Err("ssh-keygen not found — required for signed attribution".into());
     }
     let id: SessionId = target
         .parse()
-        .map_err(|err| format!("keine gültige Session-Id {target:?}: {err}"))?;
+        .map_err(|err| format!("not a valid session id {target:?}: {err}"))?;
 
     let ctx = Context::open()?;
     let session = ctx
         .store
         .get(id)?
-        .ok_or_else(|| format!("Session {id} liegt nicht im Store"))?;
+        .ok_or_else(|| format!("session {id} is not in the store"))?;
 
     let key = resolve_key(key, &ctx.root)?;
     let payload = minds_core::attestation_payload(id, &session)?;
@@ -102,7 +102,6 @@ fn resolve_key(key: Option<&str>, root: &Path) -> Fallible<String> {
     if let Some(key) = key {
         return Ok(key.to_string());
     }
-    configured_key(root).ok_or_else(|| {
-        "kein Schlüssel: --key <pfad> angeben oder `git config user.signingkey` setzen".into()
-    })
+    configured_key(root)
+        .ok_or_else(|| "no key: pass --key <path> or set `git config user.signingkey`".into())
 }

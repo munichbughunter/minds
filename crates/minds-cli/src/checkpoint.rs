@@ -127,7 +127,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
             git_dir,
             Source::Checkpoint,
             &format!(
-                "Journal-Verzeichnis ohne lesbare Schlüssel-Datei übersprungen: {}",
+                "journal directory without a readable key file skipped: {}",
                 dir.display()
             ),
         );
@@ -158,7 +158,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 hooklog::report_at(
                     git_dir,
                     Source::Checkpoint,
-                    &format!("{} übersprungen: {err}", key.display_redacted(&pipeline)),
+                    &format!("{} skipped: {err}", key.display_redacted(&pipeline)),
                 );
                 continue;
             }
@@ -199,7 +199,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                     hooklog::report_at(
                         git_dir,
                         Source::Checkpoint,
-                        &format!("Seal-Verweis für {id} nicht eingetragen: {err}"),
+                        &format!("seal back-reference for {id} not recorded: {err}"),
                     );
                 }
                 // Erst nach erfolgreicher Ablage UND Versiegelung verwerfen:
@@ -215,7 +215,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                 // die Redaktion, bevor es auf stderr und ins hook.log geht:
                 // Seit #35 gilt es als fremdbestimmter Wert, der auch ein
                 // Token sein kann (#95).
-                let mut note = format!("{} übersprungen: {err}", key.display_redacted(&pipeline));
+                let mut note = format!("{} skipped: {err}", key.display_redacted(&pipeline));
 
                 // Nur der Policy-Fall bekommt einen Block-Seal: Eine
                 // zurückgewiesene Nutzlast ist eine Aussage über die Session;
@@ -232,7 +232,7 @@ fn checkpoint(commit: Option<&str>) -> Fallible<()> {
                         &root,
                         git_dir,
                     ) {
-                        note.push_str(&format!(" — Coverage versiegelt: {seal_id}"));
+                        note.push_str(&format!(" — coverage sealed: {seal_id}"));
                     }
                 }
                 hooklog::report_at(git_dir, Source::Checkpoint, &note);
@@ -365,7 +365,7 @@ fn seal_epoch(
             hooklog::report_at(
                 git_dir,
                 Source::Checkpoint,
-                &format!("Seal nicht baubar: {err}"),
+                &format!("seal could not be built: {err}"),
             );
             return None;
         }
@@ -376,7 +376,7 @@ fn seal_epoch(
             hooklog::report_at(
                 git_dir,
                 Source::Checkpoint,
-                &format!("Seal nicht abgelegt: {err}"),
+                &format!("seal not stored: {err}"),
             );
             return None;
         }
@@ -392,7 +392,7 @@ fn seal_epoch(
         hooklog::report_at(
             git_dir,
             Source::Checkpoint,
-            &format!("Epochen-Zustand nicht fortgeschrieben: {err}"),
+            &format!("epoch state not advanced: {err}"),
         );
     }
     Some(seal_id)
@@ -425,7 +425,7 @@ fn sign_seal_best_effort(
         hooklog::report_at(
             git_dir,
             Source::Checkpoint,
-            &format!("Seal {seal_id} nicht signiert: {err}"),
+            &format!("seal {seal_id} not signed: {err}"),
         );
     }
 }
@@ -473,7 +473,7 @@ fn store_one(
         hooklog::report_at(
             git_dir,
             Source::Checkpoint,
-            &format!("Branch für {} nicht angelegt: {err}", put.id()),
+            &format!("branch for {} not created: {err}", put.id()),
         );
     }
 
@@ -497,7 +497,7 @@ fn attach_trailers(
         let expected: CommitId = expected.parse()?;
         if repo.head()?.commit() != Some(expected) {
             let note = format!(
-                "HEAD steht nicht mehr auf {expected}; {} Session(s) gespeichert, aber nicht getrailert",
+                "HEAD no longer points at {expected}; {} session(s) stored, but no trailer attached",
                 sessions.len()
             );
             // Die einzige Spur, die dieser Fall hinterlässt: `fsck` sieht einen
@@ -509,7 +509,7 @@ fn attach_trailers(
 
     let update = repo.amend_head_with_sessions(sessions)?;
     if update.rewrote_head() {
-        println!("  Trailer an {} nachgerüstet", update.commit());
+        println!("  Trailer retrofitted to {}", update.commit());
     }
     Ok(Some(update.commit()))
 }

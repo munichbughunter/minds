@@ -25,7 +25,7 @@ pub type Result<T> = std::result::Result<T, CaptureError>;
 pub enum CaptureError {
     /// Ein Dateisystem-Zugriff schlug fehl. Trägt die Operation im Klartext,
     /// damit die Meldung ohne Stacktrace verständlich ist.
-    #[error("{op} fehlgeschlagen: {path}")]
+    #[error("{op} failed: {path}")]
     Io {
         op: &'static str,
         path: PathBuf,
@@ -45,20 +45,20 @@ pub enum CaptureError {
     /// Base64-Secret mit `+`/`=`), sind die, die nie ins hook.log dürfen (#95).
     /// Länge und Regel reichen, um den Fehler zu verstehen.
     #[error(
-        "unzulässiger Wert für {field}: {len} Zeichen, erlaubt ist [A-Za-z0-9._-] (1–128, nicht ».« oder »..«)"
+        "invalid value for {field}: {len} characters — allowed is [A-Za-z0-9._-] (1–128, not \".\" or \"..\")"
     )]
     UnsafeKey { field: &'static str, len: usize },
 
     /// Von hier aufwärts liegt kein Git-Repository.
-    #[error("kein Git-Repository gefunden, ausgehend von {start}")]
+    #[error("no Git repository found, starting from {start}")]
     NoRepository { start: PathBuf },
 
     /// Nach vielen Versuchen war keine Sequenznummer frei. Praktisch heißt das:
     /// volles Dateisystem oder fehlende Schreibrechte.
-    #[error("keine freie Sequenznummer in {dir} nach {probes} Versuchen")]
+    #[error("no free sequence number in {dir} after {probes} attempts")]
     SeqExhausted { dir: PathBuf, probes: u64 },
 
-    #[error("Payload nennt weder session_id noch transcript_path")]
+    #[error("payload names neither session_id nor transcript_path")]
     NoSessionKey,
 
     /// Die Schlüssel-Datei eines Session-Verzeichnisses bestätigt nicht den
@@ -70,7 +70,7 @@ pub enum CaptureError {
     /// und keine `local_id`: Diese Meldung wandert über den Hook-Pfad ins
     /// `hook.log`, und dort eine rohe Kennung abzulegen wäre genau das Leck,
     /// das #95 schließt.
-    #[error("Schlüssel-Datei bestätigt eine andere Session: {dir}")]
+    #[error("key file confirms a different session: {dir}")]
     KeyFileMismatch { dir: PathBuf },
 
     /// Der Session-Salt fehlt oder ist beschädigt, obwohl bereits eine
@@ -82,12 +82,12 @@ pub enum CaptureError {
     /// Der Text nennt nur das Verzeichnis (gehashter Name), nie die rohe
     /// `local_id` — die Meldung wandert ins `hook.log` (#95).
     #[error(
-        "Session-Salt fehlt oder ist beschädigt, aber eine versiegelte Epoche existiert: {dir} — der Chain-Root ist nicht mehr reproduzierbar; es wird kein neuer Salt erzeugt (kein zweiter Seal für dieselbe Evidence)"
+        "session salt is missing or damaged, but a sealed epoch exists: {dir} — the chain root is no longer reproducible; no new salt is generated (no second seal for the same evidence)"
     )]
     SaltLost { dir: PathBuf },
 
     /// JSON ließ sich nicht lesen oder schreiben.
-    #[error("JSON-Fehler")]
+    #[error("JSON error")]
     Json(#[from] serde_json::Error),
 }
 

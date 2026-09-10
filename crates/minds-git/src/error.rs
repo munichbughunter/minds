@@ -45,7 +45,7 @@ pub enum GitError {
     /// Der Normalfall, wenn `minds` außerhalb eines Repos aufgerufen wird — für
     /// die CLI der Anlass für einen freundlichen Hinweis, nicht für einen
     /// Stacktrace.
-    #[error("kein Git-Repository gefunden — weder in {start} noch darüber")]
+    #[error("no Git repository found — neither in {start} nor above it")]
     Discover {
         /// Verzeichnis, ab dem nach oben gesucht wurde.
         start: PathBuf,
@@ -56,7 +56,7 @@ pub enum GitError {
 
     /// `path` ließ sich nicht als Repository öffnen (kein Repo, kaputtes
     /// `.git`, fehlende Rechte).
-    #[error("{path} lässt sich nicht als Git-Repository öffnen")]
+    #[error("{path} cannot be opened as a Git repository")]
     Open {
         /// Der angefragte Pfad.
         path: PathBuf,
@@ -66,7 +66,7 @@ pub enum GitError {
     },
 
     /// HEAD ließ sich nicht lesen oder nicht bis auf einen Commit auflösen.
-    #[error("HEAD in {path} lässt sich nicht auflösen")]
+    #[error("HEAD in {path} cannot be resolved")]
     Head {
         /// Das Git-Verzeichnis des betroffenen Repositories.
         path: PathBuf,
@@ -77,7 +77,7 @@ pub enum GitError {
 
     /// Die Historie ab `tip` ließ sich nicht (vollständig) ablaufen — der
     /// Startpunkt fehlt im Repository oder ein Objekt darunter ist nicht da.
-    #[error("Historie ab {tip} lässt sich nicht ablaufen")]
+    #[error("history from {tip} cannot be walked")]
     Revwalk {
         /// Startpunkt des Walks.
         tip: CommitId,
@@ -90,7 +90,7 @@ pub enum GitError {
     ///
     /// **Nicht** der Fall „Ref existiert nicht" — der ist regulär und kommt als
     /// `Ok(None)` zurück (siehe `objects.rs`).
-    #[error("Ref {name} lässt sich nicht auflösen")]
+    #[error("ref {name} cannot be resolved")]
     Reference {
         /// Der angefragte Ref-Name, z. B. `refs/minds/context`.
         name: String,
@@ -101,7 +101,7 @@ pub enum GitError {
 
     /// Ein Objekt ließ sich nicht lesen — es fehlt, ist beschädigt oder hat
     /// nicht den erwarteten Typ.
-    #[error("Git-Objekt {id} lässt sich nicht lesen")]
+    #[error("Git object {id} cannot be read")]
     ReadObject {
         /// Textform des Objekt-Hashes. Bewusst ein `String`: Die Variante
         /// trifft Commits, Trees und Blobs gleichermaßen, und ein
@@ -114,7 +114,7 @@ pub enum GitError {
 
     /// Ein Objekt ließ sich nicht schreiben (Rechte, volle Platte, defekte
     /// Objektdatenbank).
-    #[error("Git-Objekt lässt sich nicht schreiben")]
+    #[error("Git object cannot be written")]
     WriteObject {
         /// Ursache aus gix.
         #[source]
@@ -122,7 +122,7 @@ pub enum GitError {
     },
 
     /// Ein Commit ließ sich nicht schreiben oder der Ref nicht bewegen.
-    #[error("Commit auf {name} lässt sich nicht schreiben")]
+    #[error("commit on {name} cannot be written")]
     Commit {
         /// Der betroffene Ref-Name.
         name: String,
@@ -136,7 +136,7 @@ pub enum GitError {
     /// Das ist **kein Defekt, sondern der Schutzmechanismus**: Ein paralleler
     /// `minds capture` war schneller. Nichts ging verloren — der Aufrufer liest
     /// neu und versucht es erneut (siehe `refs.rs`).
-    #[error("Ref {name} hat sich bewegt (erwartet: {expected}, gefunden: {actual})")]
+    #[error("ref {name} has moved (expected: {expected}, found: {actual})")]
     RefRaced {
         /// Der betroffene Ref-Name.
         name: String,
@@ -154,7 +154,7 @@ pub enum GitError {
     /// wandert bis in `hook.log`, und die Abhilfe soll dort lesbar sein, ohne
     /// dass jemand den Code kennt.
     #[error(
-        "Ref-Schreib-Lock nicht zu bekommen: {path} — hält es kein laufender minds-Prozess mehr, die Datei von Hand löschen"
+        "cannot acquire the ref write lock: {path} — if no running minds process holds it anymore, delete the file by hand"
     )]
     LockUnavailable {
         /// Die Lock-Datei, die dem Schreiben im Weg steht.
@@ -165,7 +165,7 @@ pub enum GitError {
     ///
     /// Die Leitplanke gegen die eine Klasse Fehler, die man nicht wieder
     /// gutmacht — siehe `refs.rs`.
-    #[error("Minds schreibt nur unterhalb von {namespace}, nicht auf {name}")]
+    #[error("Minds only writes below {namespace}, not to {name}")]
     ForbiddenRef {
         /// Der abgewiesene Ref-Name.
         name: String,
@@ -174,9 +174,7 @@ pub enum GitError {
     },
 
     /// Es ist keine Git-Identität konfiguriert.
-    #[error(
-        "keine Git-Identität konfiguriert — `git config user.name` und `git config user.email` setzen"
-    )]
+    #[error("no Git identity configured — set `git config user.name` and `git config user.email`")]
     Identity,
 
     /// Ein Pfad taugt nicht als Eintrag in einem Git-Baum.
@@ -185,7 +183,7 @@ pub enum GitError {
     /// ist deshalb immer ein Programmfehler und nie eine Nutzereingabe. Er wird
     /// abgewiesen, bevor er in einen Baum gerät: Ein krummer Pfad im Store
     /// fiele erst dem Reader auf, und dann ist er schon geschrieben.
-    #[error("ungültiger Pfad {path:?}: {reason}")]
+    #[error("invalid path {path:?}: {reason}")]
     InvalidPath {
         /// Der abgewiesene Pfad.
         path: String,
@@ -199,7 +197,7 @@ pub enum GitError {
     /// Anders als der ungeborene HEAD beim *Lesen* (der ist regulär, siehe
     /// `head.rs`) ist er beim Nachrüsten ein Fehler: Der Aufrufer wollte etwas
     /// verlinken, und es gibt nichts zu verlinken.
-    #[error("HEAD in {path} hat noch keinen Commit — nichts zum Nachrüsten")]
+    #[error("HEAD in {path} has no commit yet — nothing to retrofit")]
     NothingToAmend {
         /// Das Git-Verzeichnis des betroffenen Repositories.
         path: PathBuf,
@@ -212,7 +210,7 @@ pub enum GitError {
     /// sie weg — siehe `amend.rs`. Der Ausweg ist der `prepare-commit-msg`-Weg,
     /// bei dem der Trailer *vor* der Signatur entsteht.
     #[error(
-        "Commit {commit} ist signiert ({header}) — ein nachgerüsteter Trailer würde die Signatur entwerten"
+        "commit {commit} is signed ({header}) — retrofitting a trailer would invalidate the signature"
     )]
     SignedCommit {
         /// Der betroffene Commit.
@@ -228,7 +226,7 @@ pub enum GitError {
     /// Gelesen wird sie trotzdem — nur verlustbehaftet (siehe
     /// `Repo::message_of`). Beim Zurückschreiben wäre dieser Verlust echter
     /// Datenverlust, also bleibt der Commit, wie er ist.
-    #[error("Message von {commit} ist kein gültiges UTF-8 — Minds schreibt sie nicht neu")]
+    #[error("message of {commit} is not valid UTF-8 — Minds will not rewrite it")]
     MessageNotUtf8 {
         /// Der betroffene Commit.
         commit: CommitId,
@@ -239,7 +237,7 @@ pub enum GitError {
     ///
     /// **Nicht** der Fall „Datei gibt es in diesem Commit nicht": Der ist
     /// regulär und kommt als leere Liste zurück (siehe `blame.rs`).
-    #[error("Blame für {path} lässt sich nicht ermitteln")]
+    #[error("blame for {path} cannot be determined")]
     Blame {
         /// Der betroffene Pfad, repo-relativ.
         path: String,
@@ -250,7 +248,7 @@ pub enum GitError {
 
     /// Der Diff eines Commits ließ sich nicht ermitteln — `git` fehlt oder
     /// bricht ab.
-    #[error("Diff für Commit {commit} lässt sich nicht ermitteln")]
+    #[error("diff for commit {commit} cannot be determined")]
     Diff {
         /// Der betroffene Commit.
         commit: CommitId,
@@ -324,7 +322,7 @@ impl GitError {
         actual: Option<CommitId>,
     ) -> Self {
         fn show(commit: Option<CommitId>) -> String {
-            commit.map_or_else(|| "kein Ref".to_owned(), |c| c.to_string())
+            commit.map_or_else(|| "no ref".to_owned(), |c| c.to_string())
         }
         Self::RefRaced {
             name: name.into(),

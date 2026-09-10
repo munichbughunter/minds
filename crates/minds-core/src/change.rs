@@ -90,10 +90,10 @@ impl FromStr for ChangeId {
 /// Warum eine Zeichenkette keine [`ChangeId`] ist.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChangeIdParseError {
-    #[error("Change-Id braucht {HEX_LEN} Hex-Zeichen, hat aber {0}")]
+    #[error("change id needs {HEX_LEN} hex characters, but has {0}")]
     Length(usize),
 
-    #[error("Change-Id enthält ein Nicht-Hex-Zeichen: {0:?}")]
+    #[error("change id contains a non-hex character: {0:?}")]
     NotHex(char),
 }
 

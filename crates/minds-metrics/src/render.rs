@@ -31,7 +31,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_sessions_total",
         "counter",
-        "Erfasste Sessions.",
+        "Captured sessions.",
     );
     int(&mut s, "minds_sessions_total", &lbl(&repo, &[]), m.sessions);
 
@@ -39,7 +39,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_tokens_total",
         "counter",
-        "Token nach Richtung.",
+        "Tokens by direction.",
     );
     int(
         &mut s,
@@ -58,7 +58,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_tool_calls_total",
         "counter",
-        "Tool-Calls insgesamt.",
+        "Total tool calls.",
     );
     int(
         &mut s,
@@ -71,7 +71,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_tool_effects_total",
         "counter",
-        "Tool-Calls mit Effekt, nach Art.",
+        "Tool calls with an effect, by kind.",
     );
     for (effect, value) in [
         ("read", m.effects.read),
@@ -92,7 +92,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_redaction_hits_total",
         "counter",
-        "Redaction-Treffer nach Kategorie.",
+        "Redaction hits by category.",
     );
     int(
         &mut s,
@@ -111,7 +111,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_distinct_files",
         "gauge",
-        "Distinkte berührte Dateien.",
+        "Distinct files touched.",
     );
     int(
         &mut s,
@@ -124,7 +124,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_sessions_by_agent",
         "gauge",
-        "Sessions je Agent.",
+        "Sessions per agent.",
     );
     for agent in &m.by_agent {
         let e = escape(&agent.agent);
@@ -135,7 +135,12 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
             agent.sessions,
         );
     }
-    head(&mut s, "minds_tokens_by_agent", "gauge", "Token je Agent.");
+    head(
+        &mut s,
+        "minds_tokens_by_agent",
+        "gauge",
+        "Tokens per agent.",
+    );
     for agent in &m.by_agent {
         let e = escape(&agent.agent);
         int(
@@ -150,7 +155,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_throughput_tokens_per_session",
         "gauge",
-        "Ø Token je Session.",
+        "Average tokens per session.",
     );
     float(
         &mut s,
@@ -162,7 +167,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_iteration_calls_per_session",
         "gauge",
-        "Ø Tool-Calls je Session.",
+        "Average tool calls per session.",
     );
     float(
         &mut s,
@@ -174,7 +179,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_continuity_seconds",
         "gauge",
-        "Längste Session in Sekunden.",
+        "Longest session in seconds.",
     );
     int(
         &mut s,
@@ -186,7 +191,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_streak_days",
         "gauge",
-        "Längster Lauf aktiver Tage.",
+        "Longest streak of active days.",
     );
     int(
         &mut s,
@@ -198,7 +203,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
         &mut s,
         "minds_streak_current_days",
         "gauge",
-        "Aktueller Lauf aktiver Tage.",
+        "Current streak of active days.",
     );
     int(
         &mut s,
@@ -208,12 +213,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
     );
 
     if let Some(cov) = coverage {
-        head(
-            &mut s,
-            "minds_commits_total",
-            "gauge",
-            "Erreichbare Commits.",
-        );
+        head(&mut s, "minds_commits_total", "gauge", "Reachable commits.");
         int(
             &mut s,
             "minds_commits_total",
@@ -224,7 +224,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
             &mut s,
             "minds_commits_with_context",
             "gauge",
-            "Commits mit auflösbarem Kontext.",
+            "Commits with resolvable context.",
         );
         int(
             &mut s,
@@ -236,7 +236,7 @@ fn render(m: &Metrics, repo: &str, coverage: Option<Coverage>, eof: bool) -> Str
             &mut s,
             "minds_context_coverage_ratio",
             "gauge",
-            "Anteil abgedeckter Commits.",
+            "Share of covered commits.",
         );
         float(
             &mut s,

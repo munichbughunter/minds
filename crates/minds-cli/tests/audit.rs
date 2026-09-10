@@ -295,15 +295,15 @@ fn the_bundle_proves_a_rejected_session_without_leaking_its_content() {
     let proves = bundle["proves"].as_array().unwrap();
     assert!(
         proves.iter().any(|l| l.as_str().is_some_and(|t| t
-            .contains("committed kryptographisch auf Chain-Root und Coverage")
-            && t.contains("nur mit lokalem Journal und Session-Salt"))),
+            .contains("commits cryptographically to chain root and coverage")
+            && t.contains("only with the local journal and session salt"))),
         "{proves:?}"
     );
     let limits = bundle["does_not_prove"].as_array().unwrap();
     assert!(
         limits.iter().any(|l| l
             .as_str()
-            .is_some_and(|t| t.contains("zwischen Append und Seal"))),
+            .is_some_and(|t| t.contains("between append and seal"))),
         "{limits:?}"
     );
 }
@@ -374,7 +374,7 @@ fn proof_mode_keeps_the_skeleton_and_drops_the_content() {
     let out = minds(dir, &["audit", "--export", "--mode", "full"]);
     assert!(!out.status.success());
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("full gibt es bewusst nicht"),
+        String::from_utf8_lossy(&out.stderr).contains("there is deliberately no full"),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

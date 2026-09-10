@@ -59,9 +59,7 @@ fn metrics(format: &str) -> Fallible<()> {
             format!("{}\n", serde_json::to_string_pretty(&doc)?)
         }
         other => {
-            return Err(
-                format!("unbekanntes Format {other:?} (prometheus|openmetrics|json)").into(),
-            );
+            return Err(format!("unknown format {other:?} (prometheus|openmetrics|json)").into());
         }
     };
     print!("{out}");

@@ -23,7 +23,7 @@ pub fn run(limit: Option<&str>, all: bool) -> ExitCode {
             Some(raw) => match raw.parse::<usize>() {
                 Ok(n) if n > 0 => n,
                 _ => {
-                    eprintln!("minds recap: --limit erwartet eine Zahl ≥ 1");
+                    eprintln!("minds recap: --limit expects a number ≥ 1");
                     return ExitCode::FAILURE;
                 }
             },
@@ -47,7 +47,7 @@ fn recap(limit: usize) -> Fallible<()> {
     }
 
     if sessions.is_empty() {
-        println!("Noch keine Sessions erfasst.");
+        println!("No sessions captured yet.");
         return Ok(());
     }
 
@@ -55,7 +55,10 @@ fn recap(limit: usize) -> Fallible<()> {
     sessions.sort_by(|a, b| context::time_key(b).cmp(context::time_key(a)));
 
     let shown = sessions.len().min(limit);
-    println!("Die {shown} jüngsten von {} Session(s):\n", sessions.len());
+    println!(
+        "The {shown} most recent of {} session(s):\n",
+        sessions.len()
+    );
     for session in sessions.iter().take(limit) {
         let when = context::time_key(session);
         let when = if when.is_empty() {
@@ -66,7 +69,7 @@ fn recap(limit: usize) -> Fallible<()> {
         let headline = minds_reader::summary::headline(&session.intent.request, 80);
         println!("{when}  {headline}");
         println!(
-            "                       {} · {} · {} Datei(en) · {}/{} Token",
+            "                       {} · {} · {} file(s) · {}/{} tokens",
             session.agent.name,
             session.model.id,
             session.produced.files.len(),

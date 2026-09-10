@@ -76,7 +76,7 @@ const PANIC_FOR_TEST: &str = "MINDS_BRIEF_PANIC_FOR_TEST";
 fn brief(paths: &[String], hook: bool) -> Fallible<()> {
     #[cfg(debug_assertions)]
     if std::env::var(PANIC_FOR_TEST).as_deref() == Ok("1") {
-        panic!("absichtlicher Panic für den Test");
+        panic!("deliberate panic for the test");
     }
 
     let ctx = Context::open()?;
@@ -91,12 +91,12 @@ fn brief(paths: &[String], hook: bool) -> Fallible<()> {
     };
 
     let label = if paths.is_empty() {
-        "gesamtes Repo".to_string()
+        "entire repo".to_string()
     } else {
         paths.join(", ")
     };
     let markdown = minds_reader::brief::render(
-        &format!("Kontext für den Agenten — {label}"),
+        &format!("Context for the agent — {label}"),
         &sessions,
         Some(CAP),
     );

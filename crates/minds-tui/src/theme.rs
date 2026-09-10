@@ -45,21 +45,21 @@ pub const DIM: Color = Color::DarkGray;
 /// alte Alphabet nicht aussprechen konnte.
 pub fn evidence(evidence: Option<EvidenceMark>) -> (String, String, Style) {
     let Some(mark) = evidence else {
-        return ("·".into(), "unverknüpft".into(), Style::default().fg(DIM));
+        return ("·".into(), "unlinked".into(), Style::default().fg(DIM));
     };
     let (glyph, word, style) = match mark.source {
         EvidenceSource::Observed => ("●", "observed", Style::default().fg(OK)),
         EvidenceSource::ContentDerived => ("◆", "content", Style::default().fg(OK)),
         EvidenceSource::HumanDeclared => ("◇", "declared", Style::default().fg(EDIT)),
-        EvidenceSource::Heuristic => ("○", "inferred [vermutet]", Style::default().fg(DIM)),
+        EvidenceSource::Heuristic => ("○", "inferred", Style::default().fg(DIM)),
     };
     let (modifier, status_word, style) = match mark.status {
-        EvidenceStatus::Verified => ("✓", "nachgerechnet", style),
-        EvidenceStatus::Partial => ("~", "teilweise geprüft", style),
+        EvidenceStatus::Verified => ("✓", "recomputed", style),
+        EvidenceStatus::Partial => ("~", "partially checked", style),
         // Ungeprüft dimmt auch eine „gute" Quelle — beobachtet heißt nicht
         // geprüft, und das darf man sehen.
-        EvidenceStatus::Unknown => ("?", "ungeprüft", style.add_modifier(Modifier::DIM)),
-        EvidenceStatus::Missing => ("✗", "Beleg fehlt", Style::default().fg(DELETE)),
+        EvidenceStatus::Unknown => ("?", "unchecked", style.add_modifier(Modifier::DIM)),
+        EvidenceStatus::Missing => ("✗", "evidence missing", Style::default().fg(DELETE)),
     };
     (
         format!("{glyph} {modifier}"),
@@ -74,9 +74,9 @@ pub fn evidence(evidence: Option<EvidenceMark>) -> (String, String, Style) {
 pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style) {
     match provenance {
         Provenance::Chained(state) => match state.verdict {
-            EvidenceVerdict::Verified => ("◈", "versiegelt", Style::default().fg(OK)),
-            EvidenceVerdict::Incomplete => ("!", "unvollständig", Style::default().fg(REVIEW)),
-            EvidenceVerdict::Tampered => ("✗", "MANIPULIERT", Style::default().fg(DELETE)),
+            EvidenceVerdict::Verified => ("◈", "sealed", Style::default().fg(OK)),
+            EvidenceVerdict::Incomplete => ("!", "incomplete", Style::default().fg(REVIEW)),
+            EvidenceVerdict::Tampered => ("✗", "TAMPERED", Style::default().fg(DELETE)),
         },
         Provenance::Legacy => ("·", "legacy", Style::default().fg(DIM)),
     }
@@ -85,7 +85,7 @@ pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style
 /// Glyph, Wort und Stil eines Verdicts.
 pub fn verdict(verdict: Verdict) -> (&'static str, &'static str, Style) {
     match verdict {
-        Verdict::Open => ("⚠", "offen", Style::default().fg(REVIEW)),
+        Verdict::Open => ("⚠", "open", Style::default().fg(REVIEW)),
         Verdict::Approved => ("✓", "approved", Style::default().fg(OK)),
         Verdict::Rejected => ("✕", "rejected", Style::default().fg(DELETE)),
         Verdict::NeedsWork => ("↻", "needs work", Style::default().fg(REVIEW)),
@@ -102,7 +102,7 @@ pub fn tool(kind: ToolKind) -> (&'static str, &'static str, Style) {
         ToolKind::Other => ("·", "TOOL", Style::default().fg(DIM)),
         // Beobachtet, nicht gedeutet (ADR-0011): halb sichtbar — Wirkung
         // unbekannt, und das darf man sehen.
-        ToolKind::Uninterpreted => ("◐", "BEOBACHTET", Style::default().fg(REVIEW)),
+        ToolKind::Uninterpreted => ("◐", "OBSERVED", Style::default().fg(REVIEW)),
     }
 }
 
@@ -114,7 +114,7 @@ pub fn node(kind: &NodeKind) -> (&'static str, &'static str, Style) {
         NodeKind::Turn(_) => ("·", "TURN", Style::default().fg(DIM)),
         NodeKind::Tool(kind) => tool(*kind),
         NodeKind::Subagent(_) => ("◉", "SUBAGENT", Style::default().fg(AGENT)),
-        NodeKind::Handover { .. } => ("⇄", "ÜBERGABE", Style::default().fg(OK)),
+        NodeKind::Handover { .. } => ("⇄", "HANDOVER", Style::default().fg(OK)),
         NodeKind::Change(_) => ("◆", "CHANGE", Style::default().fg(CHANGE)),
         NodeKind::Commit(_) => ("◆", "COMMIT", Style::default().fg(CHANGE)),
         NodeKind::Review(v) => {

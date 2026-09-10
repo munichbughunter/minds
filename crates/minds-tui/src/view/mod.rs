@@ -66,7 +66,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("MINDS ", theme::title().fg(theme::AGENT)),
         Span::styled(h.repo.clone(), theme::title()),
         Span::raw(" · "),
-        Span::raw(h.branch.clone().unwrap_or_else(|| "(losgelöst)".into())),
+        Span::raw(h.branch.clone().unwrap_or_else(|| "(detached)".into())),
     ]);
     let mut stats = vec![
         Span::raw(format!("{} Sessions", h.sessions)),
@@ -74,14 +74,14 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(format!("{} Changes", h.changes)),
         Span::raw(" · "),
         Span::raw(format!(
-            "{:.0} % Kontext-Abdeckung",
+            "{:.0} % context coverage",
             h.coverage.ratio() * 100.0
         )),
     ];
     if h.degraded > 0 {
         stats.push(Span::raw(" · "));
         stats.push(Span::styled(
-            format!("{} degradiert", h.degraded),
+            format!("{} degraded", h.degraded),
             theme::dim(),
         ));
     }
@@ -97,7 +97,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             .map(|card| {
                 if card.is_degraded() {
                     Line::from(Span::styled(
-                        "Degradiert: Die Nutzlast ist nicht lesbar — vergessen oder defekt; die Referenz bleibt auflösbar.",
+                        "Degraded: the payload is unreadable — forgotten or damaged; the reference stays resolvable.",
                         theme::dim(),
                     ))
                 } else {
@@ -113,22 +113,22 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             })
             .unwrap_or_default(),
         Some(View::Graph { .. }) => Line::from(Span::styled(
-            "Graph: Absicht → Agent → Effekte → Änderung → Review. Details unter dem Cursor.",
+            "Graph: intent → agent → effects → change → review. Details under the cursor.",
             theme::dim(),
         )),
         Some(View::Why { chain, .. }) => {
             let gaps = chain.gaps();
             if gaps.is_empty() {
                 Line::from(Span::styled(
-                    "✓ keine Lücke — jedes Glied ist belegt",
+                    "✓ no gap — every link is attested",
                     Style::default().fg(theme::OK),
                 ))
             } else {
                 Line::from(Span::styled(
                     format!(
-                        "⚠ {} {} in der Kette — siehe Block unten",
+                        "⚠ {} {} in the chain — see the block below",
                         gaps.len(),
-                        if gaps.len() == 1 { "Lücke" } else { "Lücken" }
+                        if gaps.len() == 1 { "gap" } else { "gaps" }
                     ),
                     Style::default().fg(theme::REVIEW),
                 ))
@@ -149,7 +149,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("▏", Style::default()),
             Span::styled(
                 format!(
-                    "  {}/{} Treffer · Enter übernehmen · Esc löschen",
+                    "  {}/{} match(es) · Enter apply · Esc clear",
                     app.visible.len(),
                     app.cards.len()
                 ),
@@ -166,13 +166,13 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         let keys = match app.top() {
             None => {
-                "↑↓ wählen  Enter Graph  w Why  e Evidence  / Suche  1·2·3 Zoom  ? Hilfe  q Ende"
+                "↑↓ select  Enter graph  w why  e evidence  / search  1·2·3 zoom  ? help  q quit"
             }
             Some(View::Graph { .. }) => {
-                "↑↓ wählen  Enter hinein  w Why  e Evidence  t Zeitleiste  1·2·3 Zoom  Esc zurück  ? Hilfe"
+                "↑↓ select  Enter descend  w why  e evidence  t timeline  1·2·3 zoom  Esc back  ? help"
             }
-            Some(View::Why { .. }) => "↑↓ wählen  Enter öffnen  Esc zurück  ? Hilfe",
-            Some(View::Evidence { .. }) => "↑↓ Sektion  Esc zurück  ? Hilfe",
+            Some(View::Why { .. }) => "↑↓ select  Enter open  Esc back  ? help",
+            Some(View::Evidence { .. }) => "↑↓ section  Esc back  ? help",
         };
         spans.push(Span::styled(keys, theme::dim()));
         spans.push(Span::styled(

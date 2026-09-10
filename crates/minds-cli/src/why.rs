@@ -30,7 +30,7 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Führt `minds why` aus. `target` ist `<datei>:<zeile>`.
 pub fn run(target: Option<&str>, full: bool) -> ExitCode {
     let Some(target) = target else {
-        eprintln!("minds why: erwartet <datei>:<zeile>");
+        eprintln!("minds why: expected <file>:<line>");
         return ExitCode::FAILURE;
     };
     match why(target, full) {
@@ -51,12 +51,12 @@ fn why(target: &str, full: bool) -> Fallible<()> {
     let store = config::load(&root).open(&root)?;
 
     let Some(head) = repo.head()?.commit() else {
-        return Err("HEAD hat noch keinen Commit".into());
+        return Err("HEAD has no commit yet".into());
     };
 
     // Blame der Zeile, wie sie im aktuellen Baum steht.
     let Some(commit) = repo.blame().blame_line(head, path, line)? else {
-        return Err(format!("{path}:{line} ist im Blame nicht auflösbar").into());
+        return Err(format!("{path}:{line} cannot be resolved in blame").into());
     };
 
     let trailers = repo.session_ids_of(commit)?;
@@ -75,12 +75,12 @@ fn why(target: &str, full: bool) -> Fallible<()> {
 /// **letzten** Doppelpunkt, damit Pfade mit Doppelpunkt (selten, aber möglich)
 /// nicht zerbrechen.
 fn split(target: &str) -> Fallible<(&str, u32)> {
-    let (path, line) = target.rsplit_once(':').ok_or("erwartet <datei>:<zeile>")?;
+    let (path, line) = target.rsplit_once(':').ok_or("expected <file>:<line>")?;
     let line: u32 = line
         .parse()
-        .map_err(|_| format!("keine Zeilennummer: {line:?}"))?;
+        .map_err(|_| format!("not a line number: {line:?}"))?;
     if path.is_empty() || line == 0 {
-        return Err("erwartet <datei>:<zeile> mit Zeile ≥ 1".into());
+        return Err("expected <file>:<line> with line ≥ 1".into());
     }
     Ok((path, line))
 }

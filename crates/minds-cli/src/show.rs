@@ -45,7 +45,7 @@ fn show(rev: &str, full: bool) -> Fallible<()> {
     let root = repo_root(&repo);
     let store = config::load(&root).open(&root)?;
 
-    let commit = resolve(&root, rev).ok_or_else(|| format!("keine solche Revision: {rev}"))?;
+    let commit = resolve(&root, rev).ok_or_else(|| format!("no such revision: {rev}"))?;
 
     // Trailer (beobachtet) und Store-Index (vermutet) zusammenführen — so
     // erscheinen auch importierte Sessions, die keinen Trailer haben.

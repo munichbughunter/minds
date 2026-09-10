@@ -18,7 +18,7 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Commit.
 pub fn run(target: Option<&str>) -> ExitCode {
     let Some(target) = target else {
-        eprintln!("minds recall: erwartet <ziel> (datei, datei:zeile oder commit)");
+        eprintln!("minds recall: expected <target> (file, file:line, or commit)");
         return ExitCode::FAILURE;
     };
     match recall(target) {
@@ -41,7 +41,7 @@ fn recall(target: &str) -> Fallible<()> {
     }
     let (label, sessions) = resolved?;
     let markdown =
-        minds_reader::brief::render(&format!("Kontext-Brief — {label}"), &sessions, None);
+        minds_reader::brief::render(&format!("Context brief — {label}"), &sessions, None);
     print!("{markdown}");
     Ok(())
 }
@@ -73,13 +73,13 @@ fn resolve_target(
     let (touching, s) = ctx.sessions_touching(target)?;
     skipped.merge(s);
     if !touching.is_empty() {
-        return Ok((format!("Datei {target}"), touching));
+        return Ok((format!("file {target}"), touching));
     }
 
-    Err(format!(
-        "kein Kontext für {target:?} — weder Zeile, Commit noch Datei mit erfasstem Kontext"
+    Err(
+        format!("no context for {target:?} — no line, commit, or file with captured context")
+            .into(),
     )
-    .into())
 }
 
 /// Zerlegt `<datei>:<zeile>` — am **letzten** Doppelpunkt, wie `why`. Kein

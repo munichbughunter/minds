@@ -744,7 +744,7 @@ mod tests {
         // Die Meldung benennt den offenen Ort und rät zum erneuten forget.
         let message = err.to_string();
         assert!(
-            message.contains("Session-Branch") && message.contains("erneut"),
+            message.contains("session branch") && message.contains("again"),
             "Meldung ohne offenen Ort oder Rat: {message}"
         );
 

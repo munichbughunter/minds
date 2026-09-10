@@ -564,10 +564,10 @@ impl FromStr for ContentHash {
 /// Warum eine Zeichenkette kein [`ContentHash`] ist.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ContentHashParseError {
-    #[error("Content-Hash braucht {HEX_LEN} Hex-Zeichen, hat aber {0}")]
+    #[error("content hash needs {HEX_LEN} hex characters, but has {0}")]
     Length(usize),
 
-    #[error("Content-Hash enthält ein Nicht-Hex-Zeichen: {0:?}")]
+    #[error("content hash contains a non-hex character: {0:?}")]
     NotHex(char),
 }
 

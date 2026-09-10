@@ -316,7 +316,7 @@ mod tests {
                 "   ┣━ a.rs",
                 "   ┣━ a.rs",
                 "   ┣━ cargo",
-                "   ┗━ offen",
+                "   ┗━ open",
             ]
         );
         assert_eq!(rows[0].depth, 0);
@@ -335,7 +335,7 @@ mod tests {
                 "   ┣━ a.rs",
                 "   ┣━ a.rs ×2",
                 "   ┣━ cargo",
-                "   ┗━ offen",
+                "   ┗━ open",
             ]
         );
         assert_eq!(rows[3].count, 2);
@@ -355,7 +355,7 @@ mod tests {
                 "   ┃  ┗━ a.rs",
                 "   ┣━ ASSISTANT · teste",
                 "   ┃  ┗━ cargo",
-                "   ┗━ offen",
+                "   ┗━ open",
             ]
         );
     }
@@ -369,7 +369,7 @@ mod tests {
         let teste = labels.iter().position(|l| l.contains("teste")).unwrap();
         let lese = labels.iter().position(|l| l.contains("lese")).unwrap();
         assert!(teste < lese);
-        assert_eq!(labels.last(), Some(&"offen"));
+        assert_eq!(labels.last(), Some(&"open"));
     }
 
     #[test]

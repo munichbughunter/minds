@@ -36,18 +36,18 @@ fn render(out: &Path) -> Fallible<()> {
     let site = minds_reader::render(&repo, store.as_ref(), out)?;
 
     println!(
-        "  {} Datei(en), {} Session(s) → {}",
+        "  {} file(s), {} session(s) → {}",
         site.files,
         site.sessions,
         site.out.display()
     );
     if site.skipped > 0 {
         println!(
-            "  {} Datei(en) übersprungen (kein UTF-8 oder Blame nicht möglich)",
+            "  {} file(s) skipped (not UTF-8, or blame not possible)",
             site.skipped
         );
     }
-    println!("  öffnen: {}", site.out.join("index.html").display());
+    println!("  open: {}", site.out.join("index.html").display());
     Ok(())
 }
 

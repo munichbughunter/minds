@@ -87,7 +87,7 @@ fn import() -> Fallible<()> {
                         // Anders als der Redaction-Skip darunter kein Befund:
                         // Das Tombstone ist gewollt, die Session soll fehlen.
                         // Ein Hinweis für den Hand-Aufrufer, nichts fürs Log.
-                        eprintln!("  Session {} bleibt vergessen (nicht reanimiert)", put.id());
+                        eprintln!("  session {} stays forgotten (not resurrected)", put.id());
                         continue;
                     }
                     infos.push(SessionInfo::of(put.id(), redacted.session()));
@@ -99,7 +99,7 @@ fn import() -> Fallible<()> {
                 Err(err) => hooklog::report_at(
                     &git_dir,
                     Source::Import,
-                    &format!("Session übersprungen (Redaction): {err}"),
+                    &format!("session skipped (redaction): {err}"),
                 ),
             }
         }
@@ -117,12 +117,12 @@ fn import() -> Fallible<()> {
         let count = report.sessions.len();
         match &report.note {
             Some(note) => println!("  {}: {note}", report.agent),
-            None => println!("  {}: {count} Transkript(e)", report.agent),
+            None => println!("  {}: {count} transcript(s)", report.agent),
         }
     }
 
     if stored == 0 {
-        println!("  nichts zu importieren");
+        println!("  nothing to import");
         return Ok(());
     }
 
@@ -144,7 +144,7 @@ fn import() -> Fallible<()> {
     store.set_index(&index)?;
 
     println!(
-        "  {stored} Session(s) gespeichert, {} Verknüpfung(en) vermutet",
+        "  {stored} session(s) stored, {} link(s) inferred",
         links.len()
     );
     Ok(())
@@ -200,7 +200,7 @@ fn parse_log(text: &str) -> Vec<CommitInfo> {
 fn home_dir() -> Fallible<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME ist nicht gesetzt".into())
+        .ok_or_else(|| "HOME is not set".into())
 }
 
 fn repo_root(repo: &Repo) -> PathBuf {

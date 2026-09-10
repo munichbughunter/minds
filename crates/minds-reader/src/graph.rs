@@ -58,7 +58,7 @@ impl ToolKind {
             ToolKind::Exec => "EXEC",
             ToolKind::Delete => "DELETE",
             ToolKind::Other => "TOOL",
-            ToolKind::Uninterpreted => "BEOBACHTET",
+            ToolKind::Uninterpreted => "OBSERVED",
         }
     }
 }
@@ -137,7 +137,7 @@ impl SessionGraph {
                     sanitize(&session.intent.constraints.join("\n")),
                 ),
                 (
-                    "Verworfen".into(),
+                    "Discarded".into(),
                     sanitize(&session.intent.discarded.join("\n")),
                 ),
             ],
@@ -152,12 +152,12 @@ impl SessionGraph {
             vec![
                 ("Agent".into(), sanitize(&session.agent.name)),
                 ("Version".into(), sanitize(&session.agent.version)),
-                ("Anbieter".into(), sanitize(&session.model.provider)),
-                ("Modell".into(), sanitize(&session.model.id)),
+                ("Provider".into(), sanitize(&session.model.provider)),
+                ("Model".into(), sanitize(&session.model.id)),
                 (
-                    "Token".into(),
+                    "Tokens".into(),
                     format!(
-                        "{} ein / {} aus",
+                        "{} in / {} out",
                         session.usage.input_tokens, session.usage.output_tokens
                     ),
                 ),
@@ -220,17 +220,17 @@ impl SessionGraph {
                 };
                 let mut detail = vec![
                     ("Tool".into(), sanitize(&call.name)),
-                    ("Argumente".into(), truncate(&sanitize(&call.arguments))),
+                    ("Arguments".into(), truncate(&sanitize(&call.arguments))),
                 ];
                 if let Some(capture) = &call.capture {
                     let status = match capture.status {
-                        minds_core::CaptureStatus::Interpreted => "gedeutet",
+                        minds_core::CaptureStatus::Interpreted => "interpreted",
                         minds_core::CaptureStatus::Uninterpreted => {
-                            "beobachtet, nicht gedeutet — Wirkung unbekannt"
+                            "observed, not interpreted — effect unknown"
                         }
                     };
                     detail.push((
-                        "Deutung".into(),
+                        "Interpretation".into(),
                         format!(
                             "{status} ({} v{})",
                             sanitize(&capture.adapter),
@@ -239,12 +239,12 @@ impl SessionGraph {
                     ));
                 }
                 if let Some(effect) = &call.effect {
-                    detail.push(("Effekt".into(), kind.word().into()));
+                    detail.push(("Effect".into(), kind.word().into()));
                     if let Some(p) = &path {
-                        detail.push(("Pfad".into(), p.clone()));
+                        detail.push(("Path".into(), p.clone()));
                     }
                     if let Some(hash) = &effect.content {
-                        detail.push(("Inhalt".into(), hash.to_string()));
+                        detail.push(("Content".into(), hash.to_string()));
                     }
                 }
                 graph.push(
@@ -285,7 +285,7 @@ impl SessionGraph {
                     ("Session".into(), child.to_string()),
                     ("Agent".into(), sanitize(name)),
                     (
-                        "Beleg".into(),
+                        "Evidence".into(),
                         format!("{:?}", edge.evidence).to_lowercase(),
                     ),
                 ],
@@ -300,11 +300,7 @@ impl SessionGraph {
         for link in index.content_links_of(id) {
             let incoming = link.to == id;
             let other = if incoming { link.from } else { link.to };
-            let direction = if incoming {
-                "liest von"
-            } else {
-                "schreibt für"
-            };
+            let direction = if incoming { "reads from" } else { "writes for" };
             let other_short: String = other.to_string().chars().take(11).collect();
             graph.push(
                 Some(agent),
@@ -312,11 +308,11 @@ impl SessionGraph {
                 format!("{} {} · {other_short}…", direction, link.path),
                 vec![
                     ("Session".into(), other.to_string()),
-                    ("Pfad".into(), link.path.clone()),
-                    ("Inhalt".into(), link.hash.to_string()),
+                    ("Path".into(), link.path.clone()),
+                    ("Content".into(), link.hash.to_string()),
                     (
-                        "Beleg".into(),
-                        "content [nachgerechnet] — dieselben Bytes, kein Zeitstempel nötig".into(),
+                        "Evidence".into(),
+                        "content [recomputed] — the same bytes, no timestamp needed".into(),
                     ),
                 ],
                 None,
@@ -338,8 +334,8 @@ impl SessionGraph {
             let short: String = commit.to_string().chars().take(10).collect();
             let detail = vec![
                 ("Commit".into(), commit.to_string()),
-                ("Betreff".into(), subject.clone()),
-                ("Beleg".into(), evidence),
+                ("Subject".into(), subject.clone()),
+                ("Evidence".into(), evidence),
             ];
             let node = match index.change_of(commit) {
                 Some(change) => {
@@ -385,7 +381,7 @@ impl SessionGraph {
                         format!(
                             "{}{} — {}",
                             note.decision.as_str(),
-                            if note.signed { " (signiert)" } else { "" },
+                            if note.signed { " (signed)" } else { "" },
                             note.summary
                         ),
                     )
@@ -546,7 +542,7 @@ mod tests {
             .find(|n| matches!(n.kind, NodeKind::Handover { .. }))
             .expect("Uebergabe-Knoten");
         assert!(
-            handover.label.starts_with("liest von foo.rs"),
+            handover.label.starts_with("reads from foo.rs"),
             "{}",
             handover.label
         );
@@ -558,7 +554,7 @@ mod tests {
             handover
                 .detail
                 .iter()
-                .any(|(k, v)| k == "Beleg" && v.contains("nachgerechnet")),
+                .any(|(k, v)| k == "Evidence" && v.contains("recomputed")),
             "{:?}",
             handover.detail
         );
@@ -583,11 +579,7 @@ mod tests {
                 )
             })
             .expect("auslaufende Uebergabe");
-        assert!(
-            out.label.starts_with("schreibt für foo.rs"),
-            "{}",
-            out.label
-        );
+        assert!(out.label.starts_with("writes for foo.rs"), "{}", out.label);
     }
 
     fn call(name: &str, args: &str, kind: Option<EffectKind>, path: Option<&str>) -> ToolCall {
@@ -646,7 +638,7 @@ mod tests {
                 "a.rs",
                 "a.rs",
                 "cargo test",
-                "offen"
+                "open"
             ]
         );
         let parents: Vec<Option<usize>> = g.nodes.iter().map(|n| n.parent).collect();
@@ -773,7 +765,7 @@ mod tests {
         let args = &tool
             .detail
             .iter()
-            .find(|(k, _)| k == "Argumente")
+            .find(|(k, _)| k == "Arguments")
             .unwrap()
             .1;
         assert!(!args.contains('\u{1b}'));

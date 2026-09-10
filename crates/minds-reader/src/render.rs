@@ -62,7 +62,7 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
     let head = repo.head()?.commit().ok_or(ReaderError::UnbornHead)?;
 
     std::fs::create_dir_all(out)
-        .map_err(|e| ReaderError::io("Ausgabeverzeichnis anlegen", out, e))?;
+        .map_err(|e| ReaderError::io("creating output directory", out, e))?;
 
     let mut links: Vec<FileLink> = Vec::new();
     let mut used: BTreeSet<String> = BTreeSet::new();
@@ -182,7 +182,7 @@ fn short_hex(id: SessionId) -> String {
 }
 
 fn write(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents).map_err(|e| ReaderError::io("Seite schreiben", path, e))
+    std::fs::write(path, contents).map_err(|e| ReaderError::io("writing page", path, e))
 }
 
 #[cfg(test)]

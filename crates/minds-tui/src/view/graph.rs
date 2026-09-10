@@ -27,7 +27,7 @@ pub fn draw(
 ) {
     let Some(card) = app.inspection.card(id) else {
         frame.render_widget(
-            Paragraph::new("Session nicht lesbar.").style(theme::dim()),
+            Paragraph::new("Session unreadable.").style(theme::dim()),
             area,
         );
         return;
@@ -57,13 +57,13 @@ pub fn draw(
     // Die uebrigen Achsen und Beziehungen, wo vorhanden: Epoche, Deutung,
     // Content-Uebergaben — der Kopf zeigt Beweiszustaende, nicht nur Logs.
     if let Some((k, n)) = card.epoch_position {
-        seal_summary.push_str(&format!(" · Epoche {k}/{n}"));
+        seal_summary.push_str(&format!(" · epoch {k}/{n}"));
     }
     if card.uninterpreted_calls > 0 {
-        seal_summary.push_str(&format!(" · ◐ {} nicht gedeutet", card.uninterpreted_calls));
+        seal_summary.push_str(&format!(" · ◐ {} uninterpreted", card.uninterpreted_calls));
     }
     if card.handovers > 0 {
-        seal_summary.push_str(&format!(" · ⇄ {} Übergabe(n)", card.handovers));
+        seal_summary.push_str(&format!(" · ⇄ {} handover(s)", card.handovers));
     }
     // Die Summary wächst — geclippt, damit die hinten stehenden Verdikte
     // (Kanten-Beleg, Review) auf schmalen Terminals nicht abgeschnitten
@@ -77,7 +77,7 @@ pub fn draw(
                     format!("SESSION {short}… "),
                     theme::title().fg(theme::AGENT),
                 ),
-                Span::styled(if timeline { "ZEITLEISTE" } else { "GRAPH" }, theme::dim()),
+                Span::styled(if timeline { "TIMELINE" } else { "GRAPH" }, theme::dim()),
             ]),
             Line::from(vec![
                 Span::styled(
@@ -85,7 +85,7 @@ pub fn draw(
                     Style::default().fg(theme::AGENT),
                 ),
                 Span::raw(format!(
-                    " · {} · {} Dateien · {}/{} Token · ",
+                    " · {} · {} file(s) · {}/{} tokens · ",
                     when(card.started_at.as_deref()),
                     card.summary.files,
                     card.summary.input_tokens,
@@ -174,7 +174,7 @@ fn graph_detail(app: &App, id: SessionId, row: &Row) -> Option<Vec<Line<'static>
     let mut lines: Vec<Line> = node
         .detail
         .iter()
-        .filter(|(k, _)| k != "Beleg")
+        .filter(|(k, _)| k != "Evidence")
         .map(|(k, v)| {
             Line::from(vec![
                 Span::styled(format!("{k:<10} "), theme::dim()),
@@ -184,7 +184,7 @@ fn graph_detail(app: &App, id: SessionId, row: &Row) -> Option<Vec<Line<'static>
         .collect();
     if let Some(at) = &node.at {
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<10} ", "Zeit"), theme::dim()),
+            Span::styled(format!("{:<10} ", "Time"), theme::dim()),
             Span::raw(when(Some(at))),
         ]));
     }
@@ -204,7 +204,7 @@ fn graph_detail(app: &App, id: SessionId, row: &Row) -> Option<Vec<Line<'static>
     {
         let (glyph, word, style) = theme::evidence(Some(link.evidence));
         lines.push(Line::from(vec![
-            Span::styled(format!("{:<10} ", "Beleg"), theme::dim()),
+            Span::styled(format!("{:<10} ", "Evidence"), theme::dim()),
             Span::styled(format!("{glyph} {word}"), style),
         ]));
         lines.push(Line::from(Span::styled(
@@ -219,7 +219,7 @@ fn graph_detail(app: &App, id: SessionId, row: &Row) -> Option<Vec<Line<'static>
     }
     if row.count > 1 {
         lines.push(Line::from(Span::styled(
-            format!("{} Aufrufe zusammengefasst — Zoom 2 zeigt jeden", row.count),
+            format!("{} calls merged — zoom 2 shows each one", row.count),
             theme::dim(),
         )));
     }

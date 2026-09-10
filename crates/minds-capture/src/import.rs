@@ -73,7 +73,7 @@ fn import_agent(agent: &str, repo_root: &Path, home: &Path) -> AgentImport {
         other => AgentImport {
             agent: other.to_string(),
             sessions: Vec::new(),
-            note: Some("kein Importer (Format nicht verifiziert)".to_string()),
+            note: Some("no importer (format not verified)".to_string()),
             errors: Vec::new(),
         },
     }
@@ -116,12 +116,12 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
                     .unwrap_or("unbekannt");
                 match std::fs::read(&path) {
                     Ok(bytes) => sessions.extend(parse_claude_code(&bytes, fallback)),
-                    Err(err) => errors.push(format!("{} nicht lesbar: {err}", path.display())),
+                    Err(err) => errors.push(format!("{} is unreadable: {err}", path.display())),
                 }
             }
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => errors.push(format!("{} nicht lesbar: {err}", dir.display())),
+        Err(err) => errors.push(format!("{} is unreadable: {err}", dir.display())),
     }
 
     // Keine stillen Ausfälle — auch keine stillen Auslassungen: Wenn die
@@ -134,7 +134,7 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
         .filter(|c| c.arguments.contains(minds_redact::SECRET_FILE_PLACEHOLDER))
         .count();
     if walled > 0 {
-        let hint = format!("{walled} Tool-Call(s) hinter der secretfile-Mauer ausgelassen");
+        let hint = format!("{walled} tool call(s) omitted behind the secretfile wall");
         note = Some(match note {
             Some(existing) => format!("{existing}; {hint}"),
             None => hint,
@@ -662,7 +662,7 @@ mod tests {
 
         let codex = reports.iter().find(|r| r.agent == "codex").unwrap();
         assert!(codex.sessions.is_empty());
-        assert!(codex.note.as_deref().unwrap().contains("kein Importer"));
+        assert!(codex.note.as_deref().unwrap().contains("no importer"));
     }
 
     #[test]
@@ -706,7 +706,7 @@ mod tests {
             claude.errors
         );
         assert!(
-            claude.errors[0].contains("nicht lesbar"),
+            claude.errors[0].contains("is unreadable"),
             "{:?}",
             claude.errors
         );

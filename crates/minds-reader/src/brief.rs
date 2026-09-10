@@ -38,16 +38,16 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
     let _ = writeln!(out, "# {title}\n");
     let _ = writeln!(
         out,
-        "_{} Session(s), deterministisch aus dem erfassten Kontext — 0 Tokens._\n",
+        "_{} session(s), derived deterministically from captured context — 0 tokens._\n",
         sessions.len()
     );
 
     // --- Absicht ---------------------------------------------------------
     let requests = dedup(sessions.iter().filter_map(|s| {
         let line = headline(&s.intent.request, REQUEST_MAX);
-        (line != "(kein Prompt erfasst)").then_some(line)
+        (line != "(no prompt captured)").then_some(line)
     }));
-    section(&mut out, "Absicht", &requests, take, |r| format!("- {r}"));
+    section(&mut out, "Intent", &requests, take, |r| format!("- {r}"));
 
     // --- Constraints & deklarierte Sackgassen ----------------------------
     let constraints = dedup(sessions.iter().flat_map(|s| s.intent.constraints.clone()));
@@ -58,7 +58,7 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
     let discarded = dedup(sessions.iter().flat_map(|s| s.intent.discarded.clone()));
     section(
         &mut out,
-        "Verworfene Ansätze (deklariert)",
+        "Discarded approaches (declared)",
         &discarded,
         take,
         |d| format!("- {d}"),
@@ -67,7 +67,7 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
     // --- Beobachtete Fakten ----------------------------------------------
     section(
         &mut out,
-        "Funktionierende Befehle",
+        "Commands that worked",
         &extract.commands,
         take,
         |c| format!("- `{}`{}", c.command, times(c.count)),
@@ -75,7 +75,7 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
 
     section(
         &mut out,
-        "Häufig geänderte Dateien",
+        "Frequently changed files",
         &extract.hot_files,
         take,
         |f| {
@@ -83,16 +83,16 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
                 "- `{}` — {} {} in {} {}",
                 f.path,
                 f.changes,
-                plural(f.changes, "Änderung", "Änderungen"),
+                plural(f.changes, "change", "changes"),
                 f.sessions,
-                plural(f.sessions, "Session", "Sessions"),
+                plural(f.sessions, "session", "sessions"),
             )
         },
     );
 
     section(
         &mut out,
-        "Zusammen geändert",
+        "Changed together",
         &extract.co_changes,
         take,
         |c| format!("- `{}` + `{}`{}", c.a, c.b, times(c.count)),
@@ -101,30 +101,30 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
     // --- Heuristisch ------------------------------------------------------
     section(
         &mut out,
-        "Sackgassen (heuristisch)",
+        "Dead ends (heuristic)",
         &extract.reworks,
         take,
         |r| match &r.kind {
             ReworkKind::WrittenThenDeleted => {
-                format!("- `{}`: angelegt und wieder gelöscht", r.path)
+                format!("- `{}`: created and deleted again", r.path)
             }
             ReworkKind::Churned { edits } => {
-                format!("- `{}`: {edits}× umgeschrieben", r.path)
+                format!("- `{}`: rewritten {edits}×", r.path)
             }
         },
     );
 
     section(
         &mut out,
-        "Korrekturen (heuristisch)",
+        "Corrections (heuristic)",
         &extract.corrections,
         take,
-        |c| format!("- „{}“", c.text),
+        |c| format!("- “{}”", c.text),
     );
 
     // Nichts Verwertbares? Ehrlich sagen statt leerer Überschriften.
     if requests.is_empty() && constraints.is_empty() && discarded.is_empty() && extract.is_empty() {
-        let _ = writeln!(out, "_Kein verwertbarer Kontext gefunden._");
+        let _ = writeln!(out, "_No usable context found._");
     }
 
     out
@@ -147,7 +147,7 @@ fn section<T>(
         let _ = writeln!(out, "{}", line(item));
     }
     if n < items.len() {
-        let _ = writeln!(out, "- … (+{} weitere)", items.len() - n);
+        let _ = writeln!(out, "- … (+{} more)", items.len() - n);
     }
     out.push('\n');
 }
@@ -249,8 +249,8 @@ mod tests {
     #[test]
     fn empty_sessions_say_so() {
         let out = render("Kontext-Brief", &[], None);
-        assert!(out.contains("Kein verwertbarer Kontext"));
-        assert!(!out.contains("## Absicht"));
+        assert!(out.contains("No usable context"));
+        assert!(!out.contains("## Intent"));
     }
 
     #[test]
@@ -260,11 +260,11 @@ mod tests {
             .push(assistant(vec![exec("cargo test"), write("src/retry.rs")]));
 
         let out = render("Kontext-Brief", &[s], None);
-        assert!(out.contains("## Absicht"));
+        assert!(out.contains("## Intent"));
         assert!(out.contains("- Retry-Test reparieren"));
-        assert!(out.contains("## Funktionierende Befehle"));
+        assert!(out.contains("## Commands that worked"));
         assert!(out.contains("`cargo test`"));
-        assert!(out.contains("## Häufig geänderte Dateien"));
+        assert!(out.contains("## Frequently changed files"));
         assert!(out.contains("`src/retry.rs`"));
     }
 
@@ -286,14 +286,14 @@ mod tests {
             .push(assistant(vec![exec("cmd-a"), exec("cmd-b"), exec("cmd-c")]));
         let out = render("T", &[s], Some(1));
         // Genau ein Befehl plus ein „weitere"-Hinweis.
-        assert!(out.contains("(+2 weitere)"), "{out}");
+        assert!(out.contains("(+2 more)"), "{out}");
     }
 
     #[test]
     fn empty_prompt_is_not_listed_as_an_intent() {
         let s = session("   ");
         let out = render("T", &[s], None);
-        assert!(!out.contains("## Absicht"), "{out}");
+        assert!(!out.contains("## Intent"), "{out}");
     }
 
     /// R.7 — der Brief ist Byte für Byte stabil. Ändert sich das Format
@@ -310,23 +310,23 @@ mod tests {
         let expected = "\
 # Kontext-Brief — Test
 
-_1 Session(s), deterministisch aus dem erfassten Kontext — 0 Tokens._
+_1 session(s), derived deterministically from captured context — 0 tokens._
 
-## Absicht
+## Intent
 
 - Fix the retry test.
 
-## Funktionierende Befehle
+## Commands that worked
 
 - `cargo test`
 
-## Häufig geänderte Dateien
+## Frequently changed files
 
-- `src/retry.rs` — 1 Änderung in 1 Session
+- `src/retry.rs` — 1 change in 1 session
 
-## Korrekturen (heuristisch)
+## Corrections (heuristic)
 
-- „Nein, das ist falsch.“
+- “Nein, das ist falsch.”
 
 ";
         assert_eq!(render("Kontext-Brief — Test", &[s], None), expected);

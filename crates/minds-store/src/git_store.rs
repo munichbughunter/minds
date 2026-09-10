@@ -1207,7 +1207,7 @@ impl ContextStore for GitStore {
             Err(minds_git::GitError::RefRaced { .. }) => match self.seal_text(&id)? {
                 Some(_) => Ok(id),
                 None => Err(StoreError::backend(std::io::Error::other(
-                    "Seal-Ref bewegte sich, trägt aber keinen Seal",
+                    "the seal ref moved but carries no seal",
                 ))),
             },
             Err(err) => Err(StoreError::backend(err)),
@@ -1299,7 +1299,7 @@ impl ContextStore for GitStore {
             )));
         }
         let reference = seal_ref(id);
-        let message = format!("minds: Signatur für Seal {id}");
+        let message = format!("minds: signature for seal {id}");
         let mut attempts_left = PUT_ATTEMPTS;
         loop {
             attempts_left -= 1;

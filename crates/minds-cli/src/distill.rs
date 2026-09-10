@@ -35,8 +35,8 @@ fn distill(path: Option<&str>, out: Option<&str>) -> Fallible<()> {
     }
 
     let title = match path {
-        Some(path) => format!("AGENTS.md-Entwurf — {path}"),
-        None => "AGENTS.md-Entwurf".to_string(),
+        Some(path) => format!("AGENTS.md draft — {path}"),
+        None => "AGENTS.md draft".to_string(),
     };
     let markdown = minds_reader::brief::render(&title, &sessions, None);
 
@@ -46,7 +46,7 @@ fn distill(path: Option<&str>, out: Option<&str>) -> Fallible<()> {
     match out {
         Some(file) => {
             std::fs::write(file, &markdown)?;
-            eprintln!("geschrieben: {file} ({} Sessions)", sessions.len());
+            eprintln!("written: {file} ({} sessions)", sessions.len());
         }
         None => print!("{markdown}"),
     }

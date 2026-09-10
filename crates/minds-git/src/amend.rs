@@ -225,7 +225,7 @@ impl Repo {
                     force_create_reflog: false,
                     // Der Reflog ist die Rückfahrkarte: Er nennt den Vorgang
                     // beim Namen und hält den alten Commit erreichbar.
-                    message: "minds: Session-Trailer nachgerüstet".into(),
+                    message: "minds: session trailer retrofitted".into(),
                 },
                 expected: PreviousValue::MustExistAndMatch(Target::Object(before.to_gix())),
                 new: Target::Object(after.to_gix()),

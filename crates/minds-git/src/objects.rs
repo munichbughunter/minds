@@ -139,10 +139,7 @@ impl Repo {
                 continue;
             }
             let path = String::from_utf8(record.filepath.into()).map_err(|_| {
-                GitError::invalid_path(
-                    "<nicht darstellbar>",
-                    "Pfad im Baum ist kein gültiges UTF-8",
-                )
+                GitError::invalid_path("<not representable>", "path in tree is not valid UTF-8")
             })?;
             paths.push(path);
         }
@@ -265,15 +262,15 @@ impl Repo {
 /// das des Betriebssystems.
 fn validate_path(path: &str) -> Result<()> {
     let reason = if path.is_empty() {
-        Some("leerer Pfad")
+        Some("empty path")
     } else if path.starts_with('/') || path.ends_with('/') {
-        Some("führender oder abschließender Schrägstrich")
+        Some("leading or trailing slash")
     } else if path.contains('\0') {
-        Some("Nullbyte im Pfad")
+        Some("null byte in path")
     } else if path.split('/').any(str::is_empty) {
-        Some("leere Pfadkomponente")
+        Some("empty path component")
     } else if path.split('/').any(|part| part == "." || part == "..") {
-        Some("Pfadkomponente \".\" oder \"..\"")
+        Some("path component \".\" or \"..\"")
     } else {
         None
     };

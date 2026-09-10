@@ -103,9 +103,9 @@ impl ForgottenPlace {
     /// Eine menschenlesbare Bezeichnung für die CLI-Ausgabe.
     pub fn label(self) -> &'static str {
         match self {
-            ForgottenPlace::StoreRef => "Store-Referenz",
-            ForgottenPlace::SessionBranch => "Session-Branch (session.json und session.md)",
-            ForgottenPlace::ContextTree => "Kontext-Baum (Bestandsformat)",
+            ForgottenPlace::StoreRef => "store ref",
+            ForgottenPlace::SessionBranch => "session branch (session.json and session.md)",
+            ForgottenPlace::ContextTree => "context tree (legacy format)",
         }
     }
 }
@@ -313,7 +313,7 @@ pub trait ContextStore {
     /// der Seals selbst).
     fn record_session_seal(&self, _session: SessionId, _seal_id: &ContentHash) -> Result<()> {
         Err(StoreError::backend(std::io::Error::other(
-            "dieses Backend kennt keine Seal-Rückverweise",
+            "this backend does not support seal back-references",
         )))
     }
 

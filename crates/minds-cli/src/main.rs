@@ -75,156 +75,160 @@ use minds_core::Decision;
 use minds_store::StoreConfig;
 
 const USAGE: &str = "\
-minds — dauerhafter Kontext für Agent-Sessions, in Git.
+minds — durable context for agent sessions, in Git.
 
-Verwendung:
-  minds enable [--agent <name>] [--child-repo <pfad>] [--child-remote <url>] [-v] [--ref <name>] [--recall]
-        Richtet das Repo Minds-fähig ein: registriert die Hooks im Agenten
-        und im Repo und schreibt die Store-Config nach .git/config.
-        Läuft still; -v/--verbose zeigt, was im Einzelnen passiert.
-        Ohne --agent: alle bekannten Agents. Idempotent, fremdschonend.
-        Agents: claude-code, codex, cursor, gemini, opencode, all.
-        --child-repo legt den Kontext in ein separates Repo statt in-repo;
-        es wird angelegt (bare) oder von --child-remote geklont.
-        --recall (Claude Code): SessionStart-Hook, der den Kontext-Brief der
-        vorigen Sessions der neuen Session voranstellt. Opt-in (kostet Tokens).
-        --global-hooks: bestätigt ein Hook-Verzeichnis außerhalb des Repos
-        (z. B. global gesetztes core.hooksPath) — Hooks dort gelten für alle
-        Repositories. Ohne das Flag fragt enable nach bzw. bricht ab.
+Usage:
+  minds enable [--agent <name>] [--child-repo <path>] [--child-remote <url>] [-v] [--ref <name>] [--recall]
+        Sets the repo up for Minds: registers the hooks with the agent
+        and in the repo and writes the store config to .git/config.
+        Runs quietly; -v/--verbose shows every single step.
+        Without --agent: all known agents. Idempotent, leaves foreign
+        entries alone. Agents: claude-code, codex, cursor, gemini,
+        opencode, all.
+        --child-repo puts the context into a separate repo instead of
+        in-repo; it is created (bare) or cloned from --child-remote.
+        --recall (Claude Code): SessionStart hook that puts the context
+        brief of previous sessions in front of the new session. Opt-in
+        (costs tokens).
+        --global-hooks: confirms a hooks directory outside the repo
+        (e.g. a globally set core.hooksPath) — hooks there apply to all
+        repositories. Without the flag, enable asks or aborts.
 
   minds hook --agent <name> [--event <name>]
-        Nimmt ein Agent-Hook-Event auf stdin entgegen und legt es im
-        lokalen Journal ab. Endet immer mit 0.
+        Accepts an agent hook event on stdin and stores it in the local
+        journal. Always exits 0.
 
   minds checkpoint [--commit <id>]
-        Deutet das Journal, redigiert (Policy optional aus .minds/redact.json:
-        allow/deny_secrets/deny_pii/secret_keys …), legt die Sessions im Store ab
-        und hängt den Minds-Session-Id-Trailer an HEAD. Ruft der post-commit-Hook.
+        Interprets the journal, redacts (policy optionally from
+        .minds/redact.json: allow/deny_secrets/deny_pii/secret_keys …),
+        stores the sessions and appends the Minds-Session-Id trailer to
+        HEAD. Called by the post-commit hook.
 
   minds show [<commit>] [--full]
-        Zeigt Intent und Attribution der Session(s) hinter einem Commit
-        (Default HEAD). Kompakt; --full zeigt Prompt, alle Dateien und Kanten.
+        Shows intent and attribution of the session(s) behind a commit
+        (default HEAD). Compact; --full shows prompt, all files and edges.
 
-  minds why <datei>:<zeile> [--full]
-        Zeigt die Session hinter einer einzelnen Zeile (blame → Trailer).
+  minds why <file>:<line> [--full]
+        Shows the session behind a single line (blame → trailer).
 
-  minds blame <datei>
-        Überblick, welche Session hinter welchen Zeilen einer Datei steckt,
-        nach Session aggregiert, mit Kontext-Abdeckung in Prozent.
+  minds blame <file>
+        Overview of which session sits behind which lines of a file,
+        aggregated by session, with context coverage in percent.
 
-  minds recall <ziel>
-        Verdichtet die Session(s) hinter einer Datei, einer Zeile
-        (<datei>:<zeile>) oder einem Commit zu einem knappen Kontext-Brief.
-        Deterministisch, 0 Tokens — die Agent-Schwester von why.
+  minds recall <target>
+        Condenses the session(s) behind a file, a line (<file>:<line>) or
+        a commit into a concise context brief.
+        Deterministic, 0 tokens — the agent sibling of why.
 
-  minds distill [--path <verzeichnis>] [--out <datei>]
-        Verdichtet die Historie des Repos (oder eines Pfades) zu einem
-        AGENTS.md-Entwurf: Befehle, Hot-Files, Sackgassen, Korrekturen.
-        Ohne --out nach stdout.
+  minds distill [--path <directory>] [--out <file>]
+        Condenses the repo's history (or a path's) into an AGENTS.md
+        draft: commands, hot files, dead ends, corrections.
+        Without --out, to stdout.
 
-  minds brief [<datei>...]
-        Größenbegrenzter Kontext-Block für den Start einer Agent-Session.
-        Ohne Pfade das ganze Repo.
+  minds brief [<file>...]
+        Size-bounded context block for the start of an agent session.
+        Without paths, the whole repo.
 
   minds recap [--limit <n>] [--all]
-        Die jüngsten Sessions auf einen Blick (Default 10; --all zeigt alle).
+        The most recent sessions at a glance (default 10; --all shows all).
 
   minds search <query>
-        Durchsucht Absicht, Verlauf und Dateien der erfassten Sessions.
+        Searches intent, transcript and files of the captured sessions.
 
-  minds inspect [<suche> | <datei>:<zeile>]
-        Die Entstehung einer Änderung, im Terminal: Session-Liste, Graph
-        einer Session (Absicht → Agent → Effekte → Change → Review) und die
-        Why-Kette einer Zeile. Rein lesend. Ist stdout keine Konsole, kommen
-        die Zeilen tab-separiert (für grep/fzf).
+  minds inspect [<search> | <file>:<line>]
+        How a change came to be, in the terminal: session list, a
+        session's graph (intent → agent → effects → change → review) and
+        a line's why chain. Read-only. If stdout is not a console, the
+        lines come tab-separated (for grep/fzf).
 
   minds agent-help
-        Maschinenlesbare Kommando-Karte (JSON) — für Agents, nicht Menschen.
+        Machine-readable command card (JSON) — for agents, not humans.
 
   minds metrics [--format prometheus|openmetrics|json]
-        Kennzahlen aus dem Store (Throughput, Iteration, Continuity, Streak,
-        Redaction, Kontext-Abdeckung). Default Prometheus, für Grafana.
+        Metrics from the store (throughput, iteration, continuity, streak,
+        redaction, context coverage). Default Prometheus, for Grafana.
 
   minds fsck [--require-review]
-        Prüft, ob jeder Trailer auflösbar ist, und meldet Journal-Lücken.
-        Rückgabewert ≠ 0 bei verwaisten Trailern. --require-review: verlangt für
-        jeden agent-authored Change ein Approve (Policy-Gate für die CI).
+        Checks that every trailer is resolvable and reports journal gaps.
+        Exit code ≠ 0 on orphaned trailers. --require-review: demands an
+        approve for every agent-authored change (policy gate for CI).
 
   minds forget <session> [--reason <text>]
-        DSGVO-Löschung: ersetzt die Nutzlast einer Session durch einen Tombstone.
-        Die Referenz bleibt auflösbar, der Inhalt verschwindet aus dem Store.
+        GDPR erasure: replaces a session's payload with a tombstone.
+        The reference stays resolvable, the content vanishes from the store.
 
   minds reinterpret <session>
-        Deutet die erhaltenen Tool-Aufrufe einer gespeicherten Session mit dem
-        aktuellen Adapter-Stand neu — strikt lesend, die Evidence bleibt
-        unverändert.
-  minds sign <session> [--key <pfad>]
-  minds sign --seal <seal-id> [--key <pfad>]
-        Signiert die Attribution einer Session (ssh-sig) nach stdout.
-        Schlüssel aus --key oder git config user.signingkey.
+        Reinterprets the preserved tool calls of a stored session with the
+        current adapter — strictly read-only, the evidence stays
+        unchanged.
+  minds sign <session> [--key <path>]
+  minds sign --seal <seal-id> [--key <path>]
+        Signs a session's attribution (ssh-sig) to stdout.
+        Key from --key or git config user.signingkey.
 
-  minds verify <session> [--signers <datei>] [--identity <id>]
-        Das Evidence-Verdikt: Integrität × Coverage über die Seals der Session.
-        Exit-Codes: 0 VERIFIZIERT, 1 MANIPULIERT, 2 UNVOLLSTÄNDIG,
-        3 NICHT VERIFIZIERBAR.
-  minds verify <session> --sig <datei> [--signers <datei>] [--identity <id>]
-        Prüft eine signierte Attribution. Rückgabewert ist nicht 0 bei ungültig.
+  minds verify <session> [--signers <file>] [--identity <id>]
+        The evidence verdict: integrity × coverage over the session's seals.
+        Exit codes: 0 VERIFIED, 1 TAMPERED, 2 \"VERIFIED, INCOMPLETE\",
+        3 NOT VERIFIABLE.
+  minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
+        Checks a signed attribution. Exit code is non-zero when invalid.
   minds verify --evidence <seal-id>
-        Das Verdikt eines einzelnen Seals — auch ohne Session
-        (Redaction-Block).
+        The verdict of a single seal — even without a session
+        (redaction block).
 
   minds review <subject> --approve|--reject|--needs-work [--summary <text>]
-                          [--sign] [--key <pfad>]
-        Legt ein Review-Verdict als Git-Objekt an (refs/minds/reviews).
-        <subject> ist eine Change-Id (I…) oder Session-Id (b3…).
-        --sign unterschreibt es (ssh-sig) — aus einer Behauptung wird ein
-        Nachweis. Schlüssel aus --key oder git config user.signingkey.
+                          [--sign] [--key <path>]
+        Creates a review verdict as a Git object (refs/minds/reviews).
+        <subject> is a change id (I…) or session id (b3…).
+        --sign signs it (ssh-sig) — a claim becomes proof.
+        Key from --key or git config user.signingkey.
 
-  minds reviews <subject> [--signers <datei>] [--identity <id>]
-        Zeigt Verdicts und Thread zu einer Change-Id oder Session-Id.
-        Mit --signers werden die Signaturen geprüft statt nur gemeldet.
+  minds reviews <subject> [--signers <file>] [--identity <id>]
+        Shows verdicts and thread for a change id or session id.
+        With --signers, the signatures are checked instead of just listed.
 
-  minds comment <subject> [--on <datei:zeile|turn:<n>>] \"<text>\"
-        Hängt eine Anmerkung an den Review-Thread. Der Thread ist ein
-        append-only Log content-adressierter Einträge — zwei Reviewer offline
-        ergeben keinen Konflikt, sondern eine Vereinigung.
+  minds comment <subject> [--on <file:line|turn:<n>>] \"<text>\"
+        Attaches a remark to the review thread. The thread is an
+        append-only log of content-addressed entries — two reviewers
+        offline yield no conflict but a union.
 
   minds sync [--remote <name>] [--detach] [-v]
-        Schickt Kontext und Reviews an das Remote — alle fälligen Refs in
-        einer Verbindung, nie mit --force; einzige Ausnahme ist die
-        Übertragung einer DSGVO-Löschung (Tombstone-Ref). Ruft der
-        pre-push-Hook; ohne neue Refs kostet der Aufruf keine Verbindung.
-        --detach (der Hook) übergibt den Transport einem Hintergrundprozess,
-        damit der Push des Nutzers nicht auf ihn wartet.
+        Sends context and reviews to the remote — all due refs in one
+        connection, never with --force; the only exception is the transfer
+        of a GDPR erasure (tombstone ref). Called by the pre-push hook;
+        without new refs the call costs no connection.
+        --detach (the hook) hands the transport to a background process
+        so the user's push does not wait for it.
 
   minds stack [--base <ref>]
-        Zeigt die abhängigen Changes ab der Basis und ihren jeweiligen
-        Review-Stand. Weil das Verdict an der Change-Id hängt, überlebt es
-        Rebase und Force-Push.
+        Shows the dependent changes above the base and their respective
+        review state. Because the verdict hangs off the change id, it
+        survives rebase and force-push.
 
-  minds gitlab mirror <subject> --mr <nr> [--url <basis>] [--project <id>]
+  minds gitlab mirror <subject> --mr <nr> [--url <base>] [--project <id>]
                       [--token-env <var>] [--approve]
-        Spiegelt die Verdicts eines Changes als MR-Note nach GitLab —
-        einweg und idempotent. Quelle bleibt das Repo. Token nur aus der
-        Umgebung (Default MINDS_GITLAB_TOKEN), nie als Argument.
+        Mirrors a change's verdicts as an MR note to GitLab — one-way
+        and idempotent. The repo stays the source. Token only from the
+        environment (default MINDS_GITLAB_TOKEN), never as an argument.
 
   minds gitlab webhook [--write] [--secret-env <var>]
-        Liest eine GitLab-Webhook-Nutzlast von stdin und deutet einen
-        MR-Kommentar (/minds approve|reject|needs-work) als Verdict.
-        Ohne --write wird nur gezeigt, was entstünde. Opt-in, kein Dienst.
-        Steht in MINDS_GITLAB_WEBHOOK_SECRET (oder was --secret-env nennt)
-        ein Secret, wird der X-Gitlab-Token-Header verlangt: Der Empfänger
-        reicht ihn in MINDS_GITLAB_WEBHOOK_TOKEN durch, verglichen wird
-        timing-sicher; ohne Treffer wird die Nutzlast verworfen.
+        Reads a GitLab webhook payload from stdin and interprets an MR
+        comment (/minds approve|reject|needs-work) as a verdict.
+        Without --write, only shows what would be created. Opt-in, not a
+        service. If MINDS_GITLAB_WEBHOOK_SECRET (or whatever --secret-env
+        names) holds a secret, the X-Gitlab-Token header is required: the
+        receiver passes it through in MINDS_GITLAB_WEBHOOK_TOKEN, compared
+        in constant time; without a match the payload is discarded.
 
-  minds audit --export [--out <datei>] [--base <ref>] [--mode redacted|proof]
-        Bündelt die Provenienz-Kette (Change → Session → Attribution →
-        Verdict) als portable JSON-Datei. Enthält die kanonischen Payloads
-        und Signaturen — prüfbar ohne dieses Werkzeug. Ohne --out nach stdout.
+  minds audit --export [--out <file>] [--base <ref>] [--mode redacted|proof]
+        Bundles the provenance chain (change → session → attribution →
+        verdict) as a portable JSON file. Carries the canonical payloads
+        and signatures — verifiable without this tool. Without --out, to
+        stdout.
 
-  minds render [--out <verzeichnis>]
-        Baut eine statische HTML-Seite über den Kontext (Default ./site):
-        Zeile anklicken → Prompt dahinter sehen. Zustandslos.
+  minds render [--out <directory>]
+        Builds a static HTML page over the context (default ./site):
+        click a line → see the prompt behind it. Stateless.
 
   minds --version
   minds --help
@@ -449,15 +453,15 @@ fn unexpected_positional(spec: &Spec, arg: &str) -> String {
     let arg = text::sanitize(arg);
     match spec.positionals {
         0 => format!(
-            "unerwartetes Argument „{arg}“ — `minds {}` nimmt keine positionalen Argumente",
+            "unexpected argument \"{arg}\" — `minds {}` takes no positional arguments",
             spec.name
         ),
         1 => format!(
-            "unerwartetes Argument „{arg}“ — `minds {}` nimmt höchstens ein positionales Argument",
+            "unexpected argument \"{arg}\" — `minds {}` takes at most one positional argument",
             spec.name
         ),
         n => format!(
-            "unerwartetes Argument „{arg}“ — `minds {}` nimmt höchstens {n} positionale Argumente",
+            "unexpected argument \"{arg}\" — `minds {}` takes at most {n} positional arguments",
             spec.name
         ),
     }
@@ -475,13 +479,10 @@ fn unknown_flag(spec: &Spec, arg: &str) -> String {
         .collect();
     let arg = text::sanitize(arg);
     if known.is_empty() {
-        format!(
-            "unbekanntes Flag {arg} — `minds {}` kennt keine Flags",
-            spec.name
-        )
+        format!("unknown flag {arg} — `minds {}` knows no flags", spec.name)
     } else {
         format!(
-            "unbekanntes Flag {arg}\nbekannt für `minds {}`: {}",
+            "unknown flag {arg}\nknown for `minds {}`: {}",
             spec.name,
             known.join(", ")
         )
@@ -786,7 +787,7 @@ mod tests {
     #[test]
     fn a_flag_typo_is_an_error_that_names_the_alternatives() {
         let err = parse(spec_named("fsck"), &args(&["--require-reviews"])).unwrap_err();
-        assert!(err.contains("unbekanntes Flag"), "{err}");
+        assert!(err.contains("unknown flag"), "{err}");
         // Die Meldung nennt das richtige Flag — der Tippfehler ist ohne Blick
         // in die Doku auffindbar.
         assert!(err.contains("--require-review"), "{err}");
@@ -880,12 +881,12 @@ mod tests {
     #[test]
     fn an_excess_positional_is_an_error_not_decoration() {
         let err = parse(spec_named("fsck"), &args(&["require-review"])).unwrap_err();
-        assert!(err.contains("unerwartetes Argument"), "{err}");
+        assert!(err.contains("unexpected argument"), "{err}");
 
         // Und bei begrenzter Stelligkeit zählt die Grenze: `forget a b` vergäße
         // sonst nur `a` — mit Erfolgsmeldung.
         let err = parse(spec_named("forget"), &args(&["b3-a", "b3-b"])).unwrap_err();
-        assert!(err.contains("unerwartetes Argument"), "{err}");
+        assert!(err.contains("unexpected argument"), "{err}");
     }
 
     /// Ein doppelt gesetztes Wert-Flag ist eine Entscheidung, die der Parser

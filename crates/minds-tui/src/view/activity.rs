@@ -17,9 +17,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let cards = app.visible_cards();
     if cards.is_empty() {
         let text = if app.cards.is_empty() {
-            "Noch keine Sessions erfasst.\n\nminds enable richtet die Hooks ein; nach dem nächsten Commit steht die erste Session hier."
+            "No sessions captured yet.\n\nminds enable installs the hooks; after the next commit the first session appears here."
         } else {
-            "Kein Treffer für die Suche.\n\nEsc löscht die Suche."
+            "No match for the search.\n\nEsc clears the search."
         };
         frame.render_widget(Paragraph::new(text).style(theme::dim()), area);
         return;
@@ -120,8 +120,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("⛔ ", Style::default().fg(theme::DELETE)),
             Span::styled(
                 format!(
-                    "{} Session(s) zurückgehalten (Redaction) — Coverage versiegelt, \
-                     Details: minds fsck",
+                    "{} session(s) withheld (redaction) — coverage sealed, \
+                     details: minds fsck",
                     rejected.len()
                 ),
                 Style::default().fg(theme::REVIEW),
@@ -134,7 +134,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 fn state_word(card: &SessionCard) -> &'static str {
     match card.state {
         CardState::Ok => "",
-        CardState::Forgotten { .. } => "⌦ vergessen",
-        CardState::Unreadable { .. } => "? unlesbar",
+        CardState::Forgotten { .. } => "⌦ forgotten",
+        CardState::Unreadable { .. } => "? unreadable",
     }
 }

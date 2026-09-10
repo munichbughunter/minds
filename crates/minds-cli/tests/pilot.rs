@@ -240,7 +240,7 @@ fn blame_names_the_session_behind_each_line() {
     // Alle drei Zeilen stammen aus dem Commit mit erfasster Session — die
     // vollständige Zeile, damit auch ein Teilverlust (2 von 3) rot wird.
     assert!(
-        shown.contains("greet.rs — 3 Zeilen, 3 mit erfasstem Kontext (100%)"),
+        shown.contains("greet.rs — 3 lines, 3 with captured context (100%)"),
         "{shown}"
     );
     assert!(shown.contains("▸ "), "keine Session benannt: {shown}");
@@ -256,7 +256,11 @@ fn blame_refuses_what_head_does_not_know() {
 
     let out = minds(dir, &["blame", "gibt-es-nicht.txt"], None);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("nicht auflösbar"), "{}", text(&out));
+    assert!(
+        stderr(&out).contains("cannot be resolved"),
+        "{}",
+        text(&out)
+    );
 }
 
 #[test]
@@ -271,7 +275,7 @@ fn recap_lists_the_captured_session() {
     assert!(out.status.success(), "{}", text(&out));
     let shown = stdout(&out);
     assert!(
-        shown.contains("Die 1 jüngsten von 1 Session(s):"),
+        shown.contains("The 1 most recent of 1 session(s):"),
         "{shown}"
     );
 }
@@ -287,7 +291,7 @@ fn recap_rejects_a_limit_below_one() {
     let out = minds(dir, &["recap", "--limit", "0"], None);
     assert!(!out.status.success());
     assert!(
-        stderr(&out).contains("--limit erwartet eine Zahl ≥ 1"),
+        stderr(&out).contains("--limit expects a number ≥ 1"),
         "{}",
         text(&out)
     );
@@ -305,7 +309,7 @@ fn search_finds_the_prompt_and_names_misses() {
     let hit = minds(dir, &["search", "grußfunktion"], None);
     assert!(hit.status.success(), "{}", text(&hit));
     assert!(
-        stdout(&hit).contains(r#"1 Treffer für "grußfunktion":"#),
+        stdout(&hit).contains(r#"1 match(es) for "grußfunktion":"#),
         "{}",
         stdout(&hit)
     );
@@ -315,7 +319,7 @@ fn search_finds_the_prompt_and_names_misses() {
     let miss = minds(dir, &["search", "gibtsnicht"], None);
     assert!(miss.status.success(), "{}", text(&miss));
     assert!(
-        stdout(&miss).contains(r#"Keine Treffer für "gibtsnicht"."#),
+        stdout(&miss).contains(r#"No matches for "gibtsnicht"."#),
         "{}",
         stdout(&miss)
     );
@@ -347,7 +351,7 @@ fn brief_hook_emits_the_envelope_claude_code_parses() {
     let context = hook_output["additionalContext"]
         .as_str()
         .unwrap_or_else(|| panic!("additionalContext ist kein String: {doc}"));
-    assert!(context.contains("Kontext für den Agenten"), "{context}");
+    assert!(context.contains("Context for the agent"), "{context}");
     // Nicht nur die Form, auch der Inhalt: Die erfasste Session muss im
     // Brief auftauchen — ein leerer Store lieferte dieselbe Überschrift.
     assert!(
@@ -482,8 +486,8 @@ fn gitlab_mirror_posts_the_note_through_the_cli() {
     );
     assert!(out.status.success(), "{}", text(&out));
     let shown = stdout(&out);
-    assert!(shown.contains("gespiegelt: approve"), "{shown}");
-    assert!(shown.contains("neu an MR !4 gespiegelt"), "{shown}");
+    assert!(shown.contains("mirrored: approve"), "{shown}");
+    assert!(shown.contains("newly mirrored to MR !4"), "{shown}");
 
     // Die Pfade prüfen die Verdrahtung der Flags: `--project 1` und `--mr 4`
     // müssen im richtigen URL-Segment ankommen — das assertierte stdout allein
@@ -556,7 +560,7 @@ fn gitlab_webhook_rejects_a_wrong_or_missing_token() {
     );
     assert!(!wrong.status.success(), "{}", text(&wrong));
     assert!(
-        stderr(&wrong).contains("Token-Verifikation"),
+        stderr(&wrong).contains("token verification"),
         "{}",
         text(&wrong)
     );
@@ -604,7 +608,7 @@ fn gitlab_webhook_accepts_the_matching_token() {
     assert!(out.status.success(), "{}", text(&out));
     let shown = stdout(&out);
     assert!(shown.contains("approve"), "{shown}");
-    assert!(shown.contains("(laut Payload)"), "{shown}");
+    assert!(shown.contains("(claimed by payload)"), "{shown}");
 }
 
 #[test]
@@ -646,11 +650,7 @@ fn gitlab_webhook_commit_id_never_reaches_git_as_an_option() {
             &[("MINDS_GITLAB_WEBHOOK_SECRET", "")],
         );
         assert!(!out.status.success(), "{id}: {}", text(&out));
-        assert!(
-            stderr(&out).contains("kein Subjekt"),
-            "{id}: {}",
-            text(&out)
-        );
+        assert!(stderr(&out).contains("no subject"), "{id}: {}", text(&out));
     }
     assert!(
         !target.exists(),

@@ -31,7 +31,7 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Führt `minds reinterpret` aus.
 pub fn run(target: Option<&str>) -> ExitCode {
     let Some(target) = target else {
-        eprintln!("minds reinterpret: erwartet <session-id> (b3-…)");
+        eprintln!("minds reinterpret: expected <session-id> (b3-…)");
         return ExitCode::FAILURE;
     };
     match reinterpret(target) {
@@ -51,24 +51,24 @@ pub fn run(target: Option<&str>) -> ExitCode {
 fn reinterpret(target: &str) -> Fallible<()> {
     let id: SessionId = target
         .parse()
-        .map_err(|err| format!("keine gültige Session-Id {target:?}: {err}"))?;
+        .map_err(|err| format!("not a valid session id {target:?}: {err}"))?;
     let ctx = Context::open()?;
     let session = ctx
         .store
         .get(id)?
-        .ok_or_else(|| format!("Session {id} liegt nicht im Store"))?;
+        .ok_or_else(|| format!("session {id} is not in the store"))?;
 
     println!("Session   {id}");
     println!("Agent     {}", sanitize(&session.agent.name));
     let adapter = adapter_for(&session.agent.name);
     match adapter {
         Some(adapter) => println!(
-            "Adapter   {} v{} (aktueller Stand)",
+            "Adapter   {} v{} (current state)",
             adapter.agent(),
             adapter.version()
         ),
         None => println!(
-            "Adapter   keiner für {} — die Deutung bleibt „beobachtet, nicht gedeutet“",
+            "Adapter   none for {} — the interpretation stays \"observed, not interpreted\"",
             sanitize(&session.agent.name)
         ),
     }
@@ -81,8 +81,8 @@ fn reinterpret(target: &str) -> Fallible<()> {
             println!("#{calls} {}", sanitize(&call.name));
             calls += 1;
             // Die Evidenz-Adresse: unveränderlich, das ist der Punkt.
-            println!("   Evidenz       {id}#turn{turn_index}/call{call_index} (unverändert)");
-            println!("   gespeichert   {}", stored_line(call));
+            println!("   Evidence      {id}#turn{turn_index}/call{call_index} (unchanged)");
+            println!("   stored        {}", stored_line(call));
 
             let current = adapter.and_then(|a| a.interpret_stored(&call.name, &call.arguments));
             match current {
@@ -93,30 +93,30 @@ fn reinterpret(target: &str) -> Fallible<()> {
                         changed += 1;
                     }
                     println!(
-                        "   aktuell       {} v{} → {}{}",
+                        "   current       {} v{} → {}{}",
                         now.adapter,
                         now.adapter_version,
                         effect_line(now.status, Some(&now.effect)),
                         if same {
-                            " (unverändert)"
+                            " (unchanged)"
                         } else {
-                            " (NEU GEDEUTET)"
+                            " (REINTERPRETED)"
                         }
                     );
                 }
                 None => {
-                    println!("   aktuell       kein Adapter — Deutung unverändert");
+                    println!("   current       no adapter — interpretation unchanged");
                 }
             }
         }
     }
 
     if calls == 0 {
-        println!("keine Tool-Aufrufe — nichts zu deuten");
+        println!("no tool calls — nothing to interpret");
     } else {
         println!(
-            "{calls} Aufruf(e), {changed} mit neuerer Deutung. Die Evidence ist unverändert — \
-             nur der Blick darauf."
+            "{calls} call(s), {changed} with a newer interpretation. The evidence is unchanged — \
+             only the view of it."
         );
     }
     Ok(())
@@ -132,7 +132,7 @@ fn stored_line(call: &minds_core::ToolCall) -> String {
             effect_line(capture.status, call.effect.as_ref())
         ),
         None => format!(
-            "vor Evidence-Chain erfasst → {}",
+            "captured before the evidence chain → {}",
             effect_line(CaptureStatus::Interpreted, call.effect.as_ref())
         ),
     }
@@ -141,7 +141,7 @@ fn stored_line(call: &minds_core::ToolCall) -> String {
 /// Wirkung als Wort + Pfad — oder die ehrliche Leerstelle.
 fn effect_line(status: CaptureStatus, effect: Option<&minds_core::Effect>) -> String {
     if status == CaptureStatus::Uninterpreted {
-        return "◐ beobachtet, nicht gedeutet — Wirkung unbekannt".to_string();
+        return "◐ observed, not interpreted — effect unknown".to_string();
     }
     match effect {
         Some(effect) => {
@@ -157,6 +157,6 @@ fn effect_line(status: CaptureStatus, effect: Option<&minds_core::Effect>) -> St
                 None => word.to_string(),
             }
         }
-        None => "TOOL (ohne Effekt)".to_string(),
+        None => "TOOL (no effect)".to_string(),
     }
 }

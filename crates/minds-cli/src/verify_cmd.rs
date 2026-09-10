@@ -15,12 +15,12 @@
 //!
 //! | | Coverage vollständig | Coverage unvollständig/unbekannt |
 //! |---|---|---|
-//! | Integrität intakt | `VERIFIZIERT` | `VERIFIZIERT, UNVOLLSTÄNDIG` |
-//! | Integrität verletzt | `MANIPULIERT` | `MANIPULIERT` |
-//! | Kein Material | — | `NICHT VERIFIZIERBAR` |
+//! | Integrität intakt | `VERIFIED` | `VERIFIED, INCOMPLETE` |
+//! | Integrität verletzt | `TAMPERED` | `TAMPERED` |
+//! | Kein Material | — | `NOT VERIFIABLE` |
 //!
-//! Exit-Codes (CI-Vertrag): **0** VERIFIZIERT · **1** MANIPULIERT ·
-//! **2** VERIFIZIERT, UNVOLLSTÄNDIG · **3** NICHT VERIFIZIERBAR ·
+//! Exit-Codes (CI-Vertrag): **0** VERIFIED · **1** TAMPERED ·
+//! **2** VERIFIED, INCOMPLETE · **3** NOT VERIFIABLE ·
 //! **4** operativer Fehler (Store nicht lesbar, ssh-keygen fehlt, …) — ein
 //! flakiger Runner darf nie als „manipuliert" durchgehen, deshalb kollidiert
 //! der Fehlerpfad nicht mit Code 1.
@@ -57,12 +57,14 @@ enum Verdict {
 }
 
 impl Verdict {
+    // Delegiert an die eine Wortquelle (minds-core), damit CLI und
+    // Lesemodell dasselbe Verdikt sprechen.
     fn word(self) -> &'static str {
         match self {
-            Verdict::Verified => "VERIFIZIERT",
-            Verdict::Tampered => "MANIPULIERT",
-            Verdict::Incomplete => "VERIFIZIERT, UNVOLLSTÄNDIG",
-            Verdict::Unverifiable => "NICHT VERIFIZIERBAR",
+            Verdict::Verified => minds_core::evidence::Verdict::Verified.word(),
+            Verdict::Tampered => minds_core::evidence::Verdict::Tampered.word(),
+            Verdict::Incomplete => minds_core::evidence::Verdict::Incomplete.word(),
+            Verdict::Unverifiable => minds_core::evidence::Verdict::Unverifiable.word(),
         }
     }
 
@@ -91,18 +93,18 @@ pub fn run(
             Err(err) => operational_failure(err.as_ref()),
         },
         (Some(_), _, _) => {
-            eprintln!("minds verify: --evidence steht allein (ohne <session-id>/--sig)");
+            eprintln!("minds verify: --evidence stands alone (without <session-id>/--sig)");
             ExitCode::FAILURE
         }
         // Der Attestation-Pfad, unverändert.
         (None, Some(target), Some(sig)) => match verify_attestation(target, sig, signers, identity)
         {
             Ok(true) => {
-                println!("gültig");
+                println!("valid");
                 ExitCode::SUCCESS
             }
             Ok(false) => {
-                println!("UNGÜLTIG");
+                println!("INVALID");
                 ExitCode::FAILURE
             }
             Err(err) => {
@@ -116,7 +118,7 @@ pub fn run(
             Err(err) => operational_failure(err.as_ref()),
         },
         (None, None, _) => {
-            eprintln!("minds verify: erwartet <session-id> oder --evidence <seal-id>");
+            eprintln!("minds verify: expects <session-id> or --evidence <seal-id>");
             ExitCode::FAILURE
         }
     }
@@ -163,11 +165,11 @@ enum SignatureState {
 impl SignatureState {
     fn word(&self) -> &'static str {
         match self {
-            SignatureState::Unsigned => "unsigniert",
-            SignatureState::Unchecked => "signiert (ungeprüft — mit --signers prüfen)",
-            SignatureState::Valid => "Signatur gültig",
-            SignatureState::Invalid => "SIGNATUR UNGÜLTIG",
-            SignatureState::NotAttributable => "signiert (nicht zuordenbar — --identity angeben)",
+            SignatureState::Unsigned => "unsigned",
+            SignatureState::Unchecked => "signed (unchecked — verify with --signers)",
+            SignatureState::Valid => "signature valid",
+            SignatureState::Invalid => "SIGNATURE INVALID",
+            SignatureState::NotAttributable => "signed (not attributable — pass --identity)",
         }
     }
 }
@@ -179,10 +181,10 @@ fn verify_session(
 ) -> Fallible<Verdict> {
     let id: SessionId = target
         .parse()
-        .map_err(|err| format!("keine gültige Session-Id {target:?}: {err}"))?;
+        .map_err(|err| format!("not a valid session id {target:?}: {err}"))?;
     let ctx = Context::open()?;
 
-    println!("Session   {id}");
+    println!("Session        {id}");
 
     // 1. Die Session selbst: vorhanden, vergessen (payload-freier Beweis
     //    bleibt) — oder manipuliert.
@@ -216,19 +218,22 @@ fn verify_session(
                 })
                 .count();
             interpretation = Some((calls.len() - uninterpreted, uninterpreted));
-            println!("Payload   im Store (Schema {})", session.schema_version);
+            println!(
+                "Payload        in store (schema {})",
+                session.schema_version
+            );
         }
         Ok(None) => payload_missing = true,
         Err(StoreError::Forgotten { reason, .. }) => {
             // Der Grund ist fremdbestimmter Repo-Inhalt — Terminal-Härtung
             // an der Senke (#116), wie in render/reader.
             println!(
-                "Payload   vergessen ({}) — der Seal bleibt der Beweis",
+                "Payload        forgotten ({}) — the seal remains the evidence",
                 crate::text::sanitize(&reason)
             );
         }
         Err(StoreError::Corrupt { .. }) => {
-            println!("Payload   MANIPULIERT — Inhalt hasht nicht auf seine Id");
+            println!("Payload        TAMPERED — content does not hash to its id");
             tampered = true;
         }
         Err(err) => return Err(err.into()),
@@ -241,12 +246,13 @@ fn verify_session(
         seal_ids = seals_naming(ctx.store.as_ref(), id)?;
         if !seal_ids.is_empty() {
             notes.push(
-                "Seal-Rückverweis (evidence.json) fehlte — über den Namensraum gefunden".into(),
+                "the seal back-reference (evidence.json) was missing — found via the namespace"
+                    .into(),
             );
         }
     }
     if seal_ids.is_empty() && !tampered {
-        println!("Seals     keine — vor Evidence-Chain erfasst");
+        println!("Seals          none — captured before the evidence chain");
         println!("{}", Verdict::Unverifiable.word());
         return Ok(Verdict::Unverifiable);
     }
@@ -262,16 +268,16 @@ fn verify_session(
     for c in &checked {
         if let SealOutcome::Stored { session } = &c.seal.outcome {
             if session != &id.to_string() {
-                incomplete_reasons.push(format!("Seal {} nennt eine andere Session", c.id));
+                incomplete_reasons.push(format!("seal {} names a different session", c.id));
             } else if payload_missing {
                 incomplete_reasons
-                    .push("Seal sagt stored, aber der Payload liegt nicht in diesem Store".into());
+                    .push("the seal says stored, but the payload is not in this store".into());
                 payload_missing = false; // einmal genügt
             }
         }
     }
     if payload_missing {
-        notes.push("Payload liegt nicht in diesem Store".into());
+        notes.push("the payload is not in this store".into());
     }
 
     // 4. Coverage: gap-frei je Seal + geschlossene Epochenkette.
@@ -284,10 +290,10 @@ fn verify_session(
         }
     }
     for note in &notes {
-        println!("Hinweis   {note}");
+        println!("Note           {note}");
     }
     for reason in &incomplete_reasons {
-        println!("Lücke     {reason}");
+        println!("Gap            {reason}");
     }
 
     // 5. Heuristischer Epochen-Hinweis — wertet NIE auf.
@@ -296,8 +302,8 @@ fn verify_session(
             let siblings = sibling_sessions(ctx.store.as_ref(), id, &agent, &local_id)?;
             if siblings > 0 {
                 println!(
-                    "Hinweis   heuristisch: {siblings} weitere Session(s) derselben local_id \
-                     gefunden — rekonstruierte Nähe, kein Beleg; das Verdikt bleibt unverändert"
+                    "Note           heuristic: {siblings} other session(s) with the same local_id \
+                     found — reconstructed proximity, not evidence; the verdict stays unchanged"
                 );
             }
         }
@@ -317,8 +323,8 @@ fn verify_session(
     // Das Gesamt-Verdikt und die Exit-Codes bleiben der CI-Vertrag aus
     // Integrität × Coverage; die Deutung wertet nie auf oder ab.
     println!(
-        "Integrität {}",
-        if tampered { "VERLETZT" } else { "intakt" }
+        "Integrity      {}",
+        if tampered { "VIOLATED" } else { "intact" }
     );
     let scopes: Vec<String> = {
         // Zweite Schicht neben der Parse-Härtung: Der Scope stammt aus dem
@@ -335,39 +341,39 @@ fn verify_session(
         String::new()
     } else {
         format!(
-            " (Grenze: {} — Aktivität außerhalb ist nicht erfasst)",
+            " (boundary: {} — activity outside it is not captured)",
             scopes.join(", ")
         )
     };
     println!(
-        "Coverage   {}{boundary}",
+        "Coverage       {}{boundary}",
         if tampered {
-            "nicht bewertbar"
+            "not assessable"
         } else if complete && incomplete_reasons.is_empty() {
-            "vollständig innerhalb der Grenze"
+            "complete within the boundary"
         } else {
-            "unvollständig"
+            "incomplete"
         }
     );
     let interpretation_note = match interpretation {
         Some((_, 0)) => {
-            println!("Deutung    vollständig");
+            println!("Interpretation complete");
             None
         }
         Some((done, open)) => {
             println!(
-                "Deutung    teilweise — {open} von {} Tool-Aufruf(en) beobachtet, aber nicht gedeutet (◐)",
+                "Interpretation partial — {open} of {} tool call(s) observed but not interpreted (◐)",
                 done + open
             );
-            Some(" — Deutung teilweise")
+            Some(" — interpretation partial")
         }
         None => {
-            println!("Deutung    nicht bewertbar (Payload nicht lesbar)");
+            println!("Interpretation not assessable (payload unreadable)");
             None
         }
     };
     println!(
-        "Gesamt    {}{}",
+        "Overall        {}{}",
         verdict.word(),
         interpretation_note.unwrap_or("")
     );
@@ -391,13 +397,11 @@ fn check_seals(
         let text = match store.seal_text(id) {
             Ok(Some(text)) => text,
             Ok(None) => {
-                reasons.push(format!(
-                    "Seal {id} ist verwiesen, liegt aber nicht im Store"
-                ));
+                reasons.push(format!("seal {id} is referenced but not in the store"));
                 continue;
             }
             Err(StoreError::SealMismatch { .. }) => {
-                println!("Seal      {id}: MANIPULIERT — Text hasht nicht auf seine Id");
+                println!("Seal           {id}: TAMPERED — text does not hash to its id");
                 tampered = true;
                 continue;
             }
@@ -408,7 +412,7 @@ fn check_seals(
             Err(err) => {
                 // Hash stimmt, Form nicht: ein Artefakt, das wir nie so
                 // geschrieben hätten — der Ref wurde fremdbelegt.
-                println!("Seal      {id}: MANIPULIERT — {err}");
+                println!("Seal           {id}: TAMPERED — {err}");
                 tampered = true;
                 continue;
             }
@@ -476,21 +480,21 @@ fn coverage_complete(
     for c in checked {
         if c.seal.gaps > 0 {
             reasons.push(format!(
-                "Seal {}: {} Lücke(n) im Bereich {}–{}",
+                "seal {}: {} gap(s) in range {}–{}",
                 c.id, c.seal.gaps, c.seal.first_seq, c.seal.last_seq
             ));
             complete = false;
         }
         if c.seal.pre_chain > 0 {
             reasons.push(format!(
-                "Seal {}: {} Event(s) vor Evidence-Chain erfasst (ungebunden)",
+                "seal {}: {} event(s) captured before the evidence chain (unbound)",
                 c.id, c.seal.pre_chain
             ));
             complete = false;
         }
         if matches!(c.seal.outcome, SealOutcome::Rejected) {
             reasons.push(format!(
-                "Seal {}: Nutzlast durch Speicher-Policy zurückgewiesen",
+                "seal {}: payload rejected by the storage policy",
                 c.id
             ));
             complete = false;
@@ -515,7 +519,7 @@ fn coverage_complete(
             Some(prev) if in_set.contains_key(prev) => {
                 if !internal_targets.insert(prev) {
                     reasons.push(format!(
-                        "Epochen-Fork: mehrere Seals setzen auf {prev} auf — Reihenfolge nicht belegt"
+                        "epoch fork: multiple seals build on {prev} — order not attested"
                     ));
                     complete = false;
                 }
@@ -529,25 +533,25 @@ fn coverage_complete(
                         }
                         SealOutcome::Rejected => {
                             reasons.push(format!(
-                                "Epoche vor Seal {} wurde zurückgewiesen (Block-Seal {prev})",
+                                "the epoch before seal {} was rejected (block seal {prev})",
                                 c.id
                             ));
                             complete = false;
                         }
                     },
                     Err(_) => {
-                        reasons.push(format!("Vorgänger-Seal {prev} ist nicht lesbar"));
+                        reasons.push(format!("predecessor seal {prev} is unreadable"));
                         complete = false;
                     }
                 },
                 Ok(None) => {
                     reasons.push(format!(
-                        "Vorgänger-Seal {prev} liegt nicht im Store — Epochenkette offen"
+                        "predecessor seal {prev} is not in the store — epoch chain open"
                     ));
                     complete = false;
                 }
                 Err(StoreError::SealMismatch { .. }) => {
-                    reasons.push(format!("Vorgänger-Seal {prev} wurde verändert"));
+                    reasons.push(format!("predecessor seal {prev} was altered"));
                     complete = false;
                 }
                 Err(err) => return Err(err.into()),
@@ -556,7 +560,7 @@ fn coverage_complete(
     }
     if !checked.is_empty() && entry_points != 1 && complete {
         reasons.push(format!(
-            "Epochenkette hat {entry_points} Anfänge statt einem — Reihenfolge nicht belegt"
+            "the epoch chain has {entry_points} starting points instead of one — order not attested"
         ));
         complete = false;
     }
@@ -613,18 +617,14 @@ fn sibling_sessions(
 }
 
 fn print_seal_line(c: &CheckedSeal) {
-    let outcome = match &c.seal.outcome {
-        SealOutcome::Stored { .. } => "stored",
-        SealOutcome::Rejected => "zurückgewiesen",
-    };
     println!(
-        "Seal      {}: seq {}–{}, {} Event(s), {} Lücke(n), {} — {}",
+        "Seal           {}: seq {}–{}, {} event(s), {} gap(s), {} — {}",
         c.id,
         c.seal.first_seq,
         c.seal.last_seq,
         c.seal.events,
         c.seal.gaps,
-        outcome,
+        c.seal.outcome.human_word(),
         c.signature.word()
     );
 }
@@ -636,18 +636,18 @@ fn print_seal_line(c: &CheckedSeal) {
 fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> Fallible<Verdict> {
     let id: ContentHash = target
         .parse()
-        .map_err(|err| format!("keine gültige Seal-Id {target:?}: {err}"))?;
+        .map_err(|err| format!("not a valid seal id {target:?}: {err}"))?;
     let ctx = Context::open()?;
 
     let text = match ctx.store.seal_text(&id) {
         Ok(Some(text)) => text,
         Ok(None) => {
-            println!("Seal      {id}: liegt nicht im Store");
+            println!("Seal           {id}: not in the store");
             println!("{}", Verdict::Unverifiable.word());
             return Ok(Verdict::Unverifiable);
         }
         Err(StoreError::SealMismatch { .. }) => {
-            println!("Seal      {id}: Text hasht nicht auf seine Id");
+            println!("Seal           {id}: text does not hash to its id");
             println!("{}", Verdict::Tampered.word());
             return Ok(Verdict::Tampered);
         }
@@ -656,7 +656,7 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
     let seal = match Seal::parse(&text) {
         Ok(seal) => seal,
         Err(err) => {
-            println!("Seal      {id}: {err}");
+            println!("Seal           {id}: {err}");
             println!("{}", Verdict::Tampered.word());
             return Ok(Verdict::Tampered);
         }
@@ -676,12 +676,12 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
     let verdict = match &checked.seal.outcome {
         SealOutcome::Rejected => {
             println!(
-                "Hinweis   Nutzlast durch Speicher-Policy zurückgewiesen — der Seal ist der Beweis, dass der Bereich existierte"
+                "Note           payload rejected by the storage policy — the seal is the evidence that the range existed"
             );
             Verdict::Incomplete
         }
         SealOutcome::Stored { session } => {
-            println!("Session   {session}");
+            println!("Session        {session}");
             // Dieselbe Ketten-Logik wie beim Session-Verdikt: ein extern
             // aufgelöster stored-Vorgänger (oder ein Policy-Fix-Block-Seal
             // mit identischem Root) ist keine Lücke.
@@ -692,7 +692,7 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
                 &mut reasons,
             )?;
             for reason in &reasons {
-                println!("Lücke     {reason}");
+                println!("Gap            {reason}");
             }
             if complete {
                 Verdict::Verified
@@ -716,21 +716,21 @@ fn verify_attestation(
     identity: Option<&str>,
 ) -> Fallible<bool> {
     if !minds_attest::ssh_keygen_available() {
-        return Err("ssh-keygen nicht gefunden".into());
+        return Err("ssh-keygen not found".into());
     }
     let id: SessionId = target
         .parse()
-        .map_err(|err| format!("keine gültige Session-Id {target:?}: {err}"))?;
+        .map_err(|err| format!("not a valid session id {target:?}: {err}"))?;
 
     let ctx = Context::open()?;
     let session = ctx
         .store
         .get(id)?
-        .ok_or_else(|| format!("Session {id} liegt nicht im Store"))?;
+        .ok_or_else(|| format!("session {id} is not in the store"))?;
 
     let payload = minds_core::attestation_payload(id, &session)?;
     let signature = std::fs::read_to_string(sig_file)
-        .map_err(|err| format!("Signaturdatei {sig_file:?} nicht lesbar: {err}"))?;
+        .map_err(|err| format!("signature file {sig_file:?} unreadable: {err}"))?;
     let signers = resolve_signers(signers, &ctx.root)?;
     let identity = resolve_identity(identity, &ctx.root)?;
 
@@ -746,8 +746,8 @@ fn verify_attestation(
 /// gpg.ssh.allowedSignersFile`, sonst `~/.ssh/allowed_signers`.
 fn resolve_signers(signers: Option<&str>, root: &Path) -> Fallible<String> {
     resolve_signers_optional(signers, root).ok_or_else(|| {
-        "keine allowed_signers-Datei: --signers <datei> angeben oder \
-         `git config gpg.ssh.allowedSignersFile` setzen"
+        "no allowed_signers file: pass --signers <file> or set \
+         `git config gpg.ssh.allowedSignersFile`"
             .into()
     })
 }
@@ -776,9 +776,8 @@ fn resolve_identity(identity: Option<&str>, root: &Path) -> Fallible<String> {
     if let Some(identity) = identity {
         return Ok(identity.to_string());
     }
-    git_config(root, "user.email").ok_or_else(|| {
-        "keine Identität: --identity <id> angeben oder `git config user.email` setzen".into()
-    })
+    git_config(root, "user.email")
+        .ok_or_else(|| "no identity: pass --identity <id> or set `git config user.email`".into())
 }
 
 fn git_config(root: &Path, key: &str) -> Option<String> {

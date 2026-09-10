@@ -41,7 +41,7 @@ pub enum StoreError {
     /// In der Praxis heißt das: Ein Zähler liegt außerhalb des JCS-sicheren
     /// Bereichs (siehe `minds_core::canonical`). Ohne kanonische Bytes gibt es
     /// keine reproduzierbare ID — also wird nicht geschrieben.
-    #[error("Session lässt sich nicht kanonisch serialisieren")]
+    #[error("session cannot be serialized canonically")]
     Canonical(#[from] CanonError),
 
     /// Die Kanten-Datei einer Session ist nicht lesbar.
@@ -50,7 +50,7 @@ pub enum StoreError {
     /// auf Basis einer frischen Liste schriebe den Verlust aller bisherigen
     /// Kanten aktiv fest. Die Lese-Seite bleibt tolerant (der Index ist eine
     /// heuristische Ergänzung); nachzugehen ist dem in `minds fsck`.
-    #[error("links.json unter {reference} ist nicht lesbar — Kante nicht geschrieben")]
+    #[error("links.json at {reference} is unreadable — edge not written")]
     CorruptLinks {
         /// Der betroffene Session-Ref.
         reference: String,
@@ -64,7 +64,7 @@ pub enum StoreError {
     /// von Hand oder von einer fremden Implementierung in den Ref geschrieben
     /// wurde, hat die Pipeline nie gesehen. Es unbesehen an den Reader zu geben,
     /// hieße, es in eine statische HTML-Seite zu rendern.
-    #[error("Session {id} ist nicht als redigiert markiert")]
+    #[error("session {id} is not marked as redacted")]
     Unredacted {
         /// Die betroffene Session.
         id: SessionId,
@@ -75,7 +75,7 @@ pub enum StoreError {
     /// Der Selbsttest, den Content-Adressierung gratis mitbringt: Wer die Datei
     /// im Store nachträglich editiert, fliegt beim nächsten Lesen auf. Ein
     /// Audit-Record, der still verändert werden kann, ist keiner.
-    #[error("Inhalt unter {requested} hasht auf {actual} — der Store ist beschädigt")]
+    #[error("content at {requested} hashes to {actual} — the store is corrupted")]
     Corrupt {
         /// Die angefragte — und damit erwartete — ID.
         requested: SessionId,
@@ -88,7 +88,7 @@ pub enum StoreError {
     /// Nicht zu verwechseln mit einer *neueren* Schema-Version: Unbekannte
     /// Felder werden toleriert (Architektur-Prinzip 4). Hier ist das JSON selbst
     /// kaputt oder ein Pflichtfeld fehlt.
-    #[error("Inhalt unter {id} ist kein gültiges Session-JSON")]
+    #[error("content at {id} is not valid session JSON")]
     Malformed {
         /// Die betroffene Session.
         id: SessionId,
@@ -105,9 +105,7 @@ pub enum StoreError {
     /// anlegt. Minds legt es **nicht** von sich aus an — ein Store, der
     /// nebenbei Repositories erzeugt, verwandelt einen Tippfehler im Pfad in
     /// einen zweiten, leeren Kontext-Speicher.
-    #[error(
-        "Kontext-Repository {path} lässt sich nicht öffnen (angelegt wird es von `minds init`)"
-    )]
+    #[error("context repository {path} cannot be opened (it is created by `minds init`)")]
     ChildRepo {
         /// Der konfigurierte Pfad, bereits aufgelöst.
         path: PathBuf,
@@ -122,7 +120,7 @@ pub enum StoreError {
     /// Kein Defekt, sondern eine bewusste Löschung — die Referenz bleibt
     /// auflösbar (`exists` bleibt `true`), nur der Inhalt ist weg. Der Reader und
     /// `show`/`why` zeigen das als „vergessen", nicht als Fehler.
-    #[error("Session {id} wurde vergessen: {reason}")]
+    #[error("session {id} has been forgotten: {reason}")]
     Forgotten {
         /// Die vergessene Session.
         id: SessionId,
@@ -149,7 +147,7 @@ pub enum StoreError {
     /// (erneut `forget`) stimmt und ist idempotent; die genaue offene Stelle steht
     /// in der Fehlerkette (`{:#}` / `source()`).
     #[error(
-        "Session {id} nur teilweise vergessen: {}, aber {} blieb offen — `minds forget {id}` erneut ausführen, um die Löschung zu vollenden",
+        "session {id} only partially forgotten: {}, but {} is still pending — run `minds forget {id}` again to complete the deletion",
         describe_forgotten(.forgotten),
         .pending.label()
     )]
@@ -169,7 +167,7 @@ pub enum StoreError {
     ///
     /// Fail-closed am Schreibpfad: Ein Seal ist unser eigenes kanonisches
     /// Artefakt; was nicht parst, versiegelt nichts.
-    #[error("kein gültiger Seal — nicht abgelegt")]
+    #[error("not a valid seal — nothing stored")]
     InvalidSeal {
         /// Ursache aus dem Parser.
         #[source]
@@ -180,7 +178,7 @@ pub enum StoreError {
     ///
     /// Dasselbe Gratis-Versprechen wie [`StoreError::Corrupt`] bei Sessions:
     /// Wer den Seal im Ref nachträglich editiert, fliegt beim Lesen auf.
-    #[error("Seal unter {requested} hasht auf {actual} — der Seal wurde verändert")]
+    #[error("seal at {requested} hashes to {actual} — the seal has been altered")]
     SealMismatch {
         /// Die angefragte — und damit erwartete — Id.
         requested: ContentHash,
@@ -192,7 +190,7 @@ pub enum StoreError {
     ///
     /// Die Fassade: Was darunter liegt (gix, Dateisystem, Rechte), erreicht den
     /// Nutzer über die Fehlerkette (`{:#}` bzw. `source()`), nicht über den Typ.
-    #[error("der Kontext-Speicher lässt sich nicht lesen oder schreiben")]
+    #[error("the context store cannot be read or written")]
     Backend {
         /// Ursache aus dem Backend.
         #[source]
@@ -205,10 +203,10 @@ pub enum StoreError {
 fn describe_forgotten(places: &[ForgottenPlace]) -> String {
     if places.is_empty() {
         // Der erste Ort schlug fehl — es ist noch nichts getilgt.
-        "noch nichts getilgt".to_string()
+        "nothing erased yet".to_string()
     } else {
         format!(
-            "{} bereits getilgt",
+            "{} already erased",
             places
                 .iter()
                 .map(|place| place.label())

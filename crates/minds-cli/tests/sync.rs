@@ -107,7 +107,7 @@ fn all_due_refs_travel_in_one_call() {
 
     // Ein Aufruf, beide Refs — und die Meldung nennt beide.
     assert!(
-        text(&out).contains("2 Ref(s)"),
+        text(&out).contains("2 ref(s)"),
         "beide Refs müssen in einem Push gehen: {}",
         text(&out)
     );
@@ -160,7 +160,7 @@ fn detached_sync_hands_the_transport_off_and_returns_at_once() {
     let out = minds(&work, &["sync", "--remote", "origin", "--detach"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(
-        text(&out).contains("Ref(s) → origin im Hintergrund"),
+        text(&out).contains("ref(s) → origin in the background"),
         "die Übergabe muss benannt sein: {}",
         text(&out)
     );
@@ -180,7 +180,7 @@ fn detached_sync_hands_the_transport_off_and_returns_at_once() {
     // sonst bei jedem Push einen Prozess starten würde.
     let again = minds(&work, &["sync", "--remote", "origin", "--detach", "-v"]);
     assert!(
-        text(&again).contains("nichts Neues"),
+        text(&again).contains("nothing new"),
         "der Hintergrund muss seinen Erfolg vermerkt haben: {}",
         text(&again)
     );
@@ -198,7 +198,11 @@ fn a_failed_background_sync_brings_the_next_one_to_the_foreground() {
     git(&work, &["remote", "add", "kaputt", "/gibt/es/nicht.git"]);
 
     let first = minds(&work, &["sync", "--remote", "kaputt", "--detach"]);
-    assert!(text(&first).contains("im Hintergrund"), "{}", text(&first));
+    assert!(
+        text(&first).contains("in the background"),
+        "{}",
+        text(&first)
+    );
 
     let marker = work.join(".git/minds/sync.retry");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -213,7 +217,7 @@ fn a_failed_background_sync_brings_the_next_one_to_the_foreground() {
     let second = minds(&work, &["sync", "--remote", "kaputt", "--detach"]);
     assert!(second.status.success(), "fail-soft auch im Vordergrund");
     assert!(
-        text(&second).contains("im Vordergrund"),
+        text(&second).contains("in the foreground"),
         "{}",
         text(&second)
     );
@@ -226,8 +230,12 @@ fn a_failed_background_sync_brings_the_next_one_to_the_foreground() {
 
     // Gegen ein Remote, das es gibt, klappt es — und der Marker fällt.
     let third = minds(&work, &["sync", "--remote", "origin", "--detach"]);
-    assert!(text(&third).contains("im Vordergrund"), "{}", text(&third));
-    assert!(text(&third).contains("fertig"), "{}", text(&third));
+    assert!(
+        text(&third).contains("in the foreground"),
+        "{}",
+        text(&third)
+    );
+    assert!(text(&third).contains("done"), "{}", text(&third));
     assert!(!marker.exists(), "nach Erfolg kein Marker mehr");
     assert!(remote_refs(&work).contains("refs/minds/reviews"));
 }
@@ -243,7 +251,7 @@ fn nothing_new_means_nothing_happens() {
     minds(&work, &["review", &change_id("cd"), "--approve"]);
 
     let first = minds(&work, &["sync", "--remote", "origin"]);
-    assert!(text(&first).contains("Ref(s)"), "{}", text(&first));
+    assert!(text(&first).contains("ref(s)"), "{}", text(&first));
 
     let second = minds(&work, &["sync", "--remote", "origin", "-v"]);
     assert!(second.status.success());
@@ -252,7 +260,7 @@ fn nothing_new_means_nothing_happens() {
         "ohne neue Refs darf kein Push laufen: {}",
         text(&second)
     );
-    assert!(text(&second).contains("nichts Neues"), "{}", text(&second));
+    assert!(text(&second).contains("nothing new"), "{}", text(&second));
 }
 
 #[test]
@@ -297,7 +305,7 @@ fn a_diverged_review_log_is_merged_not_overwritten() {
     let out = minds(&other, &["sync", "--remote", "origin"]);
     assert!(out.status.success(), "{}", text(&out));
     assert!(
-        text(&out).contains("vereinige"),
+        text(&out).contains("merging"),
         "die Divergenz muss über den Merge laufen: {}",
         text(&out)
     );
@@ -393,7 +401,7 @@ fn a_forgotten_pushed_session_reaches_the_forge_as_tombstone() {
     let sync = minds(&work, &["sync", "--remote", "origin"]);
     assert!(sync.status.success(), "{}", text(&sync));
     assert!(
-        text(&sync).contains("Force-Push übertragen"),
+        text(&sync).contains("transferred via force-push"),
         "die Übertragung der Löschung muss gemeldet werden: {}",
         text(&sync)
     );
@@ -420,7 +428,7 @@ fn a_forgotten_pushed_session_reaches_the_forge_as_tombstone() {
 
     // Und der dritte Lauf hat nichts mehr zu tun — die Buchhaltung stimmt wieder.
     let third = minds(&work, &["sync", "--remote", "origin", "-v"]);
-    assert!(text(&third).contains("nichts Neues"), "{}", text(&third));
+    assert!(text(&third).contains("nothing new"), "{}", text(&third));
 
     // Ein zweiter `forget` derselben Session ist ein No-op: nichts neu zu
     // tilgen, kein Ref-Delete — und der nächste Sync bleibt still.
@@ -430,12 +438,12 @@ fn a_forgotten_pushed_session_reaches_the_forge_as_tombstone() {
     );
     assert!(again.status.success(), "{}", text(&again));
     assert!(
-        text(&again).contains("nichts zu vergessen"),
+        text(&again).contains("nothing to forget"),
         "{}",
         text(&again)
     );
     let fourth = minds(&work, &["sync", "--remote", "origin", "-v"]);
-    assert!(text(&fourth).contains("nichts Neues"), "{}", text(&fourth));
+    assert!(text(&fourth).contains("nothing new"), "{}", text(&fourth));
 }
 
 #[cfg(unix)]
@@ -472,7 +480,7 @@ fn a_denied_erasure_push_is_reported_loudly() {
 
     let sync = minds(&work, &["sync", "--remote", "origin"]);
     assert!(
-        text(&sync).contains("NICHT bestätigt"),
+        text(&sync).contains("NOT confirmed"),
         "die abgewiesene Löschung muss gemeldet werden: {}",
         text(&sync)
     );
@@ -485,7 +493,7 @@ fn a_denied_erasure_push_is_reported_loudly() {
     );
     let next = minds(&work, &["sync", "--remote", "origin"]);
     assert!(
-        text(&next).contains("NICHT bestätigt"),
+        text(&next).contains("NOT confirmed"),
         "die Meldung muss wiederkommen, bis die Löschung durch ist: {}",
         text(&next)
     );
@@ -582,7 +590,7 @@ fn a_forgotten_session_branch_in_the_child_repo_reaches_its_forge_as_tombstone()
     let sync = minds(&work, &["sync"]);
     assert!(sync.status.success(), "{}", text(&sync));
     assert!(
-        text(&sync).contains("Force-Push übertragen"),
+        text(&sync).contains("transferred via force-push"),
         "{}",
         text(&sync)
     );
@@ -635,7 +643,7 @@ fn a_diverged_plaintext_ref_is_still_not_force_pushed() {
     let sync = minds(&work, &["sync", "--remote", "origin"]);
     assert!(sync.status.success(), "{}", text(&sync));
     assert!(
-        text(&sync).contains("nicht übertragen"),
+        text(&sync).contains("not transferred"),
         "der zurückgestellte Ref muss gemeldet werden: {}",
         text(&sync)
     );

@@ -126,7 +126,7 @@ pub fn draw(
         let mut lines: Vec<Line> = Vec::new();
         if links.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Keine Kante — dieser Commit trägt keine Session.",
+                "No edge — this commit carries no session.",
                 theme::dim(),
             )));
         }
@@ -160,13 +160,13 @@ pub fn draw(
 
     if gaps_h > 0 {
         let (title, style) = if gaps.is_empty() {
-            (" KEINE LÜCKE ".to_string(), Style::default().fg(theme::OK))
+            (" NO GAP ".to_string(), Style::default().fg(theme::OK))
         } else {
             (
                 format!(
                     " {} {} ",
                     gaps.len(),
-                    if gaps.len() == 1 { "LÜCKE" } else { "LÜCKEN" }
+                    if gaps.len() == 1 { "GAP" } else { "GAPS" }
                 ),
                 Style::default().fg(theme::REVIEW),
             )
@@ -174,7 +174,7 @@ pub fn draw(
         let mut lines: Vec<Line> = Vec::new();
         if gaps.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Jedes Glied ist belegt — die Kette schließt sich ohne Vermutung.",
+                "Every link is attested — the chain closes without guesswork.",
                 theme::dim(),
             )));
         }
@@ -235,7 +235,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 "◆",
                 "COMMIT",
                 theme::dim(),
-                vec!["Blame kennt die Zeile nicht (leerer HEAD oder nicht eingecheckt)".into()],
+                vec!["Blame does not know this line (empty HEAD or not checked in)".into()],
             ),
         },
         WhyStep::Change { id } => match id {
@@ -249,7 +249,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 "◆",
                 "CHANGE",
                 theme::dim(),
-                vec!["kein Minds-Change-Id-Trailer".into()],
+                vec!["no Minds-Change-Id trailer".into()],
             ),
         },
         WhyStep::Sessions { cards } => {
@@ -258,7 +258,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                     "●",
                     "SESSION",
                     theme::dim(),
-                    vec!["kein Kontext erfasst".into()],
+                    vec!["no context captured".into()],
                 )
             } else {
                 (
@@ -299,13 +299,13 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 text.push(format!("Constraints: {}", constraints.len()));
             }
             if !discarded.is_empty() {
-                text.push(format!("Verworfen: {}", discarded.len()));
+                text.push(format!("Discarded: {}", discarded.len()));
             }
             ("●", "INTENT", Style::default().fg(theme::HUMAN), text)
         }
         WhyStep::Evidence { links } => {
             if links.is_empty() {
-                ("·", "EVIDENCE", theme::dim(), vec!["keine Kante".into()])
+                ("·", "EVIDENCE", theme::dim(), vec!["no edge".into()])
             } else {
                 let best = links.iter().map(|l| l.evidence).max();
                 let (_, _, style) = theme::evidence(best);
@@ -334,7 +334,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                     "{} · {}{} · {}",
                     n.reviewer,
                     n.decision.as_str(),
-                    if n.signed { " (signiert)" } else { "" },
+                    if n.signed { " (signed)" } else { "" },
                     clip(&n.summary, width.saturating_sub(30))
                 )
             }));
@@ -346,12 +346,12 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
 pub(crate) fn explanation(why: &EvidenceExplanation) -> String {
     match why {
         EvidenceExplanation::Trailer { commit } => format!(
-            "Der Commit {} trägt den Trailer Minds-Session-Id — beobachtet, kein Raten.",
+            "Commit {} carries the Minds-Session-Id trailer — observed, no guessing.",
             commit.to_string().chars().take(10).collect::<String>()
         ),
-        EvidenceExplanation::Declared => "Ein Mensch hat die Verbindung erklärt (--after).".into(),
+        EvidenceExplanation::Declared => "A human declared the connection (--after).".into(),
         EvidenceExplanation::Content => {
-            "Nachrechenbar über den Inhalt: gelesene Bytes sind geschriebene.".into()
+            "Recomputable from content: the bytes read are the bytes written.".into()
         }
         EvidenceExplanation::Heuristic {
             shared_files,
@@ -359,25 +359,27 @@ pub(crate) fn explanation(why: &EvidenceExplanation) -> String {
             in_window,
         } => {
             let files = if shared_files.is_empty() {
-                "keine gemeinsame Datei".to_string()
+                "no shared file".to_string()
             } else {
                 format!(
-                    "{} gemeinsame Datei(en): {}",
+                    "{} shared file(s): {}",
                     shared_files.len(),
                     shared_files.join(", ")
                 )
             };
             let time = match (seconds_apart, in_window) {
-                (Some(s), Some(true)) => format!("Commit {s} s nach Session-Ende, im Fenster"),
-                (Some(s), Some(false)) => {
-                    format!("Commit {s} s nach Session-Ende, außerhalb des Fensters")
+                (Some(s), Some(true)) => {
+                    format!("commit {s} s after session end, within the window")
                 }
-                _ => "Zeitabstand nicht bestimmbar".to_string(),
+                (Some(s), Some(false)) => {
+                    format!("commit {s} s after session end, outside the window")
+                }
+                _ => "time distance not determinable".to_string(),
             };
-            format!("Nachgerechnet, nicht protokolliert: {files}; {time}.")
+            format!("Recomputed, not recorded: {files}; {time}.")
         }
         EvidenceExplanation::Unknown { reason } => {
-            format!("Gründe nicht rekonstruierbar: {reason}.")
+            format!("Reasons not reconstructable: {reason}.")
         }
     }
 }

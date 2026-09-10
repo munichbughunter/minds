@@ -156,15 +156,15 @@ use crate::pipeline::RedactionPipeline;
 pub enum RedactionError {
     /// Die Pipeline enthält keinen einzigen Detektor.
     #[error(
-        "Redaction-Policy ohne Detektoren: eine leere Pipeline ließe jeden Text \
-         unverändert durch und würde ihn trotzdem als redigiert ausweisen"
+        "redaction policy has no detectors: an empty pipeline would pass every text \
+         through unchanged and still declare it redacted"
     )]
     NoDetectors,
 
     /// Die Session trägt bereits `redaction.applied == true`.
     #[error(
-        "Session ist bereits als redigiert markiert; ein zweiter Lauf fände \
-         nichts mehr und würde den Audit des ersten überschreiben"
+        "session is already marked as redacted; a second run would find \
+         nothing and would overwrite the audit of the first"
     )]
     AlreadyRedacted,
 
@@ -173,9 +173,9 @@ pub enum RedactionError {
     /// verworfen — der Text an dieser Stelle ist damit möglicherweise
     /// ungeschwärzt.
     #[error(
-        "Detektor-Vertrag verletzt: {count} ungültige Fund-Span(s) in {field} \
-         mussten verworfen werden — der zugehörige Text ist möglicherweise \
-         ungeschwärzt geblieben"
+        "detector contract violated: {count} invalid finding span(s) in {field} \
+         had to be discarded — the corresponding text may have been left \
+         unredacted"
     )]
     InvalidFinding {
         /// Wo im Envelope.
@@ -188,8 +188,8 @@ pub enum RedactionError {
     /// — die Bereinigung erreicht keinen Fixpunkt, der erste Lauf hat also
     /// etwas stehen lassen.
     #[error(
-        "Redaction in {field} erreicht keinen Fixpunkt: ein zweiter Durchlauf \
-         verändert den bereits bereinigten Text erneut"
+        "redaction in {field} does not reach a fixed point: a second pass \
+         changes the already cleaned text again"
     )]
     Unstable {
         /// Wo im Envelope.
