@@ -15,6 +15,69 @@ versioning follows [Semantic Versioning](https://semver.org/).
 > binary reads all older schema versions; the schema only increments on a
 > breaking change to the payload, never for an additional field.
 
+## [0.4.0] — 2026-09-10 — "The Tampering Gets a Name"
+
+*Minds does not prove that a decision was right. It proves what evidence
+existed at the time of the decision — and whether that evidence was altered
+afterwards. This release makes that sentence visible: sealing now leaves a
+receipt, tampering is named instead of merely detected, and the TUI separates
+what was observed from what was merely said. A MINOR version because the
+entire user-facing surface switches to English: exit codes are unchanged,
+but scripts that grep for the German verdict words must move to `VERIFIED`,
+`TAMPERED`, `VERIFIED, INCOMPLETE`, `NOT VERIFIABLE`.*
+
+### Changed
+
+- **The entire CLI and TUI speak English.** Every terminal line, hook.log
+  note, error message, and TUI label — the docs no longer translate output,
+  they quote it. The verdict words live in **one** vocabulary in
+  `minds-core` (`Verdict`, `SealOutcome::human_word()`); CLI, read model,
+  and TUI delegate to it, so no surface can drift. Wire formats are
+  untouched: seal text, trailer keys, ref names, and JSON keys are
+  byte-identical, and existing seals verify unchanged.
+- **`minds inspect` reads like an instrument.** The session list is a
+  bordered table with named columns (`TIME · SESSION · AGENT · SIZE · SEAL ·
+  VERDICT`), the footer carries a verdict badge that follows the focused
+  session — on a tampered one it flips to `✗ TAMPERED` — and the evidence
+  view opens with a bordered `SESSION SEALED` card whose wording matches the
+  checkpoint receipt.
+
+### Added
+
+- **`minds checkpoint` leaves a receipt:** on the success path a
+  `SESSION SEALED` block names seal id, chain root, event range, observation
+  boundary, and signature presence. Every ✓ line is a fact about the write
+  ("recorded", "chain start") — verification remains `minds verify`'s
+  sentence, and the block never claims it.
+- **`minds verify` names the tampering.** A hash-invalid seal now reports
+  the expected and the found hash, the tampered text's **claimed** fields —
+  labeled `UNVERIFIED`, parsed shape-only and terminal-hardened — and
+  cross-checks against still-intact data (claimed session vs. the session
+  under verification, the claimed `previous` chain). The honest limit is
+  stated by omission: the original values are unrecoverable after the
+  journal discard, so verify never pretends to know them. Behind it sits a
+  new unchecked store read (`ContextStore::seal_bytes`, the seal sibling of
+  `get_bytes`); the hash check itself now lives once, in the trait default
+  of `seal_text`.
+- **Statements are labeled, evidence stays evidence:** in the why chain the
+  intent text carries a styled `◌ CLAIM — as recorded, not verified
+  evidence` label, while observed commit↔session edges render bold as
+  `● observed`. A recorded sentence never reads like proof.
+- **A parity test pins verify and the read model to the same verdict word**
+  — the two computations stay separate (they cover different failure
+  classes), but they can no longer disagree in wording.
+
+### Fixed
+
+- **A forged seal without a back-reference reads TAMPERED, not
+  NOT VERIFIABLE.** The namespace fallback used to skip hash-invalid seals
+  silently — an attacker who also removed `evidence.json` was rewarded with
+  the milder verdict. The claimed session assignment now brings the seal
+  into the checked set, where it fails loudly.
+- The tamper report reads the stored bytes once (hash and claim can no
+  longer describe different bytes if the ref moves mid-verification) and
+  compares session ids parsed, not as strings.
+
 ## [0.3.0] — 2026-08-26 — "A Gap Is a Link in the Chain"
 
 *Until now, Minds proved what was stored. Now it also proves which scope it
