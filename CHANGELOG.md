@@ -15,6 +15,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 > binary reads all older schema versions; the schema only increments on a
 > breaking change to the payload, never for an additional field.
 
+## [Unreleased]
+
+### Added
+
+- **`minds blame --lines <file>`** — the git-blame-shaped view: one annotated
+  row per source line instead of the summary per session. Each row carries the
+  short session id, the agent name, the line number, and the source text at
+  `HEAD`, in file order; columns align to the widest value in that output, and
+  a line without captured context shows `-` in both attribution columns. The
+  default output of `minds blame` is unchanged, and both views share the same
+  line→commit→session attribution — including the tie-break at a commit with
+  several sessions, so they can never disagree on who owns a line. Purely
+  derived: it reads committed history and stored sessions, writes nothing.
+
 ## [0.4.0] — 2026-09-10 — "The Tampering Gets a Name"
 
 *Minds does not prove that a decision was right. It proves what evidence
