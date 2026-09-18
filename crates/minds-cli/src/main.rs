@@ -60,6 +60,7 @@ mod reinterpret_cmd;
 mod render;
 mod render_cmd;
 mod review_cmd;
+mod seals_cmd;
 mod search;
 mod show;
 mod sign_cmd;
@@ -165,6 +166,12 @@ Usage:
   minds sign --seal <seal-id> [--key <path>]
         Signs a session's attribution (ssh-sig) to stdout.
         Key from --key or git config user.signingkey.
+
+  minds seals [--session <id>] [--limit <n>]
+        Lists Evidence-Chain seals — id, linked session (if any), event
+        range, gap/signature status, timestamp. Most recent first.
+        Without --session, every seal in the store; --limit caps how
+        many print (applied after sorting).
 
   minds verify <session> [--signers <file>] [--identity <id>]
         The evidence verdict: integrity × coverage over the session's seals.
@@ -302,6 +309,7 @@ const SPECS: &[Spec] = &[
     spec("forget", &["--reason"], &[], 1),
     spec("reinterpret", &[], &[], 1),
     spec("sign", &["--key", "--seal"], &[], 1),
+    spec("seals", &["--session", "--limit"], &[], 0),
     spec(
         "verify",
         &["--sig", "--signers", "--identity", "--evidence"],
@@ -719,6 +727,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--key"),
             parsed.value("--seal"),
         ),
+
+        "seals" => seals_cmd::run(parsed.value("--session"), parsed.value("--limit")),
 
         "verify" => verify_cmd::run(
             parsed.positional(0),

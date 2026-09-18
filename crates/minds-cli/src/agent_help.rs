@@ -44,6 +44,7 @@ fn card() -> serde_json::Value {
             {"name": "forget", "usage": "minds forget <session> [--reason <text>]", "summary": "GDPR erasure: the payload becomes a tombstone, the reference stays resolvable."},
             {"name": "reinterpret", "usage": "minds reinterpret <session>", "summary": "Reinterpret stored tool calls with the current adapter — strictly read-only, evidence unchanged."},
             {"name": "sign", "usage": "minds sign <session> [--key <path>] | minds sign --seal <seal-id> [--key <path>]", "summary": "Sign a session's attribution (to stdout) or retroactively sign an evidence seal (into the store)."},
+            {"name": "seals", "usage": "minds seals [--session <id>] [--limit <n>]", "summary": "List Evidence-Chain seals — id, session, event range, gaps, signature presence; most recent first."},
             {"name": "verify", "usage": "minds verify <session> [--signers <file>] | minds verify <session> --sig <file> | minds verify --evidence <seal-id>", "summary": "Evidence verdict (exit: 0 VERIFIED, 1 TAMPERED, 2 VERIFIED, INCOMPLETE, 3 NOT VERIFIABLE) or check a signed attribution."},
             {"name": "review", "usage": "minds review <change-id|session-id> --approve|--reject|--needs-work [--summary <text>] [--sign]", "summary": "Create a verdict as a Git object; --sign turns it into proof."},
             {"name": "reviews", "usage": "minds reviews <subject> [--signers <file>]", "summary": "Verdicts and thread for a change; --signers checks the signatures."},
