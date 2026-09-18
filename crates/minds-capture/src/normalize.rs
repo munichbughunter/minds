@@ -194,9 +194,47 @@ impl ToolAdapter for ClaudeAdapter {
     }
 }
 
+/// Versionsstand der Codex-Deutung. Bump bei jeder Änderung an
+/// [`codex_effect`] oder der Diff-Pfad-Extraktion (ADR-0011: Deutung ist
+/// wiederholbar, eine gespeicherte Deutung bleibt ihrem Stand zuordenbar).
+pub const CODEX_ADAPTER_VERSION: u32 = 1;
+
+/// Der Codex-Adapter.
+pub struct CodexAdapter;
+
+impl ToolAdapter for CodexAdapter {
+    fn agent(&self) -> &'static str {
+        "codex"
+    }
+
+    fn version(&self) -> u32 {
+        CODEX_ADAPTER_VERSION
+    }
+
+    fn tool_facts(&self, event: &JournalEvent) -> Option<ToolFacts> {
+        parse::<Tool>(event).and_then(codex_tool)
+    }
+
+    fn interpret_stored(&self, name: &str, arguments: &str) -> Option<StoredInterpretation> {
+        let raw = RawValue::from_string(arguments.to_string()).ok();
+        let effect = codex_effect(name, raw.as_deref());
+        let status = if codex_tool_is_interpreted(name) {
+            CaptureStatus::Interpreted
+        } else {
+            CaptureStatus::Uninterpreted
+        };
+        Some(StoredInterpretation {
+            effect,
+            status,
+            adapter: "codex",
+            adapter_version: CODEX_ADAPTER_VERSION,
+        })
+    }
+}
+
 /// Die Registry: ein Adapter je Agent. Wer hier fehlt, bekommt den
 /// generischen Fallback — beobachtet, nicht gedeutet, nie Stille.
-const ADAPTERS: &[&dyn ToolAdapter] = &[&ClaudeAdapter];
+const ADAPTERS: &[&dyn ToolAdapter] = &[&ClaudeAdapter, &CodexAdapter];
 
 /// Der Adapter für einen Agenten, falls es einen gibt.
 pub fn adapter_for(agent: &str) -> Option<&'static dyn ToolAdapter> {
@@ -362,6 +400,125 @@ pub fn claude_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
         path,
         content: None,
     }
+}
+
+/// Kennt die Codex-Deutung dieses Tools eine Wirkung?
+///
+/// `Bash` steht hier trotz des Claude-Namens absichtlich: Codex' Unified-Exec
+/// (`exec_command`) meldet sich in `PreToolUse`/`PostToolUse` unter
+/// `tool_name: "Bash"` — dieselbe Kompatibilitätsentscheidung, die schon den
+/// Hook-Umschlag identisch zu Claude Code macht (Spec §3, verifiziert gegen
+/// `developers.openai.com/codex/hooks`, Stand 2026-09).
+pub fn codex_tool_is_interpreted(tool_name: &str) -> bool {
+    matches!(tool_name, "apply_patch" | "Bash")
+}
+
+/// Baut aus Codex' `tool_name` + `tool_input` einen [`ToolFacts`].
+fn codex_tool(t: Tool) -> Option<ToolFacts> {
+    let name = t.tool_name?;
+    let arguments = t
+        .tool_input
+        .as_ref()
+        .map(|r| r.get().to_owned())
+        .unwrap_or_default();
+    let effect = codex_effect(&name, t.tool_input.as_deref());
+    let status = if codex_tool_is_interpreted(&name) {
+        CaptureStatus::Interpreted
+    } else {
+        CaptureStatus::Uninterpreted
+    };
+    Some(ToolFacts {
+        capture: Capture {
+            status,
+            adapter: "codex".into(),
+            adapter_version: CODEX_ADAPTER_VERSION,
+        },
+        name,
+        arguments,
+        effect: Some(effect),
+    })
+}
+
+/// Die agent-spezifische Abbildung Tool-Name + `tool_input` → [`Effect`] für
+/// Codex.
+pub fn codex_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
+    match tool_name {
+        "apply_patch" => {
+            let diff = tool_input
+                .and_then(|r| serde_json::from_str::<CodexPatch>(r.get()).ok())
+                .and_then(|p| p.diff);
+            let path = diff.as_deref().and_then(first_diff_path);
+            // Eine reine Löschung trägt kein `+++ b/…`, nur `+++ /dev/null` —
+            // genau das Signal, das `first_diff_path` schon erkennt, um dann
+            // auf die Quellzeile zurückzufallen. Hier wird derselbe Fund
+            // zusätzlich zur Wirkungsart: `Delete` statt `Write`.
+            let kind = if diff.as_deref().is_some_and(target_is_dev_null) {
+                EffectKind::Delete
+            } else {
+                EffectKind::Write
+            };
+            Effect {
+                kind,
+                path,
+                content: None,
+            }
+        }
+        "Bash" => Effect {
+            kind: EffectKind::Exec,
+            path: None,
+            content: None,
+        },
+        _ => Effect {
+            kind: EffectKind::Other,
+            path: None,
+            content: None,
+        },
+    }
+}
+
+/// Codex' `apply_patch`-Eingabe, nur das interessante Feld.
+#[derive(Debug, Default, Deserialize)]
+struct CodexPatch {
+    diff: Option<String>,
+}
+
+/// Der erste Dateipfad aus einem Unified Diff (`--- a/<path>` /
+/// `+++ b/<path>`-Kopfzeilen). Codex kann in einem `apply_patch`-Aufruf
+/// mehrere Dateien ändern; wie bei Claudes `Effect` (ein Pfad pro Aufruf,
+/// vgl. `claude_effect`) trägt der Adapter nur den ersten — eine benannte
+/// Grenze, keine falsche Aussage: der Aufruf bleibt vollständig als
+/// Roh-Beweismittel in `arguments` erhalten.
+///
+/// Bevorzugt die `+++ b/`-Zeile (Zielpfad nach der Änderung); fehlt sie,
+/// die `--- a/`-Zeile. `/dev/null` (reine Löschung) wird übersprungen.
+fn first_diff_path(diff: &str) -> Option<String> {
+    fn strip_prefix_path(line: &str, marker: &str) -> Option<String> {
+        let rest = line.strip_prefix(marker)?.trim();
+        // Klassisches `diff -u` haengt an die Kopfzeile einen Tab-getrennten
+        // Zeitstempel (`--- a/foo.rs\t2024-01-01 00:00:00 +0000`) - nur der
+        // Teil davor ist der Pfad.
+        let rest = rest.split('\t').next().unwrap_or(rest);
+        if rest == "/dev/null" {
+            return None;
+        }
+        // Unified-Diff-Pfade tragen ein a/ bzw. b/ Präfix.
+        let path = rest
+            .strip_prefix("a/")
+            .or_else(|| rest.strip_prefix("b/"))
+            .unwrap_or(rest);
+        Some(path.to_string())
+    }
+
+    let plus = diff.lines().find_map(|l| strip_prefix_path(l, "+++ "));
+    plus.or_else(|| diff.lines().find_map(|l| strip_prefix_path(l, "--- ")))
+}
+
+/// Trägt die `+++ `-Kopfzeile explizit `/dev/null` — der Unified-Diff-Ausdruck
+/// für „diese Datei existiert danach nicht mehr", also eine Löschung?
+fn target_is_dev_null(diff: &str) -> bool {
+    diff.lines()
+        .find_map(|l| l.strip_prefix("+++ "))
+        .is_some_and(|rest| rest.trim() == "/dev/null")
 }
 
 /// Liest den Payload eines Events in `T`; misslingt das, ergibt es `None`
@@ -558,10 +715,15 @@ mod tests {
     #[test]
     fn the_registry_resolves_known_agents_and_only_those() {
         assert!(adapter_for("claude-code").is_some());
-        assert!(adapter_for("codex").is_none());
+        assert!(adapter_for("codex").is_some());
+        assert!(adapter_for("some-future-agent").is_none());
         assert_eq!(
             adapter_for("claude-code").unwrap().version(),
             CLAUDE_ADAPTER_VERSION
+        );
+        assert_eq!(
+            adapter_for("codex").unwrap().version(),
+            CODEX_ADAPTER_VERSION
         );
     }
 
@@ -586,6 +748,146 @@ mod tests {
         );
         let got = facts("claude-code", &glob).tool.unwrap();
         assert_eq!(got.capture.status, CaptureStatus::Uninterpreted);
+    }
+
+    #[test]
+    fn apply_patch_becomes_a_write_effect_with_path() {
+        let e = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"apply_patch","tool_input":{"diff":"--- a/src/retry.rs\n+++ b/src/retry.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"}}"#,
+        );
+        let t = facts("codex", &e).tool.unwrap();
+        assert_eq!(t.name, "apply_patch");
+        assert_eq!(t.capture.status, CaptureStatus::Interpreted);
+        assert_eq!(t.capture.adapter, "codex");
+        assert_eq!(t.capture.adapter_version, CODEX_ADAPTER_VERSION);
+        let effect = t.effect.unwrap();
+        assert_eq!(effect.kind, EffectKind::Write);
+        assert_eq!(effect.path.as_deref(), Some("src/retry.rs"));
+        assert!(effect.content.is_none());
+    }
+
+    #[test]
+    fn apply_patch_with_a_dev_null_target_becomes_a_delete_effect_with_the_source_path() {
+        let e = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"apply_patch","tool_input":{"diff":"--- a/deleted.rs\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-x\n"}}"#,
+        );
+        let t = facts("codex", &e).tool.unwrap();
+        assert_eq!(t.capture.status, CaptureStatus::Interpreted);
+        let effect = t.effect.unwrap();
+        assert_eq!(effect.kind, EffectKind::Delete);
+        assert_eq!(effect.path.as_deref(), Some("deleted.rs"));
+    }
+
+    #[test]
+    fn codex_bash_is_exec_without_a_path() {
+        let e = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+        );
+        let t = facts("codex", &e).tool.unwrap();
+        assert_eq!(t.capture.status, CaptureStatus::Interpreted);
+        let effect = t.effect.unwrap();
+        assert_eq!(effect.kind, EffectKind::Exec);
+        assert!(effect.path.is_none());
+    }
+
+    #[test]
+    fn an_unknown_codex_tool_is_other_not_an_error() {
+        let e = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"unknown_tool","tool_input":{"x":1}}"#,
+        );
+        let t = facts("codex", &e).tool.unwrap();
+        assert_eq!(t.capture.status, CaptureStatus::Uninterpreted);
+        let effect = t.effect.unwrap();
+        assert_eq!(effect.kind, EffectKind::Other);
+        assert!(effect.path.is_none());
+    }
+
+    #[test]
+    fn codex_arguments_keep_the_raw_tool_input() {
+        let e = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"apply_patch","tool_input":{"diff":"--- a/x\n+++ b/x\n","z":1}}"#,
+        );
+        let t = facts("codex", &e).tool.unwrap();
+        assert!(t.arguments.contains("--- a/x"));
+        assert!(t.arguments.contains("\"z\""));
+    }
+
+    #[test]
+    fn codex_interpretation_is_deterministic() {
+        let ev = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"apply_patch","tool_input":{"diff":"--- a/x\n+++ b/x\n"}}"#,
+        );
+        assert_eq!(facts("codex", &ev), facts("codex", &ev));
+
+        let a = CodexAdapter.interpret_stored("apply_patch", r#"{"diff":"--- a/x\n+++ b/x\n"}"#);
+        let b = CodexAdapter.interpret_stored("apply_patch", r#"{"diff":"--- a/x\n+++ b/x\n"}"#);
+        assert_eq!(a, b);
+        let got = a.unwrap();
+        assert_eq!(got.status, CaptureStatus::Interpreted);
+        assert_eq!(got.effect.kind, EffectKind::Write);
+        assert_eq!(got.effect.path.as_deref(), Some("x"));
+        assert_eq!(got.adapter_version, CODEX_ADAPTER_VERSION);
+    }
+
+    #[test]
+    fn a_known_codex_tool_is_interpreted_an_unknown_one_is_not() {
+        let patch = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"apply_patch","tool_input":{"diff":"--- a/x\n+++ b/x\n"}}"#,
+        );
+        let got = facts("codex", &patch).tool.unwrap();
+        assert_eq!(got.capture.status, CaptureStatus::Interpreted);
+        assert_eq!(got.capture.adapter, "codex");
+        assert_eq!(got.capture.adapter_version, CODEX_ADAPTER_VERSION);
+
+        let other = event(
+            EventKind::ToolPre,
+            "PreToolUse",
+            r#"{"tool_name":"web_search","tool_input":{"query":"x"}}"#,
+        );
+        let got = facts("codex", &other).tool.unwrap();
+        assert_eq!(got.capture.status, CaptureStatus::Uninterpreted);
+    }
+
+    #[test]
+    fn first_diff_path_prefers_the_target_of_the_first_file() {
+        let diff = "--- a/one.rs\n+++ b/one.rs\n@@ ...\n--- a/two.rs\n+++ b/two.rs\n@@ ...\n";
+        assert_eq!(first_diff_path(diff).as_deref(), Some("one.rs"));
+    }
+
+    #[test]
+    fn first_diff_path_falls_back_to_the_source_when_the_target_is_dev_null() {
+        let diff = "--- a/deleted.rs\n+++ /dev/null\n@@ ...\n";
+        assert_eq!(first_diff_path(diff).as_deref(), Some("deleted.rs"));
+    }
+
+    #[test]
+    fn first_diff_path_is_none_for_an_empty_diff() {
+        assert_eq!(first_diff_path(""), None);
+    }
+
+    #[test]
+    fn first_diff_path_reads_the_source_line_when_no_target_line_exists() {
+        assert_eq!(first_diff_path("--- a/x\n").as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn first_diff_path_drops_a_tab_separated_timestamp() {
+        let diff = "--- a/foo.rs\t2024-01-01 00:00:00.000000000 +0000\n+++ b/foo.rs\t2024-01-01 00:00:01.000000000 +0000\n";
+        assert_eq!(first_diff_path(diff).as_deref(), Some("foo.rs"));
     }
 
     #[test]

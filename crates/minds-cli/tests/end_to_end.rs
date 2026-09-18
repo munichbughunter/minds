@@ -2946,15 +2946,19 @@ fn an_uninterpreted_call_dents_only_the_interpretation_axis() {
 
     // Ein Fremd-Agent ohne Adapter: beobachtet, nicht gedeutet.
     let payload = format!(
-        r#"{{"session_id":"sess-codex","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"wende patch an"}}"#,
+        r#"{{"session_id":"sess-other","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"wende patch an"}}"#,
         dir.display()
     );
-    minds(dir, &["hook", "--agent", "codex"], Some(&payload));
+    minds(
+        dir,
+        &["hook", "--agent", "some-other-agent"],
+        Some(&payload),
+    );
     let tool = format!(
-        r#"{{"session_id":"sess-codex","cwd":"{}","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{{"diff":"x"}}}}"#,
+        r#"{{"session_id":"sess-other","cwd":"{}","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{{"diff":"x"}}}}"#,
         dir.display()
     );
-    minds(dir, &["hook", "--agent", "codex"], Some(&tool));
+    minds(dir, &["hook", "--agent", "some-other-agent"], Some(&tool));
     minds(dir, &["checkpoint"], None);
 
     let seals = seal_refs(dir);
@@ -2976,6 +2980,41 @@ fn an_uninterpreted_call_dents_only_the_interpretation_axis() {
         text.contains("Overall        VERIFIED — interpretation partial"),
         "{text}"
     );
+}
+
+#[test]
+fn a_codex_apply_patch_call_is_fully_interpreted() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+
+    // Codex hat seit diesem Spec einen eigenen Adapter: `apply_patch` wird
+    // gedeutet, nicht bloß beobachtet.
+    let payload = format!(
+        r#"{{"session_id":"sess-codex","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"wende patch an"}}"#,
+        dir.display()
+    );
+    minds(dir, &["hook", "--agent", "codex"], Some(&payload));
+    let tool = format!(
+        r#"{{"session_id":"sess-codex","cwd":"{}","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{{"diff":"--- a/src/retry.rs\n+++ b/src/retry.rs\n"}}}}"#,
+        dir.display()
+    );
+    minds(dir, &["hook", "--agent", "codex"], Some(&tool));
+    minds(dir, &["checkpoint"], None);
+
+    let seals = seal_refs(dir);
+    assert_eq!(seals.len(), 1);
+    let session = seal_line(&seal_text(dir, &seals[0]), "session").to_string();
+
+    let out = minds(dir, &["verify", &session], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("Integrity      intact"), "{text}");
+    assert!(text.contains("Interpretation complete"), "{text}");
+    assert!(text.trim().ends_with("VERIFIED"), "{text}");
 }
 
 #[test]
