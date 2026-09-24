@@ -161,10 +161,51 @@ fn filled() -> Inspection {
     )
 }
 
+/// Das Referenz-Terminal: geteilt, mit einem Detail so breit wie früher der
+/// ganze Bildschirm (208 · 40 % = 83 Liste, 1 Luft, 124 Detail) — die
+/// Inhalts-Proben der Ebenen bleiben davon unberührt.
+const WIDE: u16 = 208;
+/// Geteilt, aber knapp: die Liste auf ihrer Untergrenze.
+const SPLIT: u16 = 124;
+/// Eine Fläche nach der anderen, wie vor der Teilung.
+const NARROW: u16 = 100;
+
 fn render(app: &mut App) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(124, 30)).unwrap();
+    render_at(app, WIDE)
+}
+
+fn render_at(app: &mut App, width: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
     terminal.draw(|frame| super::draw(frame, app)).unwrap();
     terminal.backend().to_string()
+}
+
+/// Die Spalte der rechten Rahmenecke des SESSIONS-Blocks — die Grenze
+/// zwischen Liste und Detail.
+fn list_edge(out: &str) -> usize {
+    out.lines()
+        .find(|line| line.contains(" SESSIONS "))
+        .and_then(|line| line.chars().position(|c| c == '┐'))
+        .expect("SESSIONS block")
+}
+
+/// Die Listenspalte: alles links der Grenze — damit eine Probe sagen
+/// kann, *wo* etwas steht.
+fn list_of(out: &str) -> String {
+    let edge = list_edge(out);
+    out.lines()
+        .map(|line| line.chars().take(edge + 1).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Das Detail: alles rechts der Grenze.
+fn detail_of(out: &str) -> String {
+    let edge = list_edge(out);
+    out.lines()
+        .map(|line| line.chars().skip(edge + 1).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -177,11 +218,13 @@ fn the_empty_state_points_to_enable() {
     assert!(out.contains("0 Sessions"), "{out}");
 }
 
+/// Die volle Tabelle — alle Spalten samt Umfang. Neben der Vorschau braucht
+/// die Liste dafür ihre breiteste Stufe, also ein sehr breites Terminal.
 #[test]
 fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    let out = render(&mut app);
+    let out = list_of(&render_at(&mut app, 300));
     assert!(out.contains("MINDS payment-service"), "{out}");
     // Die Tabelle traegt Spaltenkoepfe und Rahmen-Titel (Demo-Politur):
     // die Beweisspalten sind ohne Legende lesbar.
@@ -869,17 +912,236 @@ fn the_claim_label_carries_its_theme_style() {
     );
 }
 
-/// Unter 120 Spalten faellt die SIZE-Spalte weg — die Beweisspalten bleiben.
+/// Unter der Teilung, aber ueber 97 Spalten: eine Flaeche, ohne SIZE — die
+/// Beweisspalten bleiben.
 #[test]
 fn a_narrow_terminal_drops_the_size_column_but_keeps_the_evidence() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
-    let out = terminal.backend().to_string();
+    let out = render_at(&mut app, NARROW);
     assert!(!out.contains("SIZE"), "{out}");
     for header in ["TIME", "AGENT", "SEAL", "VERDICT"] {
         assert!(out.contains(header), "{header} fehlt: {out}");
     }
     assert!(out.contains("◈ sealed"), "{out}");
+}
+
+// --- Die Teilung: Liste links, Detail rechts ------------------------------
+
+/// Der Kern der Teilung: Liste und Graph der gewaehlten Karte im selben
+/// Bild, ohne Enter — und die Vorschau wandert mit dem Cursor und dem Zoom.
+#[test]
+fn the_list_and_the_graph_preview_share_the_screen() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let out = render_at(&mut app, SPLIT);
+    assert!(app.top().is_none());
+    let list = list_of(&out);
+    let detail = detail_of(&out);
+    assert!(list.contains(" SESSIONS "), "{out}");
+    assert!(list.contains("Fix retry han"), "{out}");
+    assert!(detail.contains("SESSION b3-aaaaaaaa…"), "{out}");
+    assert!(detail.contains(" YOU "), "{out}");
+    assert!(detail.contains("Fix retry handling"), "{out}");
+    assert!(detail.contains("◇ READ src/http/retry.rs"), "{out}");
+    // Die Vorschau ist nicht navigierbar: kein Detailkasten unter einem
+    // Cursor, den es nicht gibt — und keine zweite invertierte Zeile neben
+    // dem Listencursor.
+    assert!(!detail.contains("Tool       Read"), "{out}");
+    assert!(out.contains("Enter descend"), "{out}");
+    let mut terminal = Terminal::new(TestBackend::new(SPLIT, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let edge = list_edge(&out) as u16;
+    let reversed_in_detail = (0..buffer.area.height)
+        .flat_map(|y| (edge + 1..buffer.area.width).map(move |x| (x, y)))
+        .filter(|(_, y)| *y >= 2 && *y < buffer.area.height - 2) // Body, ohne Kopf/Fuss
+        .any(|pos| {
+            buffer[pos]
+                .style()
+                .add_modifier
+                .contains(ratatui::style::Modifier::REVERSED)
+        });
+    assert!(!reversed_in_detail, "{out}");
+    // Cursor runter: die Vorschau folgt, der Stapel bleibt leer.
+    app.reduce(Action::Down);
+    let out = render_at(&mut app, SPLIT);
+    assert!(app.top().is_none());
+    assert!(out.contains("SESSION b3-bbbbbbbb…"), "{out}");
+    assert!(out.contains("Add exponential backoff"), "{out}");
+    assert!(!out.contains("SESSION b3-aaaaaaaa…"), "{out}");
+    // Zoom auf der Liste wirkt auf die Vorschau wie auf eine Ebene.
+    app.reduce(Action::Zoom(3));
+    let out = render_at(&mut app, SPLIT);
+    assert!(out.contains("TURN ASSISTANT"), "{out}");
+    // Esc auf der Liste ist weiter „Suche loeschen, dann Ende" — die
+    // Vorschau kostet keinen Tastendruck.
+    app.reduce(Action::Back);
+    assert!(app.quit);
+}
+
+/// Gelegte Ebenen — Graph, Why, Evidence — verdraengen die Liste nicht
+/// mehr; sie bekommen die rechte Spalte.
+#[test]
+fn a_pushed_view_keeps_the_list_beside_it() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Enter);
+    assert!(matches!(app.top(), Some(View::Graph { .. })));
+    let out = render_at(&mut app, SPLIT);
+    assert!(list_of(&out).contains(" SESSIONS "), "{out}");
+    let detail = detail_of(&out);
+    assert!(detail.contains("◉ AGENT claude-code · opus"), "{out}");
+    // Jetzt navigierbar: der Cursor traegt seinen Detailkasten.
+    app.reduce(Action::Down);
+    app.reduce(Action::Down);
+    let out = render_at(&mut app, SPLIT);
+    assert!(detail_of(&out).contains("Tool       Read"), "{out}");
+    app.reduce(Action::Why);
+    assert!(matches!(app.top(), Some(View::Why { .. })));
+    let out = render_at(&mut app, SPLIT);
+    assert!(list_of(&out).contains(" SESSIONS "), "{out}");
+    assert!(detail_of(&out).contains("✓ EVIDENCE"), "{out}");
+    app.reduce(Action::Back);
+    app.reduce(Action::Evidence);
+    assert!(matches!(app.top(), Some(View::Evidence { .. })));
+    let out = render_at(&mut app, SPLIT);
+    assert!(list_of(&out).contains(" SESSIONS "), "{out}");
+    assert!(detail_of(&out).contains("INTEGRITY"), "{out}");
+    // Zurueck bis zur Liste: der Stapel leert sich wie vor der Teilung.
+    app.reduce(Action::Back);
+    app.reduce(Action::Back);
+    assert!(app.top().is_none());
+}
+
+/// Unter der Teilungsbreite bleibt alles beim Alten: eine Flaeche, die
+/// Liste **oder** die oberste Ebene.
+#[test]
+fn a_narrow_terminal_shows_one_pane_at_a_time() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    for width in [NARROW, 80] {
+        let out = render_at(&mut app, width);
+        assert!(out.contains(" SESSIONS "), "{width}: {out}");
+        assert!(!out.contains("SESSION b3-"), "{width}: {out}");
+        assert!(!out.contains(" YOU "), "{width}: {out}");
+    }
+    // Unter 97 Spalten nimmt auch die Einzelflaeche die kompakte Stufe —
+    // frueher schnitt die Tabelle dort hart ab; der Seal-Befund bleibt.
+    let out = render_at(&mut app, 80);
+    assert!(out.contains("SEAL"), "{out}");
+    assert!(out.contains("◈ sealed"), "{out}");
+    assert!(!out.contains("VERDICT"), "{out}");
+    app.reduce(Action::Enter);
+    let out = render_at(&mut app, NARROW);
+    assert!(out.contains("SESSION b3-aaaaaaaa…"), "{out}");
+    assert!(!out.contains(" SESSIONS "), "{out}");
+    app.reduce(Action::Back);
+    assert!(app.top().is_none());
+}
+
+/// Eine degradierte Karte hat keinen Graphen: Die Vorschau sagt, warum —
+/// mit demselben Satz wie die Fusszeile — statt zu panicken.
+#[test]
+fn a_degraded_card_previews_its_state_not_a_graph() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::End);
+    assert!(app.selected().is_some_and(|c| c.is_degraded()));
+    let out = render_at(&mut app, SPLIT);
+    assert!(list_of(&out).contains("⌦ forgotten"), "{out}");
+    let detail = detail_of(&out);
+    assert!(
+        detail.contains("Degraded: the payload is unreadable"),
+        "{out}"
+    );
+    // Der Satz bricht um, statt am Spaltenrand abgeschnitten zu werden.
+    assert!(detail.contains("the reference stays resolvable."), "{out}");
+    assert!(!detail.contains(" YOU "), "{out}");
+    assert!(footer_of(&out).contains("Degraded:"), "{out}");
+    // Enter auf einer degradierten Karte legt weiterhin nichts.
+    app.reduce(Action::Enter);
+    assert!(app.top().is_none());
+}
+
+/// Ohne Karte bleibt das Detail leer — den Leerzustand sagt die Liste,
+/// einmal, nicht zweimal.
+#[test]
+fn an_empty_list_leaves_the_preview_blank() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(Inspection::default(), &repo, None);
+    let out = render_at(&mut app, SPLIT);
+    assert!(out.contains("No sessions captured yet."), "{out}");
+    assert!(!out.contains(" YOU "), "{out}");
+    assert!(!out.contains("SESSION b3-"), "{out}");
+    assert_eq!(out.matches("minds enable").count(), 1, "{out}");
+
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::SearchStart);
+    for c in "nirgends".chars() {
+        app.reduce(Action::SearchInput(c));
+    }
+    let out = render_at(&mut app, SPLIT);
+    assert!(out.contains("No match"), "{out}");
+    assert!(!out.contains(" YOU "), "{out}");
+    assert!(!out.contains("SESSION b3-"), "{out}");
+}
+
+/// Neben der Vorschau ist die Liste kompakt: Der Manipulationsbefund
+/// (SEAL) bleibt, Umfang und Review-Verdict weichen — der Graph-Kopf
+/// daneben sagt beides. Mehr Breite gibt ihr die Spalten zurueck.
+#[test]
+fn the_list_column_keeps_the_seal_and_grows_with_the_terminal() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let list = list_of(&render_at(&mut app, SPLIT));
+    for header in ["TIME", "SESSION", "AGENT", "SEAL"] {
+        assert!(list.contains(header), "{header} fehlt: {list}");
+    }
+    assert!(!list.contains("VERDICT"), "{list}");
+    assert!(!list.contains("SIZE"), "{list}");
+    assert!(list.contains("◈ sealed"), "{list}");
+    assert!(list.contains("· legacy"), "{list}");
+    assert!(list.contains("● ?"), "{list}");
+    assert!(list.contains("claude-code"), "{list}");
+    // Ab der vollen Stufe kommt das Verdict zurueck, dann der Umfang.
+    let list = list_of(&render_at(&mut app, 250));
+    assert!(list.contains("VERDICT"), "{list}");
+    assert!(list.contains("↻ needs work"), "{list}");
+    assert!(!list.contains("SIZE"), "{list}");
+    let list = list_of(&render_at(&mut app, 300));
+    assert!(list.contains("SIZE"), "{list}");
+}
+
+/// Jeder Agent traegt seine Farbe in der AGENT-Spalte — und das Wort
+/// daneben, ohne das die Farbe nichts sagte.
+#[test]
+fn the_agent_cell_carries_its_own_color() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let mut terminal = Terminal::new(TestBackend::new(SPLIT, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let expected = crate::theme::agent_color("claude-code · opus");
+    // Die Zelle mit dem ersten `c` von „claude-code" in der Tabellenzeile
+    // der Karte a — hinter dem Zeilen-Glyph, vor der SEAL-Spalte.
+    let row = (0..buffer.area.height)
+        .find(|y| {
+            let line: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, *y)].symbol().to_string())
+                .collect();
+            line.contains("Fix retry han")
+        })
+        .expect("Zeile der Karte a");
+    let x = (0..buffer.area.width)
+        .find(|x| {
+            let line: String = (*x..(*x + 11).min(buffer.area.width))
+                .map(|x| buffer[(x, row)].symbol().to_string())
+                .collect();
+            line == "claude-code"
+        })
+        .expect("AGENT-Zelle");
+    assert_eq!(buffer[(x, row)].style().fg, Some(expected));
+    // Und es ist wirklich eine eigene Farbe, nicht die alte Einheitsfarbe.
+    assert_ne!(buffer[(x, row)].style().fg, Some(crate::theme::AGENT));
 }

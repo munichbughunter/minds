@@ -93,7 +93,7 @@ minds search "retry backoff"
 minds inspect [<query> | <file>:<line>]
 ```
 
-Shows how a change came to be, in the terminal: a session list, the graph of a session (intent → agent → effects → change → review), and the why-chain of a line. Strictly read-only. When stdout is not a terminal, lines are emitted tab-separated for `grep`/`fzf`.
+Shows how a change came to be, in the terminal: a session list, the graph of a session (intent → agent → effects → change → review), and the why-chain of a line. On a terminal at least 120 columns wide the list stays in a left column and the graph of the session under the cursor is previewed on the right; `Enter`, `w` and `e` open Graph, Why and Evidence beside the list. Strictly read-only. When stdout is not a terminal, lines are emitted tab-separated for `grep`/`fzf`.
 
 ```
 minds inspect src/main.rs:10

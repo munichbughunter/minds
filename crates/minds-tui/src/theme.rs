@@ -35,6 +35,33 @@ pub const OK: Color = Color::Green;
 /// Vermutet, sekundär, degradiert.
 pub const DIM: Color = Color::DarkGray;
 
+/// Die Farben, die einzelne Agenten in der Liste voneinander absetzen —
+/// klein und fest, damit dieselbe Session in jedem Lauf gleich aussieht.
+/// Index 0 ist [`AGENT`]: Wer nur einen Agenten hat, sieht keine Änderung.
+/// Keine der übrigen ist eine Bedeutungsfarbe von oben — ein Agent in
+/// [`OK`]-Grün neben der SEAL-Spalte sähe aus wie ein Beleg.
+const AGENT_PALETTE: [Color; 6] = [
+    AGENT,
+    Color::Indexed(75),  // Himmelblau
+    Color::Indexed(212), // Rosa
+    Color::Indexed(141), // Flieder
+    Color::Indexed(180), // Sand
+    Color::Indexed(110), // Stahlblau
+];
+
+/// Die Farbe eines Agenten in der Liste — eine reine Funktion des Namens
+/// (FNV-1a), also in jedem Lauf dieselbe. Nur eine Lesehilfe beim
+/// Überfliegen: Das Wort steht immer daneben, Kollisionen in der kleinen
+/// Palette sind erlaubt (Modul-Regel: Farbe trägt nie allein).
+pub fn agent_color(name: &str) -> Color {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.bytes() {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    AGENT_PALETTE[hash as usize % AGENT_PALETTE.len()]
+}
+
 /// Glyph, Wort und Stil einer Evidenz-Klasse; `None` heißt „mit keinem
 /// Commit verbunden".
 ///
@@ -159,4 +186,26 @@ pub fn dim() -> Style {
 /// Hervorgehobener Kopf.
 pub fn title() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Die Agentenfarbe ist eine reine Funktion des Namens — über Läufe
+    /// **und Versionen** hinweg, deshalb feste Sollwerte statt `f(x) ==
+    /// f(x)`. Total: Ein leerer Akteur darf die Oberfläche nicht panicken.
+    #[test]
+    fn agent_color_is_deterministic_and_total() {
+        assert_eq!(agent_color("claude-code · opus"), AGENT_PALETTE[3]);
+        assert_eq!(agent_color("codex · gpt-5"), AGENT_PALETTE[4]);
+        assert_eq!(agent_color(""), AGENT_PALETTE[1]);
+        // Der erste Eintrag ist bewusst `AGENT`: Die Palette verschiebt
+        // niemanden, sie unterscheidet nur — und keine ihrer Farben trägt
+        // anderswo eine Bedeutung.
+        assert_eq!(AGENT_PALETTE[0], AGENT);
+        for meaning in [HUMAN, READ, EDIT, EXEC, DELETE, CHANGE, REVIEW, OK, DIM] {
+            assert!(!AGENT_PALETTE[1..].contains(&meaning), "{meaning:?}");
+        }
+    }
 }

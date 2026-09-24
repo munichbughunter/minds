@@ -1,11 +1,17 @@
 //! Das Zeichnen. Jede Ebene hat ihr Modul; dieses verteilt Rahmen, Kopf und
 //! Fuß und legt die Hilfe darüber.
+//!
+//! Ist das Terminal breit genug, liegt die Liste dauerhaft links und rechts
+//! daneben das Detail: die oberste Ebene des Stapels — oder, solange der
+//! Stapel leer ist, der Graph der Karte unter dem Cursor als Vorschau, die
+//! mit dem Cursor wandert. Der Stapel selbst weiß davon nichts: Was `Enter`,
+//! `Esc` und die Suche tun, ändert sich nicht, nur wie viel Platz es bekommt.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
 use minds_reader::model::evidence_sentence;
 
@@ -21,6 +27,23 @@ pub mod why;
 #[cfg(test)]
 mod tests;
 
+/// Eine Spalte Luft zwischen Listenrahmen und Detail.
+const GUTTER_WIDTH: u16 = 1;
+/// Was das Detail neben der Liste mindestens braucht: Kopf, YOU-Box und
+/// eine Spur, in der ein Pfad noch lesbar ist.
+const DETAIL_MIN_WIDTH: u16 = 55;
+/// Ab dieser Breite liegen Liste und Detail nebeneinander; darunter füllt
+/// wie bisher eine Fläche den Bildschirm.
+pub const SPLIT_MIN_WIDTH: u16 = activity::COMPACT_WIDTH + GUTTER_WIDTH + DETAIL_MIN_WIDTH;
+/// Der Anteil der Liste an der Breite — begrenzt auf das, was ihre Spalten
+/// brauchen, und auf das, was ihnen noch etwas bringt.
+const LIST_SHARE_PERCENT: u32 = 40;
+
+/// Die Meldung zu einer degradierten Karte — Fußzeile und Vorschau sagen
+/// dasselbe.
+const DEGRADED: &str =
+    "Degraded: the payload is unreadable — forgotten or damaged; the reference stays resolvable.";
+
 /// Zeichnet den ganzen Bildschirm.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let [head, body, foot] = Layout::vertical([
@@ -32,35 +55,87 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     header(frame, app, head);
     // Eine Seite = sichtbare Zeilen: Die Liste verliert an Rahmen und
-    // Kopfzeile drei Zeilen, die übrigen Ebenen zwei.
+    // Kopfzeile drei Zeilen, die übrigen Ebenen zwei. Die Höhe teilt sich
+    // nicht, nur die Breite — die Teilung ändert daran nichts.
     app.page = (body.height as usize)
         .saturating_sub(if app.top().is_none() { 3 } else { 2 })
         .max(1);
-    match app.top() {
-        None => activity::draw(frame, app, body),
-        Some(View::Graph {
+    match split(body) {
+        Some((list, detail)) => {
+            activity::draw(frame, app, list);
+            match app.top() {
+                None => preview(frame, app, detail),
+                Some(view) => view_draw(frame, app, detail, view),
+            }
+        }
+        None => match app.top() {
+            None => activity::draw(frame, app, body),
+            Some(view) => view_draw(frame, app, body, view),
+        },
+    }
+    footer(frame, app, foot);
+    if app.help {
+        help::draw(frame, frame.area());
+    }
+}
+
+/// Liste links, Detail rechts — oder `None`, wenn beides nebeneinander
+/// keinen Platz hat.
+fn split(body: Rect) -> Option<(Rect, Rect)> {
+    if body.width < SPLIT_MIN_WIDTH {
+        return None;
+    }
+    let share = (u32::from(body.width) * LIST_SHARE_PERCENT / 100) as u16;
+    let list_w = share.clamp(activity::COMPACT_WIDTH, activity::WIDE_WIDTH);
+    let [list, detail] = Layout::horizontal([Constraint::Length(list_w), Constraint::Min(1)])
+        .spacing(GUTTER_WIDTH)
+        .areas(body);
+    Some((list, detail))
+}
+
+/// Zeichnet eine gelegte Ebene in `area`.
+fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
+    match view {
+        View::Graph {
             id,
             rows,
             cursor,
             timeline,
             ..
-        }) => graph::draw(frame, app, body, *id, rows, *cursor, *timeline),
-        Some(View::Why {
+        } => graph::draw(frame, app, area, *id, rows, Some(*cursor), *timeline),
+        View::Why {
             chain,
             cursor,
             edge,
             inspector,
-        }) => why::draw(frame, body, chain, *cursor, *edge, inspector.as_deref()),
-        Some(View::Evidence {
+        } => why::draw(frame, area, chain, *cursor, *edge, inspector.as_deref()),
+        View::Evidence {
             id,
             report,
             uninterpreted,
             cursor,
-        }) => evidence::draw(frame, body, *id, report.as_ref(), *uninterpreted, *cursor),
+        } => evidence::draw(frame, area, *id, report.as_ref(), *uninterpreted, *cursor),
     }
-    footer(frame, app, foot);
-    if app.help {
-        help::draw(frame, frame.area());
+}
+
+/// Die Vorschau: der Graph der Karte unter dem Cursor, gezeichnet wie eine
+/// gelegte Ebene, aber ohne Cursor und ohne Stapel. Eine leere Liste lässt
+/// die Fläche leer — ihren Leerzustand sagt die Liste selbst.
+fn preview(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(card) = app.selected() else {
+        return;
+    };
+    if card.is_degraded() {
+        frame.render_widget(
+            Paragraph::new(DEGRADED)
+                .style(theme::dim())
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+        return;
+    }
+    if let Some(rows) = app.preview_graph(card.id) {
+        graph::draw(frame, app, area, card.id, &rows, None, false);
     }
 }
 
@@ -100,18 +175,12 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             .selected()
             .map(|card| {
                 if card.is_degraded() {
-                    Line::from(Span::styled(
-                        "Degraded: the payload is unreadable — forgotten or damaged; the reference stays resolvable.",
-                        theme::dim(),
-                    ))
+                    Line::from(Span::styled(DEGRADED, theme::dim()))
                 } else {
                     let (glyph, word, style) = theme::evidence(card.evidence);
                     Line::from(vec![
                         Span::styled(format!("{glyph} {word}  "), style),
-                        Span::styled(
-                            evidence_sentence(card.evidence).to_string(),
-                            theme::dim(),
-                        ),
+                        Span::styled(evidence_sentence(card.evidence).to_string(), theme::dim()),
                     ])
                 }
             })
@@ -189,7 +258,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         let keys = match app.top() {
             None => {
-                "↑↓ select  Enter graph  w why  e evidence  / search  1·2·3 zoom  ? help  q quit"
+                "↑↓ select  Enter descend  w why  e evidence  / search  1·2·3 zoom  ? help  q quit"
             }
             Some(View::Graph { .. }) => {
                 "↑↓ select  Enter descend  w why  e evidence  t timeline  1·2·3 zoom  Esc back  ? help"
