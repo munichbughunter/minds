@@ -29,6 +29,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
   several sessions, so they can never disagree on who owns a line. Purely
   derived: it reads committed history and stored sessions, writes nothing.
 
+### Changed
+
+- **`minds inspect` keeps the session list in view.** On a terminal at least
+  120 columns wide the list stays in a left column and the right column shows
+  the graph of the session under the cursor — live, no `Enter` needed. `Enter`,
+  `w` and `e` still open Graph, Why and Evidence as before, now beside the list
+  instead of over it; `Esc` walks back exactly as it did. The list column takes
+  about 40 % of the width and picks its columns from what fits: the SEAL
+  column — the tampering verdict — is always there, the review VERDICT and the
+  SIZE columns come back as the terminal grows. Narrower terminals keep the
+  single full-width pane. Each agent name now carries its own fixed color in
+  the AGENT column; the name is always printed beside it, so a monochrome
+  terminal loses nothing.
+
 ## [0.4.0] — 2026-09-10 — "The Tampering Gets a Name"
 
 *Minds does not prove that a decision was right. It proves what evidence

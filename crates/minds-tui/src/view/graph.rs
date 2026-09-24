@@ -15,14 +15,16 @@ use crate::view::{clip, offset, when};
 use minds_reader::graph::NodeKind;
 use minds_reader::model::evidence_sentence;
 
-/// Zeichnet den Graphen.
+/// Zeichnet den Graphen. `cursor` ist `None` für die Vorschau neben der
+/// Liste: kein Fokus, also keine hervorgehobene Zeile und kein Detailkasten
+/// — die gehören der gelegten Ebene, die man mit ↑↓ bewegt.
 pub fn draw(
     frame: &mut Frame,
     app: &App,
     area: Rect,
     id: SessionId,
     rows: &[Row],
-    cursor: usize,
+    cursor: Option<usize>,
     timeline: bool,
 ) {
     let Some(card) = app.inspection.card(id) else {
@@ -32,9 +34,9 @@ pub fn draw(
         );
         return;
     };
-    let detail_h = rows
-        .get(cursor)
-        .and_then(|r| app.views.last().and_then(|_| graph_detail_len(app, id, r)))
+    let focused = cursor.and_then(|c| rows.get(c));
+    let detail_h = focused
+        .and_then(|r| graph_detail_len(app, id, r))
         .map(|n| (n as u16 + 2).min(12))
         .unwrap_or(0);
     let [head, intent, body, detail] = Layout::vertical([
@@ -116,7 +118,7 @@ pub fn draw(
 
     // Die Spur.
     let height = body.height as usize;
-    let first = offset(cursor, rows.len(), height);
+    let first = offset(cursor.unwrap_or(0), rows.len(), height);
     let lines: Vec<Line> = rows
         .iter()
         .enumerate()
@@ -138,7 +140,7 @@ pub fn draw(
                 spans.push(Span::styled(format!("  {}", when(Some(at))), theme::dim()));
             }
             let mut line = Line::from(spans);
-            if i == cursor {
+            if Some(i) == cursor {
                 line = line.style(theme::cursor());
             }
             line
@@ -148,7 +150,7 @@ pub fn draw(
 
     // Die Details unter dem Cursor.
     if detail_h > 0
-        && let Some(row) = rows.get(cursor)
+        && let Some(row) = focused
         && let Some(lines) = graph_detail(app, id, row)
     {
         let (_, word, style) = theme::node(&row.kind);

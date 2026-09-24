@@ -162,6 +162,16 @@ impl<'a> App<'a> {
             .unwrap_or(0);
     }
 
+    /// Die Zeilen des Graphen einer Session, wie `Enter` sie zeigen würde —
+    /// aber ohne den Stapel zu berühren. Die Vorschau neben der Liste
+    /// zeichnet daraus; sie darf keinen `Esc` kosten und folgt dem Zoom wie
+    /// eine gelegte Ebene. `None`, wenn der Reader keinen Graphen hat.
+    pub fn preview_graph(&self, id: SessionId) -> Option<Vec<Row>> {
+        self.inspection
+            .graph(id)
+            .map(|graph| layout::rows(&graph, self.zoom))
+    }
+
     fn push_graph(&mut self, id: SessionId) {
         let Some(graph) = self.inspection.graph(id) else {
             return;
