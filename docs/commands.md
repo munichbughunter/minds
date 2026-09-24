@@ -45,13 +45,22 @@ minds why src/lib.rs:42
 ### minds blame
 
 ```
-minds blame <file>
+minds blame [--lines] <file>
 ```
 
-Shows which session is behind which lines of a file, aggregated per session, with context coverage as a percentage.
+Shows which session is behind which lines of a file, aggregated per session, with context coverage as a percentage. `--lines` prints one annotated row per source line instead — short session id, agent name, line number, and the source text, in file order; lines without captured context carry a `-` in both attribution columns.
 
 ```
 minds blame crates/minds-core/src/evidence.rs
+minds blame --lines src/retry.rs
+```
+
+```
+src/retry.rs — 3 lines, 1 with captured context (33%)
+
+-                -            1  fn retry() {
+b3-a1b2c3d4e5f6  claude-code  2      backoff(3);
+-                -            3  }
 ```
 
 ### minds recap

@@ -111,9 +111,11 @@ Usage:
   minds why <file>:<line> [--full]
         Shows the session behind a single line (blame → trailer).
 
-  minds blame <file>
+  minds blame [--lines] <file>
         Overview of which session sits behind which lines of a file,
         aggregated by session, with context coverage in percent.
+        --lines prints one annotated line per source line instead of
+        the session summary — the git-blame-shaped view.
 
   minds recall <target>
         Condenses the session(s) behind a file, a line (<file>:<line>) or
@@ -289,7 +291,7 @@ const SPECS: &[Spec] = &[
     spec("checkpoint", &["--commit"], &[], 0),
     spec("show", &[], &["--full"], 1),
     spec("why", &[], &["--full"], 1),
-    spec("blame", &[], &[], 1),
+    spec("blame", &[], &["--lines"], 1),
     spec("recall", &[], &[], 1),
     spec("distill", &["--path", "--out"], &[], 0),
     spec("brief", &[], &["--hook"], usize::MAX),
@@ -628,7 +630,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
 
         "why" => why::run(parsed.positional(0), parsed.has("--full")),
 
-        "blame" => blame::run(parsed.positional(0)),
+        "blame" => blame::run(parsed.positional(0), parsed.has("--lines")),
 
         "recall" => recall::run(parsed.positional(0)),
 
@@ -865,6 +867,20 @@ mod tests {
             !err.contains("background"),
             "internes Flag in der Meldung: {err}"
         );
+    }
+
+    /// `minds blame --lines <datei>`: Das Flag ist in der Tabelle, der
+    /// Tippfehler daneben nicht — sonst liefe `--linez` als nacktes `blame`
+    /// durch und lieferte still die falsche Ansicht, mit Exit 0.
+    #[test]
+    fn blame_knows_lines_and_rejects_the_typo_next_to_it() {
+        let parsed = parse(spec_named("blame"), &args(&["--lines", "src/retry.rs"])).unwrap();
+        assert!(parsed.has("--lines"));
+        assert_eq!(parsed.positional(0), Some("src/retry.rs"));
+
+        let err = parse(spec_named("blame"), &args(&["--linez", "src/retry.rs"])).unwrap_err();
+        assert!(err.contains("unknown flag"), "{err}");
+        assert!(err.contains("--lines"), "{err}");
     }
 
     /// Zwei Kommandos mit demselben Namen wären ein stiller Dispatch-Fehler.

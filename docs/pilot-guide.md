@@ -59,6 +59,7 @@ it takes; the rest happens in the background.
 minds show                    # the session behind the last commit
 minds why <file>:<line>       # the session behind a single line
 minds blame <file>            # which session is behind which lines
+minds blame --lines <file>    # one annotated row per source line
 ```
 
 **Overview and search:**

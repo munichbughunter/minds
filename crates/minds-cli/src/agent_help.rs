@@ -31,7 +31,7 @@ fn card() -> serde_json::Value {
             {"name": "checkpoint", "usage": "minds checkpoint [--commit <id>]", "summary": "Interpret the journal, redact, store sessions, append trailers."},
             {"name": "show", "usage": "minds show [<commit>] [--full]", "summary": "Intent and attribution behind a commit."},
             {"name": "why", "usage": "minds why <file>:<line> [--full]", "summary": "The session behind a single line."},
-            {"name": "blame", "usage": "minds blame <file>", "summary": "Attribution per line, aggregated by session, with context coverage."},
+            {"name": "blame", "usage": "minds blame [--lines] <file>", "summary": "Which session is behind which lines of a file, aggregated by session, with context coverage; --lines annotates every source line instead."},
             {"name": "recall", "usage": "minds recall <target>", "summary": "Context brief behind a file, line, or commit — agent-friendly."},
             {"name": "distill", "usage": "minds distill [--path <dir>] [--out <file>]", "summary": "AGENTS.md draft from the repo history."},
             {"name": "brief", "usage": "minds brief [<file>...]", "summary": "Size-bounded context block for the start of a session."},
