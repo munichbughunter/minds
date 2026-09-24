@@ -201,6 +201,18 @@ minds stack --base origin/main
 
 ## Evidence & compliance
 
+### minds seals
+
+```
+minds seals [--session <id>] [--limit <n>]
+```
+
+Lists Evidence-Chain seals — id, linked session (if any), event range, gap/signature status, timestamp — so a seal id becomes something you discover, not something you must already know before `verify --evidence` or `sign --seal`. Most recent first; `--session` scopes to one session's seals, `--limit` caps how many print (applied after sorting). A tampered or unreadable seal is reported inline and does not hide the rest of the list.
+
+```
+minds seals --session b3a1f0e --limit 5
+```
+
 ### minds verify
 
 ```
