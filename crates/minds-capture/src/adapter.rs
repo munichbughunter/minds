@@ -165,12 +165,17 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
 
 /// Füllt die Inhalts-Hashes der Effekte, deren Datei sich lesen lässt.
 ///
-/// Drei Regeln, alle fail-closed:
-/// - **Schreib**-Effekte immer: Der Hash ist der Fingerabdruck des vom
-///   Agenten *erzeugten* Artefakts.
-/// - **Lese**-Effekte nur innerhalb der Read-Grenze ([`Checkpoint::tracked`]):
-///   getrackte, repo-relative Pfade — als Beweismittel für Content-Übergaben
-///   (Phase 6). Bloßes Lesen einer privaten oder repo-fremden Datei erzeugt
+/// Vier Regeln, alle fail-closed:
+/// - **Nie** außerhalb des Repos: `path` ist Text, den der Agent selbst
+///   gewählt hat — nie vertrauenswürdig. Ein absoluter oder über `..`
+///   flüchtender Pfad bekommt keinen Hash, egal ob Schreib- oder Lese-Effekt;
+///   sonst wäre ein Content-Hash ein Existenz-/Inhalts-Orakel über beliebige
+///   Dateien der Maschine.
+/// - **Schreib**-Effekte innerhalb dieser Grenze immer: Der Hash ist der
+///   Fingerabdruck des vom Agenten *erzeugten* Artefakts.
+/// - **Lese**-Effekte zusätzlich nur innerhalb der Read-Grenze
+///   ([`Checkpoint::tracked`]): getrackte Pfade — als Beweismittel für
+///   Content-Übergaben (Phase 6). Bloßes Lesen einer privaten Datei erzeugt
 ///   nie einen Fingerabdruck.
 /// - **Nie** für eine Zugangsdaten-Datei: Bei einer kurzen, ratbaren Datei wäre
 ///   ein Hash ein Orakel. Die Secretfile-Mauer gilt auch für Fingerabdrücke.
@@ -199,18 +204,26 @@ fn hash_artifacts(
         if minds_redact::is_secret_file(path) {
             continue;
         }
-        // Read-Grenze (siehe [`Checkpoint::tracked`]): Nur getrackte,
-        // repo-relative Pfade — bloßes Lesen einer privaten Datei erzeugt
-        // keinen Fingerabdruck. Schreib-Effekte bleiben wie bisher: Was der
-        // Agent erzeugt hat, ist sein Artefakt.
-        if effect.kind == EffectKind::Read {
-            let inside = Path::new(path).is_relative()
-                && !Path::new(path)
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir));
-            if !inside || !tracked.is_some_and(|set| set.contains(path)) {
-                continue;
-            }
+        // Boundary gegen Pfad-Flucht: `path` kommt aus Text, den der Agent
+        // selbst gewählt hat (ein Tool-Argument, bei `apply_patch` sogar eine
+        // frei formulierte Diff-Kopfzeile) — nie aus vertrauenswürdiger
+        // Eingabe. Ein absoluter oder über `..` aus dem Repo führender Pfad
+        // würde sonst beliebige Dateien der Maschine hashen: ein
+        // Existenz-/Inhalts-Orakel. Gilt für Schreib- **und** Lese-Effekte
+        // gleichermaßen.
+        let inside = Path::new(path).is_relative()
+            && !Path::new(path)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+        if !inside {
+            continue;
+        }
+        // Read-Grenze (siehe [`Checkpoint::tracked`]): zusätzlich nur
+        // getrackte Pfade — bloßes Lesen einer privaten Datei erzeugt keinen
+        // Fingerabdruck. Schreib-Effekte brauchen das nicht: Was der Agent
+        // innerhalb des Repos erzeugt hat, ist sein Artefakt.
+        if effect.kind == EffectKind::Read && !tracked.is_some_and(|set| set.contains(path)) {
+            continue;
         }
         if let Some(bytes) = read_artifact(root, path) {
             let digest = blake3::hash(&bytes);
@@ -820,5 +833,84 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_write_effect_that_escapes_the_repo_is_never_hashed() {
+        // `path` ist Text, den der Agent selbst waehlt — bei Claudes
+        // `file_path`-Feld ebenso wie bei Codex' Diff-Kopfzeile. Ein
+        // absoluter oder ueber `..` fluechtender Pfad darf nie zu einem
+        // Content-Hash fuehren, sonst waere er ein Orakel ueber beliebige
+        // Dateien der Maschine.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("outside.txt"), b"secret machine content").unwrap();
+
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                r#"{"tool_name":"Write","tool_input":{"file_path":"../outside.txt"}}"#,
+            ),
+            ev(
+                1,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t1",
+                &format!(
+                    r#"{{"tool_name":"Write","tool_input":{{"file_path":"{}"}}}}"#,
+                    dir.path().join("outside.txt").display()
+                ),
+            ),
+        ];
+        let ctx = Checkpoint {
+            root: Some(&dir.path().join("repo")),
+            commit: None,
+            tracked: None,
+        };
+        std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+        let s = checkpoint(&key(), &events, &ctx);
+        for call in s.turns.iter().flat_map(|t| &t.tool_calls) {
+            let effect = call.effect.as_ref().unwrap();
+            assert!(
+                effect.content.is_none(),
+                "Pfad-Flucht darf nie gehasht werden: {:?}",
+                effect.path
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_apply_patch_diff_pointing_outside_the_repo_is_never_hashed() {
+        // Derselbe Fall ueber den Codex-Adapter: Der Pfad kommt aus einer
+        // freien Diff-Kopfzeile, nicht aus einem strukturierten Feld — noch
+        // weniger Grund, ihr zu vertrauen.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("repo")).unwrap();
+        fs::write(dir.path().join("outside.txt"), b"secret machine content").unwrap();
+
+        let diff = "--- a/x\n+++ b/../outside.txt\n@@ ...\n";
+        let events = vec![ev(
+            0,
+            EventKind::ToolPre,
+            "PreToolUse",
+            "t0",
+            &format!(r#"{{"tool_name":"apply_patch","tool_input":{{"diff":"{diff}"}}}}"#)
+                .replace('\n', "\\n"),
+        )];
+        let key = SessionKey::new("codex", key().local_id()).unwrap();
+        let ctx = Checkpoint {
+            root: Some(&dir.path().join("repo")),
+            commit: None,
+            tracked: None,
+        };
+        let s = checkpoint(&key, &events, &ctx);
+        let effect = s.turns[0].tool_calls[0].effect.as_ref().unwrap();
+        assert_eq!(effect.path.as_deref(), Some("../outside.txt"));
+        assert!(
+            effect.content.is_none(),
+            "Diff-basierte Pfad-Flucht darf nie gehasht werden"
+        );
     }
 }

@@ -510,9 +510,10 @@ today".*
   `minds show` and `minds why` show the main tree's commit
   ([#20](https://github.com/munichbughunter/minds/issues/20)).
 - **No native Windows binary** — the supported route is WSL.
-- **Tool level complete only for Claude Code.** Other agents (Codex,
-  Cursor, Gemini, opencode): the prompt is captured, the tool and file
-  levels are not yet interpreted.
+- **Tool level complete for Claude Code; partial for Codex.** Codex's
+  file/shell calls (`apply_patch`, shell) are interpreted the same way;
+  other Codex tools fall back to raw evidence. Cursor, Gemini and opencode:
+  the prompt is captured, the tool and file levels are not yet interpreted.
 - **The review layer needs two people on one repo** — solo, capture,
   `why`, and `recall` remain testable; reviews do not.
 - **Two edge cases remain around `forget`** — since 0.1.3 the erasure also

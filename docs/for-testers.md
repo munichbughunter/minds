@@ -154,7 +154,8 @@ The honest part. I would rather you read it here than discover it yourself:
 | | State today |
 |---|---|
 | **Claude Code** | complete — prompt, tool calls, files, model, tokens |
-| **Gemini, Codex, Cursor, opencode** | the prompt is captured; the tool and file level is **not** yet interpreted |
+| **Codex** | prompt and file/shell calls (`apply_patch`, shell) interpreted; other tool calls stored as raw evidence |
+| **Gemini, Cursor, opencode** | the prompt is captured; the tool and file level is **not** yet interpreted |
 
 That is deliberate: better **one** agent done right than four done halfway.
 Which agent comes next is your call — tell me what you use.
