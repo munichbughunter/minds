@@ -3438,14 +3438,14 @@ fn reinterpret_is_read_only_and_deterministic() {
     assert!(out.status.success(), "{text}");
     // Interpretations-Protokoll: Evidenz-Adresse unverändert, gespeicherter
     // und aktueller Stand nebeneinander.
-    assert!(text.contains("Adapter   claude-code v1"), "{text}");
+    assert!(text.contains("Adapter   claude-code v2"), "{text}");
     assert!(text.contains("Evidence"), "{text}");
     assert!(
-        text.contains("stored        claude-code v1 → READ a.rs"),
+        text.contains("stored        claude-code v2 → READ a.rs"),
         "{text}"
     );
     assert!(
-        text.contains("current       claude-code v1 → READ a.rs (unchanged)"),
+        text.contains("current       claude-code v2 → READ a.rs (unchanged)"),
         "{text}"
     );
     assert!(text.contains("0 with a newer interpretation"), "{text}");
@@ -3460,4 +3460,62 @@ fn reinterpret_is_read_only_and_deterministic() {
         .map(|ns| stdout(&git(dir, &["for-each-ref", ns])))
         .collect();
     assert_eq!(before, after, "reinterpret hat Refs verändert");
+}
+
+#[test]
+fn reinterpret_shows_the_write_time_hash_of_a_captured_write() {
+    // EA-01a über den ganzen Weg: Hook → Journal → Checkpoint → Store →
+    // `minds reinterpret`. Der Schreibzeit-Hash steht in der gespeicherten
+    // wie in der aktuellen Deutung, und weder er noch der Platten-Hash
+    // (`content`) machen aus einer unveränderten Deutung eine neue.
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    minds(dir, &["enable", "--agent", "claude-code"], None);
+    // Claude Code nennt Pfade absolut.
+    let file = dir.join("notes.txt");
+    let path = file.display();
+    event(
+        dir,
+        r#""hook_event_name":"UserPromptSubmit","prompt":"schreib die Notiz""#,
+    );
+    event(
+        dir,
+        &format!(
+            r#""hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{{"file_path":"{path}","content":"hello world\nsecond line\n"}},"tool_use_id":"toolu_w""#
+        ),
+    );
+    std::fs::write(&file, "hello world\nsecond line\n").unwrap();
+    event(
+        dir,
+        &format!(
+            r#""hook_event_name":"PostToolUse","tool_name":"Write","tool_input":{{"file_path":"{path}","content":"hello world\nsecond line\n"}},"tool_response":{{"type":"create","filePath":"{path}","content":"hello world\nsecond line\n","structuredPatch":[],"originalFile":null}},"tool_use_id":"toolu_w""#
+        ),
+    );
+    event(dir, r#""hook_event_name":"Stop""#);
+    git(dir, &["add", "notes.txt"]);
+    git(dir, &["commit", "-q", "-m", "feat: notes"]);
+    let id = last_session_id(dir);
+
+    let out = minds(dir, &["reinterpret", &id], None);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    // Golden: blake3("hello world\nsecond line\n") — derselbe Wert wie in
+    // `minds-capture/tests/written.rs`.
+    let written = " · written b3-94803d2ead501d00c5434080fc6f831289846cdfe4e33ee03e3a29576f8f22ac";
+    let stored = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("stored") && l.contains("EDIT"))
+        .unwrap_or_else(|| panic!("keine gespeicherte Schreibung:\n{text}"));
+    assert!(stored.contains("claude-code v2"), "{text}");
+    assert!(stored.ends_with(written), "{text}");
+    let current = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("current") && l.contains("EDIT"))
+        .unwrap_or_else(|| panic!("keine aktuelle Schreibung:\n{text}"));
+    assert!(current.contains(written), "{text}");
+    assert!(current.ends_with("(unchanged)"), "{text}");
+    assert!(text.contains("0 with a newer interpretation"), "{text}");
 }

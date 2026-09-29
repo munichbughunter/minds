@@ -225,6 +225,8 @@ mod tests {
                     kind: EffectKind::Exec,
                     path: None,
                     content: None,
+                    written: None,
+                    written_unavailable: None,
                 }),
             }],
             parent: None,

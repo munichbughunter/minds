@@ -869,6 +869,8 @@ mod tests {
                         kind,
                         path: Some("foo.rs".into()),
                         content: Some(h.clone()),
+                        written: None,
+                        written_unavailable: None,
                     }),
                 }],
                 parent: None,

@@ -492,6 +492,8 @@ mod tests {
                 kind,
                 path: path.map(str::to_string),
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         }
     }

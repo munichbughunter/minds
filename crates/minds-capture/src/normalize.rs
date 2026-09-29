@@ -34,7 +34,7 @@
 //! darf den Checkpoint einer ganzen Session nicht zum Absturz bringen. Was wir
 //! heute nicht deuten, liegt über den rohen Payload im Journal weiter bereit.
 
-use minds_core::{Capture, CaptureStatus, Effect, EffectKind};
+use minds_core::{Capture, CaptureStatus, Effect, EffectKind, WrittenUnavailable};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -55,9 +55,14 @@ pub struct EventFacts {
 }
 
 /// Versionsstand der Claude-Code-Deutung. Bump bei jeder Änderung an
-/// [`claude_effect`] oder der Turn-Bildung — damit eine gespeicherte Deutung
-/// ihrem Stand zuordenbar bleibt (Interpretation ist wiederholbar, ADR-0011).
-pub const CLAUDE_ADAPTER_VERSION: u32 = 1;
+/// [`claude_effect`], [`claude_written`] oder der Turn-Bildung — damit eine
+/// gespeicherte Deutung ihrem Stand zuordenbar bleibt (Interpretation ist
+/// wiederholbar, ADR-0011).
+///
+/// - v1: Tool → Wirkung und Pfad.
+/// - v2: zusätzlich der Schreibzeit-Hash [`Effect::written`] aus dem
+///   PostToolUse-Payload (EA-01a). Sessions aus v1 bleiben ohne ihn.
+pub const CLAUDE_ADAPTER_VERSION: u32 = 2;
 
 /// Versionsstand des generischen Fallbacks für Agents ohne eigenen Adapter.
 pub const GENERIC_ADAPTER_VERSION: u32 = 1;
@@ -143,8 +148,44 @@ pub trait ToolAdapter: Sync {
     /// Deutet einen **gespeicherten** Aufruf neu — aus `name` und den
     /// erhaltenen `arguments` (der Reinterpretations-Pfad, ohne Journal).
     /// `None` heißt: Dieser Adapter kann daraus keine Wirkung ableiten.
+    ///
+    /// [`Effect::written`] bleibt hier immer `None`: Er entsteht aus dem
+    /// PostToolUse-Payload, und der liegt nach dem Checkpoint nicht mehr vor.
+    /// Gespeichertes `written` ist damit Beweismittel des Checkpoints, nicht
+    /// wiederholbare Deutung — `minds reinterpret` übernimmt es unverändert.
     fn interpret_stored(&self, name: &str, arguments: &str) -> Option<StoredInterpretation>;
+
+    /// Die Korrelationskennung eines Tool-Events — dieselbe bei PreToolUse
+    /// und PostToolUse **desselben** Aufrufs. `None`: Der Agent liefert
+    /// keine, dann bleibt Pre und Post unverbunden (und `written` fehlt mit
+    /// [`WrittenUnavailable::PayloadWithoutContent`]). Raten über die
+    /// Reihenfolge wäre bei parallelen Tool-Aufrufen eine falsche Zuordnung.
+    fn call_id(&self, _event: &JournalEvent) -> Option<String> {
+        None
+    }
+
+    /// Leitet aus dem PostToolUse-Event die Bytes ab, die das Tool laut
+    /// Payload geschrieben hat — die Grundlage des Schreibzeit-Hashes.
+    ///
+    /// `path` ist der Pfad des Effekts (aus dem Pre-Event, schon durch Mauer
+    /// und Grenze). Der Adapter muss ihn gegen den Post-Payload
+    /// gegenprüfen: Ein Post, der einen anderen Pfad nennt, gehört nicht zu
+    /// diesem Aufruf — dann keine Bytes.
+    ///
+    /// **Vertrag für den Aufrufer:** Secretfile-Mauer und Repo-Grenze sind
+    /// *vor* diesem Aufruf geprüft, Redaction-Scan und Hash kommen *danach*
+    /// (siehe `adapter::written_hashes`) — beides Regeln des Checkpoints,
+    /// nicht des Adapters. Der Adapter sieht den Payload nur für Pfade, die
+    /// Mauer und Grenze passiert haben, und hasht nie selbst.
+    /// Der Default: Dieser Agent trägt keinen Inhalt im Payload.
+    fn written_bytes(&self, _post: &JournalEvent, _path: &str) -> WrittenOutcome {
+        Err(WrittenUnavailable::PayloadWithoutContent)
+    }
 }
+
+/// Ergebnis der Schreibzeit-Deutung: die geschriebenen Bytes, oder warum es
+/// keine gibt.
+pub type WrittenOutcome = Result<String, WrittenUnavailable>;
 
 /// Das Ergebnis einer (Re-)Deutung eines gespeicherten Aufrufs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +232,30 @@ impl ToolAdapter for ClaudeAdapter {
             adapter: "claude-code",
             adapter_version: CLAUDE_ADAPTER_VERSION,
         })
+    }
+
+    fn call_id(&self, event: &JournalEvent) -> Option<String> {
+        parse::<CallId>(event)?.tool_use_id
+    }
+
+    fn written_bytes(&self, post: &JournalEvent, path: &str) -> WrittenOutcome {
+        use WrittenUnavailable::PayloadWithoutContent;
+        // `PostToolUseFailure` faellt in `hook_event::classify` bewusst mit
+        // `PostToolUse` auf `ToolPost` zusammen — fuer den Record dasselbe
+        // Ereignis, fuer den Schreibzeit-Hash nicht: Ein gescheiterter Write
+        // hat nichts geschrieben. Nur der gelungene Aufruf traegt Bytes.
+        if post.raw_kind != "PostToolUse" {
+            return Err(PayloadWithoutContent);
+        }
+        let tool = parse::<PostTool>(post).ok_or(PayloadWithoutContent)?;
+        let name = tool.tool_name.ok_or(PayloadWithoutContent)?;
+        // Gegenprobe: Der Post-Payload muss denselben Pfad nennen wie der
+        // Effekt. So haengt die Mauer-Aussage (geprueft am Pfad des
+        // Pre-Events) nicht an einer Kennung allein.
+        if !claude_post_names_path(tool.tool_input.as_ref(), tool.tool_response.as_ref(), path) {
+            return Err(PayloadWithoutContent);
+        }
+        claude_written(&name, tool.tool_response.as_ref())
     }
 }
 
@@ -361,7 +426,235 @@ pub fn claude_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
         kind,
         path,
         content: None,
+        written: None,
+        written_unavailable: None,
     }
+}
+
+/// Die geschriebenen Bytes aus Claude Codes PostToolUse-Payload — die
+/// Payload-Formen sind **aufgezeichnet, nicht geraten** (Fixtures unter
+/// `tests/fixtures/claude-code/`, Claude Code 2.1.282):
+///
+/// - `Write`: `tool_response.content` ist der geschriebene Inhalt — der
+///   Beleg des **gelungenen** Schreibens. `tool_input.content` ist nur die
+///   Absicht und wird bewusst nicht herangezogen: Ein `PostToolUseFailure`
+///   trägt sie ebenfalls, geschrieben wurde aber nichts.
+/// - `Edit`: `tool_response.originalFile` ist der Inhalt **vor** der
+///   Änderung, `oldString`/`newString`/`replaceAll` die **tatsächlich
+///   angewandte** Ersetzung (Claude Code normalisiert z. B. Anführungszeichen
+///   gegenüber `tool_input`, deshalb nie der Rückfall auf die Eingabe).
+///   Einen Nachher-Inhalt trägt der Payload nicht; er wird so rekonstruiert,
+///   wie das Tool ersetzt (erstes Vorkommen bzw. alle), und dann gegen den
+///   `structuredPatch` des Tools geprüft ([`agrees_with_patch`]). Die
+///   Fixture-Tests prüfen das Ergebnis gegen die tatsächlich entstandene Datei.
+/// - `NotebookEdit`: `tool_response.updated_file` ist der Nachher-Inhalt.
+/// - `MultiEdit`: In Claude Code 2.1.x nicht mehr vorhanden, keine Fixture —
+///   deshalb bewusst [`WrittenUnavailable::PayloadWithoutContent`] statt
+///   einer geratenen Form.
+///
+/// `userModified: true` (Write und Edit): Der Nutzer hat den Vorschlag vor
+/// dem Übernehmen geändert; welche Bytes geschrieben wurden, sagt der Payload
+/// dann nicht verlässlich ([`WrittenUnavailable::UserModified`]).
+///
+/// Fail-closed an jeder Stelle, an der wir nicht *sicher* wissen, welche
+/// Bytes das Tool geschrieben hat ([`WrittenUnavailable::ReconstructionFailed`]):
+/// Suchtext nicht im Original, leerer Suchtext, CRLF-Zeilenenden im Original
+/// (Claude Code passt `newString` dann an die Zeilenenden an — ohne Fixture
+/// dafür behaupten wir lieber nichts), ein Ergebnis über
+/// [`WRITTEN_RECONSTRUCTION_CAP`], oder eine Rekonstruktion, die dem
+/// `structuredPatch` widerspricht (etwa weil das Tool beim Löschen einer
+/// Zeile den Zeilenumbruch mitnimmt — ein Verhalten, das wir nicht
+/// nachbauen, sondern am Patch erkennen).
+pub(crate) fn claude_written(
+    tool_name: &str,
+    response: Option<&serde_json::Value>,
+) -> WrittenOutcome {
+    use WrittenUnavailable::{PayloadWithoutContent, ReconstructionFailed, UserModified};
+
+    let field = |key: &str| -> Option<String> { response?.get(key)?.as_str().map(str::to_owned) };
+    let user_modified = response
+        .and_then(|r| r.get("userModified"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    match tool_name {
+        "Write" => {
+            let content = field("content").ok_or(PayloadWithoutContent)?;
+            if user_modified {
+                return Err(UserModified);
+            }
+            Ok(content)
+        }
+        "Edit" => {
+            let original = field("originalFile").ok_or(PayloadWithoutContent)?;
+            let old = field("oldString").ok_or(PayloadWithoutContent)?;
+            let new = field("newString").ok_or(PayloadWithoutContent)?;
+            if user_modified {
+                return Err(UserModified);
+            }
+            let replace_all = response
+                .and_then(|r| r.get("replaceAll"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if old.is_empty() || original.contains("\r\n") || !original.contains(&old) {
+                return Err(ReconstructionFailed);
+            }
+            // Schranke vor der Allokation: Der Payload ist fremd, und ein
+            // kurzer Suchtext mit langem Ersatz und `replace_all` waechst
+            // multiplikativ. Das Tool hat dieselbe Datei geschrieben, also
+            // ist alles jenseits der Hook-Obergrenze ohnehin nicht plausibel.
+            let matches = if replace_all {
+                original.matches(&old).count()
+            } else {
+                1
+            };
+            let growth = matches.saturating_mul(new.len().saturating_sub(old.len()));
+            if original.len().saturating_add(growth) > WRITTEN_RECONSTRUCTION_CAP {
+                return Err(ReconstructionFailed);
+            }
+            let result = if replace_all {
+                original.replace(&old, &new)
+            } else {
+                original.replacen(&old, &new, 1)
+            };
+            let patch = response.and_then(|r| r.get("structuredPatch"));
+            if !agrees_with_patch(&original, &result, patch) {
+                return Err(ReconstructionFailed);
+            }
+            Ok(result)
+        }
+        "NotebookEdit" => field("updated_file").ok_or(PayloadWithoutContent),
+        _ => Err(PayloadWithoutContent),
+    }
+}
+
+/// Stimmt die Rekonstruktion mit dem `structuredPatch` überein, den Claude
+/// Code zum `Edit` mitliefert? Der Patch wird vollständig auf das Original
+/// angewandt ([`apply_patch`]), und das Ergebnis muss mit der
+/// Rekonstruktion **byte-gleich** sein — inklusive der Zeilen hinter dem
+/// letzten Hunk und des Zeilenumbruchs am Dateiende.
+///
+/// Das fängt jedes Tool-Verhalten, das [`claude_written`] nicht nachbaut,
+/// ohne es kennen zu müssen (etwa den mitgelöschten Zeilenumbruch beim
+/// Entfernen der letzten Zeile). Kein Patch, ein leerer Patch (ein `Edit`
+/// ändert immer etwas) oder eine unbekannte Hunk-Form: keine
+/// Übereinstimmung — fail-closed.
+fn agrees_with_patch(original: &str, result: &str, patch: Option<&serde_json::Value>) -> bool {
+    patch
+        .and_then(serde_json::Value::as_array)
+        .filter(|hunks| !hunks.is_empty())
+        .and_then(|hunks| apply_patch(original, hunks))
+        .is_some_and(|patched| patched == result)
+}
+
+/// Wendet jsdiff-Hunks (Claude Codes `structuredPatch`) auf `original` an.
+///
+/// Streng: Die Hunks müssen aufsteigend und überlappungsfrei sein, ihre
+/// alte Seite muss im Original genau an `oldStart` stehen, und die
+/// Zeilenzahlen müssen stimmen. `\ No newline at end of file` nach einer
+/// Zeile der neuen Seite heißt: Die neue Datei endet ohne Umbruch; nach einer
+/// der alten Seite muss das Original so enden. Ein Hunk mit leerer alter
+/// Seite kommt nur bei leerem Original vor — das rekonstruieren wir ohnehin
+/// nicht, also `None`. Jede Abweichung: `None`.
+fn apply_patch(original: &str, hunks: &[serde_json::Value]) -> Option<String> {
+    let before: Vec<&str> = original.lines().collect();
+    let mut after: Vec<&str> = Vec::with_capacity(before.len());
+    let mut cursor = 0usize;
+    // Endet die neue Datei mit Umbruch? Ohne Hunk am Dateiende wie das
+    // Original; mit Hunk dort ja, außer ein Marker sagt nein.
+    let mut trailing_newline = original.ends_with('\n');
+
+    for hunk in hunks {
+        let number = |key: &str| {
+            hunk.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok())
+        };
+        let (old_start, old_lines, new_lines) = (
+            number("oldStart")?,
+            number("oldLines")?,
+            number("newLines")?,
+        );
+        let from = old_start.checked_sub(1)?;
+        let to = from.checked_add(old_lines)?;
+        if old_lines == 0 || from < cursor || to > before.len() {
+            return None;
+        }
+        after.extend_from_slice(&before[cursor..from]);
+
+        let (mut old_side, mut new_side) = (Vec::new(), Vec::new());
+        let (mut old_no_eol, mut new_no_eol) = (false, false);
+        let mut last: Option<char> = None;
+        for line in hunk.get("lines")?.as_array()? {
+            let line = line.as_str()?;
+            let (tag, text) = line.split_at_checked(1)?;
+            match tag {
+                " " => {
+                    old_side.push(text);
+                    new_side.push(text);
+                }
+                "-" => old_side.push(text),
+                "+" => new_side.push(text),
+                "\\" => match last? {
+                    ' ' => (old_no_eol, new_no_eol) = (true, true),
+                    '-' => old_no_eol = true,
+                    _ => new_no_eol = true,
+                },
+                _ => return None,
+            }
+            last = tag.chars().next().filter(|c| *c != '\\').or(last);
+        }
+        if old_side.len() != old_lines
+            || new_side.len() != new_lines
+            || before[from..to] != old_side[..]
+        {
+            return None;
+        }
+        let at_end = to == before.len();
+        if at_end && old_no_eol == original.ends_with('\n') {
+            return None;
+        }
+        if at_end {
+            trailing_newline = !new_no_eol;
+        } else if old_no_eol || new_no_eol {
+            return None;
+        }
+        after.extend(new_side);
+        cursor = to;
+    }
+    after.extend_from_slice(&before[cursor..]);
+
+    let mut patched = after.join("\n");
+    if trailing_newline && !after.is_empty() {
+        patched.push('\n');
+    }
+    Some(patched)
+}
+
+/// Obergrenze für ein rekonstruiertes Edit-Ergebnis — dieselbe Größe wie die
+/// stdin-Grenze des Hooks: Was das Tool nicht durch den Hook bekommen hätte,
+/// rekonstruieren wir auch nicht.
+const WRITTEN_RECONSTRUCTION_CAP: usize = 32 * 1024 * 1024;
+
+/// Nennt der Post-Payload den Pfad des Effekts? Geprüft werden die Felder,
+/// die Claude Code bei den datei-berührenden Tools führt: `tool_input`
+/// (`file_path`, `notebook_path`) und `tool_response` (`filePath`,
+/// `notebook_path`). Nichts davon: kein Aufruf zu diesem Effekt.
+fn claude_post_names_path(
+    input: Option<&serde_json::Value>,
+    response: Option<&serde_json::Value>,
+    path: &str,
+) -> bool {
+    let names = |value: Option<&serde_json::Value>, key: &str| -> bool {
+        value
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|named| named == path)
+    };
+    names(input, "file_path")
+        || names(input, "notebook_path")
+        || names(response, "filePath")
+        || names(response, "notebook_path")
 }
 
 /// Liest den Payload eines Events in `T`; misslingt das, ergibt es `None`
@@ -383,6 +676,24 @@ struct Prompt {
 struct Tool {
     tool_name: Option<String>,
     tool_input: Option<Box<RawValue>>,
+}
+
+/// Claude Codes Korrelationskennung: `tool_use_id` steht in PreToolUse und
+/// PostToolUse desselben Aufrufs.
+#[derive(Debug, Deserialize)]
+struct CallId {
+    tool_use_id: Option<String>,
+}
+
+/// Claude Codes PostToolUse-Payload, so weit die Schreibzeit-Deutung ihn
+/// braucht: `tool_input` nur für die Pfad-Gegenprobe, `tool_response` als
+/// Beleg des Ergebnisses. Beide als [`serde_json::Value`]: Die Felder werden
+/// gezielt abgefragt, nichts davon wandert verbatim weiter.
+#[derive(Debug, Deserialize)]
+struct PostTool {
+    tool_name: Option<String>,
+    tool_input: Option<serde_json::Value>,
+    tool_response: Option<serde_json::Value>,
 }
 
 /// Die zwei Pfadfelder, die bei den datei-berührenden Tools vorkommen — eine
@@ -586,6 +897,293 @@ mod tests {
         );
         let got = facts("claude-code", &glob).tool.unwrap();
         assert_eq!(got.capture.status, CaptureStatus::Uninterpreted);
+    }
+
+    #[test]
+    fn the_call_id_is_claudes_tool_use_id() {
+        let e = event(
+            EventKind::ToolPost,
+            "PostToolUse",
+            r#"{"tool_name":"Write","tool_use_id":"toolu_01","tool_input":{}}"#,
+        );
+        assert_eq!(ClaudeAdapter.call_id(&e).as_deref(), Some("toolu_01"));
+        let without = event(EventKind::ToolPre, "PreToolUse", r#"{"tool_name":"Write"}"#);
+        assert_eq!(ClaudeAdapter.call_id(&without), None);
+    }
+
+    /// Deutet einen Post-Payload; die Pfad-Gegenprobe wird hier mit dem Pfad
+    /// aus dem Payload selbst bedient (`file_path`, sonst `notebook_path`,
+    /// sonst `filePath`), damit die Tests die Deutung isoliert sehen.
+    fn written_of(payload: &str) -> WrittenOutcome {
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap_or_default();
+        let path = ["file_path", "notebook_path"]
+            .iter()
+            .find_map(|k| value.get("tool_input")?.get(k)?.as_str())
+            .or_else(|| value.get("tool_response")?.get("filePath")?.as_str())
+            .unwrap_or("a.rs")
+            .to_owned();
+        ClaudeAdapter.written_bytes(&event(EventKind::ToolPost, "PostToolUse", payload), &path)
+    }
+
+    #[test]
+    fn a_failed_write_never_yields_a_written_hash() {
+        // `PostToolUseFailure` ist ebenfalls `ToolPost` und traegt die
+        // Absicht (`tool_input.content`), aber kein `tool_response`: Es
+        // wurde nichts geschrieben — also auch kein Hash ueber „nichts".
+        let failure = event(
+            EventKind::ToolPost,
+            "PostToolUseFailure",
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"x\n"},"tool_use_id":"t","error":"File has not been read yet"}"#,
+        );
+        assert_eq!(
+            ClaudeAdapter.written_bytes(&failure, "a.rs"),
+            Err(WrittenUnavailable::PayloadWithoutContent)
+        );
+        // Und selbst ein `PostToolUse` ohne `tool_response` haengt nicht an
+        // der Absicht: `tool_input.content` zaehlt nie.
+        let got = written_of(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"x\n"},"tool_use_id":"t"}"#,
+        );
+        assert_eq!(got, Err(WrittenUnavailable::PayloadWithoutContent));
+        // Auch nicht, wenn ein Failure-Event zufaellig ein tool_response traegt.
+        let failure = event(
+            EventKind::ToolPost,
+            "PostToolUseFailure",
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs"},"tool_response":{"content":"x\n"},"tool_use_id":"t"}"#,
+        );
+        assert_eq!(
+            ClaudeAdapter.written_bytes(&failure, "a.rs"),
+            Err(WrittenUnavailable::PayloadWithoutContent)
+        );
+    }
+
+    #[test]
+    fn a_post_naming_another_path_does_not_count() {
+        // Die Gegenprobe: Der Post muss den Pfad des Effekts nennen —
+        // ueber tool_input.file_path, tool_input.notebook_path oder
+        // tool_response.filePath. Sonst gehoert er nicht zu diesem Aufruf.
+        let post = event(
+            EventKind::ToolPost,
+            "PostToolUse",
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs"},"tool_response":{"type":"create","filePath":"a.rs","content":"x"}}"#,
+        );
+        assert!(ClaudeAdapter.written_bytes(&post, "a.rs").is_ok());
+        assert_eq!(
+            ClaudeAdapter.written_bytes(&post, "b.rs"),
+            Err(WrittenUnavailable::PayloadWithoutContent)
+        );
+        let only_response = event(
+            EventKind::ToolPost,
+            "PostToolUse",
+            r#"{"tool_name":"Write","tool_response":{"filePath":"a.rs","content":"x"}}"#,
+        );
+        assert!(ClaudeAdapter.written_bytes(&only_response, "a.rs").is_ok());
+        let notebook = event(
+            EventKind::ToolPost,
+            "PostToolUse",
+            r#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"n.ipynb"},"tool_response":{"updated_file":"{}"}}"#,
+        );
+        assert!(ClaudeAdapter.written_bytes(&notebook, "n.ipynb").is_ok());
+        assert!(ClaudeAdapter.written_bytes(&notebook, "m.ipynb").is_err());
+    }
+
+    #[test]
+    fn an_edit_result_over_the_cap_is_not_reconstructed() {
+        // Kurzer Suchtext, langer Ersatz, replace_all: Das Ergebnis wuerde
+        // multiplikativ wachsen — die Schranke greift vor der Allokation.
+        let original = "a".repeat(64 * 1024);
+        let new = "b".repeat(1024);
+        let payload = format!(
+            r#"{{"tool_name":"Edit","tool_input":{{"file_path":"a"}},"tool_response":{{"originalFile":"{original}","oldString":"a","newString":"{new}","replaceAll":true}}}}"#
+        );
+        assert_eq!(
+            written_of(&payload),
+            Err(WrittenUnavailable::ReconstructionFailed)
+        );
+        // Ohne replace_all waechst es nur um einen Ersatz — das geht.
+        let result = format!("{new}{}", &original[1..]);
+        let payload = format!(
+            r#"{{"tool_name":"Edit","tool_input":{{"file_path":"a"}},"tool_response":{{"originalFile":"{original}","oldString":"a","newString":"{new}","replaceAll":false,"structuredPatch":[{{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-{original}","\\ No newline at end of file","+{result}","\\ No newline at end of file"]}}]}}}}"#
+        );
+        assert_eq!(written_of(&payload), bytes(&result));
+    }
+
+    fn bytes(text: &str) -> WrittenOutcome {
+        Ok(text.to_owned())
+    }
+
+    #[test]
+    fn written_for_write_is_the_hash_of_the_content() {
+        let got = written_of(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"x\n"},"tool_response":{"type":"create","content":"x\n"}}"#,
+        );
+        assert_eq!(got, bytes("x\n"));
+        // Ohne Inhalt im Payload: der Grund, kein Hash über nichts.
+        let got = written_of(r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs"}}"#);
+        assert_eq!(got, Err(WrittenUnavailable::PayloadWithoutContent));
+    }
+
+    #[test]
+    fn written_for_edit_reconstructs_exactly_like_the_tool() {
+        // Erstes Vorkommen.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"b","new_string":"X","replace_all":false},"tool_response":{"originalFile":"a b b\n","oldString":"b","newString":"X","replaceAll":false,"structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-a b b","+a X b"]}]}}"#,
+        );
+        assert_eq!(got, bytes("a X b\n"));
+        // Alle Vorkommen.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"b","new_string":"X","replace_all":true},"tool_response":{"originalFile":"a b b\n","oldString":"b","newString":"X","replaceAll":true,"structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-a b b","+a X X"]}]}}"#,
+        );
+        assert_eq!(got, bytes("a X X\n"));
+        // Nur `tool_response` zaehlt (die tatsaechlich angewandte Ersetzung);
+        // `tool_input` ist die Eingabe vor Claude Codes Normalisierung und
+        // wird nie als Rueckfall genommen — eine nicht aufgezeichnete
+        // Payload-Form ergibt den Grund, keinen geratenen Hash.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a","old_string":"b","new_string":"X"},"tool_response":{"originalFile":"a b\n"}}"#,
+        );
+        assert_eq!(got, Err(WrittenUnavailable::PayloadWithoutContent));
+    }
+
+    #[test]
+    fn an_edit_that_contradicts_its_structured_patch_is_not_reconstructed() {
+        use WrittenUnavailable::ReconstructionFailed;
+        // Eine Zeile loeschen: Claude Code nimmt den Zeilenumbruch mit
+        // (`foo\n` faellt weg), die blosse Ersetzung liesse eine Leerzeile
+        // stehen. Der Patch des Tools zeigt, was wirklich geschah — die
+        // Rekonstruktion widerspricht ihm, also kein Hash statt eines
+        // falschen (der sonst „ein Mensch hat editiert" vortaeuschte).
+        let delete = r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"x\nfoo\ny\n","oldString":"foo","newString":"","replaceAll":false,"structuredPatch":[{"oldStart":1,"oldLines":3,"newStart":1,"newLines":2,"lines":[" x","-foo"," y"]}]}}"#;
+        assert_eq!(written_of(delete), Err(ReconstructionFailed));
+
+        // Die letzte Zeile loeschen: Hinter dem Hunk steht nichts mehr, das
+        // den Unterschied zeigen koennte — der Vergleich des ganzen
+        // Ergebnisses muss ihn finden (Tool: `x\n`, blosse Ersetzung: `x\n\n`).
+        let last = r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"x\nfoo\n","oldString":"foo","newString":"","structuredPatch":[{"oldStart":1,"oldLines":2,"newStart":1,"newLines":1,"lines":[" x","-foo"]}]}}"#;
+        assert_eq!(written_of(last), Err(ReconstructionFailed));
+        // Die einzige Zeile loeschen (Tool: leere Datei, Ersetzung: `\n`).
+        let only = r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"foo\n","oldString":"foo","newString":"","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":0,"newLines":0,"lines":["-foo"]}]}}"#;
+        assert_eq!(written_of(only), Err(ReconstructionFailed));
+        // Nur der Umbruch am Ende unterscheidet sich (Tool: `x` ohne Umbruch,
+        // Ersetzung: `x\n`) — der Marker sagt es.
+        let eol = r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"x\nfoo\n","oldString":"\nfoo","newString":"","structuredPatch":[{"oldStart":1,"oldLines":2,"newStart":1,"newLines":1,"lines":["-x","-foo","+x","\\ No newline at end of file"]}]}}"#;
+        assert_eq!(written_of(eol), Err(ReconstructionFailed));
+        // Ein Patch, der das Dateiende nicht erreicht, laesst den Rest stehen.
+        let tail = r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"a\nb\nc\nd\ne\n","oldString":"a","newString":"A","structuredPatch":[{"oldStart":1,"oldLines":2,"newStart":1,"newLines":2,"lines":["-a","+A"," b"]}]}}"#;
+        assert_eq!(written_of(tail), bytes("A\nb\nc\nd\ne\n"));
+
+        // Derselbe Edit mit passendem Patch geht durch — der Check ist keine
+        // Pauschalabsage an leere Ersetzungen.
+        let blank = r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"x\nfoo\ny\n","oldString":"foo","newString":"","replaceAll":false,"structuredPatch":[{"oldStart":1,"oldLines":3,"newStart":1,"newLines":3,"lines":[" x","-foo","+"," y"]}]}}"#;
+        assert_eq!(written_of(blank), bytes("x\n\ny\n"));
+
+        // Kein Patch, leerer Patch, ein Hunk an falscher Stelle, eine
+        // unbekannte Zeilenform: fail-closed.
+        for patch in [
+            "",
+            r#","structuredPatch":[]"#,
+            r#","structuredPatch":[{"oldStart":2,"oldLines":1,"newStart":2,"newLines":1,"lines":["-a b b","+a X b"]}]"#,
+            r#","structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["?a b b","+a X b"]}]"#,
+            r#","structuredPatch":[{"oldStart":1,"oldLines":2,"newStart":1,"newLines":1,"lines":["-a b b","+a X b"]}]"#,
+        ] {
+            let payload = format!(
+                r#"{{"tool_name":"Edit","tool_input":{{"file_path":"a"}},"tool_response":{{"originalFile":"a b b\n","oldString":"b","newString":"X"{patch}}}}}"#
+            );
+            assert_eq!(written_of(&payload), Err(ReconstructionFailed), "{patch}");
+        }
+    }
+
+    #[test]
+    fn a_user_modified_proposal_yields_no_bytes() {
+        // `userModified: true`: Der Nutzer hat den Vorschlag im Diff
+        // geaendert — welche Bytes auf der Platte landeten, sagt der Payload
+        // dann nicht verlaesslich.
+        for payload in [
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a"},"tool_response":{"type":"update","content":"x\n","userModified":true}}"#,
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"a b\n","oldString":"b","newString":"X","userModified":true,"structuredPatch":[{"oldStart":1,"oldLines":1,"newStart":1,"newLines":1,"lines":["-a b","+a X"]}]}}"#,
+        ] {
+            assert_eq!(
+                written_of(payload),
+                Err(WrittenUnavailable::UserModified),
+                "{payload}"
+            );
+        }
+        // `false` (wie in allen Aufzeichnungen) aendert nichts.
+        let got = written_of(
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a"},"tool_response":{"type":"update","content":"x\n","userModified":false}}"#,
+        );
+        assert_eq!(got, bytes("x\n"));
+    }
+
+    #[test]
+    fn written_for_edit_fails_closed_where_the_result_is_uncertain() {
+        use WrittenUnavailable::{PayloadWithoutContent, ReconstructionFailed};
+        // Kein Original: nichts zu rekonstruieren.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"old_string":"b","new_string":"X"},"tool_response":{"oldString":"b","newString":"X"}}"#,
+        );
+        assert_eq!(got, Err(PayloadWithoutContent));
+        // Suchtext nicht im Original.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"a\n","oldString":"zzz","newString":"X"}}"#,
+        );
+        assert_eq!(got, Err(ReconstructionFailed));
+        // Leerer Suchtext (Datei anlegen ueber Edit): nicht aufgezeichnet.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"","oldString":"","newString":"X"}}"#,
+        );
+        assert_eq!(got, Err(ReconstructionFailed));
+        // CRLF: Claude Code passt newString an — ohne Fixture keine Behauptung.
+        let got = written_of(
+            r#"{"tool_name":"Edit","tool_input":{"file_path":"a"},"tool_response":{"originalFile":"a\r\nb\r\n","oldString":"a","newString":"X"}}"#,
+        );
+        assert_eq!(got, Err(ReconstructionFailed));
+    }
+
+    #[test]
+    fn written_for_notebook_edit_is_the_updated_file() {
+        let got = written_of(
+            r#"{"tool_name":"NotebookEdit","tool_input":{"notebook_path":"n.ipynb"},"tool_response":{"original_file":"{}","updated_file":"{\"cells\":[]}"}}"#,
+        );
+        assert_eq!(got, bytes("{\"cells\":[]}"));
+        let got = written_of(r#"{"tool_name":"NotebookEdit","tool_response":{"error":"x"}}"#);
+        assert_eq!(got, Err(WrittenUnavailable::PayloadWithoutContent));
+    }
+
+    #[test]
+    fn written_for_unknown_or_multiedit_is_documented_as_unavailable() {
+        for payload in [
+            r#"{"tool_name":"MultiEdit","tool_response":{"originalFile":"a"}}"#,
+            r#"{"tool_name":"Bash","tool_response":"ok"}"#,
+            r#"{"tool_name":"Read","tool_response":{"file":{"content":"x"}}}"#,
+            r#"{"nope":1}"#,
+        ] {
+            assert_eq!(
+                written_of(payload),
+                Err(WrittenUnavailable::PayloadWithoutContent),
+                "{payload}"
+            );
+        }
+        // Ein abgeschnittener Payload (als JSON-String abgelegt) ebenso.
+        let wrapped = serde_json::to_string(r#"{"tool_name":"Write","tool_inp"#).unwrap();
+        assert_eq!(
+            written_of(&wrapped),
+            Err(WrittenUnavailable::PayloadWithoutContent)
+        );
+    }
+
+    #[test]
+    fn interpret_stored_never_invents_a_written_hash() {
+        // Die gespeicherten `arguments` sind redigiert und tragen kein
+        // Post-Event: Ein daraus gerechneter Hash waere falsch. `written`
+        // bleibt beim Reinterpretieren leer, ohne Grund — der Grund ist
+        // Sache des Checkpoints.
+        let got = ClaudeAdapter
+            .interpret_stored("Write", r#"{"file_path":"a.rs","content":"x"}"#)
+            .unwrap();
+        assert_eq!(got.effect.written, None);
+        assert_eq!(got.effect.written_unavailable, None);
+        assert_eq!(got.adapter_version, 2);
     }
 
     #[test]

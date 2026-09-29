@@ -15,6 +15,45 @@ versioning follows [Semantic Versioning](https://semver.org/).
 > binary reads all older schema versions; the schema only increments on a
 > breaking change to the payload, never for an additional field.
 
+## [Unreleased]
+
+### Added
+
+- **Write-time content hash (EA-01a).** Every interpreted write effect of a
+  Claude Code session now carries `effect.written`: the blake3 of the bytes
+  the tool wrote according to the observed `PostToolUse` payload, taken at
+  write time rather than from the worktree at checkpoint. `effect.content`
+  keeps its meaning. Where the hash is absent, `effect.written_unavailable`
+  names the reason (`secret-file`, `outside-repo`, `payload-without-content`,
+  `reconstruction-failed`, `redacted-content`, `unscanned`, `user-modified`).
+  Both fields are additive: sessions without them serialize byte-identically,
+  existing session ids are unchanged. Claude adapter version 1 → 2;
+  `minds reinterpret` shows the stored hash and carries it over unchanged (it
+  cannot be recomputed without the journal payload). Payload shapes are
+  recorded fixtures from Claude Code 2.1.282, not guesses. An `Edit` is
+  reconstructed from the original plus the applied replacement and must agree
+  with the tool's `structuredPatch`; otherwise no hash.
+
+### Changed
+
+- **Write hashes are only formed over bytes the redaction policy finds
+  clean.** Before hashing, the checkpoint scans exactly the bytes behind
+  `written` and behind the `content` of a write effect; any finding means no
+  hash. This closes a dictionary oracle for secrets in written files — also
+  for bytes that never reach the envelope, such as the original of an `Edit`.
+  With the strict default policy this drops the hashes of many ordinary
+  source files (identifier assignments trip the heuristic), so fewer content
+  handovers appear in the evidence DAG. See ADR-0011, decision 9.
+- **Redaction drops both hashes of a write where it redacted the call's
+  arguments** — the second line behind the scan.
+
+### Fixed
+
+- **`minds reinterpret` no longer reports every hashed file as
+  reinterpreted.** The stored `content` hash (and now `written`) is checkpoint
+  evidence, not a repeatable interpretation; it is carried over into the
+  current interpretation instead of being compared against an empty one.
+
 ## [0.4.0] — 2026-09-10 — "The Tampering Gets a Name"
 
 *Minds does not prove that a decision was right. It proves what evidence

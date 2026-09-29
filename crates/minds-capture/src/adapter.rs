@@ -37,13 +37,13 @@
 //! Pipeline und in den Store. Der Store nimmt nur redigierte Sessions an — das
 //! ist ein Typ, kein Vorsatz.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use minds_core::{
     Agent, ContentHash, EffectKind, Intent, Lineage, Model, Produced, Redaction, Role, Session,
-    ToolCall, Turn,
+    ToolCall, Turn, WrittenUnavailable,
 };
 
 use crate::edges;
@@ -56,7 +56,7 @@ use crate::transcript::{self, Transcript};
 /// Beides ist optional, weil ein Checkpoint auch ohne beides sinnvoll ist: Ohne
 /// `root` bleiben die Artefakt-Hashes leer, ohne `commit` fehlt die
 /// Produced-Kante. Der Adapter erzwingt nichts, was die Aufrufstelle nicht hat.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 pub struct Checkpoint<'a> {
     /// Wurzel für die Auflösung relativer Effekt-Pfade beim Artefakt-Hash.
     /// Üblicherweise die Repo-Wurzel.
@@ -75,6 +75,26 @@ pub struct Checkpoint<'a> {
     /// heißt: Grenze unbekannt ⇒ keine Read-Hashes (fail-closed in Richtung
     /// „weniger Fingerabdruck").
     pub tracked: Option<&'a std::collections::BTreeSet<String>>,
+
+    /// Die Redaction-Policy des Repos — der Prüfstein für jeden Hash über
+    /// geschriebene Bytes (`content` wie `written` eines Schreib-Effekts).
+    /// Ein ungesalzener Hash über Bytes, in denen ein Secret steht, wäre ein
+    /// Wörterbuch-Orakel; deshalb werden genau die Bytes gescannt, die
+    /// gehasht würden, und bei jedem Fund entsteht kein Hash. `None` heißt:
+    /// nichts prüfbar ⇒ keine Schreib-Hashes (fail-closed; `written` trägt
+    /// dann [`WrittenUnavailable::Unscanned`]).
+    pub redaction: Option<&'a minds_redact::RedactionPipeline>,
+}
+
+impl std::fmt::Debug for Checkpoint<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Checkpoint")
+            .field("root", &self.root)
+            .field("commit", &self.commit)
+            .field("tracked", &self.tracked.map(|set| set.len()))
+            .field("redaction", &self.redaction.map(|p| p.len()))
+            .finish()
+    }
 }
 
 /// Baut aus allen Sessions eines Journals ihre [`Session`]-Records.
@@ -109,10 +129,18 @@ pub fn build(journal: &Journal) -> crate::Result<Vec<Session>> {
 /// Öffentlich, damit `minds capture` (M6) und die Fixture-Tests eine Session
 /// gezielt bauen können, ohne den Umweg über das ganze Journal.
 pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
+    build_indexed(key, events).0
+}
+
+/// Wie [`build_one`], liefert zusätzlich je Tool-Call (in Envelope-Reihenfolge,
+/// über alle Züge flach) den Index des Journal-Events, aus dem er entstand.
+/// Der Checkpoint braucht diese Brücke zurück zu den Events, um den
+/// PostToolUse-Payload eines Aufrufs zu finden ([`written_hashes`]).
+fn build_indexed(key: &SessionKey, events: &[JournalEvent]) -> (Session, Vec<usize>) {
     let agent = key.agent();
     let transcript = read_transcript(events);
 
-    let turns = build_turns(agent, events, &transcript);
+    let (turns, call_events) = build_turns(agent, events, &transcript);
     let intent = Intent {
         request: first_prompt(agent, events).unwrap_or_default(),
         discarded: discarded_files(&turns),
@@ -123,7 +151,7 @@ pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
         files: produced_files(&turns),
     };
 
-    Session {
+    let session = Session {
         schema_version: minds_core::SCHEMA_VERSION,
         agent: Agent {
             name: agent.to_string(),
@@ -140,7 +168,8 @@ pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
         redaction: Redaction::default(),
         lineage: Some(lineage(key, events)),
         edges: Vec::new(),
-    }
+    };
+    (session, call_events)
 }
 
 /// Baut die [`Session`] und reichert sie mit dem an, was nur der Checkpoint
@@ -151,9 +180,10 @@ pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
 /// [`build_one`]: Wer nur die Struktur will (der Reader, ein Test), zahlt den
 /// I/O nicht.
 pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -> Session {
-    let mut session = build_one(key, events);
+    let (mut session, call_events) = build_indexed(key, events);
 
-    hash_artifacts(&mut session, ctx.root, ctx.tracked);
+    written_hashes(&mut session, events, &call_events, key.agent(), ctx);
+    hash_artifacts(&mut session, ctx);
 
     session.edges.extend(edges::subagent(key.agent(), events));
     if let Some(commit) = ctx.commit {
@@ -165,20 +195,25 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
 
 /// Füllt die Inhalts-Hashes der Effekte, deren Datei sich lesen lässt.
 ///
-/// Drei Regeln, alle fail-closed:
-/// - **Schreib**-Effekte immer: Der Hash ist der Fingerabdruck des vom
-///   Agenten *erzeugten* Artefakts.
+/// Vier Regeln, alle fail-closed:
+/// - **Schreib**-Effekte: Der Hash ist der Fingerabdruck des vom Agenten
+///   *erzeugten* Artefakts — aber nur, wenn die Redaction in den Bytes nichts
+///   findet ([`Checkpoint::redaction`], [`scanned_hash`]).
 /// - **Lese**-Effekte nur innerhalb der Read-Grenze ([`Checkpoint::tracked`]):
 ///   getrackte, repo-relative Pfade — als Beweismittel für Content-Übergaben
 ///   (Phase 6). Bloßes Lesen einer privaten oder repo-fremden Datei erzeugt
 ///   nie einen Fingerabdruck.
 /// - **Nie** für eine Zugangsdaten-Datei: Bei einer kurzen, ratbaren Datei wäre
 ///   ein Hash ein Orakel. Die Secretfile-Mauer gilt auch für Fingerabdrücke.
-fn hash_artifacts(
-    session: &mut Session,
-    root: Option<&Path>,
-    tracked: Option<&std::collections::BTreeSet<String>>,
-) {
+/// - Lese-Effekte werden **nicht** gescannt: Sie liegen innerhalb der
+///   Read-Grenze, ihr Inhalt ist für jeden Repo-Leser ohnehin sichtbar.
+fn hash_artifacts(session: &mut Session, ctx: &Checkpoint) {
+    let Checkpoint {
+        root,
+        tracked,
+        redaction,
+        ..
+    } = *ctx;
     for call in session.turns.iter_mut().flat_map(|t| &mut t.tool_calls) {
         let Some(effect) = call.effect.as_mut() else {
             continue;
@@ -212,11 +247,214 @@ fn hash_artifacts(
                 continue;
             }
         }
-        if let Some(bytes) = read_artifact(root, path) {
-            let digest = blake3::hash(&bytes);
-            effect.content = Some(ContentHash::from_bytes(*digest.as_bytes()));
+        let Some(bytes) = read_artifact(root, path) else {
+            continue;
+        };
+        effect.content = match effect.kind {
+            // Nicht-UTF-8 (etwa UTF-16) lässt sich nicht verlässlich scannen:
+            // verlustbehaftet gelesen, fände kein Detektor `g\0h\0p\0_…`.
+            // Ungeprüft gibt es keinen Hash.
+            EffectKind::Write => std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|text| scanned_hash(redaction, text, &bytes).ok()),
+            _ => Some(ContentHash::from_bytes(*blake3::hash(&bytes).as_bytes())),
+        };
+    }
+}
+
+/// Füllt den **Schreibzeit**-Hash ([`Effect::written`](minds_core::Effect::written))
+/// der Schreib-Effekte — aus dem PostToolUse-Payload, nie von der Platte.
+///
+/// Die Reihenfolge ist die Mauer, nicht bloß eine Optimierung:
+///
+/// 1. **Secretfile-Mauer zuerst.** Für eine Zugangsdaten-Datei wird der
+///    Payload gar nicht angesehen — kein Hash, kein Orakel, dieselbe Regel
+///    wie bei [`hash_artifacts`]. Die Hot-Path-Wall hat den Payload meist
+///    schon ersetzt; hier gilt sie unabhängig davon noch einmal.
+/// 2. **Repo-Grenze.** Nur Pfade innerhalb der Wurzel ([`inside_repo`]).
+///    Ein Schreib-Hash für `~/.ssh/config` wäre ein Fingerabdruck über eine
+///    private Datei; ohne bekannte Wurzel ist jeder absolute Pfad draußen.
+/// 3. **Korrelation.** Pre- und Post-Event desselben Aufrufs verbindet die
+///    Kennung des Adapters ([`ToolAdapter::call_id`](crate::ToolAdapter::call_id));
+///    fehlt sie, ist sie doppelt oder fehlt das Post-Event, gibt es keinen Hash
+///    und der Grund steht daneben. Über die Reihenfolge wird nicht geraten.
+/// 4. Erst dann deutet der Adapter den Payload
+///    ([`ToolAdapter::written_bytes`](crate::ToolAdapter::written_bytes)).
+/// 5. **Redaction-Scan** über genau die Bytes, die gehasht würden
+///    ([`scanned_hash`]). Das fängt, was die zweite Linie in der Redaction
+///    (`arguments` getroffen ⇒ Hash weg) nicht sehen kann: das Original eines
+///    `Edit`, das Notebook nach `NotebookEdit`, eine Antwort, die vom
+///    `tool_input` abweicht.
+///
+/// Ein Agent ohne Adapter bekommt weder Hash noch Grund: Seine Effekte sind
+/// ohnehin ungedeutet.
+fn written_hashes(
+    session: &mut Session,
+    events: &[JournalEvent],
+    call_events: &[usize],
+    agent: &str,
+    ctx: &Checkpoint,
+) {
+    let root = ctx.root;
+    let Some(adapter) = normalize::adapter_for(agent) else {
+        return;
+    };
+    // Die Wurzel auch in kanonischer Form: Claude Code bildet `file_path` aus
+    // seinem `cwd`, gix liefert die Wurzel — liegt ein Symlink dazwischen
+    // (macOS `/tmp` → `/private/tmp`, verlinktes Home), waere sonst jede
+    // Schreibung der Session still „draussen". Die Gegenrichtung (der Agent
+    // nennt den Symlink-Pfad, die Wurzel ist aufgeloest) deckt
+    // [`inside_repo_resolved`] ab. I/O nur fuer Verzeichnisse, nie fuer die
+    // Datei.
+    let canonical_root = root.and_then(|r| fs::canonicalize(r).ok());
+    let roots: Vec<&Path> = root.into_iter().chain(canonical_root.as_deref()).collect();
+
+    // Pre-Kennungen zaehlen: Eine Kennung, die zwei Aufrufe tragen, ordnet
+    // keinem von beiden ein Post-Event zu.
+    let mut pre_ids: BTreeMap<String, usize> = BTreeMap::new();
+    for event in events.iter().filter(|e| e.kind == EventKind::ToolPre) {
+        if let Some(id) = adapter.call_id(event) {
+            *pre_ids.entry(id).or_default() += 1;
         }
     }
+
+    // Post-Events nach Kennung. Eine doppelt vergebene Kennung ist keine
+    // Zuordnung, sondern zwei — dann lieber keine (`None`).
+    let mut posts: BTreeMap<String, Option<&JournalEvent>> = BTreeMap::new();
+    for event in events.iter().filter(|e| e.kind == EventKind::ToolPost) {
+        if let Some(id) = adapter.call_id(event) {
+            posts
+                .entry(id)
+                .and_modify(|slot| *slot = None)
+                .or_insert(Some(event));
+        }
+    }
+
+    let calls = session.turns.iter_mut().flat_map(|t| &mut t.tool_calls);
+    for (call, &pre_index) in calls.zip(call_events) {
+        let Some(effect) = call.effect.as_mut() else {
+            continue;
+        };
+        if effect.kind != EffectKind::Write {
+            continue;
+        }
+        let outcome = match effect.path.as_deref() {
+            None => Err(WrittenUnavailable::PayloadWithoutContent),
+            Some(path) if minds_redact::is_secret_file(path) => Err(WrittenUnavailable::SecretFile),
+            Some(path) if !inside_repo_resolved(path, &roots) => {
+                Err(WrittenUnavailable::OutsideRepo)
+            }
+            Some(path) => {
+                let post = events
+                    .get(pre_index)
+                    .and_then(|pre| adapter.call_id(pre))
+                    .filter(|id| pre_ids.get(id) == Some(&1))
+                    .and_then(|id| posts.get(&id).copied().flatten());
+                match post {
+                    Some(post) => adapter
+                        .written_bytes(post, path)
+                        .and_then(|bytes| scanned_hash(ctx.redaction, &bytes, bytes.as_bytes())),
+                    None => Err(WrittenUnavailable::PayloadWithoutContent),
+                }
+            }
+        };
+        match outcome {
+            Ok(hash) => effect.written = Some(hash),
+            Err(reason) => effect.written_unavailable = Some(reason),
+        }
+    }
+}
+
+/// blake3 über `bytes` — nur, wenn die Redaction in `text` (denselben Bytes
+/// als Text) nichts findet und keinen Detektor-Fehler meldet.
+///
+/// Das ist die erste Linie gegen das Wörterbuch-Orakel: Ein ungesalzener
+/// Hash über eine kurze Datei mit einem Passwort ließe sich gegen Kandidaten
+/// durchprobieren. Ohne Pipeline gibt es nichts zu prüfen und deshalb keinen
+/// Hash. `text` und `bytes` sind dieselben Bytes — Aufrufer mit
+/// Nicht-UTF-8-Bytes hashen gar nicht erst (siehe [`hash_artifacts`]).
+fn scanned_hash(
+    redaction: Option<&minds_redact::RedactionPipeline>,
+    text: &str,
+    bytes: &[u8],
+) -> Result<ContentHash, WrittenUnavailable> {
+    let pipeline = redaction.ok_or(WrittenUnavailable::Unscanned)?;
+    let scan = pipeline.redact(text);
+    if scan.counts != minds_core::RedactionCounts::default() || scan.invalid_findings > 0 {
+        return Err(WrittenUnavailable::RedactedContent);
+    }
+    Ok(ContentHash::from_bytes(*blake3::hash(bytes).as_bytes()))
+}
+
+/// Wie [`inside_repo`], mit einer zweiten Chance für einen absoluten Pfad,
+/// der lexikalisch draußen liegt: Sein **Elternverzeichnis** wird aufgelöst
+/// und der Pfad erneut geprüft. Das fängt den Fall, dass der Agent den
+/// Symlink-Pfad nennt (`/var/folders/…`, ein verlinktes `~/dev`), die Wurzel
+/// aber aufgelöst vorliegt (`/private/var/folders/…`).
+///
+/// Die lexikalischen Regeln gelten vorher am rohen Pfad: `..`, `~`, `$` und
+/// Backslash bleiben draußen, auch wenn die Auflösung „drinnen" ergäbe.
+/// Aufgelöst wird nur ein Verzeichnis, nie die Datei — ihr Inhalt wird hier
+/// nicht gelesen. Existiert das Verzeichnis nicht, bleibt es bei „draußen".
+///
+/// Bewusst **nicht** geprüft: ein Pfad, der lexikalisch innen liegt, aber
+/// über einen Symlink im Repo nach draußen zeigt (`/repo/link → ~/.aws`).
+/// Er gilt als innen. Für `Write` stehen dieselben Bytes ohnehin in den
+/// `arguments`; für `Edit` fingert `written` dann eine Datei außerhalb —
+/// eine benannte Grenze dieser Prüfung (siehe ADR-0011, Entscheidung 9),
+/// die der Redaction-Scan für Secret-förmigen Inhalt abdeckt, für anderen
+/// nicht.
+fn inside_repo_resolved(path: &str, roots: &[&Path]) -> bool {
+    if inside_repo(path, roots) {
+        return true;
+    }
+    let candidate = Path::new(path);
+    if !candidate.is_absolute() || !lexically_plain(path) {
+        return false;
+    }
+    let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) else {
+        return false;
+    };
+    let Ok(parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+    parent
+        .join(name)
+        .to_str()
+        .is_some_and(|resolved| inside_repo(resolved, roots))
+}
+
+/// Liegt `path` innerhalb einer der Repo-Wurzeln (roh und kanonisch)?
+///
+/// Relativ ohne `..` gilt als innen (so wie es die Read-Grenze in
+/// [`hash_artifacts`] hält) — außer der Pfad ist nur *technisch* relativ:
+/// `~/…` und `$HOME/…` meinen eine Shell-Expansion, ein Backslash einen
+/// Windows-Pfad; beides zeigt nicht ins Repo. Absolut nur, wenn eine Wurzel
+/// bekannt ist und der Pfad lexikalisch unter ihr liegt — Claude Code nennt
+/// Pfade absolut, sonst bliebe `written` in jeder echten Session leer. Ohne
+/// Wurzel ist jeder absolute Pfad draußen (fail-closed in Richtung „kein
+/// Fingerabdruck"). Rein lexikalisch: Die Platte wird hier nicht angefasst
+/// (die Auflösung von Symlinks macht [`inside_repo_resolved`]).
+fn inside_repo(path: &str, roots: &[&Path]) -> bool {
+    if !lexically_plain(path) {
+        return false;
+    }
+    let candidate = Path::new(path);
+    if candidate.is_relative() {
+        return true;
+    }
+    roots
+        .iter()
+        .any(|root| candidate.strip_prefix(root).is_ok())
+}
+
+/// Kein `..`, keine Shell-Expansion (`~`, `$`), kein Windows-Pfad — die
+/// Regeln, die ein Pfad vor jeder Grenzprüfung erfüllen muss.
+fn lexically_plain(path: &str) -> bool {
+    !(path.starts_with('~') || path.starts_with('$') || path.contains('\\'))
+        && !Path::new(path)
+            .components()
+            .any(|c| c == Component::ParentDir)
 }
 
 /// Liest die Artefakt-Datei. Absolute Pfade wie sie sind, relative gegen `root`
@@ -270,11 +508,20 @@ fn first_prompt(agent: &str, events: &[JournalEvent]) -> Option<String> {
 
 /// Baut die Züge aus den Events und färbt die Assistant-Züge der Reihe nach mit
 /// den Texten aus dem Transkript ein.
-fn build_turns(agent: &str, events: &[JournalEvent], transcript: &Transcript) -> Vec<Turn> {
+///
+/// Der zweite Rückgabewert ist je gebautem Tool-Call der Index seines
+/// Pre-Events — flach über alle Züge, in derselben Reihenfolge, in der die
+/// Aufrufe im Envelope stehen (Züge werden nur angehängt, nie umsortiert).
+fn build_turns(
+    agent: &str,
+    events: &[JournalEvent],
+    transcript: &Transcript,
+) -> (Vec<Turn>, Vec<usize>) {
     let mut turns: Vec<Turn> = Vec::new();
     let mut open: Option<Turn> = None;
+    let mut call_events: Vec<usize> = Vec::new();
 
-    for event in events {
+    for (index, event) in events.iter().enumerate() {
         let facts = normalize::facts(agent, event);
         match event.kind {
             EventKind::Prompt => {
@@ -296,6 +543,7 @@ fn build_turns(agent: &str, events: &[JournalEvent], transcript: &Transcript) ->
                         effect: tool.effect,
                         capture: Some(tool.capture),
                     });
+                    call_events.push(index);
                 }
             }
             EventKind::TurnEnd => {
@@ -313,7 +561,7 @@ fn build_turns(agent: &str, events: &[JournalEvent], transcript: &Transcript) ->
     flush(&mut open, &mut turns);
 
     paint_assistant_text(&mut turns, &transcript.assistant_texts);
-    turns
+    (turns, call_events)
 }
 
 fn assistant_turn(at: &str) -> Turn {
@@ -465,6 +713,26 @@ fn lineage(key: &SessionKey, events: &[JournalEvent]) -> Lineage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Die strenge Default-Policy — dieselbe, die `minds checkpoint` ohne
+    /// `.minds/redact.json` verwendet.
+    fn policy() -> &'static minds_redact::RedactionPipeline {
+        static POLICY: std::sync::OnceLock<minds_redact::RedactionPipeline> =
+            std::sync::OnceLock::new();
+        POLICY.get_or_init(|| {
+            minds_redact::RedactionConfig::default()
+                .pipeline()
+                .expect("Default-Policy muss bauen")
+        })
+    }
+
+    /// Ein Checkpoint ohne Wurzel und Commit, aber mit Redaction-Policy.
+    fn scanned() -> Checkpoint<'static> {
+        Checkpoint {
+            redaction: Some(policy()),
+            ..Checkpoint::default()
+        }
+    }
     use minds_core::EffectKind;
     use serde_json::value::RawValue;
 
@@ -649,6 +917,7 @@ mod tests {
             root: Some(dir.path()),
             commit: None,
             tracked: None,
+            redaction: Some(policy()),
         };
         let s = checkpoint(&key(), &events, &ctx);
 
@@ -675,6 +944,7 @@ mod tests {
             root: None,
             commit: Some("deadbeefcafe"),
             tracked: None,
+            redaction: Some(policy()),
         };
         let s = checkpoint(&key(), &events, &ctx);
         assert_eq!(s.edges.len(), 1);
@@ -753,6 +1023,459 @@ mod tests {
         assert!(build_one(&key(), &events).intent.discarded.is_empty());
     }
 
+    fn write_pre(path: &str, id: &str) -> String {
+        format!(
+            r#"{{"tool_name":"Write","tool_input":{{"file_path":"{path}","content":"agent\n"}},"tool_use_id":"{id}"}}"#
+        )
+    }
+
+    fn write_post(path: &str, id: &str) -> String {
+        format!(
+            r#"{{"tool_name":"Write","tool_input":{{"file_path":"{path}","content":"agent\n"}},"tool_response":{{"type":"create","content":"agent\n"}},"tool_use_id":"{id}"}}"#
+        )
+    }
+
+    fn first_write(session: &Session) -> &minds_core::Effect {
+        session
+            .turns
+            .iter()
+            .flat_map(|t| &t.tool_calls)
+            .filter_map(|c| c.effect.as_ref())
+            .find(|e| e.kind == EffectKind::Write)
+            .unwrap()
+    }
+
+    #[test]
+    fn written_comes_from_the_post_event_correlated_by_call_id() {
+        // Zwei parallele Schreibungen, die Post-Events in umgekehrter
+        // Reihenfolge: Die Kennung ordnet richtig zu, nicht die Position.
+        let post_b = r#"{"tool_name":"Write","tool_input":{"file_path":"b.rs","content":"BBB"},"tool_response":{"type":"create","content":"BBB"},"tool_use_id":"tb"}"#;
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("a.rs", "ta"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t1",
+                r#"{"tool_name":"Write","tool_input":{"file_path":"b.rs","content":"BBB"},"tool_use_id":"tb"}"#,
+            ),
+            ev(2, EventKind::ToolPost, "PostToolUse", "t2", post_b),
+            ev(
+                3,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t3",
+                &write_post("a.rs", "ta"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        let calls: Vec<_> = s.turns.iter().flat_map(|t| &t.tool_calls).collect();
+        let a = calls[0].effect.as_ref().unwrap();
+        let b = calls[1].effect.as_ref().unwrap();
+        let hash = |bytes: &[u8]| ContentHash::from_bytes(*blake3::hash(bytes).as_bytes());
+        assert_eq!(a.written, Some(hash(b"agent\n")));
+        assert_eq!(b.written, Some(hash(b"BBB")));
+        // `content` bleibt leer: Es gibt keine Platte hinter diesen Pfaden —
+        // und `written` hat sie auch nie gebraucht.
+        assert_eq!(a.content, None);
+    }
+
+    #[test]
+    fn without_a_post_event_or_with_an_ambiguous_id_there_is_no_written() {
+        // Kein Post-Event.
+        let events = vec![ev(
+            0,
+            EventKind::ToolPre,
+            "PreToolUse",
+            "t0",
+            &write_pre("a.rs", "ta"),
+        )];
+        let s = checkpoint(&key(), &events, &scanned());
+        let e = first_write(&s);
+        assert_eq!(e.written, None);
+        assert_eq!(
+            e.written_unavailable,
+            Some(WrittenUnavailable::PayloadWithoutContent)
+        );
+
+        // Zwei Post-Events mit derselben Kennung: keine Zuordnung statt einer
+        // geratenen.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("a.rs", "dup"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post("a.rs", "dup"),
+            ),
+            ev(
+                2,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t2",
+                &write_post("a.rs", "dup"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        assert_eq!(
+            first_write(&s).written_unavailable,
+            Some(WrittenUnavailable::PayloadWithoutContent)
+        );
+
+        // Ohne Kennung im Pre-Event ebenso — die Reihenfolge zaehlt nicht.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"x"}}"#,
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post("a.rs", "ta"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        assert_eq!(first_write(&s).written, None);
+    }
+
+    #[test]
+    fn written_is_only_derived_for_write_effects_and_only_by_an_adapter() {
+        // Ein Read traegt weder Hash noch Grund.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"},"tool_use_id":"r"}"#,
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                r#"{"tool_name":"Read","tool_input":{"file_path":"a.rs"},"tool_response":{"file":{"content":"x"}},"tool_use_id":"r"}"#,
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        let e = s.turns[0].tool_calls[0].effect.as_ref().unwrap();
+        assert_eq!((e.written.as_ref(), e.written_unavailable), (None, None));
+
+        // Ein Agent ohne Adapter: ungedeutet, also auch kein `written`.
+        let other = SessionKey::new("some-future-agent", "x1").unwrap();
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("a.rs", "ta"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post("a.rs", "ta"),
+            ),
+        ];
+        let s = checkpoint(&other, &events, &scanned());
+        assert!(s.turns[0].tool_calls[0].effect.is_none());
+    }
+
+    #[test]
+    fn the_secret_wall_and_the_repo_boundary_come_before_the_payload() {
+        // Fuer eine Secret-Datei wird der Payload nicht angesehen — selbst
+        // wenn er (hier ungewallt konstruiert) den Inhalt traegt.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre(".env", "s"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post(".env", "s"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        let e = first_write(&s);
+        assert_eq!(e.written, None);
+        assert_eq!(e.written_unavailable, Some(WrittenUnavailable::SecretFile));
+
+        // Absolut ohne Wurzel: draussen. Mit passender Wurzel: drinnen.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("/repo/a.rs", "o"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post("/repo/a.rs", "o"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        assert_eq!(
+            first_write(&s).written_unavailable,
+            Some(WrittenUnavailable::OutsideRepo)
+        );
+        let ctx = Checkpoint {
+            root: Some(Path::new("/repo")),
+            commit: None,
+            tracked: None,
+            redaction: Some(policy()),
+        };
+        assert!(
+            first_write(&checkpoint(&key(), &events, &ctx))
+                .written
+                .is_some()
+        );
+        // Eine andere Wurzel: draussen. Auch `/repo2` ist nicht `/repo`.
+        let ctx = Checkpoint {
+            root: Some(Path::new("/repo2")),
+            commit: None,
+            tracked: None,
+            redaction: Some(policy()),
+        };
+        assert_eq!(
+            first_write(&checkpoint(&key(), &events, &ctx)).written_unavailable,
+            Some(WrittenUnavailable::OutsideRepo)
+        );
+    }
+
+    #[test]
+    fn inside_repo_is_lexical_and_fail_closed() {
+        let root: &[&Path] = &[Path::new("/repo")];
+        assert!(inside_repo("src/a.rs", &[]));
+        assert!(inside_repo("src/a.rs", root));
+        assert!(!inside_repo("../a.rs", root));
+        assert!(!inside_repo("src/../../a.rs", root));
+        assert!(inside_repo("/repo/src/a.rs", root));
+        assert!(!inside_repo("/repo/../a.rs", root));
+        assert!(!inside_repo("/repo2/a.rs", root));
+        assert!(!inside_repo("/elsewhere/a.rs", root));
+        assert!(!inside_repo("/repo/src/a.rs", &[]));
+        // Nur technisch relativ: Shell-Expansion und Windows-Pfade.
+        assert!(!inside_repo("~/notes.txt", root));
+        assert!(!inside_repo("$HOME/notes.txt", root));
+        assert!(!inside_repo("C:\\Users\\anna\\privat.txt", root));
+    }
+
+    #[test]
+    fn a_symlinked_root_still_counts_as_inside() {
+        // Die Wurzel kommt roh (z. B. ueber einen Symlink), der Agent nennt
+        // den aufgeloesten Pfad. Das ist drinnen.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir(&real).unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            link
+        };
+        #[cfg(not(unix))]
+        let link = real.clone();
+        let file = fs::canonicalize(&real).unwrap().join("a.rs");
+        let path = file.to_str().unwrap();
+
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre(path, "s"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post(path, "s"),
+            ),
+        ];
+        let ctx = Checkpoint {
+            root: Some(&link),
+            commit: None,
+            tracked: None,
+            redaction: Some(policy()),
+        };
+        let s = checkpoint(&key(), &events, &ctx);
+        assert!(
+            first_write(&s).written.is_some(),
+            "{:?}",
+            first_write(&s).written_unavailable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_path_under_a_resolved_root_still_counts_as_inside() {
+        // Die Gegenrichtung: Der Agent nennt den Pfad ueber den Symlink
+        // (`cwd` aus der Shell, macOS `/var/folders/…`), die Wurzel liegt
+        // aufgeloest vor (`/private/var/folders/…`). Auch das ist drinnen.
+        let dir = tempfile::tempdir().unwrap();
+        let real = fs::canonicalize(dir.path()).unwrap().join("real");
+        fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let path = link.join("a.rs");
+        let path = path.to_str().unwrap();
+
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre(path, "s"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post(path, "s"),
+            ),
+        ];
+        let ctx = Checkpoint {
+            root: Some(&real),
+            commit: None,
+            tracked: None,
+            redaction: Some(policy()),
+        };
+        let s = checkpoint(&key(), &events, &ctx);
+        assert!(
+            first_write(&s).written.is_some(),
+            "{:?}",
+            first_write(&s).written_unavailable
+        );
+
+        // Ein Symlink-Verzeichnis, das nach draussen zeigt, bleibt draussen;
+        // ebenso ein Verzeichnis, das es nicht gibt, und `..` im Rohpfad.
+        let outside = tempfile::tempdir().unwrap();
+        let escape = real.join("escape");
+        std::os::unix::fs::symlink(outside.path(), &escape).unwrap();
+        let roots: &[&Path] = &[&real];
+        let escaped = link.join("escape").join("x.rs");
+        assert!(!inside_repo_resolved(escaped.to_str().unwrap(), roots));
+        let missing = link.join("missing").join("x.rs");
+        assert!(!inside_repo_resolved(missing.to_str().unwrap(), roots));
+        let dotted = format!("{}/../link/a.rs", link.display());
+        assert!(!inside_repo_resolved(&dotted, roots));
+    }
+
+    #[test]
+    fn a_failed_write_gets_no_written_hash_at_checkpoint() {
+        // Der ganze Weg: Pre + PostToolUseFailure, korreliert ueber dieselbe
+        // Kennung ⇒ kein Hash, der Grund steht dabei.
+        let failure = r#"{"tool_name":"Write","tool_input":{"file_path":"a.rs","content":"agent\n"},"tool_use_id":"f","error":"File has not been read yet"}"#;
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("a.rs", "f"),
+            ),
+            ev(1, EventKind::ToolPost, "PostToolUseFailure", "t1", failure),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        let e = first_write(&s);
+        assert_eq!(e.written, None);
+        assert_eq!(
+            e.written_unavailable,
+            Some(WrittenUnavailable::PayloadWithoutContent)
+        );
+    }
+
+    #[test]
+    fn two_pre_events_with_one_id_and_a_post_on_another_path_get_nothing() {
+        // Doppelte Pre-Kennung: keiner der beiden Aufrufe bekommt das Post.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("a.rs", "dup"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t1",
+                &write_pre("b.rs", "dup"),
+            ),
+            ev(
+                2,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t2",
+                &write_post("a.rs", "dup"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        for call in s.turns.iter().flat_map(|t| &t.tool_calls) {
+            let e = call.effect.as_ref().unwrap();
+            assert_eq!(e.written, None, "{:?}", e.path);
+            assert_eq!(
+                e.written_unavailable,
+                Some(WrittenUnavailable::PayloadWithoutContent)
+            );
+        }
+        // Gleiche Kennung, aber das Post nennt einen anderen Pfad: Die
+        // Gegenprobe schlaegt fehl, kein Hash.
+        let events = vec![
+            ev(
+                0,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t0",
+                &write_pre("a.rs", "x"),
+            ),
+            ev(
+                1,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t1",
+                &write_post("b.rs", "x"),
+            ),
+        ];
+        let s = checkpoint(&key(), &events, &scanned());
+        assert_eq!(first_write(&s).written, None);
+    }
+
     #[test]
     fn a_read_effect_is_hashed_but_a_secret_read_never() {
         // Seit Phase 6 traegt auch ein Read-Effekt den Inhalts-Hash — das
@@ -783,6 +1506,7 @@ mod tests {
             root: Some(dir.path()),
             commit: None,
             tracked: Some(&tracked),
+            redaction: Some(policy()),
         };
         let s = checkpoint(&key(), &events, &ctx);
         let calls: Vec<_> = s.turns.iter().flat_map(|t| t.tool_calls.iter()).collect();
@@ -801,6 +1525,7 @@ mod tests {
             root: Some(dir.path()),
             commit: None,
             tracked: None,
+            redaction: Some(policy()),
         };
         let s2 = checkpoint(&key(), &events, &ctx_unbounded);
         let read2 = s2

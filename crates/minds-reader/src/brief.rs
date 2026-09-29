@@ -209,6 +209,8 @@ mod tests {
                 kind: EffectKind::Exec,
                 path: None,
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         }
     }
@@ -222,6 +224,8 @@ mod tests {
                 kind: EffectKind::Write,
                 path: Some(path.into()),
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         }
     }

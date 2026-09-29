@@ -14,7 +14,7 @@ pub use session::{
 mod lineage;
 pub use lineage::{
     CONTENT_HASH_PREFIX, ContentHash, ContentHashParseError, Edge, EdgeKind, Effect, EffectKind,
-    Endpoint, Evidence, EvidenceMark, EvidenceSource, EvidenceStatus, Lineage,
+    Endpoint, Evidence, EvidenceMark, EvidenceSource, EvidenceStatus, Lineage, WrittenUnavailable,
 };
 
 /// Die Evidence-Chain-Primitive (ADR-0011): Hashes, Lücken, Fold.

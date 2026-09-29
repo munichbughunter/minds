@@ -505,6 +505,8 @@ mod tests {
                     kind: EffectKind::Write,
                     path: Some("foo.rs".into()),
                     content: Some(hash.clone()),
+                    written: None,
+                    written_unavailable: None,
                 }),
             }],
         ));
@@ -522,6 +524,8 @@ mod tests {
                     kind: EffectKind::Read,
                     path: Some("foo.rs".into()),
                     content: Some(hash),
+                    written: None,
+                    written_unavailable: None,
                 }),
             }],
         ));
@@ -591,6 +595,8 @@ mod tests {
                 kind,
                 path: path.map(str::to_string),
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         }
     }

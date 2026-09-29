@@ -56,7 +56,9 @@ pub use error::{CaptureError, Result};
 pub mod hook_event;
 
 pub mod normalize;
-pub use normalize::{EventFacts, StoredInterpretation, ToolAdapter, ToolFacts, adapter_for};
+pub use normalize::{
+    EventFacts, StoredInterpretation, ToolAdapter, ToolFacts, WrittenOutcome, adapter_for,
+};
 
 pub mod secretwall;
 

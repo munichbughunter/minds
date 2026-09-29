@@ -60,6 +60,8 @@ fn session(request: &str, started: &str) -> Session {
                     kind: EffectKind::Read,
                     path: Some("src/http/retry.rs".into()),
                     content: None,
+                    written: None,
+                    written_unavailable: None,
                 }),
             },
             ToolCall {
@@ -70,6 +72,8 @@ fn session(request: &str, started: &str) -> Session {
                     kind: EffectKind::Write,
                     path: Some("src/http/retry.rs".into()),
                     content: None,
+                    written: None,
+                    written_unavailable: None,
                 }),
             },
             ToolCall {
@@ -80,6 +84,8 @@ fn session(request: &str, started: &str) -> Session {
                     kind: EffectKind::Exec,
                     path: None,
                     content: None,
+                    written: None,
+                    written_unavailable: None,
                 }),
             },
         ],
