@@ -47,5 +47,7 @@ pub mod graph;
 
 pub mod evidence;
 
+pub mod reconcile;
+
 mod query;
 pub use query::{Inspection, touches};
