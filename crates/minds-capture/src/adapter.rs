@@ -214,6 +214,9 @@ fn hash_artifacts(session: &mut Session, ctx: &Checkpoint) {
         redaction,
         ..
     } = *ctx;
+    // Wurzel roh und kanonisch, wie bei `written` (siehe dort).
+    let canonical_root = root.and_then(|r| fs::canonicalize(r).ok());
+    let roots: Vec<&Path> = root.into_iter().chain(canonical_root.as_deref()).collect();
     for call in session.turns.iter_mut().flat_map(|t| &mut t.tool_calls) {
         let Some(effect) = call.effect.as_mut() else {
             continue;
@@ -240,12 +243,9 @@ fn hash_artifacts(session: &mut Session, ctx: &Checkpoint) {
         // Eingabe. Ein absoluter oder über `..` aus dem Repo führender Pfad
         // würde sonst beliebige Dateien der Maschine hashen: ein
         // Existenz-/Inhalts-Orakel. Gilt für Schreib- **und** Lese-Effekte
-        // gleichermaßen.
-        let inside = Path::new(path).is_relative()
-            && !Path::new(path)
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
-        if !inside {
+        // gleichermaßen — mit derselben Grenze wie `written`: Claude Code
+        // nennt Pfade absolut, ein absoluter Pfad unter der Wurzel ist innen.
+        if !inside_repo_resolved(path, &roots) {
             continue;
         }
         // Read-Grenze (siehe [`Checkpoint::tracked`]): zusätzlich nur
@@ -1588,6 +1588,7 @@ mod tests {
             root: Some(&dir.path().join("repo")),
             commit: None,
             tracked: None,
+            redaction: Some(policy()),
         };
         std::fs::create_dir_all(dir.path().join("repo")).unwrap();
         let s = checkpoint(&key(), &events, &ctx);
@@ -1624,6 +1625,7 @@ mod tests {
             root: Some(&dir.path().join("repo")),
             commit: None,
             tracked: None,
+            redaction: Some(policy()),
         };
         let s = checkpoint(&key, &events, &ctx);
         let effect = s.turns[0].tool_calls[0].effect.as_ref().unwrap();

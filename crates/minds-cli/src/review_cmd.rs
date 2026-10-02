@@ -300,6 +300,15 @@ mod tests {
             eprintln!("git not on PATH — test skipped");
             return;
         }
+        // Repo-lokale Identität: Der Store schreibt Commits und darf nicht von
+        // einer globalen Git-Konfiguration der Maschine abhängen.
+        for (key, value) in [("user.name", "Test"), ("user.email", "test@example.org")] {
+            std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(dir.path())
+                .status()
+                .unwrap();
+        }
         let store = ReviewStore::new(Repo::discover(dir.path()).unwrap());
         let forged = Review::new(
             Subject::Change(format!("I{}", "ab".repeat(20))),
