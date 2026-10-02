@@ -29,8 +29,23 @@ const REQUEST_MAX: usize = 100;
 ///
 /// `cap` deckelt jeden Abschnitt auf höchstens so viele Einträge (für
 /// `minds brief`, das klein bleiben soll, damit der Agent-Input nicht ausufert).
-/// `None` heißt vollständig (für `recall`/`distill`).
+/// `None` heißt alle Einträge (für `distill`); Absichten bleiben Überschriften.
+/// Für den vollständigen Wortlaut gibt es [`render_full_intents`].
 pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
+    render_inner(title, sessions, cap, false)
+}
+
+/// Wie [`render`], aber mit den vollständigen, mehrzeiligen Absichten für `recall`.
+pub fn render_full_intents(title: &str, sessions: &[Session]) -> String {
+    render_inner(title, sessions, None, true)
+}
+
+fn render_inner(
+    title: &str,
+    sessions: &[Session],
+    cap: Option<usize>,
+    full_intents: bool,
+) -> String {
     let extract = Extract::from_sessions(sessions);
     let take = |n: usize| cap.map_or(n, |c| c.min(n));
 
@@ -44,10 +59,15 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
 
     // --- Absicht ---------------------------------------------------------
     let requests = dedup(sessions.iter().filter_map(|s| {
+        if full_intents {
+            return (!s.intent.request.trim().is_empty()).then(|| s.intent.request.clone());
+        }
         let line = headline(&s.intent.request, REQUEST_MAX);
         (line != "(no prompt captured)").then_some(line)
     }));
-    section(&mut out, "Intent", &requests, take, |r| format!("- {r}"));
+    section(&mut out, "Intent", &requests, take, |r| {
+        format!("- {}", r.replace('\n', "\n  "))
+    });
 
     // --- Constraints & deklarierte Sackgassen ----------------------------
     let constraints = dedup(sessions.iter().flat_map(|s| s.intent.constraints.clone()));
@@ -298,6 +318,22 @@ mod tests {
         let s = session("   ");
         let out = render("T", &[s], None);
         assert!(!out.contains("## Intent"), "{out}");
+    }
+
+    #[test]
+    fn full_intents_keep_shared_headlines_and_all_lines() {
+        let first = format!(
+            "{}\nFirst details.\n\nLast details.",
+            "long request ".repeat(12)
+        );
+        let second = format!("{}\nOther details.", "long request ".repeat(12));
+        let sessions = [session(&first), session(&second), session(&first)];
+        let out = render_full_intents("T", &sessions);
+        assert!(out.contains(&format!("- {}", first.replace('\n', "\n  "))));
+        assert!(out.contains(&format!("- {}", second.replace('\n', "\n  "))));
+        assert_eq!(out.matches("First details.").count(), 1);
+        assert!(!render("T", &sessions, Some(1)).contains("First details."));
+        assert!(!render_full_intents("T", &[session(" \n ")]).contains("## Intent"));
     }
 
     /// R.7 — der Brief ist Byte für Byte stabil. Ändert sich das Format
