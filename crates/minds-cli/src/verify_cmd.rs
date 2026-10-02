@@ -2,8 +2,9 @@
 //!
 //! Drei Betriebsarten:
 //!
-//! - `minds verify <session>` — das **Evidence-Verdikt**: Integrität ×
-//!   Coverage über die Seals der Session, als Matrix mit festen Exit-Codes.
+//! - `minds verify [<session|rev>]` — das **Evidence-Verdikt**: Integrität ×
+//!   Coverage über die Seals der Session(s), als Matrix mit festen Exit-Codes.
+//!   Ohne Ziel werden die mit HEAD verknüpften Sessions geprüft.
 //! - `minds verify <session> --sig <datei> [--signers] [--identity]` — der
 //!   bisherige Attestation-Pfad: eine signierte Attribution prüfen.
 //! - `minds verify --evidence <seal-id>` — das Verdikt eines einzelnen Seals,
@@ -30,7 +31,7 @@
 //! Epochen-Schluss über `lineage.local_id` erscheint nur als Hinweis und
 //! wertet das Verdikt **nie** auf — Heuristik bleibt Heuristik.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -76,6 +77,15 @@ impl Verdict {
             Verdict::Unverifiable => ExitCode::from(3),
         }
     }
+
+    fn severity(self) -> u8 {
+        match self {
+            Self::Verified => 0,
+            Self::Incomplete => 1,
+            Self::Unverifiable => 2,
+            Self::Tampered => 3,
+        }
+    }
 }
 
 /// Führt `minds verify` aus.
@@ -112,16 +122,82 @@ pub fn run(
                 ExitCode::FAILURE
             }
         },
-        // Das Evidence-Verdikt einer Session.
-        (None, Some(target), None) => match verify_session(target, signers, identity) {
-            Ok(verdict) => verdict.exit(),
-            Err(err) => operational_failure(err.as_ref()),
-        },
-        (None, None, _) => {
-            eprintln!("minds verify: expects <session-id> or --evidence <seal-id>");
+        // Session-Id oder Revision; ohne Argument gilt HEAD.
+        (None, target, None) => verify_target(target.unwrap_or("HEAD"), signers, identity),
+        (None, None, Some(_)) => {
+            eprintln!("minds verify: --sig expects <session-id>");
             ExitCode::FAILURE
         }
     }
+}
+
+fn verify_target(target: &str, signers: Option<&str>, identity: Option<&str>) -> ExitCode {
+    let ctx = match Context::open() {
+        Ok(ctx) => ctx,
+        Err(err) => return operational_failure(err.as_ref()),
+    };
+    let ids = if let Ok(id) = target.parse::<SessionId>() {
+        vec![id]
+    } else {
+        match sessions_of_revision(&ctx, target) {
+            Ok(ids) => ids,
+            Err(err) => return operational_failure(err.as_ref()),
+        }
+    };
+    if ids.is_empty() {
+        return Verdict::Unverifiable.exit();
+    }
+
+    let mut worst = Verdict::Verified;
+    let mut failed = false;
+    for (i, id) in ids.into_iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        match verify_session(&ctx, id, signers, identity) {
+            Ok(verdict) => {
+                if verdict.severity() > worst.severity() {
+                    worst = verdict;
+                }
+            }
+            Err(err) => {
+                operational_failure(err.as_ref());
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::from(4)
+    } else {
+        worst.exit()
+    }
+}
+
+fn sessions_of_revision(ctx: &Context, rev: &str) -> Fallible<Vec<SessionId>> {
+    // resolve_rev passes one argument after --end-of-options and peels to a commit.
+    let commit = ctx
+        .resolve_rev(rev)
+        .ok_or_else(|| format!("no such revision: {rev}"))?;
+    let mut ids = ctx.repo.session_ids_of(commit)?;
+    if ids.is_empty() {
+        ids = ctx
+            .store
+            .index()?
+            .links_of(&commit.to_string())
+            .iter()
+            .map(|link| link.session)
+            .collect();
+    }
+    let mut seen = BTreeSet::new();
+    ids.retain(|id| seen.insert(*id));
+    if ids.is_empty() {
+        println!(
+            "No session is linked to {} ({}).",
+            crate::text::sanitize(rev),
+            &commit.to_string()[..7]
+        );
+    }
+    Ok(ids)
 }
 
 /// Der operative Fehlerpfad: Exit **4**, nie 1 — und der Fehlertext läuft
@@ -175,15 +251,11 @@ impl SignatureState {
 }
 
 fn verify_session(
-    target: &str,
+    ctx: &Context,
+    id: SessionId,
     signers: Option<&str>,
     identity: Option<&str>,
 ) -> Fallible<Verdict> {
-    let id: SessionId = target
-        .parse()
-        .map_err(|err| format!("not a valid session id {target:?}: {err}"))?;
-    let ctx = Context::open()?;
-
     println!("Session        {id}");
 
     // 1. Die Session selbst: vorhanden, vergessen (payload-freier Beweis

@@ -107,6 +107,9 @@ minds recall <target>
 
 Condenses the session(s) behind a file, a line (`<file>:<line>`), or a commit into a short context brief. Deterministic and costs 0 tokens — the agent-facing sibling of `why`.
 
+Includes the complete intent request, preserving multiple lines. Terminal output is
+sanitized and wrapped to the terminal width (`COLUMNS` or 80 columns as a fallback).
+
 ```
 minds recall src/lib.rs:42
 ```
@@ -216,15 +219,20 @@ minds seals --session b3a1f0e --limit 5
 ### minds verify
 
 ```
-minds verify <session> [--signers <file>] [--identity <id>]
+minds verify [<session|rev>] [--signers <file>] [--identity <id>]
 minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
 minds verify --evidence <seal-id>
 ```
 
-Renders the evidence verdict: integrity × coverage across the seals of a session. Exit codes: 0 VERIFIED, 1 TAMPERED, 2 INCOMPLETE, 3 NOT VERIFIABLE. With `--sig` it checks a signed attribution and exits non-zero when the signature is invalid. `--evidence` yields the verdict for a single seal, even without a session (redaction block).
+Renders the evidence verdict: integrity × coverage across the seals of a session. With no argument, verifies the sessions linked to `HEAD`. A target that is not a session id is resolved as a Git revision (for example `HEAD~1`). Sessions come from `Minds-Session-Id` trailers, falling back to the store's commit-to-session index when no session trailers are present.
+
+Multiple sessions produce the same blocks as individual session checks, separated by a blank line. Exit codes: 0 VERIFIED, 1 TAMPERED, 2 INCOMPLETE, 3 NOT VERIFIABLE, 4 operational failure. The worst result wins in the order **4 > 1 > 3 > 2 > 0**. If HEAD has no linked session, prints `No session is linked to HEAD (<short sha>).` and exits 3. Invalid revisions exit 4.
+
+With `--sig` a session id is required; it checks a signed attribution and exits non-zero when the signature is invalid. `--evidence` yields the verdict for a single seal, even without a session (redaction block).
 
 ```
-minds verify b3a1f0e --signers .minds/allowed_signers
+minds verify --signers .minds/allowed_signers
+minds verify HEAD~1
 ```
 
 ### minds sign

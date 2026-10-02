@@ -121,6 +121,7 @@ Usage:
   minds recall <target>
         Condenses the session(s) behind a file, a line (<file>:<line>) or
         a commit into a concise context brief.
+        Includes the full intent request, wrapped to the terminal width.
         Deterministic, 0 tokens — the agent sibling of why.
 
   minds distill [--path <directory>] [--out <file>]
@@ -175,10 +176,12 @@ Usage:
         Without --session, every seal in the store; --limit caps how
         many print (applied after sorting).
 
-  minds verify <session> [--signers <file>] [--identity <id>]
+  minds verify [<session|rev>] [--signers <file>] [--identity <id>]
         The evidence verdict: integrity × coverage over the session's seals.
+        Defaults to HEAD; revisions use session trailers, then the store index.
+        Multiple sessions print separate blocks; the worst verdict wins.
         Exit codes: 0 VERIFIED, 1 TAMPERED, 2 \"VERIFIED, INCOMPLETE\",
-        3 NOT VERIFIABLE.
+        3 NOT VERIFIABLE, 4 operational failure (priority: 4 > 1 > 3 > 2 > 0).
   minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
         Checks a signed attribution. Exit code is non-zero when invalid.
   minds verify --evidence <seal-id>
@@ -848,6 +851,13 @@ mod tests {
         let parsed = parse(spec_named("verify"), &args(&["--sig", "s.sig", "b3-abc"])).unwrap();
         assert_eq!(parsed.positional(0), Some("b3-abc"));
         assert_eq!(parsed.value("--sig"), Some("s.sig"));
+    }
+
+    #[test]
+    fn verify_accepts_zero_or_one_positional() {
+        assert!(parse(spec_named("verify"), &args(&[])).is_ok());
+        assert!(parse(spec_named("verify"), &args(&["HEAD~1"])).is_ok());
+        assert!(parse(spec_named("verify"), &args(&["HEAD", "HEAD~1"])).is_err());
     }
 
     /// `minds gitlab mirror --mr 5 I…`: Das Subjekt ist die Change-Id, nicht

@@ -24,7 +24,7 @@ pub fn run(target: Option<&str>) -> ExitCode {
     match recall(target) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("minds recall: {err}");
+            eprintln!("minds recall: {}", crate::text::sanitize(&err.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -41,9 +41,32 @@ fn recall(target: &str) -> Fallible<()> {
     }
     let (label, sessions) = resolved?;
     let markdown =
-        minds_reader::brief::render(&format!("Context brief — {label}"), &sessions, None);
-    print!("{markdown}");
+        minds_reader::brief::render_full_intents(&format!("Context brief — {label}"), &sessions);
+    let width = terminal_size::terminal_size()
+        .map(|(terminal_size::Width(width), _)| usize::from(width))
+        .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
+        .filter(|width| *width > 0)
+        .unwrap_or(80);
+    print!("{}", terminal_markdown(&markdown, width));
     Ok(())
+}
+
+/// Originale Zeilen erhalten, fremden Text vor dem Umbruch entschärfen und
+/// Fortsetzungen unter dem Listeneintrag einrücken.
+fn terminal_markdown(markdown: &str, width: usize) -> String {
+    let mut out = String::new();
+    for line in markdown.lines() {
+        let safe = crate::text::sanitize(line);
+        let indent = if safe.starts_with("- ") || safe.starts_with("  ") {
+            "  "
+        } else {
+            ""
+        };
+        let options = textwrap::Options::new(width).subsequent_indent(indent);
+        out.push_str(&textwrap::fill(&safe, options));
+        out.push('\n');
+    }
+    out
 }
 
 /// Löst `target` zu einer Menge Sessions auf und liefert dazu eine Beschriftung.
@@ -93,7 +116,22 @@ fn split_file_line(target: &str) -> Option<(&str, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::split_file_line;
+    use super::{split_file_line, terminal_markdown};
+
+    #[test]
+    fn multiline_intents_are_sanitized_and_wrapped() {
+        let out = terminal_markdown("- one two three four\n  next\n  \u{1b}[31mred\n", 13);
+        assert_eq!(
+            out,
+            "- one two\n  three four\n  next\n  \\u{1b}\n  [31mred\n"
+        );
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn wrapping_counts_terminal_columns_for_unicode() {
+        assert_eq!(terminal_markdown("- 中文 中文\n", 6), "- 中文\n  中文\n");
+    }
 
     #[test]
     fn recognises_file_and_line() {

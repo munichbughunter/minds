@@ -2853,6 +2853,239 @@ fn sealed_repo() -> Option<(tempfile::TempDir, String)> {
     Some((repo, id))
 }
 
+/// A new production commit with exactly the requested session trailers.
+fn commit_with_sessions(dir: &Path, ids: &[&str]) {
+    let mut message = String::from("test: session links\n\n");
+    for id in ids {
+        message.push_str(&format!("Minds-Session-Id: {id}\n"));
+    }
+    let out = git(
+        dir,
+        &[
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            &message,
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn verify_without_argument_uses_head() {
+    let Some((repo, id)) = sealed_repo() else {
+        return;
+    };
+    let explicit = minds(repo.path(), &["verify", &id], None);
+    let head = minds(repo.path(), &["verify"], None);
+    assert_eq!(
+        head.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&head.stderr)
+    );
+    assert_eq!(head.status.code(), explicit.status.code());
+    assert_eq!(head.stdout, explicit.stdout);
+    assert_eq!(head.stderr, explicit.stderr);
+
+    // Repeated trailers still name just one session.
+    commit_with_sessions(repo.path(), &[&id, &id]);
+    assert_eq!(
+        minds(repo.path(), &["verify"], None).stdout,
+        explicit.stdout
+    );
+}
+
+#[test]
+fn verify_head_without_session_is_not_verifiable() {
+    let Some(repo) = scratch_repo() else { return };
+    commit_with_sessions(repo.path(), &[]);
+    let sha = stdout(&git(repo.path(), &["rev-parse", "HEAD"]));
+    let out = minds(repo.path(), &["verify"], None);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(
+        stdout(&out),
+        format!("No session is linked to HEAD ({}).\n", &sha[..7])
+    );
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn verify_accepts_revision() {
+    let Some((repo, id)) = sealed_repo() else {
+        return;
+    };
+    commit_with_sessions(repo.path(), &[]);
+    let explicit = minds(repo.path(), &["verify", &id], None);
+    let parent = minds(repo.path(), &["verify", "HEAD~1"], None);
+    assert_eq!(parent.status.code(), explicit.status.code());
+    assert_eq!(parent.stdout, explicit.stdout);
+    assert!(parent.stderr.is_empty());
+
+    for rev in [
+        "missing-revision",
+        "bad\u{1b}[31m\u{202e}revision",
+        "--output=unexpected",
+    ] {
+        let out = minds(repo.path(), &["verify", "--", rev], None);
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(error.contains("no such revision:"), "{error}");
+        assert!(!error.contains(['\u{1b}', '\u{202e}']));
+        assert!(out.stdout.is_empty());
+    }
+    assert!(!repo.path().join("unexpected").exists());
+}
+
+#[test]
+fn verify_falls_back_to_index_only_without_trailers() {
+    use minds_store::ContextStore;
+    let Some((repo, id)) = sealed_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    let explicit = minds(dir, &["verify", &id], None);
+    commit_with_sessions(dir, &[]);
+    let sha = stdout(&git(dir, &["rev-parse", "HEAD"]));
+    let store = minds_store::InRepoStore::open(dir).unwrap();
+    store
+        .link(
+            id.parse().unwrap(),
+            sha.trim(),
+            minds_core::Evidence::Observed.into(),
+        )
+        .unwrap();
+    let out = minds(dir, &["verify"], None);
+    assert_eq!(out.status.code(), explicit.status.code());
+    assert_eq!(out.stdout, explicit.stdout);
+
+    commit_with_sessions(dir, &[&id]);
+    let sha = stdout(&git(dir, &["rev-parse", "HEAD"]));
+    let missing = format!("b3-{}", "7".repeat(64));
+    store
+        .link(
+            missing.parse().unwrap(),
+            sha.trim(),
+            minds_core::Evidence::Observed.into(),
+        )
+        .unwrap();
+    let out = minds(dir, &["verify"], None);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, explicit.stdout);
+}
+
+#[test]
+fn verify_worst_verdict_wins_for_multiple_sessions() {
+    use minds_store::ContextStore;
+    let Some((repo, verified)) = sealed_repo() else {
+        return;
+    };
+    let dir = repo.path();
+    let unverifiable = format!("b3-{}", "7".repeat(64));
+    let incomplete = format!("b3-{}", "8".repeat(64));
+    let store = minds_store::InRepoStore::open(dir).unwrap();
+    let missing_seal = format!("b3-{}", "9".repeat(64)).parse().unwrap();
+    store
+        .record_session_seal(incomplete.parse().unwrap(), &missing_seal)
+        .unwrap();
+
+    let check_pair = |first: &str, second: &str, expected: i32| {
+        for ids in [[first, second], [second, first]] {
+            commit_with_sessions(dir, &ids);
+            let out = minds(dir, &["verify"], None);
+            assert_eq!(
+                out.status.code(),
+                Some(expected),
+                "{}\n{}",
+                stdout(&out),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let a = minds(dir, &["verify", ids[0]], None);
+            let b = minds(dir, &["verify", ids[1]], None);
+            assert_eq!(stdout(&out), format!("{}\n{}", stdout(&a), stdout(&b)));
+        }
+    };
+    check_pair(&verified, &incomplete, 2);
+    check_pair(&verified, &unverifiable, 3);
+    check_pair(&incomplete, &unverifiable, 3);
+
+    // Change the stored seal bytes under their old id to obtain TAMPERED.
+    let seals = seal_refs(dir);
+    let forged = seal_text(dir, &seals[0]).replacen("events=2", "events=9", 1);
+    let blob = stdout(&git_stdin(dir, &["hash-object", "-w", "--stdin"], &forged));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    assert!(
+        git(dir, &["update-ref", &seals[0], commit.trim()])
+            .status
+            .success()
+    );
+    check_pair(&verified, &unverifiable, 1);
+    check_pair(&verified, &incomplete, 1);
+
+    // A store ref pointing to a blob is an operational failure, not tampering.
+    let broken = format!("b3-{}", "a".repeat(64));
+    let reference = format!("refs/minds/store/{}", &broken[3..]);
+    assert!(
+        git(dir, &["update-ref", &reference, blob.trim()])
+            .status
+            .success()
+    );
+    check_pair(&verified, &broken, 4);
+}
+
+#[test]
+fn recall_prints_full_multiline_intent() {
+    let Some(repo) = scratch_repo() else { return };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+    let prompt = format!(
+        "First line.\n{}end of long line.\n\nLast line.\u{1b}[31m",
+        "More details here. ".repeat(12)
+    );
+    let json = serde_json::to_string(&prompt).unwrap();
+    record_session(dir, "multiline", &json[1..json.len() - 1], "intent.rs");
+    let mut cmd = Command::new(MINDS);
+    cmd.current_dir(dir)
+        .args(["recall", "intent.rs"])
+        .env("COLUMNS", "40");
+    let out = without_user_config(&mut cmd).output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = stdout(&out);
+    assert!(text.contains("- First line.\n"), "{text}");
+    assert!(text.contains("end of long line."), "{text}");
+    assert!(text.contains("Last line."), "{text}");
+    assert_eq!(text.matches("More details here.").count(), 12, "{text}");
+    assert!(!text.contains('\u{1b}'), "{text:?}");
+    assert!(
+        text.lines().all(|line| line.chars().count() <= 40),
+        "{text}"
+    );
+}
+
 /// EV: Der manuelle Checkpoint quittiert mit der „SESSION SEALED"-
 /// Zusammenfassung — Identität, Root, Bereich, Grenze, Signatur-Anwesenheit
 /// und die Tatsachen-Zeilen. Der Hook-Pfad wirft stdout weg; dieser Block ist
