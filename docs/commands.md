@@ -220,6 +220,7 @@ minds seals --session b3a1f0e --limit 5
 
 ```
 minds verify [<session|rev>] [--signers <file>] [--identity <id>]
+             [--commit <rev>] [--require-explained <percent>] [--all]
 minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
 minds verify --evidence <seal-id>
 ```
@@ -230,9 +231,37 @@ Multiple sessions produce the same blocks as individual session checks, separate
 
 With `--sig` a session id is required; it checks a signed attribution and exits non-zero when the signature is invalid. `--evidence` yields the verdict for a single seal, even without a session (redaction block).
 
+**Artifact coverage.** The Coverage line also reconciles the commit against the stored write evidence: how many added or modified lines of the commit are explained by the sessions this run verifies, followed by the places that are not.
+
+```
+Coverage       complete within the boundary (boundary: agent-hooks/v1 — activity outside it is not captured · 0 gaps · artifact 148/151 lines explained)
+  unexplained    src/sort/merge.rs:88     not observed in the session
+  unexplained    src/sort/merge.rs:91-92  not observed in the session
+  file only      Cargo.lock               line level unavailable (reconstruction mismatch)
+```
+
+- **Which commit.** `--commit <rev>` if given, otherwise the resolved revision (`HEAD` by default); for a session id, the newest commit reachable from `HEAD` (topological order) whose `Minds-Session-Id` trailer names the session. Without such a commit the block prints `Artifact       not assessed (no linked commit)`. In a shallow clone whose first parent is missing, or a partial clone missing a tree or blob, it prints `not assessed (first parent not in this clone (shallow))`, `not assessed (tree not in this clone (partial))` or `not assessed (blob not in this clone (partial))` — verify never fetches. None of these changes the verdict. Objects are read without replace refs (`refs/replace`) and checked against their ids; a replaced object is an error, never a substitute.
+- **Which evidence.** Only the sessions whose verdict this run prints contribute claims — the target session, or the sessions of the target revision. `--commit` chooses the commit, not the sessions: `minds verify <session> --commit <rev>` reconciles `<rev>` against that one session. `minds verify <session> --require-explained N` judges the session's own trailer commit, not `HEAD`; to gate `HEAD`, use `minds verify --require-explained N`.
+- **Which paths.** Agents record absolute paths. A claim under this checkout's root names exactly that file. In a clone elsewhere (CI), the session's recorded working directory stands in for the root at capture time; because the repository root itself is not recorded, such a claim only counts if it lies below that directory and exactly one candidate path exists in the commit's trees. Deletions — and therefore renames, which count as deletion plus addition — are never explained this way, and sessions started in a subdirectory may stay unexplained outside the capture checkout: fail-closed.
+- **What "explained" means.** A line counts as explained when evidence backs it — today a tool claim whose write-time hash matches the committed bytes (*reported only*). That is the agent's own statement, chained into the seals by the hooks; without a valid seal signature (`--signers`) or a witness (EA-08) it is a self-declaration of whoever controls the evidence refs, not an observation. Lines without matching evidence (human edits, shell writes) are *unexplained*. A claim is bound to the bytes it wrote, not to the commit's parent: a linked session that once wrote exactly these bytes explains them, even if a later commit had changed them in between. Contiguous lines are compressed to ranges; at most 20 detail lines are printed, then `… N more (minds verify --commit <rev> --all)`. *file only* marks files judged as a whole (binary, too large, reconstruction mismatch); such a file weighs one line when backed and all of its lines when unexplained. Changes that are not added lines are listed too: deletions, removed lines (a removal not replaced in place, from the base or from what the agent wrote), submodule pointers (also when `.gitmodules` says `ignore`), mode changes, new executables and symlinks. Paths are sanitized before printing (and shortened beyond 256 characters); file contents never appear. Because every verdict-mode run reads the commit's blobs, a damaged object or a replaced object (`refs/replace`) now makes `minds verify` exit 4 even without the artifact flags.
+
+`--require-explained <percent>` (an integer from 0 to 100) turns this into a gate. It fails when explained × 100 / changed falls below the requirement (`Gate           explained 98% < required 100%`) and — for any requirement above 0 — when an unexplained change is not captured by added lines: a deletion, removed lines, a binary or oversized file, a submodule pointer, a mode change or a symlink (`Gate           1 unexplained change(s) beyond added lines — required 100%`). A requirement above 0 also fails when nothing can be assessed (no commit, shallow or partial clone, several trailer commits for a session id — pass `--commit`); `--require-explained 0` requires nothing. Only `100` is a hard statement: below it, a large backed file under 2 MiB (a regenerated lockfile) can outweigh unexplained lines elsewhere. A failed gate exits 2 — the same code as VERIFIED, INCOMPLETE, so a pipeline that tolerates 2 also skips the gate; the printed `Gate` line tells them apart — unless the verdict is already 1, 3 or 4, which always win. With several sessions, each block repeats the commit's artifact lines; the `Gate` line appears once at the end.
+
+The gate judges **one commit** against its first parent. A branch with several commits needs one run per commit — otherwise a human commit sandwiched below an agent commit at `HEAD` goes unchecked:
+
+```
+for c in $(git rev-list --reverse origin/main..HEAD); do
+  minds verify "$c" --require-explained 100 || exit $?
+done
+```
+
+The flags apply only to the evidence verdict, not to `--sig` or `--evidence`. A human commit without a linked session exits 3 (NOT VERIFIABLE) in that loop — which also stops it.
+
 ```
 minds verify --signers .minds/allowed_signers
 minds verify HEAD~1
+minds verify --require-explained 100
+minds verify b3a1f0e --commit HEAD~2 --all
 ```
 
 ### minds sign

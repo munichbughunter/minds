@@ -97,6 +97,7 @@ fn run(
         changed,
         sessions,
         observations,
+        roots: &[],
     })
 }
 fn lines(file: &FileRecon) -> Vec<(u32, ReconClass)> {
@@ -558,9 +559,9 @@ fn reconcile_is_read_only() {
         .unwrap()
         .unwrap();
     let changes = [file("a", None, Some(&blob))];
-    let result = index.reconcile(commit, None, &changes, &[]);
+    let result = index.reconcile(commit, None, &changes, &[], &[]);
     assert_eq!(result.files[0].class, ReportedOnly);
-    assert_eq!(result, index.reconcile(commit, None, &changes, &[]));
+    assert_eq!(result, index.reconcile(commit, None, &changes, &[], &[]));
     assert_eq!(before_refs, git(dir.path(), &["show-ref"]));
     assert_eq!(
         before,
@@ -591,7 +592,13 @@ fn index_only_uses_sessions_linked_to_the_commit() {
     let index = Index::from_parts(BTreeMap::from([(id, s)]), BTreeMap::new());
     assert_eq!(
         index
-            .reconcile(commit(), None, &[file("a", None, Some(b"text\n"))], &[])
+            .reconcile(
+                commit(),
+                None,
+                &[file("a", None, Some(b"text\n"))],
+                &[],
+                &[]
+            )
             .files[0]
             .class,
         Unexplained
@@ -637,4 +644,281 @@ fn matching_old_claim_explains_observation_but_not_an_unobserved_commit() {
             .class,
         Explained
     );
+}
+
+#[test]
+fn unexplained_lines_count_line_and_file_level_gaps() {
+    let session = session(vec![write("a", "one\ntwo\nthree\n"), write("bin", "x\0y")]);
+    let changed = [
+        file("a", None, Some(b"one\nHUMAN\nthree\n")),
+        file("bin", None, Some(b"x\0y")),
+        file("human.bin", None, Some(b"h\0h")),
+        file("gone", Some(b"old\n"), None),
+    ];
+    let result = run(&changed, &[&session], &[]);
+    let per_file: Vec<_> = result
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.changed_lines, f.unexplained_lines()))
+        .collect();
+    // Line level: one human line. Binary + ReportedOnly: no gap. Binary +
+    // Unexplained: the whole file counts. A deletion changes no lines.
+    assert_eq!(
+        per_file,
+        [
+            ("a", 3, 1),
+            ("bin", 1, 0),
+            ("gone", 0, 0),
+            ("human.bin", 1, 1)
+        ]
+    );
+    assert_eq!(result.unexplained_lines(), 2);
+    assert_eq!(result.total_changed_lines, 5);
+    assert_eq!(
+        result.files.iter().map(|f| f.changed_lines).sum::<u64>(),
+        result.total_changed_lines
+    );
+}
+
+#[test]
+fn absolute_claims_match_only_under_a_root() {
+    let root = Path::new("/work/repo");
+    assert_eq!(
+        repo_path("/work/repo/src/a.rs", &[root]).as_deref(),
+        Some("src/a.rs")
+    );
+    assert_eq!(repo_path("./src/a.rs", &[]).as_deref(), Some("src/a.rs"));
+    for outside in [
+        "/work/other/src/a.rs",
+        "/work/repo/../repo/src/a.rs",
+        "/work/repo",
+        "~/repo/a.rs",
+        "$HOME/a.rs",
+        "src\\a.rs",
+        "../a.rs",
+    ] {
+        assert_eq!(repo_path(outside, &[root]), None, "{outside}");
+    }
+
+    // Claude Code nennt Pfade absolut: Ohne Wurzel erklärt der Claim nichts,
+    // mit Wurzel genau die Datei darunter — und keine gleichnamige draußen.
+    let session = session(vec![write("/work/repo/a", "text\n")]);
+    let changed = [file("a", None, Some(b"text\n"))];
+    let with = |roots: &[&Path]| {
+        reconcile(&ReconInput {
+            commit: commit(),
+            base: None,
+            changed: &changed,
+            sessions: &[&session],
+            observations: &[],
+            roots,
+        })
+        .files[0]
+            .class
+    };
+    assert_eq!(with(&[]), Unexplained);
+    assert_eq!(with(&[root]), ReportedOnly);
+    assert_eq!(with(&[Path::new("/work/other")]), Unexplained);
+}
+
+fn with_cwd(mut session: Session, cwd: &str) -> Session {
+    session.lineage = Some(minds_core::Lineage {
+        local_id: "capture".into(),
+        started_at: None,
+        ended_at: None,
+        cwd: Some(cwd.into()),
+    });
+    session
+}
+
+#[test]
+fn claims_match_under_the_sessions_own_capture_root() {
+    // Captured on a developer machine, verified in CI under another path: the
+    // session's recorded cwd spells the capture-time root.
+    let captured = with_cwd(
+        session(vec![
+            write("/Users/dev/proj/src/a.rs", "agent\n"),
+            write("rel.rs", "relative\n"),
+        ]),
+        "/Users/dev/proj/src",
+    );
+    let changed = [
+        file("src/a.rs", None, Some(b"agent\n")),
+        file("src/rel.rs", None, Some(b"relative\n")),
+        file("rel.rs", None, Some(b"relative\n")),
+    ];
+    let ci = Path::new("/home/runner/work/proj");
+    let result = reconcile(&ReconInput {
+        commit: commit(),
+        base: None,
+        changed: &changed,
+        sessions: &[&captured],
+        observations: &[],
+        roots: &[ci],
+    });
+    let classes: Vec<_> = result
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.class))
+        .collect();
+    // a.rs maps to exactly one changed path. The relative claim resolves to
+    // …/src/rel.rs, which could be `src/rel.rs` (proj is the root) or
+    // `rel.rs` (src is the root): ambiguous, so it explains neither.
+    assert_eq!(
+        classes,
+        [
+            ("rel.rs", Unexplained),
+            ("src/a.rs", ReportedOnly),
+            ("src/rel.rs", Unexplained)
+        ]
+    );
+}
+
+#[test]
+fn capture_root_fallback_never_aliases() {
+    let known = |paths: &'static [&'static str]| move |p: &str| paths.contains(&p);
+    // Monorepo session in a subdirectory: its delete may not explain a
+    // top-level deletion — deletions carry no hash, so no fallback at all.
+    let session_delete = with_cwd(
+        session(vec![call("Delete", "/r/pkg/auth.rs", json!({}), None)]),
+        "/r/pkg",
+    );
+    let changed = [file("auth.rs", Some(b"check\n"), None)];
+    assert_eq!(
+        run(&changed, &[&session_delete], &[]).files[0].class,
+        Unexplained
+    );
+    // Two tree paths fit one claim: ambiguous, no claim.
+    assert_eq!(
+        claim_path(
+            "/r/packages/foo/src/index.ts",
+            Some("/r/packages/foo"),
+            &[],
+            &known(&["src/index.ts", "packages/foo/src/index.ts"]),
+            false,
+        ),
+        None
+    );
+    assert_eq!(
+        claim_path(
+            "/r/packages/foo/src/index.ts",
+            Some("/r/packages/foo"),
+            &[],
+            &known(&["packages/foo/src/index.ts"]),
+            false,
+        )
+        .as_deref(),
+        Some("packages/foo/src/index.ts")
+    );
+    // Outside the session's cwd nothing is inferred.
+    assert_eq!(
+        claim_path(
+            "/home/alice/src/x.rs",
+            Some("/home/alice/r"),
+            &[],
+            &known(&["src/x.rs"]),
+            false,
+        ),
+        None
+    );
+    // `/` is never a root; `..` never resolves.
+    assert_eq!(
+        claim_path("/x.rs", Some("/"), &[], &known(&["x.rs"]), false),
+        None
+    );
+    assert_eq!(
+        claim_path("../x.rs", Some("/r/sub"), &[], &known(&["x.rs"]), false),
+        None
+    );
+    assert_eq!(
+        claim_path("./x.rs", None, &[], &known(&[]), false).as_deref(),
+        Some("x.rs")
+    );
+    // The verifying checkout's root is exact, for deletions too.
+    assert_eq!(
+        claim_path(
+            "/ci/repo/a.rs",
+            Some("/elsewhere"),
+            &[Path::new("/ci/repo")],
+            &known(&[]),
+            true
+        )
+        .as_deref(),
+        Some("a.rs")
+    );
+}
+
+#[test]
+fn removals_are_flagged() {
+    let flags = |base: Option<&[u8]>, committed: Option<&[u8]>| {
+        run(&[file("a", base, committed)], &[], &[]).files[0].removes
+    };
+    assert!(!flags(None, Some(b"new\n")));
+    assert!(flags(Some(b"old\n"), None));
+    // A guard removed, a comment added elsewhere: the removal is no line.
+    assert!(flags(Some(b"a\ncheck\nb\n"), Some(b"a\nb\ncomment\n")));
+    // A replacement shows as an unexplained line instead.
+    assert!(!flags(Some(b"a\ncheck\nb\n"), Some(b"a\nCHANGED\nb\n")));
+    assert!(!flags(Some(b"a\n"), Some(b"a\nmore\n")));
+    assert!(flags(Some(b"x\0y"), Some(b"x\0z")));
+}
+
+#[test]
+fn absorbing_file_wise_results_equals_one_pass() {
+    let session = session(vec![write("a", "one\n"), write("b", "two\n")]);
+    let a = [file("a", None, Some(b"one\n"))];
+    let b = [file("b", None, Some(b"HUMAN\n"))];
+    let mut merged = run(&b, &[&session], &[]);
+    merged.absorb(run(&a, &[&session], &[]));
+    let both = [a[0].clone(), b[0].clone()];
+    assert_eq!(merged, run(&both, &[&session], &[]));
+}
+
+#[test]
+fn claimed_lines_missing_from_the_commit_count_as_removal() {
+    // The agent wrote a guard; someone removed it and added a comment.
+    let session = session(vec![write("a", "fn a(){}\nif !ok { return }\nfn b(){}\n")]);
+    let changed = [file("a", None, Some(b"fn a(){}\nfn b(){}\n// note\n"))];
+    let result = run(&changed, &[&session], &[]);
+    assert_eq!(result.files[0].class, Unexplained);
+    assert_eq!(result.files[0].unexplained_lines(), 1);
+    assert!(result.files[0].removes);
+    // A pure insertion keeps every claimed line: no removal.
+    let changed = [file(
+        "a",
+        None,
+        Some(b"fn a(){}\nif !ok { return }\n// note\nfn b(){}\n"),
+    )];
+    assert!(!run(&changed, &[&session], &[]).files[0].removes);
+}
+
+#[test]
+fn backed_oversized_files_weigh_one_line() {
+    let big = "x\n".repeat(LINE_LEVEL_LIMIT);
+    let session = session(vec![write("big", &big)]);
+    let mut backed = file("big", None, Some(big.as_bytes()));
+    backed.added_lines = 1_000_000;
+    let result = run(&[backed.clone()], &[&session], &[]);
+    assert_eq!(result.files[0].class, ReportedOnly);
+    assert_eq!((result.total_changed_lines, result.backed_lines()), (1, 1));
+    // Unexplained, the upper bound applies in full.
+    let result = run(&[backed], &[], &[]);
+    assert_eq!(result.total_changed_lines, 1_000_000);
+    assert_eq!(result.unexplained_lines(), 1_000_000);
+}
+
+#[test]
+fn removals_made_by_the_agent_are_not_reported_as_unobserved() {
+    // The agent removed the guard (claimed), a human appended a line.
+    let session = session(vec![call(
+        "Edit",
+        "a",
+        json!({"old_string": "guard\n", "new_string": ""}),
+        Some(b"a\nb\n"),
+    )]);
+    let changed = [file("a", Some(b"a\nguard\nb\n"), Some(b"a\nb\nc\n"))];
+    let result = run(&changed, &[&session], &[]);
+    assert_eq!(result.files[0].class, Unexplained);
+    assert_eq!(lines(&result.files[0]), [(3, Unexplained)]);
+    assert!(!result.files[0].removes);
 }

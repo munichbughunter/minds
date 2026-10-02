@@ -10,6 +10,14 @@
 //! - `minds verify --evidence <seal-id>` — das Verdikt eines einzelnen Seals,
 //!   auch ohne Session (der Redaction-Block-Fall).
 //!
+//! Im ersten Modus hängt die Coverage-Zeile zusätzlich die **Artefakt-
+//! Coverage** an (EA-02, siehe [`artifact`]): wie viele geänderte Zeilen des
+//! Commits durch Evidenz erklärt sind, gefolgt von den unerklärten Stellen.
+//! Der Commit ist `--commit <rev>`, sonst die aufgelöste Revision, sonst — bei
+//! einer direkt genannten Session — der jüngste Commit mit ihrem Trailer.
+//! `--require-explained <prozent>` macht daraus ein Gate: verfehlt ⇒ Exit 2,
+//! außer das Verdikt ist schon schlechter (das Schlechteste gewinnt, W6).
+//!
 //! # VALID ≠ COMPLETE
 //!
 //! Die zwei Achsen sind getrennte Urteile (ADR-0011, Entscheidung 7):
@@ -36,10 +44,15 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use minds_core::evidence::{Seal, SealOutcome};
-use minds_core::{ContentHash, SessionId};
+use minds_core::{ContentHash, Session, SessionId};
+use minds_git::CommitId;
 use minds_store::{ContextStore, StoreError};
 
 use crate::context::Context;
+
+mod artifact;
+
+use artifact::Artifact;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -88,6 +101,36 @@ impl Verdict {
     }
 }
 
+/// Die Artefakt-Optionen des Verdikt-Modus (EA-02).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ArtifactOptions<'a> {
+    /// `--commit <rev>`: gegen diesen Commit abgleichen.
+    pub commit: Option<&'a str>,
+    /// `--require-explained <prozent>`: das Gate, roh wie übergeben.
+    pub require_explained: Option<&'a str>,
+    /// `--all`: alle Detailzeilen, ungekappt.
+    pub all: bool,
+}
+
+impl ArtifactOptions<'_> {
+    fn any(&self) -> bool {
+        self.commit.is_some() || self.require_explained.is_some() || self.all
+    }
+}
+
+/// Liest `--require-explained`: eine ganze Zahl 0–100.
+fn parse_required(raw: &str) -> Result<u8, String> {
+    // Nur Ziffern: `+50` wäre für `u8::from_str` gültig.
+    let digits = !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit());
+    let parsed = digits.then(|| raw.parse::<u8>().ok()).flatten();
+    parsed.filter(|p| *p <= 100).ok_or_else(|| {
+        format!(
+            "--require-explained expects an integer from 0 to 100, got \"{}\"",
+            crate::text::sanitize(raw)
+        )
+    })
+}
+
 /// Führt `minds verify` aus.
 pub fn run(
     target: Option<&str>,
@@ -95,7 +138,24 @@ pub fn run(
     signers: Option<&str>,
     identity: Option<&str>,
     evidence: Option<&str>,
+    options: ArtifactOptions<'_>,
 ) -> ExitCode {
+    // Die Artefakt-Flags gehören nur zum Verdikt-Modus. Ein Fehlgebrauch ist
+    // ein operativer Fehler (4), nie ein Verdikt — ein CI-Gate, das still
+    // wegfällt, wäre schlimmer als ein lauter Abbruch.
+    if options.any() && (evidence.is_some() || sig.is_some()) {
+        eprintln!(
+            "minds verify: --commit, --require-explained and --all apply only to the evidence verdict (not with --evidence/--sig)"
+        );
+        return ExitCode::from(4);
+    }
+    let required = match options.require_explained.map(parse_required).transpose() {
+        Ok(required) => required,
+        Err(err) => {
+            eprintln!("minds verify: {err}");
+            return ExitCode::from(4);
+        }
+    };
     match (evidence, target, sig) {
         // Ein einzelner Seal, auch ohne Session.
         (Some(seal_id), None, None) => match verify_seal(seal_id, signers, identity) {
@@ -123,7 +183,13 @@ pub fn run(
             }
         },
         // Session-Id oder Revision; ohne Argument gilt HEAD.
-        (None, target, None) => verify_target(target.unwrap_or("HEAD"), signers, identity),
+        (None, target, None) => verify_target(
+            target.unwrap_or("HEAD"),
+            signers,
+            identity,
+            options,
+            required,
+        ),
         (None, None, Some(_)) => {
             eprintln!("minds verify: --sig expects <session-id>");
             ExitCode::FAILURE
@@ -131,30 +197,48 @@ pub fn run(
     }
 }
 
-fn verify_target(target: &str, signers: Option<&str>, identity: Option<&str>) -> ExitCode {
+fn verify_target(
+    target: &str,
+    signers: Option<&str>,
+    identity: Option<&str>,
+    options: ArtifactOptions<'_>,
+    required: Option<u8>,
+) -> ExitCode {
     let ctx = match Context::open() {
         Ok(ctx) => ctx,
         Err(err) => return operational_failure(err.as_ref()),
     };
-    let ids = if let Ok(id) = target.parse::<SessionId>() {
-        vec![id]
+    let (ids, revision) = if let Ok(id) = target.parse::<SessionId>() {
+        (vec![id], None)
     } else {
         match sessions_of_revision(&ctx, target) {
-            Ok(ids) => ids,
+            Ok((commit, ids)) => (ids, Some(commit)),
             Err(err) => return operational_failure(err.as_ref()),
         }
     };
     if ids.is_empty() {
         return Verdict::Unverifiable.exit();
     }
+    let artifact = match artifact_of(&ctx, &options, required, revision, &ids) {
+        Ok(artifact) => artifact,
+        Err(err) => return operational_failure(err.as_ref()),
+    };
 
     let mut worst = Verdict::Verified;
-    let mut failed = false;
+    // Ein gescheiterter Abgleich ist operativ (4) — die Session-Blöcke
+    // stehen trotzdem da, das Integritäts-Urteil soll er nicht verschlucken.
+    let mut failed = match &artifact {
+        ArtifactState::Failed(err) => {
+            eprintln!("minds verify: {err}");
+            true
+        }
+        _ => false,
+    };
     for (i, id) in ids.into_iter().enumerate() {
         if i > 0 {
             println!();
         }
-        match verify_session(&ctx, id, signers, identity) {
+        match verify_session(&ctx, id, signers, identity, &artifact) {
             Ok(verdict) => {
                 if verdict.severity() > worst.severity() {
                     worst = verdict;
@@ -166,14 +250,128 @@ fn verify_target(target: &str, signers: Option<&str>, identity: Option<&str>) ->
             }
         }
     }
+    // Das Gate steht einmal, nach allen Blöcken: Es urteilt über den Commit,
+    // nicht über eine einzelne Session.
+    // `--require-explained 0` verlangt nichts — auch keinen beurteilbaren
+    // Commit.
+    let gate_failed = required.filter(|r| *r > 0).is_some_and(|required| {
+        // Nicht beurteilbar heißt nicht bestanden (fail-closed).
+        let not_assessed = |why: &str| {
+            Some(format!(
+                "Gate           not assessed ({why}) — required {required}%"
+            ))
+        };
+        let line = match &artifact {
+            ArtifactState::Assessed(artifact) => artifact.gate_failure(required),
+            ArtifactState::NoCommit => not_assessed("no linked commit"),
+            ArtifactState::Unavailable(why) => not_assessed(why),
+            ArtifactState::Failed(_) => not_assessed("error"),
+        };
+        line.map(|line| println!("{line}")).is_some()
+    });
     if failed {
         ExitCode::from(4)
+    } else if gate_failed && worst == Verdict::Verified {
+        // Ein verfehltes Gate ist Exit 2 — es maskiert nie 1/3/4 (W6).
+        Verdict::Incomplete.exit()
     } else {
         worst.exit()
     }
 }
 
-fn sessions_of_revision(ctx: &Context, rev: &str) -> Fallible<Vec<SessionId>> {
+/// Was über die Artefakt-Coverage eines Laufs sagbar ist.
+enum ArtifactState {
+    /// Der Commit ist abgeglichen.
+    Assessed(Artifact),
+    /// Kein Commit ist mit der Session verknüpft.
+    NoCommit,
+    /// Nicht bestimmbar, aber kein Fehler: der Elternteil fehlt im Klon
+    /// (Shallow Clone), oder das Gate verlangt einen eindeutigen Commit.
+    Unavailable(&'static str),
+    /// Der Abgleich scheiterte (Git, Store) — schon entschärft.
+    Failed(String),
+}
+
+/// Der Commit, gegen den abgeglichen wird, samt Reconciliation.
+///
+/// Nur eine unauflösbare `--commit`-Revision ist ein sofortiger Fehler (ein
+/// Bedienfehler, wie eine unbekannte Revision als Ziel). Scheitert der
+/// Abgleich selbst, wird das zu [`ArtifactState::Failed`].
+///
+/// Claims stammen nur aus den Sessions `ids`, deren Verdikt dieser Lauf
+/// ausspricht (siehe [`artifact::assess`]).
+fn artifact_of(
+    ctx: &Context,
+    options: &ArtifactOptions<'_>,
+    required: Option<u8>,
+    revision: Option<CommitId>,
+    ids: &[SessionId],
+) -> Fallible<ArtifactState> {
+    let failed = |err: Box<dyn std::error::Error>| {
+        ArtifactState::Failed(crate::text::sanitize(&err.to_string()))
+    };
+    let commit = match (options.commit, revision, ids) {
+        (Some(rev), _, _) => ctx
+            .resolve_rev(rev)
+            .ok_or_else(|| format!("no such revision: {rev}"))?,
+        (None, Some(commit), _) => commit,
+        (None, None, [id]) => match trailer_commits(ctx, *id) {
+            Ok(commits) => match commits[..] {
+                [] => return Ok(ArtifactState::NoCommit),
+                // Ein Gate urteilt nicht über einen geratenen Commit: Wer
+                // einen späteren Commit mit demselben Trailer anlegt, könnte
+                // sonst den Prüfgegenstand wählen.
+                [_, _, ..] if required.is_some_and(|r| r > 0) => {
+                    return Ok(ArtifactState::Unavailable(
+                        "several commits carry this session — pass --commit",
+                    ));
+                }
+                [newest, ..] => newest,
+            },
+            Err(err) => return Ok(failed(err)),
+        },
+        (None, None, _) => return Ok(ArtifactState::NoCommit),
+    };
+    // Gelesen wie im Verdikt-Block; was dort nicht lesbar ist, meldet der
+    // Block selbst — hier trägt es schlicht keine Claims bei.
+    let sessions: Vec<Session> = ids
+        .iter()
+        .filter_map(|id| ctx.store.get(*id).ok().flatten())
+        .collect();
+    let sessions: Vec<&Session> = sessions.iter().collect();
+    // Derselbe Lauf, ungekappt: das Ziel (Revision oder Session) und der
+    // Commit, beides in voller Länge.
+    let target = match (revision, ids) {
+        (Some(revision), _) => revision.to_string(),
+        (None, [id]) => id.to_string(),
+        (None, _) => commit.to_string(),
+    };
+    let rerun = if target == commit.to_string() {
+        format!("minds verify {commit} --all")
+    } else {
+        format!("minds verify {target} --commit {commit} --all")
+    };
+    Ok(
+        match artifact::assess(ctx, commit, &sessions, options.all, rerun) {
+            Ok(Ok(artifact)) => ArtifactState::Assessed(artifact),
+            Ok(Err(why)) => ArtifactState::Unavailable(why),
+            Err(err) => failed(err),
+        },
+    )
+}
+
+/// Die von HEAD erreichbaren Commits, deren **Trailer** diese Session nennt —
+/// die beobachteten Kanten, jüngster (topologisch) zuerst. Die
+/// Store-Index-Kanten zählen hier bewusst nicht: Sie sind vermutet, und eine
+/// Vermutung wählt keinen Prüfgegenstand.
+fn trailer_commits(ctx: &Context, id: SessionId) -> Fallible<Vec<CommitId>> {
+    let Some(head) = ctx.repo.head()?.commit() else {
+        return Ok(Vec::new());
+    };
+    Ok(ctx.repo.commits_with_session(head, id)?)
+}
+
+fn sessions_of_revision(ctx: &Context, rev: &str) -> Fallible<(CommitId, Vec<SessionId>)> {
     // resolve_rev passes one argument after --end-of-options and peels to a commit.
     let commit = ctx
         .resolve_rev(rev)
@@ -197,7 +395,7 @@ fn sessions_of_revision(ctx: &Context, rev: &str) -> Fallible<Vec<SessionId>> {
             &commit.to_string()[..7]
         );
     }
-    Ok(ids)
+    Ok((commit, ids))
 }
 
 /// Der operative Fehlerpfad: Exit **4**, nie 1 — und der Fehlertext läuft
@@ -255,6 +453,7 @@ fn verify_session(
     id: SessionId,
     signers: Option<&str>,
     identity: Option<&str>,
+    artifact: &ArtifactState,
 ) -> Fallible<Verdict> {
     println!("Session        {id}");
 
@@ -415,13 +614,25 @@ fn verify_session(
         s.dedup();
         s
     };
-    let boundary = if scopes.is_empty() {
+    let mut segments = Vec::new();
+    if !scopes.is_empty() {
+        segments.push(format!(
+            "boundary: {} — activity outside it is not captured",
+            scopes.join(", ")
+        ));
+    }
+    if let ArtifactState::Assessed(artifact) = artifact {
+        // Store-Daten: sättigend summieren, nie überlaufen.
+        let gaps = checked
+            .iter()
+            .fold(0u64, |sum, c| sum.saturating_add(c.seal.gaps));
+        segments.push(format!("{gaps} {}", if gaps == 1 { "gap" } else { "gaps" }));
+        segments.push(artifact.coverage_segment());
+    }
+    let boundary = if segments.is_empty() {
         String::new()
     } else {
-        format!(
-            " (boundary: {} — activity outside it is not captured)",
-            scopes.join(", ")
-        )
+        format!(" ({})", segments.join(" · "))
     };
     println!(
         "Coverage       {}{boundary}",
@@ -433,6 +644,16 @@ fn verify_session(
             "incomplete"
         }
     );
+    match artifact {
+        ArtifactState::Assessed(artifact) => {
+            for line in artifact.detail_lines() {
+                println!("{line}");
+            }
+        }
+        ArtifactState::NoCommit => println!("Artifact       not assessed (no linked commit)"),
+        ArtifactState::Unavailable(why) => println!("Artifact       not assessed ({why})"),
+        ArtifactState::Failed(err) => println!("Artifact       not assessed (error: {err})"),
+    }
     let interpretation_note = match interpretation {
         Some((_, 0)) => {
             println!("Interpretation complete");

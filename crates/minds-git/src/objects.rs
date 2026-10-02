@@ -260,7 +260,7 @@ impl Repo {
 /// Erlaubt bleibt alles andere, was Git erlaubt — insbesondere Unicode. Der
 /// Trenner ist immer `/`, auch unter Windows: Das ist Gits Baumformat, nicht
 /// das des Betriebssystems.
-fn validate_path(path: &str) -> Result<()> {
+pub(crate) fn validate_path(path: &str) -> Result<()> {
     let reason = if path.is_empty() {
         Some("empty path")
     } else if path.starts_with('/') || path.ends_with('/') {

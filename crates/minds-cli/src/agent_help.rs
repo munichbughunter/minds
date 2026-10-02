@@ -45,7 +45,7 @@ fn card() -> serde_json::Value {
             {"name": "reinterpret", "usage": "minds reinterpret <session>", "summary": "Reinterpret stored tool calls with the current adapter — strictly read-only, evidence unchanged."},
             {"name": "sign", "usage": "minds sign <session> [--key <path>] | minds sign --seal <seal-id> [--key <path>]", "summary": "Sign a session's attribution (to stdout) or retroactively sign an evidence seal (into the store)."},
             {"name": "seals", "usage": "minds seals [--session <id>] [--limit <n>]", "summary": "List Evidence-Chain seals — id, session, event range, gaps, signature presence; most recent first."},
-            {"name": "verify", "usage": "minds verify [<session|rev>] [--signers <file>] | minds verify <session> --sig <file> | minds verify --evidence <seal-id>", "summary": "Evidence verdict for a session or the sessions linked to a revision (default HEAD); exit: 0 VERIFIED, 1 TAMPERED, 2 VERIFIED, INCOMPLETE, 3 NOT VERIFIABLE, 4 operational failure. Multiple sessions: worst wins (4 > 1 > 3 > 2 > 0). Or check a signed attribution."},
+            {"name": "verify", "usage": "minds verify [<session|rev>] [--signers <file>] [--commit <rev>] [--require-explained <percent>] [--all] | minds verify <session> --sig <file> | minds verify --evidence <seal-id>", "summary": "Evidence verdict for a session or the sessions linked to a revision (default HEAD); exit: 0 VERIFIED, 1 TAMPERED, 2 VERIFIED, INCOMPLETE, 3 NOT VERIFIABLE, 4 operational failure. Multiple sessions: worst wins (4 > 1 > 3 > 2 > 0). The Coverage line adds artifact coverage (explained/changed lines of the commit) and lists unexplained lines (20 max, --all for every line); --require-explained <0-100> is a gate that fails with exit 2 but never masks 1/3/4. Or check a signed attribution."},
             {"name": "review", "usage": "minds review <change-id|session-id> --approve|--reject|--needs-work [--summary <text>] [--sign]", "summary": "Create a verdict as a Git object; --sign turns it into proof."},
             {"name": "reviews", "usage": "minds reviews <subject> [--signers <file>]", "summary": "Verdicts and thread for a change; --signers checks the signatures."},
             {"name": "comment", "usage": "minds comment <subject> [--on <file:line|turn:<n>>] \"<text>\"", "summary": "Attach a remark to the review thread — append-only, mergeable without conflicts."},
@@ -128,5 +128,9 @@ mod tests {
                 .contains("[<session|rev>]")
         );
         assert!(verify["summary"].as_str().unwrap().contains("default HEAD"));
+        // EA-02: die Artefakt-Flags stehen auf der Karte.
+        for flag in ["--commit <rev>", "--require-explained <percent>", "--all"] {
+            assert!(verify["usage"].as_str().unwrap().contains(flag), "{flag}");
+        }
     }
 }

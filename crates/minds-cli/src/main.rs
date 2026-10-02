@@ -177,9 +177,14 @@ Usage:
         many print (applied after sorting).
 
   minds verify [<session|rev>] [--signers <file>] [--identity <id>]
+               [--commit <rev>] [--require-explained <percent>] [--all]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
         Multiple sessions print separate blocks; the worst verdict wins.
+        The Coverage line adds the artifact coverage of the commit (the
+        revision, --commit, or the session's trailer commit) and lists
+        unexplained lines (at most 20 without --all). --require-explained
+        fails with exit 2 below the given percentage (never masks 1/3/4).
         Exit codes: 0 VERIFIED, 1 TAMPERED, 2 \"VERIFIED, INCOMPLETE\",
         3 NOT VERIFIABLE, 4 operational failure (priority: 4 > 1 > 3 > 2 > 0).
   minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
@@ -317,8 +322,15 @@ const SPECS: &[Spec] = &[
     spec("seals", &["--session", "--limit"], &[], 0),
     spec(
         "verify",
-        &["--sig", "--signers", "--identity", "--evidence"],
-        &[],
+        &[
+            "--sig",
+            "--signers",
+            "--identity",
+            "--evidence",
+            "--commit",
+            "--require-explained",
+        ],
+        &["--all"],
         1,
     ),
     spec(
@@ -741,6 +753,11 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--signers"),
             parsed.value("--identity"),
             parsed.value("--evidence"),
+            verify_cmd::ArtifactOptions {
+                commit: parsed.value("--commit"),
+                require_explained: parsed.value("--require-explained"),
+                all: parsed.has("--all"),
+            },
         ),
 
         "render" => render_cmd::run(parsed.value("--out")),

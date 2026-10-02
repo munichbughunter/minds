@@ -217,7 +217,11 @@ pub fn time_key(session: &Session) -> &str {
 /// `git rev-parse` — versteht jede Schreibweise, die selbst zu implementieren
 /// müßig wäre (siehe `show`).
 fn resolve(root: &Path, rev: &str) -> Option<CommitId> {
+    // Wie der Abgleich in `verify`: keine Ersatzobjekte, kein Nachladen.
     let output = Command::new("git")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .args(["-c", "protocol.allow=never"])
+        .arg("--no-replace-objects")
         .arg("-C")
         .arg(root)
         .args([

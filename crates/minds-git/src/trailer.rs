@@ -91,6 +91,45 @@ impl Repo {
     pub fn session_ids_of(&self, commit: CommitId) -> Result<Vec<SessionId>> {
         Ok(Trailer::session_ids(&self.message_of(commit)?))
     }
+
+    /// Die von `head` erreichbaren Commits, deren Trailer `id` nennen —
+    /// jüngster (topologisch) zuerst.
+    ///
+    /// `git rev-list --grep` grenzt nur vor (schnell, auch in langen
+    /// Historien; es trifft auch Erwähnungen im Fließtext), maßgeblich ist
+    /// erst der geparste Trailer jedes Kandidaten. Alle Argumente sind Hex
+    /// bzw. eine geparste Session-Id — nichts Fremdbestimmtes erreicht Git.
+    pub fn commits_with_session(&self, head: CommitId, id: SessionId) -> Result<Vec<CommitId>> {
+        let output = std::process::Command::new("git")
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args(["-c", "protocol.allow=never"])
+            .arg("--no-replace-objects")
+            .arg("--git-dir")
+            .arg(self.git_dir())
+            .args(["rev-list", "--topo-order", "--fixed-strings"])
+            .arg("--regexp-ignore-case")
+            .arg(format!("--grep={id}"))
+            .arg(head.to_string())
+            .output()
+            .map_err(|err| GitError::revwalk(head, err))?;
+        if !output.status.success() {
+            return Err(GitError::revwalk(
+                head,
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            ));
+        }
+        let mut commits = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let commit: CommitId = line
+                .trim()
+                .parse()
+                .map_err(|err| GitError::revwalk(head, format!("{err}")))?;
+            if self.session_ids_of(commit)?.contains(&id) {
+                commits.push(commit);
+            }
+        }
+        Ok(commits)
+    }
 }
 
 #[cfg(test)]
@@ -342,5 +381,24 @@ mod tests {
 
         let err = repo.session_ids_of(missing).unwrap_err();
         assert!(matches!(err, GitError::ReadObject { .. }), "{err}");
+    }
+
+    #[test]
+    fn commits_with_session_trusts_the_trailer_not_the_grep() {
+        let fixture = TempRepo::init();
+        let older = fixture.commit(&format!("feat: a\n\nMinds-Session-Id: {}", id('a')));
+        // Nur erwähnt, kein Trailer: Der Grep trifft, der Parser nicht.
+        fixture.commit(&format!("docs: see {} for context", id('a')));
+        let newer = fixture.commit(&format!("fix: b\n\nMinds-Session-Id: {}", id('a')));
+        let repo = Repo::open(fixture.path()).unwrap();
+        assert_eq!(
+            repo.commits_with_session(newer, id('a')).unwrap(),
+            [newer, older]
+        );
+        assert!(
+            repo.commits_with_session(newer, id('b'))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

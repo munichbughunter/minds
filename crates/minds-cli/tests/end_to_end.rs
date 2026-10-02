@@ -2894,11 +2894,12 @@ fn verify_without_argument_uses_head() {
     assert_eq!(head.stdout, explicit.stdout);
     assert_eq!(head.stderr, explicit.stderr);
 
-    // Repeated trailers still name just one session.
+    // Repeated trailers still name just one session. A session id resolves
+    // to its newest trailer commit — now the new HEAD (EA-02).
     commit_with_sessions(repo.path(), &[&id, &id]);
     assert_eq!(
         minds(repo.path(), &["verify"], None).stdout,
-        explicit.stdout
+        minds(repo.path(), &["verify", &id], None).stdout
     );
 }
 
@@ -2968,7 +2969,10 @@ fn verify_falls_back_to_index_only_without_trailers() {
         .unwrap();
     let out = minds(dir, &["verify"], None);
     assert_eq!(out.status.code(), explicit.status.code());
-    assert_eq!(out.stdout, explicit.stdout);
+    // The session id alone reconciles its trailer commit (EA-02); pinned to
+    // HEAD it prints the same block as the index-only revision lookup.
+    let pinned = minds(dir, &["verify", &id, "--commit", "HEAD"], None);
+    assert_eq!(out.stdout, pinned.stdout);
 
     commit_with_sessions(dir, &[&id]);
     let sha = stdout(&git(dir, &["rev-parse", "HEAD"]));
@@ -2982,7 +2986,7 @@ fn verify_falls_back_to_index_only_without_trailers() {
         .unwrap();
     let out = minds(dir, &["verify"], None);
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(out.stdout, explicit.stdout);
+    assert_eq!(out.stdout, minds(dir, &["verify", &id], None).stdout);
 }
 
 #[test]
@@ -3790,4 +3794,613 @@ fn reinterpret_shows_the_write_time_hash_of_a_captured_write() {
     assert!(current.contains(written), "{text}");
     assert!(current.ends_with("(unchanged)"), "{text}");
     assert!(text.contains("0 with a newer interpretation"), "{text}");
+}
+
+// ---------------------------------------------------------------------------
+// EA-02: Artefakt-Coverage und das `--require-explained`-Gate
+// ---------------------------------------------------------------------------
+
+/// Ein Hook-Event als JSON — mit sauberem Escaping für Dateiinhalte.
+fn hook_json(dir: &Path, mut body: serde_json::Value) {
+    body["session_id"] = "sess-artifact".into();
+    body["cwd"] = dir.display().to_string().into();
+    let out = minds(
+        dir,
+        &["hook", "--agent", "claude-code"],
+        Some(&body.to_string()),
+    );
+    assert!(out.status.success(), "hook endet immer mit 0");
+}
+
+/// Eine Agent-Session, die `writes` über das `Write`-Tool schreibt (Pre- und
+/// PostToolUse, also mit Schreibzeit-Hash). Danach landet `committed` auf der
+/// Platte — weicht es vom Geschriebenen ab, ist das die menschliche Änderung —
+/// und wird committet; der post-commit-Hook setzt den Trailer. Liefert die
+/// Session-Id.
+fn artifact_commit(dir: &Path, writes: &[(&str, &str, &str)]) -> String {
+    use serde_json::json;
+    hook_json(
+        dir,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "write the files"}),
+    );
+    for (i, (path, written, committed)) in writes.iter().enumerate() {
+        let file = dir.join(path);
+        let absolute = file.display().to_string();
+        let input = json!({"file_path": absolute, "content": written});
+        let id = format!("toolu_{i}");
+        hook_json(
+            dir,
+            json!({"hook_event_name": "PreToolUse", "tool_name": "Write",
+                   "tool_input": input, "tool_use_id": id}),
+        );
+        hook_json(
+            dir,
+            json!({"hook_event_name": "PostToolUse", "tool_name": "Write",
+                   "tool_input": input, "tool_use_id": id,
+                   "tool_response": {"type": "create", "filePath": absolute,
+                                     "content": written, "structuredPatch": [],
+                                     "originalFile": null}}),
+        );
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&file, committed).unwrap();
+        git(dir, &["add", path]);
+    }
+    hook_json(dir, json!({"hook_event_name": "Stop"}));
+    assert!(
+        git(dir, &["commit", "-q", "-m", "feat: artifact"])
+            .status
+            .success()
+    );
+    last_session_id(dir)
+}
+
+/// Ein Repo mit eingerichtetem Minds, oder `None` ohne `git`.
+fn enabled_repo() -> Option<tempfile::TempDir> {
+    let repo = scratch_repo()?;
+    let out = minds(repo.path(), &["enable", "--agent", "claude-code"], None);
+    assert!(out.status.success(), "{}", stdout(&out));
+    Some(repo)
+}
+
+/// Die Coverage-Zeile und alle eingerückten Zeilen direkt darunter.
+fn coverage_block(text: &str) -> String {
+    let mut lines = text.lines().skip_while(|l| !l.starts_with("Coverage"));
+    let mut block = vec![
+        lines
+            .next()
+            .unwrap_or_else(|| panic!("keine Coverage:\n{text}")),
+    ];
+    block.extend(lines.take_while(|l| l.starts_with("  ")));
+    block.join("\n")
+}
+
+const BOUNDARY: &str = "boundary: agent-hooks/v1 — activity outside it is not captured";
+
+#[test]
+fn verify_prints_artifact_coverage() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    let id = artifact_commit(
+        dir,
+        &[("a.rs", "fn a() {}\nfn b() {}\n", "fn a() {}\nfn b() {}\n")],
+    );
+
+    let out = minds(dir, &["verify"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(
+        coverage_block(&text),
+        format!(
+            "Coverage       complete within the boundary ({BOUNDARY} · 0 gaps · artifact 2/2 lines explained)"
+        )
+    );
+    // Die direkt genannte Session nimmt ihren Trailer-Commit: derselbe Block.
+    let explicit = minds(dir, &["verify", &id], None);
+    assert_eq!(explicit.stdout, out.stdout);
+    assert_eq!(explicit.status.code(), Some(0));
+}
+
+#[test]
+fn verify_lists_unexplained_ranges() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    artifact_commit(
+        dir,
+        &[
+            (
+                "src/sort/merge.rs",
+                "a1\na2\na3\na4\na5\na6\n",
+                "a1\nH2\na3\nH4\nH5\na6\n",
+            ),
+            ("Cargo.lock", "x\0y", "x\0y"),
+        ],
+    );
+    let out = minds(dir, &["verify"], None);
+    let text = stdout(&out);
+    // Ohne Gate bleibt das Verdikt unberührt.
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert_eq!(
+        coverage_block(&text),
+        format!(
+            "Coverage       complete within the boundary ({BOUNDARY} · 0 gaps · artifact 4/7 lines explained)\n  \
+             unexplained    src/sort/merge.rs:2    not observed in the session\n  \
+             unexplained    src/sort/merge.rs:4-5  not observed in the session\n  \
+             file only      Cargo.lock             line level unavailable (binary)"
+        )
+    );
+    // `--commit` nennt denselben Commit ausdrücklich — dieselbe Ausgabe.
+    let pinned = minds(dir, &["verify", "--commit", "HEAD"], None);
+    assert_eq!(pinned.stdout, out.stdout);
+}
+
+#[test]
+fn verify_detail_lines_are_capped() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    let written: String = (1..=50).map(|i| format!("agent {i}\n")).collect();
+    // Jede zweite Zeile von Hand geändert: 25 einzelne, getrennte Stellen.
+    let committed: String = (1..=50)
+        .map(|i| {
+            if i % 2 == 0 {
+                format!("human {i}\n")
+            } else {
+                format!("agent {i}\n")
+            }
+        })
+        .collect();
+    artifact_commit(dir, &[("big.rs", &written, &committed)]);
+    let sha = stdout(&git(dir, &["rev-parse", "HEAD"]));
+
+    let capped = stdout(&minds(dir, &["verify"], None));
+    let block = coverage_block(&capped);
+    let details: Vec<&str> = block.lines().skip(1).collect();
+    assert_eq!(details.len(), 21, "{block}");
+    assert_eq!(
+        details[0],
+        "  unexplained    big.rs:2   not observed in the session"
+    );
+    assert_eq!(
+        details[20],
+        format!("  … 5 more (minds verify {} --all)", sha.trim())
+    );
+    // Der Hinweis wiederholt genau diesen Abgleich, ungekappt.
+    let rerun = stdout(&minds(dir, &["verify", sha.trim(), "--all"], None));
+    assert_eq!(coverage_block(&rerun).lines().count(), 26);
+    assert!(block.contains("artifact 25/50 lines explained"), "{block}");
+
+    let all = stdout(&minds(dir, &["verify", "--all"], None));
+    let block = coverage_block(&all);
+    let details: Vec<&str> = block.lines().skip(1).collect();
+    assert_eq!(details.len(), 25, "{block}");
+    assert!(!block.contains("more ("), "{block}");
+    assert!(details[24].contains("big.rs:50"), "{block}");
+}
+
+#[test]
+fn verify_require_explained_gate() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    let agent = artifact_commit(dir, &[("a.rs", "one\ntwo\n", "one\ntwo\n")]);
+    let out = minds(dir, &["verify", "--require-explained", "100"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    assert!(!stdout(&out).contains("Gate"), "{}", stdout(&out));
+
+    // Menschliche Zeile: 2 von 3 erklärt.
+    artifact_commit(dir, &[("b.rs", "three\nfour\n", "three\nHUMAN\nfour\n")]);
+    let out = minds(dir, &["verify", "--require-explained", "100"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("Overall        VERIFIED\n"), "{text}");
+    assert!(
+        text.ends_with("Gate           explained 66% < required 100%\n"),
+        "{text}"
+    );
+    let out = minds(dir, &["verify", "--require-explained", "66"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+    // Das ältere, reine Agent-Commit besteht weiterhin — über --commit, mit
+    // seiner Session als Ziel: Claims zählen nur aus geprüften Sessions.
+    let out = minds(
+        dir,
+        &[
+            "verify",
+            &agent,
+            "--commit",
+            "HEAD~1",
+            "--require-explained",
+            "100",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+
+    // Fehlgebrauch ist operativ (4), nie ein Verdikt.
+    for args in [
+        &["verify", "--require-explained", "101"][..],
+        &["verify", "--require-explained", "+50"],
+        &["verify", "--require-explained", "x\u{1b}[31m"],
+        &["verify", "--commit", "no-such-rev"],
+        &["verify", "--evidence", "b3-00", "--all"],
+    ] {
+        let out = minds(dir, args, None);
+        assert_eq!(out.status.code(), Some(4), "{args:?}");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains('\u{1b}'));
+    }
+
+    // Ohne Trailer-Commit ist nichts beurteilbar — und das Gate fällt
+    // (fail-closed), ohne das Verdikt zu ändern.
+    // Eine neue, unverbundene Historie: Kein erreichbarer Commit trägt den
+    // Trailer der Session mehr.
+    assert!(
+        git(dir, &["checkout", "-q", "--orphan", "fresh"])
+            .status
+            .success()
+    );
+    commit_with_sessions(dir, &[]);
+    let out = minds(dir, &["verify", &agent], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        text.contains("Artifact       not assessed (no linked commit)\n"),
+        "{text}"
+    );
+    let out = minds(dir, &["verify", &agent, "--require-explained", "1"], None);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(
+        stdout(&out).ends_with("Gate           not assessed (no linked commit) — required 1%\n"),
+        "{}",
+        stdout(&out)
+    );
+    // 0 % verlangt nichts, auch keinen Commit.
+    let out = minds(dir, &["verify", &agent, "--require-explained", "0"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
+}
+
+#[test]
+fn verify_gate_never_masks_tampered() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    artifact_commit(dir, &[("b.rs", "one\n", "HUMAN\n")]);
+    let gated = minds(dir, &["verify", "--require-explained", "100"], None);
+    assert_eq!(gated.status.code(), Some(2), "{}", stdout(&gated));
+
+    // Die gespeicherten Seal-Bytes unter ihrer alten Id verändern.
+    let seals = seal_refs(dir);
+    let original = seal_text(dir, &seals[0]);
+    let events = seal_line(&original, "events");
+    let forged = original.replacen(&format!("events={events}"), "events=999", 1);
+    assert_ne!(forged, original);
+    let blob = stdout(&git_stdin(dir, &["hash-object", "-w", "--stdin"], &forged));
+    let tree = stdout(&git_stdin(
+        dir,
+        &["mktree"],
+        &format!("100644 blob {}\tseal\n", blob.trim()),
+    ));
+    let commit = stdout(&git(dir, &["commit-tree", tree.trim(), "-m", "forged"]));
+    assert!(
+        git(dir, &["update-ref", &seals[0], commit.trim()])
+            .status
+            .success()
+    );
+    let out = minds(dir, &["verify", "--require-explained", "100"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("Gate           explained 0% < required 100%"),
+        "{text}"
+    );
+}
+
+/// Review-Regressionen (EA-02): Weder eine ungeprüfte Index-Session noch
+/// gewichtslose Änderungen (Löschung, `-diff`-Großdatei) bringen ein Gate
+/// durch.
+#[test]
+fn verify_gate_resists_unverified_claims_and_weightless_changes() {
+    use minds_store::ContextStore;
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    // b.rs schreibt ein Mensch, im selben Commit wie die Agent-Datei a.rs.
+    let human = "hello world\nsecond line\n";
+    std::fs::write(dir.join("b.rs"), human).unwrap();
+    git(dir, &["add", "b.rs"]);
+    let s1 = artifact_commit(dir, &[("a.rs", "agent\n", "agent\n")]);
+    let sha = stdout(&git(dir, &["rev-parse", "HEAD"]));
+
+    // Eine untergeschobene, nie versiegelte Session behauptet b.rs — mit dem
+    // passenden Schreibzeit-Hash (blake3 von `human`) — und hängt nur über
+    // den Store-Index am Commit.
+    let mut forged = minds_core::Session::new(
+        minds_core::Agent {
+            name: "claude-code".into(),
+            version: "x".into(),
+        },
+        minds_core::Model {
+            provider: "x".into(),
+            id: "x".into(),
+        },
+        minds_core::Intent {
+            request: "forged".into(),
+            ..Default::default()
+        },
+    );
+    forged.turns.push(minds_core::Turn {
+        role: minds_core::Role::Assistant,
+        text: String::new(),
+        parent: None,
+        at: None,
+        tool_calls: vec![minds_core::ToolCall {
+            name: "Write".into(),
+            arguments: serde_json::json!({"file_path": "b.rs", "content": human}).to_string(),
+            capture: None,
+            effect: Some(minds_core::Effect {
+                kind: minds_core::EffectKind::Write,
+                path: Some("b.rs".into()),
+                content: None,
+                written: Some(
+                    "b3-94803d2ead501d00c5434080fc6f831289846cdfe4e33ee03e3a29576f8f22ac"
+                        .parse()
+                        .unwrap(),
+                ),
+                written_unavailable: None,
+            }),
+        }],
+    });
+    let redacted = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_session(forged)
+        .unwrap();
+    let store = minds_store::InRepoStore::open(dir).unwrap();
+    let s2 = store.put(&redacted).unwrap().id();
+    store
+        .link(s2, sha.trim(), minds_core::Evidence::Observed.into())
+        .unwrap();
+
+    let out = minds(dir, &["verify", "--require-explained", "100"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("artifact 1/3 lines explained"), "{text}");
+    assert!(!text.contains(&s2.to_string()), "{text}");
+
+    // Nur eine Zeile entfernt, von Hand: 0 geänderte Zeilen, aber unerklärt.
+    std::fs::write(dir.join("a.rs"), "").unwrap();
+    git(dir, &["add", "a.rs"]);
+    commit_with_sessions(dir, &[&s1]);
+    let out = minds(dir, &["verify", "--require-explained", "100"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("artifact 0/0 lines explained"), "{text}");
+    assert!(
+        text.ends_with(
+            "Gate           1 unexplained change(s) beyond added lines — required 100%\n"
+        ),
+        "{text}"
+    );
+
+    // Eine Großdatei, die `.gitattributes` als `-diff` markiert: Gits
+    // numstat sagte „0 Zeilen"; gezählt wird trotzdem jede Zeile.
+    std::fs::write(dir.join(".gitattributes"), "big.txt -diff\n").unwrap();
+    std::fs::write(dir.join("big.txt"), "x=1;\n".repeat(700_000)).unwrap();
+    git(dir, &["add", ".gitattributes", "big.txt"]);
+    commit_with_sessions(dir, &[&s1]);
+    let out = minds(dir, &["verify", "--require-explained", "1"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    // 700 000 Zeilen big.txt plus die eine Zeile .gitattributes.
+    assert!(text.contains("artifact 0/700001 lines explained"), "{text}");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with("  unexplained    big.txt ")
+                && l.ends_with("not observed in the session; line level unavailable (too large)")),
+        "{text}"
+    );
+}
+
+/// Ein Klon an anderem Ort erklärt dieselben Zeilen (das `cwd` der Session
+/// buchstabiert die Wurzel zur Erfassungszeit); ein Shallow Clone ohne
+/// Elternteil ist ein Zustand, kein operativer Fehler.
+#[test]
+fn verify_artifact_outside_the_capture_checkout() {
+    let Some(repo) = enabled_repo() else { return };
+    let src = repo.path();
+    commit_with_sessions(src, &[]);
+    artifact_commit(src, &[("a.rs", "one\ntwo\n", "one\ntwo\n")]);
+    let elsewhere = tempfile::tempdir().unwrap();
+    let source = format!("file://{}", src.display());
+
+    git(src, &["config", "uploadpack.allowFilter", "true"]);
+    let cases = [
+        ("full", None, None),
+        (
+            "shallow",
+            Some("--depth=1"),
+            Some("first parent not in this clone (shallow)"),
+        ),
+        (
+            "blobless",
+            Some("--filter=blob:none"),
+            Some("blob not in this clone (partial)"),
+        ),
+        (
+            "treeless",
+            Some("--filter=tree:0"),
+            Some("blob not in this clone (partial)"),
+        ),
+    ];
+    for (name, option, unavailable) in cases {
+        let dst = elsewhere.path().join(name);
+        // Ohne Checkout: Der lüde in Partial Clones die Blobs nach.
+        let mut args = vec!["clone", "-q", "--no-checkout"];
+        args.extend(option);
+        args.extend([source.as_str(), dst.to_str().unwrap()]);
+        assert!(git(elsewhere.path(), &args).status.success(), "{name}");
+        // Die Evidence-Refs vollständig, auch im Partial Clone.
+        let fetch = [
+            "fetch",
+            "-q",
+            "--no-filter",
+            "origin",
+            "refs/minds/*:refs/minds/*",
+        ];
+        assert!(git(&dst, &fetch).status.success(), "{name}");
+        let out = minds(&dst, &["verify"], None);
+        let text = stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{name}: {text}");
+        let gated = minds(&dst, &["verify", "--require-explained", "100"], None);
+        match unavailable {
+            None => {
+                assert!(text.contains("artifact 2/2 lines explained"), "{text}");
+                assert_eq!(gated.status.code(), Some(0), "{}", stdout(&gated));
+            }
+            Some(why) => {
+                assert!(
+                    text.contains(&format!("Artifact       not assessed ({why})\n")),
+                    "{name}: {text}"
+                );
+                assert_eq!(gated.status.code(), Some(2), "{}", stdout(&gated));
+            }
+        }
+    }
+}
+
+/// Scheitert der Abgleich (hier: ein fehlendes Blob-Objekt), stehen die
+/// Session-Blöcke trotzdem da — das Ergebnis ist operativ (4).
+#[test]
+fn verify_artifact_failure_keeps_the_blocks() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    artifact_commit(dir, &[("a.rs", "one\n", "one\n")]);
+    let blob = stdout(&git(dir, &["rev-parse", "HEAD:a.rs"]));
+    let blob = blob.trim();
+    let loose = dir.join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    if std::fs::remove_file(&loose).is_err() {
+        eprintln!("Blob nicht lose abgelegt — Test übersprungen");
+        return;
+    }
+    let out = minds(dir, &["verify"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(4), "{text}");
+    assert!(text.starts_with("Session        "), "{text}");
+    assert!(
+        text.contains("Artifact       not assessed (error: "),
+        "{text}"
+    );
+    assert!(text.contains("Overall        VERIFIED"), "{text}");
+    assert!(!String::from_utf8_lossy(&out.stderr).is_empty());
+}
+
+/// Review-Regressionen (EA-02, Iteration 2): entfernte Zeilen neben einer
+/// neuen, Modus-Wechsel, Submodul-Zeiger und mehrdeutige Trailer-Commits.
+#[test]
+fn verify_gate_sees_removals_submodules_modes_and_ambiguity() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    let base: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+    let s1 = artifact_commit(dir, &[("auth.rs", &base, &base)]);
+    let ok = minds(dir, &["verify", "--require-explained", "100"], None);
+    assert_eq!(ok.status.code(), Some(0), "{}", stdout(&ok));
+
+    // Ein Mensch entfernt eine Prüfung (Zeilen 5–7) und fügt einen
+    // Kommentar an: Die Entfernung fällt das Gate auch bei 1 %.
+    let mut lines: Vec<String> = base.lines().map(|l| format!("{l}\n")).collect();
+    lines.drain(4..7);
+    lines.push("// tidy\n".into());
+    std::fs::write(dir.join("auth.rs"), lines.concat()).unwrap();
+    git(dir, &["add", "auth.rs"]);
+    commit_with_sessions(dir, &[&s1]);
+    let out = minds(dir, &["verify", "--require-explained", "1"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("  unexplained    auth.rs     removed lines not observed in the session\n"),
+        "{text}"
+    );
+
+    // Modus-Wechsel ohne Inhaltsänderung.
+    git(dir, &["update-index", "--chmod=+x", "auth.rs"]);
+    commit_with_sessions(dir, &[&s1]);
+    let out = minds(dir, &["verify", "--require-explained", "1"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("artifact 0/0 lines explained"), "{text}");
+    assert!(
+        text.contains("  unexplained    auth.rs  mode change not observed in the session\n"),
+        "{text}"
+    );
+
+    // Ein Submodul-Zeiger (Gitlink) — ohne Blob, aber eine Änderung.
+    let head = stdout(&git(dir, &["rev-parse", "HEAD"]));
+    let out = git(
+        dir,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},vendor/crypto", head.trim()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    commit_with_sessions(dir, &[&s1]);
+    let out = minds(dir, &["verify", "--require-explained", "1"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(
+            "  unexplained    vendor/crypto  submodule pointer not observed in the session\n"
+        ),
+        "{text}"
+    );
+
+    // `.gitmodules` mit `ignore = all` blendet den Zeiger für `git diff`
+    // aus — für den Abgleich nie.
+    std::fs::write(
+        dir.join(".gitmodules"),
+        "[submodule \"crypto\"]\n\tpath = vendor/crypto\n\turl = ./crypto\n\tignore = all\n",
+    )
+    .unwrap();
+    git(dir, &["add", ".gitmodules"]);
+    commit_with_sessions(dir, &[]);
+    let base = stdout(&git(dir, &["rev-parse", "HEAD~1"]));
+    let out = git(
+        dir,
+        &[
+            "update-index",
+            "--cacheinfo",
+            &format!("160000,{},vendor/crypto", base.trim()),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    commit_with_sessions(dir, &[&s1]);
+    let out = minds(dir, &["verify", "--require-explained", "1"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(
+            "  unexplained    vendor/crypto  submodule pointer not observed in the session\n"
+        ),
+        "{text}"
+    );
+
+    // s1 trägt jetzt mehrere Trailer-Commits: ohne Gate der jüngste, mit
+    // Gate kein geratener Prüfgegenstand.
+    let out = minds(dir, &["verify", &s1], None);
+    assert!(stdout(&out).contains("vendor/crypto"), "{}", stdout(&out));
+    let out = minds(dir, &["verify", &s1, "--require-explained", "1"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains(
+            "Artifact       not assessed (several commits carry this session — pass --commit)\n"
+        ),
+        "{text}"
+    );
 }
