@@ -19,6 +19,20 @@ use std::process::Command;
 use crate::oid::CommitId;
 use crate::{GitError, Repo, Result};
 
+/// Pure line diff: zero-based ranges added in `after`, including replacements.
+/// Uses Myers with Git's indentation heuristics, as does [`Repo::diff_commit`].
+/// Line terminators are significant, including a missing final newline. Callers
+/// processing untrusted blobs should bound their size before calling this.
+pub fn added_line_ranges(before: &[u8], after: &[u8]) -> Vec<std::ops::Range<u32>> {
+    use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
+    let input = InternedInput::new(before, after);
+    diff_with_slider_heuristics(Algorithm::Myers, &input)
+        .hunks()
+        .filter(|hunk| !hunk.after.is_empty())
+        .map(|hunk| hunk.after)
+        .collect()
+}
+
 /// Wie eine Diff-Zeile zu lesen ist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffKind {
@@ -86,6 +100,8 @@ impl Repo {
             .arg("-p") // Patch-Format
             .arg("-r") // in Unterbäume absteigen
             .arg("--no-color")
+            .arg("--diff-algorithm=myers")
+            .arg("--indent-heuristic")
             .arg("--unified=3")
             .arg(commit.to_string())
             .output()
@@ -232,6 +248,52 @@ fn hunk_starts(rest: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pure_line_diff_matches_commit_diff() {
+        let cases = [
+            ("", "new\nfile\n"),
+            ("a\nb\nc\n", "a\nB\nc\n"),
+            ("a\nb\n", "insert\na\nb\n"),
+            ("a\nb\nc\n", "a\nc\n"),
+            ("end\n", "end"),
+            ("a\r\nb\r\n", "a\nb\r\n"),
+            ("same\nsame\nend\n", "same\nend\n"),
+            ("a\n\nb\n\nc\n", "a\n\nb\n\nb\n\nc\n"),
+            (
+                "fn a() {\n    a();\n}\n",
+                "fn a() {\n    b();\n    a();\n}\n",
+            ),
+            ("old\n", ""),
+        ];
+        let fixture = crate::fixture::TempRepo::init();
+        for (index, (before, _)) in cases.iter().enumerate() {
+            fixture.write_file(&format!("{index}.txt"), before);
+        }
+        fixture.commit("base");
+        for (index, (_, after)) in cases.iter().enumerate() {
+            fixture.write_file(&format!("{index}.txt"), after);
+        }
+        let commit = fixture.commit("changes");
+        let repo = crate::Repo::open(fixture.path()).unwrap();
+        let diff = repo.diff_commit(commit).unwrap();
+        for (index, (before, after)) in cases.iter().enumerate() {
+            let path = format!("{index}.txt");
+            let file = diff.files.iter().find(|f| f.path == path).unwrap();
+            let git: Vec<_> = file
+                .lines
+                .iter()
+                .filter(|line| line.kind == super::DiffKind::Added)
+                .map(|line| line.new.unwrap())
+                .collect();
+            let pure: Vec<_> = super::added_line_ranges(before.as_bytes(), after.as_bytes())
+                .into_iter()
+                .flatten()
+                .map(|line| line + 1)
+                .collect();
+            assert_eq!(pure, git, "{path}");
+        }
+    }
+
     use super::*;
 
     #[test]

@@ -74,7 +74,7 @@ mod time;
 
 pub use amend::TrailerUpdate;
 pub use blame::{AutoBlame, BlameLine, BlameProvider, GixBlame, ShellBlame};
-pub use diff::{CommitDiff, DiffFile, DiffKind, DiffLine};
+pub use diff::{CommitDiff, DiffFile, DiffKind, DiffLine, added_line_ranges};
 pub use error::{GitError, Result, Source};
 pub use head::Head;
 pub use oid::{BlobId, CommitId, CommitIdParseError, TreeId};
