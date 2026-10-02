@@ -442,6 +442,25 @@ mod tests {
                 "unbelegtes M5-Feld {key:?} darf nicht serialisiert werden"
             );
         }
+
+        // EA-01a: Ein Effekt ohne Schreibzeit-Hash serialisiert wie zuvor —
+        // sonst bekaeme jede bestehende Session mit Effekten eine neue Id.
+        let mut with_effect = sample();
+        with_effect.turns[1].tool_calls[0].effect = Some(Effect {
+            kind: EffectKind::Write,
+            path: Some("src/retry.rs".into()),
+            content: None,
+            written: None,
+            written_unavailable: None,
+        });
+        let json = crate::to_canonical_string(&with_effect).unwrap();
+        for key in ["written", "written_unavailable", "content"] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "unbelegtes EA-01a-Feld {key:?} darf nicht serialisiert werden"
+            );
+        }
+        assert!(json.contains("\"effect\""));
     }
 
     #[test]
@@ -481,6 +500,8 @@ mod tests {
             kind: EffectKind::Read,
             path: Some("src/retry.rs".into()),
             content: Some(ContentHash::from_bytes([7u8; 32])),
+            written: None,
+            written_unavailable: None,
         });
 
         let json = serde_json::to_string(&s).unwrap();

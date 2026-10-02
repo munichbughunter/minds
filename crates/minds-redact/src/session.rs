@@ -560,7 +560,26 @@ impl RedactionPipeline {
                     effect,
                     capture,
                 } = call;
-                let effect = self.redact_effect(effect, turn_index, call_index, &mut audit)?;
+                // `arguments` zuerst: Ob die Redaction hier etwas entfernt
+                // hat, entscheidet gleich ueber den Schreibzeit-Hash des
+                // Effekts (siehe `redact_effect`).
+                let sites_before = audit.sites.len();
+                let arguments = self.redact_field(
+                    Field::ToolCallArguments {
+                        turn: turn_index,
+                        call: call_index,
+                    },
+                    arguments,
+                    &mut audit,
+                )?;
+                let arguments_redacted = audit.sites.len() > sites_before;
+                let effect = self.redact_effect(
+                    effect,
+                    turn_index,
+                    call_index,
+                    arguments_redacted,
+                    &mut audit,
+                )?;
                 // `capture.adapter` ist unser eigenes Vokabular („claude-code",
                 // „generic") — aber die Ausnahmeliste bleibt leer (siehe
                 // Modul-Doku): gescannt wird jeder Text, auch dieser.
@@ -597,14 +616,7 @@ impl RedactionPipeline {
                         name,
                         &mut audit,
                     )?,
-                    arguments: self.redact_field(
-                        Field::ToolCallArguments {
-                            turn: turn_index,
-                            call: call_index,
-                        },
-                        arguments,
-                        &mut audit,
-                    )?,
+                    arguments,
                 });
             }
 
@@ -708,6 +720,25 @@ impl RedactionPipeline {
     /// Redigiert wird nur der Pfad, der bei absoluten Angaben einen
     /// Benutzernamen enthalten kann.
     ///
+    /// # Beide Hashes einer Schreibung fallen weg, wenn `arguments` getroffen wurden
+    ///
+    /// Bei einem `Write` sind die `arguments` das verbatim `tool_input`
+    /// samt Inhalt — und `written` wie `content` sind der ungesalzene Hash
+    /// genau dieses Inhalts vor der Redaction (`content` von der Platte, meist
+    /// byte-gleich). Stünden sie daneben, hätte ein Leser das redigierte
+    /// Template plus den Hash des Klartexts: ein Wörterbuch-Orakel für die
+    /// entfernte Stelle (kurze Passwörter, E-Mail-Adressen, Namen). Deshalb,
+    /// fail-closed: Hat die Redaction in den `arguments` dieses Aufrufs etwas
+    /// entfernt, werden bei einem Schreib-Effekt beide Hashes verworfen und
+    /// der Grund
+    /// ([`WrittenUnavailable::RedactedContent`](minds_core::WrittenUnavailable::RedactedContent))
+    /// gesetzt.
+    ///
+    /// Das ist die zweite Linie. Die erste steht im Checkpoint: Dort werden
+    /// die Bytes selbst gescannt, bevor sie gehasht werden — auch die, die
+    /// nie in `arguments` stehen (das Original eines `Edit`, das Notebook
+    /// nach `NotebookEdit`).
+    ///
     /// # `content` ist die einzige ungescannte Zeichenkette im Envelope
     ///
     /// Und sie ist es **wegen ihres Typs**, nicht wegen ihres Inhalts: Hier
@@ -727,12 +758,15 @@ impl RedactionPipeline {
         effect: Option<Effect>,
         turn: usize,
         call: usize,
+        arguments_redacted: bool,
         audit: &mut RedactionAudit,
     ) -> Result<Option<Effect>, RedactionError> {
         let Some(Effect {
             kind,
             path,
             content,
+            written,
+            written_unavailable,
         }) = effect
         else {
             return Ok(None);
@@ -741,10 +775,22 @@ impl RedactionPipeline {
             Some(path) => Some(self.redact_field(Field::EffectPath { turn, call }, path, audit)?),
             None => None,
         };
+        // `written` ist wie `content` ein [`ContentHash`](minds_core::ContentHash)
+        // und aus demselben Grund ungescannt: Der Typ erzwingt 64 Hex-Zeichen.
+        // `written_unavailable` ist ein geschlossenes Enum ohne Freitext.
+        let hit = arguments_redacted && kind == minds_core::EffectKind::Write;
+        let content = if hit { None } else { content };
+        let (written, written_unavailable) = if hit && written.is_some() {
+            (None, Some(minds_core::WrittenUnavailable::RedactedContent))
+        } else {
+            (written, written_unavailable)
+        };
         Ok(Some(Effect {
             kind,
             path,
             content,
+            written,
+            written_unavailable,
         }))
     }
 
@@ -1328,6 +1374,87 @@ mod tests {
     }
 
     #[test]
+    fn a_written_hash_is_dropped_when_the_arguments_were_redacted() {
+        // MUST_NOT_FINGERPRINT: Der Inhalt eines Write traegt ein Secret. Die
+        // `arguments` werden redigiert — und der ungesalzene Hash des
+        // Klartexts darf nicht daneben stehen bleiben (Woerterbuch-Orakel).
+        use minds_core::{ContentHash, EffectKind, WrittenUnavailable};
+
+        let hash = ContentHash::from_bytes([7u8; 32]);
+        let mut s = session();
+        let mut turn = user_turn("schreib die Konfiguration");
+        turn.tool_calls.push(ToolCall {
+            capture: None,
+            name: "Write".into(),
+            arguments: r#"{"file_path":"src/config.rs","content":"token = \"ghp_012345678901234567890123456789012345\"\n"}"#.into(),
+            effect: Some(Effect {
+                kind: EffectKind::Write,
+                path: Some("src/config.rs".into()),
+                content: Some(hash.clone()),
+                written: Some(hash.clone()),
+                written_unavailable: None,
+            }),
+        });
+        // Derselbe Aufruf ohne Treffer: Der Hash bleibt.
+        turn.tool_calls.push(ToolCall {
+            capture: None,
+            name: "Write".into(),
+            arguments: r#"{"file_path":"src/lib.rs","content":"fn main() {}\n"}"#.into(),
+            effect: Some(Effect {
+                kind: EffectKind::Write,
+                path: Some("src/lib.rs".into()),
+                content: None,
+                written: Some(hash.clone()),
+                written_unavailable: None,
+            }),
+        });
+        s.turns.push(turn);
+
+        let out = pipeline().redact_session(s).unwrap();
+        let calls = &out.session().turns[0].tool_calls;
+        assert!(!calls[0].arguments.contains("ghp_012345"));
+        let hit = calls[0].effect.as_ref().unwrap();
+        assert_eq!(hit.written, None, "Hash neben dem redigierten Template");
+        assert_eq!(
+            hit.written_unavailable,
+            Some(WrittenUnavailable::RedactedContent)
+        );
+        // Und `content` ebenso: meist byte-gleich mit `written`, also
+        // dasselbe Orakel unter anderem Namen.
+        assert_eq!(hit.content, None, "Platten-Hash neben dem Template");
+        let clean = calls[1].effect.as_ref().unwrap();
+        assert_eq!(clean.written, Some(hash));
+        assert_eq!(clean.written_unavailable, None);
+    }
+
+    #[test]
+    fn the_written_unavailable_vocabulary_is_a_fixpoint_of_the_pipeline() {
+        // MUST_SURVIVE: Die kanonische Textform enthaelt `secret` — genau die
+        // Klasse, die `minds_secret_file_reason` einmal getroffen hat. Ein
+        // kuenftiger Freitext-Renderer darf sie nicht verlieren.
+        use minds_core::WrittenUnavailable;
+        let pipeline = pipeline();
+        for reason in [
+            WrittenUnavailable::SecretFile,
+            WrittenUnavailable::OutsideRepo,
+            WrittenUnavailable::PayloadWithoutContent,
+            WrittenUnavailable::ReconstructionFailed,
+            WrittenUnavailable::RedactedContent,
+            WrittenUnavailable::Unscanned,
+            WrittenUnavailable::UserModified,
+        ] {
+            for text in [
+                format!("\"written_unavailable\":\"{}\"", reason.as_str()),
+                format!(" · written unavailable ({})", reason.as_str()),
+            ] {
+                let out = pipeline.redact(&text);
+                assert_eq!(out.text, text, "kein Fixpunkt mehr");
+                assert_eq!(out.counts, minds_core::RedactionCounts::default());
+            }
+        }
+    }
+
+    #[test]
     fn a_secret_in_an_effect_path_is_removed_and_located() {
         use minds_core::EffectKind;
 
@@ -1341,6 +1468,8 @@ mod tests {
                 kind: EffectKind::Write,
                 path: Some("/tmp/ghp_012345678901234567890123456789012345/out.rs".into()),
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         });
         s.turns.push(turn);

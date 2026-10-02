@@ -421,7 +421,22 @@ fn assistant_blocks(content: Option<&serde_json::Value>) -> (String, Vec<ToolCal
                 // den Pfad, nie den Inhalt, und einen Artefakt-Hash bildet der
                 // Import ohnehin nicht (`claude_effect` setzt `content: None`).
                 let raw = effective.and_then(|i| RawValue::from_string(i.to_string()).ok());
-                let effect = normalize::claude_effect(&name, raw.as_deref());
+                let mut effect = normalize::claude_effect(&name, raw.as_deref());
+                // Der Import sieht `tool_use`-Bloecke, nie den PostToolUse-
+                // Payload mit dem Ergebnis: Einen Schreibzeit-Hash gibt es
+                // hier nicht, und der Grund steht dabei, damit eine
+                // Import-Session nicht als „v2 ohne Aussage" gelesen wird.
+                if effect.kind == EffectKind::Write {
+                    let secret = effect
+                        .path
+                        .as_deref()
+                        .is_some_and(minds_redact::is_secret_file);
+                    effect.written_unavailable = Some(if secret {
+                        minds_core::WrittenUnavailable::SecretFile
+                    } else {
+                        minds_core::WrittenUnavailable::PayloadWithoutContent
+                    });
+                }
                 let status = if normalize::claude_tool_is_interpreted(&name) {
                     minds_core::CaptureStatus::Interpreted
                 } else {

@@ -514,6 +514,9 @@ fn store_one(
         root: Some(root),
         commit: None,
         tracked,
+        // Dieselbe Policy, die gleich die Session redigiert, prüft vorher die
+        // Bytes hinter jedem Schreib-Hash (EA-01a).
+        redaction: Some(pipeline),
     };
     let session = adapter::checkpoint(key, events, &ctx);
     let redacted = pipeline.redact_session(session)?;

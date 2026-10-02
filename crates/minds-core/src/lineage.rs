@@ -424,8 +424,101 @@ pub struct Effect {
     ///   gehasht (die Read-Grenze, Phase 6): getrackter Inhalt ist für jeden
     ///   Repo-Leser ohnehin sichtbar, sein Hash verrät nichts Neues — alles
     ///   Private bleibt beim bloßen Lesen fingerabdruck-frei.
+    /// - **Schreib**-Effekte werden nur gehasht, wenn die Redaction in den
+    ///   Bytes nichts findet (EA-01a) — und der Hash fällt nachträglich weg,
+    ///   wenn die Redaction die `arguments` desselben Aufrufs trifft. Sonst
+    ///   stünde neben dem redigierten Text der ungesalzene Hash seines
+    ///   Klartexts: ein Wörterbuch-Orakel für die entfernte Stelle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<ContentHash>,
+
+    /// blake3 der Bytes, die das Tool laut beobachtetem Payload geschrieben
+    /// hat — zum **Schreibzeitpunkt**, nicht zum Checkpoint-Zeitpunkt.
+    ///
+    /// `content` fingert die Datei, wie sie beim Checkpoint auf der Platte
+    /// lag. Zwischen dem Schreiben des Agenten und dem Commit kann ein Mensch
+    /// die Datei angefasst haben; `content` hasht dann die menschliche
+    /// Fassung als wäre sie die des Agenten. `written` entsteht dagegen
+    /// **ausschließlich** aus dem beobachteten Tool-Payload (Schreib-Inhalt,
+    /// bzw. Original plus angewandte Ersetzung) und berührt die Platte nie.
+    /// `content ≠ written` heißt: Da lag etwas dazwischen.
+    ///
+    /// Nur für Schreib-Effekte, nur wo der Payload den Inhalt trägt. Dieselben
+    /// fail-closed-Regeln wie bei `content`: nie für eine Zugangsdaten-Datei,
+    /// nie für einen Pfad außerhalb des Repos, nie für Bytes, in denen die
+    /// Redaction etwas findet — und nachträglich keiner, wenn sie die
+    /// `arguments` desselben Aufrufs trifft
+    /// ([`WrittenUnavailable::RedactedContent`]).
+    ///
+    /// Eingaben der Ableitung: Payload, Adapter-Version, Redaction-Policy und
+    /// Repo-Wurzel — und der Zustand des Dateisystems beim Checkpoint, soweit
+    /// die Repo-Grenze Symlinks über **Verzeichnisse** auflöst (die Datei
+    /// selbst wird nie gelesen). Additiv und hash-stabil — eine Session ohne
+    /// `written` serialisiert byte-identisch wie zuvor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written: Option<ContentHash>,
+
+    /// Warum `written` fehlt, wenn es fehlt — eine Interpretation, kein
+    /// Beweis. Nur gesetzt, wenn der Adapter den Effekt als Schreibung
+    /// gedeutet und die Ableitung bewusst unterlassen hat (auch der
+    /// Transkript-Import setzt ihn: dort gibt es kein Post-Event), oder wenn
+    /// die Redaction den Hash nachträglich verworfen hat. Ein Schreib-Effekt
+    /// ohne beides ist eine Legacy-Deutung (Adapter v1), die `written` noch
+    /// nicht kannte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_unavailable: Option<WrittenUnavailable>,
+}
+
+/// Warum ein Schreib-Effekt keinen Schreibzeit-Hash ([`Effect::written`])
+/// trägt.
+///
+/// Die Menge ist geschlossen im Sinne des Schemas; `rename_all = "kebab-case"`
+/// gibt die kanonische Textform vor. Ein Enum statt eines Freitexts, damit
+/// hier nie etwas landen kann, das die Redaction scannen müsste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WrittenUnavailable {
+    /// Der Pfad trifft die Secretfile-Mauer: Kein Hash, kein Orakel — der
+    /// Payload wurde gar nicht erst angesehen.
+    SecretFile,
+    /// Der Pfad liegt außerhalb der Repo-Wurzel (absolut außerhalb, `..`,
+    /// oder die Wurzel war unbekannt).
+    OutsideRepo,
+    /// Der Payload trägt den geschriebenen Inhalt nicht (Tool ohne Inhalt im
+    /// Payload, fehlendes Post-Event, unbekannte Payload-Form).
+    PayloadWithoutContent,
+    /// Der Payload trägt Original und Ersetzung, aber die Rekonstruktion
+    /// des Ergebnisses schlug fehl (Suchtext nicht gefunden, Zeilenenden, die
+    /// das Tool anders behandelt als wir sicher wissen, Ergebnis über der
+    /// Größenschranke, Widerspruch zum `structuredPatch` des Tools).
+    ReconstructionFailed,
+    /// Die Redaction hat in den geschriebenen Bytes etwas gefunden, oder in
+    /// den `arguments` desselben Aufrufs etwas entfernt — ein Hash könnte den
+    /// entfernten Klartext bestätigen (siehe [`Effect::written`]).
+    RedactedContent,
+    /// Der Checkpoint hatte keine Redaction-Policy, gegen die die Bytes
+    /// geprüft werden konnten. Ungeprüft gibt es keinen Hash.
+    Unscanned,
+    /// Der Payload meldet, dass der Nutzer den Vorschlag vor dem Übernehmen
+    /// geändert hat (`userModified`) — welche Bytes geschrieben wurden, sagt
+    /// er dann nicht verlässlich.
+    UserModified,
+}
+
+impl WrittenUnavailable {
+    /// Die kanonische Textform — dieselbe wie im JSON (`kebab-case`), damit
+    /// CLI und Envelope ein Vokabular sprechen.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SecretFile => "secret-file",
+            Self::OutsideRepo => "outside-repo",
+            Self::PayloadWithoutContent => "payload-without-content",
+            Self::ReconstructionFailed => "reconstruction-failed",
+            Self::RedactedContent => "redacted-content",
+            Self::Unscanned => "unscanned",
+            Self::UserModified => "user-modified",
+        }
+    }
 }
 
 /// Art eines [`Effect`].
@@ -624,6 +717,71 @@ mod tests {
         assert!(json.starts_with("\"b3-"));
         let back: ContentHash = serde_json::from_str(&json).unwrap();
         assert_eq!(h, back);
+    }
+
+    #[test]
+    fn written_unavailable_has_a_frozen_kebab_case_form() {
+        // Golden: die Textform ist Schema. `as_str` und serde muessen dasselbe
+        // sagen, sonst sprechen CLI und Envelope zwei Vokabulare.
+        let cases = [
+            (WrittenUnavailable::SecretFile, "secret-file"),
+            (WrittenUnavailable::OutsideRepo, "outside-repo"),
+            (
+                WrittenUnavailable::PayloadWithoutContent,
+                "payload-without-content",
+            ),
+            (
+                WrittenUnavailable::ReconstructionFailed,
+                "reconstruction-failed",
+            ),
+            (WrittenUnavailable::RedactedContent, "redacted-content"),
+            (WrittenUnavailable::Unscanned, "unscanned"),
+            (WrittenUnavailable::UserModified, "user-modified"),
+        ];
+        for (value, text) in cases {
+            assert_eq!(value.as_str(), text);
+            assert_eq!(
+                serde_json::to_string(&value).unwrap(),
+                format!("\"{text}\"")
+            );
+            let back: WrittenUnavailable = serde_json::from_str(&format!("\"{text}\"")).unwrap();
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn an_effect_with_written_roundtrips_and_a_legacy_effect_reads_without_it() {
+        let effect = Effect {
+            kind: EffectKind::Write,
+            path: Some("a.rs".into()),
+            content: Some(ContentHash::from_bytes([1u8; 32])),
+            written: Some(ContentHash::from_bytes([2u8; 32])),
+            written_unavailable: None,
+        };
+        let json = serde_json::to_string(&effect).unwrap();
+        assert!(json.contains("\"written\":\"b3-0202"));
+        assert!(!json.contains("written_unavailable"));
+        let back: Effect = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, effect);
+
+        // Legacy (v1-Deutung): kein Schluessel, keine Annahme.
+        let legacy: Effect = serde_json::from_str(r#"{"kind":"write","path":"a.rs"}"#).unwrap();
+        assert_eq!(legacy.written, None);
+        assert_eq!(legacy.written_unavailable, None);
+
+        // Ein Grund statt eines Hashes.
+        let unavailable: Effect =
+            serde_json::from_str(r#"{"kind":"write","written_unavailable":"secret-file"}"#)
+                .unwrap();
+        assert_eq!(
+            unavailable.written_unavailable,
+            Some(WrittenUnavailable::SecretFile)
+        );
+        // Freitext ist kein Grund.
+        assert!(
+            serde_json::from_str::<Effect>(r#"{"kind":"write","written_unavailable":"weil"}"#)
+                .is_err()
+        );
     }
 
     #[test]

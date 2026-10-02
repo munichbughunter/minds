@@ -253,6 +253,8 @@ mod tests {
                 kind,
                 path: Some(path.into()),
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         }
     }

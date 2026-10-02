@@ -1230,6 +1230,8 @@ mod tests {
                         kind: EffectKind::Exec,
                         path: None,
                         content: None,
+                        written: None,
+                        written_unavailable: None,
                     }),
                 },
                 ToolCall {
@@ -1240,6 +1242,8 @@ mod tests {
                         kind: EffectKind::Write,
                         path: Some("src/retry.rs".into()),
                         content: None,
+                        written: None,
+                        written_unavailable: None,
                     }),
                 },
             ],

@@ -259,6 +259,8 @@ mod tests {
                 kind,
                 path: None,
                 content: None,
+                written: None,
+                written_unavailable: None,
             }),
         }
     }

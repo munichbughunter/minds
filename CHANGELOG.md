@@ -19,29 +19,40 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **`minds blame --lines <file>`** — the git-blame-shaped view: one annotated
-  row per source line instead of the summary per session. Each row carries the
-  short session id, the agent name, the line number, and the source text at
-  `HEAD`, in file order; columns align to the widest value in that output, and
-  a line without captured context shows `-` in both attribution columns. The
-  default output of `minds blame` is unchanged, and both views share the same
-  line→commit→session attribution — including the tie-break at a commit with
-  several sessions, so they can never disagree on who owns a line. Purely
-  derived: it reads committed history and stored sessions, writes nothing.
+- **Write-time content hash (EA-01a).** Every interpreted write effect of a
+  Claude Code session now carries `effect.written`: the blake3 of the bytes
+  the tool wrote according to the observed `PostToolUse` payload, taken at
+  write time rather than from the worktree at checkpoint. `effect.content`
+  keeps its meaning. Where the hash is absent, `effect.written_unavailable`
+  names the reason (`secret-file`, `outside-repo`, `payload-without-content`,
+  `reconstruction-failed`, `redacted-content`, `unscanned`, `user-modified`).
+  Both fields are additive: sessions without them serialize byte-identically,
+  existing session ids are unchanged. Claude adapter version 1 → 2;
+  `minds reinterpret` shows the stored hash and carries it over unchanged (it
+  cannot be recomputed without the journal payload). Payload shapes are
+  recorded fixtures from Claude Code 2.1.282, not guesses. An `Edit` is
+  reconstructed from the original plus the applied replacement and must agree
+  with the tool's `structuredPatch`; otherwise no hash.
 
 ### Changed
 
-- **`minds inspect` keeps the session list in view.** On a terminal at least
-  120 columns wide the list stays in a left column and the right column shows
-  the graph of the session under the cursor — live, no `Enter` needed. `Enter`,
-  `w` and `e` still open Graph, Why and Evidence as before, now beside the list
-  instead of over it; `Esc` walks back exactly as it did. The list column takes
-  about 40 % of the width and picks its columns from what fits: the SEAL
-  column — the tampering verdict — is always there, the review VERDICT and the
-  SIZE columns come back as the terminal grows. Narrower terminals keep the
-  single full-width pane. Each agent name now carries its own fixed color in
-  the AGENT column; the name is always printed beside it, so a monochrome
-  terminal loses nothing.
+- **Write hashes are only formed over bytes the redaction policy finds
+  clean.** Before hashing, the checkpoint scans exactly the bytes behind
+  `written` and behind the `content` of a write effect; any finding means no
+  hash. This closes a dictionary oracle for secrets in written files — also
+  for bytes that never reach the envelope, such as the original of an `Edit`.
+  With the strict default policy this drops the hashes of many ordinary
+  source files (identifier assignments trip the heuristic), so fewer content
+  handovers appear in the evidence DAG. See ADR-0011, decision 9.
+- **Redaction drops both hashes of a write where it redacted the call's
+  arguments** — the second line behind the scan.
+
+### Fixed
+
+- **`minds reinterpret` no longer reports every hashed file as
+  reinterpreted.** The stored `content` hash (and now `written`) is checkpoint
+  evidence, not a repeatable interpretation; it is carried over into the
+  current interpretation instead of being compared against an empty one.
 
 ## [0.4.0] — 2026-09-10 — "The Tampering Gets a Name"
 

@@ -86,7 +86,25 @@ fn reinterpret(target: &str) -> Fallible<()> {
 
             let current = adapter.and_then(|a| a.interpret_stored(&call.name, &call.arguments));
             match current {
-                Some(now) => {
+                Some(mut now) => {
+                    // Beide Hashes sind Beweismittel des Checkpoints und keine
+                    // wiederholbare Deutung: `content` stammt von der Platte
+                    // beim Checkpoint, `written` aus dem PostToolUse-Payload —
+                    // beides liegt nicht mehr vor. Sie werden übernommen,
+                    // nicht neu gerechnet, und zählen nicht als Änderung.
+                    // Nur bei gleicher Wirkung am selben Pfad: Deutet der
+                    // Adapter heute etwas anderes, gehört der alte Hash nicht
+                    // zur neuen Deutung — sonst stünde „dieselben Bytes an P"
+                    // an einem Pfad, an dem sie nie beobachtet wurden.
+                    if let Some(stored) = &call.effect {
+                        if now.effect.kind == stored.kind && now.effect.path == stored.path {
+                            now.effect.content = stored.content.clone();
+                            if stored.kind == EffectKind::Write {
+                                now.effect.written = stored.written.clone();
+                                now.effect.written_unavailable = stored.written_unavailable;
+                            }
+                        }
+                    }
                     let same = call.effect.as_ref() == Some(&now.effect)
                         && call.capture.as_ref().map(|c| c.status) == Some(now.status);
                     if !same {
@@ -152,10 +170,18 @@ fn effect_line(status: CaptureStatus, effect: Option<&minds_core::Effect>) -> St
                 EffectKind::Delete => "DELETE",
                 EffectKind::Other => "TOOL",
             };
-            match &effect.path {
+            let mut line = match &effect.path {
                 Some(path) => format!("{word} {}", sanitize_path(path)),
                 None => word.to_string(),
+            };
+            // Der Schreibzeit-Hash, wo der Adapter ihn abgeleitet hat — oder
+            // der Grund, warum nicht. Legacy-Deutungen (v1) zeigen nichts.
+            if let Some(written) = &effect.written {
+                line.push_str(&format!(" · written {written}"));
+            } else if let Some(reason) = effect.written_unavailable {
+                line.push_str(&format!(" · written unavailable ({})", reason.as_str()));
             }
+            line
         }
         None => "TOOL (no effect)".to_string(),
     }

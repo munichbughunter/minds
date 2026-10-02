@@ -255,6 +255,30 @@ salted against. The secret-file exception is unchanged). None of this is stored:
 time, deterministically sorted. These edges are the first place that produces
 `(ContentDerived, Verified)` — not observed, not claimed, but **recomputed**.
 
+**Amendment (EA-01a): write hashes are scanned before they exist.** A write effect now
+carries two fingerprints: `content` (the file on disk at checkpoint) and `written` (the
+bytes the tool wrote, from the observed payload). Both are unsalted, and both would be a
+dictionary oracle if the hashed bytes contained a secret. Two lines of defence, both
+fail-closed:
+
+1. At checkpoint, the repository's redaction policy scans exactly the bytes that would be
+   hashed — for `written` including bytes that never appear in the stored `arguments`
+   (the original of an `Edit`, the notebook after `NotebookEdit`). Any finding: no hash.
+   No policy: no write hash at all (`written_unavailable: unscanned`).
+2. In the redaction stage, if the call's `arguments` were redacted, both hashes of a write
+   effect are dropped (`written_unavailable: redacted-content`).
+
+The price is deliberate: the strict default policy flags many ordinary source files
+(identifier assignments such as `session_id: …` trip the assignment heuristic — roughly
+half of this repository's own sources). Those writes carry neither hash, so fewer
+content handovers can be projected. Missing evidence is a gap; a confirmable secret is a
+leak. Read hashes are not scanned: they stay inside the tracked boundary above.
+
+Named limit: the repo boundary for `written` is lexical, with directory symlinks resolved
+only as a second chance. A lexically inside path that leads outside through a symlink
+inside the repository is treated as inside; for secret-shaped content the scan covers it,
+for other content it does not.
+
 ## Decision 10: Proof bundles — and why there is no `full` (phase 7)
 
 `minds audit --export --mode proof` exports only the proof scaffold (ids, canonical
