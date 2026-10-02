@@ -1,0 +1,48 @@
+# EA-S2: host variables are required; see docs/spikes/ea-s2-container-profile.md.
+# MINDS_WORKSPACE_NAME must equal the host workspace directory's basename.
+services:
+  agent:
+    build:
+      context: .
+      args:
+        AGENT_UID: "${MINDS_HOST_UID:?Set MINDS_HOST_UID to id -u (non-root)}"
+        AGENT_GID: "${MINDS_HOST_GID:?Set MINDS_HOST_GID to id -g}"
+        CLAUDE_CODE_VERSION: "${MINDS_CLAUDE_CODE_VERSION:-stable}"
+      dockerfile_inline: |
+        FROM debian:bookworm-slim
+        ARG AGENT_UID
+        ARG AGENT_GID
+        ARG CLAUDE_CODE_VERSION
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            bash ca-certificates curl git socat \
+            && rm -rf /var/lib/apt/lists/*
+        RUN test "$$AGENT_UID" -gt 0 \
+            && groupadd --non-unique --gid "$$AGENT_GID" agent \
+            && useradd --uid "$$AGENT_UID" --gid agent --create-home --shell /bin/bash agent
+        USER agent
+        WORKDIR /home/agent
+        RUN curl -fsSL https://claude.ai/install.sh -o /tmp/install-claude.sh \
+            && bash /tmp/install-claude.sh "$$CLAUDE_CODE_VERSION" \
+            && rm /tmp/install-claude.sh
+        ENV PATH="/home/agent/.local/bin:$$PATH"
+        ENV DISABLE_AUTOUPDATER=1
+        RUN claude --version
+    user: agent
+    working_dir: "/workspaces/${MINDS_WORKSPACE_NAME:?Set MINDS_WORKSPACE_NAME}"
+    command: ["sleep", "infinity"]
+    init: true
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      MINDS_WITNESS_SOCKET: /run/minds-witness/witness.sock
+    volumes:
+      - type: bind
+        source: "${MINDS_WORKSPACE_ROOT:?Set MINDS_WORKSPACE_ROOT to the canonical host repo path}"
+        target: "/workspaces/${MINDS_WORKSPACE_NAME:?Set MINDS_WORKSPACE_NAME}"
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${MINDS_WITNESS_HOME:?Set MINDS_WITNESS_HOME to the host-only state directory}/run"
+        target: /run/minds-witness
+        bind:
+          create_host_path: false

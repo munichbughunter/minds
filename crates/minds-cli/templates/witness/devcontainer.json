@@ -1,0 +1,10 @@
+{
+  "name": "Minds witness agent",
+  "dockerComposeFile": "compose.yaml",
+  "service": "agent",
+  "workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+  "remoteUser": "agent",
+  "updateRemoteUserUID": false,
+  "overrideCommand": false,
+  "shutdownAction": "stopCompose"
+}
