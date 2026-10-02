@@ -280,8 +280,8 @@ fn two_agents_in_one_journal() {
     assert_eq!(sessions[1].agent.name, "codex");
     assert_eq!(sessions[1].intent.request, "review den Plan");
 
-    // codex hat (noch) keinen Normalisierer — der Prompt wird trotzdem erfasst,
-    // weil das Feld agent-unabhängig heißt; das Journal verliert nichts.
+    // Der Prompt ist agent-unabhängig erfasst, unabhängig davon, ob ein
+    // Adapter registriert ist — das Journal verliert nichts.
     assert_eq!(sessions[1].lineage.as_ref().unwrap().local_id, "x1");
 }
 
@@ -296,16 +296,16 @@ fn a_foreign_agents_tool_call_survives_as_uninterpreted() {
 
     feed(
         &journal,
-        "codex",
+        "some-other-agent",
         None,
         r#"{"session_id":"x2","hook_event_name":"UserPromptSubmit","prompt":"wende den Patch an"}"#,
         0,
     );
     let tool_payload = r#"{"session_id":"x2","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_input":{"diff":"--- a/x"}}"#;
-    feed(&journal, "codex", None, tool_payload, 1);
+    feed(&journal, "some-other-agent", None, tool_payload, 1);
     feed(
         &journal,
-        "codex",
+        "some-other-agent",
         None,
         r#"{"session_id":"x2","hook_event_name":"Stop"}"#,
         2,
@@ -313,7 +313,7 @@ fn a_foreign_agents_tool_call_survives_as_uninterpreted() {
 
     let sessions = adapter::build(&journal).unwrap();
     let session = &sessions[0];
-    assert_eq!(session.agent.name, "codex");
+    assert_eq!(session.agent.name, "some-other-agent");
 
     // Vor ADR-0011 entstand hier GAR KEIN ToolCall — stiller Verlust, denn
     // das Journal wird nach dem Checkpoint geloescht. Jetzt: beobachtet,

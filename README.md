@@ -87,7 +87,8 @@ calls, and re-run `minds enable` after moving the binary.
 | Agent | Status |
 |---|---|
 | Claude Code | complete — prompt, tool calls, files, model, tokens |
-| Codex, Cursor, Gemini, opencode | hooks register, prompt is captured; tool calls are stored as raw evidence, not yet interpreted |
+| Codex | prompt and file/shell tool calls (`apply_patch`, shell) interpreted; other tool calls stored as raw evidence |
+| Cursor, Gemini, opencode | hooks register, prompt is captured; tool calls are stored as raw evidence, not yet interpreted |
 
 Intent: one agent done right rather than four done halfway. Which agent gets
 full support next follows what users actually run — [tell us what you

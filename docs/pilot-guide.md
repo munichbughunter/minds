@@ -59,6 +59,7 @@ it takes; the rest happens in the background.
 minds show                    # the session behind the last commit
 minds why <file>:<line>       # the session behind a single line
 minds blame <file>            # which session is behind which lines
+minds blame --lines <file>    # one annotated row per source line
 ```
 
 **Overview and search:**
@@ -101,9 +102,10 @@ Deliberate decisions, not gaps in the test plan:
   flag exists, but as a pipeline gate it will only be recommended once exit
   codes and error chains are dependable.
 - **`minds sync` across multiple machines** as a scenario of its own.
-- **Other agents** (Gemini, Codex, Cursor, opencode): the prompt is
-  captured, the tool and file level is not yet interpreted. The pilot runs
-  on Claude Code.
+- **Other agents.** Codex now interprets its file/shell calls (`apply_patch`,
+  shell) the same as Claude Code; Gemini, Cursor and opencode still only
+  capture the prompt, not the tool and file level. The pilot itself runs on
+  Claude Code regardless.
 - **Multi-agent scenarios.**
 
 ## 5. When nothing shows up

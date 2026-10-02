@@ -45,13 +45,22 @@ minds why src/lib.rs:42
 ### minds blame
 
 ```
-minds blame <file>
+minds blame [--lines] <file>
 ```
 
-Shows which session is behind which lines of a file, aggregated per session, with context coverage as a percentage.
+Shows which session is behind which lines of a file, aggregated per session, with context coverage as a percentage. `--lines` prints one annotated row per source line instead — short session id, agent name, line number, and the source text, in file order; lines without captured context carry a `-` in both attribution columns.
 
 ```
 minds blame crates/minds-core/src/evidence.rs
+minds blame --lines src/retry.rs
+```
+
+```
+src/retry.rs — 3 lines, 1 with captured context (33%)
+
+-                -            1  fn retry() {
+b3-a1b2c3d4e5f6  claude-code  2      backoff(3);
+-                -            3  }
 ```
 
 ### minds recap
@@ -84,7 +93,7 @@ minds search "retry backoff"
 minds inspect [<query> | <file>:<line>]
 ```
 
-Shows how a change came to be, in the terminal: a session list, the graph of a session (intent → agent → effects → change → review), and the why-chain of a line. Strictly read-only. When stdout is not a terminal, lines are emitted tab-separated for `grep`/`fzf`.
+Shows how a change came to be, in the terminal: a session list, the graph of a session (intent → agent → effects → change → review), and the why-chain of a line. On a terminal at least 120 columns wide the list stays in a left column and the graph of the session under the cursor is previewed on the right; `Enter`, `w` and `e` open Graph, Why and Evidence beside the list. Strictly read-only. When stdout is not a terminal, lines are emitted tab-separated for `grep`/`fzf`.
 
 ```
 minds inspect src/main.rs:10
@@ -191,6 +200,18 @@ minds stack --base origin/main
 ```
 
 ## Evidence & compliance
+
+### minds seals
+
+```
+minds seals [--session <id>] [--limit <n>]
+```
+
+Lists Evidence-Chain seals — id, linked session (if any), event range, gap/signature status, timestamp — so a seal id becomes something you discover, not something you must already know before `verify --evidence` or `sign --seal`. Most recent first; `--session` scopes to one session's seals, `--limit` caps how many print (applied after sorting). A tampered or unreadable seal is reported inline and does not hide the rest of the list.
+
+```
+minds seals --session b3a1f0e --limit 5
+```
 
 ### minds verify
 

@@ -259,9 +259,47 @@ impl ToolAdapter for ClaudeAdapter {
     }
 }
 
+/// Versionsstand der Codex-Deutung. Bump bei jeder Änderung an
+/// [`codex_effect`] oder der Diff-Pfad-Extraktion (ADR-0011: Deutung ist
+/// wiederholbar, eine gespeicherte Deutung bleibt ihrem Stand zuordenbar).
+pub const CODEX_ADAPTER_VERSION: u32 = 1;
+
+/// Der Codex-Adapter.
+pub struct CodexAdapter;
+
+impl ToolAdapter for CodexAdapter {
+    fn agent(&self) -> &'static str {
+        "codex"
+    }
+
+    fn version(&self) -> u32 {
+        CODEX_ADAPTER_VERSION
+    }
+
+    fn tool_facts(&self, event: &JournalEvent) -> Option<ToolFacts> {
+        parse::<Tool>(event).and_then(codex_tool)
+    }
+
+    fn interpret_stored(&self, name: &str, arguments: &str) -> Option<StoredInterpretation> {
+        let raw = RawValue::from_string(arguments.to_string()).ok();
+        let effect = codex_effect(name, raw.as_deref());
+        let status = if codex_tool_is_interpreted(name) {
+            CaptureStatus::Interpreted
+        } else {
+            CaptureStatus::Uninterpreted
+        };
+        Some(StoredInterpretation {
+            effect,
+            status,
+            adapter: "codex",
+            adapter_version: CODEX_ADAPTER_VERSION,
+        })
+    }
+}
+
 /// Die Registry: ein Adapter je Agent. Wer hier fehlt, bekommt den
 /// generischen Fallback — beobachtet, nicht gedeutet, nie Stille.
-const ADAPTERS: &[&dyn ToolAdapter] = &[&ClaudeAdapter];
+const ADAPTERS: &[&dyn ToolAdapter] = &[&ClaudeAdapter, &CodexAdapter];
 
 /// Der Adapter für einen Agenten, falls es einen gibt.
 pub fn adapter_for(agent: &str) -> Option<&'static dyn ToolAdapter> {
@@ -869,10 +907,15 @@ mod tests {
     #[test]
     fn the_registry_resolves_known_agents_and_only_those() {
         assert!(adapter_for("claude-code").is_some());
-        assert!(adapter_for("codex").is_none());
+        assert!(adapter_for("codex").is_some());
+        assert!(adapter_for("some-future-agent").is_none());
         assert_eq!(
             adapter_for("claude-code").unwrap().version(),
             CLAUDE_ADAPTER_VERSION
+        );
+        assert_eq!(
+            adapter_for("codex").unwrap().version(),
+            CODEX_ADAPTER_VERSION
         );
     }
 

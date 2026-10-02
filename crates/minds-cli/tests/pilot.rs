@@ -244,6 +244,51 @@ fn blame_names_the_session_behind_each_line() {
         "{shown}"
     );
     assert!(shown.contains("▸ "), "keine Session benannt: {shown}");
+    assert!(
+        shown.contains("  3 line(s) · claude-code · "),
+        "Rumpfzeile der Aggregation verändert: {shown}"
+    );
+    // Die Vorgabe-Ansicht bleibt die Aggregation: Der Quelltext gehört in die
+    // `--lines`-Ansicht und darf hier nicht auftauchen.
+    assert!(
+        !shown.contains("fn greet()"),
+        "Quelltext im Überblick: {shown}"
+    );
+}
+
+#[test]
+fn blame_lines_annotates_every_source_line() {
+    let Some(dir) = captured_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = dir.path();
+
+    let out = minds(dir, &["blame", "--lines", "greet.rs"], None);
+    assert!(out.status.success(), "{}", text(&out));
+    let shown = stdout(&out);
+
+    // Die Kurz-Id steht nicht im Test — sie entsteht aus der erfassten
+    // Session. Alles andere schon: Der Vergleich ist vollständig, damit auch
+    // eine verrutschte Spalte rot wird und nicht nur eine fehlende Zeile.
+    let first_row = shown.lines().nth(2).unwrap_or_default();
+    let id = first_row
+        .split_whitespace()
+        .next()
+        .expect("die erste Zeile trägt eine Kurz-Id");
+    assert!(id.starts_with("b3-"), "keine Session-Id: {shown}");
+
+    let expected = format!(
+        "greet.rs — 3 lines, 3 with captured context (100%)\n\
+         \n\
+         {id}  claude-code  1  fn greet() {{\n\
+         {id}  claude-code  2      println!(\"hallo\");\n\
+         {id}  claude-code  3  }}\n"
+    );
+    assert_eq!(shown, expected);
+    // Was ohne Kontext ist, stünde je Zeile — die Schlusszeile der
+    // Aggregation gehört hier bewusst nicht hin.
+    assert!(!shown.contains("without captured context"), "{shown}");
 }
 
 #[test]
