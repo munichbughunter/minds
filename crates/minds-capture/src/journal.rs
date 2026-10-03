@@ -390,9 +390,14 @@ impl Journal {
     /// Legt nichts an — das passiert erst beim ersten [`append`](Self::append).
     /// Ein Hook, der nichts zu schreiben hat, hinterlässt keine Spur.
     pub fn open(git_dir: &Path) -> Self {
-        Self {
-            root: git_dir.join(JOURNAL_DIR),
-        }
+        Self::at(git_dir.join(JOURNAL_DIR))
+    }
+
+    /// Öffnet das Journal direkt an `root`, unabhängig vom Git-Verzeichnis.
+    /// Legt nichts an; beim Schreiben gelten dieselben 0700/0600- und
+    /// Symlink-Prüfungen wie bei [`open`](Self::open).
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
     /// Sucht von `start` aufwärts ein `.git` und öffnet das Journal darin.
@@ -1180,6 +1185,68 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8], op: &'static str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_at_arbitrary_root_hardens_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("evidence/inbox");
+        let j = Journal::at(&root);
+        assert_eq!(j.root(), root);
+        assert!(!root.exists(), "opening remains lazy");
+        let key = SessionKey::new("claude-code", "arbitrary-root").unwrap();
+        j.append(&key, event(EventKind::Prompt)).unwrap();
+
+        let dir = j.session_dir(&key);
+        for path in [&root, &root.join(key.agent()), &dir] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        // Existing directories are hardened again on the next write.
+        j.append(&key, event(EventKind::TurnEnd)).unwrap();
+        for path in [&root, &root.join(key.agent()), &dir] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        for entry in fs::read_dir(&dir).unwrap() {
+            assert_eq!(
+                entry.unwrap().metadata().unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(j.sessions().unwrap().keys, vec![key.clone()]);
+        assert_eq!(j.read(&key).unwrap().events.len(), 2);
+        j.discard(&key).unwrap();
+        assert!(j.sessions().unwrap().keys.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_at_symlinked_root_refuses_to_write() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::set_permissions(target.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let root = tmp.path().join("inbox");
+        symlink(target.path(), &root).unwrap();
+        let j = Journal::at(root);
+        let key = SessionKey::new("claude-code", "symlink").unwrap();
+        let err = j.append(&key, event(EventKind::Prompt)).unwrap_err();
+        assert!(err.to_string().contains("symlink"));
+        assert!(fs::read_dir(target.path()).unwrap().next().is_none());
+        assert_eq!(
+            fs::metadata(target.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 
     fn raw(s: &str) -> Box<RawValue> {
         RawValue::from_string(s.to_string()).unwrap()

@@ -1,0 +1,13 @@
+minds-seal-v1
+root=b3-e996e664b53a3c6ccd08c7a11b03be93f38410a543d3cad6cd708af008f6d598
+agent=claude-code
+scope=agent-hooks/v1
+first_seq=0
+last_seq=1
+events=2
+gaps=0
+pre_chain=0
+outcome=stored
+session=b3-5e95f00822b7819c561eb980b4c13b68ff7b7974fc0e68f4cd38d2836970578a
+previous=-
+last_event_at=2026-01-01T00:00:01Z

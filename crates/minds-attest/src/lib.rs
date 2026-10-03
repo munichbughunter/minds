@@ -61,6 +61,12 @@ pub fn ssh_keygen_available() -> bool {
 /// Signiert `payload` mit dem SSH-Schlüssel unter `key` und gibt die armierte
 /// Signatur zurück.
 pub fn ssh_sign(payload: &str, key: &Path) -> Result<String, AttestError> {
+    ssh_sign_ns(payload, key, NAMESPACE)
+}
+
+/// Signiert `payload` im angegebenen SSH-Namespace. Der Namespace trennt
+/// Signaturen verschiedener Verwendungszwecke kryptographisch voneinander.
+pub fn ssh_sign_ns(payload: &str, key: &Path, namespace: &str) -> Result<String, AttestError> {
     let dir = private_tempdir()?;
     let data = dir.path().join("payload");
     write_private(&data, payload.as_bytes())?;
@@ -68,7 +74,7 @@ pub fn ssh_sign(payload: &str, key: &Path) -> Result<String, AttestError> {
     // im selben privaten Verzeichnis, das mit dem TempDir-Drop verschwindet.
     let sig = dir.path().join("payload.sig");
     let output = Command::new("ssh-keygen")
-        .args(["-Y", "sign", "-n", NAMESPACE, "-f"])
+        .args(["-Y", "sign", "-n", namespace, "-f"])
         .arg(key)
         .arg(&data)
         .stdin(Stdio::null()) // ein passphrasegeschützter Schlüssel scheitert, statt zu hängen
@@ -198,6 +204,49 @@ mod tests {
         // hier hängen (lokal sichtbar, im CI als Timeout). Terminieren ist der
         // Beweis.
         let _ = ssh_keygen_available();
+    }
+
+    #[test]
+    fn explicit_namespace_is_bound_into_the_signature() {
+        if !ssh_keygen_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-t", "ed25519", "-N", "", "-q", "-f"])
+                .arg(&key)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let payload = "fixed namespace test payload";
+        // Ed25519 is deterministic: the wrapper must sign the same bytes.
+        assert_eq!(
+            ssh_sign(payload, &key).unwrap(),
+            ssh_sign_ns(payload, &key, NAMESPACE).unwrap()
+        );
+        let signature = ssh_sign_ns(payload, &key, "test-checkpoint").unwrap();
+        let sig = dir.path().join("payload.sig");
+        std::fs::write(&sig, &signature).unwrap();
+        for (namespace, valid) in [("test-checkpoint", true), (NAMESPACE, false)] {
+            let mut child = Command::new("ssh-keygen")
+                .args(["-Y", "check-novalidate", "-n", namespace, "-s"])
+                .arg(&sig)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(payload.as_bytes())
+                .unwrap();
+            assert_eq!(child.wait().unwrap().success(), valid);
+        }
     }
 
     #[cfg(unix)]
