@@ -52,9 +52,13 @@ impl EpochState {
     /// Öffnet den Zustand unterhalb des Git-Verzeichnisses. Legt nichts an —
     /// das passiert erst beim ersten [`record`](Self::record).
     pub fn open(git_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            root: git_dir.into().join(STATE_DIR),
-        }
+        Self::at(git_dir.into().join(STATE_DIR))
+    }
+
+    /// Öffnet den Epochen-Zustand direkt an `root`. Anlage und Härtung
+    /// erfolgen wie bei [`open`](Self::open) erst beim Schreiben.
+    pub fn at(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
     }
 
     /// Die `seal_id` der letzten Epoche dieser Session, falls bekannt.
@@ -177,6 +181,63 @@ fn random_salt() -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn epoch_state_at_arbitrary_root_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("private/epochs");
+        let state = EpochState::at(&root);
+        assert!(!root.exists(), "opening remains lazy");
+        assert_eq!(state.last_seal(&key()), None);
+        let salt = state.salt(&key()).unwrap();
+        state.record(&key(), &id(1)).unwrap();
+
+        let reopened = EpochState::at(&root);
+        assert_eq!(reopened.last_seal(&key()), Some(id(1)));
+        assert_eq!(reopened.salt(&key()).unwrap(), salt);
+        reopened.record(&key(), &id(2)).unwrap();
+        assert_eq!(state.last_seal(&key()), Some(id(2)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&root, &root.join(key().agent())] {
+                assert_eq!(
+                    fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+            for file in [
+                state.file(&key()),
+                state.file(&key()).with_extension(SALT_SUFFIX),
+            ] {
+                assert_eq!(
+                    fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn epoch_state_at_symlinked_root_refuses_to_write() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        fs::set_permissions(target.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let root = tmp.path().join("epochs");
+        symlink(target.path(), &root).unwrap();
+        let state = EpochState::at(root);
+        assert!(state.record(&key(), &id(1)).is_err());
+        assert!(state.salt(&key()).is_err());
+        assert!(fs::read_dir(target.path()).unwrap().next().is_none());
+        assert_eq!(
+            fs::metadata(target.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 
     fn key() -> SessionKey {
         SessionKey::new("claude-code", "s1").unwrap()
