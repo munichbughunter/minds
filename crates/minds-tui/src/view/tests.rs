@@ -1287,11 +1287,16 @@ fn evidence_mode_reconciles_a_human_line_as_not_observed() {
     let buffer = render_buffer(&mut app);
     let (_, _, neutral) = crate::theme::not_observed();
     let mut marks = 0;
+    let alarming = [
+        crate::theme::DELETE,
+        crate::theme::REVIEW,
+        ratatui::style::Color::Red,
+        ratatui::style::Color::LightRed,
+    ];
     for cell in buffer.content() {
-        assert_ne!(
-            cell.fg,
-            crate::theme::DELETE,
-            "red cell {:?}",
+        assert!(
+            !alarming.contains(&cell.fg),
+            "alarming cell {:?}",
             cell.symbol()
         );
         if cell.symbol() == "◦" {
@@ -1312,7 +1317,8 @@ fn evidence_mode_shows_an_agent_only_commit_as_fully_explained() {
         .lines()
         .find(|l| l.contains("ARTIFACT"))
         .expect("ARTIFACT row");
-    assert!(row.contains("✓ ARTIFACT"), "{out}");
+    // Belegt, aber nur berichtet: `◇`, nicht das grüne `✓` eines Zeugen.
+    assert!(row.contains("◇ ARTIFACT"), "{out}");
     assert!(row.contains("artifact 4/4 lines explained"), "{out}");
     app.reduce(Action::Down);
     app.reduce(Action::Down);
@@ -1355,4 +1361,61 @@ fn a_legacy_session_still_shows_its_reconciliation() {
     assert!(out.contains(" SESSION · LEGACY "), "{out}");
     assert!(out.contains("artifact 3/4 lines explained"), "{out}");
     assert!(out.contains("line 2 not observed in the session"), "{out}");
+}
+
+#[test]
+fn hostile_and_overlong_paths_are_sanitized_and_capped() {
+    use minds_reader::artifact::{ArtifactState, Assessed, CommitArtifact};
+    use minds_reader::reconcile::{FileRecon, LineLevel, ReconClass, Reconciliation};
+    let long = format!("{}/x.rs", "d".repeat(100_000));
+    let files = ["evil\u{202e}txt.exe\u{1b}[2J", long.as_str()]
+        .into_iter()
+        .map(|path| FileRecon {
+            path: path.into(),
+            class: ReconClass::Unexplained,
+            line_level: LineLevel::Available(Vec::new()),
+            committed: minds_core::ContentHash::from_bytes([0; 32]),
+            deleted: false,
+            changed_lines: 0,
+            removes: false,
+            last_observed: None,
+        })
+        .collect();
+    let artifacts = vec![CommitArtifact {
+        commit: commit('1'),
+        subject: None,
+        inferred: true,
+        claimants: 1,
+        state: ArtifactState::Assessed(Assessed {
+            recon: Reconciliation {
+                commit: commit('1'),
+                base: None,
+                files,
+                explained_lines: 0,
+                total_changed_lines: 0,
+            },
+            structural: Vec::new(),
+        }),
+    }];
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let report = app.inspection.evidence_report(sid('a'));
+    app.views.push(View::Evidence {
+        id: sid('a'),
+        report,
+        uninterpreted: 0,
+        artifacts,
+        cursor: 2,
+    });
+    let out = render(&mut app);
+    assert!(!out.contains(['\u{1b}', '\u{202e}']), "{out}");
+    assert!(
+        out.contains("claims from inferred links (no trailer)"),
+        "{out}"
+    );
+    // Gekappt und von vorn gekürzt: genau eine Zeile trägt den Pfad, und
+    // sein Ende bleibt lesbar.
+    let long_lines: Vec<&str> = out.lines().filter(|l| l.contains("dddd")).collect();
+    assert_eq!(long_lines.len(), 1, "{out}");
+    assert!(long_lines[0].contains("…dddd") && long_lines[0].contains("/x.rs"));
 }

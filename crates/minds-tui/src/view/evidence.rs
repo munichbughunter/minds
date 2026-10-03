@@ -22,7 +22,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use minds_reader::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, summary};
+use minds_reader::artifact::{
+    ArtifactState, CommitArtifact, NOT_OBSERVED, provenance_note, summary,
+};
 use minds_reader::model::{EpochLink, EpochReport, EvidenceReport, LEGACY_SENTENCE};
 use minds_reader::reconcile::ReconClass;
 
@@ -93,7 +95,7 @@ pub fn draw(
         head,
     );
 
-    // Ebene 1: das Verdikt — sechs Zeilen, je Achse eine Aussage.
+    // Ebene 1: das Verdikt — sieben Zeilen, je Achse eine Aussage.
     let lines: Vec<Line> = rows(report, uninterpreted, artifacts)
         .into_iter()
         .enumerate()
@@ -309,11 +311,34 @@ fn any_unexplained(assessed: &minds_reader::artifact::Assessed) -> bool {
             .any(|f| f.class == ReconClass::Unexplained)
 }
 
+/// Ob ein abgeglichener Commit Zeilen trägt, die nur berichtet sind — ein
+/// Tool-Claim ohne Zeugen.
+fn any_reported_only(assessed: &minds_reader::artifact::Assessed) -> bool {
+    assessed.recon.files.iter().any(|f| {
+        f.class == ReconClass::ReportedOnly
+            || matches!(&f.line_level, minds_reader::reconcile::LineLevel::Available(lines)
+                if lines.iter().any(|l| l.class == ReconClass::ReportedOnly))
+    })
+}
+
+/// Glyph und Stil der Artefakt-Zeile: unerklärt → neutral `◦`; nur durch
+/// Claims belegt → `◇` (belegt, aber nicht bezeugt, also nicht grün); alles
+/// bezeugt → `✓`.
+fn artifact_mark(unexplained: bool, reported_only: bool) -> (String, Style) {
+    let (neutral_glyph, _, neutral) = theme::not_observed();
+    if unexplained {
+        (neutral_glyph.into(), neutral)
+    } else if reported_only {
+        let (glyph, _, style) = theme::recon(ReconClass::ReportedOnly);
+        (glyph.into(), style)
+    } else {
+        ("✓".into(), Style::default().fg(theme::OK))
+    }
+}
+
 /// Die Verdikt-Zeile der Artefakt-Sektion. Unerklärtes ist neutral
 /// (`◦`, gedimmt) — nie die Warn- oder Fehlerfarbe.
 fn artifact_row(artifacts: &[CommitArtifact]) -> (String, String, Style) {
-    let ok = Style::default().fg(theme::OK);
-    let (neutral_glyph, _, neutral) = theme::not_observed();
     match artifacts {
         [] => (
             "·".into(),
@@ -322,12 +347,14 @@ fn artifact_row(artifacts: &[CommitArtifact]) -> (String, String, Style) {
         ),
         [one] => match &one.state {
             ArtifactState::Assessed(assessed) => {
-                let text = format!("{} · {}", summary(&assessed.recon), short_commit(one));
-                if any_unexplained(assessed) {
-                    (neutral_glyph.into(), text, neutral)
-                } else {
-                    ("✓".into(), text, ok)
+                let mut text = format!("{} · {}", summary(&assessed.recon), short_commit(one));
+                let note = provenance_note(one);
+                if !note.is_empty() {
+                    text.push_str(&format!(" · {note}"));
                 }
+                let (glyph, style) =
+                    artifact_mark(any_unexplained(assessed), any_reported_only(assessed));
+                (glyph, text, style)
             }
             ArtifactState::Unavailable(why) => {
                 ("·".into(), format!("not assessed ({why})"), theme::dim())
@@ -352,13 +379,30 @@ fn artifact_row(artifacts: &[CommitArtifact]) -> (String, String, Style) {
             if skipped > 0 {
                 text.push_str(&format!(" · {skipped} not assessed"));
             }
-            if skipped > 0 || assessed.iter().any(|a| any_unexplained(a)) {
-                (neutral_glyph.into(), text, neutral)
-            } else {
-                ("✓".into(), text, ok)
+            if many.iter().any(|a| a.inferred) {
+                text.push_str(" · partly inferred links");
             }
+            let (glyph, style) = artifact_mark(
+                skipped > 0 || assessed.iter().any(|a| any_unexplained(a)),
+                assessed.iter().any(|a| any_reported_only(a)),
+            );
+            (glyph, text, style)
         }
     }
+}
+
+/// Höchstens so breit wird die Pfadspalte; längere Pfade werden von vorn
+/// gekürzt — das Ende (Dateiname) trägt die Aussage.
+const PATH_WIDTH: usize = 60;
+
+/// Ein Pfad zur Anzeige: entschärft und auf [`PATH_WIDTH`] gekürzt.
+fn shown_path(path: &str) -> String {
+    let path = minds_reader::sanitize(path);
+    if path.chars().count() <= PATH_WIDTH {
+        return path;
+    }
+    let tail: Vec<char> = path.chars().rev().take(PATH_WIDTH - 1).collect();
+    format!("…{}", tail.into_iter().rev().collect::<String>())
 }
 
 fn short_commit(artifact: &CommitArtifact) -> String {
@@ -391,8 +435,13 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
             Span::styled(format!("{:<12} ", "Commit"), theme::dim()),
             Span::styled(short_commit(artifact), Style::default().fg(theme::CHANGE)),
         ];
+        // Der Betreff ist im Index schon entschärft.
         if let Some(subject) = &artifact.subject {
-            head.push(Span::raw(format!("  {}", minds_reader::sanitize(subject))));
+            head.push(Span::raw(format!("  {subject}")));
+        }
+        let note = provenance_note(artifact);
+        if !note.is_empty() {
+            head.push(Span::styled(format!("  · {note}"), theme::dim()));
         }
         lines.push(Line::from(head));
         let assessed = match &artifact.state {
@@ -420,12 +469,12 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
             .recon
             .files
             .iter()
-            .map(|f| minds_reader::sanitize(&f.path).chars().count())
+            .map(|f| shown_path(&f.path).chars().count())
             .chain(
                 assessed
                     .structural
                     .iter()
-                    .map(|s| minds_reader::sanitize(&s.path).chars().count()),
+                    .map(|s| shown_path(&s.path).chars().count()),
             )
             .max()
             .unwrap_or(0);
@@ -434,7 +483,7 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
             let mut spans = vec![
                 Span::styled(format!("  {glyph} "), style),
                 Span::styled(format!("{word:<20}"), style),
-                Span::raw(format!("{:<width$}", minds_reader::sanitize(&file.path))),
+                Span::raw(format!("{:<width$}", shown_path(&file.path))),
             ];
             let note = file.note();
             if !note.is_empty() {
@@ -452,10 +501,7 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled(format!("  {glyph} "), style),
                 Span::styled(format!("{word:<20}"), style),
-                Span::raw(format!(
-                    "{:<width$}",
-                    minds_reader::sanitize(&structural.path)
-                )),
+                Span::raw(format!("{:<width$}", shown_path(&structural.path))),
                 Span::styled(format!("  {} {NOT_OBSERVED}", structural.what), neutral),
             ]));
         }

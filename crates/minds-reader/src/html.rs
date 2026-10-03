@@ -30,7 +30,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use minds_core::{EffectKind, Role, Session, SessionId, ToolCall};
 use minds_git::{CommitDiff, DiffFile, DiffKind, DiffLine};
 
-use crate::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, summary};
+use crate::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, provenance_note, summary};
 use crate::file::FileView;
 use crate::index::Index;
 use crate::reconcile::ReconClass;
@@ -545,6 +545,9 @@ fn changes_html(
                 _ => None,
             });
         for file in &diff.files {
+            // Zugeordnet über den Pfad. Weichen die Schreibweisen der beiden
+            // Git-Aufrufe ab (nicht als UTF-8 lesbare Pfade), bleibt die
+            // Datei unmarkiert — keine Markierung statt einer falschen.
             let unexplained = recon
                 .and_then(|r| r.files.iter().find(|f| f.path == file.path))
                 .map(|f| f.unexplained_set())
@@ -597,8 +600,14 @@ pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
             .as_deref()
             .map(|s| format!(" {}", escape(s)))
             .unwrap_or_default();
+        let note = provenance_note(artifact);
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            format!(" <span class=\"recon-note\">· {}</span>", escape(&note))
+        };
         out.push_str(&format!(
-            "<div class=\"recon-commit\">\n<p class=\"recon-head\"><code>{short}</code>{subject}</p>\n"
+            "<div class=\"recon-commit\">\n<p class=\"recon-head\"><code>{short}</code>{subject}{note}</p>\n"
         ));
         let assessed = match &artifact.state {
             ArtifactState::Assessed(assessed) => assessed,
@@ -630,7 +639,7 @@ pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
                 cls = recon_class(file.class),
                 mark = if unexplained { gutter_mark() } else { "" },
                 word = file.class.word(),
-                path = escape(&file.path),
+                path = escape(&crate::sanitize_path(&file.path)),
                 note = if note.is_empty() {
                     String::new()
                 } else {
@@ -643,7 +652,7 @@ pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
                 "<li class=\"recon-file unexplained\">{mark}<span class=\"recon-class\">unexplained</span> \
                  <code>{path}</code> <span class=\"recon-note\">{what} {NOT_OBSERVED}</span></li>\n",
                 mark = gutter_mark(),
-                path = escape(&structural.path),
+                path = escape(&crate::sanitize_path(&structural.path)),
                 what = structural.what,
             ));
         }
@@ -1047,7 +1056,7 @@ pub fn escape(text: &str) -> String {
 /// Das Stylesheet. Bewusst knapp und ohne Abhängigkeit; hell und dunkel über
 /// `prefers-color-scheme`.
 const STYLE: &str = "\
-:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e;--hl-kw:#8250df;--hl-str:#0a7d33;--hl-num:#b35900;--hl-com:#6a737d}\
+:root{--ok:#2da44e;--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e;--hl-kw:#8250df;--hl-str:#0a7d33;--hl-num:#b35900;--hl-com:#6a737d}\
 @media(prefers-color-scheme:dark){:root{--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5;--hl-kw:#c678dd;--hl-str:#98c379;--hl-num:#d19a66;--hl-com:#8b949e}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}\
@@ -1159,7 +1168,7 @@ details.tools>summary{cursor:pointer;font-size:.78rem;color:var(--dim)}\
 .recon-summary{margin:0 0 .3rem;font-family:ui-monospace,monospace;font-size:.9rem}\
 .recon-files{list-style:none;padding:0;margin:0 0 .5rem;display:grid;gap:.15rem;font-size:.85rem}\
 .recon-class{display:inline-block;min-width:11rem;color:var(--dim)}\
-.recon-file.explained .recon-class,.recon-file.explained-fs-only .recon-class{color:#2da44e}\
+.recon-file.explained .recon-class,.recon-file.explained-fs-only .recon-class{color:var(--ok)}\
 .recon-note{color:var(--dim)}\
 .agent-badge{display:inline-block;font-size:.68rem;padding:.02rem .35rem;border-radius:.25rem;background:var(--mark);color:var(--accent);font-family:ui-monospace,monospace}\
 ";
@@ -1777,6 +1786,8 @@ mod tests {
         CommitArtifact {
             commit: cid('1'),
             subject: Some("write <the> files".into()),
+            inferred: false,
+            claimants: 1,
             state: ArtifactState::Assessed(Assessed {
                 recon: Reconciliation {
                     commit: cid('1'),
@@ -1911,10 +1922,33 @@ mod tests {
     }
 
     #[test]
+    fn inferred_and_shared_claims_are_named_in_the_head() {
+        let mut artifact = two_files();
+        artifact.inferred = true;
+        artifact.claimants = 2;
+        let html = artifact_section(&[artifact]);
+        assert!(html.contains(
+            "<span class=\"recon-note\">· claims of 2 sessions · claims from inferred links (no trailer)</span>"
+        ), "{html}");
+    }
+
+    #[test]
+    fn bidi_controls_in_paths_are_made_visible() {
+        let mut artifact = two_files();
+        if let ArtifactState::Assessed(a) = &mut artifact.state {
+            a.recon.files[0].path = "src/\u{202e}txt.exe".into();
+        }
+        let html = artifact_section(&[artifact]);
+        assert!(!html.contains('\u{202e}'), "{html}");
+    }
+
+    #[test]
     fn an_unassessable_commit_says_why() {
         let html = artifact_section(&[CommitArtifact {
             commit: cid('2'),
             subject: None,
+            inferred: false,
+            claimants: 0,
             state: ArtifactState::Unavailable("first parent not in this clone (shallow)"),
         }]);
         assert!(html.contains("not assessed (first parent not in this clone (shallow))"));

@@ -32,6 +32,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use minds_core::{ContentHash, SessionId};
 use minds_git::{BlameProvider, CommitId, Repo};
@@ -76,12 +77,15 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
     // Seite, kein Abbruch des Laufs.
     let spellings = crate::artifact::roots_of(repo);
     let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
-    let mut artifacts: BTreeMap<CommitId, CommitArtifact> = BTreeMap::new();
-    let mut artifact_of = |commit: CommitId| -> CommitArtifact {
-        artifacts
-            .entry(commit)
-            .or_insert_with(|| index.artifact(repo, &roots, commit))
-            .clone()
+    // `Rc`: Datei-Seiten fragen je Blame-Commit — bei breiten Commits
+    // vielfach; geteilt wird der Zeiger, nicht die Zeilenklassen.
+    let mut artifacts: BTreeMap<CommitId, Rc<CommitArtifact>> = BTreeMap::new();
+    let mut artifact_of = |commit: CommitId| -> Rc<CommitArtifact> {
+        Rc::clone(
+            artifacts
+                .entry(commit)
+                .or_insert_with(|| Rc::new(index.artifact(repo, &roots, commit))),
+        )
     };
 
     // Trägt kein Commit einen Trailer, kann auch keine Zeile zugeordnet sein —
@@ -135,9 +139,9 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
     for (id, session) in index.sessions() {
         let diffs = diffs_for(repo, &index, *id);
         let recons: Vec<CommitArtifact> = index
-            .commits_of(*id)
+            .claimed_commits(*id)
             .into_iter()
-            .map(&mut artifact_of)
+            .map(|commit| CommitArtifact::clone(&artifact_of(commit)))
             .collect();
         let href = unique_slug(&format!("session-{}", short_hex(*id)), &mut used);
         write(
@@ -179,7 +183,7 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
 fn unexplained_at_head(
     view: &crate::file::FileView,
     head_hash: &ContentHash,
-    artifact_of: &mut impl FnMut(CommitId) -> CommitArtifact,
+    artifact_of: &mut impl FnMut(CommitId) -> Rc<CommitArtifact>,
 ) -> BTreeSet<u32> {
     let commits: BTreeSet<CommitId> = view
         .lines
@@ -189,7 +193,8 @@ fn unexplained_at_head(
         .collect();
     let mut marked = BTreeSet::new();
     for commit in commits {
-        let ArtifactState::Assessed(assessed) = artifact_of(commit).state else {
+        let artifact = artifact_of(commit);
+        let ArtifactState::Assessed(assessed) = &artifact.state else {
             continue;
         };
         let Some(file) = assessed
@@ -304,6 +309,8 @@ mod tests {
         let artifact = CommitArtifact {
             commit,
             subject: None,
+            inferred: false,
+            claimants: 1,
             state: ArtifactState::Assessed(Assessed {
                 recon: Reconciliation {
                     commit,
@@ -333,7 +340,8 @@ mod tests {
                 structural: Vec::new(),
             }),
         };
-        let mut lookup = |_| artifact.clone();
+        let artifact = Rc::new(artifact);
+        let mut lookup = |_| Rc::clone(&artifact);
         assert_eq!(
             unexplained_at_head(&view, &committed, &mut lookup),
             BTreeSet::from([2])

@@ -43,7 +43,8 @@ pub struct Structural {
 pub struct Assessed {
     /// Die Klassen je Datei und Zeile.
     pub recon: Reconciliation,
-    /// Submodul-Zeiger, Modus-Wechsel und Symlinks — nach Pfad sortiert.
+    /// Submodul-Zeiger, Modus-Wechsel und Symlinks — in Pfad-Reihenfolge
+    /// des Diffs.
     pub structural: Vec<Structural>,
 }
 
@@ -194,6 +195,11 @@ pub fn assess(
     Ok(Ok(Assessed { recon, structural }))
 }
 
+/// Höchstens so viele Commits einer Session gleicht der Evidence-Mode ab —
+/// jeder Abgleich liest Blobs, synchron beim Öffnen. Der Rest wird als
+/// „nicht abgeglichen" benannt, nie verschwiegen.
+pub const MAX_COMMITS: usize = 20;
+
 /// Der Abgleich eines Commits, wie eine Oberfläche ihn zeigt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitArtifact {
@@ -201,6 +207,12 @@ pub struct CommitArtifact {
     pub commit: CommitId,
     /// Sein Betreff, entschärft — sofern bekannt.
     pub subject: Option<String>,
+    /// Die Claims stammen aus Store-Index-Kanten, nicht aus einem Trailer —
+    /// vermutete Verknüpfungen; die Oberfläche sagt das dazu.
+    pub inferred: bool,
+    /// Wie viele Sessions Claims beitragen. Der Abgleich gilt dem **Commit**:
+    /// Bei mehr als einer erklären auch die Claims der anderen Sessions.
+    pub claimants: usize,
     /// Das Ergebnis.
     pub state: ArtifactState,
 }
@@ -216,34 +228,38 @@ pub enum ArtifactState {
     Failed(String),
 }
 
+/// Die Text-Kennzeichnung vermuteter Claimants.
+pub const INFERRED_NOTE: &str = "claims from inferred links (no trailer)";
+
 impl crate::Index {
-    /// Die Sessions, deren Claims `commit` erklären dürfen — dieselbe Wahl
-    /// wie `minds verify <rev>`: die per Trailer belegten; nur wenn es keine
-    /// gibt, die Kanten des Store-Index.
-    pub fn claimants(&self, commit: CommitId) -> Vec<&Session> {
-        let linked = self.sessions_of(commit);
-        let observed: Vec<_> = linked
-            .iter()
-            .filter(|id| {
-                self.evidence_of(commit, **id)
-                    .is_some_and(|mark| mark.source == minds_core::EvidenceSource::Observed)
-            })
-            .collect();
-        let chosen: Vec<_> = if observed.is_empty() {
-            linked.iter().collect()
+    /// Die Sessions, deren Claims `commit` erklären dürfen, und ob sie nur
+    /// vermutet verknüpft sind — dieselbe Wahl wie `minds verify <rev>`:
+    /// Nennt der **Trailer** Sessions, zählen genau diese (fehlt eine im
+    /// Index, trägt sie nichts bei — es gibt keinen Rückfall). Nur ohne
+    /// Trailer zählen die Kanten des Store-Index. Ob eine Store-Kante sich
+    /// selbst `Observed` nennt, spielt keine Rolle: Sie liegt auf einem
+    /// geteilten Ref, der Trailer im Commit.
+    ///
+    /// Eine Abweichung bleibt: Sessions ohne erfasste Absicht hält der Index
+    /// gar nicht (siehe [`crate::Index::build`]); `verify` liest sie direkt
+    /// aus dem Store.
+    pub fn claimants(&self, commit: CommitId) -> (Vec<&Session>, bool) {
+        let trailer = self.trailer_ids(commit);
+        let (ids, inferred) = if trailer.is_empty() {
+            (self.sessions_of(commit), true)
         } else {
-            observed
+            (trailer, false)
         };
-        chosen
-            .into_iter()
-            .filter_map(|id| self.session(*id))
-            .collect()
+        let sessions: Vec<&Session> = ids.iter().filter_map(|id| self.session(*id)).collect();
+        let inferred = inferred && !sessions.is_empty();
+        (sessions, inferred)
     }
 
     /// Gleicht `commit` gegen die Claims seiner [`Index::claimants`] ab.
     /// Fail-soft: Ein Lesefehler wird zu [`ArtifactState::Failed`].
     pub fn artifact(&self, repo: &Repo, roots: &[&Path], commit: CommitId) -> CommitArtifact {
-        let state = match assess(repo, roots, commit, &self.claimants(commit)) {
+        let (claimants, inferred) = self.claimants(commit);
+        let state = match assess(repo, roots, commit, &claimants) {
             Ok(Ok(assessed)) => ArtifactState::Assessed(assessed),
             Ok(Err(why)) => ArtifactState::Unavailable(why),
             Err(err) => ArtifactState::Failed(crate::sanitize(&err.to_string())),
@@ -251,25 +267,70 @@ impl crate::Index {
         CommitArtifact {
             commit,
             subject: self.subject_of(commit).map(str::to_owned),
+            inferred,
+            claimants: claimants.len(),
             state,
         }
     }
 }
 
+impl crate::Index {
+    /// Die Commits, an deren Abgleich `id` als Claimant teilnimmt: die, deren
+    /// Trailer sie nennt, und — vermutet — die per Store-Index verknüpften
+    /// **ohne** Trailer. Einen Commit mit fremdem Trailer gleicht sie nicht
+    /// ab: Dort zählen ihre Claims nicht ([`Index::claimants`]).
+    pub fn claimed_commits(&self, id: minds_core::SessionId) -> Vec<CommitId> {
+        self.commits_of(id)
+            .into_iter()
+            .filter(|commit| {
+                let trailer = self.trailer_ids(*commit);
+                trailer.is_empty() || trailer.contains(&id)
+            })
+            .collect()
+    }
+}
+
 impl crate::Inspection {
-    /// Die Abgleiche aller Commits, die `id` tragen — für den Evidence-Mode.
-    /// Reihenfolge wie [`crate::Index::commits_of`]; leer, wenn die Session
-    /// mit keinem Commit verbunden ist.
+    /// Die Abgleiche der Commits, an denen `id` als Claimant teilnimmt
+    /// ([`crate::Index::claimed_commits`]) — für den Evidence-Mode. Leer,
+    /// wenn es keinen gibt. Synchron; über [`MAX_COMMITS`] hinaus wird
+    /// nichts gelesen, diese Commits stehen als nicht abgeglichen da.
     pub fn artifacts(&self, repo: &Repo, id: minds_core::SessionId) -> Vec<CommitArtifact> {
         let spellings = roots_of(repo);
         let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
         let index = self.index();
         index
-            .commits_of(id)
+            .claimed_commits(id)
             .into_iter()
-            .map(|commit| index.artifact(repo, &roots, commit))
+            .enumerate()
+            .map(|(i, commit)| {
+                if i < MAX_COMMITS {
+                    index.artifact(repo, &roots, commit)
+                } else {
+                    CommitArtifact {
+                        commit,
+                        subject: index.subject_of(commit).map(str::to_owned),
+                        inferred: false,
+                        claimants: 0,
+                        state: ArtifactState::Unavailable("skipped: too many linked commits"),
+                    }
+                }
+            })
             .collect()
     }
+}
+
+/// Der Kopf-Zusatz eines Abgleichs: vermutete Claimants und mehrere
+/// beitragende Sessions — leer, wenn es nichts zu sagen gibt.
+pub fn provenance_note(artifact: &CommitArtifact) -> String {
+    let mut parts = Vec::new();
+    if artifact.claimants > 1 {
+        parts.push(format!("claims of {} sessions", artifact.claimants));
+    }
+    if artifact.inferred {
+        parts.push(INFERRED_NOTE.to_owned());
+    }
+    parts.join(" · ")
 }
 
 /// Zeilen eines Blobs; eine letzte Zeile ohne Umbruch zählt mit.
@@ -365,8 +426,13 @@ impl FileRecon {
             };
         }
         if let LineLevel::Unavailable(reason) = &self.line_level {
-            return format!("line level unavailable ({})", reason.word());
+            return if self.class == ReconClass::Unexplained {
+                format!("{NOT_OBSERVED}; line level unavailable ({})", reason.word())
+            } else {
+                format!("line level unavailable ({})", reason.word())
+            };
         }
+        let mut parts = Vec::new();
         let ranges = self.unexplained_ranges();
         if !ranges.is_empty() {
             let word = if ranges.len() == 1 && ranges[0].0 == ranges[0].1 {
@@ -375,16 +441,18 @@ impl FileRecon {
                 "lines"
             };
             let list: Vec<String> = ranges.into_iter().map(range_text).collect();
-            return format!("{word} {} {NOT_OBSERVED}", list.join(", "));
+            parts.push(format!("{word} {} {NOT_OBSERVED}", list.join(", ")));
         }
         if self.class == ReconClass::Unexplained {
-            return if self.removes {
-                format!("removed lines {NOT_OBSERVED}")
-            } else {
-                NOT_OBSERVED.into()
-            };
+            // Entfernte Zeilen auch neben unerklärten Zeilen — sonst zeigte
+            // die Liste nur den Kommentar, nicht die entfernte Prüfung.
+            if self.removes {
+                parts.push(format!("removed lines {NOT_OBSERVED}"));
+            } else if parts.is_empty() {
+                parts.push(NOT_OBSERVED.into());
+            }
         }
-        String::new()
+        parts.join("; ")
     }
 }
 
@@ -434,5 +502,57 @@ mod tests {
         assert_eq!(line_count(b""), 0);
         assert_eq!(line_count(b"a\nb"), 2);
         assert_eq!(line_count(b"a\nb\n"), 2);
+    }
+
+    fn file(class: ReconClass, line_level: LineLevel) -> FileRecon {
+        FileRecon {
+            path: "a".into(),
+            class,
+            line_level,
+            committed: minds_core::ContentHash::from_bytes([0; 32]),
+            deleted: false,
+            changed_lines: 1,
+            removes: false,
+            last_observed: None,
+        }
+    }
+
+    /// Dieselben Worte wie die Detailzeilen von `minds verify`.
+    #[test]
+    fn notes_speak_the_verify_vocabulary() {
+        use crate::reconcile::LineRecon;
+        use ReconClass::*;
+        let binary = file(Unexplained, LineLevel::Unavailable(Reason::Binary));
+        assert_eq!(
+            binary.note(),
+            "not observed in the session; line level unavailable (binary)"
+        );
+        let lock = file(ReportedOnly, LineLevel::Unavailable(Reason::TooLarge));
+        assert_eq!(lock.note(), "line level unavailable (too large)");
+        let lines = LineLevel::Available(vec![
+            LineRecon {
+                line: 2,
+                class: Unexplained,
+            },
+            LineRecon {
+                line: 3,
+                class: Unexplained,
+            },
+            LineRecon {
+                line: 5,
+                class: Unexplained,
+            },
+        ]);
+        let mut both = file(Unexplained, lines);
+        assert_eq!(both.note(), "lines 2-3, 5 not observed in the session");
+        both.removes = true;
+        assert_eq!(
+            both.note(),
+            "lines 2-3, 5 not observed in the session; removed lines not observed in the session"
+        );
+        let mut gone = file(Unexplained, LineLevel::Available(Vec::new()));
+        gone.deleted = true;
+        assert_eq!(gone.note(), "deletion not observed in the session");
+        assert_eq!(file(Explained, LineLevel::Available(Vec::new())).note(), "");
     }
 }
