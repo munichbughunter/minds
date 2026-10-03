@@ -319,7 +319,11 @@ impl Repo {
 /// wurden. Ersatzobjekte (`refs/replace`) — oder eine Objektdatenbank, die
 /// lügt — fallen so laut auf, statt einen Abgleich zu schönen; auf die
 /// Replace-Konfiguration der Git-Schicht allein ist kein Verlass.
-fn verify_object(requested: gix::ObjectId, kind: gix::objs::Kind, data: &[u8]) -> Result<()> {
+pub(crate) fn verify_object(
+    requested: gix::ObjectId,
+    kind: gix::objs::Kind,
+    data: &[u8],
+) -> Result<()> {
     let actual = gix::objs::compute_hash(requested.kind(), kind, data)
         .map_err(|err| GitError::read_object(requested, err))?;
     if actual == requested {

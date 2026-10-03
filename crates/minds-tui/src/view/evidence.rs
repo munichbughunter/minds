@@ -382,10 +382,14 @@ fn artifact_row(artifacts: &[CommitArtifact]) -> (String, String, Style) {
             if many.iter().any(|a| a.inferred) {
                 text.push_str(" · partly inferred links");
             }
-            let (glyph, style) = artifact_mark(
-                skipped > 0 || assessed.iter().any(|a| any_unexplained(a)),
-                assessed.iter().any(|a| any_reported_only(a)),
-            );
+            let unexplained = assessed.iter().any(|a| any_unexplained(a));
+            // Nicht abgeglichen ist nicht „nicht beobachtet": `·` wie im
+            // Ein-Commit-Fall, nicht das `◦` der Legende.
+            let (glyph, style) = if !unexplained && skipped > 0 {
+                ("·".into(), theme::dim())
+            } else {
+                artifact_mark(unexplained, assessed.iter().any(|a| any_reported_only(a)))
+            };
             (glyph, text, style)
         }
     }

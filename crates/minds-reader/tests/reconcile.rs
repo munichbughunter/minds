@@ -1041,12 +1041,224 @@ fn artifact_and_render_mark_the_human_line_read_only() {
     );
 }
 
-/// Ohne Trailer zählen die Store-Index-Kanten — als vermutet benannt.
+/// Ohne jede Kante gibt es keine Claimants — und nichts ist „vermutet".
 #[test]
-fn claimants_without_a_trailer_are_inferred() {
+fn no_links_means_no_claimants() {
     let s = session(vec![write("a", "text\n")]);
     let id = SessionId::of(&s).unwrap();
     let index = Index::from_parts(BTreeMap::from([(id, s)]), BTreeMap::new());
     let (claimants, inferred) = index.claimants(commit());
     assert!(claimants.is_empty() && !inferred);
+}
+
+fn stored(store: &InRepoStore, calls: Vec<ToolCall>) -> SessionId {
+    let redacted = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_session(session(calls))
+        .unwrap();
+    store.put(&redacted).unwrap().id()
+}
+
+/// Der Trailer entscheidet auch für Commits, die HEAD nicht erreicht: Eine
+/// Store-Kante (geteilter Ref, frei beschreibbar) auf einen Seitenzweig-Commit
+/// mit fremdem Trailer erklärt keine Zeile. Nur ein Commit **ohne** Trailer
+/// fällt auf Store-Kanten zurück — und heißt dann vermutet.
+#[test]
+fn store_edges_never_override_a_trailer_outside_head() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    // A schrieb genau die Bytes beider Commits; B nicht.
+    let a = stored(&store, vec![write("y", "y\n"), write("x", "x\n")]);
+    let b = stored(&store, vec![write("x", "other\n")]);
+
+    // Y auf dem Hauptzweig, ohne Trailer.
+    std::fs::write(dir.path().join("y"), "y\n").unwrap();
+    git(dir.path(), &["add", "y"]);
+    git(dir.path(), &["commit", "-qm", "no trailer"]);
+    let main = String::from_utf8(git(dir.path(), &["branch", "--show-current"])).unwrap();
+    let repo = Repo::open(dir.path()).unwrap();
+    let y = repo.head().unwrap().commit().unwrap();
+
+    // X auf einem Seitenzweig, Trailer nennt B; HEAD kehrt zurück.
+    git(dir.path(), &["switch", "-qc", "side"]);
+    std::fs::write(dir.path().join("x"), "x\n").unwrap();
+    git(dir.path(), &["add", "x"]);
+    git(
+        dir.path(),
+        &["commit", "-qm", &format!("side\n\nMinds-Session-Id: {b}")],
+    );
+    let x = Repo::open(dir.path())
+        .unwrap()
+        .head()
+        .unwrap()
+        .commit()
+        .unwrap();
+    git(dir.path(), &["switch", "-q", main.trim()]);
+
+    let observed = minds_core::EvidenceMark::of(minds_core::EvidenceSource::Observed);
+    let heuristic = minds_core::EvidenceMark::of(minds_core::EvidenceSource::Heuristic);
+    store.link(a, &x.to_string(), observed).unwrap();
+    store.link(a, &y.to_string(), heuristic).unwrap();
+
+    let repo = Repo::open(dir.path()).unwrap();
+    let index = Index::build(&repo, &store).unwrap();
+    assert_eq!(index.position(x), None, "X liegt außerhalb von HEAD");
+    assert_eq!(index.trailer_ids(x), [b]);
+    assert_eq!(index.subject_of(x), Some("side"));
+
+    // X: nur B, nicht vermutet — A erklärt dort nichts.
+    let (claimants, inferred) = index.claimants(x);
+    assert_eq!(
+        claimants
+            .iter()
+            .map(|s| SessionId::of(s).unwrap())
+            .collect::<Vec<_>>(),
+        [b]
+    );
+    assert!(!inferred);
+    assert_eq!(index.claimed_commits(a), [y]);
+    // Die vom Trailer genannte Session sieht ihren Commit.
+    assert_eq!(index.claimed_commits(b), [x]);
+    assert_eq!(
+        index.evidence_of(x, b).map(|m| m.source),
+        Some(minds_core::EvidenceSource::Observed)
+    );
+    let spellings = minds_reader::artifact::roots_of(&repo);
+    let roots: Vec<&Path> = spellings.iter().map(|p| p.as_path()).collect();
+    let artifact = index.artifact(&repo, &roots, x);
+    let minds_reader::artifact::ArtifactState::Assessed(assessed) = &artifact.state else {
+        panic!("{artifact:?}");
+    };
+    assert_eq!(
+        minds_reader::artifact::summary(&assessed.recon),
+        "artifact 0/1 lines explained"
+    );
+    assert!(minds_reader::artifact::provenance_note(&artifact).is_empty());
+
+    // Y: ohne Trailer zählt die Store-Kante — als vermutet benannt.
+    let (claimants, inferred) = index.claimants(y);
+    assert_eq!(claimants.len(), 1);
+    assert!(inferred);
+    let artifact = index.artifact(&repo, &roots, y);
+    assert!(artifact.inferred);
+    assert_eq!(
+        minds_reader::artifact::provenance_note(&artifact),
+        minds_reader::artifact::INFERRED_NOTE
+    );
+    let minds_reader::artifact::ArtifactState::Assessed(assessed) = &artifact.state else {
+        panic!("{artifact:?}");
+    };
+    assert_eq!(
+        minds_reader::artifact::summary(&assessed.recon),
+        "artifact 1/1 lines explained"
+    );
+}
+
+/// Ein Commit, den der Klon (noch) nicht hat, ist nicht „ohne Trailer":
+/// Sein Trailer ist unbekannt, eine Store-Kante wählt keine Claimants.
+#[test]
+fn a_store_edge_to_a_missing_commit_chooses_no_claimants() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let a = stored(&store, vec![write("x", "x\n")]);
+    std::fs::write(dir.path().join("x"), "x\n").unwrap();
+    git(dir.path(), &["add", "x"]);
+    git(dir.path(), &["commit", "-qm", "base"]);
+    let missing: CommitId = "0123456789abcdef0123456789abcdef01234567".parse().unwrap();
+    let observed = minds_core::EvidenceMark::of(minds_core::EvidenceSource::Observed);
+    store.link(a, &missing.to_string(), observed).unwrap();
+    // Auch ein Schlüssel, der auf einen Blob statt auf einen Commit zeigt.
+    let blob: CommitId = String::from_utf8(git(dir.path(), &["rev-parse", "HEAD:x"]))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    store.link(a, &blob.to_string(), observed).unwrap();
+
+    let repo = Repo::open(dir.path()).unwrap();
+    let index = Index::build(&repo, &store).unwrap();
+    for commit in [missing, blob] {
+        assert!(index.trailer_unknown(commit), "{commit}");
+        let (claimants, inferred) = index.claimants(commit);
+        assert!(claimants.is_empty() && !inferred, "{commit}");
+    }
+    assert!(index.claimed_commits(a).is_empty());
+}
+
+/// Ein Ersatzobjekt (`git replace`) ohne Trailer verdeckt den Trailer eines
+/// Commits außerhalb von HEAD nicht: Er bleibt unbekannt.
+#[test]
+fn a_replaced_commit_outside_head_has_an_unknown_trailer() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let a = stored(&store, vec![write("x", "x\n")]);
+    let b = stored(&store, vec![write("x", "other\n")]);
+    std::fs::write(dir.path().join("y"), "y\n").unwrap();
+    git(dir.path(), &["add", "y"]);
+    git(dir.path(), &["commit", "-qm", "base"]);
+    let main = String::from_utf8(git(dir.path(), &["branch", "--show-current"])).unwrap();
+    git(dir.path(), &["switch", "-qc", "side"]);
+    std::fs::write(dir.path().join("x"), "x\n").unwrap();
+    git(dir.path(), &["add", "x"]);
+    git(
+        dir.path(),
+        &["commit", "-qm", &format!("side\n\nMinds-Session-Id: {b}")],
+    );
+    let x = String::from_utf8(git(dir.path(), &["rev-parse", "HEAD"])).unwrap();
+    git(dir.path(), &["commit", "-q", "--amend", "-m", "no trailer"]);
+    let replacement = String::from_utf8(git(dir.path(), &["rev-parse", "HEAD"])).unwrap();
+    git(dir.path(), &["replace", x.trim(), replacement.trim()]);
+    git(dir.path(), &["switch", "-q", main.trim()]);
+    let x: CommitId = x.trim().parse().unwrap();
+    let observed = minds_core::EvidenceMark::of(minds_core::EvidenceSource::Observed);
+    store.link(a, &x.to_string(), observed).unwrap();
+
+    let repo = Repo::open(dir.path()).unwrap();
+    let index = Index::build(&repo, &store).unwrap();
+    // Entweder liest die Git-Schicht das Original (Trailer B) oder sie
+    // verwirft das Ersatzobjekt (Trailer unbekannt) — nie gilt X als
+    // trailerlos, nie wählt die Store-Kante A.
+    let (claimants, inferred) = index.claimants(x);
+    assert!(!inferred);
+    assert!(
+        claimants.iter().all(|s| SessionId::of(s).unwrap() == b),
+        "{claimants:?}"
+    );
+    assert!(index.trailer_unknown(x) || index.trailer_ids(x) == [b]);
+    assert!(index.claimed_commits(a).is_empty());
+}
+
+/// Nennt der Trailer nur Sessions, die der Index nicht hält, erklärt
+/// niemand — und die Oberfläche sagt warum, statt still „0/N" zu zeigen.
+#[test]
+fn a_trailer_without_readable_sessions_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    std::fs::write(dir.path().join("a"), "a\n").unwrap();
+    git(dir.path(), &["add", "a"]);
+    let ghost = format!("b3-{}", "e".repeat(64));
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-qm",
+            &format!("ghost\n\nMinds-Session-Id: {ghost}"),
+        ],
+    );
+    let repo = Repo::open(dir.path()).unwrap();
+    let commit = repo.head().unwrap().commit().unwrap();
+    let index = Index::build(&repo, &store).unwrap();
+    assert_eq!(index.trailer_ids(commit).len(), 1);
+    let artifact = index.artifact(&repo, &[], commit);
+    assert_eq!(artifact.claimants, 0);
+    assert!(!artifact.inferred);
+    assert_eq!(
+        minds_reader::artifact::provenance_note(&artifact),
+        minds_reader::artifact::NO_CLAIMANT_NOTE
+    );
 }

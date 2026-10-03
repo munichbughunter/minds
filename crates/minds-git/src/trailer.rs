@@ -72,6 +72,22 @@ impl Repo {
         Ok(String::from_utf8_lossy(raw).into_owned())
     }
 
+    /// Wie [`Repo::message_of`], aber die gelesenen Bytes müssen zur
+    /// angefragten Id hashen — ein Ersatzobjekt (`refs/replace`) ist ein
+    /// Fehler, keine andere Message. Für Commits, deren Herkunft niemand
+    /// geprüft hat (etwa Schlüssel aus dem geteilten Store-Index).
+    pub fn verified_message_of(&self, commit: CommitId) -> Result<String> {
+        let object = self
+            .gix()
+            .find_commit(commit.to_gix())
+            .map_err(|err| GitError::read_object(commit, err))?;
+        crate::diff::verify_object(commit.to_gix(), gix::objs::Kind::Commit, &object.data)?;
+        let raw = object
+            .message_raw()
+            .map_err(|err| GitError::read_object(commit, err))?;
+        Ok(String::from_utf8_lossy(raw).into_owned())
+    }
+
     /// Alle über Trailer verlinkten [`SessionId`]s eines Commits, in
     /// Auftretens-Reihenfolge.
     ///

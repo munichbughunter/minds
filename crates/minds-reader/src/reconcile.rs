@@ -730,8 +730,9 @@ fn replace(original: &str, edit: &serde_json::Value) -> Result<String, Reason> {
 }
 
 impl crate::Index {
-    /// Reconcile only sessions linked to `commit` by this index. All blobs and
-    /// window-filtered witness observations are supplied by the caller.
+    /// Reconcile only the claimants of `commit` ([`crate::Index::claimants`]:
+    /// trailer sessions, store-index links only without a trailer). All blobs
+    /// and window-filtered witness observations are supplied by the caller.
     pub fn reconcile(
         &self,
         commit: CommitId,
@@ -740,11 +741,7 @@ impl crate::Index {
         observations: &[FsObservation],
         roots: &[&Path],
     ) -> Reconciliation {
-        let sessions: Vec<_> = self
-            .sessions_of(commit)
-            .iter()
-            .filter_map(|id| self.session(*id))
-            .collect();
+        let (sessions, _) = self.claimants(commit);
         reconcile(&ReconInput {
             commit,
             base,

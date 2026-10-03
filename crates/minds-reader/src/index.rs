@@ -184,10 +184,21 @@ pub struct Index {
     /// Store-Index-Kante sich selbst als `Observed` ausgeben kann; die Wahl
     /// der Claimants (EA-03) folgt nur dem Commit-Text, wie `minds verify`.
     trailers: BTreeMap<CommitId, Vec<SessionId>>,
+    /// Position im Revwalk ab HEAD (0 = HEAD) — für eine Reihenfolge
+    /// „neueste zuerst"; Commits außerhalb von HEAD fehlen hier.
+    order: BTreeMap<CommitId, usize>,
+    /// Commits, deren Message nicht gelesen werden konnte: Ob ein Trailer
+    /// existiert, ist unbekannt — sie haben keine Claimants (fail-closed).
+    trailer_unknown: BTreeSet<CommitId>,
     degraded: Vec<Degraded>,
     commits_total: u64,
     covered: u64,
 }
+
+/// Höchstens so viele Zeichen trägt der Betreff eines Commits außerhalb von
+/// HEAD — sein Schlüssel kommt aus dem geteilten Store-Index, der Betreff
+/// landet im geteilten HTML.
+const SUBJECT_CAP: usize = 200;
 
 impl Index {
     /// Zieht Sessions, Trailer und den Store-Index aus Store und Repository.
@@ -235,8 +246,9 @@ impl Index {
         //    Commit einmal gelesen; Session-Ids, Change-Id und Betreff kommen
         //    aus demselben Text.
         if let Some(head) = repo.head()?.commit() {
-            for commit in repo.revwalk(head)? {
+            for (position, commit) in repo.revwalk(head)?.enumerate() {
                 let commit = commit?;
+                index.order.insert(commit, position);
                 index.commits_total += 1;
                 let message = repo.message_of(commit)?;
                 let mut covered = false;
@@ -266,6 +278,16 @@ impl Index {
             let Ok(commit) = hex.parse::<CommitId>() else {
                 continue;
             };
+            // Ein Commit außerhalb von HEAD (Seitenzweig, umgeschrieben):
+            // Seinen Trailer liest der Revwalk nicht. Gelesen wird er hier,
+            // einmal je Commit — sonst gälte er als trailerlos, und eine
+            // Store-Kante (geteilter Ref) wählte die Claimants (EA-03).
+            if !index.order.contains_key(&commit)
+                && !index.trailers.contains_key(&commit)
+                && !index.trailer_unknown.contains(&commit)
+            {
+                index.read_outside_trailer(repo, commit);
+            }
             for link in links {
                 if index.sessions.contains_key(&link.session) {
                     index.link(commit, link.session, link.evidence);
@@ -351,6 +373,42 @@ impl Index {
     pub fn with_tampered_seal(mut self, id: SessionId) -> Self {
         self.seal_tampered.insert(id);
         self
+    }
+
+    /// Liest Trailer und Betreff eines Commits, den der Revwalk ab HEAD
+    /// nicht erreicht. Fail-closed: Fehlt er im Klon (noch nicht geholt,
+    /// anderes Hash-Format), ist seine Message unlesbar oder ist er durch ein
+    /// Ersatzobjekt verdeckt, bleibt der Trailer **unbekannt** — nie „ohne
+    /// Trailer", sonst wählte eine Store-Kante die Claimants.
+    fn read_outside_trailer(&mut self, repo: &Repo, commit: CommitId) {
+        let message = match repo.has_commit(commit) {
+            true => repo.verified_message_of(commit).ok(),
+            false => None,
+        };
+        let Some(message) = message else {
+            self.trailer_unknown.insert(commit);
+            return;
+        };
+        // Gelesen ist gelesen — auch ohne Trailer; weitere Schlüssel, die auf
+        // denselben Commit zeigen (andere Schreibweise), lesen nicht erneut.
+        self.trailers.entry(commit).or_default();
+        // Wie im Revwalk: Der Trailer ist verbindlich — die genannten
+        // Sessions hängen beobachtet an diesem Commit, auch außerhalb von HEAD.
+        for id in Trailer::session_ids(&message) {
+            push_unique(self.trailers.entry(commit).or_default(), id);
+            if self.sessions.contains_key(&id) {
+                self.link(commit, id, EvidenceMark::of(EvidenceSource::Observed));
+            }
+        }
+        // Keine Change-Id: Ein Commit außerhalb von HEAD ist oft der alte
+        // Stand eines umgeschriebenen — er soll dem gemergten keine Change
+        // streitig machen.
+        // Gekappt: Der Schlüssel kommt aus dem geteilten Store-Index, der
+        // Betreff landet im geteilten HTML.
+        if let Some(subject) = message.lines().map(str::trim).find(|l| !l.is_empty()) {
+            let subject: String = subject.chars().take(SUBJECT_CAP).collect();
+            self.subjects.insert(commit, sanitize(&subject));
+        }
     }
 
     /// Trägt eine Kante ein; ein besserer Beleg ersetzt einen schwächeren,
@@ -760,6 +818,17 @@ impl Index {
     /// die der Index nicht hält. Leer ohne Trailer.
     pub fn trailer_ids(&self, commit: CommitId) -> &[SessionId] {
         self.trailers.get(&commit).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Ob die Message dieses Commits unlesbar war — dann ist unbekannt, ob
+    /// ein Trailer existiert.
+    pub fn trailer_unknown(&self, commit: CommitId) -> bool {
+        self.trailer_unknown.contains(&commit)
+    }
+
+    /// Die Position im Revwalk ab HEAD (0 = HEAD); `None` außerhalb.
+    pub fn position(&self, commit: CommitId) -> Option<usize> {
+        self.order.get(&commit).copied()
     }
 
     /// Die Sessions, deren Trailer an diesem Commit stehen.
