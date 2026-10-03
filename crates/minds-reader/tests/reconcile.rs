@@ -922,3 +922,131 @@ fn removals_made_by_the_agent_are_not_reported_as_unobserved() {
     assert_eq!(lines(&result.files[0]), [(3, Unexplained)]);
     assert!(!result.files[0].removes);
 }
+
+/// EA-03: der I/O-Pfad des Readers über einen echten Commit — Abgleich,
+/// Datei- und Session-Seite — strikt lesend.
+#[test]
+fn artifact_and_render_mark_the_human_line_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let redacted = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_session(session(vec![
+            write("a", "one\ntwo\nthree\n"),
+            write("b", "three\n"),
+        ]))
+        .unwrap();
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let id = store.put(&redacted).unwrap().id();
+    std::fs::write(dir.path().join("a"), "one\nHUMAN\nthree\n").unwrap();
+    std::fs::write(dir.path().join("b"), "three\n").unwrap();
+    git(dir.path(), &["add", "a", "b"]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-qm",
+            &format!("fixture\n\nMinds-Session-Id: {id}"),
+        ],
+    );
+    let repo = Repo::open(dir.path()).unwrap();
+    let commit = repo.head().unwrap().commit().unwrap();
+    // Eine Store-Index-Kante, die sich selbst `Observed` nennt und den
+    // menschlichen Stand „erklären" würde: Der Trailer entscheidet, nicht der
+    // geteilte Ref.
+    let forged = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_session(session(vec![write("a", "one\nHUMAN\nthree\n")]))
+        .unwrap();
+    let forged = store.put(&forged).unwrap().id();
+    store
+        .link(
+            forged,
+            &commit.to_string(),
+            minds_core::EvidenceMark::of(minds_core::EvidenceSource::Observed),
+        )
+        .unwrap();
+    let before_refs = git(dir.path(), &["show-ref"]);
+    let before = snapshot(dir.path());
+
+    let index = Index::build(&repo, &store).unwrap();
+    assert_eq!(index.sessions_of(commit).len(), 2);
+    let (claimants, inferred) = index.claimants(commit);
+    assert_eq!(claimants.len(), 1);
+    assert!(!inferred);
+    assert_eq!(SessionId::of(claimants[0]).unwrap(), id);
+    // Die nur per Index verknüpfte Session nimmt am Abgleich nicht teil.
+    assert!(index.claimed_commits(forged).is_empty());
+    assert_eq!(index.claimed_commits(id), [commit]);
+    let spellings = minds_reader::artifact::roots_of(&repo);
+    let roots: Vec<&Path> = spellings.iter().map(|p| p.as_path()).collect();
+    let artifact = index.artifact(&repo, &roots, commit);
+    assert_eq!(artifact.subject.as_deref(), Some("fixture"));
+    let minds_reader::artifact::ArtifactState::Assessed(assessed) = &artifact.state else {
+        panic!("{artifact:?}");
+    };
+    assert_eq!(
+        minds_reader::artifact::summary(&assessed.recon),
+        "artifact 3/4 lines explained"
+    );
+    assert_eq!(assessed.recon.files[0].unexplained_ranges(), [(2, 2)]);
+    assert_eq!(
+        assessed.recon.files[0].note(),
+        "line 2 not observed in the session"
+    );
+    assert_eq!(assessed.recon.files[1].class, ReportedOnly);
+    assert_eq!(artifact, index.artifact(&repo, &roots, commit));
+
+    // Die Seite: außerhalb des Repos geschrieben.
+    let out = tempfile::tempdir().unwrap();
+    minds_reader::render(&repo, &store, out.path()).unwrap();
+    let page = std::fs::read_to_string(out.path().join("a.html")).unwrap();
+    let marked: Vec<&str> = page
+        .lines()
+        .filter(|l| l.contains(" unexplained\""))
+        .collect();
+    assert_eq!(marked.len(), 1, "{page}");
+    assert!(marked[0].contains("</span>2</span><code>HUMAN"), "{page}");
+    assert!(page.contains("class=\"recon-legend\""));
+    // b ist voll belegt: keine Markierung, keine Legende.
+    let page = std::fs::read_to_string(out.path().join("b.html")).unwrap();
+    assert!(!page.contains(" unexplained\""), "{page}");
+    assert!(!page.contains("class=\"recon-legend\""), "{page}");
+    // Die Seite der Trailer-Session trägt den Abgleich; die nur per Index
+    // verknüpfte nicht.
+    let page_of = |id: SessionId| {
+        let short: String = id
+            .to_string()
+            .trim_start_matches("b3-")
+            .chars()
+            .take(12)
+            .collect();
+        std::fs::read_to_string(out.path().join(format!("session-{short}.html"))).unwrap()
+    };
+    assert!(!page_of(forged).contains("class=\"artifact\""));
+    let session_page = page_of(id);
+    assert!(
+        session_page.contains("artifact 3/4 lines explained"),
+        "{session_page}"
+    );
+    assert!(session_page.contains("<tr class=\"add unexplained\">"));
+
+    assert_eq!(before_refs, git(dir.path(), &["show-ref"]));
+    assert_eq!(
+        before,
+        snapshot(dir.path()),
+        "no file or Git object may be written"
+    );
+}
+
+/// Ohne Trailer zählen die Store-Index-Kanten — als vermutet benannt.
+#[test]
+fn claimants_without_a_trailer_are_inferred() {
+    let s = session(vec![write("a", "text\n")]);
+    let id = SessionId::of(&s).unwrap();
+    let index = Index::from_parts(BTreeMap::from([(id, s)]), BTreeMap::new());
+    let (claimants, inferred) = index.claimants(commit());
+    assert!(claimants.is_empty() && !inferred);
+}

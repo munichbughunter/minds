@@ -1790,12 +1790,14 @@ dependencies = [
 name = "minds-tui"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "crossterm",
  "minds-core",
  "minds-git",
  "minds-metrics",
  "minds-reader",
  "ratatui",
+ "serde_json",
  "tempfile",
 ]
 

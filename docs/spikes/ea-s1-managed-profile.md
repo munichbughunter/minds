@@ -11,7 +11,8 @@ cannot supply the missing boundary.
 
 Recorded 2026-10-02, repository baseline `f4c31a1`. No production code or
 `minds enable` changes. [ADR-0012](../adr/0012-witnessed-evidence.md#addendum-ea-s1)
-records the same decision. Its original proposed status is unchanged.
+records the same decision. The ADR was proposed when this spike was recorded;
+EA-04 subsequently accepted it without lifting the A1 cap.
 
 Blocking results and open requirements:
 

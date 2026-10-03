@@ -49,5 +49,7 @@ pub mod evidence;
 
 pub mod reconcile;
 
+pub mod artifact;
+
 mod query;
 pub use query::{Inspection, touches};

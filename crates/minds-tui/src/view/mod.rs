@@ -113,8 +113,17 @@ fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
             id,
             report,
             uninterpreted,
+            artifacts,
             cursor,
-        } => evidence::draw(frame, area, *id, report.as_ref(), *uninterpreted, *cursor),
+        } => evidence::draw(
+            frame,
+            area,
+            *id,
+            report.as_ref(),
+            *uninterpreted,
+            artifacts,
+            *cursor,
+        ),
     }
 }
 

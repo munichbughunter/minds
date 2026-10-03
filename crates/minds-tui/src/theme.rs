@@ -12,6 +12,7 @@ use minds_core::{EvidenceMark, EvidenceSource, EvidenceStatus};
 use minds_reader::graph::{NodeKind, ToolKind};
 use minds_reader::model::Verdict;
 use minds_reader::model::{EvidenceVerdict, Provenance};
+use minds_reader::reconcile::ReconClass;
 use ratatui::style::{Color, Modifier, Style};
 
 /// Mensch und Absicht.
@@ -119,6 +120,29 @@ pub fn claim() -> (&'static str, &'static str, Style) {
         "CLAIM",
         Style::default().fg(HUMAN).add_modifier(Modifier::DIM),
     )
+}
+
+/// Glyph, Wort und Stil einer Reconciliation-Klasse (EA-03). Unerklärt ist
+/// **nie** ein Fehler: kein Rot, sondern der neutrale Stil von
+/// [`not_observed`] — eine Stelle ohne Beleg ist nicht beobachtet, nicht
+/// falsch.
+pub fn recon(class: ReconClass) -> (&'static str, &'static str, Style) {
+    match class {
+        ReconClass::Explained => ("●", class.word(), Style::default().fg(OK)),
+        ReconClass::ExplainedFsOnly => ("◍", class.word(), Style::default().fg(OK)),
+        // Ein Tool-Claim ohne Zeugen: belegt, aber nur berichtet.
+        ReconClass::ReportedOnly => ("◇", class.word(), Style::default()),
+        ReconClass::Unexplained => {
+            let (glyph, _, style) = not_observed();
+            (glyph, class.word(), style)
+        }
+    }
+}
+
+/// Der neutrale Zustand „in der Session nicht beobachtet" — Glyph, Wort und
+/// Stil. Gedimmt wie alles Sekundäre, nie in einer Warn- oder Fehlerfarbe.
+pub fn not_observed() -> (&'static str, &'static str, Style) {
+    ("◦", "not observed", Style::default().fg(DIM))
 }
 
 /// Glyph, Wort und Stil eines Verdicts.

@@ -179,6 +179,11 @@ pub struct Index {
     /// Kanten (`Endpoint::Session`).
     locals: BTreeMap<(String, String), SessionId>,
     observed: BTreeSet<SessionId>,
+    /// Die Session-Ids, die der **Trailer** eines Commits nennt — auch
+    /// solche, die der Index nicht hält. Getrennt von `evidence`, weil eine
+    /// Store-Index-Kante sich selbst als `Observed` ausgeben kann; die Wahl
+    /// der Claimants (EA-03) folgt nur dem Commit-Text, wie `minds verify`.
+    trailers: BTreeMap<CommitId, Vec<SessionId>>,
     degraded: Vec<Degraded>,
     commits_total: u64,
     covered: u64,
@@ -236,6 +241,7 @@ impl Index {
                 let message = repo.message_of(commit)?;
                 let mut covered = false;
                 for id in Trailer::session_ids(&message) {
+                    push_unique(index.trailers.entry(commit).or_default(), id);
                     covered |= known.contains(&id);
                     if index.sessions.contains_key(&id) {
                         index.link(commit, id, EvidenceMark::of(EvidenceSource::Observed));
@@ -298,6 +304,7 @@ impl Index {
             for id in ids {
                 if index.sessions.contains_key(&id) {
                     index.link(commit, id, EvidenceMark::of(EvidenceSource::Observed));
+                    push_unique(index.trailers.entry(commit).or_default(), id);
                     any = true;
                 }
             }
@@ -747,6 +754,12 @@ impl Index {
     /// Alle Sessions, nach Id sortiert (die Ordnung von [`SessionId`]).
     pub fn sessions(&self) -> impl Iterator<Item = (&SessionId, &Session)> {
         self.sessions.iter()
+    }
+
+    /// Die Session-Ids, die der Trailer dieses Commits nennt — auch solche,
+    /// die der Index nicht hält. Leer ohne Trailer.
+    pub fn trailer_ids(&self, commit: CommitId) -> &[SessionId] {
+        self.trailers.get(&commit).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Die Sessions, deren Trailer an diesem Commit stehen.

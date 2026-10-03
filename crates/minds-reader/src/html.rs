@@ -25,13 +25,15 @@
 //! Code, statt dass die Seite leer wirkt — progressive Verbesserung, keine
 //! Voraussetzung.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use minds_core::{EffectKind, Role, Session, SessionId, ToolCall};
 use minds_git::{CommitDiff, DiffFile, DiffKind, DiffLine};
 
+use crate::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, provenance_note, summary};
 use crate::file::FileView;
 use crate::index::Index;
+use crate::reconcile::ReconClass;
 use crate::summary::Summary;
 
 /// Eine Datei in der Übersicht: wohin sie zeigt und wie viel Kontext sie trägt.
@@ -65,7 +67,12 @@ pub fn page(title: &str, body: &str) -> String {
 
 /// Die Seite einer Datei: links der Code mit klickbaren Zeilen, rechts die
 /// Session hinter der angeklickten Zeile.
-pub fn file_page(view: &FileView, index: &Index) -> String {
+///
+/// `unexplained` sind die Zeilennummern (1-basiert, in dieser Fassung), die
+/// der Abgleich ihres Commits als unerklärt führt (EA-03): Sie tragen im
+/// Rand die Markierung „not observed in the session" — eine CSS-Klasse plus
+/// Text für Screenreader, kein Skript, keine Fehlerfarbe.
+pub fn file_page(view: &FileView, index: &Index, unexplained: &BTreeSet<u32>) -> String {
     let attributed = view.attributed_lines();
     let total = view.lines.len();
     let pct = (attributed * 100).checked_div(total).unwrap_or(0);
@@ -76,6 +83,7 @@ pub fn file_page(view: &FileView, index: &Index) -> String {
            <div class=\"attrbar\" title=\"{pct}% of lines with captured agent context\">\
              <div class=\"attrbar-fill\" style=\"width:{pct}%\"></div></div>\n\
            <p class=\"meta\">{attributed} of {total} lines with captured context · {pct}% agent</p>\n\
+           {legend}\
          </header>\n\
          <main class=\"split\">\n\
            <div class=\"code\">{code}</div>\n\
@@ -85,7 +93,12 @@ pub fn file_page(view: &FileView, index: &Index) -> String {
            </aside>\n\
          </main>\n",
         path = escape(&view.path),
-        code = code_block(view),
+        legend = if unexplained.is_empty() {
+            String::new()
+        } else {
+            legend()
+        },
+        code = code_block(view, unexplained),
         panels = panels_for(view, index),
     );
     page(&view.path, &body)
@@ -94,10 +107,15 @@ pub fn file_page(view: &FileView, index: &Index) -> String {
 /// Der Codeblock: je Zeile eine Zeilennummer und der Text. Zeilen mit Kontext
 /// tragen `data-sessions` und werden dadurch klickbar. Der Text läuft durch das
 /// Highlighting (U.7) — das jedes Token **einzeln escaped**, die XSS-Zusage bleibt.
-fn code_block(view: &FileView) -> String {
+fn code_block(view: &FileView, unexplained: &BTreeSet<u32>) -> String {
     let lang = lang_of(&view.path);
     let mut out = String::new();
     for line in &view.lines {
+        let (extra, mark) = if unexplained.contains(&line.number) {
+            (" unexplained", gutter_mark())
+        } else {
+            ("", "")
+        };
         let ids = line
             .sessions
             .iter()
@@ -113,9 +131,9 @@ fn code_block(view: &FileView) -> String {
                 format!("Show the {count} sessions behind this line")
             };
             out.push_str(&format!(
-                "<div class=\"line has-context\" data-sessions=\"{ids}\" tabindex=\"0\" \
+                "<div class=\"line has-context{extra}\" data-sessions=\"{ids}\" tabindex=\"0\" \
                  role=\"button\" title=\"{title}\">\
-                 <span class=\"num\">{num}</span><code>{text}</code></div>\n",
+                 <span class=\"num\">{mark}{num}</span><code>{text}</code></div>\n",
                 ids = escape(&ids),
                 title = escape(&title),
                 num = line.number,
@@ -123,7 +141,7 @@ fn code_block(view: &FileView) -> String {
             ));
         } else {
             out.push_str(&format!(
-                "<div class=\"line\"><span class=\"num\">{num}</span><code>{text}</code></div>\n",
+                "<div class=\"line{extra}\"><span class=\"num\">{mark}{num}</span><code>{text}</code></div>\n",
                 num = line.number,
                 text = highlight(&line.text, lang.as_ref()),
             ));
@@ -469,12 +487,17 @@ fn effect_label(kind: EffectKind) -> &'static str {
 /// hierher und zeigt *alle* betroffenen Dateien samt Änderungen, nicht nur die
 /// erste. `file_href` verlinkt jede geänderte Datei — sofern der Reader eine
 /// Seite für sie gebaut hat — auf ihre zeilenweise Ansicht.
+///
+/// `artifacts` ist der Abgleich der Commits (EA-03): je Commit die
+/// Zusammenfassung und die Dateiliste über den Änderungen, und in den
+/// Diff-Zeilen sind unerklärte Zeilen im Rand markiert.
 pub fn session_page(
     id: SessionId,
     session: &Session,
     diffs: &[CommitDiff],
     inferred: bool,
     file_href: &BTreeMap<String, String>,
+    artifacts: &[CommitArtifact],
 ) -> String {
     let summary = Summary::of(id, session);
     let changed: usize = diffs.iter().map(|d| d.files.len()).sum();
@@ -487,19 +510,25 @@ pub fn session_page(
          </header>\n\
          <main class=\"session-view\">\n\
            {panel}\
+           {artifact}\
            <h2 class=\"changes-h\">Changes</h2>\n\
            {changes}\n\
          </main>\n",
         headline = escape(&summary.headline),
         actor = escape(&summary.actor),
         panel = session_panel(id, session, inferred),
-        changes = changes_html(diffs, file_href),
+        artifact = artifact_section(artifacts),
+        changes = changes_html(diffs, file_href, artifacts),
     );
     page(&summary.headline, &body)
 }
 
 /// Alle Datei-Änderungen einer Session, jede in einem aufklappbaren Block.
-fn changes_html(diffs: &[CommitDiff], file_href: &BTreeMap<String, String>) -> String {
+fn changes_html(
+    diffs: &[CommitDiff],
+    file_href: &BTreeMap<String, String>,
+    artifacts: &[CommitArtifact],
+) -> String {
     let total: usize = diffs.iter().map(|d| d.files.len()).sum();
     if total == 0 {
         return "<p class=\"empty\">No change attributed to a commit — \
@@ -508,16 +537,139 @@ fn changes_html(diffs: &[CommitDiff], file_href: &BTreeMap<String, String>) -> S
     }
     let mut out = String::new();
     for diff in diffs {
+        let recon = artifacts
+            .iter()
+            .find(|a| a.commit == diff.commit)
+            .and_then(|a| match &a.state {
+                ArtifactState::Assessed(assessed) => Some(&assessed.recon),
+                _ => None,
+            });
         for file in &diff.files {
-            out.push_str(&diff_file_html(file, file_href));
+            // Zugeordnet über den Pfad. Weichen die Schreibweisen der beiden
+            // Git-Aufrufe ab (nicht als UTF-8 lesbare Pfade), bleibt die
+            // Datei unmarkiert — keine Markierung statt einer falschen.
+            let unexplained = recon
+                .and_then(|r| r.files.iter().find(|f| f.path == file.path))
+                .map(|f| f.unexplained_set())
+                .unwrap_or_default();
+            out.push_str(&diff_file_html(file, file_href, &unexplained));
         }
     }
     out
 }
 
+/// Die Randmarkierung einer unerklärten Zeile: ein neutrales Zeichen (nur
+/// Optik, für Screenreader verborgen) und der Text für Screenreader.
+fn gutter_mark() -> &'static str {
+    "<span class=\"recon-mark\" aria-hidden=\"true\">◦</span>\
+     <span class=\"sr-only\">not observed in the session: </span>"
+}
+
+/// Die Legende zur Randmarkierung.
+fn legend() -> String {
+    format!(
+        "<p class=\"recon-legend\"><span class=\"recon-mark\" aria-hidden=\"true\">◦</span> \
+         {NOT_OBSERVED}</p>\n"
+    )
+}
+
+/// Die CSS-Klasse einer Reconciliation-Klasse.
+fn recon_class(class: ReconClass) -> &'static str {
+    match class {
+        ReconClass::Explained => "explained",
+        ReconClass::ExplainedFsOnly => "explained-fs-only",
+        ReconClass::ReportedOnly => "reported-only",
+        ReconClass::Unexplained => "unexplained",
+    }
+}
+
+/// Der Abgleich der Commits einer Session (EA-03): je Commit die
+/// Zusammenfassung `artifact X/Y lines explained` und die Dateiliste mit
+/// Klasse und unerklärten Zeilen. Statisch, ohne Skript; Pfade und Betreff
+/// sind fremdbestimmt und laufen durch [`escape`]. Leer ohne Commit.
+pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
+    if artifacts.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        String::from("<section class=\"artifact\">\n<h2 class=\"changes-h\">Artifact</h2>\n");
+    for artifact in artifacts {
+        let short: String = artifact.commit.to_string().chars().take(7).collect();
+        let subject = artifact
+            .subject
+            .as_deref()
+            .map(|s| format!(" {}", escape(s)))
+            .unwrap_or_default();
+        let note = provenance_note(artifact);
+        let note = if note.is_empty() {
+            String::new()
+        } else {
+            format!(" <span class=\"recon-note\">· {}</span>", escape(&note))
+        };
+        out.push_str(&format!(
+            "<div class=\"recon-commit\">\n<p class=\"recon-head\"><code>{short}</code>{subject}{note}</p>\n"
+        ));
+        let assessed = match &artifact.state {
+            ArtifactState::Assessed(assessed) => assessed,
+            ArtifactState::Unavailable(why) => {
+                out.push_str(&format!(
+                    "<p class=\"recon-summary empty\">not assessed ({})</p>\n</div>\n",
+                    escape(why)
+                ));
+                continue;
+            }
+            ArtifactState::Failed(err) => {
+                out.push_str(&format!(
+                    "<p class=\"recon-summary empty\">not assessed (error: {})</p>\n</div>\n",
+                    escape(err)
+                ));
+                continue;
+            }
+        };
+        out.push_str(&format!(
+            "<p class=\"recon-summary\">{}</p>\n<ul class=\"recon-files\">\n",
+            summary(&assessed.recon)
+        ));
+        for file in &assessed.recon.files {
+            let unexplained = file.class == ReconClass::Unexplained;
+            let note = file.note();
+            out.push_str(&format!(
+                "<li class=\"recon-file {cls}\">{mark}<span class=\"recon-class\">{word}</span> \
+                 <code>{path}</code>{note}</li>\n",
+                cls = recon_class(file.class),
+                mark = if unexplained { gutter_mark() } else { "" },
+                word = file.class.word(),
+                path = escape(&crate::sanitize_path(&file.path)),
+                note = if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" <span class=\"recon-note\">{}</span>", escape(&note))
+                },
+            ));
+        }
+        for structural in &assessed.structural {
+            out.push_str(&format!(
+                "<li class=\"recon-file unexplained\">{mark}<span class=\"recon-class\">unexplained</span> \
+                 <code>{path}</code> <span class=\"recon-note\">{what} {NOT_OBSERVED}</span></li>\n",
+                mark = gutter_mark(),
+                path = escape(&crate::sanitize_path(&structural.path)),
+                what = structural.what,
+            ));
+        }
+        out.push_str("</ul>\n</div>\n");
+    }
+    out.push_str(&legend());
+    out.push_str("</section>\n");
+    out
+}
+
 /// Ein aufklappbarer Diff-Block für eine Datei — Kopf mit Pfad und Zähler,
 /// darunter die Zeilen. Große Diffs starten eingeklappt.
-fn diff_file_html(file: &DiffFile, file_href: &BTreeMap<String, String>) -> String {
+fn diff_file_html(
+    file: &DiffFile,
+    file_href: &BTreeMap<String, String>,
+    unexplained: &BTreeSet<u32>,
+) -> String {
     let name = match file_href.get(&file.path) {
         Some(href) => format!(
             "<a href=\"{href}\">{path}</a>",
@@ -533,7 +685,7 @@ fn diff_file_html(file: &DiffFile, file_href: &BTreeMap<String, String>) -> Stri
     } else {
         format!(
             "<div class=\"diff-body\"><table class=\"diff-table\">\n{rows}</table></div>\n",
-            rows = diff_rows_html(&file.lines),
+            rows = diff_rows_html(&file.lines, unexplained),
         )
     };
     format!(
@@ -550,7 +702,10 @@ fn diff_file_html(file: &DiffFile, file_href: &BTreeMap<String, String>) -> Stri
 
 /// Die Zeilen eines Datei-Diffs als Tabellenzeilen: zwei Nummern-Spalten (alt,
 /// neu) und der Code, eingefärbt nach [`DiffKind`].
-fn diff_rows_html(lines: &[DiffLine]) -> String {
+///
+/// Hinzugefügte Zeilen, die der Abgleich als unerklärt führt (`unexplained`,
+/// Nummern der neuen Fassung), tragen die Randmarkierung.
+fn diff_rows_html(lines: &[DiffLine], unexplained: &BTreeSet<u32>) -> String {
     let mut out = String::new();
     for line in lines {
         if line.kind == DiffKind::Hunk {
@@ -566,8 +721,15 @@ fn diff_rows_html(lines: &[DiffLine]) -> String {
             DiffKind::Removed => ("del", "-"),
             _ => ("ctx", " "),
         };
+        let marked =
+            line.kind == DiffKind::Added && line.new.is_some_and(|n| unexplained.contains(&n));
+        let (extra, mark) = if marked {
+            (" unexplained", gutter_mark())
+        } else {
+            ("", "")
+        };
         out.push_str(&format!(
-            "<tr class=\"{cls}\"><td class=\"ln\">{old}</td><td class=\"ln\">{new}</td>\
+            "<tr class=\"{cls}{extra}\"><td class=\"ln\">{old}</td><td class=\"ln\">{mark}{new}</td>\
              <td class=\"code\"><span class=\"sign\">{sign}</span>{text}</td></tr>\n",
             old = num(line.old),
             new = num(line.new),
@@ -894,7 +1056,7 @@ pub fn escape(text: &str) -> String {
 /// Das Stylesheet. Bewusst knapp und ohne Abhängigkeit; hell und dunkel über
 /// `prefers-color-scheme`.
 const STYLE: &str = "\
-:root{--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e;--hl-kw:#8250df;--hl-str:#0a7d33;--hl-num:#b35900;--hl-com:#6a737d}\
+:root{--ok:#2da44e;--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e;--hl-kw:#8250df;--hl-str:#0a7d33;--hl-num:#b35900;--hl-com:#6a737d}\
 @media(prefers-color-scheme:dark){:root{--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5;--hl-kw:#c678dd;--hl-str:#98c379;--hl-num:#d19a66;--hl-com:#8b949e}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}\
@@ -998,6 +1160,16 @@ details.tools>summary{cursor:pointer;font-size:.78rem;color:var(--dim)}\
 .hl-str{color:var(--hl-str)}\
 .hl-num{color:var(--hl-num)}\
 .hl-com{color:var(--hl-com);font-style:italic}\
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}\
+.recon-mark{color:var(--dim);margin-right:.25rem;user-select:none}\
+.unexplained .num,.diff-table tr.unexplained td.ln:nth-child(2){text-decoration:underline dotted var(--dim)}\
+.recon-legend{margin:.35rem 0 0;color:var(--dim);font-size:.8rem}\
+.recon-head{margin:.5rem 0 .1rem;font-size:.9rem}\
+.recon-summary{margin:0 0 .3rem;font-family:ui-monospace,monospace;font-size:.9rem}\
+.recon-files{list-style:none;padding:0;margin:0 0 .5rem;display:grid;gap:.15rem;font-size:.85rem}\
+.recon-class{display:inline-block;min-width:11rem;color:var(--dim)}\
+.recon-file.explained .recon-class,.recon-file.explained-fs-only .recon-class{color:var(--ok)}\
+.recon-note{color:var(--dim)}\
 .agent-badge{display:inline-block;font-size:.68rem;padding:.02rem .35rem;border-radius:.25rem;background:var(--mark);color:var(--accent);font-family:ui-monospace,monospace}\
 ";
 
@@ -1129,28 +1301,32 @@ mod tests {
     fn a_prompt_cannot_inject_markup() {
         // Prompts sind per Definition beliebiger Text — der wichtigste Test hier.
         let index = index_with("<img src=x onerror=alert(1)>");
-        let html = file_page(&view(), &index);
+        let html = file_page(&view(), &index, &BTreeSet::new());
         assert!(!html.contains("<img src=x"), "ungeschütztes Markup im HTML");
         assert!(html.contains("&lt;img src=x"));
     }
 
     #[test]
     fn an_attributed_line_is_clickable_and_carries_its_session() {
-        let html = file_page(&view(), &index_with("egal"));
+        let html = file_page(&view(), &index_with("egal"), &BTreeSet::new());
         assert!(html.contains("class=\"line has-context\""));
         assert!(html.contains(&format!("data-sessions=\"{}\"", sid('a'))));
     }
 
     #[test]
     fn a_plain_line_is_not_clickable() {
-        let html = file_page(&view(), &index_with("egal"));
+        let html = file_page(&view(), &index_with("egal"), &BTreeSet::new());
         // Zeile 2 hat keinen Blame-Eintrag und darf kein data-sessions tragen.
         assert!(html.contains("<div class=\"line\"><span class=\"num\">2</span>"));
     }
 
     #[test]
     fn the_panel_holds_the_intent_and_the_origin() {
-        let html = file_page(&view(), &index_with("Der Retry-Test flackert"));
+        let html = file_page(
+            &view(),
+            &index_with("Der Retry-Test flackert"),
+            &BTreeSet::new(),
+        );
         assert!(html.contains("Der Retry-Test flackert"));
         assert!(html.contains("claude-code"));
         assert!(html.contains("claude-opus-4"));
@@ -1161,7 +1337,7 @@ mod tests {
 
     #[test]
     fn the_page_is_self_contained() {
-        let html = file_page(&view(), &index_with("egal"));
+        let html = file_page(&view(), &index_with("egal"), &BTreeSet::new());
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("<style>"));
         assert!(html.contains("<script>"));
@@ -1189,7 +1365,7 @@ mod tests {
             &index,
         );
         assert!(!view.is_attributed(), "der verwaiste Verweis ist gefiltert");
-        let html = file_page(&view, &index);
+        let html = file_page(&view, &index, &BTreeSet::new());
         assert!(!html.contains("orphaned"));
     }
 
@@ -1262,7 +1438,7 @@ mod tests {
 
     #[test]
     fn the_file_page_shows_an_attribution_bar() {
-        let html = file_page(&view(), &index_with("egal"));
+        let html = file_page(&view(), &index_with("egal"), &BTreeSet::new());
         assert!(html.contains("class=\"attrbar\""));
         assert!(html.contains("% agent"));
     }
@@ -1315,7 +1491,14 @@ mod tests {
             ),
         ])];
         let empty = BTreeMap::new();
-        let html = session_page(sid('a'), &session("meine Absicht"), &diffs, false, &empty);
+        let html = session_page(
+            sid('a'),
+            &session("meine Absicht"),
+            &diffs,
+            false,
+            &empty,
+            &[],
+        );
 
         // Beide Dateien tauchen auf, jede in einem aufklappbaren Block.
         assert!(html.contains(".claude/settings.json"));
@@ -1336,14 +1519,14 @@ mod tests {
         )])];
         let mut file_href = BTreeMap::new();
         file_href.insert("src/x.rs".to_string(), "src-x.rs.html".to_string());
-        let html = session_page(sid('a'), &session("egal"), &diffs, false, &file_href);
+        let html = session_page(sid('a'), &session("egal"), &diffs, false, &file_href, &[]);
         assert!(html.contains("href=\"src-x.rs.html\""));
     }
 
     #[test]
     fn a_session_without_a_commit_says_so() {
         let empty = BTreeMap::new();
-        let html = session_page(sid('a'), &session("nur Absicht"), &[], false, &empty);
+        let html = session_page(sid('a'), &session("nur Absicht"), &[], false, &empty, &[]);
         assert!(html.contains("nur Absicht"));
         assert!(html.contains("No change attributed to a commit"));
     }
@@ -1360,7 +1543,7 @@ mod tests {
             )],
         )])];
         let empty = BTreeMap::new();
-        let html = session_page(sid('a'), &session("egal"), &diffs, false, &empty);
+        let html = session_page(sid('a'), &session("egal"), &diffs, false, &empty, &[]);
         assert!(!html.contains("<script>alert(1)"));
         assert!(html.contains("&lt;script&gt;"));
     }
@@ -1550,7 +1733,11 @@ mod tests {
     fn the_page_is_readable_without_javascript() {
         // Die Panels werden sichtbar ausgeliefert; erst das Skript versteckt
         // sie. Stünde `hidden` schon im Markup, wäre die Seite ohne JS leer.
-        let html = file_page(&view(), &index_with("Der Retry-Test flackert"));
+        let html = file_page(
+            &view(),
+            &index_with("Der Retry-Test flackert"),
+            &BTreeSet::new(),
+        );
         assert!(
             !html.contains("class=\"session\" id=\"s-") || !html.contains("\" hidden>"),
             "Panels dürfen nicht als hidden ausgeliefert werden"
@@ -1563,8 +1750,207 @@ mod tests {
 
     #[test]
     fn an_attributed_line_announces_itself() {
-        let html = file_page(&view(), &index_with("egal"));
+        let html = file_page(&view(), &index_with("egal"), &BTreeSet::new());
         assert!(html.contains("role=\"button\""));
         assert!(html.contains("Show the session behind this line"));
+    }
+
+    // -----------------------------------------------------------------------
+    // EA-03: der Abgleich auf der Seite
+
+    use crate::artifact::Assessed;
+    use crate::reconcile::{FileRecon, LineLevel, LineRecon, Reconciliation};
+
+    fn recon_file(path: &str, class: ReconClass, lines: &[(u32, ReconClass)]) -> FileRecon {
+        FileRecon {
+            path: path.into(),
+            class,
+            line_level: LineLevel::Available(
+                lines
+                    .iter()
+                    .map(|&(line, class)| LineRecon { line, class })
+                    .collect(),
+            ),
+            committed: minds_core::ContentHash::from_bytes([0; 32]),
+            deleted: false,
+            changed_lines: lines.len() as u64,
+            removes: false,
+            last_observed: None,
+        }
+    }
+
+    /// Eine erklärte und eine unerklärte Datei — der Commit aus EA-01 mit
+    /// der menschlichen Zeile.
+    fn two_files() -> CommitArtifact {
+        use ReconClass::*;
+        CommitArtifact {
+            commit: cid('1'),
+            subject: Some("write <the> files".into()),
+            inferred: false,
+            claimants: 1,
+            state: ArtifactState::Assessed(Assessed {
+                recon: Reconciliation {
+                    commit: cid('1'),
+                    base: None,
+                    files: vec![
+                        recon_file(
+                            "src/a.rs",
+                            Unexplained,
+                            &[(1, Explained), (2, Unexplained), (3, Explained)],
+                        ),
+                        recon_file("src/b.rs", Explained, &[(1, Explained)]),
+                    ],
+                    explained_lines: 3,
+                    total_changed_lines: 4,
+                },
+                structural: Vec::new(),
+            }),
+        }
+    }
+
+    /// Golden: die eingefrorene Form der Artefakt-Sektion. Statisch, ohne
+    /// Skript; die Markierung ist Klasse plus Screenreader-Text; der Betreff
+    /// ist escaped.
+    #[test]
+    fn the_artifact_section_matches_the_golden_html() {
+        let html = artifact_section(&[two_files()]);
+        let golden = "\
+<section class=\"artifact\">
+<h2 class=\"changes-h\">Artifact</h2>
+<div class=\"recon-commit\">
+<p class=\"recon-head\"><code>1111111</code> write &lt;the&gt; files</p>
+<p class=\"recon-summary\">artifact 3/4 lines explained</p>
+<ul class=\"recon-files\">
+<li class=\"recon-file unexplained\"><span class=\"recon-mark\" aria-hidden=\"true\">◦</span><span class=\"sr-only\">not observed in the session: </span><span class=\"recon-class\">unexplained</span> <code>src/a.rs</code> <span class=\"recon-note\">line 2 not observed in the session</span></li>
+<li class=\"recon-file explained\"><span class=\"recon-class\">explained</span> <code>src/b.rs</code></li>
+</ul>
+</div>
+<p class=\"recon-legend\"><span class=\"recon-mark\" aria-hidden=\"true\">◦</span> not observed in the session</p>
+</section>
+";
+        assert_eq!(html, golden);
+        // Der Golden-Text selbst, eingefroren über seinen Hash.
+        assert_eq!(
+            blake3::hash(golden.as_bytes()).to_hex().as_str(),
+            GOLDEN_ARTIFACT_HASH
+        );
+    }
+
+    const GOLDEN_ARTIFACT_HASH: &str =
+        "4d06ba9bb7b46993b6408a5e21e99311deadfd2e3a5cbc38e593a147aba68eb1";
+
+    /// Unerklärt ist nie ein Fehler: Die Regeln der Markierung benutzen nur
+    /// die neutrale Farbe, nie `--warn`.
+    #[test]
+    fn the_unexplained_marker_is_never_styled_as_an_error() {
+        for rule in STYLE
+            .split('}')
+            .filter(|r| r.contains("recon") || r.contains("unexplained"))
+        {
+            assert!(!rule.contains("--warn"), "{rule}");
+            assert!(!rule.contains("#b3261e"), "{rule}");
+        }
+        assert!(STYLE.contains(".sr-only{"));
+    }
+
+    #[test]
+    fn the_session_page_marks_unexplained_lines_in_the_diff_gutter() {
+        let diffs = vec![diff_of(vec![changed_file(
+            "src/a.rs",
+            vec![
+                line(DiffKind::Added, None, Some(1), "one"),
+                line(DiffKind::Added, None, Some(2), "HUMAN"),
+                line(DiffKind::Added, None, Some(3), "three"),
+            ],
+        )])];
+        let html = session_page(
+            sid('a'),
+            &session("egal"),
+            &diffs,
+            false,
+            &BTreeMap::new(),
+            &[two_files()],
+        );
+        assert!(html.contains("artifact 3/4 lines explained"), "{html}");
+        let marked: Vec<&str> = html
+            .lines()
+            .filter(|l| l.starts_with("<tr class=\"add unexplained\">"))
+            .collect();
+        assert_eq!(marked.len(), 1, "{html}");
+        assert!(marked[0].contains("not observed in the session: </span>2</td>"));
+        assert!(marked[0].contains("HUMAN"));
+        // Ohne Abgleich keine Sektion, keine Markierung.
+        let html = session_page(
+            sid('a'),
+            &session("egal"),
+            &diffs,
+            false,
+            &BTreeMap::new(),
+            &[],
+        );
+        assert!(!html.contains("class=\"artifact\""));
+        assert!(!html.contains("add unexplained"));
+    }
+
+    #[test]
+    fn the_file_page_marks_unexplained_lines_with_a_legend() {
+        let marked: BTreeSet<u32> = [1].into();
+        let html = file_page(&view(), &index_with("egal"), &marked);
+        assert!(
+            html.contains("class=\"line has-context unexplained\""),
+            "{html}"
+        );
+        assert!(
+            html.contains("<span class=\"sr-only\">not observed in the session: </span>1</span>")
+        );
+        assert!(html.contains("class=\"recon-legend\""));
+        // Ohne Markierung keine Legende.
+        let html = file_page(&view(), &index_with("egal"), &BTreeSet::new());
+        assert!(!html.contains("class=\"recon-legend\""));
+        assert!(!html.contains("recon-mark\" aria-hidden"));
+    }
+
+    #[test]
+    fn hostile_paths_cannot_inject_markup_into_the_artifact_section() {
+        let mut artifact = two_files();
+        if let ArtifactState::Assessed(a) = &mut artifact.state {
+            a.recon.files[0].path = "<script>alert(1)</script>".into();
+        }
+        let html = artifact_section(&[artifact]);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn inferred_and_shared_claims_are_named_in_the_head() {
+        let mut artifact = two_files();
+        artifact.inferred = true;
+        artifact.claimants = 2;
+        let html = artifact_section(&[artifact]);
+        assert!(html.contains(
+            "<span class=\"recon-note\">· claims of 2 sessions · claims from inferred links (no trailer)</span>"
+        ), "{html}");
+    }
+
+    #[test]
+    fn bidi_controls_in_paths_are_made_visible() {
+        let mut artifact = two_files();
+        if let ArtifactState::Assessed(a) = &mut artifact.state {
+            a.recon.files[0].path = "src/\u{202e}txt.exe".into();
+        }
+        let html = artifact_section(&[artifact]);
+        assert!(!html.contains('\u{202e}'), "{html}");
+    }
+
+    #[test]
+    fn an_unassessable_commit_says_why() {
+        let html = artifact_section(&[CommitArtifact {
+            commit: cid('2'),
+            subject: None,
+            inferred: false,
+            claimants: 0,
+            state: ArtifactState::Unavailable("first parent not in this clone (shallow)"),
+        }]);
+        assert!(html.contains("not assessed (first parent not in this clone (shallow))"));
     }
 }

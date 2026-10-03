@@ -93,7 +93,7 @@ minds search "retry backoff"
 minds inspect [<query> | <file>:<line>]
 ```
 
-Shows how a change came to be, in the terminal: a session list, the graph of a session (intent → agent → effects → change → review), and the why-chain of a line. On a terminal at least 120 columns wide the list stays in a left column and the graph of the session under the cursor is previewed on the right; `Enter`, `w` and `e` open Graph, Why and Evidence beside the list. Strictly read-only. When stdout is not a terminal, lines are emitted tab-separated for `grep`/`fzf`.
+Shows how a change came to be, in the terminal: a session list, the graph of a session (intent → agent → effects → change → review), and the why-chain of a line. On a terminal at least 120 columns wide the list stays in a left column and the graph of the session under the cursor is previewed on the right; `Enter`, `w` and `e` open Graph, Why and Evidence beside the list. Evidence mode includes an `ARTIFACT` section: the reconciliation of the commits that carry the session (`artifact X/Y lines explained`) and a per-file list where unexplained lines are named as `not observed in the session`. Strictly read-only. When stdout is not a terminal, lines are emitted tab-separated for `grep`/`fzf`.
 
 ```
 minds inspect src/main.rs:10
@@ -382,6 +382,8 @@ minds render [--out <directory>]
 ```
 
 Builds a static HTML site from the context (default `./site`): click a line to see the prompt behind it. Stateless.
+
+Each session page reconciles the commits the session takes part in — commits whose trailer names it, or, for commits without a trailer, those linked through the store index (then marked `claims from inferred links (no trailer)`). The reconciliation is per commit: when a trailer names several sessions, all their claims count (`claims of N sessions`), as in `minds verify <rev>`. The page shows `artifact 148/150 lines explained` and a per-file list (`explained`, `explained (fs only)`, `reported only`, `unexplained`). In the changes of the session and on a file page, unexplained lines carry a neutral gutter mark (`◦`, with a screen-reader label `not observed in the session`) — never an error colour. A file page marks lines only while the file at HEAD is byte-identical to the reconciled commit; otherwise the session page shows the marks in the commit's diff. No JavaScript required.
 
 ```
 minds render --out public

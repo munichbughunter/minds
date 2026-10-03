@@ -111,6 +111,27 @@ fn repo() -> (tempfile::TempDir, Repo) {
     (dir, repo)
 }
 
+/// Eine saubere, unsignierte Epoche für die Session `id`.
+fn clean_seal(id: SessionId) -> (minds_core::ContentHash, minds_core::evidence::Seal) {
+    let seal = minds_core::evidence::Seal {
+        root: minds_core::ContentHash::from_bytes([9u8; 32]),
+        agent: "claude-code".into(),
+        scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 4,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: minds_core::evidence::SealOutcome::Stored {
+            session: id.to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-07-25T14:10:00Z".into(),
+    };
+    let seal_id = minds_core::evidence::Seal::id_of_text(&seal.to_text().unwrap());
+    (seal_id, seal)
+}
+
 fn filled() -> Inspection {
     let mut sessions = BTreeMap::new();
     sessions.insert(
@@ -129,22 +150,7 @@ fn filled() -> Inspection {
     // Session a ist versiegelt (eine saubere Epoche) — Session b bewusst
     // nicht: Der Unterschied gehört zum Fixture, weil die Oberfläche ihn
     // aussprechen muss.
-    let seal = minds_core::evidence::Seal {
-        root: minds_core::ContentHash::from_bytes([9u8; 32]),
-        agent: "claude-code".into(),
-        scope: minds_core::evidence::SCOPE_AGENT_HOOKS_V1.into(),
-        first_seq: 0,
-        last_seq: 3,
-        events: 4,
-        gaps: 0,
-        pre_chain: 0,
-        outcome: minds_core::evidence::SealOutcome::Stored {
-            session: sid('a').to_string(),
-        },
-        previous: None,
-        last_event_at: "2026-07-25T14:10:00Z".into(),
-    };
-    let seal_id = minds_core::evidence::Seal::id_of_text(&seal.to_text().unwrap());
+    let (seal_id, seal) = clean_seal(sid('a'));
     let index = Index::from_parts(sessions, commits)
         .with_changes(changes)
         .with_seals(sid('a'), vec![(seal_id, seal, false)])
@@ -612,6 +618,13 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
         out.contains("Missing evidence does not prove that nothing happened"),
         "{out}"
     );
+
+    // ARTIFACT: Der Fixture-Commit existiert im leeren Repo nicht — der
+    // Abgleich ist ein ehrlicher Zustand, kein Absturz und kein Fehlerrot.
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(out.contains("ARTIFACT"), "{out}");
+    assert!(out.contains("not assessed (error"), "{out}");
 
     // EPOCHEN: die Kette als Zeitleiste, nicht abstrakt.
     app.reduce(Action::Down);
@@ -1150,4 +1163,259 @@ fn the_agent_cell_carries_its_own_color() {
     assert_eq!(buffer[(x, row)].style().fg, Some(expected));
     // Und es ist wirklich eine eigene Farbe, nicht die alte Einheitsfarbe.
     assert_ne!(buffer[(x, row)].style().fg, Some(crate::theme::AGENT));
+}
+
+// ---------------------------------------------------------------------------
+// EA-03: der Abgleich im Evidence-Mode, über die EA-01-Fixtures
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(args)
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Ein `Write`-Aufruf samt Schreibzeit-Hash — wie EA-01a ihn speichert.
+fn write_call(path: &str, text: &str) -> ToolCall {
+    ToolCall {
+        capture: None,
+        name: "Write".into(),
+        arguments: serde_json::json!({ "content": text }).to_string(),
+        effect: Some(Effect {
+            kind: EffectKind::Write,
+            path: Some(path.into()),
+            content: None,
+            written: Some(minds_core::ContentHash::from_bytes(
+                *blake3::hash(text.as_bytes()).as_bytes(),
+            )),
+            written_unavailable: None,
+        }),
+    }
+}
+
+/// Die EA-01-Fixtures als echter Commit: Die Session schreibt `a` und `b`;
+/// mit `human` ändert danach ein Mensch Zeile 2 von `a`.
+fn reconciled(human: bool) -> (tempfile::TempDir, Repo, Inspection) {
+    let (dir, _) = repo();
+    let a = if human {
+        "one\nHUMAN\nthree\n"
+    } else {
+        "one\ntwo\nthree\n"
+    };
+    std::fs::write(dir.path().join("a"), a).unwrap();
+    std::fs::write(dir.path().join("b"), "three\n").unwrap();
+    git(dir.path(), &["add", "a", "b"]);
+    git(dir.path(), &["commit", "-q", "-m", "write the files"]);
+    let head: CommitId = git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+
+    let mut s = session("Write the files", "2026-10-02T10:00:00Z");
+    s.turns[0].tool_calls = vec![
+        write_call("a", "one\ntwo\nthree\n"),
+        write_call("b", "three\n"),
+    ];
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), s);
+    let mut commits = BTreeMap::new();
+    commits.insert(head, vec![sid('a')]);
+    let (seal_id, seal) = clean_seal(sid('a'));
+    let index =
+        Index::from_parts(sessions, commits).with_seals(sid('a'), vec![(seal_id, seal, false)]);
+    let inspection = Inspection::from_index(index, vec![], "r");
+    let repo = Repo::open(dir.path()).unwrap();
+    (dir, repo, inspection)
+}
+
+/// Der Puffer samt Stilen — für die Probe, dass Unerklärtes nie rot ist.
+fn render_buffer(app: &mut App) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(WIDE, 30)).unwrap();
+    terminal.draw(|frame| super::draw(frame, app)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn evidence_mode_reconciles_a_human_line_as_not_observed() {
+    let (_dir, repo, inspection) = reconciled(true);
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    // Die Verdikt-Zeile: Zusammenfassung und Commit.
+    let row = out
+        .lines()
+        .find(|l| l.contains("ARTIFACT"))
+        .expect("ARTIFACT row");
+    assert!(row.contains("◦ ARTIFACT"), "{out}");
+    assert!(row.contains("artifact 3/4 lines explained · "), "{out}");
+
+    // Das Detail folgt dem Fokus: INTEGRITY → COVERAGE → ARTIFACT.
+    app.reduce(Action::Down);
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    let detail = detail_of(&out);
+    assert!(detail.contains(" ARTIFACT "), "{detail}");
+    assert!(detail.contains("artifact 3/4 lines explained"), "{detail}");
+    // Die Dateiliste, nach Pfad: a mit der menschlichen Zeile, b belegt.
+    let file_lines: Vec<&str> = detail
+        .lines()
+        .map(|l| {
+            // Der Rahmen des Detail-Blocks und das Zeilenende des Puffers.
+            l.trim_start()
+                .trim_start_matches('│')
+                .trim_end_matches('"')
+                .trim_end_matches('│')
+                .trim_end()
+        })
+        .filter(|l| l.starts_with("  ◦ ") || l.starts_with("  ◇ "))
+        .collect();
+    assert_eq!(
+        file_lines,
+        [
+            "  ◦ unexplained         a  line 2 not observed in the session",
+            "  ◇ reported only       b",
+        ],
+        "{detail}"
+    );
+    assert!(detail.contains("◦ not observed in the session"), "{detail}");
+
+    // Unerklärt ist nie ein Fehler: kein Rot, nirgends auf dem Schirm, und
+    // die Marke trägt den neutralen Stil.
+    let buffer = render_buffer(&mut app);
+    let (_, _, neutral) = crate::theme::not_observed();
+    let mut marks = 0;
+    let alarming = [
+        crate::theme::DELETE,
+        crate::theme::REVIEW,
+        ratatui::style::Color::Red,
+        ratatui::style::Color::LightRed,
+    ];
+    for cell in buffer.content() {
+        assert!(
+            !alarming.contains(&cell.fg),
+            "alarming cell {:?}",
+            cell.symbol()
+        );
+        if cell.symbol() == "◦" {
+            marks += 1;
+            assert_eq!(Some(cell.fg), neutral.fg);
+        }
+    }
+    assert!(marks >= 3, "row, file and legend carry the mark");
+}
+
+#[test]
+fn evidence_mode_shows_an_agent_only_commit_as_fully_explained() {
+    let (_dir, repo, inspection) = reconciled(false);
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    let row = out
+        .lines()
+        .find(|l| l.contains("ARTIFACT"))
+        .expect("ARTIFACT row");
+    // Belegt, aber nur berichtet: `◇`, nicht das grüne `✓` eines Zeugen.
+    assert!(row.contains("◇ ARTIFACT"), "{out}");
+    assert!(row.contains("artifact 4/4 lines explained"), "{out}");
+    app.reduce(Action::Down);
+    app.reduce(Action::Down);
+    let detail = detail_of(&render(&mut app));
+    assert!(detail.contains("◇ reported only       a"), "{detail}");
+    assert!(detail.contains("◇ reported only       b"), "{detail}");
+    assert!(!detail.contains("◦ unexplained"), "{detail}");
+}
+
+#[test]
+fn evidence_mode_without_a_commit_says_so() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Down); // Session b: an keinem Commit
+    let id = app.selected().unwrap().id;
+    assert!(app.inspection.index().commits_of(id).is_empty());
+    // Legacy zeigt keinen Abgleich ohne Commit — kein leeres Gerüst.
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(!out.contains("artifact "), "{out}");
+}
+
+#[test]
+fn a_legacy_session_still_shows_its_reconciliation() {
+    let (_dir, repo, inspection) = reconciled(true);
+    // Dieselbe Fixture ohne Seal: Der Abgleich hängt nicht an der Chain.
+    let index = inspection.index().clone();
+    let mut sessions = BTreeMap::new();
+    let mut commits = BTreeMap::new();
+    for (id, session) in index.sessions() {
+        sessions.insert(*id, session.clone());
+        for commit in index.commits_of(*id) {
+            commits.insert(commit, vec![*id]);
+        }
+    }
+    let inspection = Inspection::from_index(Index::from_parts(sessions, commits), vec![], "r");
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(out.contains(" SESSION · LEGACY "), "{out}");
+    assert!(out.contains("artifact 3/4 lines explained"), "{out}");
+    assert!(out.contains("line 2 not observed in the session"), "{out}");
+}
+
+#[test]
+fn hostile_and_overlong_paths_are_sanitized_and_capped() {
+    use minds_reader::artifact::{ArtifactState, Assessed, CommitArtifact};
+    use minds_reader::reconcile::{FileRecon, LineLevel, ReconClass, Reconciliation};
+    let long = format!("{}/x.rs", "d".repeat(100_000));
+    let files = ["evil\u{202e}txt.exe\u{1b}[2J", long.as_str()]
+        .into_iter()
+        .map(|path| FileRecon {
+            path: path.into(),
+            class: ReconClass::Unexplained,
+            line_level: LineLevel::Available(Vec::new()),
+            committed: minds_core::ContentHash::from_bytes([0; 32]),
+            deleted: false,
+            changed_lines: 0,
+            removes: false,
+            last_observed: None,
+        })
+        .collect();
+    let artifacts = vec![CommitArtifact {
+        commit: commit('1'),
+        subject: None,
+        inferred: true,
+        claimants: 1,
+        state: ArtifactState::Assessed(Assessed {
+            recon: Reconciliation {
+                commit: commit('1'),
+                base: None,
+                files,
+                explained_lines: 0,
+                total_changed_lines: 0,
+            },
+            structural: Vec::new(),
+        }),
+    }];
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let report = app.inspection.evidence_report(sid('a'));
+    app.views.push(View::Evidence {
+        id: sid('a'),
+        report,
+        uninterpreted: 0,
+        artifacts,
+        cursor: 2,
+    });
+    let out = render(&mut app);
+    assert!(!out.contains(['\u{1b}', '\u{202e}']), "{out}");
+    assert!(
+        out.contains("claims from inferred links (no trailer)"),
+        "{out}"
+    );
+    // Gekappt und von vorn gekürzt: genau eine Zeile trägt den Pfad, und
+    // sein Ende bleibt lesbar.
+    let long_lines: Vec<&str> = out.lines().filter(|l| l.contains("dddd")).collect();
+    assert_eq!(long_lines.len(), 1, "{out}");
+    assert!(long_lines[0].contains("…dddd") && long_lines[0].contains("/x.rs"));
 }

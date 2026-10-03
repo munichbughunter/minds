@@ -1,10 +1,17 @@
 # ADR-0012 — Witnessed Evidence: the agent does not write its own record
 
-- Status: proposed
-- Date: 2026-09-24
+- Status: accepted
+- Date: 2026-10-03
 - Affects: `minds-core`, `minds-capture`, `minds-attest`, `minds-reader`, `minds-gitlab`, `minds-cli`, `minds-tui`
-- Related: ADR-0003 (hooks over transcript parsing), ADR-0008 (signed attribution),
-  ADR-0011 (evidence chain); implementation plan: Track EA (evidence assurance)
+- Related: [ADR-0003](0003-hooks-over-transcript-parsing.md) (hooks over transcript parsing),
+  [ADR-0008](0008-signed-attribution.md) (signed attribution),
+  [ADR-0011](0011-evidence-chain.md) (evidence chain);
+  implementation plan: [Track EA](../specs/track-ea/README.md) (evidence assurance)
+
+Acceptance records the architecture and the qualification gates below; it does not
+certify an isolation profile or mean that the planned witness commands are implemented.
+The spike results in [Decision 2](#decision-2-isolation-profiles--how-the-witness-gets-its-own-trust-domain)
+remain binding on the implementation.
 
 ## Context
 
@@ -101,24 +108,52 @@ It runs in a trust domain the agent cannot write into (Decision 2).
 
 ## Decision 2: Isolation profiles — how the witness gets its own trust domain
 
-`minds enable --witness <profile>` sets up one of three profiles. The profile is a fact
-the verifier checks (via the signer principal), not a claim in the seal.
+`minds enable --witness <profile>` is planned to set up the profiles below, subject to
+their qualification gates. The profile is a fact the verifier checks (via the signer
+principal), not a claim in the seal. A profile name alone never grants A2.
 
 | Profile | Agent runs | Witness runs | Agent is kept out by |
 |---|---|---|---|
-| `container` (default for regulated teams) | in a dev container, worktree bind-mounted | on the host | the container boundary; only the socket is mounted in |
+| `container` (intended default for regulated teams once qualified) | in a dev container, worktree bind-mounted | on the host | the container boundary; only the socket directory is mounted from witness state |
 | `user` | as the developer's UID | as a dedicated OS user `minds-witness` | file ownership; socket is write-only for the developer group |
-| `managed` (Claude Code) | natively | as the developer's UID | managed settings: `allowManagedHooksOnly`, sandbox write/network denials for the witness paths and socket, deny rules on `.claude/settings*.json` |
+| `managed` (Claude Code; A1 only) | natively | as the developer's UID | candidate system-managed policy and sandbox/file-tool denials; exclusion has not been demonstrated |
 
-The `managed` profile depends on harness behaviour we do not control and must be proven by
-spike EA-S1 before it may produce A2. Until then it yields A1.
+**Container qualification (EA-S2).** The [container spike](../spikes/ea-s2-container-profile.md)
+provides reusable templates and a repeatable experiment, not successful isolation or
+watcher measurements. Use **inotify on native Linux** as the first qualification target;
+the recorded Linux run is still outstanding. Keep **macOS container recording disabled**
+until FSEvents measurements and an actual host Unix-socket round trip pass on an identified
+Docker Desktop version and file-sharing backend. Both platforms' latency, burst-loss,
+socket, isolation and hook results remain deferred or not run. Acceptance of this ADR
+does not turn those missing measurements into A2 qualification.
 
-What the agent can still do in every profile: send fabricated frames into the socket (the
-socket must accept the hook, and the hook runs as the agent). This is expected. Principle 2
-handles it: a fabricated write event without a matching file-system observation is
+The container mounts the worktree and `$MINDS_WITNESS_HOME/run`, never the host home,
+journal, salt, keys, ledger, configuration or Docker socket. Mounting the socket's
+directory allows socket recreation; its writable bind also lets the agent unlink the
+socket (denial of service), without access to the evidence store. The profile assumes
+the agent cannot control the host Docker daemon or add mounts. A visible socket inode
+does not prove host reachability through Docker Desktop's Linux VM; no TCP relay or
+VM-hosted witness is implicitly substituted. EA-10 must validate canonical paths and
+keep witness state outside the workspace; linked Git worktrees need separate handling.
+
+**Managed qualification (EA-S1).** The [managed spike](../spikes/ea-s1-managed-profile.md)
+decides that `managed` **stays A1 on Linux and macOS**. Native Claude policy enforcement,
+signal/debugger denial, managed-hook access and command/HTTP payload parity have not
+been established. Same-UID control processes could read/write protected fixture files
+and terminate a disposable child, but these were not Claude sandbox experiments.
+The policy is a candidate, not an installed or qualified deployment template. Only a
+complete native matrix for pinned OS/harness versions can reopen A2 qualification;
+missing measurements are never successful denials (see [Addendum EA-S1](#addendum-ea-s1)).
+
+In the `container` and `user` profiles the agent can still send fabricated frames into
+the socket: it must accept hooks running as the agent. The candidate `managed` profile
+instead aims to deny agent socket access while allowing managed hooks; that distinction
+remains unverified. Socket access is not authentication of an event. Principle 2 handles
+it: a fabricated write event without a matching file-system observation is
 *uncorroborated*; a fabricated test result is *not reproduced*. The agent can add noise to
 the record; it cannot remove or rewrite what the witness already chained, and it cannot
-make a claim corroborated.
+make a claim corroborated merely by submitting it. These guarantees require a qualified
+isolation boundary; they are not claims about the current A1 managed profile.
 
 ## Decision 3: A second observer — the file system
 
@@ -256,8 +291,9 @@ not a transparency log and needs no network beyond the self-managed GitLab
 
 ## Consequences
 
-- minds gains an operated component (the witness). The `container` profile keeps it
-  invisible for teams that already run agents in dev containers.
+- minds gains an operated component (the witness). The `container` profile is the intended
+  default for teams using dev containers, subject to the Linux-first qualification and
+  macOS recording gate in Decision 2.
 - The file observer sees human edits in the worktree. It records only paths and hashes,
   no content, keystrokes or timing beyond the change event; attribution to a person is
   never made. This must be stated in the privacy overview and the §87 BetrVG material:
@@ -281,5 +317,5 @@ platform. Missing measurements must not be interpreted as denied operations.
 Do not qualify `managed` ranges for A2 until the spike's complete native results
 demonstrate agent exclusion and working managed hooks for the pinned OS/harness
 versions. This is a conservative qualification decision, not a proof that all
-managed configurations are incapable of isolation. The ADR remains proposed;
-formal acceptance belongs to EA-04. No production behavior changes in EA-S1.
+managed configurations are incapable of isolation. EA-04 accepts this ADR with the A1
+cap intact. No production behavior changes in EA-S1.
