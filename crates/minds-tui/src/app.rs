@@ -12,6 +12,7 @@ use crossterm::event::{self, Event};
 use minds_core::SessionId;
 use minds_git::Repo;
 use minds_reader::Inspection;
+use minds_reader::artifact::CommitArtifact;
 use minds_reader::graph::{NodeKind, SessionGraph};
 use minds_reader::model::{EvidenceReport, LinkEvidence, SessionCard, WhyChain, WhyStep};
 
@@ -66,13 +67,16 @@ pub enum View {
         /// Beobachtete, aber nicht gedeutete Tool-Aufrufe — die
         /// Deutungs-Achse neben Integrität und Coverage.
         uninterpreted: usize,
+        /// Der Abgleich der Commits, die die Session tragen (EA-03) —
+        /// beim Öffnen einmal gerechnet, vom Reader.
+        artifacts: Vec<CommitArtifact>,
         /// Die Sektion unter dem Cursor; das Detail folgt dem Fokus.
         cursor: usize,
     },
 }
 
 /// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge.
-pub const EVIDENCE_SECTIONS: usize = 6;
+pub const EVIDENCE_SECTIONS: usize = 7;
 
 /// Der Zustand.
 pub struct App<'a> {
@@ -202,10 +206,13 @@ impl<'a> App<'a> {
             .card(id)
             .map(|card| card.uninterpreted_calls)
             .unwrap_or(0);
+        // Strikt lesend: Der Reader liest nur Blobs der verknüpften Commits.
+        let artifacts = self.inspection.artifacts(self.repo, id);
         self.views.push(View::Evidence {
             id,
             report,
             uninterpreted,
+            artifacts,
             cursor: 0,
         });
     }
@@ -492,6 +499,7 @@ impl<'a> App<'a> {
                 id,
                 report,
                 uninterpreted,
+                artifacts,
                 mut cursor,
             }) => {
                 // Legacy hat keine Sektionen — nur den einen ehrlichen Satz.
@@ -514,6 +522,7 @@ impl<'a> App<'a> {
                         id,
                         report,
                         uninterpreted,
+                        artifacts,
                         cursor,
                     });
                 }

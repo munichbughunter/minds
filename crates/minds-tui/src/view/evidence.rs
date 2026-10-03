@@ -9,6 +9,11 @@
 //! als das Modell: „vollständig" heißt vollständig **innerhalb** der
 //! Beobachtungsgrenze; was außerhalb liegt, ist `— nicht erfasst`, keine
 //! Lücke — und eine Lücke ist kein Beweis, dass etwas geschah.
+//!
+//! Die Sektion **ARTIFACT** (EA-03) zeigt den Abgleich der Commits, die die
+//! Session tragen: `artifact X/Y lines explained` und je Datei die Klasse,
+//! darunter die unerklärten Zeilen. Unerklärt ist nie ein Fehler — es steht
+//! im neutralen Stil „not observed in the session", nie in Rot.
 
 use minds_core::SessionId;
 use ratatui::Frame;
@@ -17,7 +22,9 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
+use minds_reader::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, summary};
 use minds_reader::model::{EpochLink, EpochReport, EvidenceReport, LEGACY_SENTENCE};
+use minds_reader::reconcile::ReconClass;
 
 use crate::theme;
 
@@ -26,6 +33,7 @@ use crate::theme;
 const SECTIONS: [&str; crate::app::EVIDENCE_SECTIONS] = [
     "INTEGRITY",
     "COVERAGE",
+    "ARTIFACT",
     "EPOCHS",
     "SIGNATURE",
     "INTERPRETATION",
@@ -40,11 +48,12 @@ pub fn draw(
     id: SessionId,
     report: Option<&EvidenceReport>,
     uninterpreted: usize,
+    artifacts: &[CommitArtifact],
     cursor: usize,
 ) {
     let short: String = id.to_string().chars().take(11).collect();
     let Some(report) = report else {
-        legacy(frame, area, &short);
+        legacy(frame, area, &short, artifacts);
         return;
     };
 
@@ -85,7 +94,7 @@ pub fn draw(
     );
 
     // Ebene 1: das Verdikt — sechs Zeilen, je Achse eine Aussage.
-    let lines: Vec<Line> = rows(report, uninterpreted)
+    let lines: Vec<Line> = rows(report, uninterpreted, artifacts)
         .into_iter()
         .enumerate()
         .map(|(i, (glyph, status, style))| {
@@ -112,7 +121,7 @@ pub fn draw(
 
     // Ebene 2 + 3: das Detail folgt dem Fokus — wie der Inspector der
     // Why-Kette, ohne dass Enter etwas verspricht.
-    let (title, lines) = detail(report, uninterpreted, cursor);
+    let (title, lines) = detail(report, uninterpreted, artifacts, cursor);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
@@ -123,8 +132,8 @@ pub fn draw(
     );
 }
 
-fn legacy(frame: &mut Frame, area: Rect, short: &str) {
-    let lines = vec![
+fn legacy(frame: &mut Frame, area: Rect, short: &str, artifacts: &[CommitArtifact]) {
+    let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("EVIDENCE {short}…  "),
@@ -141,6 +150,12 @@ fn legacy(frame: &mut Frame, area: Rect, short: &str) {
             theme::dim(),
         )),
     ];
+    // Der Abgleich hängt nicht an der Chain: Auch eine Legacy-Session kann
+    // Zeilen eines Commits erklären — oder eben nicht.
+    if !artifacts.is_empty() {
+        lines.push(Line::default());
+        lines.extend(artifact(artifacts));
+    }
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
@@ -153,7 +168,11 @@ fn legacy(frame: &mut Frame, area: Rect, short: &str) {
 }
 
 /// Glyph, Statustext und Stil je Sektion — die Verdikt-Zeilen.
-fn rows(report: &EvidenceReport, uninterpreted: usize) -> Vec<(String, String, Style)> {
+fn rows(
+    report: &EvidenceReport,
+    uninterpreted: usize,
+    artifacts: &[CommitArtifact],
+) -> Vec<(String, String, Style)> {
     let state = &report.state;
     let scope = report.scope.as_deref().unwrap_or("?");
     let ok = Style::default().fg(theme::OK);
@@ -194,6 +213,9 @@ fn rows(report: &EvidenceReport, uninterpreted: usize) -> Vec<(String, String, S
             warn,
         )
     });
+
+    // Artefakt: wie viel des Commits die Session erklärt.
+    out.push(artifact_row(artifacts));
 
     // Epochen: schließt sich die previous-Kette?
     let mut epochs = if state.chain_closed {
@@ -262,16 +284,196 @@ fn rows(report: &EvidenceReport, uninterpreted: usize) -> Vec<(String, String, S
 fn detail(
     report: &EvidenceReport,
     uninterpreted: usize,
+    artifacts: &[CommitArtifact],
     cursor: usize,
 ) -> (&'static str, Vec<Line<'static>>) {
     match cursor {
         0 => ("INTEGRITY", integrity(report)),
         1 => ("COVERAGE", coverage(report)),
-        2 => ("EPOCHS", epochs(report)),
-        3 => ("SIGNATURE", signature(report)),
-        4 => ("INTERPRETATION", interpretation(uninterpreted)),
+        2 => ("ARTIFACT", artifact(artifacts)),
+        3 => ("EPOCHS", epochs(report)),
+        4 => ("SIGNATURE", signature(report)),
+        5 => ("INTERPRETATION", interpretation(uninterpreted)),
         _ => ("LIMITS", limitations(report)),
     }
+}
+
+/// Ob ein abgeglichener Commit irgendetwas Unerklärtes trägt — Zeilen,
+/// ganze Dateien (Löschung, binär) oder strukturelle Änderungen.
+fn any_unexplained(assessed: &minds_reader::artifact::Assessed) -> bool {
+    !assessed.structural.is_empty()
+        || assessed
+            .recon
+            .files
+            .iter()
+            .any(|f| f.class == ReconClass::Unexplained)
+}
+
+/// Die Verdikt-Zeile der Artefakt-Sektion. Unerklärtes ist neutral
+/// (`◦`, gedimmt) — nie die Warn- oder Fehlerfarbe.
+fn artifact_row(artifacts: &[CommitArtifact]) -> (String, String, Style) {
+    let ok = Style::default().fg(theme::OK);
+    let (neutral_glyph, _, neutral) = theme::not_observed();
+    match artifacts {
+        [] => (
+            "·".into(),
+            "not assessed (no linked commit)".into(),
+            theme::dim(),
+        ),
+        [one] => match &one.state {
+            ArtifactState::Assessed(assessed) => {
+                let text = format!("{} · {}", summary(&assessed.recon), short_commit(one));
+                if any_unexplained(assessed) {
+                    (neutral_glyph.into(), text, neutral)
+                } else {
+                    ("✓".into(), text, ok)
+                }
+            }
+            ArtifactState::Unavailable(why) => {
+                ("·".into(), format!("not assessed ({why})"), theme::dim())
+            }
+            ArtifactState::Failed(_) => ("·".into(), "not assessed (error)".into(), theme::dim()),
+        },
+        many => {
+            let assessed: Vec<_> = many
+                .iter()
+                .filter_map(|a| match &a.state {
+                    ArtifactState::Assessed(assessed) => Some(assessed),
+                    _ => None,
+                })
+                .collect();
+            let backed: u64 = assessed.iter().map(|a| a.recon.backed_lines()).sum();
+            let total: u64 = assessed.iter().map(|a| a.recon.total_changed_lines).sum();
+            let mut text = format!(
+                "artifact {backed}/{total} lines explained · {} commits",
+                many.len()
+            );
+            let skipped = many.len() - assessed.len();
+            if skipped > 0 {
+                text.push_str(&format!(" · {skipped} not assessed"));
+            }
+            if skipped > 0 || assessed.iter().any(|a| any_unexplained(a)) {
+                (neutral_glyph.into(), text, neutral)
+            } else {
+                ("✓".into(), text, ok)
+            }
+        }
+    }
+}
+
+fn short_commit(artifact: &CommitArtifact) -> String {
+    artifact.commit.to_string().chars().take(7).collect()
+}
+
+/// Das Detail der Artefakt-Sektion: je Commit die Zusammenfassung, dann je
+/// Datei Klasse, Pfad und was unerklärt ist. Pfade sind fremdbestimmt und
+/// laufen durch die Terminal-Härtung des Readers.
+fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
+    if artifacts.is_empty() {
+        return vec![
+            Line::from(Span::raw(
+                "No commit carries this session — nothing to reconcile.",
+            )),
+            Line::default(),
+            Line::from(Span::styled(
+                "Reconciliation compares a commit with the session's stored writes.",
+                theme::dim(),
+            )),
+        ];
+    }
+    let (neutral_glyph, _, neutral) = theme::not_observed();
+    let mut lines = Vec::new();
+    for (i, artifact) in artifacts.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::default());
+        }
+        let mut head = vec![
+            Span::styled(format!("{:<12} ", "Commit"), theme::dim()),
+            Span::styled(short_commit(artifact), Style::default().fg(theme::CHANGE)),
+        ];
+        if let Some(subject) = &artifact.subject {
+            head.push(Span::raw(format!("  {}", minds_reader::sanitize(subject))));
+        }
+        lines.push(Line::from(head));
+        let assessed = match &artifact.state {
+            ArtifactState::Assessed(assessed) => assessed,
+            ArtifactState::Unavailable(why) => {
+                lines.push(Line::from(Span::styled(
+                    format!("{:<12} not assessed ({why})", ""),
+                    theme::dim(),
+                )));
+                continue;
+            }
+            ArtifactState::Failed(err) => {
+                lines.push(Line::from(Span::styled(
+                    format!("{:<12} not assessed (error: {err})", ""),
+                    theme::dim(),
+                )));
+                continue;
+            }
+        };
+        lines.push(Line::from(vec![
+            Span::raw(format!("{:<12} ", "")),
+            Span::styled(summary(&assessed.recon), theme::title()),
+        ]));
+        let width = assessed
+            .recon
+            .files
+            .iter()
+            .map(|f| minds_reader::sanitize(&f.path).chars().count())
+            .chain(
+                assessed
+                    .structural
+                    .iter()
+                    .map(|s| minds_reader::sanitize(&s.path).chars().count()),
+            )
+            .max()
+            .unwrap_or(0);
+        for file in &assessed.recon.files {
+            let (glyph, word, style) = theme::recon(file.class);
+            let mut spans = vec![
+                Span::styled(format!("  {glyph} "), style),
+                Span::styled(format!("{word:<20}"), style),
+                Span::raw(format!("{:<width$}", minds_reader::sanitize(&file.path))),
+            ];
+            let note = file.note();
+            if !note.is_empty() {
+                let note_style = if file.class == ReconClass::Unexplained {
+                    neutral
+                } else {
+                    theme::dim()
+                };
+                spans.push(Span::styled(format!("  {note}"), note_style));
+            }
+            lines.push(Line::from(spans));
+        }
+        for structural in &assessed.structural {
+            let (glyph, word, style) = theme::recon(ReconClass::Unexplained);
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), style),
+                Span::styled(format!("{word:<20}"), style),
+                Span::raw(format!(
+                    "{:<width$}",
+                    minds_reader::sanitize(&structural.path)
+                )),
+                Span::styled(format!("  {} {NOT_OBSERVED}", structural.what), neutral),
+            ]));
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled(format!("{neutral_glyph} "), neutral),
+        Span::styled(NOT_OBSERVED, neutral),
+        Span::styled(
+            "  ·  ◇ reported only: a tool claim, no witness",
+            theme::dim(),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "\"explained\" counts every line with evidence, reported only included.",
+        theme::dim(),
+    )));
+    lines
 }
 
 fn short_hash(hash: &minds_core::ContentHash) -> String {

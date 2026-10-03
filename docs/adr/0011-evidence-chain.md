@@ -346,3 +346,5 @@ verify` suffice (recipe in the verification guide, `docs/verification-guide.md`)
 
 The price: schema 2 is unreadable for old binaries (central distribution, no existing
 users — accepted), and the chaining guarantee begins only at the seal, not at the append.
+[ADR-0012](0012-witnessed-evidence.md) addresses the append→seal window and key control
+with a witness outside the agent's trust domain, subject to its isolation qualification gates.

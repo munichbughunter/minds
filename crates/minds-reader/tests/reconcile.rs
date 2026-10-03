@@ -922,3 +922,93 @@ fn removals_made_by_the_agent_are_not_reported_as_unobserved() {
     assert_eq!(lines(&result.files[0]), [(3, Unexplained)]);
     assert!(!result.files[0].removes);
 }
+
+/// EA-03: der I/O-Pfad des Readers über einen echten Commit — Abgleich,
+/// Datei- und Session-Seite — strikt lesend.
+#[test]
+fn artifact_and_render_mark_the_human_line_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let redacted = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_session(session(vec![
+            write("a", "one\ntwo\nthree\n"),
+            write("b", "three\n"),
+        ]))
+        .unwrap();
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let id = store.put(&redacted).unwrap().id();
+    std::fs::write(dir.path().join("a"), "one\nHUMAN\nthree\n").unwrap();
+    std::fs::write(dir.path().join("b"), "three\n").unwrap();
+    git(dir.path(), &["add", "a", "b"]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-qm",
+            &format!("fixture\n\nMinds-Session-Id: {id}"),
+        ],
+    );
+    let repo = Repo::open(dir.path()).unwrap();
+    let commit = repo.head().unwrap().commit().unwrap();
+    let before_refs = git(dir.path(), &["show-ref"]);
+    let before = snapshot(dir.path());
+
+    let index = Index::build(&repo, &store).unwrap();
+    assert_eq!(index.claimants(commit).len(), 1);
+    let spellings = minds_reader::artifact::roots_of(&repo);
+    let roots: Vec<&Path> = spellings.iter().map(|p| p.as_path()).collect();
+    let artifact = index.artifact(&repo, &roots, commit);
+    assert_eq!(artifact.subject.as_deref(), Some("fixture"));
+    let minds_reader::artifact::ArtifactState::Assessed(assessed) = &artifact.state else {
+        panic!("{artifact:?}");
+    };
+    assert_eq!(
+        minds_reader::artifact::summary(&assessed.recon),
+        "artifact 3/4 lines explained"
+    );
+    assert_eq!(assessed.recon.files[0].unexplained_ranges(), [(2, 2)]);
+    assert_eq!(
+        assessed.recon.files[0].note(),
+        "line 2 not observed in the session"
+    );
+    assert_eq!(assessed.recon.files[1].class, ReportedOnly);
+    assert_eq!(artifact, index.artifact(&repo, &roots, commit));
+
+    // Die Seite: außerhalb des Repos geschrieben.
+    let out = tempfile::tempdir().unwrap();
+    minds_reader::render(&repo, &store, out.path()).unwrap();
+    let page = std::fs::read_to_string(out.path().join("a.html")).unwrap();
+    let marked: Vec<&str> = page
+        .lines()
+        .filter(|l| l.contains(" unexplained\""))
+        .collect();
+    assert_eq!(marked.len(), 1, "{page}");
+    assert!(marked[0].contains("</span>2</span><code>HUMAN"), "{page}");
+    assert!(page.contains("class=\"recon-legend\""));
+    // b ist voll belegt: keine Markierung, keine Legende.
+    let page = std::fs::read_to_string(out.path().join("b.html")).unwrap();
+    assert!(!page.contains(" unexplained\""), "{page}");
+    assert!(!page.contains("class=\"recon-legend\""), "{page}");
+    let session_page = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("session-")
+        })
+        .unwrap();
+    let session_page = std::fs::read_to_string(session_page).unwrap();
+    assert!(session_page.contains("artifact 3/4 lines explained"));
+    assert!(session_page.contains("<tr class=\"add unexplained\">"));
+
+    assert_eq!(before_refs, git(dir.path(), &["show-ref"]));
+    assert_eq!(
+        before,
+        snapshot(dir.path()),
+        "no file or Git object may be written"
+    );
+}

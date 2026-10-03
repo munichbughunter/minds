@@ -128,6 +128,11 @@ agents capture raw evidence via the generic fallback); the reader shows
 sessions and history but no overview tiles or charts yet, although
 `minds metrics` already supplies the numbers; the CLI output is
 German today — English output is on the list.
+Capture still shares the agent's trust domain: the append→seal window and key control
+remain gaps addressed by [Track EA](docs/specs/track-ea/README.md) and the accepted
+[ADR-0012](docs/adr/0012-witnessed-evidence.md); `managed` stays A1, Linux container
+qualification is pending, and macOS container recording remains disabled pending the
+required watcher and host-socket measurements.
 
 ## 6. The roadmap in layers
 

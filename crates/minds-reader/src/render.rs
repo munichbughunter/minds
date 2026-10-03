@@ -33,10 +33,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use minds_core::SessionId;
-use minds_git::{BlameProvider, Repo};
+use minds_core::{ContentHash, SessionId};
+use minds_git::{BlameProvider, CommitId, Repo};
 use minds_store::ContextStore;
 
+use crate::artifact::{ArtifactState, CommitArtifact};
 use crate::error::{ReaderError, Result};
 use crate::file::FileView;
 use crate::html::{self, FileLink};
@@ -70,6 +71,18 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
     // Pfad → die Datei-Seite, die ihn zeigt. Die Session-Seiten verlinken damit
     // jede geänderte Datei auf ihre zeilenweise Ansicht.
     let mut file_href: BTreeMap<String, String> = BTreeMap::new();
+    // Der Abgleich je Commit (EA-03), einmal gerechnet und von Datei- und
+    // Session-Seiten geteilt. Rein lesend; ein Fehler ist ein Zustand der
+    // Seite, kein Abbruch des Laufs.
+    let spellings = crate::artifact::roots_of(repo);
+    let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
+    let mut artifacts: BTreeMap<CommitId, CommitArtifact> = BTreeMap::new();
+    let mut artifact_of = |commit: CommitId| -> CommitArtifact {
+        artifacts
+            .entry(commit)
+            .or_insert_with(|| index.artifact(repo, &roots, commit))
+            .clone()
+    };
 
     // Trägt kein Commit einen Trailer, kann auch keine Zeile zugeordnet sein —
     // dann ist jeder Blame verschwendet. Das ist der Zustand eines Repos, in
@@ -84,6 +97,7 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
         let Some(bytes) = repo.read_blob_at("HEAD", &path)? else {
             continue;
         };
+        let head_hash = ContentHash::from_bytes(*blake3::hash(&bytes).as_bytes());
         // Binärdateien haben keine Zeilen, die man anklicken könnte.
         let Ok(content) = String::from_utf8(bytes) else {
             skipped += 1;
@@ -99,8 +113,12 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
             continue;
         }
 
+        let unexplained = unexplained_at_head(&view, &head_hash, &mut artifact_of);
         let href = unique_slug(&path, &mut used);
-        write(&out.join(&href), &html::file_page(&view, &index))?;
+        write(
+            &out.join(&href),
+            &html::file_page(&view, &index, &unexplained),
+        )?;
         file_href.insert(path.clone(), href.clone());
         links.push(FileLink {
             attributed: view.attributed_lines(),
@@ -116,10 +134,22 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
     let mut session_page: BTreeMap<SessionId, String> = BTreeMap::new();
     for (id, session) in index.sessions() {
         let diffs = diffs_for(repo, &index, *id);
+        let recons: Vec<CommitArtifact> = index
+            .commits_of(*id)
+            .into_iter()
+            .map(&mut artifact_of)
+            .collect();
         let href = unique_slug(&format!("session-{}", short_hex(*id)), &mut used);
         write(
             &out.join(&href),
-            &html::session_page(*id, session, &diffs, !index.is_observed(*id), &file_href),
+            &html::session_page(
+                *id,
+                session,
+                &diffs,
+                !index.is_observed(*id),
+                &file_href,
+                &recons,
+            ),
         )?;
         session_page.insert(*id, href);
     }
@@ -135,6 +165,50 @@ pub fn render(repo: &Repo, store: &dyn ContextStore, out: &Path) -> Result<Site>
         sessions: index.len(),
         skipped,
     })
+}
+
+/// Die Zeilen der HEAD-Fassung, die der Abgleich ihres Blame-Commits als
+/// unerklärt führt.
+///
+/// Zeilennummern des Abgleichs gelten im Stand **des Commits**. Ohne die
+/// Ursprungszeile aus dem Blame ist die Abbildung nur dann exakt, wenn die
+/// Datei in HEAD byte-gleich mit dem Commit-Stand ist (der Inhalts-Hash
+/// entscheidet). Sonst wird nichts markiert — lieber keine Markierung als
+/// eine an der falschen Zeile; die Session-Seite zeigt die Markierungen im
+/// Diff des Commits immer.
+fn unexplained_at_head(
+    view: &crate::file::FileView,
+    head_hash: &ContentHash,
+    artifact_of: &mut impl FnMut(CommitId) -> CommitArtifact,
+) -> BTreeSet<u32> {
+    let commits: BTreeSet<CommitId> = view
+        .lines
+        .iter()
+        .filter(|l| l.is_attributed())
+        .filter_map(|l| l.commit)
+        .collect();
+    let mut marked = BTreeSet::new();
+    for commit in commits {
+        let ArtifactState::Assessed(assessed) = artifact_of(commit).state else {
+            continue;
+        };
+        let Some(file) = assessed
+            .recon
+            .files
+            .iter()
+            .find(|f| f.path == view.path && !f.deleted && f.committed == *head_hash)
+        else {
+            continue;
+        };
+        let lines = file.unexplained_set();
+        marked.extend(
+            view.lines
+                .iter()
+                .filter(|l| l.commit == Some(commit) && lines.contains(&l.number))
+                .map(|l| l.number),
+        );
+    }
+    marked
 }
 
 /// Ein Dateiname, der in diesem Lauf noch nicht vergeben ist.
@@ -203,5 +277,68 @@ mod tests {
         assert_eq!(unique_slug("a/b.rs", &mut used), "a-b.rs.html");
         assert_eq!(unique_slug("a-b.rs", &mut used), "a-b.rs-2.html");
         assert_eq!(unique_slug("a b.rs", &mut used), "a-b.rs-3.html");
+    }
+
+    /// Nur byte-gleiche Fassungen werden markiert — sonst stünde die
+    /// Markierung womöglich an der falschen Zeile.
+    #[test]
+    fn head_lines_are_marked_only_when_head_matches_the_commit() {
+        use crate::artifact::Assessed;
+        use crate::file::{FileView, Line};
+        use crate::reconcile::{FileRecon, LineLevel, LineRecon, ReconClass, Reconciliation};
+
+        let commit: CommitId = "1".repeat(40).parse().unwrap();
+        let sid: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let committed = ContentHash::from_bytes([7; 32]);
+        let view = FileView {
+            path: "a".into(),
+            lines: (1..=3)
+                .map(|number| Line {
+                    number,
+                    text: String::new(),
+                    commit: Some(commit),
+                    sessions: vec![sid],
+                })
+                .collect(),
+        };
+        let artifact = CommitArtifact {
+            commit,
+            subject: None,
+            state: ArtifactState::Assessed(Assessed {
+                recon: Reconciliation {
+                    commit,
+                    base: None,
+                    files: vec![FileRecon {
+                        path: "a".into(),
+                        class: ReconClass::Unexplained,
+                        line_level: LineLevel::Available(vec![
+                            LineRecon {
+                                line: 1,
+                                class: ReconClass::ReportedOnly,
+                            },
+                            LineRecon {
+                                line: 2,
+                                class: ReconClass::Unexplained,
+                            },
+                        ]),
+                        committed: committed.clone(),
+                        deleted: false,
+                        changed_lines: 2,
+                        removes: false,
+                        last_observed: None,
+                    }],
+                    explained_lines: 0,
+                    total_changed_lines: 2,
+                },
+                structural: Vec::new(),
+            }),
+        };
+        let mut lookup = |_| artifact.clone();
+        assert_eq!(
+            unexplained_at_head(&view, &committed, &mut lookup),
+            BTreeSet::from([2])
+        );
+        let later = ContentHash::from_bytes([8; 32]);
+        assert!(unexplained_at_head(&view, &later, &mut lookup).is_empty());
     }
 }
