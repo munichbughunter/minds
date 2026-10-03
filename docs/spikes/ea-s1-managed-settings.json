@@ -1,0 +1,87 @@
+{
+  "allowManagedHooksOnly": true,
+  "allowManagedPermissionRulesOnly": true,
+  "disableAllHooks": false,
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "deny": [
+      "Read(//tmp/minds-ea-s1/witness/**)",
+      "Read(//private/tmp/minds-ea-s1/witness/**)",
+      "Edit(//tmp/minds-ea-s1/witness/**)",
+      "Edit(//private/tmp/minds-ea-s1/witness/**)",
+      "Write(//tmp/minds-ea-s1/witness/**)",
+      "Write(//private/tmp/minds-ea-s1/witness/**)",
+      "Edit(//tmp/minds-ea-s1/worktree/.claude/**)",
+      "Edit(//private/tmp/minds-ea-s1/worktree/.claude/**)",
+      "Write(//tmp/minds-ea-s1/worktree/.claude/**)",
+      "Write(//private/tmp/minds-ea-s1/worktree/.claude/**)",
+      "Edit(//Library/Application Support/ClaudeCode/**)",
+      "Write(//Library/Application Support/ClaudeCode/**)",
+      "Edit(//etc/claude-code/**)",
+      "Write(//etc/claude-code/**)",
+      "Edit(//opt/minds-ea-s1/**)",
+      "Write(//opt/minds-ea-s1/**)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [],
+    "enableWeakerNestedSandbox": false,
+    "enableWeakerNetworkIsolation": false,
+    "allowAppleEvents": false,
+    "filesystem": {
+      "disabled": false,
+      "allowManagedReadPathsOnly": true,
+      "denyRead": [
+        "/tmp/minds-ea-s1/witness",
+        "/private/tmp/minds-ea-s1/witness"
+      ],
+      "denyWrite": [
+        "/tmp/minds-ea-s1/witness",
+        "/private/tmp/minds-ea-s1/witness",
+        "/tmp/minds-ea-s1/worktree/.claude",
+        "/private/tmp/minds-ea-s1/worktree/.claude",
+        "/Library/Application Support/ClaudeCode",
+        "/etc/claude-code",
+        "/opt/minds-ea-s1"
+      ]
+    },
+    "network": {
+      "allowManagedDomainsOnly": true,
+      "allowedDomains": [],
+      "allowUnixSockets": [],
+      "allowAllUnixSockets": false,
+      "allowLocalBinding": false
+    }
+  },
+  "hooks": {
+    "PostToolUse": [{
+      "matcher": ".*",
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/minds-ea-s1/minds hook --agent claude-code --event PostToolUse"
+      }]
+    }],
+    "UserPromptSubmit": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/minds-ea-s1/minds hook --agent claude-code --event UserPromptSubmit"
+      }]
+    }],
+    "Stop": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/minds-ea-s1/minds hook --agent claude-code --event Stop"
+      }]
+    }],
+    "SessionStart": [{
+      "hooks": [{
+        "type": "command",
+        "command": "/opt/minds-ea-s1/minds hook --agent claude-code --event SessionStart"
+      }]
+    }]
+  }
+}
