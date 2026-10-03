@@ -1419,3 +1419,34 @@ fn hostile_and_overlong_paths_are_sanitized_and_capped() {
     assert_eq!(long_lines.len(), 1, "{out}");
     assert!(long_lines[0].contains("…dddd") && long_lines[0].contains("/x.rs"));
 }
+
+/// Nicht abgeglichen ist nicht „nicht beobachtet": Übersprungene Commits
+/// ohne Unerklärtes tragen `·`, nicht das `◦` der Legende.
+#[test]
+fn skipped_commits_are_not_shown_as_not_observed() {
+    use minds_reader::artifact::{ArtifactState, CommitArtifact};
+    let skipped = |c: char| CommitArtifact {
+        commit: commit(c),
+        subject: None,
+        inferred: false,
+        claimants: 1,
+        state: ArtifactState::Unavailable("skipped: too many linked commits"),
+    };
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let report = app.inspection.evidence_report(sid('a'));
+    app.views.push(View::Evidence {
+        id: sid('a'),
+        report,
+        uninterpreted: 0,
+        artifacts: vec![skipped('1'), skipped('2')],
+        cursor: 0,
+    });
+    let out = render(&mut app);
+    let row = out
+        .lines()
+        .find(|l| l.contains("ARTIFACT"))
+        .expect("ARTIFACT row");
+    assert!(row.contains("· ARTIFACT"), "{row}");
+    assert!(row.contains("2 commits · 2 not assessed"), "{row}");
+}

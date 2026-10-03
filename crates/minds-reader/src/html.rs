@@ -593,6 +593,7 @@ pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
     }
     let mut out =
         String::from("<section class=\"artifact\">\n<h2 class=\"changes-h\">Artifact</h2>\n");
+    let mut marked = false;
     for artifact in artifacts {
         let short: String = artifact.commit.to_string().chars().take(7).collect();
         let subject = artifact
@@ -630,8 +631,10 @@ pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
             "<p class=\"recon-summary\">{}</p>\n<ul class=\"recon-files\">\n",
             summary(&assessed.recon)
         ));
+        marked |= !assessed.structural.is_empty();
         for file in &assessed.recon.files {
             let unexplained = file.class == ReconClass::Unexplained;
+            marked |= unexplained;
             let note = file.note();
             out.push_str(&format!(
                 "<li class=\"recon-file {cls}\">{mark}<span class=\"recon-class\">{word}</span> \
@@ -658,7 +661,10 @@ pub fn artifact_section(artifacts: &[CommitArtifact]) -> String {
         }
         out.push_str("</ul>\n</div>\n");
     }
-    out.push_str(&legend());
+    // Die Legende erklärt die Markierung — nur, wo es eine gibt.
+    if marked {
+        out.push_str(&legend());
+    }
     out.push_str("</section>\n");
     out
 }
@@ -1057,7 +1063,7 @@ pub fn escape(text: &str) -> String {
 /// `prefers-color-scheme`.
 const STYLE: &str = "\
 :root{--ok:#2da44e;--bg:#fff;--fg:#1a1a1a;--dim:#666;--rule:#e3e3e3;--mark:#f0f6ff;--accent:#2f6feb;--warn:#b3261e;--hl-kw:#8250df;--hl-str:#0a7d33;--hl-num:#b35900;--hl-com:#6a737d}\
-@media(prefers-color-scheme:dark){:root{--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5;--hl-kw:#c678dd;--hl-str:#98c379;--hl-num:#d19a66;--hl-com:#8b949e}}\
+@media(prefers-color-scheme:dark){:root{--ok:#57ab5a;--bg:#14151a;--fg:#e6e6e6;--dim:#9aa0a6;--rule:#2a2c33;--mark:#1b2740;--accent:#7aa7ff;--warn:#f2b8b5;--hl-kw:#c678dd;--hl-str:#98c379;--hl-num:#d19a66;--hl-com:#8b949e}}\
 *{box-sizing:border-box}\
 body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,sans-serif}\
 a{color:var(--accent)}\
@@ -1940,6 +1946,18 @@ mod tests {
         }
         let html = artifact_section(&[artifact]);
         assert!(!html.contains('\u{202e}'), "{html}");
+    }
+
+    #[test]
+    fn a_fully_explained_commit_has_no_legend() {
+        let mut artifact = two_files();
+        if let ArtifactState::Assessed(a) = &mut artifact.state {
+            a.recon.files.remove(0);
+        }
+        let html = artifact_section(&[artifact]);
+        assert!(html.contains("class=\"recon-file explained\""), "{html}");
+        assert!(!html.contains("recon-legend"), "{html}");
+        assert!(!html.contains("recon-mark"), "{html}");
     }
 
     #[test]

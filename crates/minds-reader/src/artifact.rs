@@ -228,6 +228,11 @@ pub enum ArtifactState {
     Failed(String),
 }
 
+/// Die Text-Kennzeichnung eines Abgleichs ohne lesbare Claimant-Session.
+/// Ein Schutz für direkte Aufrufer von [`crate::Index::artifact`]: Über
+/// [`crate::Index::claimed_commits`] ist die Session selbst immer Claimant.
+pub const NO_CLAIMANT_NOTE: &str = "no readable claimant session";
+
 /// Die Text-Kennzeichnung vermuteter Claimants.
 pub const INFERRED_NOTE: &str = "claims from inferred links (no trailer)";
 
@@ -243,7 +248,19 @@ impl crate::Index {
     /// Eine Abweichung bleibt: Sessions ohne erfasste Absicht hält der Index
     /// gar nicht (siehe [`crate::Index::build`]); `verify` liest sie direkt
     /// aus dem Store.
+    ///
+    /// Ein Commit außerhalb von HEAD (Seitenzweig, geholter PR-Ref) zählt mit
+    /// seinem Trailer als nicht vermutet — der Trailer ist Commit-Inhalt,
+    /// aber dieser Stand ist nicht gemergte Historie ([`crate::Index::position`]
+    /// ist dann `None`).
+    ///
+    /// Auch Commits außerhalb von HEAD tragen ihren gelesenen Trailer (siehe
+    /// [`crate::Index::build`]); ist ihre Message unlesbar, gibt es keine
+    /// Claimants — unbekannt heißt nicht „ohne Trailer".
     pub fn claimants(&self, commit: CommitId) -> (Vec<&Session>, bool) {
+        if self.trailer_unknown(commit) {
+            return (Vec::new(), false);
+        }
         let trailer = self.trailer_ids(commit);
         let (ids, inferred) = if trailer.is_empty() {
             (self.sessions_of(commit), true)
@@ -279,14 +296,22 @@ impl crate::Index {
     /// Trailer sie nennt, und — vermutet — die per Store-Index verknüpften
     /// **ohne** Trailer. Einen Commit mit fremdem Trailer gleicht sie nicht
     /// ab: Dort zählen ihre Claims nicht ([`Index::claimants`]).
+    ///
+    /// In Revwalk-Reihenfolge ab HEAD; Commits außerhalb von HEAD danach,
+    /// nach Hash. Commits mit unbekanntem Trailer (nicht im Klon, Message
+    /// unlesbar) fehlen — ihr Abgleich wäre ohne Claimants nicht bestimmbar.
     pub fn claimed_commits(&self, id: minds_core::SessionId) -> Vec<CommitId> {
-        self.commits_of(id)
+        let mut commits: Vec<CommitId> = self
+            .commits_of(id)
             .into_iter()
+            .filter(|commit| !self.trailer_unknown(*commit))
             .filter(|commit| {
                 let trailer = self.trailer_ids(*commit);
                 trailer.is_empty() || trailer.contains(&id)
             })
-            .collect()
+            .collect();
+        commits.sort_by_key(|commit| (self.position(*commit).unwrap_or(usize::MAX), *commit));
+        commits
     }
 }
 
@@ -307,11 +332,13 @@ impl crate::Inspection {
                 if i < MAX_COMMITS {
                     index.artifact(repo, &roots, commit)
                 } else {
+                    // Ohne I/O: Wer beitrüge, ist trotzdem bekannt.
+                    let (claimants, inferred) = index.claimants(commit);
                     CommitArtifact {
                         commit,
                         subject: index.subject_of(commit).map(str::to_owned),
-                        inferred: false,
-                        claimants: 0,
+                        inferred,
+                        claimants: claimants.len(),
                         state: ArtifactState::Unavailable("skipped: too many linked commits"),
                     }
                 }
@@ -324,6 +351,11 @@ impl crate::Inspection {
 /// beitragende Sessions — leer, wenn es nichts zu sagen gibt.
 pub fn provenance_note(artifact: &CommitArtifact) -> String {
     let mut parts = Vec::new();
+    // Der Trailer nennt Sessions, aber keine ist lesbar (ohne Absicht,
+    // vergessen, beschädigt): Dann erklärt niemand — und das wird gesagt.
+    if artifact.claimants == 0 && matches!(artifact.state, ArtifactState::Assessed(_)) {
+        parts.push(NO_CLAIMANT_NOTE.to_owned());
+    }
     if artifact.claimants > 1 {
         parts.push(format!("claims of {} sessions", artifact.claimants));
     }
