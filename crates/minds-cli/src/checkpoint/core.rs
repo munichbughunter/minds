@@ -54,6 +54,23 @@ pub struct CheckpointOutcome {
     pub sealed: Vec<SealSummary>,
 }
 
+/// Witness-Grenzen: Auswahl, Integritätsprüfung und dauerhafte Quittierung
+/// müssen vor dem Discard durchlaufen werden. Der lokale Checkpoint nutzt
+/// weiterhin den unveränderten Standardpfad.
+pub trait CheckpointGuard {
+    fn includes(&self, key: &minds_capture::SessionKey) -> bool;
+    /// Prüft genau das `ReadOutcome`, das danach gespeichert und versiegelt wird.
+    fn validate(
+        &self,
+        key: &minds_capture::SessionKey,
+        read: &minds_capture::ReadOutcome,
+        result: &ChainResult,
+    ) -> Fallible<()>;
+    fn sealed(&self, key: &minds_capture::SessionKey, sealed: &SealSummary) -> Fallible<()>;
+    fn path_map(&self) -> &[(std::path::PathBuf, std::path::PathBuf)];
+    fn report(&self, message: &str);
+}
+
 /// Verarbeitet die Quelle mit derselben Fehlerisolation wie `minds checkpoint`.
 /// Nur nach erfolgreicher Speicherung und Versiegelung wird verworfen;
 /// abgewiesene oder vertagte Journale bleiben zur Diagnose liegen.
@@ -61,6 +78,15 @@ pub fn run_checkpoint(
     env: &CheckpointEnv<'_>,
     src: &EvidenceSource<'_>,
     signer: &SealSigner<'_>,
+) -> Fallible<CheckpointOutcome> {
+    run_checkpoint_guarded(env, src, signer, None)
+}
+
+pub fn run_checkpoint_guarded(
+    env: &CheckpointEnv<'_>,
+    src: &EvidenceSource<'_>,
+    signer: &SealSigner<'_>,
+    guard: Option<&dyn CheckpointGuard>,
 ) -> Fallible<CheckpointOutcome> {
     let journal = src.journal;
     let epochs = src.epochs;
@@ -77,9 +103,9 @@ pub fn run_checkpoint(
     // verschwiegen. Der Pfad trägt nur Agentname und Hash, nie ein rohes
     // local_id (#95) — er darf ins Log.
     for dir in &sessions.unresolved {
-        hooklog::report_at(
+        report(
             log_dir,
-            Source::Checkpoint,
+            guard,
             &format!(
                 "journal directory without a readable key file skipped: {}",
                 dir.display()
@@ -87,6 +113,9 @@ pub fn run_checkpoint(
         );
     }
     for key in sessions.keys {
+        if guard.is_some_and(|guard| !guard.includes(&key)) {
+            continue;
+        }
         let read = journal.read(&key)?;
         if read.events.is_empty() {
             // Nur Beschädigtes ohne ein einziges Event: kein Zeitstempel, kein
@@ -104,28 +133,39 @@ pub fn run_checkpoint(
             Err(err) => {
                 // Ohne Salt kein Seal, ohne Seal kein Discard — vertagen,
                 // wie bei jedem anderen Fehler dieser Session.
-                hooklog::report_at(
+                report(
                     log_dir,
-                    Source::Checkpoint,
+                    guard,
                     &format!("{} skipped: {err}", key.display_redacted(pipeline)),
                 );
                 continue;
             }
         };
         let result = chain::chain_salted(&salt, &read);
+        if let Some(guard) = guard {
+            if guard.validate(&key, &read, &result).is_err() {
+                guard.report(
+                    "integrity error: live chain differs from journal; checkpoint deferred",
+                );
+                continue;
+            }
+        }
 
-        match store_one(env, &key, &read.events) {
+        match store_one(env, &key, &read.events, guard) {
             Ok(id) => {
                 let sealed = seal_epoch(
                     env,
                     src,
                     signer,
-                    &key,
-                    &read.events,
-                    &result,
-                    SealOutcome::Stored {
-                        session: id.to_string(),
+                    SealInput {
+                        key: &key,
+                        events: &read.events,
+                        result: &result,
+                        outcome: SealOutcome::Stored {
+                            session: id.to_string(),
+                        },
                     },
+                    guard,
                 );
                 let Some(sealed) = sealed else {
                     // Ohne Seal kein Discard: Der Seal muss die
@@ -136,9 +176,9 @@ pub fn run_checkpoint(
                 // Rückverweis Session → Seal, best-effort: aus `list_seals`
                 // jederzeit rekonstruierbar, darf den Checkpoint nicht kippen.
                 if let Err(err) = store.record_session_seal(id, &sealed.seal_id) {
-                    hooklog::report_at(
+                    report(
                         log_dir,
-                        Source::Checkpoint,
+                        guard,
                         &format!("seal back-reference for {id} not recorded: {err}"),
                     );
                 }
@@ -146,8 +186,10 @@ pub fn run_checkpoint(
                 // Ein Absturz dazwischen darf weder Rohdaten noch Beweis
                 // verlieren.
                 journal.discard(&key)?;
-                println!("  {}: {id}", key.display_redacted(pipeline));
-                print_session_sealed(&sealed);
+                if guard.is_none() {
+                    println!("  {}: {id}", key.display_redacted(pipeline));
+                    print_session_sealed(&sealed);
+                }
                 outcome.stored.push(id);
                 outcome.sealed.push(sealed);
             }
@@ -168,16 +210,19 @@ pub fn run_checkpoint(
                         env,
                         src,
                         signer,
-                        &key,
-                        &read.events,
-                        &result,
-                        SealOutcome::Rejected,
+                        SealInput {
+                            key: &key,
+                            events: &read.events,
+                            result: &result,
+                            outcome: SealOutcome::Rejected,
+                        },
+                        guard,
                     ) {
                         note.push_str(&format!(" — coverage sealed: {}", sealed.seal_id));
                         outcome.sealed.push(sealed);
                     }
                 }
-                hooklog::report_at(log_dir, Source::Checkpoint, &note);
+                report(log_dir, guard, &note);
             }
         }
     }
@@ -189,15 +234,26 @@ pub fn run_checkpoint(
 /// fort. Gibt die [`SealSummary`] zurück — oder `None`, wenn die Ablage
 /// scheiterte (dann bleibt das Journal liegen und der nächste Lauf holt sie
 /// idempotent nach).
+struct SealInput<'a> {
+    key: &'a minds_capture::SessionKey,
+    events: &'a [minds_capture::JournalEvent],
+    result: &'a ChainResult,
+    outcome: SealOutcome,
+}
+
 fn seal_epoch(
     env: &CheckpointEnv<'_>,
     src: &EvidenceSource<'_>,
     signer: &SealSigner<'_>,
-    key: &minds_capture::SessionKey,
-    events: &[minds_capture::JournalEvent],
-    result: &ChainResult,
-    outcome: SealOutcome,
+    input: SealInput<'_>,
+    guard: Option<&dyn CheckpointGuard>,
 ) -> Option<SealSummary> {
+    let SealInput {
+        key,
+        events,
+        result,
+        outcome,
+    } = input;
     let store = env.store;
     let log_dir = env.log_dir;
     let epochs = src.epochs;
@@ -223,7 +279,13 @@ fn seal_epoch(
                     // Signatur-Anwesenheit frisch nachsehen, nicht raten: Der
                     // wiederverwendete Seal kann inzwischen signiert sein.
                     let signed = store.seal_signature(prev_id).ok().flatten().is_some();
-                    return Some(SealSummary::new(prev_id.clone(), prev, signed));
+                    let sealed = SealSummary::new(prev_id.clone(), prev, signed);
+                    if let Some(guard) = guard {
+                        if !signed || guard.sealed(key, &sealed).is_err() {
+                            return None;
+                        }
+                    }
+                    return Some(sealed);
                 }
             }
         }
@@ -249,22 +311,30 @@ fn seal_epoch(
         Ok(text) => text,
         Err(err) => {
             // #12-Fall am Agentnamen — benennt das Feld, zitiert nie den Wert.
-            hooklog::report_at(
-                log_dir,
-                Source::Checkpoint,
-                &format!("seal could not be built: {err}"),
-            );
+            report(log_dir, guard, &format!("seal could not be built: {err}"));
             return None;
         }
+    };
+    // Beim Witness ist die Signatur Pflicht. Vor der ersten Ablage signieren:
+    // ein fehlender Schlüssel darf keinen scheinbar erfolgreichen Seal erzeugen.
+    let required_signature = if guard.is_some() {
+        let SealSigner::Key { path, namespace } = signer else {
+            return None;
+        };
+        match minds_attest::ssh_sign_ns(&text, path, namespace) {
+            Ok(signature) => Some(signature),
+            Err(_) => {
+                guard?.report("witness signing failed; checkpoint deferred");
+                return None;
+            }
+        }
+    } else {
+        None
     };
     let seal_id = match store.put_seal(&text) {
         Ok(id) => id,
         Err(err) => {
-            hooklog::report_at(
-                log_dir,
-                Source::Checkpoint,
-                &format!("seal not stored: {err}"),
-            );
+            report(log_dir, guard, &format!("seal not stored: {err}"));
             return None;
         }
     };
@@ -272,17 +342,26 @@ fn seal_epoch(
     // Best-effort-Signatur (ADR-0011, Entscheidung 5): nur mit konfiguriertem
     // Schlüssel, nie ein Grund zum Abbruch — ein unsignierter Seal bleibt
     // hash-valide, `minds sign --seal` rüstet nach.
-    let signed = sign_seal_best_effort(env, signer, &seal_id, &text);
+    let signed = if let Some(signature) = required_signature {
+        if store.put_seal_signature(&seal_id, &signature).is_err() {
+            return None;
+        }
+        true
+    } else {
+        sign_seal_best_effort(env, signer, &seal_id, &text)
+    };
     // Epochen-Zustand best-effort: Fehlt er künftig, ist die Kette offen —
     // sichtbar und ehrlich, kein Grund, den Checkpoint zu kippen.
     if let Err(err) = epochs.record(key, &seal_id) {
-        hooklog::report_at(
-            log_dir,
-            Source::Checkpoint,
-            &format!("epoch state not advanced: {err}"),
-        );
+        report(log_dir, guard, &format!("epoch state not advanced: {err}"));
     }
-    Some(SealSummary::new(seal_id, seal, signed))
+    let sealed = SealSummary::new(seal_id, seal, signed);
+    if let Some(guard) = guard {
+        if guard.sealed(key, &sealed).is_err() {
+            return None;
+        }
+    }
+    Some(sealed)
 }
 
 /// Druckt die „SESSION SEALED"-Zusammenfassung eines frisch (oder idempotent
@@ -351,6 +430,7 @@ fn sign_seal_best_effort(
     seal_id: &minds_core::ContentHash,
     text: &str,
 ) -> bool {
+    let guard = None;
     let configured;
     let (key, namespace) = match signer {
         SealSigner::UserConfig => {
@@ -378,11 +458,7 @@ fn sign_seal_best_effort(
     match outcome {
         Ok(()) => true,
         Err(err) => {
-            hooklog::report_at(
-                log_dir,
-                Source::Checkpoint,
-                &format!("seal {seal_id} not signed: {err}"),
-            );
+            report(log_dir, guard, &format!("seal {seal_id} not signed: {err}"));
             false
         }
     }
@@ -394,6 +470,7 @@ fn store_one(
     env: &CheckpointEnv<'_>,
     key: &minds_capture::SessionKey,
     events: &[minds_capture::JournalEvent],
+    guard: Option<&dyn CheckpointGuard>,
 ) -> Fallible<SessionId> {
     let root = env.root;
     let log_dir = env.log_dir;
@@ -412,7 +489,10 @@ fn store_one(
         // Bytes hinter jedem Schreib-Hash (EA-01a).
         redaction: Some(pipeline),
     };
-    let session = adapter::checkpoint(key, events, &ctx);
+    let session = match guard {
+        Some(guard) => adapter::checkpoint_witness(key, events, &ctx, guard.path_map()),
+        None => adapter::checkpoint(key, events, &ctx),
+    };
     let redacted = pipeline.redact_session(session)?;
     let put = store.put(&redacted)?;
 
@@ -432,12 +512,19 @@ fn store_one(
     // bauen — ein Fehlschlag hier darf den Checkpoint nicht abbrechen und die
     // Session nicht ins Journal zurückwerfen.
     if let Err(err) = store.put_session_branch(&redacted) {
-        hooklog::report_at(
+        report(
             log_dir,
-            Source::Checkpoint,
+            guard,
             &format!("branch for {} not created: {err}", put.id()),
         );
     }
 
     Ok(put.id())
+}
+
+fn report(log_dir: &Path, guard: Option<&dyn CheckpointGuard>, message: &str) {
+    match guard {
+        Some(guard) => guard.report(message),
+        None => hooklog::report_at(log_dir, Source::Checkpoint, message),
+    }
 }

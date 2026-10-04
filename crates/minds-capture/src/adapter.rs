@@ -137,8 +137,15 @@ pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
 /// Der Checkpoint braucht diese Brücke zurück zu den Events, um den
 /// PostToolUse-Payload eines Aufrufs zu finden ([`written_hashes`]).
 fn build_indexed(key: &SessionKey, events: &[JournalEvent]) -> (Session, Vec<usize>) {
+    build_with_transcript(key, events, read_transcript(events))
+}
+
+fn build_with_transcript(
+    key: &SessionKey,
+    events: &[JournalEvent],
+    transcript: Transcript,
+) -> (Session, Vec<usize>) {
     let agent = key.agent();
-    let transcript = read_transcript(events);
 
     let (turns, call_events) = build_turns(agent, events, &transcript);
     let intent = Intent {
@@ -183,13 +190,47 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
     let (mut session, call_events) = build_indexed(key, events);
 
     written_hashes(&mut session, events, &call_events, key.agent(), ctx);
-    hash_artifacts(&mut session, ctx);
+    hash_artifacts(&mut session, ctx, &[]);
 
     session.edges.extend(edges::subagent(key.agent(), events));
     if let Some(commit) = ctx.commit {
         session.edges.push(edges::commit(commit));
     }
 
+    session
+}
+
+/// Der Host darf aus fremden Hook-Pfaden keine Transkripte nachladen.
+/// Nur die Artefakt-Lesezugriffe werden gemappt; Evidence und Effektpfade
+/// bleiben im ursprünglichen Namensraum.
+pub fn checkpoint_witness(
+    key: &SessionKey,
+    events: &[JournalEvent],
+    ctx: &Checkpoint,
+    path_map: &[(PathBuf, PathBuf)],
+) -> Session {
+    let (mut session, call_events) = build_with_transcript(key, events, Transcript::default());
+    let agent_root = path_map
+        .iter()
+        .find(|(_, host)| Some(host.as_path()) == ctx.root)
+        .map(|(agent, _)| agent.as_path())
+        .or(ctx.root);
+    let written_ctx = Checkpoint {
+        root: agent_root,
+        ..*ctx
+    };
+    written_hashes(
+        &mut session,
+        events,
+        &call_events,
+        key.agent(),
+        &written_ctx,
+    );
+    hash_artifacts(&mut session, ctx, path_map);
+    session.edges.extend(edges::subagent(key.agent(), events));
+    if let Some(commit) = ctx.commit {
+        session.edges.push(edges::commit(commit));
+    }
     session
 }
 
@@ -207,7 +248,7 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
 ///   ein Hash ein Orakel. Die Secretfile-Mauer gilt auch für Fingerabdrücke.
 /// - Lese-Effekte werden **nicht** gescannt: Sie liegen innerhalb der
 ///   Read-Grenze, ihr Inhalt ist für jeden Repo-Leser ohnehin sichtbar.
-fn hash_artifacts(session: &mut Session, ctx: &Checkpoint) {
+fn hash_artifacts(session: &mut Session, ctx: &Checkpoint, path_map: &[(PathBuf, PathBuf)]) {
     let Checkpoint {
         root,
         tracked,
@@ -237,6 +278,20 @@ fn hash_artifacts(session: &mut Session, ctx: &Checkpoint) {
         if minds_redact::is_secret_file(path) {
             continue;
         }
+        let mapped = path_map
+            .iter()
+            .filter_map(|(agent, host)| {
+                Path::new(path)
+                    .strip_prefix(agent)
+                    .ok()
+                    .map(|rest| (agent.components().count(), host.join(rest)))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, path)| path);
+        let path = mapped.as_deref().and_then(Path::to_str).unwrap_or(path);
+        if minds_redact::is_secret_file(path) {
+            continue;
+        }
         // Boundary gegen Pfad-Flucht: `path` kommt aus Text, den der Agent
         // selbst gewählt hat (ein Tool-Argument, bei `apply_patch` sogar eine
         // frei formulierte Diff-Kopfzeile) — nie aus vertrauenswürdiger
@@ -252,7 +307,11 @@ fn hash_artifacts(session: &mut Session, ctx: &Checkpoint) {
         // getrackte Pfade — bloßes Lesen einer privaten Datei erzeugt keinen
         // Fingerabdruck. Schreib-Effekte brauchen das nicht: Was der Agent
         // innerhalb des Repos erzeugt hat, ist sein Artefakt.
-        if effect.kind == EffectKind::Read && !tracked.is_some_and(|set| set.contains(path)) {
+        let relative = root
+            .and_then(|root| Path::new(path).strip_prefix(root).ok())
+            .and_then(Path::to_str)
+            .unwrap_or(path);
+        if effect.kind == EffectKind::Read && !tracked.is_some_and(|set| set.contains(relative)) {
             continue;
         }
         let Some(bytes) = read_artifact(root, path) else {

@@ -99,7 +99,7 @@
 //! nicht als gültiges Event — [`Journal::read`] meldet sie als
 //! [`Damaged`](ReadOutcome::Damaged), statt sie zu verschweigen.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -519,9 +519,18 @@ impl Journal {
     fn reserve(&self, dir: &Path) -> Result<(u64, PathBuf)> {
         let mut seq = read_hint(dir).unwrap_or_else(|| scan_next_seq(dir));
 
+        // Die Reservierung ist nach einem Absturz ein Rest im Journal und
+        // muss so privat sein wie jedes Event, nicht umask-abhängig.
+        let mut opts = OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
         for _ in 0..MAX_SEQ_PROBES {
             let path = dir.join(format!("{seq:010}.json"));
-            match File::create_new(&path) {
+            match opts.open(&path) {
                 Ok(_) => return Ok((seq, path)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     seq += 1;
@@ -1185,6 +1194,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8], op: &'static str) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
 
     #[cfg(unix)]
     #[test]
@@ -1449,6 +1459,21 @@ mod tests {
         assert_eq!(out.events.len(), 1);
         assert_eq!(out.damaged.len(), 1);
         assert!(!out.is_complete());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reservation_is_private_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "reserved").unwrap();
+        j.append(&key, event(EventKind::SessionStart)).unwrap();
+        // Bleibt nach einem Absturz vor dem `rename` genau so liegen.
+        let (seq, claim) = j.reserve(&j.session_dir(&key)).unwrap();
+        assert_eq!(seq, 1);
+        let mode = fs::metadata(&claim).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

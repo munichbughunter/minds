@@ -1,30 +1,77 @@
 //! Witness key setup, independent of the agent's signing configuration.
 
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::ExitCode;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
 
+#[cfg(unix)]
 type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub fn run(command: Option<&str>, home: Option<&str>) -> ExitCode {
+#[cfg(unix)]
+mod daemon;
+
+pub fn run(parsed: &crate::Parsed) -> ExitCode {
+    #[cfg(not(unix))]
+    {
+        let _ = parsed;
+        eprintln!("minds witness: not supported on this platform");
+        ExitCode::from(4)
+    }
+    #[cfg(unix)]
+    run_unix(parsed)
+}
+
+#[cfg(unix)]
+fn run_unix(parsed: &crate::Parsed) -> ExitCode {
     let result = (|| {
-        if command != Some("keygen") {
-            return Err("expected: minds witness keygen [--home <directory>]".into());
+        let command = parsed
+            .positional(0)
+            .ok_or("expected: witness init, run, keygen or status")?;
+        if command != "init"
+            && (parsed.value("--repo").is_some() || parsed.value("--path-map").is_some())
+        {
+            return Err("--repo and --path-map require witness init".into());
         }
-        keygen(&resolve_home(home)?)
+        if command != "run" && parsed.has("--follow") {
+            return Err("--follow requires witness run".into());
+        }
+        let home = resolve_home_for(parsed.value("--home"), parsed.value("--repo"))?;
+        match command {
+            "keygen" => keygen(&home),
+            "init" => daemon::init(
+                &home,
+                parsed.value("--repo").ok_or("init requires --repo")?,
+                parsed.value("--path-map"),
+            ),
+            "run" => {
+                daemon::run(&home, parsed.has("--follow"))?;
+                Ok(String::new())
+            }
+            "status" => daemon::status(&home),
+            _ => Err("expected: witness init, run, keygen or status".into()),
+        }
     })();
     match result {
         Ok(line) => {
-            println!("{line}");
+            if !line.is_empty() {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         Err(err) => {
-            eprintln!("minds witness: {err}");
-            ExitCode::FAILURE
+            eprintln!(
+                "minds witness: {}",
+                crate::hooklog::diagnostic(&err.to_string())
+            );
+            ExitCode::from(4)
         }
     }
 }
 
-fn resolve_home(explicit: Option<&str>) -> Fallible<PathBuf> {
+#[cfg(unix)]
+fn resolve_home_for(explicit: Option<&str>, repo: Option<&str>) -> Fallible<PathBuf> {
     if let Some(home) = explicit {
         if home.is_empty() {
             return Err("--home must not be empty".into());
@@ -35,7 +82,7 @@ fn resolve_home(explicit: Option<&str>) -> Fallible<PathBuf> {
         return Ok(home.into());
     }
     let output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
+        .args(["-C", repo.unwrap_or("."), "rev-parse", "--show-toplevel"])
         .stdin(Stdio::null())
         .output()?;
     if !output.status.success() {
@@ -52,6 +99,7 @@ fn resolve_home(explicit: Option<&str>) -> Fallible<PathBuf> {
     Ok(state.join("minds-witness").join(&digest[..16]))
 }
 
+#[cfg(unix)]
 fn private_directory(path: &Path) -> Fallible<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -80,6 +128,7 @@ fn private_directory(path: &Path) -> Fallible<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn keygen(home: &Path) -> Fallible<String> {
     // Strip trailing separators / `.` so symlink_metadata inspects the home
     // itself instead of following a directory symlink through a trailing `/`.

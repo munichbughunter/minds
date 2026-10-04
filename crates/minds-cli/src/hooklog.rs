@@ -599,6 +599,12 @@ fn entry(message: &str) -> String {
     line
 }
 
+/// Gemeinsame Begrenzung und Redaktion für lokale Witness-Diagnosen.
+#[cfg(unix)]
+pub(crate) fn diagnostic(message: &str) -> String {
+    entry(message)
+}
+
 /// Was statt einer Meldung in der Zeile steht, die länger als [`MAX_INPUT`] war.
 ///
 /// Ein Marker und kein Präfix: Die Meldung ist mit Sicherheit keine lesbare
