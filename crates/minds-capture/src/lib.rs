@@ -54,6 +54,7 @@
 mod error;
 pub use error::{CaptureError, Result};
 pub mod hook_event;
+pub mod witness_proto;
 
 pub mod normalize;
 pub use normalize::{
