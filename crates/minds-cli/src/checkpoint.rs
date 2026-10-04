@@ -161,7 +161,7 @@ fn checkpoint_at(cwd: &Path, commit: Option<&str>) -> Fallible<()> {
 
 /// Schreibt für jeden gerade abgelegten Session-Verweis eine beobachtete Kante
 /// `commit → session` in den Store-Index.
-fn record_index(
+pub(crate) fn record_index(
     store: &dyn ContextStore,
     commit: CommitId,
     sessions: &[SessionId],
@@ -185,7 +185,7 @@ fn record_index(
 
 /// Die von git getrackten, repo-relativen Pfade — `git ls-files -z`, einmal
 /// je Checkpoint-Lauf. `None`, wenn git nicht antwortet.
-fn tracked_files(root: &Path) -> Option<std::collections::BTreeSet<String>> {
+pub(crate) fn tracked_files(root: &Path) -> Option<std::collections::BTreeSet<String>> {
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -210,7 +210,7 @@ fn tracked_files(root: &Path) -> Option<std::collections::BTreeSet<String>> {
 /// Wächter-Commit steht. Gibt den Commit zurück, an dem die Trailer nun stehen
 /// (der *nachgerüstete*, also nach dem Amend), oder `None`, wenn nichts
 /// getrailert wurde.
-fn attach_trailers(
+pub(crate) fn attach_trailers(
     repo: &Repo,
     commit: Option<&str>,
     sessions: &[SessionId],

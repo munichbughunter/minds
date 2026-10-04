@@ -106,6 +106,9 @@ Usage:
         stores the sessions and appends the Minds-Session-Id trailer to
         HEAD. Called by the post-commit hook.
 
+  minds witness init --repo <host-path> [--home <directory>] [--path-map <agent>=<host>]
+  minds witness run [--home <directory>] [--follow]
+  minds witness status [--home <directory>]
   minds witness keygen [--home <directory>]
         Creates a private Ed25519 witness key without overwriting an existing
         key. Prints its namespace-restricted allowed_signers line to stdout.
@@ -310,7 +313,12 @@ const SPECS: &[Spec] = &[
     },
     spec("hook", &["--agent", "--event"], &[], 0),
     spec("checkpoint", &["--commit"], &[], 0),
-    spec("witness", &["--home"], &[], 1),
+    spec(
+        "witness",
+        &["--home", "--repo", "--path-map"],
+        &["--follow"],
+        1,
+    ),
     spec("show", &[], &["--full"], 1),
     spec("why", &[], &["--full"], 1),
     spec("blame", &[], &["--lines"], 1),
@@ -712,7 +720,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--mode"),
         ),
 
-        "witness" => witness_cmd::run(parsed.positional(0), parsed.value("--home")),
+        "witness" => witness_cmd::run(parsed),
 
         "gitlab" => gitlab_cmd::run(
             parsed.positional(0),

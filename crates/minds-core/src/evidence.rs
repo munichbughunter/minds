@@ -458,6 +458,9 @@ pub const SEAL_LINES: usize = 13;
 /// Quelle) — damit ein Prüfer weiß, *welche* Grenze „vollständig" meinte.
 pub const SCOPE_AGENT_HOOKS_V1: &str = "agent-hooks/v1";
 
+/// Vom unabhängigen Witness beobachtete Hook-Evidence.
+pub const SCOPE_WITNESS_V1: &str = "witness/v1";
+
 /// Was der Checkpoint mit der Session gemacht hat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealOutcome {

@@ -216,6 +216,50 @@ Lists Evidence-Chain seals — id, linked session (if any), event range, gap/sig
 minds seals --session b3a1f0e --limit 5
 ```
 
+### minds witness init / run / status
+
+```sh
+minds witness init --repo /host/project --home /private/witness \
+  --path-map /workspaces/project=/host/project
+minds witness keygen --home /private/witness
+minds witness run --home /private/witness --follow
+minds witness status --home /private/witness
+```
+
+The Unix-only daemon owns one repository. `init` creates schema-version-1
+`witness.json` and private journal, epoch, key, ledger, log and runtime directories.
+Omit `--path-map` for a local user profile; with a map the profile is `container`.
+The map must connect an absolute agent repository root to the canonical host root.
+Configuration may also select `managed` and a numeric `socket_group`; profile
+selection alone does not establish an assurance level.
+
+`run` requires a generated key and refuses symlinked, foreign-owned or insufficiently
+private state. A process lock enforces a single writer even during stale-socket
+recovery. Only `run/witness.sock` (0660) belongs in the agent's namespace; keep
+the rest of the 0700 state directory on the host. Deployment and group access
+configuration remain part of the later enable integration.
+
+Hook frames are parsed and secret-file-filtered using the same code as local hooks.
+Each journal append advances a salted, atomically persisted chain. Restart checks
+the persisted prefix before completing interrupted updates. `witness.start` records
+whether the previous run stopped cleanly; SIGINT and SIGTERM append `witness.stop`.
+`--follow` shows sequence, event kind, interpreted tool/path and chain head, without
+prompts, arguments or tool responses. Redacted diagnostics go to `log/witness.log`.
+`status` shows the profile, repository, socket health, open hook sessions, most recent
+event, key fingerprint and the ten latest ledger entries.
+
+The internal checkpoint entry point checks the live root before sealing, signs under
+`minds-witness` with scope `witness/v1`, records each seal once in the fsynced ledger,
+and attaches the standard session trailers. Path mapping affects artifact reads only;
+stored hook paths and payloads retain the agent namespace. Host transcripts are never
+loaded from hook-supplied paths. Lifecycle events remain chained in the witness stream
+and are not yet sealed. Socket checkpoint delegation, hook forwarding, filesystem
+observation and enable integration are separate follow-up features; checkpoint and
+intent requests currently receive `not supported`.
+
+On non-Unix platforms, `minds witness` exits 4 with
+`not supported on this platform`.
+
 ### minds witness keygen
 
 ```
