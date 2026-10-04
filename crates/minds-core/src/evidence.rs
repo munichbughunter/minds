@@ -39,6 +39,7 @@
 //! mögliche Behauptung mehr; möglich ist nur „nicht erfasst", explizit.
 
 use crate::ContentHash;
+use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
 // Domain-Kontexte
@@ -124,7 +125,7 @@ pub fn event_hash(facts: &EventFacts<'_>) -> ContentHash {
 }
 
 /// Eine Lücke im beobachteten Bereich — selbst Evidence, kein Schweigen.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GapRecord {
     /// Sequenznummern, die zwischen erstem und letztem gelesenen Event fehlen
     /// (beide Grenzen einschließlich).
@@ -238,6 +239,165 @@ pub struct ChainResult {
     pub coverage: Coverage,
 }
 
+/// Persistierbarer Zwischenstand eines [`ChainFolder`] für lokale Recovery.
+///
+/// Enthält nur den aktuellen Hash und die Coverage, keine vergangenen Events.
+/// Der Zustand muss wie der Salt lokal geschützt bleiben: Vor dem ersten Glied
+/// enthält er den abgeleiteten Salt. Serde prüft die Form, nicht die Echtheit;
+/// Wiederaufnahme setzt einen vertrauenswürdigen, unveränderten Stand voraus.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderState {
+    state: [u8; 32],
+    first_seq: Option<u64>,
+    last_seq: u64,
+    events: u64,
+    pre_chain: u64,
+    gaps: Vec<GapRecord>,
+}
+
+/// Inkrementeller Evidence-Fold: ein Kettenglied pro [`Self::push`].
+///
+/// Root und Coverage entsprechen jederzeit [`chain_salted`] bzw. [`chain`]
+/// über denselben Präfix. Events werden nicht aufgehoben; nur Gap-Records
+/// bleiben für die Coverage erhalten. Die gegebene Reihenfolge wird gebunden,
+/// weder sortiert noch auf fehlende Sequenzen geprüft.
+///
+/// ```
+/// use minds_core::evidence::{ChainFolder, ChainItem, GapRecord, chain_salted};
+///
+/// let salt = [7; 32]; // In Produktion: zufälliger, lokal geschützter Session-Salt.
+/// let items = [
+///     ChainItem::PreChain { seq: 0 },
+///     ChainItem::Gap(GapRecord::Missing { from: 1, to: 2 }),
+/// ];
+/// let mut folder = ChainFolder::new_salted(&salt);
+/// folder.push(&items[0]);
+/// let saved = serde_json::to_vec(&folder.to_state())?;
+/// let mut resumed = ChainFolder::from_state(serde_json::from_slice(&saved)?);
+/// resumed.push(&items[1]);
+/// assert_eq!(resumed.snapshot(), chain_salted(&salt, &items));
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Debug, Clone)]
+pub struct ChainFolder {
+    state: [u8; 32],
+    first_seq: Option<u64>,
+    last_seq: u64,
+    events: u64,
+    pre_chain: u64,
+    gaps: Vec<GapRecord>,
+}
+
+impl ChainFolder {
+    /// Startet wie [`chain_salted`] auf `derive_key(CTX_CHAIN, salt)`.
+    pub fn new_salted(salt: &[u8; 32]) -> Self {
+        Self::new(blake3::derive_key(CTX_CHAIN, salt))
+    }
+
+    /// Startet wie [`chain`] auf 32 Nullbytes (lokale Nachrechnung, Tests).
+    pub fn new_unsalted() -> Self {
+        Self::new([0; 32])
+    }
+
+    fn new(state: [u8; 32]) -> Self {
+        Self {
+            state,
+            first_seq: None,
+            last_seq: 0,
+            events: 0,
+            pre_chain: 0,
+            gaps: Vec::new(),
+        }
+    }
+
+    /// Bindet genau ein Glied an den bisherigen Head und ergänzt die Coverage.
+    /// Lücken zählen nicht als gelesene Events und erweitern deren Bereich nicht.
+    pub fn push(&mut self, item: &ChainItem) {
+        let mut buf = Vec::with_capacity(80);
+        buf.extend_from_slice(&self.state);
+        match item {
+            ChainItem::Event { seq, hash } => {
+                buf.push(TAG_EVENT);
+                buf.extend_from_slice(&hash.to_bytes());
+                self.events += 1;
+                self.first_seq.get_or_insert(*seq);
+                self.last_seq = self.last_seq.max(*seq);
+            }
+            ChainItem::PreChain { seq } => {
+                buf.push(TAG_PRE_CHAIN);
+                put_u64(&mut buf, *seq);
+                self.pre_chain += 1;
+                self.first_seq.get_or_insert(*seq);
+                self.last_seq = self.last_seq.max(*seq);
+            }
+            ChainItem::Gap(gap) => {
+                buf.push(TAG_GAP);
+                buf.extend_from_slice(&gap_hash(gap).to_bytes());
+                self.gaps.push(gap.clone());
+            }
+        }
+        self.state = blake3::derive_key(CTX_CHAIN, &buf);
+    }
+
+    /// Der aktuelle Root, ohne die Coverage zu kopieren.
+    pub fn head(&self) -> ContentHash {
+        ContentHash::from_bytes(self.state)
+    }
+
+    /// Root und Coverage des bisherigen Präfixes; der Folder bleibt nutzbar.
+    pub fn snapshot(&self) -> ChainResult {
+        ChainResult {
+            root: self.head(),
+            coverage: Coverage {
+                first_seq: self.first_seq.unwrap_or(0),
+                last_seq: self.last_seq,
+                events: self.events,
+                gaps: self.gaps.clone(),
+                pre_chain: self.pre_chain,
+            },
+        }
+    }
+
+    /// Kopiert den vollständigen Stand für lokale Persistierung per Serde.
+    pub fn to_state(&self) -> FolderState {
+        FolderState {
+            state: self.state,
+            first_seq: self.first_seq,
+            last_seq: self.last_seq,
+            events: self.events,
+            pre_chain: self.pre_chain,
+            gaps: self.gaps.clone(),
+        }
+    }
+
+    /// Setzt einen vertrauenswürdigen lokalen Stand ohne erneutes Falten fort.
+    /// Der ursprüngliche Salt ist zur Wiederaufnahme nicht erforderlich.
+    pub fn from_state(s: FolderState) -> Self {
+        Self {
+            state: s.state,
+            first_seq: s.first_seq,
+            last_seq: s.last_seq,
+            events: s.events,
+            pre_chain: s.pre_chain,
+            gaps: s.gaps,
+        }
+    }
+
+    // Der Batch-Pfad kann die Gap-Liste verschieben, statt sie zu kopieren.
+    fn into_result(self) -> ChainResult {
+        ChainResult {
+            root: self.head(),
+            coverage: Coverage {
+                first_seq: self.first_seq.unwrap_or(0),
+                last_seq: self.last_seq,
+                events: self.events,
+                gaps: self.gaps,
+                pre_chain: self.pre_chain,
+            },
+        }
+    }
+}
+
 /// Faltet die Glieder in gegebener Reihenfolge zum Root — Start sind 32
 /// Nullbytes. Für Seals, die eine Forge erreichen, gehört stattdessen
 /// [`chain_salted`] verwendet (Anti-Orakel, siehe dort); die ungesalzene Form
@@ -270,50 +430,11 @@ pub fn chain_salted(salt: &[u8; 32], items: &[ChainItem]) -> ChainResult {
 /// sortiert); die Funktion ordnet nicht um — sie bindet die **gegebene**
 /// Reihenfolge.
 fn chain_from(start: [u8; 32], items: &[ChainItem]) -> ChainResult {
-    let mut state = start;
-    let mut first_seq: Option<u64> = None;
-    let mut last_seq: u64 = 0;
-    let mut events: u64 = 0;
-    let mut pre_chain: u64 = 0;
-    let mut gaps = Vec::new();
-
+    let mut folder = ChainFolder::new(start);
     for item in items {
-        let mut buf = Vec::with_capacity(80);
-        buf.extend_from_slice(&state);
-        match item {
-            ChainItem::Event { seq, hash } => {
-                buf.push(TAG_EVENT);
-                buf.extend_from_slice(&hash.to_bytes());
-                events += 1;
-                first_seq.get_or_insert(*seq);
-                last_seq = last_seq.max(*seq);
-            }
-            ChainItem::PreChain { seq } => {
-                buf.push(TAG_PRE_CHAIN);
-                put_u64(&mut buf, *seq);
-                pre_chain += 1;
-                first_seq.get_or_insert(*seq);
-                last_seq = last_seq.max(*seq);
-            }
-            ChainItem::Gap(gap) => {
-                buf.push(TAG_GAP);
-                buf.extend_from_slice(&gap_hash(gap).to_bytes());
-                gaps.push(gap.clone());
-            }
-        }
-        state = blake3::derive_key(CTX_CHAIN, &buf);
+        folder.push(item);
     }
-
-    ChainResult {
-        root: ContentHash::from_bytes(state),
-        coverage: Coverage {
-            first_seq: first_seq.unwrap_or(0),
-            last_seq,
-            events,
-            gaps,
-            pre_chain,
-        },
-    }
+    folder.into_result()
 }
 
 // ---------------------------------------------------------------------------
