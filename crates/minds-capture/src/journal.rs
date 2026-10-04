@@ -215,7 +215,7 @@ impl SessionKey {
 ///
 /// Die andere Hälfte dieser Entscheidung — warum gescannt statt validiert
 /// wird — steht in der Modul-Doku von `minds_redact::session`.
-fn check_component(value: &str, field: &'static str) -> Result<()> {
+pub(crate) fn check_component(value: &str, field: &'static str) -> Result<()> {
     let ok = !value.is_empty()
         && value.len() <= 128
         && value != "."
