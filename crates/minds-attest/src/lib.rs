@@ -21,7 +21,15 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 /// Der ssh-sig-Namespace — trennt Minds-Signaturen von anderen ssh-sig-Domänen.
-pub const NAMESPACE: &str = "minds";
+pub const NS_DEFAULT: &str = "minds";
+/// Witness seals, separate from human reviews and attributions.
+pub const NS_WITNESS: &str = "minds-witness";
+/// Human intent approvals.
+pub const NS_INTENT: &str = "minds-intent";
+/// CI anchors and replay records.
+pub const NS_ANCHOR: &str = "minds-anchor";
+/// Backwards-compatible name for the default namespace.
+pub const NAMESPACE: &str = NS_DEFAULT;
 
 /// Fehler beim Signieren oder Verifizieren.
 #[derive(Debug, thiserror::Error)]
@@ -99,11 +107,24 @@ pub fn ssh_verify(
     signers: &Path,
     identity: &str,
 ) -> Result<bool, AttestError> {
+    ssh_verify_ns(payload, signature, signers, identity, NS_DEFAULT)
+}
+
+/// Verifies both the signature namespace and the allowed signer's restrictions.
+pub fn ssh_verify_ns(
+    payload: &str,
+    signature: &str,
+    signers: &Path,
+    identity: &str,
+    namespace: &str,
+) -> Result<bool, AttestError> {
+    // A missing/unreadable trust file is an operational error, not tampering.
+    std::fs::File::open(signers)?;
     let dir = private_tempdir()?;
     let sig = dir.path().join("attest.sig");
     write_private(&sig, signature.as_bytes())?;
     let mut child = Command::new("ssh-keygen")
-        .args(["-Y", "verify", "-n", NAMESPACE, "-I", identity, "-f"])
+        .args(["-Y", "verify", "-n", namespace, "-I", identity, "-f"])
         .arg(signers)
         .arg("-s")
         .arg(&sig)
@@ -127,6 +148,43 @@ pub fn ssh_verify(
         }
     }
     Ok(child.wait()?.success())
+}
+
+/// Finds candidate principals for a signature's key. This does not verify the
+/// payload or namespace: each candidate must still pass [`ssh_verify_ns`].
+/// An invalid signature or an untrusted key yields an empty list.
+pub fn ssh_find_principals(signature: &str, signers: &Path) -> Result<Vec<String>, AttestError> {
+    let allowed = std::fs::read_to_string(signers)?;
+    let dir = private_tempdir()?;
+    let sig = dir.path().join("attest.sig");
+    write_private(&sig, signature.as_bytes())?;
+    let mut principals = Vec::new();
+    // OpenSSH stops at the first matching allowed_signers record, regardless
+    // of its namespace restriction. Discover per record so a human-only entry
+    // cannot hide a later witness entry for the same key. OpenSSH still does
+    // all parsing and key matching; verification uses the original trust file.
+    for (index, line) in allowed.lines().enumerate() {
+        if line.trim().is_empty() || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let record = dir.path().join(format!("signers-{index}"));
+        write_private(&record, format!("{line}\n").as_bytes())?;
+        let output = Command::new("ssh-keygen")
+            .args(["-Y", "find-principals", "-f"])
+            .arg(record)
+            .arg("-s")
+            .arg(&sig)
+            .stdin(Stdio::null())
+            .output()?;
+        if output.status.success() {
+            for principal in String::from_utf8_lossy(&output.stdout).lines() {
+                if !principal.is_empty() && !principals.iter().any(|p| p == principal) {
+                    principals.push(principal.to_owned());
+                }
+            }
+        }
+    }
+    Ok(principals)
 }
 
 /// Ein Temp-Verzeichnis mit zufälligem Namen, nur für den Eigentümer lesbar.
@@ -159,6 +217,95 @@ fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn namespace_restriction_blocks_cross_role_use() {
+        assert!(
+            ssh_keygen_available(),
+            "SSH signature tests require ssh-keygen"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&key)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        let signers = dir.path().join("allowed_signers");
+        std::fs::write(
+            &signers,
+            format!(
+                "minds-witness@host namespaces=\"minds-witness\" {}",
+                public.trim()
+            ),
+        )
+        .unwrap();
+        let payload = "minds-review-v1\ndecision=approve\n";
+        let witness = ssh_sign_ns(payload, &key, NS_WITNESS).unwrap();
+        assert_eq!(
+            ssh_find_principals(&witness, &signers).unwrap(),
+            vec!["minds-witness@host"]
+        );
+        assert!(
+            ssh_verify_ns(
+                payload,
+                &witness,
+                &signers,
+                "minds-witness@host",
+                NS_WITNESS
+            )
+            .unwrap()
+        );
+        assert!(
+            !ssh_verify_ns(
+                "altered",
+                &witness,
+                &signers,
+                "minds-witness@host",
+                NS_WITNESS
+            )
+            .unwrap()
+        );
+        for namespace in [NS_DEFAULT, NS_INTENT, NS_ANCHOR] {
+            let signature = ssh_sign_ns(payload, &key, namespace).unwrap();
+            assert!(
+                !ssh_verify_ns(
+                    payload,
+                    &signature,
+                    &signers,
+                    "minds-witness@host",
+                    namespace
+                )
+                .unwrap()
+            );
+            assert!(
+                !ssh_verify_ns(
+                    payload,
+                    &signature,
+                    &signers,
+                    "minds-witness@host",
+                    NS_WITNESS
+                )
+                .unwrap()
+            );
+        }
+        // Remove just the restriction: the same review signature now verifies.
+        let review = ssh_sign(payload, &key).unwrap();
+        std::fs::write(&signers, format!("minds-witness@host {}", public.trim())).unwrap();
+        assert!(ssh_verify(payload, &review, &signers, "minds-witness@host").unwrap());
+        assert!(
+            ssh_find_principals("malformed signature", &signers)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::write(&signers, "").unwrap();
+        assert!(ssh_find_principals(&witness, &signers).unwrap().is_empty());
+        assert!(ssh_find_principals(&witness, &dir.path().join("missing")).is_err());
+    }
 
     #[test]
     fn sign_verify_roundtrip_and_detect_tampering() {

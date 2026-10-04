@@ -22,6 +22,8 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["raw_value"] }
 terminal_size.workspace = true
 textwrap.workspace = true
+tempfile.workspace = true
+blake3.workspace = true
 
 # Nur für `setsid` im losgelösten Sync (#85) — ohnehin transitiv über gix im
 # Graphen, hier nur noch direkt benannt.
@@ -35,7 +37,6 @@ default = ["tui"]
 tui = ["dep:minds-tui"]
 
 [dev-dependencies]
-tempfile.workspace = true
 serde_json.workspace = true
 
 [[bin]]
