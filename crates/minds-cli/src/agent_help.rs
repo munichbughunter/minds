@@ -26,6 +26,7 @@ fn card() -> serde_json::Value {
         "version": env!("CARGO_PKG_VERSION"),
         "description": "Durable context for agent sessions, in Git.",
         "commands": [
+            {"name": "witness", "usage": "minds witness keygen [--home <directory>]", "summary": "Create a private witness key; print its namespace-restricted allowed_signers line. Never overwrites keys."},
             {"name": "enable", "usage": "minds enable [--agent <name>] [--child-repo <path>] [--child-remote <url>]", "summary": "Set the repo up for Minds: hooks + store config."},
             {"name": "hook", "usage": "minds hook --agent <name> [--event <name>]", "summary": "Agent hook event from stdin into the local journal. Always exits 0."},
             {"name": "checkpoint", "usage": "minds checkpoint [--commit <id>]", "summary": "Interpret the journal, redact, store sessions, append trailers."},

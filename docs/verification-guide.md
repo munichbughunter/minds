@@ -157,8 +157,8 @@ git cat-file blob refs/minds/evidence/<id>:seal  # fetch the text
 assert derive("minds/evidence/v1/seal", seal_text_bytes) == ref_name_hex
 ```
 
-**2. The signature** (if `seal.sig` sits next to it) — exactly the stored
-bytes, checked like a Git SSH signature:
+**2. The signature** — exactly the stored bytes, checked like a Git SSH
+signature. Legacy `agent-hooks/v1` seals use the `minds` namespace:
 
 ```sh
 git cat-file blob refs/minds/evidence/<id>:seal      > seal.txt
@@ -166,6 +166,70 @@ git cat-file blob refs/minds/evidence/<id>:seal.sig  > seal.sig
 ssh-keygen -Y verify -n minds -I <identity> \
   -f allowed_signers -s seal.sig < seal.txt
 ```
+
+Seals with `scope=witness/v1` or `scope=witness-fs/v1` **must** carry
+`seal.sig` and verify under `minds-witness`. Discover the candidate principal
+from the independently trusted signer file, then verify the payload and namespace:
+
+```sh
+ssh-keygen -Y find-principals -f allowed_signers -s seal.sig
+# Use a returned principal; if there are several, try each until one verifies.
+ssh-keygen -Y verify -n minds-witness -I 'minds-witness@host' \
+  -f allowed_signers -s seal.sig < seal.txt
+```
+
+Principal discovery alone does not prove validity. `minds verify --evidence
+<seal-id> --signers allowed_signers` performs both steps and reports
+`witness-signed (minds-witness@host)` on success. Session and revision
+verification apply the same rule to every witness seal. Witness principals
+come from `allowed_signers`, independently of `--identity` and `user.email`.
+OpenSSH's `find-principals` stops at the first matching key entry. Minds
+discovers candidates per entry so a namespace restriction on an earlier entry
+cannot hide a later valid witness entry; when checking manually, use the
+dedicated witness entry for discovery if your file repeats a key.
+A missing signature is `TAMPERED` even without a signer file. An invalid or
+untrusted signature, or a wrong namespace, is `TAMPERED` with the reason
+`witness seal not signed under minds-witness` (exit 1). When no signer file
+is available, a present signature is reported as `signature not checked`
+without changing the verdict. An explicitly configured but unreadable signer
+file, or an unavailable verification executable, is an operational failure
+(exit 4).
+
+Create a dedicated witness key on the host:
+
+```sh
+minds witness keygen --home /path/to/private/witness-home > witness.allowed_signers
+```
+
+This creates `key/witness_ed25519` and `key/witness_ed25519.pub` with mode
+0600 inside private directories (0700), refuses existing keys (including
+symlinks), and prints exactly one trust-file entry:
+
+```text
+minds-witness@host namespaces="minds-witness" ssh-ed25519 AAAA…
+```
+
+Distribute that public entry through your trusted channel. Keep the private
+key in the witness domain. Home resolution is `--home`, then
+`MINDS_WITNESS_HOME`, then `$XDG_STATE_HOME/minds-witness/<repo-id>` (with
+`$HOME/.local/state` as the XDG fallback). The repo id is the first 16 hex
+characters of BLAKE3 over the canonical worktree root path. Outside a
+worktree, provide `--home` or `MINDS_WITNESS_HOME`. Existing home and key
+directories must be owned by the current user and private; keygen refuses
+symlinked directories and does not relax permissions.
+
+The signing namespaces separate roles:
+
+| Namespace | Purpose |
+| --- | --- |
+| `minds` | Reviews, attributions, legacy seals |
+| `minds-witness` | Witness and filesystem-witness seals |
+| `minds-intent` | Intent approvals |
+| `minds-anchor` | CI anchors and replay records |
+
+Use `namespaces="…"` restrictions in `allowed_signers` to enforce each
+key's role. A witness-only entry rejects a review signed with the same key
+under `minds`. Existing human signatures remain in `minds`.
 
 **3. The chain root** — recomputable only **locally**, with the journal still at
 rest **and** the session salt (`<git-dir>/minds/evidence/state/…/*.salt`;

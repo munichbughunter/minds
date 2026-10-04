@@ -216,7 +216,28 @@ Lists Evidence-Chain seals — id, linked session (if any), event range, gap/sig
 minds seals --session b3a1f0e --limit 5
 ```
 
+### minds witness keygen
+
+```
+minds witness keygen [--home <directory>]
+```
+
+Creates an Ed25519 key at `<home>/key/witness_ed25519` with mode 0600 and
+prints its `namespaces="minds-witness"` allowed-signers entry to stdout.
+Refuses existing private/public keys and symlinks. Home defaults to
+`MINDS_WITNESS_HOME`, otherwise `$XDG_STATE_HOME/minds-witness/<repo-id>`
+(`$HOME/.local/state` when XDG is unset). Existing home and key directories
+must be private and owned by the current user. No repository is needed when
+the home is explicit. See the [verification guide](verification-guide.md)
+for trust-file distribution and independent signature verification.
+
 ### minds verify
+
+Witness-scoped seals require a signature in `minds-witness` by a principal
+discovered in the trusted `allowed_signers` file. Success prints
+`witness-signed (<principal>)`; missing, invalid or incorrectly namespaced
+signatures produce `TAMPERED`. Without a signer file, present signatures
+print `signature not checked`. See the [verification guide](verification-guide.md).
 
 ```
 minds verify [<session|rev>] [--signers <file>] [--identity <id>]

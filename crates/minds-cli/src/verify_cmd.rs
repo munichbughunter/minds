@@ -434,17 +434,35 @@ enum SignatureState {
     /// Manipulationsbeweis, sondern eine offene Zuordnung (ADR-0011: ein
     /// Prüfprimitive, das regulär falsch-positiv rauscht, ist wertlos).
     NotAttributable,
+    WitnessValid(String),
+    WitnessUnchecked,
+    WitnessInvalid,
+    WitnessUnsigned,
 }
 
 impl SignatureState {
-    fn word(&self) -> &'static str {
+    fn is_invalid(&self) -> bool {
+        matches!(
+            self,
+            Self::Invalid | Self::WitnessInvalid | Self::WitnessUnsigned
+        )
+    }
+
+    fn word(&self) -> String {
         match self {
+            SignatureState::WitnessValid(principal) => {
+                return format!("witness-signed ({})", crate::text::sanitize(principal));
+            }
+            SignatureState::WitnessUnchecked => "signature not checked",
+            SignatureState::WitnessInvalid => "witness seal not signed under minds-witness",
+            SignatureState::WitnessUnsigned => "witness seal missing signature",
             SignatureState::Unsigned => "unsigned",
             SignatureState::Unchecked => "signed (unchecked — verify with --signers)",
             SignatureState::Valid => "signature valid",
             SignatureState::Invalid => "SIGNATURE INVALID",
             SignatureState::NotAttributable => "signed (not attributable — pass --identity)",
         }
+        .to_owned()
     }
 }
 
@@ -562,7 +580,7 @@ fn verify_session(
 
     for c in &checked {
         print_seal_line(c);
-        if matches!(c.signature, SignatureState::Invalid) {
+        if c.signature.is_invalid() {
             tampered = true;
         }
     }
@@ -796,7 +814,7 @@ fn check_seals(
                 continue;
             }
         };
-        let signature = signature_state(store, id, &text, signers, identity, root)?;
+        let signature = signature_state(store, id, &text, &seal.scope, signers, identity, root)?;
         checked.push(CheckedSeal {
             id: id.clone(),
             seal,
@@ -815,16 +833,43 @@ fn signature_state(
     store: &dyn ContextStore,
     id: &ContentHash,
     text: &str,
+    scope: &str,
     signers: Option<&str>,
     identity: Option<&str>,
     root: &Path,
 ) -> Fallible<SignatureState> {
+    let witness = matches!(scope, "witness/v1" | "witness-fs/v1");
     let Some(signature) = store.seal_signature(id)? else {
-        return Ok(SignatureState::Unsigned);
+        return Ok(if witness {
+            SignatureState::WitnessUnsigned
+        } else {
+            SignatureState::Unsigned
+        });
     };
     let Some(signers) = resolve_signers_optional(signers, root) else {
-        return Ok(SignatureState::Unchecked);
+        return Ok(if witness {
+            SignatureState::WitnessUnchecked
+        } else {
+            SignatureState::Unchecked
+        });
     };
+    if witness {
+        // The witness identity comes from the trusted signer file, never the
+        // developer's --identity or user.email. Discovery alone is not proof.
+        let signers = Path::new(&signers);
+        for principal in minds_attest::ssh_find_principals(&signature, signers)? {
+            if minds_attest::ssh_verify_ns(
+                text,
+                &signature,
+                signers,
+                &principal,
+                minds_attest::NS_WITNESS,
+            )? {
+                return Ok(SignatureState::WitnessValid(principal));
+            }
+        }
+        return Ok(SignatureState::WitnessInvalid);
+    }
     let explicit = identity.is_some();
     let Some(identity) = identity
         .map(str::to_string)
@@ -1068,7 +1113,15 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
             return Ok(Verdict::Tampered);
         }
     };
-    let signature = signature_state(ctx.store.as_ref(), &id, &text, signers, identity, &ctx.root)?;
+    let signature = signature_state(
+        ctx.store.as_ref(),
+        &id,
+        &text,
+        &seal.scope,
+        signers,
+        identity,
+        &ctx.root,
+    )?;
     let checked = CheckedSeal {
         id,
         seal,
@@ -1076,7 +1129,7 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
     };
     print_seal_line(&checked);
 
-    if matches!(checked.signature, SignatureState::Invalid) {
+    if checked.signature.is_invalid() {
         println!("{}", Verdict::Tampered.word());
         return Ok(Verdict::Tampered);
     }

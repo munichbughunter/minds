@@ -69,6 +69,7 @@ mod sync;
 mod text;
 mod verify_cmd;
 mod why;
+mod witness_cmd;
 
 use std::process::ExitCode;
 
@@ -104,6 +105,11 @@ Usage:
         .minds/redact.json: allow/deny_secrets/deny_pii/secret_keys …),
         stores the sessions and appends the Minds-Session-Id trailer to
         HEAD. Called by the post-commit hook.
+
+  minds witness keygen [--home <directory>]
+        Creates a private Ed25519 witness key without overwriting an existing
+        key. Prints its namespace-restricted allowed_signers line to stdout.
+        Home: --home, MINDS_WITNESS_HOME, or the repository's XDG state path.
 
   minds show [<commit>] [--full]
         Shows intent and attribution of the session(s) behind a commit
@@ -304,6 +310,7 @@ const SPECS: &[Spec] = &[
     },
     spec("hook", &["--agent", "--event"], &[], 0),
     spec("checkpoint", &["--commit"], &[], 0),
+    spec("witness", &["--home"], &[], 1),
     spec("show", &[], &["--full"], 1),
     spec("why", &[], &["--full"], 1),
     spec("blame", &[], &["--lines"], 1),
@@ -704,6 +711,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--base"),
             parsed.value("--mode"),
         ),
+
+        "witness" => witness_cmd::run(parsed.positional(0), parsed.value("--home")),
 
         "gitlab" => gitlab_cmd::run(
             parsed.positional(0),
