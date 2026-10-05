@@ -11,6 +11,7 @@ minds-core = { path = "../minds-core" }
 gix = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+filetime.workspace = true
 
 
 [dev-dependencies]

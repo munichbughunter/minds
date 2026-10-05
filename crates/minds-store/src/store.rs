@@ -33,8 +33,9 @@
 //! **gespeicherten Bytes**, nicht gegen das, was wir daraus wieder machen
 //! würden.
 
+use minds_core::observation::Observations;
 use minds_core::{ContentHash, EvidenceMark, Session, SessionId};
-use minds_redact::RedactedSession;
+use minds_redact::{RedactedObservations, RedactedSession};
 
 use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
@@ -367,6 +368,54 @@ pub trait ContextStore {
     /// Die Signatur zu einem Seal — `None`, wenn er unsigniert ist.
     fn seal_signature(&self, _id: &ContentHash) -> Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Legt ein redigiertes Observation-Objekt des Datei-Beobachters ab
+    /// (EA-08) und gibt seine Id zurück: `blake3` der kanonischen Bytes,
+    /// ein Ref je Objekt unter `refs/minds/observations/<64 hex>`.
+    ///
+    /// Dass hier [`RedactedObservations`] verlangt wird, ist dieselbe
+    /// fail-closed-Zusage in Typform wie bei [`put`](Self::put).
+    /// Idempotent; der Default lehnt ab, statt Beweise still zu verlieren.
+    fn put_observations(&self, _observations: &RedactedObservations) -> Result<ContentHash> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store observation objects",
+        )))
+    }
+
+    /// Die rohen Bytes eines Observation-Objekts — **ungeprüft**.
+    fn observations_bytes(&self, _id: &ContentHash) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Alle abgelegten Observation-Objekte.
+    fn list_observations(&self) -> Result<Vec<ContentHash>> {
+        Ok(Vec::new())
+    }
+
+    /// Das Observation-Objekt unter `id` — `None`, wenn es hier nicht liegt.
+    ///
+    /// Geprüft wird gegen die **gespeicherten Bytes** (wie bei Sessions);
+    /// gelesen wird tolerant (unbekannte Felder und Gründe brechen nicht).
+    fn get_observations(&self, id: &ContentHash) -> Result<Option<Observations>> {
+        let Some(bytes) = self.observations_bytes(id)? else {
+            return Ok(None);
+        };
+        let actual = Observations::id_of_bytes(&bytes);
+        if actual != *id {
+            return Err(StoreError::ObservationsMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        // Nur die Kategorie, nie der Parser-Text: Er zitierte Werte aus
+        // Bytes, die jeder unter `refs/minds/` ablegen kann.
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|err| StoreError::MalformedObservations {
+                id: id.clone(),
+                reason: format!("{:?}", err.classify()).to_lowercase(),
+            })
     }
 
     /// Holt die Session unter `id` — `None`, wenn sie hier nicht liegt.

@@ -357,7 +357,7 @@ impl Index {
     /// Store prüfen. `(seal_id, Seal, signiert?)`, wie beim Laden.
     pub fn with_seals(mut self, id: SessionId, seals: Vec<(ContentHash, Seal, bool)>) -> Self {
         for (seal_id, seal, _) in &seals {
-            let stored = matches!(seal.outcome, SealOutcome::Stored { .. });
+            let stored = !matches!(seal.outcome, SealOutcome::Rejected);
             self.all_seals.insert(
                 seal_id.clone(),
                 (stored, seal.root.clone(), seal.previous.clone()),
@@ -467,7 +467,10 @@ impl Index {
                 let Ok(seal) = Seal::parse(&text) else {
                     continue;
                 };
-                let stored = matches!(seal.outcome, SealOutcome::Stored { .. });
+                // `stored` heißt hier „kein Block-Seal": Auch eine
+                // `witness-fs/v1`-Epoche ist abgelegt und schließt als
+                // Vorgänger die Kette.
+                let stored = !matches!(seal.outcome, SealOutcome::Rejected);
                 self.all_seals.insert(
                     seal_id.clone(),
                     (stored, seal.root.clone(), seal.previous.clone()),

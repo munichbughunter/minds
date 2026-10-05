@@ -51,6 +51,7 @@ use minds_store::{ContextStore, StoreError};
 use crate::context::Context;
 
 mod artifact;
+mod witness_trust;
 
 use artifact::Artifact;
 
@@ -219,7 +220,7 @@ fn verify_target(
     if ids.is_empty() {
         return Verdict::Unverifiable.exit();
     }
-    let artifact = match artifact_of(&ctx, &options, required, revision, &ids) {
+    let artifact = match artifact_of(&ctx, &options, required, revision, &ids, signers) {
         Ok(artifact) => artifact,
         Err(err) => return operational_failure(err.as_ref()),
     };
@@ -306,6 +307,7 @@ fn artifact_of(
     required: Option<u8>,
     revision: Option<CommitId>,
     ids: &[SessionId],
+    signers: Option<&str>,
 ) -> Fallible<ArtifactState> {
     let failed = |err: Box<dyn std::error::Error>| {
         ArtifactState::Failed(crate::text::sanitize(&err.to_string()))
@@ -334,11 +336,38 @@ fn artifact_of(
     };
     // Gelesen wie im Verdikt-Block; was dort nicht lesbar ist, meldet der
     // Block selbst — hier trägt es schlicht keine Claims bei.
-    let sessions: Vec<Session> = ids
+    let loaded: Vec<(SessionId, Session)> = ids
         .iter()
-        .filter_map(|id| ctx.store.get(*id).ok().flatten())
+        .filter_map(|id| Some((*id, ctx.store.get(*id).ok().flatten()?)))
         .collect();
-    let sessions: Vec<&Session> = sessions.iter().collect();
+    let sessions: Vec<&Session> = loaded.iter().map(|(_, session)| session).collect();
+    // Beobachtungen des Datei-Beobachters (EA-08) — nur aus
+    // `witness-fs/v1`-Seals mit gültiger Witness-Signatur, geprüft gegen eine
+    // Signer-Datei, die nicht aus der Repo-Konfiguration stammt, für
+    // Principals, die auf `minds-witness` beschränkt sind (`witness_trust`),
+    // und nur in den Fenstern der vom Witness bezeugten Sessions
+    // (`witness_windows`). Unter `refs/minds/` kann auch der Agent schreiben,
+    // und die Zeitpunkte unbezeugter Sessions setzt er selbst; eine
+    // ungeprüfte Beobachtung könnte eine menschliche Zeile „erklären" und das
+    // Gate aushebeln. Ohne vertrauenswürdige Signer: keine.
+    // Das Urteil je Seal einmal: `witness_windows` und
+    // `observations_in_windows` fragen teils dieselben Seals, und jede
+    // Prüfung startet `ssh-keygen`.
+    let check = witness_trust::observation_trust(ctx.store.as_ref(), signers);
+    let verdicts = std::cell::RefCell::new(std::collections::HashMap::new());
+    let trusted = |seal_id: &ContentHash, text: &str| {
+        if let Some(verdict) = verdicts.borrow().get(seal_id) {
+            return *verdict;
+        }
+        let verdict = check(seal_id, text);
+        verdicts.borrow_mut().insert(seal_id.clone(), verdict);
+        verdict
+    };
+    let pairs: Vec<(SessionId, &Session)> =
+        loaded.iter().map(|(id, session)| (*id, session)).collect();
+    let windows = minds_reader::observations::witness_windows(ctx.store.as_ref(), &pairs, &trusted);
+    let observations =
+        minds_reader::observations::observations_in_windows(ctx.store.as_ref(), &windows, &trusted);
     // Derselbe Lauf, ungekappt: das Ziel (Revision oder Session) und der
     // Commit, beides in voller Länge.
     let target = match (revision, ids) {
@@ -352,7 +381,7 @@ fn artifact_of(
         format!("minds verify {target} --commit {commit} --all")
     };
     Ok(
-        match artifact::assess(ctx, commit, &sessions, options.all, rerun) {
+        match artifact::assess(ctx, commit, &sessions, &observations, options.all, rerun) {
             Ok(Ok(artifact)) => ArtifactState::Assessed(artifact),
             Ok(Err(why)) => ArtifactState::Unavailable(why),
             Err(err) => failed(err),
@@ -739,6 +768,7 @@ fn report_tampered_seal(
     // sicher; `sanitize` bleibt als zweite Schicht (wie beim Scope oben).
     let session = match &claimed.outcome {
         SealOutcome::Stored { session } => session.as_str(),
+        SealOutcome::ObservationsStored { observations } => observations.as_str(),
         SealOutcome::Rejected => "-",
     };
     println!("  claimed      (UNVERIFIED — the tampered text's statement, not evidence)");
@@ -756,11 +786,11 @@ fn report_tampered_seal(
         // Geparste Ids vergleichen, nicht Strings: `SessionId::from_str`
         // normalisiert (Groß-Hex) — ein String-Vergleich meldete sonst
         // „does NOT match" für die semantisch identische Session.
-        let word = if session.parse::<SessionId>().ok() == Some(target) {
-            "matches"
-        } else {
-            "does NOT match"
-        };
+        // Nur `stored` nennt eine Session; die Id eines Observation-Objekts
+        // hat dieselbe Form, ist aber keine.
+        let names = matches!(claimed.outcome, SealOutcome::Stored { .. })
+            && session.parse::<SessionId>().ok() == Some(target);
+        let word = if names { "matches" } else { "does NOT match" };
         println!("  cross-check  the claimed session {word} the session under verification");
     }
     if let Some(prev) = &claimed.previous {
@@ -951,7 +981,12 @@ fn coverage_complete(
             Some(prev) => match store.seal_text(prev) {
                 Ok(Some(text)) => match Seal::parse(&text) {
                     Ok(prev_seal) => match &prev_seal.outcome {
-                        SealOutcome::Stored { .. } => entry_points += 1,
+                        // Eine `witness-fs/v1`-Epoche folgt auf die
+                        // vorige des Witness-Streams: gespeichert wie
+                        // `stored`, also ein geschlossener Vorgänger.
+                        SealOutcome::Stored { .. } | SealOutcome::ObservationsStored { .. } => {
+                            entry_points += 1
+                        }
                         SealOutcome::Rejected if prev_seal.root == c.seal.root => {
                             entry_points += 1;
                         }
@@ -1019,7 +1054,7 @@ fn seals_naming(store: &dyn ContextStore, id: SessionId) -> Fallible<Vec<Content
                         SealOutcome::Stored { session } => {
                             session.parse::<SessionId>().ok() == Some(id)
                         }
-                        SealOutcome::Rejected => false,
+                        SealOutcome::ObservationsStored { .. } | SealOutcome::Rejected => false,
                     });
                 if claims_this {
                     found.push(seal_id);
@@ -1139,6 +1174,43 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
                 "Note           payload rejected by the storage policy — the seal is the evidence that the range existed"
             );
             Verdict::Incomplete
+        }
+        SealOutcome::ObservationsStored { observations } => {
+            println!("Observations   {observations}");
+            let mut reasons = Vec::new();
+            let complete = coverage_complete(
+                ctx.store.as_ref(),
+                std::slice::from_ref(&checked),
+                &mut reasons,
+            )?;
+            // Wie bei `stored`: Der Seal sagt „abgelegt" — dann muss das
+            // Objekt hier auch liegen und auf seine Id hashen.
+            match observations
+                .parse::<ContentHash>()
+                .map_err(|_| ())
+                .and_then(|id| ctx.store.get_observations(&id).map_err(|_| ()))
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => reasons.push("the observation object is not in this store".into()),
+                Err(()) => reasons.push("the observation object is unreadable".into()),
+            }
+            for reason in &reasons {
+                println!("Gap            {reason}");
+            }
+            // Das Verdikt sagt etwas über den Seal. Ob seine Beobachtungen
+            // eine Zeile erklären dürfen, entscheidet die strengere
+            // Witness-Prüfung — das wird hier dazugesagt, nicht verschwiegen.
+            let trusted = witness_trust::observation_trust(ctx.store.as_ref(), signers);
+            if !trusted(&checked.id, &text) {
+                println!(
+                    "Note           not trusted for reconciliation — needs a principal restricted to minds-witness in --signers or ~/.ssh/allowed_signers"
+                );
+            }
+            if complete && reasons.is_empty() {
+                Verdict::Verified
+            } else {
+                Verdict::Incomplete
+            }
         }
         SealOutcome::Stored { session } => {
             println!("Session        {session}");

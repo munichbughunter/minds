@@ -28,6 +28,12 @@ crossterm = "0.29"
 terminal_size = "0.4"
 textwrap = "0.16"
 libc = "0.2"
+# Zeitstempel-Typ für `gix::index::State::from_bytes` (EA-08); über
+# gix-index ohnehin im Graphen.
+filetime = "0.2"
+# Datei-Beobachter des Witness (EA-08). Linux: inotify (reines Rust + libc,
+# musl-tauglich), macOS: FSEvents. Keine weiteren Default-Features.
+notify = { version = "8.2", default-features = false, features = ["macos_fsevent"] }
 
 [profile.release]
 strip = true

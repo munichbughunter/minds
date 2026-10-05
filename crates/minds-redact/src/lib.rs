@@ -55,6 +55,7 @@
 
 mod assignment;
 mod config;
+mod observations;
 mod pii;
 mod pipeline;
 mod redactor;
@@ -66,6 +67,7 @@ pub use assignment::{
     KeyValueRedactor, ShortFlagRedactor, Tier, UrlCredentialRedactor, has_credential_shape,
 };
 pub use config::{AllowList, ConfigError, DenyListRedactor, HighEntropyConfig, RedactionConfig};
+pub use observations::RedactedObservations;
 pub use pii::EmailRedactor;
 pub use pipeline::{RedactedText, RedactionPipeline};
 pub use redactor::{Category, Finding, Redactor};

@@ -164,6 +164,21 @@ impl ContextStore for ChildRepoStore {
         self.0.list_seals()
     }
 
+    fn put_observations(
+        &self,
+        observations: &minds_redact::RedactedObservations,
+    ) -> Result<minds_core::ContentHash> {
+        self.0.put_observations(observations)
+    }
+
+    fn observations_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.observations_bytes(id)
+    }
+
+    fn list_observations(&self) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.list_observations()
+    }
+
     fn put_seal_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
         self.0.put_seal_signature(id, signature)
     }

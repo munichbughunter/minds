@@ -84,6 +84,7 @@ fn observation(path: &str, bytes: Option<&[u8]>, seq: u64) -> FsObservation {
             at: None,
         },
         content: bytes.map(<[u8]>::to_vec),
+        opaque: false,
     }
 }
 fn run(

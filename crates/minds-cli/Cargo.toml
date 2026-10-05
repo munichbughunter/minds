@@ -29,6 +29,8 @@ blake3.workspace = true
 # Graphen, hier nur noch direkt benannt.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# Der Datei-Beobachter des Witness (EA-08) — der Witness ist Unix-only.
+notify.workspace = true
 
 # `tui` ist Default der Release-Builds; `--no-default-features` baut die
 # Kern-CLI ohne Oberfläche (und ohne ratatui/crossterm im Binary).
@@ -38,6 +40,7 @@ tui = ["dep:minds-tui"]
 
 [dev-dependencies]
 serde_json.workspace = true
+jiff.workspace = true
 
 [[bin]]
 name = "minds"

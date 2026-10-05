@@ -49,6 +49,8 @@ pub mod evidence;
 
 pub mod reconcile;
 
+pub mod observations;
+
 pub mod artifact;
 
 mod query;

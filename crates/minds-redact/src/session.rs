@@ -195,6 +195,12 @@ pub enum RedactionError {
         /// Wo im Envelope.
         field: Field,
     },
+
+    /// Ein Observation-Objekt verletzt die Schreib-Regeln
+    /// ([`minds_core::observation::Observations::check`]) — vor oder nach
+    /// der Bereinigung. Es gibt nichts zu speichern.
+    #[error("observation object refused: {0}")]
+    Observations(#[from] minds_core::observation::ObservationError),
 }
 
 // ---------------------------------------------------------------------------
@@ -275,6 +281,14 @@ pub enum Field {
     EdgeLocalId(usize),
     /// `edges[e].to.id`
     EdgeCommitId(usize),
+    /// `first_at` eines Observation-Objekts (EA-08).
+    ObservationsFirstAt,
+    /// `last_at` eines Observation-Objekts.
+    ObservationsLastAt,
+    /// `observations[i].path`
+    ObservationPath(usize),
+    /// `observations[i].at`
+    ObservationAt(usize),
 }
 
 impl fmt::Display for Field {
@@ -310,6 +324,10 @@ impl fmt::Display for Field {
             Field::EdgeAgent(e) => write!(f, "edges[{e}].to.agent"),
             Field::EdgeLocalId(e) => write!(f, "edges[{e}].to.local_id"),
             Field::EdgeCommitId(e) => write!(f, "edges[{e}].to.id"),
+            Field::ObservationsFirstAt => f.write_str("first_at"),
+            Field::ObservationsLastAt => f.write_str("last_at"),
+            Field::ObservationPath(i) => write!(f, "observations[{i}].path"),
+            Field::ObservationAt(i) => write!(f, "observations[{i}].at"),
         }
     }
 }
@@ -664,7 +682,7 @@ impl RedactionPipeline {
     }
 
     /// Bereinigt ein einzelnes Feld, verifiziert das Ergebnis und verbucht es.
-    fn redact_field(
+    pub(crate) fn redact_field(
         &self,
         field: Field,
         text: String,

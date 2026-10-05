@@ -22,7 +22,7 @@ use minds_core::Session;
 use minds_git::{BlobId, CommitId, GitError, Repo};
 
 use crate::reconcile::{
-    ChangedFile, Claims, FileRecon, LineLevel, Reason, ReconClass, Reconciliation,
+    ChangedFile, Claims, FileRecon, FsObservation, LineLevel, Reason, ReconClass, Reconciliation,
 };
 
 /// Der Legendentext einer unerklärten Stelle — nie ein Fehler, nur: In der
@@ -48,7 +48,10 @@ pub struct Assessed {
     pub structural: Vec<Structural>,
 }
 
-/// Gleicht `commit` gegen die Claims von `sessions` ab.
+/// Gleicht `commit` gegen die Claims von `sessions` und die Beobachtungen
+/// des Witness ab (`observations`: schon auf das Fenster der Sessions und
+/// auf vertrauenswürdige Seals beschränkt, siehe
+/// [`crate::observations::observations_in_window`]; leer ohne Witness).
 ///
 /// `roots` sind die Schreibweisen der Wurzel des prüfenden Checkouts (siehe
 /// [`roots_of`]). Der Aufrufer wählt die Sessions: Nur wessen Claims hier
@@ -62,6 +65,7 @@ pub fn assess(
     roots: &[&Path],
     commit: CommitId,
     sessions: &[&Session],
+    observations: &[FsObservation],
 ) -> minds_git::Result<Result<Assessed, &'static str>> {
     if let Some(parent) = repo.first_parent(commit)?
         && !repo.has_commit(parent)
@@ -189,8 +193,19 @@ pub fn assess(
         } else {
             &no_claims
         };
-        // Ohne Datei-Beobachter (EA-08) gibt es keine Beobachtungen.
-        recon.absorb(claims.reconcile(commit, changes.base, std::slice::from_ref(&file), &[]));
+        // Beobachtungen tragen nur bei UTF-8-Pfaden: Nur dort ist der Pfad
+        // eine Identität, die der Witness ebenso geschrieben hat.
+        let observations = if entry.path_is_utf8 {
+            observations
+        } else {
+            &[]
+        };
+        recon.absorb(claims.reconcile(
+            commit,
+            changes.base,
+            std::slice::from_ref(&file),
+            observations,
+        ));
     }
     Ok(Ok(Assessed { recon, structural }))
 }
@@ -274,9 +289,14 @@ impl crate::Index {
 
     /// Gleicht `commit` gegen die Claims seiner [`Index::claimants`] ab.
     /// Fail-soft: Ein Lesefehler wird zu [`ArtifactState::Failed`].
+    ///
+    /// Ohne Witness-Beobachtungen: Der Index kennt keine `allowed_signers`
+    /// und könnte einen `witness-fs/v1`-Seal nicht von einem gefälschten
+    /// unterscheiden. Beobachtungen nutzt `minds verify`, das die
+    /// Witness-Signatur prüft.
     pub fn artifact(&self, repo: &Repo, roots: &[&Path], commit: CommitId) -> CommitArtifact {
         let (claimants, inferred) = self.claimants(commit);
-        let state = match assess(repo, roots, commit, &claimants) {
+        let state = match assess(repo, roots, commit, &claimants, &[]) {
             Ok(Ok(assessed)) => ArtifactState::Assessed(assessed),
             Ok(Err(why)) => ArtifactState::Unavailable(why),
             Err(err) => ArtifactState::Failed(crate::sanitize(&err.to_string())),

@@ -143,13 +143,17 @@ fn checkpoint_delegates_to_witness() {
     let said = text(&out);
     assert!(out.status.success(), "{said}");
 
-    // Der Witness hat versiegelt und es über den Socket gesagt …
+    // Der Witness hat versiegelt und es über den Socket gesagt: die
+    // Agent-Session und — seit EA-08 — den eigenen Stream (Lebenszyklus und
+    // Datei-Beobachtungen) als zweiten Bereich.
     assert!(
-        said.contains("witness: 1 range(s) sealed"),
+        said.contains("witness: 2 range(s) sealed"),
         "{said}\nwitness.log: {}",
         fs::read_to_string(f.home.join("log/witness.log")).unwrap_or_default()
     );
     assert!(said.contains("· scope witness/v1 ·"), "{said}");
+    assert!(said.contains("OBSERVATIONS SEALED b3-"), "{said}");
+    assert!(said.contains("· scope witness-fs/v1 ·"), "{said}");
     assert!(!said.contains(UNAVAILABLE), "{said}");
     // … und danach lief der lokale Pfad unverändert.
     assert!(said.contains("Scope      agent-hooks/v1"), "{said}");
@@ -167,8 +171,9 @@ fn checkpoint_delegates_to_witness() {
             .map_or(true, |read| read.events.is_empty())
     );
     let ledger = fs::read_to_string(f.home.join("ledger")).unwrap();
-    assert_eq!(ledger.lines().count(), 1, "{ledger}");
+    assert_eq!(ledger.lines().count(), 2, "{ledger}");
     assert!(ledger.contains(" witness/v1 "), "{ledger}");
+    assert!(ledger.contains(" witness-fs/v1 "), "{ledger}");
 
     // Auch der Store allein kennt beide am Commit des Branches — nicht am
     // Zwischen-Commit, den der zweite Amend verwaist hat.

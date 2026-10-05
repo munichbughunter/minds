@@ -183,6 +183,14 @@ const SEAL_FILE: &str = "seal";
 /// Die `ssh-sig`-Signatur daneben — nie im Seal selbst (zirkulär).
 const SEAL_SIG_FILE: &str = "seal.sig";
 
+/// Namensraum der Observation-Objekte des Datei-Beobachters (EA-08): ein
+/// elternloser Commit je Objekt, adressiert über die volle Id (ADR-0010-
+/// Muster). Kein `forget`: Das Objekt trägt nur redigierte Pfade und Hashes.
+const OBSERVATIONS_REF_PREFIX: &str = "refs/minds/observations/";
+
+/// Dateiname des Objekts im Baum seines Refs.
+const OBSERVATIONS_FILE: &str = "observations.json";
+
 /// Rückverweise Session → Seals im Baum des Session-Refs, neben
 /// `session.json` und `links.json`. Veränderlich wie `links.json`, nie
 /// kanonisch; `forget` ersetzt nur `session.json`, die Rückverweise bleiben.
@@ -868,6 +876,18 @@ fn seal_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
     (id.hex() == hex).then_some(id)
 }
 
+/// Der Ref eines Observation-Objekts.
+fn observations_ref(id: &minds_core::ContentHash) -> String {
+    format!("{OBSERVATIONS_REF_PREFIX}{}", id.hex())
+}
+
+/// Die Id hinter einem Observation-Ref — `None` für Fremdes.
+fn observations_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(OBSERVATIONS_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
 /// Die Form der `evidence.json`: ein Objekt, damit spätere Nachbarn (etwa
 /// Signatur-Verweise) additiv Platz finden.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1326,6 +1346,59 @@ impl ContextStore for GitStore {
             .map_err(StoreError::backend)?
             .iter()
             .filter_map(|(name, _)| seal_id_of_ref(name))
+            .collect())
+    }
+
+    fn put_observations(
+        &self,
+        observations: &minds_redact::RedactedObservations,
+    ) -> Result<minds_core::ContentHash> {
+        use minds_core::observation::Observations;
+
+        let bytes = observations
+            .observations()
+            .canonical_bytes()
+            .map_err(|err| StoreError::backend(std::io::Error::other(err)))?;
+        let id = Observations::id_of_bytes(&bytes);
+        let reference = observations_ref(&id);
+        // Content-adressiert wie Seals: Liegt etwas unter dem Ref, muss es
+        // genau dieses Objekt sein — ein fremd vorbelegter Ref fällt als
+        // Mismatch auf, statt still als „schon da" durchzugehen.
+        if self.get_observations(&id)?.is_some() {
+            return Ok(id);
+        }
+        let write = || -> minds_git::Result<()> {
+            let blob = self.repo.write_blob(&bytes)?;
+            let tree = self.repo.write_tree(None, [(OBSERVATIONS_FILE, blob)])?;
+            self.repo
+                .commit_tree_to_ref(&reference, tree, &format!("minds: Observations {id}"))?;
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(id),
+            Err(GitError::RefRaced { .. }) => match self.get_observations(&id)? {
+                Some(_) => Ok(id),
+                None => Err(StoreError::backend(std::io::Error::other(
+                    "the observation ref moved but carries no observation object",
+                ))),
+            },
+            Err(err) => Err(StoreError::backend(err)),
+        }
+    }
+
+    fn observations_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.repo
+            .read_blob_at(&observations_ref(id), OBSERVATIONS_FILE)
+            .map_err(StoreError::backend)
+    }
+
+    fn list_observations(&self) -> Result<Vec<minds_core::ContentHash>> {
+        Ok(self
+            .repo
+            .refs_under(OBSERVATIONS_REF_PREFIX)
+            .map_err(StoreError::backend)?
+            .iter()
+            .filter_map(|(name, _)| observations_id_of_ref(name))
             .collect())
     }
 
@@ -2013,6 +2086,106 @@ mod tests {
         );
         let tree = fixture.git(&["ls-tree", "-r", "--name-only", &session_ref(id)]);
         assert!(tree.contains(SESSION_EVIDENCE_FILE), "{tree}");
+    }
+
+    fn sample_observations() -> minds_redact::RedactedObservations {
+        use minds_core::observation::{Observation, ObservationReason, Observations};
+        let object = Observations::new(vec![
+            Observation {
+                seq: 1,
+                at: "2026-10-05T10:00:00Z".into(),
+                path: "src/a.rs".into(),
+                content: Some(minds_core::ContentHash::from_bytes([7; 32])),
+                reason: None,
+            },
+            Observation {
+                seq: 2,
+                at: "2026-10-05T10:00:01Z".into(),
+                path: ".env".into(),
+                content: None,
+                reason: Some(ObservationReason::SecretFile),
+            },
+        ]);
+        minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_observations(object)
+            .unwrap()
+    }
+
+    #[test]
+    fn an_observation_object_roundtrips_idempotently_and_fsck_stays_clean() {
+        let (fixture, store) = fresh_store();
+        let foreign_refs = || {
+            fixture
+                .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+                .lines()
+                .filter(|line| !line.starts_with("refs/minds/"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let before = foreign_refs();
+        let redacted = sample_observations();
+        let id = store.put_observations(&redacted).unwrap();
+        assert_eq!(id, redacted.observations().id().unwrap());
+        assert_eq!(
+            store.get_observations(&id).unwrap().as_ref(),
+            Some(redacted.observations())
+        );
+        // Die gespeicherten Bytes sind die kanonische Form.
+        assert_eq!(
+            store.observations_bytes(&id).unwrap().unwrap(),
+            redacted.observations().canonical_bytes().unwrap()
+        );
+        assert_eq!(store.list_observations().unwrap(), vec![id.clone()]);
+        assert_eq!(store.put_observations(&redacted).unwrap(), id);
+        let reference = observations_ref(&id);
+        assert!(reference.starts_with("refs/minds/observations/"));
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "1"
+        );
+        // Unsichtbar für Git-Nutzer: kein Branch, `fsck` sauber.
+        assert_eq!(foreign_refs(), before);
+        fixture.git(&["fsck", "--strict", "--no-progress"]);
+        let absent = minds_core::ContentHash::from_bytes([0; 32]);
+        assert!(store.get_observations(&absent).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_tampered_observation_object_is_caught_on_read() {
+        let (fixture, store) = fresh_store();
+        let id = store.put_observations(&sample_observations()).unwrap();
+        let tmp = fixture.path().join("forged-observations");
+        std::fs::write(
+            &tmp,
+            br#"{"schema":1,"first_at":null,"last_at":null,"observations":[]}"#,
+        )
+        .unwrap();
+        let blob = fixture.git(&["hash-object", "-w", tmp.to_str().unwrap()]);
+        let tree_input = format!("100644 blob {}\t{}\n", blob.trim(), OBSERVATIONS_FILE);
+        let tree = fixture.git_with_stdin(&["mktree"], &tree_input);
+        let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "forged"]);
+        fixture.git(&["update-ref", &observations_ref(&id), commit.trim()]);
+        assert!(matches!(
+            store.get_observations(&id),
+            Err(StoreError::ObservationsMismatch { .. })
+        ));
+        // Auch ein zweites `put` repariert nicht still über Fremdes hinweg.
+        assert!(store.put_observations(&sample_observations()).is_err());
+    }
+
+    #[test]
+    fn foreign_refs_in_the_observation_namespace_are_not_objects() {
+        for name in [
+            "refs/minds/observations/x",
+            "refs/minds/observations/ABCDEF",
+            &format!("refs/minds/observations/{}", "A".repeat(64)),
+        ] {
+            assert_eq!(observations_id_of_ref(name), None, "{name}");
+        }
+        let id = minds_core::ContentHash::from_bytes([1; 32]);
+        assert_eq!(observations_id_of_ref(&observations_ref(&id)), Some(id));
     }
 
     #[test]
