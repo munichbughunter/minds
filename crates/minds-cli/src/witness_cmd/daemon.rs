@@ -26,6 +26,7 @@ mod observer;
 mod socket;
 #[cfg(test)]
 mod tests;
+mod witness_clock;
 pub use socket::run;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -268,7 +269,9 @@ fn log(home: &Path, message: &str) {
     }
 }
 
-/// Die Uhr des Witness (RFC 3339, Unix-Nanos).
+/// Die Wanduhr des Witness (RFC 3339, Unix-Nanos) — eine Ablesung. Was ins
+/// Journal kommt, stempelt [`Writer::append`] darüber hinaus monoton
+/// ([`witness_clock`]).
 pub(super) fn now() -> (String, u64) {
     clock::now()
 }
@@ -284,6 +287,8 @@ struct Writer {
     config: Config,
     journal: Journal,
     epochs: EpochState,
+    /// Die monotone Uhr über alle Läufe (EA-08a).
+    clock: witness_clock::WitnessClock,
     folders: BTreeMap<SessionKey, ChainFolder>,
     follow: bool,
     /// Ob seit dem letzten vollständigen Checkpoint ein Agent-Event kam oder
@@ -338,6 +343,7 @@ impl Writer {
             config,
             journal: Journal::at(home.join("journal")),
             epochs: EpochState::at(home.join("evidence/state")),
+            clock: witness_clock::WitnessClock::open(home)?,
             folders: BTreeMap::new(),
             follow,
             dirty: true,
@@ -352,6 +358,7 @@ impl Writer {
             last_gap: std::collections::HashMap::new(),
         };
         writer.recover_all()?;
+        writer.witness_ledger()?;
         Ok(writer)
     }
 
@@ -360,6 +367,11 @@ impl Writer {
     fn recover(&mut self, key: &SessionKey) -> Fallible<()> {
         let read = self.journal.read(key)?;
         verify_events(&read.events)?;
+        // Was schon im Journal steht, hat die Uhr vergeben — auch ein Witness
+        // von vor EA-08a ohne Uhr-Datei stempelt danach nicht früher.
+        for event in &read.events {
+            self.clock.witnessed(event.at_nanos);
+        }
         let items = base_items(&read);
         let path = folder_path(&self.home, key);
         let saved = match fs::read(&path) {
@@ -397,10 +409,18 @@ impl Writer {
         Ok(())
     }
 
-    fn append(&mut self, key: &SessionKey, event: NewEvent) -> Fallible<JournalEvent> {
+    /// Jeder Stempel im Journal läuft hier durch die monotone Uhr: Lebenszyklus,
+    /// `fs.observed`, `fs.gap`, `fs.checkpoint` und angenommene Hook-Events.
+    /// Die Marke ist persistiert, bevor das Event angehängt wird.
+    ///
+    /// Der Stempel ist damit der **Journal-Zeitpunkt**: Bei `fs.observed`
+    /// liegt er nie vor der Klassifikation, kann aber um die Wartezeit in der
+    /// begrenzten Warteschlange (`fs_ready`) dahinter liegen.
+    fn append(&mut self, key: &SessionKey, mut event: NewEvent) -> Fallible<JournalEvent> {
         if !self.folders.contains_key(key) {
             self.recover(key)?;
         }
+        (event.at, event.at_nanos) = self.clock.stamp((event.at, event.at_nanos))?;
         let event = self.journal.append(key, event)?;
         if self.includes(key) {
             self.dirty = true;
@@ -492,6 +512,25 @@ impl Writer {
             },
         )?;
         Ok(())
+    }
+
+    /// Beginnt den eigenen Stream `key` eines Laufs: Erst schaltet `arm` den
+    /// Beobachter scharf, **dann** kommt `witness.start` ins Journal. Dessen
+    /// Stempel ist der Beginn der ersten Epoche (`started_at`, EA-08a), und
+    /// der Leser verankert an ihm — was danach geschrieben wird, meldet der
+    /// Watcher also schon (gesammelt, bis die Eventloop es abholt).
+    fn start_stream<T>(
+        &mut self,
+        key: &SessionKey,
+        payload: serde_json::Value,
+        arm: impl FnOnce() -> T,
+    ) -> Fallible<T> {
+        let armed = arm();
+        self.lifecycle(key, "witness.start", payload)?;
+        // Der eigene Stream gilt auch ohne Beobachter: Jeder Checkpoint
+        // schließt seine Epoche mit `fs.checkpoint` ab.
+        self.stream = Some(key.clone());
+        Ok(armed)
     }
 
     /// Startet die Datei-Beobachtung in den eigenen Stream `stream`.
@@ -765,25 +804,12 @@ impl Writer {
         // (`witness_windows`) — nicht die des nächsten, die schon die Arbeit
         // nach dem Commit enthielte.
         //
-        // Gestempelt wird monoton: nie vor dem letzten Event irgendeiner
+        // Gestempelt wird monoton ([`Self::append`]): nach jedem Event, das
+        // der Witness je angehängt hat, also auch nach dem letzten jeder
         // offenen Session — springt die Wanduhr zurück, läge die Grenze sonst
         // vor dem bezeugten Bereich.
         if let Some(stream) = self.stream.clone() {
-            let latest = self
-                .journal
-                .sessions()?
-                .keys
-                .iter()
-                .filter_map(|key| self.journal.read(key).ok())
-                .filter_map(|read| read.events.last().map(|event| event.at_nanos))
-                .max()
-                .unwrap_or(0);
-            let now = clock::now();
-            let at = if now.1 > latest {
-                now
-            } else {
-                (clock::rfc3339_from_nanos(latest + 1), latest + 1)
-            };
+            let at = clock::now();
             self.append(
                 &stream,
                 NewEvent {
@@ -808,6 +834,30 @@ impl Writer {
             Err(_) => self.folders.clear(),
         }
         result
+    }
+
+    /// Hebt die Uhr auf jeden Seal im Ledger an: Es überdauert das Verwerfen
+    /// versiegelter Journale. So stempelt auch ein Witness ohne Uhr-Datei
+    /// (von vor EA-08a, oder die Datei ging verloren) nie vor einem
+    /// versiegelten Event. Eine unlesbare Zeile (etwa ein abgerissenes
+    /// Ende nach einem Absturz) hebt nichts an.
+    fn witness_ledger(&mut self) -> Fallible<()> {
+        let ledger = match fs::read_to_string(self.home.join("ledger")) {
+            Ok(ledger) => ledger,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        for line in ledger.lines() {
+            let nanos = line
+                .split_whitespace()
+                .nth(2)
+                .and_then(|at| at.parse::<jiff::Timestamp>().ok())
+                .and_then(|at| u64::try_from(at.as_nanosecond()).ok());
+            if let Some(nanos) = nanos {
+                self.clock.witnessed(nanos);
+            }
+        }
+        Ok(())
     }
 
     fn recover_all(&mut self) -> Fallible<()> {

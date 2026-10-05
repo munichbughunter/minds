@@ -157,7 +157,7 @@ impl Fixture {
         let empty = minds_redact::RedactionConfig::default()
             .pipeline()
             .unwrap()
-            .redact_observations(Observations::new(Vec::new()))
+            .redact_observations(Observations::new("2026-10-02T08:59:00Z", Vec::new()))
             .unwrap();
         let object = self.store.put_observations(&empty).unwrap();
         let seal = Seal {
@@ -188,16 +188,52 @@ impl Fixture {
     /// verkettet an den Anker.
     fn observe_epoch(&self, namespace: Option<&str>, at: &str, bytes: &[u8], last: &str) {
         let anchor = self.anchor();
+        self.put_epoch(
+            namespace,
+            "2026-10-02T09:00:00.001Z",
+            at,
+            bytes,
+            last,
+            Some(anchor),
+        );
+    }
+
+    /// Die erste Epoche nach einem Witness-Start (kein Vorgänger), die um
+    /// `started_at` begann und den Shell-Schreibzugriff sah — signiert vom
+    /// Witness.
+    fn observe_from_start(&self, started_at: &str) {
+        self.put_epoch(
+            Some(minds_attest::NS_WITNESS),
+            started_at,
+            "2026-10-02T10:00:05Z",
+            b"shell\n",
+            "2026-10-02T10:00:31Z",
+            None,
+        );
+    }
+
+    fn put_epoch(
+        &self,
+        namespace: Option<&str>,
+        started_at: &str,
+        at: &str,
+        bytes: &[u8],
+        last: &str,
+        previous: Option<ContentHash>,
+    ) {
         let object = minds_redact::RedactionConfig::default()
             .pipeline()
             .unwrap()
-            .redact_observations(Observations::new(vec![Observation {
-                seq: 1,
-                at: at.into(),
-                path: "generated.rs".into(),
-                content: Some(hash(bytes)),
-                reason: None,
-            }]))
+            .redact_observations(Observations::new(
+                started_at,
+                vec![Observation {
+                    seq: 1,
+                    at: at.into(),
+                    path: "generated.rs".into(),
+                    content: Some(hash(bytes)),
+                    reason: None,
+                }],
+            ))
             .unwrap();
         let object = self.store.put_observations(&object).unwrap();
         let seal = Seal {
@@ -212,7 +248,7 @@ impl Fixture {
             outcome: SealOutcome::ObservationsStored {
                 observations: object.to_string(),
             },
-            previous: Some(anchor),
+            previous,
             last_event_at: last.into(),
         }
         .to_text()
@@ -319,5 +355,30 @@ fn verify_explains_a_shell_write_with_a_witness_signed_observation() {
     assert!(out.contains("artifact 1/1 lines explained"), "{out}");
     // Ohne allowed_signers ist die Signatur nicht prüfbar: fail-closed.
     let out = f.verify(false);
+    assert!(out.contains("artifact 0/1 lines explained"), "{out}");
+}
+
+#[test]
+fn verify_uses_the_first_epoch_after_a_witness_start_that_began_before_the_session() {
+    // EA-08a: Der Witness startete um 09:59:00, die Session beginnt um 10:00
+    // (Fenster ab 09:59:30), der erste Checkpoint schließt die erste Epoche
+    // des Laufs — ohne Vorgänger. Ihr signierter Beginn verankert die Kette:
+    // Die Beobachtung zählt (früher: `reported only`).
+    let f = Fixture::new();
+    f.observe_from_start("2026-10-02T09:59:00Z");
+    let out = f.verify(true);
+    assert!(out.contains("artifact 1/1 lines explained"), "{out}");
+    // Ohne Vertrauen in die Signatur bleibt es dabei: nichts.
+    let out = f.verify(false);
+    assert!(out.contains("artifact 0/1 lines explained"), "{out}");
+}
+
+#[test]
+fn verify_ignores_a_witness_restarted_during_the_session() {
+    // Neustart nach dem Fensterbeginn: Was davor geschah, sah dieser Lauf
+    // nicht — kein Fenster, wie ohne Witness.
+    let f = Fixture::new();
+    f.observe_from_start("2026-10-02T10:00:01Z");
+    let out = f.verify(true);
     assert!(out.contains("artifact 0/1 lines explained"), "{out}");
 }

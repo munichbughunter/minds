@@ -281,6 +281,8 @@ pub enum Field {
     EdgeLocalId(usize),
     /// `edges[e].to.id`
     EdgeCommitId(usize),
+    /// `started_at` eines Observation-Objekts (EA-08a).
+    ObservationsStartedAt,
     /// `first_at` eines Observation-Objekts (EA-08).
     ObservationsFirstAt,
     /// `last_at` eines Observation-Objekts.
@@ -324,6 +326,7 @@ impl fmt::Display for Field {
             Field::EdgeAgent(e) => write!(f, "edges[{e}].to.agent"),
             Field::EdgeLocalId(e) => write!(f, "edges[{e}].to.local_id"),
             Field::EdgeCommitId(e) => write!(f, "edges[{e}].to.id"),
+            Field::ObservationsStartedAt => f.write_str("started_at"),
             Field::ObservationsFirstAt => f.write_str("first_at"),
             Field::ObservationsLastAt => f.write_str("last_at"),
             Field::ObservationPath(i) => write!(f, "observations[{i}].path"),

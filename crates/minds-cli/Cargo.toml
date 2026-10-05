@@ -24,6 +24,8 @@ terminal_size.workspace = true
 textwrap.workspace = true
 tempfile.workspace = true
 blake3.workspace = true
+# Ledger-Zeitstempel der Witness-Uhr (EA-08a) — ohnehin über minds-core im Graphen.
+jiff.workspace = true
 
 # Nur für `setsid` im losgelösten Sync (#85) — ohnehin transitiv über gix im
 # Graphen, hier nur noch direkt benannt.
@@ -40,7 +42,6 @@ tui = ["dep:minds-tui"]
 
 [dev-dependencies]
 serde_json.workspace = true
-jiff.workspace = true
 
 [[bin]]
 name = "minds"

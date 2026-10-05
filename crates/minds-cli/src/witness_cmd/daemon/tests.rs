@@ -74,9 +74,15 @@ fn witness_chain_equals_legacy_chain() {
     let f = Fixture::new();
     let mut writer = f.writer();
     let legacy = Journal::at(f._dir.path().join("legacy"));
-    for _ in 0..4 {
-        append(&mut writer);
-        let mut parsed = hook_event::parse(payload(), "claude-code", None, at()).unwrap();
+    // Steigende Stempel: Die monotone Uhr (EA-08a) ließe einen gleichen
+    // nicht stehen — wohl aber jeden, der schon steigt.
+    for i in 0..4 {
+        let nanos = at().1 + i * 1_000_000_000;
+        let stamp = (minds_capture::clock::rfc3339_from_nanos(nanos), nanos);
+        writer
+            .hook("claude-code", None, payload(), stamp.clone())
+            .unwrap();
+        let mut parsed = hook_event::parse(payload(), "claude-code", None, stamp).unwrap();
         secretwall::guard(&mut parsed.event);
         legacy.append(&parsed.key, parsed.event).unwrap();
     }

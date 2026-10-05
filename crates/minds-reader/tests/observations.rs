@@ -37,6 +37,11 @@ fn plain(
         .collect()
 }
 
+/// Beginn der Epochen in Tests, die einen Kettenanfang **nicht** verankern
+/// sollen: nach dem Fensterbeginn der Test-Session (09:59:30) — der Stand vor
+/// EA-08a, als kein Kettenanfang verankerte.
+const UNANCHORED: &str = "2026-10-02T10:00:00Z";
+
 fn hash(bytes: &[u8]) -> ContentHash {
     ContentHash::from_bytes(*blake3::hash(bytes).as_bytes())
 }
@@ -121,7 +126,7 @@ fn seal_observations(store: &InRepoStore, observations: Vec<Observation>) -> Con
     let redacted = minds_redact::RedactionConfig::default()
         .pipeline()
         .unwrap()
-        .redact_observations(Observations::new(observations))
+        .redact_observations(Observations::new(UNANCHORED, observations))
         .unwrap();
     let object = store.put_observations(&redacted).unwrap();
     let seal = Seal {
@@ -206,12 +211,10 @@ fn reconcile_with_observations_end_to_end() {
     let redacted_forgery = minds_redact::RedactionConfig::default()
         .pipeline()
         .unwrap()
-        .redact_observations(Observations::new(vec![seen(
-            5,
-            "forged.rs",
-            Some(b"forged\n"),
-            None,
-        )]))
+        .redact_observations(Observations::new(
+            UNANCHORED,
+            vec![seen(5, "forged.rs", Some(b"forged\n"), None)],
+        ))
         .unwrap();
     store.put_observations(&redacted_forgery).unwrap();
 
@@ -353,11 +356,14 @@ fn only_witnessed_sessions_open_the_window() {
         reason: None,
     };
     let object = pipeline
-        .redact_observations(Observations::new(vec![
-            observation(1, "2026-10-02T10:00:05Z", "a.rs"),
-            observation(2, "2026-10-05T12:00:00Z", "human.rs"),
-            observation(3, "2026-10-12T10:00:05Z", "b.rs"),
-        ]))
+        .redact_observations(Observations::new(
+            UNANCHORED,
+            vec![
+                observation(1, "2026-10-02T10:00:05Z", "a.rs"),
+                observation(2, "2026-10-05T12:00:00Z", "human.rs"),
+                observation(3, "2026-10-12T10:00:05Z", "b.rs"),
+            ],
+        ))
         .unwrap();
     let object = store.put_observations(&object).unwrap();
     put(Seal {
@@ -418,6 +424,7 @@ fn witness_windows_end_with_the_checkpoints_observation_epoch() {
             Some(observations) => {
                 let object = pipeline
                     .redact_observations(Observations::new(
+                        UNANCHORED,
                         observations
                             .into_iter()
                             .map(|(seq, at, path)| Observation {
@@ -541,7 +548,7 @@ fn a_missing_checkpoint_epoch_never_widens_the_window() {
     let empty = store
         .put_observations(
             &pipeline
-                .redact_observations(Observations::new(Vec::new()))
+                .redact_observations(Observations::new(UNANCHORED, Vec::new()))
                 .unwrap(),
         )
         .unwrap();
@@ -591,7 +598,7 @@ fn a_missing_checkpoint_epoch_never_widens_the_window() {
     let empty = store
         .put_observations(
             &pipeline
-                .redact_observations(Observations::new(Vec::new()))
+                .redact_observations(Observations::new(UNANCHORED, Vec::new()))
                 .unwrap(),
         )
         .unwrap();
@@ -647,7 +654,7 @@ fn a_missing_checkpoint_epoch_never_widens_the_window() {
         let empty = store
             .put_observations(
                 &pipeline
-                    .redact_observations(Observations::new(Vec::new()))
+                    .redact_observations(Observations::new(UNANCHORED, Vec::new()))
                     .unwrap(),
             )
             .unwrap();
@@ -714,13 +721,16 @@ fn only_a_complete_chain_of_epochs_counts() {
         let outcome = match observation {
             Some((at, path, bytes)) => {
                 let object = pipeline
-                    .redact_observations(Observations::new(vec![Observation {
-                        seq: 1,
-                        at: at.into(),
-                        path: path.into(),
-                        content: Some(hash(bytes)),
-                        reason: None,
-                    }]))
+                    .redact_observations(Observations::new(
+                        UNANCHORED,
+                        vec![Observation {
+                            seq: 1,
+                            at: at.into(),
+                            path: path.into(),
+                            content: Some(hash(bytes)),
+                            reason: None,
+                        }],
+                    ))
                     .unwrap();
                 SealOutcome::ObservationsStored {
                     observations: store.put_observations(&object).unwrap().to_string(),
@@ -827,4 +837,284 @@ fn only_a_complete_chain_of_epochs_counts() {
             .map(|o| o.observed.hash)
             .collect();
     assert_eq!(seen, [Some(hash(b"B")), Some(hash(b"Y"))]);
+}
+
+/// EA-08a: ein frisches Repo mit der bezeugten Session (Zug um 10:00:00,
+/// Fensterbeginn 09:59:30, bezeugt bis 10:00:30).
+fn witnessed_repo() -> (
+    tempfile::TempDir,
+    InRepoStore,
+    minds_core::SessionId,
+    Session,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let agent = session(vec![]);
+    let pipeline = minds_redact::RedactionConfig::default().pipeline().unwrap();
+    let id = store
+        .put(&pipeline.redact_session(agent.clone()).unwrap())
+        .unwrap()
+        .id();
+    let seal = Seal {
+        root: hash(b"session"),
+        agent: "claude-code".into(),
+        scope: "witness/v1".into(),
+        first_seq: 0,
+        last_seq: 1,
+        events: 2,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: SealOutcome::Stored {
+            session: id.to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-10-02T10:00:30Z".into(),
+    };
+    store.put_seal(&seal.to_text().unwrap()).unwrap();
+    (dir, store, id, agent)
+}
+
+/// Legt ein Observation-Objekt (Schema 2) mit Beginn `started_at` und einer
+/// Beobachtung von `a.rs` um `at` ab.
+fn started_object(store: &InRepoStore, started_at: &str, at: &str) -> ContentHash {
+    let object = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_observations(Observations::new(
+            started_at,
+            vec![Observation {
+                seq: 1,
+                at: at.into(),
+                path: "a.rs".into(),
+                content: Some(hash(b"A")),
+                reason: None,
+            }],
+        ))
+        .unwrap();
+    store.put_observations(&object).unwrap()
+}
+
+/// Legt einen `witness-fs/v1`-Seal ab, der `object` nennt (`None`: ein
+/// Block-Seal).
+fn fs_epoch(
+    store: &InRepoStore,
+    object: Option<&ContentHash>,
+    last: &str,
+    previous: Option<ContentHash>,
+) -> ContentHash {
+    let seal = Seal {
+        root: hash(format!("{last}{object:?}").as_bytes()),
+        agent: "witness".into(),
+        scope: SCOPE_WITNESS_FS_V1.into(),
+        first_seq: 0,
+        last_seq: 1,
+        events: 2,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: match object {
+            Some(object) => SealOutcome::ObservationsStored {
+                observations: object.to_string(),
+            },
+            None => SealOutcome::Rejected,
+        },
+        previous,
+        last_event_at: last.into(),
+    };
+    store.put_seal(&seal.to_text().unwrap()).unwrap()
+}
+
+fn windows_of(
+    store: &InRepoStore,
+    id: minds_core::SessionId,
+    agent: &Session,
+) -> Vec<minds_reader::observations::Window> {
+    minds_reader::observations::witness_windows(store, &[(id, agent)], &|_, _| true)
+}
+
+#[test]
+fn chain_start_before_window_anchors() {
+    let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+    // Witness-Start vor dem Fensterbeginn — auch genau auf ihm.
+    for started_at in ["2026-10-02T09:59:00Z", "2026-10-02T09:59:30Z"] {
+        let (_dir, store, id, agent) = witnessed_repo();
+        let object = started_object(&store, started_at, "2026-10-02T10:00:05Z");
+        let start = fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);
+        let windows = windows_of(&store, id, &agent);
+        assert_eq!(
+            spans(&windows),
+            [(at("2026-10-02T09:59:30Z"), at("2026-10-02T10:00:32Z"))],
+            "{started_at}"
+        );
+        assert_eq!(
+            windows[0].epochs,
+            Some(std::collections::BTreeSet::from([start]))
+        );
+        let seen: Vec<String> =
+            minds_reader::observations::observations_in_windows(&store, &windows, &|_, _| true)
+                .into_iter()
+                .map(|o| o.path)
+                .collect();
+        assert_eq!(seen, ["a.rs"]);
+    }
+
+    // Der Anfang darf auch weiter zurück liegen: Die Kette läuft über eine
+    // Epoche, die im Fenster endet, bis zum Anfang des Laufs.
+    let (_dir, store, id, agent) = witnessed_repo();
+    let first = started_object(&store, "2026-10-02T09:00:00Z", "2026-10-02T09:59:50Z");
+    let first = fs_epoch(&store, Some(&first), "2026-10-02T10:00:01Z", None);
+    let object = started_object(&store, "2026-10-02T10:00:01.001Z", "2026-10-02T10:00:05Z");
+    let checkpoint = fs_epoch(
+        &store,
+        Some(&object),
+        "2026-10-02T10:00:32Z",
+        Some(first.clone()),
+    );
+    let windows = windows_of(&store, id, &agent);
+    assert_eq!(
+        windows[0].epochs,
+        Some(std::collections::BTreeSet::from([first, checkpoint]))
+    );
+}
+
+#[test]
+fn chain_start_after_window_start_stays_incomplete() {
+    // Neustart während der Session (nach dem Fensterbeginn): Was davor
+    // geschah, sah dieser Lauf nicht — kein Fenster.
+    for started_at in ["2026-10-02T09:59:30.001Z", "2026-10-02T10:00:01Z"] {
+        let (_dir, store, id, agent) = witnessed_repo();
+        let object = started_object(&store, started_at, "2026-10-02T10:00:05Z");
+        fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);
+        assert!(windows_of(&store, id, &agent).is_empty(), "{started_at}");
+    }
+    // Ein Block-Seal als Anfang trägt keinen Beginn.
+    let (_dir, store, id, agent) = witnessed_repo();
+    fs_epoch(&store, None, "2026-10-02T10:00:32Z", None);
+    assert!(windows_of(&store, id, &agent).is_empty());
+    // Ein Anfang, dessen Objekt fehlt (gelöscht), ebenso nicht.
+    let (_dir, store, id, agent) = witnessed_repo();
+    fs_epoch(
+        &store,
+        Some(&hash(b"deleted object")),
+        "2026-10-02T10:00:32Z",
+        None,
+    );
+    assert!(windows_of(&store, id, &agent).is_empty());
+}
+
+#[test]
+fn restart_and_deleted_epoch_never_widens_window() {
+    // Regression aus dem EA-08-Review: Die Session lief im alten Lauf.
+    let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+    let old_run = |store: &InRepoStore| {
+        let object = started_object(store, "2026-10-02T09:00:00Z", "2026-10-02T09:58:00Z");
+        fs_epoch(store, Some(&object), "2026-10-02T09:59:00Z", None)
+    };
+    // Der neue Lauf begann nach dem Commit; seine erste Epoche sah die
+    // Arbeit danach.
+    let new_run = |store: &InRepoStore| {
+        let object = started_object(store, "2026-10-02T10:02:00Z", "2026-10-02T10:05:00Z");
+        fs_epoch(store, Some(&object), "2026-10-02T10:05:01Z", None)
+    };
+    // Steht die Checkpoint-Epoche des alten Laufs noch da, endet das Fenster
+    // mit ihr.
+    let (_dir, store, id, agent) = witnessed_repo();
+    let anchor = old_run(&store);
+    let object = started_object(&store, "2026-10-02T09:59:00.001Z", "2026-10-02T10:00:05Z");
+    fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", Some(anchor));
+    new_run(&store);
+    assert_eq!(
+        spans(&windows_of(&store, id, &agent)),
+        [(at("2026-10-02T09:59:30Z"), at("2026-10-02T10:00:32Z"))]
+    );
+    // Ist sie gelöscht, wäre die erste Epoche des neuen Laufs die früheste
+    // danach. Ihr Beginn liegt nach dem Fensterbeginn — sie verankert nicht,
+    // kein Fenster bis 10:05.
+    let (_dir, store, id, agent) = witnessed_repo();
+    old_run(&store);
+    new_run(&store);
+    assert!(windows_of(&store, id, &agent).is_empty());
+}
+
+#[test]
+fn schema1_chain_start_never_anchors() {
+    // Ein Kettenanfang aus der Zeit vor EA-08a: Sein Objekt nennt keinen
+    // Beginn — kein Beleg, kein Fenster, auch wenn die Beobachtung passt.
+    let (dir, store, id, agent) = witnessed_repo();
+    let bytes = format!(
+        concat!(
+            r#"{{"first_at":"2026-10-02T10:00:05Z","last_at":"2026-10-02T10:00:05Z","#,
+            r#""observations":[{{"at":"2026-10-02T10:00:05Z","content":"{}","#,
+            r#""path":"a.rs","reason":null,"seq":1}}],"schema":1}}"#
+        ),
+        hash(b"A")
+    );
+    let object = put_raw_observations(dir.path(), bytes.as_bytes());
+    let read = store.get_observations(&object).unwrap().unwrap();
+    assert_eq!((read.schema, read.started_at()), (1, None));
+    fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);
+    assert!(windows_of(&store, id, &agent).is_empty());
+    // Ein Schema-1-Objekt **mit** `started_at` (so schrieb es nie ein
+    // Witness) verankert ebenso nicht.
+    let (dir, store, id, agent) = witnessed_repo();
+    let forged = bytes.replace(
+        r#""schema":1"#,
+        r#""schema":1,"started_at":"2026-10-02T09:00:00Z""#,
+    );
+    let object = put_raw_observations(dir.path(), forged.as_bytes());
+    fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);
+    assert!(windows_of(&store, id, &agent).is_empty());
+    // Ein künftiges Schema mit frühem Beginn: Was `started_at` dort heißt,
+    // weiß dieses Binary nicht — es verankert nicht (fail-closed).
+    let (dir, store, id, agent) = witnessed_repo();
+    let future = bytes.replace(
+        r#""schema":1"#,
+        r#""schema":3,"started_at":"2026-10-02T09:00:00Z""#,
+    );
+    let object = put_raw_observations(dir.path(), future.as_bytes());
+    fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);
+    assert!(windows_of(&store, id, &agent).is_empty());
+    // Dieselben Bytes mit Schema 2 verankern — es liegt am Schema.
+    let (dir, store, id, agent) = witnessed_repo();
+    let current = bytes.replace(
+        r#""schema":1"#,
+        r#""schema":2,"started_at":"2026-10-02T09:00:00Z""#,
+    );
+    let object = put_raw_observations(dir.path(), current.as_bytes());
+    fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);
+    assert_eq!(windows_of(&store, id, &agent).len(), 1);
+}
+
+/// Legt Bytes als Observation-Objekt ab, an der Pipeline vorbei (wie ein
+/// altes Binary) — über Git-Plumbing.
+fn put_raw_observations(repo: &Path, bytes: &[u8]) -> ContentHash {
+    use std::io::Write as _;
+    let id = Observations::id_of_bytes(bytes);
+    let file = repo.join("raw-observations");
+    std::fs::write(&file, bytes).unwrap();
+    let blob = git(repo, &["hash-object", "-w", file.to_str().unwrap()]);
+    let mut mktree = Command::new("git")
+        .current_dir(repo)
+        .arg("mktree")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    mktree
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("100644 blob {}\tobservations.json\n", blob.trim()).as_bytes())
+        .unwrap();
+    let tree = String::from_utf8(mktree.wait_with_output().unwrap().stdout).unwrap();
+    let commit = git(repo, &["commit-tree", tree.trim(), "-m", "raw"]);
+    git(
+        repo,
+        &[
+            "update-ref",
+            &format!("refs/minds/observations/{}", id.hex()),
+            commit.trim(),
+        ],
+    );
+    id
 }

@@ -929,6 +929,197 @@ fn the_checkpoint_mark_never_precedes_a_session_event() {
     assert!(last("witness-fs/v1") >= last("witness/v1"));
 }
 
+/// Die gespeicherten Observation-Objekte der `witness-fs/v1`-Seals.
+fn stored_objects(root: &Path) -> Vec<minds_core::observation::Observations> {
+    use minds_core::evidence::{Seal, SealOutcome};
+    let store = minds_store::InRepoStore::open(root).unwrap();
+    store
+        .list_seals()
+        .unwrap()
+        .into_iter()
+        .filter_map(|id| {
+            let seal = Seal::parse(&store.seal_text(&id).unwrap().unwrap()).unwrap();
+            match seal.outcome {
+                SealOutcome::ObservationsStored { observations } => Some(
+                    store
+                        .get_observations(&observations.parse().unwrap())
+                        .unwrap()
+                        .unwrap(),
+                ),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn observations_carry_epoch_start() {
+    // EA-08a: Das Objekt der ersten Epoche beginnt mit `witness.start`, das
+    // der nächsten mit ihrem ersten Event nach dem Seal.
+    let f = Fixture::new();
+    f.keygen();
+    let root = canonical_root(&f);
+    let mut writer = f.writer();
+    writer
+        .lifecycle(&stream(), "witness.start", serde_json::json!({}))
+        .unwrap();
+    let started = writer.journal.read(&stream()).unwrap().events[0].at.clone();
+    let observer = observer::Observer::detached(&root, Box::new(observer::Blake3)).unwrap();
+    writer.observe_into(stream(), observer);
+    fs::write(root.join("a.rs"), "a").unwrap();
+    writer.observer.as_ref().unwrap().note(&root.join("a.rs"));
+    append(&mut writer);
+    writer.checkpoint_now(None).unwrap();
+    let objects = stored_objects(&f.root);
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].schema, 2);
+    assert_eq!(objects[0].started_at.as_deref(), Some(started.as_str()));
+    assert!(
+        objects[0].started_at() <= objects[0].first_at.as_deref().map(|at| at.parse().unwrap())
+    );
+
+    // Die zweite Epoche beginnt mit dem ersten Event nach dem Seal — hier
+    // der Beobachtung selbst.
+    fs::write(root.join("b.rs"), "b").unwrap();
+    writer.observer.as_ref().unwrap().note(&root.join("b.rs"));
+    writer.next_step();
+    writer.observe(true).unwrap();
+    let first = writer.journal.read(&stream()).unwrap().events[0].clone();
+    assert_eq!(first.raw_kind, "fs.observed");
+    writer.next_step();
+    writer.checkpoint_now(None).unwrap();
+    let objects = stored_objects(&f.root);
+    let second = objects
+        .iter()
+        .find(|o| o.observations.iter().any(|o| o.path == "b.rs"))
+        .unwrap();
+    assert_eq!(second.started_at.as_deref(), Some(first.at.as_str()));
+    assert!(second.started_at() > objects.iter().find(|o| o != &second).unwrap().started_at());
+}
+
+#[test]
+fn witness_clock_survives_restart_monotonic() {
+    // Der alte Lauf stempelte eine Stunde „in der Zukunft" — dann springt
+    // die Wanduhr über den Neustart zurück. Der neue Lauf stempelt trotzdem
+    // nie davor: weder im Journal noch als Text, noch beim Schlüssel seines
+    // Streams.
+    let f = Fixture::new();
+    let ahead = clock::now().1 + 3_600_000_000_000;
+    let ahead_text = clock::rfc3339_from_nanos(ahead);
+    {
+        let mut writer = f.writer();
+        writer
+            .hook("claude-code", None, payload(), (ahead_text.clone(), ahead))
+            .unwrap();
+        // Ohne Journal bleibt nur die Uhr-Datei als Gedächtnis.
+        writer.journal.discard(&key()).unwrap();
+    }
+    let meta = fs::symlink_metadata(f.home.join(witness_clock::CLOCK_FILE)).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o600);
+    let mut writer = f.writer();
+    assert!(writer.clock.peek().unwrap() > ahead);
+    let restarted = SessionKey::new("witness", "2").unwrap();
+    for _ in 0..3 {
+        writer
+            .lifecycle(&restarted, "witness.start", serde_json::json!({}))
+            .unwrap();
+    }
+    let events = writer.journal.read(&restarted).unwrap().events;
+    let mut previous = (ahead, ahead_text.parse::<jiff::Timestamp>().unwrap());
+    for event in events {
+        let text = event.at.parse::<jiff::Timestamp>().unwrap();
+        assert!(event.at_nanos > previous.0, "{}", event.at);
+        assert!(text > previous.1, "{}", event.at);
+        assert_eq!(event.at, clock::rfc3339_from_nanos(event.at_nanos));
+        previous = (event.at_nanos, text);
+    }
+
+    // Auch ein Witness von vor EA-08a (ohne Uhr-Datei) stempelt nicht vor
+    // seinem Journal.
+    let f = Fixture::new();
+    {
+        let mut writer = f.writer();
+        writer
+            .hook("claude-code", None, payload(), (ahead_text.clone(), ahead))
+            .unwrap();
+    }
+    fs::remove_file(f.home.join(witness_clock::CLOCK_FILE)).unwrap();
+    let mut writer = f.writer();
+    writer
+        .lifecycle(&stream(), "witness.start", serde_json::json!({}))
+        .unwrap();
+    assert!(writer.journal.read(&stream()).unwrap().events[0].at_nanos > ahead);
+}
+
+#[test]
+fn the_watcher_is_armed_before_witness_start() {
+    // `started_at` der ersten Epoche ist der Stempel von `witness.start`; der
+    // Leser verankert an ihm. Also muss der Watcher schon laufen, wenn er
+    // vergeben wird — sonst läge ein Schreibzugriff im Spalt ungesehen
+    // innerhalb einer „vollständigen" Kette.
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    let journal = Journal::at(f.home.join("journal"));
+    let armed = writer
+        .start_stream(&stream(), serde_json::json!({}), || {
+            journal.read(&stream()).unwrap().events.len()
+        })
+        .unwrap();
+    assert_eq!(armed, 0, "witness.start was appended before arming");
+    let events = writer.journal.read(&stream()).unwrap().events;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].raw_kind, "witness.start");
+    assert_eq!(writer.stream, Some(stream()));
+}
+
+#[test]
+fn a_missing_clock_file_still_never_stamps_before_the_ledger() {
+    // Versiegelte Journale sind verworfen — das Ledger bleibt. Fehlt die
+    // Uhr-Datei (Upgrade, Verlust), hebt es die Marke an.
+    let f = Fixture::new();
+    let sealed = clock::now().1 + 3_600_000_000_000;
+    let mut ledger = private_append(&f.home.join("ledger")).unwrap();
+    writeln!(ledger, "b3-x witness-fs/v1 kaputt").unwrap();
+    writeln!(
+        ledger,
+        "b3-y witness-fs/v1 {}",
+        clock::rfc3339_from_nanos(sealed)
+    )
+    .unwrap();
+    let mut writer = f.writer();
+    assert!(!f.home.join(witness_clock::CLOCK_FILE).exists());
+    writer
+        .lifecycle(&stream(), "witness.start", serde_json::json!({}))
+        .unwrap();
+    assert!(writer.journal.read(&stream()).unwrap().events[0].at_nanos > sealed);
+}
+
+#[test]
+fn witness_refuses_corrupt_clock_state() {
+    let f = Fixture::new();
+    // Keine Datei: erster Lauf, kein Fehler.
+    assert!(Writer::open(&f.home, load(&f.home).unwrap(), false).is_ok());
+    let path = f.home.join(witness_clock::CLOCK_FILE);
+    for bad in [&b""[..], b"garbage\n", b"12", b"-5\n", b"0012\n"] {
+        fs::write(&path, bad).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = Writer::open(&f.home, load(&f.home).unwrap(), false)
+            .err()
+            .unwrap();
+        assert_eq!(err.to_string(), "corrupt witness clock state", "{bad:?}");
+        // Nie still zurückgesetzt: Die Datei bleibt, wie sie war.
+        assert_eq!(fs::read(&path).unwrap(), bad);
+    }
+    // Ein Verzeichnis an ihrer Stelle ebenso.
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    let err = Writer::open(&f.home, load(&f.home).unwrap(), false)
+        .err()
+        .unwrap();
+    assert_eq!(err.to_string(), "corrupt witness clock state");
+}
+
 #[test]
 fn witness_refuses_home_inside_repo() {
     let f = Fixture::new();

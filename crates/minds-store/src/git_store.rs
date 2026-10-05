@@ -2090,22 +2090,25 @@ mod tests {
 
     fn sample_observations() -> minds_redact::RedactedObservations {
         use minds_core::observation::{Observation, ObservationReason, Observations};
-        let object = Observations::new(vec![
-            Observation {
-                seq: 1,
-                at: "2026-10-05T10:00:00Z".into(),
-                path: "src/a.rs".into(),
-                content: Some(minds_core::ContentHash::from_bytes([7; 32])),
-                reason: None,
-            },
-            Observation {
-                seq: 2,
-                at: "2026-10-05T10:00:01Z".into(),
-                path: ".env".into(),
-                content: None,
-                reason: Some(ObservationReason::SecretFile),
-            },
-        ]);
+        let object = Observations::new(
+            "2026-10-05T09:59:00Z",
+            vec![
+                Observation {
+                    seq: 1,
+                    at: "2026-10-05T10:00:00Z".into(),
+                    path: "src/a.rs".into(),
+                    content: Some(minds_core::ContentHash::from_bytes([7; 32])),
+                    reason: None,
+                },
+                Observation {
+                    seq: 2,
+                    at: "2026-10-05T10:00:01Z".into(),
+                    path: ".env".into(),
+                    content: None,
+                    reason: Some(ObservationReason::SecretFile),
+                },
+            ],
+        );
         minds_redact::RedactionConfig::default()
             .pipeline()
             .unwrap()

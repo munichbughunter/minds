@@ -54,10 +54,14 @@ impl RedactionPipeline {
         let mut audit = RedactionAudit::default();
         let Observations {
             schema,
+            started_at,
             first_at,
             last_at,
             observations,
         } = observations;
+        let started_at = started_at
+            .map(|at| self.redact_field(Field::ObservationsStartedAt, at, &mut audit))
+            .transpose()?;
         let first_at = first_at
             .map(|at| self.redact_field(Field::ObservationsFirstAt, at, &mut audit))
             .transpose()?;
@@ -83,6 +87,7 @@ impl RedactionPipeline {
         }
         let observations = Observations {
             schema,
+            started_at,
             first_at,
             last_at,
             observations: redacted,
@@ -104,6 +109,7 @@ mod tests {
 
     fn object(paths: &[&str]) -> Observations {
         Observations::new(
+            "2026-10-05T09:59:00Z",
             paths
                 .iter()
                 .enumerate()
@@ -161,6 +167,57 @@ mod tests {
         input.observations[1].reason = Some(ObservationReason::SecretFile);
         let redacted = pipeline().redact_observations(input.clone()).unwrap();
         assert_eq!(redacted.observations(), &input);
+    }
+
+    /// Jede Epoche trägt jetzt mindestens einen Zeitstempel: Trifft ein
+    /// Detektor der Standard-Policy einen, würde jede Epoche zum Block-Seal.
+    const TIMESTAMPS_MUST_SURVIVE: &[&str] = &[
+        "2026-10-05T09:59:58.125Z",
+        "1970-01-01T00:00:00.000Z",
+        "2554-07-21T23:34:33.709Z",
+        "2026-10-05T10:00:00Z",
+    ];
+
+    #[test]
+    fn witness_timestamps_survive_the_default_policy() {
+        let pipeline = pipeline();
+        for at in TIMESTAMPS_MUST_SURVIVE {
+            let mut input = object(&["a.rs"]);
+            input.started_at = Some((*at).into());
+            input.observations[0].at = (*at).into();
+            input.first_at = Some((*at).into());
+            input.last_at = Some((*at).into());
+            let redacted = pipeline.redact_observations(input.clone()).unwrap();
+            assert_eq!(redacted.observations(), &input, "{at}");
+            assert!(redacted.audit().is_clean(), "{at}");
+        }
+    }
+
+    #[test]
+    fn the_epoch_start_is_scanned_like_every_text_field() {
+        let pipeline = pipeline();
+        let clean = pipeline.redact_observations(object(&["a.rs"])).unwrap();
+        assert_eq!(
+            clean.observations().started_at.as_deref(),
+            Some("2026-10-05T09:59:00Z")
+        );
+        assert!(clean.audit().is_clean());
+        // Was kein lesbarer Zeitpunkt ist (etwa mit einem Token darin), wird
+        // schon vor der Bereinigung abgelehnt — es gibt kein Objekt. Ein
+        // Platzhalter danach machte ihn ebenso unlesbar (Prüfung danach).
+        let mut input = object(&["a.rs"]);
+        input.started_at = Some("2026-10-05T09:59:00Z glpat-AbCdEfGhIjKlMnOpQrSt".into());
+        assert_eq!(
+            pipeline.redact_observations(input),
+            Err(RedactionError::Observations(ObservationError::Start))
+        );
+        // Fehlt er, gibt es ebenfalls keins.
+        let mut input = object(&["a.rs"]);
+        input.started_at = None;
+        assert_eq!(
+            pipeline.redact_observations(input),
+            Err(RedactionError::Observations(ObservationError::Start))
+        );
     }
 
     #[test]

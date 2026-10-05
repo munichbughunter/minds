@@ -355,6 +355,11 @@ pub fn seal_observation_streams(
 /// Das Observation-Objekt aus den `fs.observed`-Events einer Epoche. Die
 /// übrigen Events des Streams (Lebenszyklus, Lücken des Beobachters) bindet
 /// allein die Kette. Ein unlesbares eigenes Event ist ein Integritätsfehler.
+///
+/// `started_at` (EA-08a) ist der Zeitstempel des ersten Events der Epoche —
+/// `witness.start` in der ersten Epoche eines Laufs, sonst das erste Event
+/// nach dem vorigen Seal. Er stammt aus dem eigenen Journal des Witness,
+/// gestempelt von dessen monotoner Uhr, nie aus Agent-Eingaben.
 #[cfg(unix)]
 pub fn observations_of(
     events: &[minds_capture::JournalEvent],
@@ -368,6 +373,7 @@ pub fn observations_of(
         content: Option<minds_core::ContentHash>,
         reason: Option<ObservationReason>,
     }
+    let started_at = events.first().ok_or("empty witness stream")?.at.clone();
     let mut observations = Vec::new();
     for event in events.iter().filter(|e| e.raw_kind == FS_OBSERVED) {
         let payload: Payload = serde_json::from_str(event.payload.get())
@@ -380,7 +386,7 @@ pub fn observations_of(
             reason: payload.reason,
         });
     }
-    Ok(Observations::new(observations))
+    Ok(Observations::new(started_at, observations))
 }
 
 /// Redigiert das Objekt; lehnt die Pipeline es ab, wird jede Beobachtung
@@ -399,13 +405,24 @@ fn redact_each(
     match pipeline.redact_observations(object.clone()) {
         Ok(redacted) => Ok(redacted),
         Err(err) => {
+            // Scheitert schon das Gerüst (ohne Detektoren, ein Beginn, den die
+            // Pipeline ablehnt), bleibt es beim Fehler — keine Beobachtung
+            // ist dann „einzeln verworfen" (ein leerer Beginn besteht keine
+            // Prüfung).
+            let started_at = object.started_at.clone().unwrap_or_default();
+            if pipeline
+                .redact_observations(Observations::new(started_at.clone(), Vec::new()))
+                .is_err()
+            {
+                return Err(err);
+            }
             let total = object.observations.len();
             let kept: Vec<_> = object
                 .observations
                 .into_iter()
                 .filter(|o| {
                     pipeline
-                        .redact_observations(Observations::new(vec![o.clone()]))
+                        .redact_observations(Observations::new(started_at.clone(), vec![o.clone()]))
                         .is_ok()
                 })
                 .collect();
@@ -416,7 +433,7 @@ fn redact_each(
                 "{} observation(s) dropped: redaction refused them",
                 total - kept.len()
             ));
-            pipeline.redact_observations(Observations::new(kept))
+            pipeline.redact_observations(Observations::new(started_at, kept))
         }
     }
 }

@@ -317,8 +317,10 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
         Err(e) => return Err(e.into()),
     };
     // RFC3339 enthält Doppelpunkte, SessionKey erlaubt sie nicht. Unix-Nanos
-    // sind derselbe Startzeitpunkt in einer pfadsicheren Darstellung.
-    let local_id = clock::now().1.to_string();
+    // sind derselbe Startzeitpunkt in einer pfadsicheren Darstellung — von
+    // der monotonen Uhr: Auch nach einem Rückwärtssprung der Wanduhr ist der
+    // Schlüssel neu und nie der eines früheren Laufs.
+    let local_id = writer.clock.peek()?.to_string();
     let key = SessionKey::new("witness", &local_id)?;
     atomic(
         &marker_path,
@@ -328,24 +330,22 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
         })?,
     )?;
     let profile = writer.config.profile.name();
-    writer.lifecycle(
-        &key,
-        "witness.start",
-        serde_json::json!({"previous_stop": previous, "profile": profile, "key": key_fingerprint}),
-    )?;
     // Das zweite Auge (EA-08). Scheitert der Watcher (etwa am inotify-Limit),
     // läuft der Witness weiter — die Blindheit steht dann als `fs.gap` in der
     // Kette, nicht nur im Log.
-    // Der eigene Stream gilt auch ohne Beobachter: Jeder Checkpoint
-    // schließt seine Epoche mit `fs.checkpoint` ab.
-    writer.stream = Some(key.clone());
+    // Scharf geschaltet wird er vor `witness.start` ([`Writer::start_stream`]).
     let root = writer.config.repo_root.clone();
     // Inhalte prüft dieselbe Policy wie der Checkpoint, nie schwächer als
     // der Standard; ist sie nicht lesbar, gilt der Standard.
     let pipeline = crate::config::load_redaction_untrusted(&root)
         .ok()
         .and_then(|config| config.floored_at_default().pipeline().ok());
-    match observer::Observer::watch(&root, Box::new(observer::Blake3)) {
+    let watched = writer.start_stream(
+        &key,
+        serde_json::json!({"previous_stop": previous, "profile": profile, "key": key_fingerprint}),
+        || observer::Observer::watch(&root, Box::new(observer::Blake3)),
+    )?;
+    match watched {
         Ok(observer) => {
             let observer = match pipeline {
                 Some(pipeline) => observer.with_pipeline(pipeline),
