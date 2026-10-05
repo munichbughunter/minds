@@ -61,6 +61,7 @@ mod blame;
 mod diff;
 mod error;
 mod head;
+pub mod ignore;
 mod objects;
 mod oid;
 mod refs;

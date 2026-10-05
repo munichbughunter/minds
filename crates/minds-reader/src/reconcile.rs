@@ -170,8 +170,9 @@ pub struct ObservedAt {
     pub at: Option<String>,
 }
 
-/// Future EA-08 input. Callers restrict observations to the linked sessions'
-/// window. No filesystem is consulted, and `content` is optional.
+/// A witness file observation (EA-08, see [`crate::observations`]). Callers
+/// restrict observations to the linked sessions' window. No filesystem is
+/// consulted, and `content` is optional.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsObservation {
     pub path: String,
@@ -179,6 +180,14 @@ pub struct FsObservation {
     /// Optional bytes for partial line attribution when the commit differs.
     /// Accepted only after verification against `observed.hash`.
     pub content: Option<Vec<u8>>,
+    /// The file was present, but the witness deliberately recorded no hash
+    /// (secret file, too large, link target outside the repository) —
+    /// `observed.hash` is then `None` without meaning absence. A latest
+    /// opaque observation confirms nothing and never erases an earlier
+    /// readable contradiction; without one, the file is classified as if
+    /// unobserved (claims only). It can therefore classify worse than claims
+    /// alone — when the witness last read different bytes.
+    pub opaque: bool,
 }
 
 pub struct ReconInput<'a> {
@@ -368,6 +377,7 @@ impl<'a> Claims<'a> {
                     .cmp(&key(b))
                     .then_with(|| a.observed.hash.cmp(&b.observed.hash))
                     .then_with(|| a.observed.at.cmp(&b.observed.at))
+                    .then_with(|| a.opaque.cmp(&b.opaque))
                     .then_with(|| a.content.cmp(&b.content))
             });
         }
@@ -431,7 +441,7 @@ fn classify(
     state: Option<&ContentHash>,
 ) -> ReconClass {
     if let Some(observation) = observation {
-        if observation.observed.hash.as_ref() != state {
+        if observation.opaque || observation.observed.hash.as_ref() != state {
             ReconClass::Unexplained
         } else if claims_state(claims, state) {
             ReconClass::Explained
@@ -455,12 +465,24 @@ fn reconcile_file(
 ) -> (FileRecon, u64, u64) {
     let committed = hash(file.committed.unwrap_or_default());
     let state = file.committed.map(|_| &committed);
-    let observation = observations.last().copied();
+    // An opaque latest state says nothing about the bytes: fall back to the
+    // claims, as without a witness — unless an earlier, readable observation
+    // already contradicts the committed state. An opaque touch (a hard link,
+    // a secret-looking rewrite) must not erase a contradiction.
+    let observation = match observations.last().copied() {
+        Some(latest) if latest.opaque => observations
+            .iter()
+            .rev()
+            .copied()
+            .find(|o| !o.opaque)
+            .filter(|o| o.observed.hash.as_ref() != state),
+        latest => latest,
+    };
     let class = classify(claims, observation, state);
     let last_observed = observations
         .iter()
         .rev()
-        .find(|o| o.observed.hash.as_ref() == state)
+        .find(|o| !o.opaque && o.observed.hash.as_ref() == state)
         .map(|o| o.observed.clone());
     let (line_level, changed, explained, removes) =
         line_reconciliation(file, claims, observation, class);
@@ -582,7 +604,12 @@ fn line_evidence(
     class: ReconClass,
 ) -> Result<(Option<Vec<u8>>, ReconClass), Reason> {
     if let Some(observation) = observation {
-        let Some(expected) = observation.observed.hash.as_ref() else {
+        let Some(expected) = observation
+            .observed
+            .hash
+            .as_ref()
+            .filter(|_| !observation.opaque)
+        else {
             return Ok((None, ReconClass::Unexplained));
         };
         let evidence_class = if claims_state(claims, Some(expected)) {

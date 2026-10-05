@@ -144,6 +144,7 @@ fn render(entries: Vec<Entry>) -> String {
         );
         let session = match &entry.seal.outcome {
             SealOutcome::Stored { session } => session.as_str(),
+            SealOutcome::ObservationsStored { observations } => observations.as_str(),
             SealOutcome::Rejected => "-",
         };
         let _ = writeln!(out, "  session  {session}");

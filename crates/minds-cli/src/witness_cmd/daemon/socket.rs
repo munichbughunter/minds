@@ -294,6 +294,7 @@ struct Marker {
 pub fn run(home: &Path, follow: bool) -> Fallible<()> {
     let home: PathBuf = home.components().collect();
     let config = load(&home)?;
+    refuse_home_in_repo(&home, &config)?;
     let _lock = lock(&home)?;
     let _signals = Signals::install()?;
     let key_fingerprint = fingerprint(&home)?;
@@ -332,6 +333,37 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
         "witness.start",
         serde_json::json!({"previous_stop": previous, "profile": profile, "key": key_fingerprint}),
     )?;
+    // Das zweite Auge (EA-08). Scheitert der Watcher (etwa am inotify-Limit),
+    // läuft der Witness weiter — die Blindheit steht dann als `fs.gap` in der
+    // Kette, nicht nur im Log.
+    // Der eigene Stream gilt auch ohne Beobachter: Jeder Checkpoint
+    // schließt seine Epoche mit `fs.checkpoint` ab.
+    writer.stream = Some(key.clone());
+    let root = writer.config.repo_root.clone();
+    // Inhalte prüft dieselbe Policy wie der Checkpoint, nie schwächer als
+    // der Standard; ist sie nicht lesbar, gilt der Standard.
+    let pipeline = crate::config::load_redaction_untrusted(&root)
+        .ok()
+        .and_then(|config| config.floored_at_default().pipeline().ok());
+    match observer::Observer::watch(&root, Box::new(observer::Blake3)) {
+        Ok(observer) => {
+            let observer = match pipeline {
+                Some(pipeline) => observer.with_pipeline(pipeline),
+                None => {
+                    log(
+                        &home,
+                        "redaction policy not loadable; observer uses the default",
+                    );
+                    observer
+                }
+            };
+            writer.observe_into(key.clone(), observer)
+        }
+        Err(err) => {
+            log(&home, &format!("file observer unavailable: {err}"));
+            writer.lifecycle(&key, "fs.gap", serde_json::json!({"reason": "unavailable"}))?;
+        }
+    }
     let result = serve(&socket.listener, &mut writer);
     if result.is_ok() {
         writer.lifecycle(&key, "witness.stop", serde_json::json!({}))?;
@@ -355,6 +387,7 @@ fn serve(listener: &UnixListener, writer: &mut Writer) -> Fallible<()> {
     let mut clients: Vec<Client> = Vec::new();
     let mut accept_logged = None;
     while !STOP.load(Ordering::Relaxed) {
+        writer.next_step();
         for _ in clients.len()..MAX_CLIENTS {
             match listener.accept() {
                 Ok((stream, _)) => {
@@ -397,6 +430,7 @@ fn serve(listener: &UnixListener, writer: &mut Writer) -> Fallible<()> {
                 clients.swap_remove(idx);
             }
         }
+        writer.observe(false)?;
         if evict_largest(&mut clients, MAX_BUFFERED) {
             log(
                 &writer.home,

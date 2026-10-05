@@ -24,6 +24,9 @@ pub use lineage::{
 /// Crate-Ebene mit Nachbarn kollidieren.
 pub mod evidence;
 
+/// Das Observation-Objekt des Datei-Beobachters (EA-08).
+pub mod observation;
+
 mod attribution;
 pub use attribution::{Attribution, AttributionError};
 

@@ -461,6 +461,10 @@ pub const SCOPE_AGENT_HOOKS_V1: &str = "agent-hooks/v1";
 /// Vom unabhängigen Witness beobachtete Hook-Evidence.
 pub const SCOPE_WITNESS_V1: &str = "witness/v1";
 
+/// Vom Witness selbst beobachtete Datei-Änderungen im Worktree (EA-08):
+/// der eigene Stream des Witness mit `fs.observed`-Events.
+pub const SCOPE_WITNESS_FS_V1: &str = "witness-fs/v1";
+
 /// Was der Checkpoint mit der Session gemacht hat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealOutcome {
@@ -475,6 +479,19 @@ pub enum SealOutcome {
     /// der einzige Beleg, dass der Bereich existierte (ADR-0011,
     /// Entscheidung 3).
     Rejected,
+
+    /// Die Beobachtungen des Datei-Beobachters (Scope `witness-fs/v1`)
+    /// wurden redigiert und als Observation-Objekt abgelegt (EA-08).
+    ///
+    /// Die Zeile `session=` trägt hier die **Id des Observation-Objekts**
+    /// (`b3-…`, [`crate::observation::Observations::id`]) — dieselbe Zeile,
+    /// anderer Gegenstand: Das Seal-Format bleibt bei 13 Zeilen, und ein
+    /// älteres Binary lehnt das unbekannte Outcome-Wort ab, statt die Id als
+    /// Session zu deuten (derselbe akzeptierte Tausch wie bei Schema 2).
+    ObservationsStored {
+        /// Die Id des Observation-Objekts in Textform (`b3-…`).
+        observations: String,
+    },
 }
 
 /// Der Coverage-Seal eines Checkpoint-Laufs: was versiegelt wurde, worauf es
@@ -540,10 +557,12 @@ impl Seal {
         crate::attest::check_single_line("last_event_at", &self.last_event_at)?;
         let session = match &self.outcome {
             SealOutcome::Stored { session } => session.as_str(),
+            SealOutcome::ObservationsStored { observations } => observations.as_str(),
             SealOutcome::Rejected => "-",
         };
         let outcome = match &self.outcome {
             SealOutcome::Stored { .. } => "stored",
+            SealOutcome::ObservationsStored { .. } => "observations_stored",
             SealOutcome::Rejected => "storage_policy_rejected_payload",
         };
         let previous = match &self.previous {
@@ -637,6 +656,17 @@ impl Seal {
             ("stored", id) if id.parse::<crate::SessionId>().is_ok() => SealOutcome::Stored {
                 session: id.to_string(),
             },
+            // Strenger als `stored`: nur die kanonische Kleinschreibung — die
+            // Id adressiert einen Ref, und es gibt genau eine Schreibweise.
+            ("observations_stored", id)
+                if id
+                    .parse::<ContentHash>()
+                    .is_ok_and(|hash| hash.as_str() == id) =>
+            {
+                SealOutcome::ObservationsStored {
+                    observations: id.to_string(),
+                }
+            }
             ("storage_policy_rejected_payload", "-") => SealOutcome::Rejected,
             _ => return Err(SealParseError::Field("outcome")),
         };
@@ -751,6 +781,7 @@ impl SealOutcome {
     pub const fn human_word(&self) -> &'static str {
         match self {
             SealOutcome::Stored { .. } => "stored",
+            SealOutcome::ObservationsStored { .. } => "observations stored",
             SealOutcome::Rejected => "rejected (payload)",
         }
     }
@@ -1145,6 +1176,60 @@ mod tests {
             Seal::parse(&text),
             Err(SealParseError::Field("outcome"))
         ));
+    }
+
+    fn witness_fs_seal() -> Seal {
+        Seal {
+            agent: "witness".into(),
+            scope: SCOPE_WITNESS_FS_V1.into(),
+            outcome: SealOutcome::ObservationsStored {
+                observations: format!("b3-{}", "c".repeat(64)),
+            },
+            ..sample_seal()
+        }
+    }
+
+    #[test]
+    fn witness_fs_seal_text_is_golden() {
+        // Absolut: die eingefrorene Textform samt Id. Ein älteres Binary
+        // lehnt `observations_stored` ab — der dokumentierte Tausch.
+        let seal = witness_fs_seal();
+        let text = seal.to_text().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "minds-seal-v1\nroot={}\nagent=witness\nscope=witness-fs/v1\nfirst_seq=0\n\
+                 last_seq=41\nevents=40\ngaps=2\npre_chain=0\noutcome=observations_stored\n\
+                 session=b3-{}\nprevious=-\nlast_event_at=2026-08-24T10:15:00Z\n",
+                payload_hash(b"root-material"),
+                "c".repeat(64)
+            )
+        );
+        assert_eq!(
+            Seal::id_of_text(&text).as_str(),
+            "b3-460d5be3b51613317fd249d8534d28ebc656332bf07146b82152b42e6bdf6d07"
+        );
+        assert_eq!(Seal::parse(&text).unwrap(), seal);
+        assert_eq!(seal.outcome.human_word(), "observations stored");
+    }
+
+    #[test]
+    fn witness_fs_seal_parsing_is_strict() {
+        let text = witness_fs_seal().to_text().unwrap();
+        let hex = "c".repeat(64);
+        for bad in [
+            "-".to_owned(),
+            format!("b3-{}", hex.to_uppercase()),
+            format!("B3-{hex}"),
+            hex.clone(),
+            "glpat-abc123".to_owned(),
+        ] {
+            let forged = text.replacen(&format!("b3-{hex}"), &bad, 1);
+            assert!(
+                matches!(Seal::parse(&forged), Err(SealParseError::Field("outcome"))),
+                "{bad}"
+            );
+        }
     }
 
     // --- Die Invarianten aus ADR-0011, als benannte Verträge ---------------

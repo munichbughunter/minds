@@ -258,6 +258,173 @@ pub fn run_checkpoint_guarded(
     Ok(outcome)
 }
 
+/// Versiegelt die laufenden Epochen der Witness-eigenen Streams (EA-08):
+/// Scope `witness-fs/v1`, Outcome `observations_stored`, die `session=`-Zeile
+/// trägt die Id des Observation-Objekts.
+///
+/// Dieselbe Reihenfolge wie bei Sessions: Kette über das volle Journal,
+/// Prüfung gegen den Live-Fold (`guard.validate`), Objekt redigieren und
+/// ablegen, versiegeln (Pflichtsignatur), erst dann verwerfen. Lehnt die
+/// Redaction das Objekt ab, entsteht ein Block-Seal desselben Scopes. Jeder
+/// Fehler vertagt nur diesen Stream.
+#[cfg(unix)]
+pub fn seal_observation_streams(
+    env: &CheckpointEnv<'_>,
+    src: &EvidenceSource<'_>,
+    signer: &SealSigner<'_>,
+    guard: &dyn CheckpointGuard,
+    streams: &[minds_capture::SessionKey],
+) -> Vec<SealSummary> {
+    let mut sealed = Vec::new();
+    for key in streams {
+        let read = match src.journal.read(key) {
+            Ok(read) => read,
+            Err(err) => {
+                guard.report(&format!("witness stream skipped: {err}"));
+                continue;
+            }
+        };
+        if read.events.is_empty() {
+            continue;
+        }
+        let salt = match src.epochs.salt(key) {
+            Ok(salt) => salt,
+            Err(err) => {
+                guard.report(&format!("witness stream skipped: {err}"));
+                continue;
+            }
+        };
+        let result = chain::chain_salted(&salt, &read);
+        if guard.validate(key, &read, &result).is_err() {
+            guard.report("integrity error: live witness stream differs from journal; deferred");
+            continue;
+        }
+        let object = match observations_of(&read.events) {
+            Ok(object) => object,
+            Err(err) => {
+                guard.report(&format!("integrity error: {err}; witness stream deferred"));
+                continue;
+            }
+        };
+        let outcome = match redact_each(env.pipeline, object, guard) {
+            Ok(redacted) => match env.store.put_observations(&redacted) {
+                Ok(id) => SealOutcome::ObservationsStored {
+                    observations: id.to_string(),
+                },
+                // Die Epoche wird trotzdem geschlossen (Block-Seal): Bliebe
+                // sie offen, versiegelte der nächste Checkpoint sie zusammen
+                // mit der Arbeit nach diesem Commit — und ein Fenster, das
+                // hier endet, reichte bis dorthin. Es fehlen dann
+                // Beobachtungen (sichere Richtung); die Grenze stimmt.
+                Err(err) => {
+                    guard.report(&format!(
+                        "observations not stored: {err}; epoch closed, observations discarded"
+                    ));
+                    SealOutcome::Rejected
+                }
+            },
+            Err(err) => {
+                guard.report(&format!("observations rejected by redaction: {err}"));
+                SealOutcome::Rejected
+            }
+        };
+        let Some(summary) = seal_epoch(
+            env,
+            src,
+            signer,
+            SealInput {
+                key,
+                events: &read.events,
+                result: &result,
+                outcome,
+            },
+            Some(guard),
+        ) else {
+            continue;
+        };
+        if let Err(err) = src.journal.discard(key) {
+            guard.report(&format!(
+                "witness stream not discarded after sealing: {err}"
+            ));
+        }
+        sealed.push(summary);
+    }
+    sealed
+}
+
+/// Das Observation-Objekt aus den `fs.observed`-Events einer Epoche. Die
+/// übrigen Events des Streams (Lebenszyklus, Lücken des Beobachters) bindet
+/// allein die Kette. Ein unlesbares eigenes Event ist ein Integritätsfehler.
+#[cfg(unix)]
+pub fn observations_of(
+    events: &[minds_capture::JournalEvent],
+) -> Fallible<minds_core::observation::Observations> {
+    use minds_core::observation::{Observation, ObservationReason, Observations};
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Payload {
+        path: String,
+        content: Option<minds_core::ContentHash>,
+        reason: Option<ObservationReason>,
+    }
+    let mut observations = Vec::new();
+    for event in events.iter().filter(|e| e.raw_kind == FS_OBSERVED) {
+        let payload: Payload = serde_json::from_str(event.payload.get())
+            .map_err(|_| "unreadable fs.observed event")?;
+        observations.push(Observation {
+            seq: event.seq,
+            at: event.at.clone(),
+            path: payload.path,
+            content: payload.content,
+            reason: payload.reason,
+        });
+    }
+    Ok(Observations::new(observations))
+}
+
+/// Redigiert das Objekt; lehnt die Pipeline es ab, wird jede Beobachtung
+/// einzeln geprüft und nur die abgelehnte verworfen. Ein absichtlich
+/// unredigierbarer Dateiname soll nicht die ganze Epoche des Beobachters
+/// auslöschen — die verworfene Beobachtung fehlt (sicherer Fall: weniger
+/// Beleg, nie mehr), ihre Zahl steht im Log. Scheitert auch das Gerüst
+/// (etwa ohne Detektoren), bleibt es beim Fehler.
+#[cfg(unix)]
+fn redact_each(
+    pipeline: &minds_redact::RedactionPipeline,
+    object: minds_core::observation::Observations,
+    guard: &dyn CheckpointGuard,
+) -> Result<minds_redact::RedactedObservations, minds_redact::RedactionError> {
+    use minds_core::observation::Observations;
+    match pipeline.redact_observations(object.clone()) {
+        Ok(redacted) => Ok(redacted),
+        Err(err) => {
+            let total = object.observations.len();
+            let kept: Vec<_> = object
+                .observations
+                .into_iter()
+                .filter(|o| {
+                    pipeline
+                        .redact_observations(Observations::new(vec![o.clone()]))
+                        .is_ok()
+                })
+                .collect();
+            if kept.len() == total {
+                return Err(err);
+            }
+            guard.report(&format!(
+                "{} observation(s) dropped: redaction refused them",
+                total - kept.len()
+            ));
+            pipeline.redact_observations(Observations::new(kept))
+        }
+    }
+}
+
+/// `raw_kind` einer Datei-Beobachtung im Witness-Stream.
+#[cfg(unix)]
+pub const FS_OBSERVED: &str = "fs.observed";
+
 /// Baut den Seal dieser Epoche, legt ihn ab und schreibt den Epochen-Zustand
 /// fort. Gibt die [`SealSummary`] zurück — oder `None`, wenn die Ablage
 /// scheiterte (dann bleibt das Journal liegen und der nächste Lauf holt sie
@@ -301,6 +468,10 @@ fn seal_epoch(
                     (SealOutcome::Stored { session: a }, SealOutcome::Stored { session: b }) => {
                         a == b
                     }
+                    (
+                        SealOutcome::ObservationsStored { observations: a },
+                        SealOutcome::ObservationsStored { observations: b },
+                    ) => a == b,
                     _ => false,
                 };
                 if prev.root == result.root && prev.scope == src.scope && same_outcome {
@@ -378,10 +549,19 @@ fn seal_epoch(
     } else {
         sign_seal_best_effort(env, signer, &seal_id, &text)
     };
-    // Epochen-Zustand best-effort: Fehlt er künftig, ist die Kette offen —
-    // sichtbar und ehrlich, kein Grund, den Checkpoint zu kippen.
+    // Lokal best-effort: Fehlt der Zustand künftig, ist die Kette offen —
+    // sichtbar und ehrlich, kein Grund, den Checkpoint zu kippen. Beim
+    // Witness nicht: Blieb der Zustand auf der vorigen Epoche stehen, nennte
+    // der nächste Seal **sie** als Vorgänger — die Kette gabelte sich an
+    // dieser Epoche vorbei, und der Reader (EA-08) ließe ihre Beobachtungen
+    // stillschweigend weg. Dann vertagen: nicht verworfen, der nächste Lauf
+    // versiegelt dieselbe Epoche idempotent (gleicher Inhalt, gleiche Id)
+    // und schreibt den Zustand erneut.
     if let Err(err) = epochs.record(key, &seal_id) {
         report(log_dir, guard, &format!("epoch state not advanced: {err}"));
+        if guard.is_some() {
+            return None;
+        }
     }
     let sealed = SealSummary::new(seal_id, seal, signed);
     if let Some(guard) = guard {
@@ -441,6 +621,11 @@ fn print_session_sealed(sealed: &SealSummary) {
         SealOutcome::Stored { .. } => {
             println!("    ✓ seal recorded — check it with `minds verify <session-id>`");
         }
+        SealOutcome::ObservationsStored { .. } => {
+            println!(
+                "    ✓ observation seal recorded — check it with `minds verify --evidence <seal>`"
+            );
+        }
         SealOutcome::Rejected => {
             println!("    ✓ block seal recorded — the payload was rejected, the range is attested");
         }
@@ -460,6 +645,9 @@ pub fn session_sealed_line(sealed: &SealSummary) -> String {
     let seal = &sealed.seal;
     let head = match &seal.outcome {
         SealOutcome::Stored { session } => format!("SESSION SEALED {session}"),
+        SealOutcome::ObservationsStored { observations } => {
+            format!("OBSERVATIONS SEALED {observations}")
+        }
         SealOutcome::Rejected => "RANGE SEALED (payload rejected)".to_owned(),
     };
     let gaps = if seal.gaps == 0 && seal.pre_chain == 0 {

@@ -1,6 +1,8 @@
 use super::*;
 use minds_store::ContextStore;
 
+mod observer_tests;
+
 struct Fixture {
     _dir: tempfile::TempDir,
     home: PathBuf,
@@ -281,7 +283,8 @@ fn witness_ledger_is_idempotent_after_sealing_before_discard() {
 }
 
 #[test]
-fn witness_lifecycle_is_not_sealed_and_agent_cannot_forge_it() {
+fn witness_lifecycle_is_sealed_as_its_own_stream_and_agent_cannot_forge_it() {
+    use minds_core::evidence::Seal;
     let f = Fixture::new();
     f.keygen();
     let mut writer = f.writer();
@@ -293,11 +296,34 @@ fn witness_lifecycle_is_not_sealed_and_agent_cannot_forge_it() {
             serde_json::json!({"previous_stop":"none"}),
         )
         .unwrap();
+    // Der Agent kann nicht in den eigenen Stream schreiben.
     writer.hook("witness", None, payload(), at()).unwrap();
+    assert_eq!(writer.journal.read(&own).unwrap().events.len(), 1);
     append(&mut writer);
     writer.checkpoint_now(None).unwrap();
-    assert_eq!(writer.journal.read(&own).unwrap().events.len(), 1);
-    assert_eq!(writer.journal.sessions().unwrap().keys, vec![own]);
+    // Seit EA-08 wird der eigene Stream versiegelt — als eigener Bereich mit
+    // Scope `witness-fs/v1`, nie als Agent-Session (`witness/v1`).
+    let store = minds_store::InRepoStore::open(&f.root).unwrap();
+    let mut seals: Vec<(String, String, u64)> = store
+        .list_seals()
+        .unwrap()
+        .iter()
+        .map(|id| {
+            let seal = Seal::parse(&store.seal_text(id).unwrap().unwrap()).unwrap();
+            (seal.scope, seal.agent, seal.events)
+        })
+        .collect();
+    seals.sort();
+    assert_eq!(
+        seals,
+        [
+            // Nur `witness.start`: Ohne laufenden eigenen Stream (kein
+            // `run`) schreibt der Checkpoint keine Grenze.
+            ("witness-fs/v1".into(), "witness".into(), 1),
+            ("witness/v1".into(), "claude-code".into(), 1),
+        ]
+    );
+    assert!(writer.journal.sessions().unwrap().keys.is_empty());
 }
 
 #[test]

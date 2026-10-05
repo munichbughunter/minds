@@ -121,6 +121,25 @@ ref already pushed to the forge, the next `git push` (or `minds sync`)
 propagates the deletion via a targeted force-push — it thereby reaches the
 ref tip on the forge as well (#102).
 
+**Witness file observations are not subject to `forget`.** When a witness
+runs (ADR-0012), it records observation objects under
+`refs/minds/observations/<hash>`. They contain only repo-relative paths
+(passed through the same redaction pipeline, fail-closed) and blake3
+hashes — never file content. Secret files (`.env`, keys …) appear without a
+hash, ignored paths (`.gitignore`, `.git/info/exclude`) and `.git/` do not
+appear at all, and no symlink target is ever read — only the link text, as Git stores it.
+A file whose content the redaction pipeline would change (a token, a
+password assignment) and any non-text file get no hash either. No content
+can be erased from such an object because none is in it. Two honest
+caveats: an untracked file that is *not* ignored and is written during a
+session appears with its path and hash even if it is never committed —
+for a very short file (a PIN, a single word) such a hash can be guessed
+offline; and
+only the repository's `.gitignore` and `.git/info/exclude` count — your
+global excludes (`core.excludesFile`, `~/.config/git/ignore`) are **not**
+consulted by the witness. Keep private scratch files in `.gitignore` or
+`.git/info/exclude`.
+
 ## 6. Known gaps — as of v0.1.3
 
 The list an approval decision needs. None of this is hidden; all of it is

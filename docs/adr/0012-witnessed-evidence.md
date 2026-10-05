@@ -170,6 +170,101 @@ as its own event class `fs.observed` in the same chain.
   keys etc.; untracked private files outside the repo are never fingerprinted; ignored
   paths (`target/`, `node_modules/`) are skipped by `.gitignore`.
 
+**As implemented (EA-08).** `fs.observed` events live in the witness's own stream
+(`agent = "witness"`, the same stream as `witness.start`/`witness.stop`), with payload
+`{"path","content":"b3-…"|null,"reason":null|"too_large"|"secret_file"|"deleted"|"outside_repo"|"redacted_content"|"unscannable"}`.
+
+- **What is observed.** Paths are repo-relative. A hash is computed only over content the
+  redaction pipeline would leave unchanged (`redacted_content` otherwise) and only over
+  UTF-8 (`unscannable` otherwise) — the same dictionary-oracle rule as `Effect.written`.
+  Secret files are never read. For a symlink the **link text** is fingerprinted (what Git
+  commits); a link pointing out of the repository is `outside_repo`, and so is a file with
+  a second hard link (it may be a host file). A deletion is recorded only for tracked paths
+  or paths this run already observed.
+- **What is ignored.** Only `.gitignore` and `.git/info/exclude` decide (no global or
+  config-named exclude file); tracked files are never ignored. The rules are evaluated
+  **in-process** from bytes the witness reads itself — the witness never runs `git`
+  against the agent's worktree, because the agent controls its configuration and index (a
+  lazy fetch via a promisor remote would run `core.sshCommand` on the host). An unreadable
+  rule file drops the paths it governs.
+- **How it reads.** The repository root is opened once as a directory descriptor; every
+  access walks below it with `openat(O_NOFOLLOW)`/`fstatat`/`readlinkat`, never crosses a
+  file-system boundary, and reads only regular files. The watcher does not follow
+  symlinks; nested repositories (submodules) are not observed; new directories are
+  searched (bounded), since inotify does not report files created before their watch.
+- **Bounded work.** Paths, bytes and appends per event-loop step are capped, also on a
+  checkpoint request; what does not fit goes into the next epoch. Lost notifications
+  (queue overflow, a swapped root, unreadable ignore rules, a panic, watcher unavailable)
+  are chained as `fs.gap` events.
+
+Every witness checkpoint also seals the stream's current epoch: scope `witness-fs/v1`,
+signed under `minds-witness`, outcome **`observations_stored`**. The seal format stays at
+13 lines; for this outcome the `session=` line carries the **id of the observation
+object** (`b3-` + blake3 of its RFC 8785 bytes), not a session id. Older binaries reject
+the unknown outcome word rather than misread the id — the same accepted trade-off as
+schema 2. The object `{"schema":1,"first_at","last_at","observations":[{"seq","at","path",
+"content","reason"}]}` passes the redaction pipeline fail-closed (`RedactedObservations`,
+no public constructor; an observation whose path the pipeline refuses is dropped, not the
+whole epoch) and is stored under `refs/minds/observations/<64 hex>`, one ref per object,
+carried by `minds sync`. `minds forget` does not apply to it: it holds only redacted paths
+and hashes.
+
+The reader accepts an observation object only through a `witness-fs/v1` seal whose
+signature verifies under `minds-witness` (the agent can write `refs/minds/observations/`
+and seals in a shared repository). `minds verify` takes the trust file only from
+`--signers` or `~/.ssh/allowed_signers` — never from the repository's
+`gpg.ssh.allowedSignersFile` — and accepts a principal only if every line naming it **or
+carrying one of its keys** is restricted to exactly `namespaces="minds-witness"`.
+Reconciliation uses observations only for linked sessions that a trusted `witness/v1`
+seal names (the witness stamps their times), one window per session. It ends with the
+checkpoint's observation epoch: the earliest **trusted** `witness-fs/v1` epoch ending at or
+after the session's witnessed range. The witness seals that epoch before the sessions and
+closes it with a monotonically stamped `fs.checkpoint` event, so work continued after the
+commit lands in the next epoch. From that epoch the signed `previous` chain is followed back
+to the first epoch ending before the window starts; only observations from the epochs in
+between count. A chain that starts (first checkpoint after a witness start) before reaching
+such an epoch is not enough — no seal records when it began — so a session spanning or
+directly following a witness start gets no observations (follow-up: sign the epoch's
+start, or let the session seal name its checkpoint epoch). If a link is
+missing (deleted), untrusted or a block seal (observations not stored), the session gets
+**no** observations — the latest remaining reading would not be the latest. Untrusted seals
+are ignored entirely. With a single trusted witness key, deleting or planting seals can
+therefore throw a session back to the state without a witness, never turn a line into
+`explained` (deleted witnessed seals become
+visible through the witness ledger, EA-11/EA-12). Unwitnessed sessions open no window —
+their timestamps can be set by the agent — and the gap between two linked sessions belongs
+to no window. A session sealed at several checkpoints has one window up to its latest
+witnessed range. An opaque latest observation (no hash)
+does not erase an earlier contradicting one; otherwise the file is classified as without a
+witness. Corroboration window: an observation of H at P within `[claim − 2 s,
+claim + 30 s]`.
+
+Known limits: a rewrite of identical content within one epoch is a single observation
+(a later claim for it stays uncorroborated); in SHA-256 repositories tracked files that
+match an ignore pattern are not observed; `fs.gap` events are chained but not yet surfaced
+by `minds verify` (EA-11/EA-12); linked worktrees (`.git` is a file) are not observed.
+`explained (fs only)` means the witness saw exactly the committed bytes in the window —
+it says nothing about who wrote them (an agent can re-surface existing content with a
+`touch` after an epoch boundary). The witness seals the observation epoch **before** the sessions of the same checkpoint;
+if that epoch cannot be sealed, the sessions are deferred — a trusted `witness/v1` seal
+exists only together with its checkpoint's epoch. The `fs.checkpoint` mark is stamped
+monotonically (never before the last session event). A window in which an observation
+epoch ended as a block seal (observations not stored) yields no observations, since the
+latest remaining reading would not be the latest. The chain rule assumes a single witness key per repository: with several
+witnesses pushing to one remote, a deleted epoch of one can be bridged by another's (until
+EA-10 pins the key). The
+observer hashes up to 16 MiB, capture up to 32 MiB: a file the witness last read
+smaller and then only saw as `too_large` stays contradicted by that earlier reading.
+Seals do not name their repository: with several witnesses, a principal restricted to
+`minds-witness` counts for every repository (pinning the witness key per repository is
+EA-10). The default `~/.ssh/allowed_signers` may be writable by an agent running as the
+developer's uid — gates such as `--require-explained` should pass `--signers` with a file
+the agent cannot write. On Linux the recursive inotify watch also covers ignored
+directories (`target/`, `node_modules/`); a large tree can exhaust `max_user_watches`, which
+is recorded as `fs.gap` (`unavailable`). Untracked, non-ignored files in the worktree are
+fingerprinted even if never committed, which is an offline guessing target for
+low-entropy content.
+
 ## Decision 4: Artifact reconciliation — the commit must be explained by evidence
 
 `minds verify <session> --commit <rev>` (and the default target `HEAD` when no argument

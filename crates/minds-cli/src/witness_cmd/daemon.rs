@@ -22,6 +22,7 @@ use crate::checkpoint::core::{
     CheckpointEnv, CheckpointGuard, EvidenceSource, SealSigner, run_checkpoint_guarded,
 };
 
+mod observer;
 mod socket;
 #[cfg(test)]
 mod tests;
@@ -114,6 +115,16 @@ pub fn init(home: &Path, repo: &str, mapping: Option<&str>) -> Fallible<String> 
     ledger.sync_all()?;
     sync_dir(&home)?;
     Ok("Witness initialized. Run `minds witness keygen` before `minds witness run`.".into())
+}
+
+/// Liegt das Witness-Home im beobachteten Repo, sähe der Beobachter die
+/// eigenen Schreibzugriffe — und der Agent das Home. Der Witness startet
+/// dann nicht (EA-08).
+fn refuse_home_in_repo(home: &Path, config: &Config) -> Fallible<()> {
+    if home.canonicalize()?.starts_with(&config.repo_root) {
+        return Err("witness home must not be inside the repository".into());
+    }
+    Ok(())
 }
 
 fn plain(path: &Path) -> bool {
@@ -257,6 +268,11 @@ fn log(home: &Path, message: &str) {
     }
 }
 
+/// Die Uhr des Witness (RFC 3339, Unix-Nanos).
+pub(super) fn now() -> (String, u64) {
+    clock::now()
+}
+
 fn folder_path(home: &Path, key: &SessionKey) -> PathBuf {
     let digest = blake3::hash(format!("{}\0{}", key.agent(), key.local_id()).as_bytes());
     home.join("evidence/folders")
@@ -280,7 +296,34 @@ struct Writer {
     /// wiederholt hat — ein erzwungener Fehlschlag je Sekunde darf ältere
     /// Diagnosen nicht aus dem rotierenden Log drängen.
     last_failure: Option<(String, usize)>,
+    /// Der eigene Stream dieses Laufs (`agent = "witness"`): Lebenszyklus,
+    /// `fs.observed` und `fs.gap`.
+    stream: Option<SessionKey>,
+    /// Das zweite Auge (EA-08); `None`, solange `run` es nicht startet.
+    observer: Option<observer::Observer>,
+    /// Ob seit dem letzten Versiegeln eine Datei-Beobachtung kam.
+    fs_dirty: bool,
+    /// Ob ein Scheitern der Ignore-Auswertung schon geloggt wurde.
+    ignore_failure_logged: bool,
+    /// Klassifizierte Beobachtungen, die noch ins Journal müssen.
+    fs_ready: std::collections::VecDeque<observer::Seen>,
+    /// Wann je Grund zuletzt ein `fs.gap` angehängt wurde: höchstens eines
+    /// je Grund und Sekunde — eine dauerhafte Störung füllt das Journal
+    /// nicht im Takt der Eventloop.
+    last_gap: std::collections::HashMap<&'static str, std::time::Instant>,
+    /// Ob in diesem Durchlauf der Eventloop schon für einen Checkpoint
+    /// ohne Entprellung beobachtet wurde. Eine Flut von Anfragen in einem
+    /// Durchlauf kostet so höchstens einmal das Budget.
+    settled_this_step: bool,
 }
+
+/// Höchstzahl der `fs.observed`-Appends je Durchlauf der Eventloop.
+const FS_APPENDS_PER_STEP: usize = 64;
+
+/// Höchstzahl der `fs.observed`-Appends zu Beginn eines Checkpoints — auch
+/// eine Flut von Anfragen hält die Eventloop nicht länger an. Was darüber
+/// hinaus wartet, kommt in die nächste Epoche.
+const FS_APPENDS_ON_CHECKPOINT: usize = 256;
 
 /// Mindestabstand zwischen zwei versiegelnden Checkpoints auf Anfrage der
 /// Agent-Seite. Ohne ihn könnte der Agent zwischen je zwei Events einen
@@ -300,6 +343,13 @@ impl Writer {
             dirty: true,
             last_run: None,
             last_failure: None,
+            stream: None,
+            observer: None,
+            fs_dirty: false,
+            ignore_failure_logged: false,
+            fs_ready: std::collections::VecDeque::new(),
+            settled_this_step: false,
+            last_gap: std::collections::HashMap::new(),
         };
         writer.recover_all()?;
         Ok(writer)
@@ -406,7 +456,7 @@ impl Writer {
         stdin: Vec<u8>,
         at: (String, u64),
     ) -> Fallible<()> {
-        if agent == "witness" {
+        if agent.eq_ignore_ascii_case("witness") {
             log(&self.home, "reserved agent rejected");
             return Ok(());
         }
@@ -442,6 +492,137 @@ impl Writer {
             },
         )?;
         Ok(())
+    }
+
+    /// Startet die Datei-Beobachtung in den eigenen Stream `stream`.
+    fn observe_into(&mut self, stream: SessionKey, observer: observer::Observer) {
+        self.stream = Some(stream);
+        self.observer = Some(observer);
+    }
+
+    /// Ein Durchlauf des Beobachters: beruhigte (mit `settle` alle) Pfade
+    /// lesen und als `fs.observed` an den eigenen Stream hängen. Verlorene
+    /// Meldungen werden ein `fs.gap`. `Err` ist ausschließlich ein Fehler
+    /// des eigenen Speichers.
+    fn observe(&mut self, settle: bool) -> Fallible<()> {
+        let (Some(observer), Some(stream)) = (self.observer.as_mut(), self.stream.clone()) else {
+            return Ok(());
+        };
+        // Gebremst wird vor dem Klassifizieren: Wartet schon eine volle
+        // Ladung auf das Journal, bleibt der Rest in der begrenzten Sammlung
+        // des Beobachters — und läuft die über, wird das eine Lücke.
+        let batch = if self.fs_ready.len() < observer::MAX_PENDING {
+            // Agent-bestimmte Bytes (Index, `.gitignore`) laufen durch gix:
+            // Ein Panic darin darf den einzigen Schreiber nicht beenden.
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                observer.tick(std::time::Instant::now(), settle)
+            })) {
+                Ok(batch) => batch,
+                Err(_) => {
+                    observer.forget_caches();
+                    self.gap(&stream, "panic", "file observer panicked; gap recorded")?;
+                    observer::Batch::default()
+                }
+            }
+        } else {
+            observer::Batch::default()
+        };
+        self.fs_ready.extend(batch.seen);
+        if batch.overflow {
+            self.gap(
+                &stream,
+                "overflow",
+                "file observer lost notifications; gap recorded",
+            )?;
+        }
+        if batch.ignore_failed {
+            // Lieber blind als einen ignorierten Pfad fingerprinten. Die
+            // Lücke steht einmal je Fehlerphase in der Kette und im Log —
+            // eine dauerhaft unlesbare `.gitignore` füllt beides nicht.
+            if !self.ignore_failure_logged {
+                log(
+                    &self.home,
+                    "ignore rules not evaluable; observations dropped",
+                );
+                self.lifecycle(
+                    &stream,
+                    "fs.gap",
+                    serde_json::json!({"reason": "ignore_rules"}),
+                )?;
+                self.fs_dirty = true;
+                self.ignore_failure_logged = true;
+            }
+        } else if batch.classified {
+            // Erst eine gelungene Auswertung beendet die Fehlerphase — ein
+            // ruhiger Durchlauf ohne Pfade sagt darüber nichts.
+            self.ignore_failure_logged = false;
+        }
+        // Jeder Append fsynct Journal und Fold. Ein Burst von tausend
+        // Dateien darf die Hooks nicht sekundenlang warten lassen: höchstens
+        // [`FS_APPENDS_PER_STEP`] je Durchlauf der Eventloop, beim
+        // Checkpoint [`FS_APPENDS_ON_CHECKPOINT`]. Erst nach dem Append
+        // verlässt eine Beobachtung die Warteschlange: Scheitert er, geht
+        // nichts verloren.
+        let limit = if settle {
+            FS_APPENDS_ON_CHECKPOINT
+        } else {
+            FS_APPENDS_PER_STEP
+        };
+        for _ in 0..limit {
+            let Some(seen) = self.fs_ready.front() else {
+                break;
+            };
+            let payload = serde_json::value::RawValue::from_string(seen.payload()?)?;
+            let at = seen.at.clone();
+            self.append(
+                &stream,
+                NewEvent {
+                    at: at.0,
+                    at_nanos: at.1,
+                    kind: minds_capture::EventKind::Other,
+                    raw_kind: crate::checkpoint::core::FS_OBSERVED.into(),
+                    cwd: None,
+                    transcript_path: None,
+                    payload,
+                },
+            )?;
+            self.fs_ready.pop_front();
+            self.fs_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Hängt ein `fs.gap` mit `reason` an und loggt `note` — höchstens
+    /// einmal je Grund und Sekunde.
+    fn gap(&mut self, stream: &SessionKey, reason: &'static str, note: &str) -> Fallible<()> {
+        let now = std::time::Instant::now();
+        if self
+            .last_gap
+            .get(reason)
+            .is_some_and(|at| now.duration_since(*at) < std::time::Duration::from_secs(1))
+        {
+            return Ok(());
+        }
+        self.last_gap.insert(reason, now);
+        log(&self.home, note);
+        self.lifecycle(stream, "fs.gap", serde_json::json!({ "reason": reason }))?;
+        self.fs_dirty = true;
+        Ok(())
+    }
+
+    /// [`Self::observe`] ohne Entprellung, höchstens einmal je Durchlauf der
+    /// Eventloop ([`Self::next_step`] gibt ihn wieder frei).
+    fn settle_once(&mut self) -> Fallible<()> {
+        if self.settled_this_step {
+            return Ok(());
+        }
+        self.settled_this_step = true;
+        self.observe(true)
+    }
+
+    /// Ein neuer Durchlauf der Eventloop beginnt.
+    pub(super) fn next_step(&mut self) {
+        self.settled_this_step = false;
     }
 
     /// Der Einstieg für `CheckpointRequest` vom Socket (EA-06d): ein Lauf von
@@ -482,7 +663,13 @@ impl Writer {
         if !requester_alive() {
             return Err("requester gone");
         }
-        if !self.dirty {
+        // Was gerade noch entprellt wird, gehört in diese Epoche — auch die
+        // Frage „gibt es etwas zu versiegeln?" muss es schon sehen.
+        if self.settle_once().is_err() {
+            self.note_failure(Some("file observations not recorded".into()));
+            return Err("checkpoint failed");
+        }
+        if !self.dirty && !self.fs_dirty {
             return Ok(checkpoint_status(&[], 0, Ok(None)));
         }
         if self
@@ -550,9 +737,11 @@ impl Writer {
     /// Agent-Seite druckt, weil sie selbst nichts vom Witness-Zustand lesen
     /// darf (W1).
     ///
-    /// `Err` heißt: Es wurde **nichts** versiegelt — alle Prüfungen, die
-    /// scheitern können, laufen vor dem ersten Seal, und Fehler einzelner
-    /// Sessions danach vertagt der Kern nur diese Session. Was nach dem
+    /// `Err` heißt: Es wurde **keine Agent-Session** versiegelt — alle
+    /// Prüfungen, die scheitern können, laufen vor dem ersten Session-Seal,
+    /// und Fehler einzelner Sessions danach vertagt der Kern nur diese
+    /// Session. Beobachtungs-Epochen (`witness-fs/v1`) können dabei schon
+    /// geschlossen sein. Was nach dem
     /// Versiegeln scheitert (Trailer), steht in der Statuszeile, nicht im
     /// Fehler.
     #[cfg(test)]
@@ -566,6 +755,48 @@ impl Writer {
         commit: Option<&str>,
         requester_alive: &dyn Fn() -> bool,
     ) -> Fallible<String> {
+        // Was bis zum Commit geschrieben wurde, soll in diese Epoche — nicht
+        // erst nach der Entprellung in die nächste.
+        self.settle_once()?;
+        // Die Grenze der Beobachtungs-Epoche: Jeder Checkpoint versiegelt so
+        // eine, und ihr Ende liegt nicht vor dem letzten Event der Sessions,
+        // die er versiegelt (die letzte Beobachtung kommt meist **vor** dem
+        // Stop-Hook). Der Reader findet darüber die Epoche des Checkpoints
+        // (`witness_windows`) — nicht die des nächsten, die schon die Arbeit
+        // nach dem Commit enthielte.
+        //
+        // Gestempelt wird monoton: nie vor dem letzten Event irgendeiner
+        // offenen Session — springt die Wanduhr zurück, läge die Grenze sonst
+        // vor dem bezeugten Bereich.
+        if let Some(stream) = self.stream.clone() {
+            let latest = self
+                .journal
+                .sessions()?
+                .keys
+                .iter()
+                .filter_map(|key| self.journal.read(key).ok())
+                .filter_map(|read| read.events.last().map(|event| event.at_nanos))
+                .max()
+                .unwrap_or(0);
+            let now = clock::now();
+            let at = if now.1 > latest {
+                now
+            } else {
+                (clock::rfc3339_from_nanos(latest + 1), latest + 1)
+            };
+            self.append(
+                &stream,
+                NewEvent {
+                    at: at.0,
+                    at_nanos: at.1,
+                    kind: minds_capture::EventKind::Other,
+                    raw_kind: "fs.checkpoint".into(),
+                    cwd: None,
+                    transcript_path: None,
+                    payload: serde_json::value::RawValue::from_string("{}".into())?,
+                },
+            )?;
+        }
         let result = self.checkpoint_sessions(commit, requester_alive);
         // Auch ein Fehler mitten im Lauf kann Sessions bereits verworfen haben.
         // Ihr alter Fold darf nie die nächste Epoche fortsetzen; `append` lädt
@@ -643,9 +874,19 @@ impl Writer {
         let store = store_config.open(root)?;
         // Die Policy darf verschärfen, nie abschwächen — und ihre Datei ist
         // fremd: gewöhnliche Datei, begrenzt, ohne zu blockieren gelesen.
-        let pipeline = crate::config::load_redaction_untrusted(root)?
-            .floored_at_default()
-            .pipeline()?;
+        let policy = crate::config::load_redaction_untrusted(root)?.floored_at_default();
+        let pipeline = policy.pipeline()?;
+        // Der Beobachter prüft Inhalte ab jetzt mit derselben, frischen
+        // Policy — verschärft das Repo sie, hasht er nichts mehr, was sie
+        // ersetzen würde. Aus **derselben** Lesung gebaut: Die Datei gehört
+        // dem Agenten, und ein zweites Lesen könnte etwas anderes ergeben.
+        // Der Beobachter wird dabei nie herausgenommen, bevor die neue
+        // Pipeline feststeht — er kann nicht verloren gehen.
+        if let Ok(fresh) = policy.pipeline() {
+            if let Some(observer) = self.observer.take() {
+                self.observer = Some(observer.with_pipeline(fresh));
+            }
+        }
         let tracked = crate::checkpoint::tracked_files(root);
         fingerprint(&self.home)?;
         let key = self.home.join("key/witness_ed25519");
@@ -662,7 +903,57 @@ impl Writer {
             epochs: &self.epochs,
             scope: minds_core::evidence::SCOPE_WITNESS_V1,
         };
-        let outcome = run_checkpoint_guarded(
+        // Zuerst die Beobachtungs-Epoche dieses Checkpoints (`witness-fs/v1`),
+        // dann die Sessions: Ein vertrauenswürdiger `witness/v1`-Seal soll
+        // nur existieren, wenn die Epoche seines Checkpoints abgelegt ist.
+        // Bliebe sie offen (ein Ablagefehler, den der Agent per Ref-Konflikt
+        // herbeiführen kann), verschmölze sie mit der nächsten — und das
+        // Fenster der Session reichte über den Commit hinaus. Dann lieber
+        // vertagen: Die Sessions bleiben offen, nichts wird behauptet.
+        let streams: Vec<SessionKey> = self
+            .journal
+            .sessions()?
+            .keys
+            .into_iter()
+            .filter(|key| key.agent() == "witness")
+            .collect();
+        let fs_source = EvidenceSource {
+            journal: &self.journal,
+            epochs: &self.epochs,
+            scope: minds_core::evidence::SCOPE_WITNESS_FS_V1,
+        };
+        let fs_sealed = crate::checkpoint::core::seal_observation_streams(
+            &env,
+            &fs_source,
+            &SealSigner::Key {
+                path: &key,
+                namespace: minds_attest::NS_WITNESS,
+            },
+            &*self,
+            &streams,
+        );
+        // Gleich nach dem Versiegeln, vor jedem frühen Ausstieg: Ist die
+        // Epoche geschlossen, beginnt die nächste ohne Gedächtnis.
+        self.fs_dirty = match &self.stream {
+            Some(stream) => self.journal.read(stream).map_or(true, |read| {
+                // Auch eine verbliebene Lücke will versiegelt werden.
+                read.events.iter().any(|e| e.raw_kind.starts_with("fs."))
+            }),
+            None => false,
+        };
+        // Eine neue Epoche beginnt ohne Gedächtnis: Schreibt jemand danach
+        // denselben Inhalt erneut, ist das in ihr eine eigene Beobachtung.
+        if !self.fs_dirty {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.forget_states();
+            }
+        }
+        if let Some(stream) = &self.stream {
+            if !self.journal.read(stream)?.events.is_empty() {
+                return Err("observation epoch not sealed; witnessed sessions deferred".into());
+            }
+        }
+        let mut outcome = run_checkpoint_guarded(
             &env,
             &source,
             &SealSigner::Key {
@@ -671,6 +962,7 @@ impl Writer {
             },
             Some(self),
         )?;
+        outcome.sealed.extend(fs_sealed);
         // Ab hier ist versiegelt und verworfen. Ein Fehler beim Trailern macht
         // daraus keinen `Nack` mehr — die Agent-Seite meldete sonst „bleiben
         // offen". Er steht als fester Grund in der Statuszeile.
@@ -875,7 +1167,14 @@ impl CheckpointGuard for Writer {
             "{} {} {}\n",
             sealed.seal_id, sealed.seal.scope, sealed.seal.last_event_at
         );
-        if let minds_core::evidence::SealOutcome::Stored { .. } = sealed.seal.outcome {
+        // Der eigene Stream wird auch nach einem Block-Seal verworfen; ohne
+        // Markierung hielte `recover` das leere Journal für verschwunden.
+        if matches!(
+            sealed.seal.outcome,
+            minds_core::evidence::SealOutcome::Stored { .. }
+                | minds_core::evidence::SealOutcome::ObservationsStored { .. }
+        ) || key.agent() == "witness"
+        {
             atomic(
                 &folder_path(&self.home, key).with_extension("sealed"),
                 sealed.seal.root.as_str().as_bytes(),

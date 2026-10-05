@@ -186,6 +186,26 @@ pub enum StoreError {
         actual: ContentHash,
     },
 
+    /// Die unter einer Observation-Id abgelegten Bytes hashen nicht auf
+    /// diese Id — das Objekt wurde nachträglich verändert (EA-08).
+    #[error("observation object at {requested} hashes to {actual} — it has been altered")]
+    ObservationsMismatch {
+        /// Die angefragte Id.
+        requested: ContentHash,
+        /// Die Id der abgelegten Bytes.
+        actual: ContentHash,
+    },
+
+    /// Die Bytes hashen korrekt, sind aber kein lesbares Observation-Objekt.
+    #[error("observation object at {id} is not readable: {reason}")]
+    MalformedObservations {
+        /// Die Id.
+        id: ContentHash,
+        /// Die Fehlerkategorie des Parsers (`syntax`, `data`, `eof`) — nie
+        /// sein Text, der Werte zitieren könnte.
+        reason: String,
+    },
+
     /// Das Backend konnte nicht lesen oder schreiben.
     ///
     /// Die Fassade: Was darunter liegt (gix, Dateisystem, Rechte), erreicht den

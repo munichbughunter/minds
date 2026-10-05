@@ -9,9 +9,10 @@
 //!
 //! Gezählt wird alles, was **nicht** `unexplained` ist — also auch
 //! `reported only` (ein Tool-Claim mit passendem Schreibzeit-Hash, aber ohne
-//! Zeugen). Solange es keinen Datei-Beobachter gibt (EA-08), ist das die
-//! stärkste verfügbare Aussage; die Abstufung nach Belegstärke ist Sache der
-//! Assurance-Zeile (EA-12), nicht dieser Zählung.
+//! Zeugen). Beobachtungen des Datei-Beobachters (EA-08) heben eine Datei zu
+//! `explained` bzw. `explained (fs only)` — nur aus Witness-signierten Seals;
+//! die Abstufung nach Belegstärke ist Sache der Assurance-Zeile (EA-12),
+//! nicht dieser Zählung.
 //!
 //! # Terminal-Härtung
 //!
@@ -71,20 +72,21 @@ pub(super) fn assess(
     ctx: &Context,
     commit: CommitId,
     sessions: &[&Session],
+    observations: &[minds_reader::reconcile::FsObservation],
     all: bool,
     rerun: String,
 ) -> Fallible<Result<Artifact, &'static str>> {
     let spellings = root_spellings(&ctx.root);
     let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
     Ok(
-        minds_reader::artifact::assess(&ctx.repo, &roots, commit, sessions)?.map(|assessed| {
-            Artifact {
+        minds_reader::artifact::assess(&ctx.repo, &roots, commit, sessions, observations)?.map(
+            |assessed| Artifact {
                 recon: assessed.recon,
                 structural: assessed.structural,
                 all,
                 rerun,
-            }
-        }),
+            },
+        ),
     )
 }
 
