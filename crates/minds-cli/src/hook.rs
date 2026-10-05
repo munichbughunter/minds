@@ -35,12 +35,24 @@
 //! Das ist ein Pfad-Test plus, im seltenen Trefferfall, ein kleiner
 //! JSON-Neubau — billig genug für den heißen Pfad und die einzige Stelle, an
 //! der Weglassen wichtiger ist als Geschwindigkeit.
+//!
+//! # Mit Witness: weitergeben statt schreiben (EA-07)
+//!
+//! Ist `MINDS_WITNESS_SOCKET` gesetzt, schreibt der Hook nicht selbst, sondern
+//! schickt das Event als Frame an den Witness — den einen Schreiber auf dem
+//! Host (W1). Die Mauer läuft **davor** und bleibt auf der Agent-Seite: Der
+//! Inhalt einer Zugangsdaten-Datei überquert den Socket nicht. Scheitert die
+//! Weitergabe, aus welchem Grund auch immer, steht eine Zeile in `hook.log`
+//! und das Event geht wie bisher ins lokale Journal. Ohne die Variable ist
+//! alles wie vorher. Die Einzelheiten stehen in [`witness`].
+
+mod witness;
 
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use minds_capture::{Journal, clock, hook_event, secretwall};
+use minds_capture::{Journal, NewEvent, clock, hook_event, secretwall};
 
 use crate::hooklog::{self, Source};
 
@@ -113,13 +125,57 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
         _ => {}
     }
 
+    // Mit Witness braucht die Weitergabe die Rohbytes, `parse` verbraucht sie.
+    // Die Kopie entsteht nur dann — ohne Variable bleibt der Pfad wie bisher —
+    // und nur, wenn sie überhaupt in einen Frame passt: Ein Event über
+    // `MAX_FRAME` bliebe ohnehin lokal, und eine nutzlose Kopie von bis zu
+    // 32 MiB ist auf dem heißen Pfad ein OOM-Risiko, kein Detail.
+    let witness = witness::socket_path().map(|socket| {
+        let raw = witness::admissible(agent, event_override, bytes.len()).map(|()| bytes.clone());
+        (socket, raw)
+    });
+
     // Die Uhr liest der Prozess, nicht der Parser: So bleibt `parse` eine reine
     // Funktion und damit gegen Fixtures testbar.
     let mut parsed = hook_event::parse(bytes, agent, event_override, clock::now())?;
 
-    // Fail-closed, noch vor dem ersten Byte auf der Platte: Berührt dieses Event
-    // eine Zugangsdaten-Datei, wird ihr Inhalt weggelassen, nicht aufgehoben.
-    secretwall::guard(&mut parsed.event);
+    // Fail-closed, noch vor dem ersten Byte auf der Platte und auf dem Socket:
+    // Berührt dieses Event eine Zugangsdaten-Datei, wird ihr Inhalt
+    // weggelassen, nicht aufgehoben.
+    let walled = secretwall::guard(&mut parsed.event).is_some();
+
+    let unreachable = match witness {
+        Some((socket, raw)) => {
+            // Hat die Mauer gegriffen, gehen nicht die Rohbytes über den
+            // Socket, sondern ihr gewallter Neubau — der passt auch dann in
+            // einen Frame, wenn der Rohpayload es nicht tat.
+            //
+            // Ein Payload, der kein JSON war (abgeschnitten, kaputt — `parse`
+            // hat ihn als Zeichenkette gerettet), konnte die Mauer nicht
+            // prüfen. Lokal ist das der bekannte Stand; über den Socket ginge
+            // er womöglich zu einem anderen Nutzer. Also bleibt er hier —
+            // gleich welcher Art: Bei kaputtem JSON ist auch die Eventart nur
+            // geraten, und ein Tool-Event ohne erkannten Namen wäre sonst
+            // durchgerutscht.
+            //
+            // Hat die Mauer gegriffen, war die Kopie oben umsonst. Das lässt
+            // sich nicht vorziehen, weil `parse` die Bytes verbraucht; die
+            // Obergrenze `MAX_FRAME` gilt trotzdem.
+            let stdin = if walled {
+                secretwall::walled_hook_bytes(&parsed.key, &parsed.event)
+                    .ok_or("unforwardable payload")
+            } else if salvaged(&parsed.event) {
+                Err("unforwardable payload")
+            } else {
+                raw
+            };
+            match stdin.and_then(|stdin| witness::forward(&socket, agent, event_override, stdin)) {
+                Ok(()) => return Ok(()),
+                Err(kind) => Some(kind),
+            }
+        }
+        None => None,
+    };
 
     // Das Arbeitsverzeichnis aus dem Payload schlaegt unser eigenes — Agents
     // starten Hooks nicht zwingend im Projektverzeichnis, und ein Hook, der das
@@ -129,6 +185,29 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
         None => std::env::current_dir()?,
     };
 
-    Journal::discover(&start)?.append(&parsed.key, parsed.event)?;
+    let journal = match Journal::discover(&start) {
+        Ok(journal) => journal,
+        // Ohne Journal kein Ort neben ihm: Das Event scheitert ohnehin, und
+        // `run` loggt den Fehler — der Grund des Rückfalls reist in derselben
+        // Zeile mit statt in einer zweiten.
+        Err(err) => {
+            return Err(match unreachable {
+                Some(kind) => format!("witness unreachable: {kind}; {err}").into(),
+                None => err.into(),
+            });
+        }
+    };
+    // Der Rückfall ist kein Fehler des Events, aber einer der Einrichtung — er
+    // gehört ins Log, und zwar neben das Journal, das ihn jetzt auffängt.
+    if let Some(kind) = unreachable {
+        hooklog::log_static_beside(&journal, Source::Hook, &["witness unreachable: ", kind]);
+    }
+    journal.append(&parsed.key, parsed.event)?;
     Ok(())
+}
+
+/// Ein Event, dessen Payload als JSON-Zeichenkette gerettet wurde — die Mauer
+/// hatte darin keinen Pfad zu sehen.
+fn salvaged(event: &NewEvent) -> bool {
+    event.payload.get().starts_with('"')
 }

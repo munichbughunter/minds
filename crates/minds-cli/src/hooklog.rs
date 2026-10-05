@@ -428,6 +428,13 @@ pub(crate) fn log(source: Source, message: &str) {
 /// die belastbare Antwort, während die Suche ab `cwd` eine Vermutung bleibt —
 /// und in einer Schleife obendrein eine wiederholte.
 pub(crate) fn log_at(git_dir: &Path, source: Source, message: &str) {
+    append_line(git_dir, source, &entry(message));
+}
+
+/// Hängt eine fertige, einzeilige Nachricht an das Log unter `git_dir` an —
+/// mit allen Schutzregeln für Verzeichnis, Blatt und Rotation, aber ohne
+/// Redaction: Die ist Sache des Aufrufers ([`entry`] oder `'static`-Text).
+fn append_line(git_dir: &Path, source: Source, entry: &str) {
     let path = path(git_dir);
     let Some(dir) = path.parent() else {
         return;
@@ -493,7 +500,7 @@ pub(crate) fn log_at(git_dir: &Path, source: Source, message: &str) {
         // Bei einer Agent-Flotte schreiben mehrere `minds hook`-Prozesse
         // gleichzeitig; die Zeilen zersägten sich dann gegenseitig, und
         // `count_entries` zählte Bruchstücke. Erst bauen, dann schreiben.
-        let line = format!("{at} {}: {}\n", source.as_str(), entry(message));
+        let line = format!("{at} {}: {entry}\n", source.as_str());
         let _ = file.write_all(line.as_bytes());
     }
 }
@@ -638,10 +645,34 @@ fn rotate_if_full(path: &Path) {
     let _ = fs::rename(path, path.with_file_name(ROTATED_FILE));
 }
 
+/// Schreibt eine Zeile aus festen Bausteinen in das Log neben `journal` —
+/// für den heißen Pfad des Hooks (EA-07).
+///
+/// **Neben dem Journal:** Der Hook findet sein Journal über das `cwd` des
+/// Payloads; die Zeile gehört dorthin, wo auch das Event landet, nicht in das
+/// Repository, in dem der Prozess zufällig gestartet wurde.
+///
+/// **Ohne Redaction-Lauf, und deshalb nur `'static`:** [`entry`] baut für
+/// jede Zeile die Redaction-Policy auf — im Debug-Build gemessen rund 800 ms,
+/// auch im Release ein Vielfaches des Latenzbudgets. Für Fehlertexte von
+/// außen ist das der richtige Preis. Text, der als Literal im Binary steht,
+/// kann aber keine Zugangsdaten und keinen Zeilenumbruch eines Fremden
+/// tragen; der Typ `&'static str` hält fest, dass nichts anderes hier
+/// hereinkommt.
+pub(crate) fn log_static_beside(journal: &Journal, source: Source, parts: &[&'static str]) {
+    if let Some(git_dir) = git_dir_of(journal) {
+        append_line(&git_dir, source, &sanitize(&parts.concat()));
+    }
+}
+
 /// Das Git-Verzeichnis, von `cwd` aufwärts gesucht.
 fn discover_git_dir() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    let journal = Journal::discover(&cwd).ok()?;
+    git_dir_of(&Journal::discover(&cwd).ok()?)
+}
+
+/// Das Git-Verzeichnis, zu dem ein Journal gehört.
+fn git_dir_of(journal: &Journal) -> Option<PathBuf> {
     // `Journal::root()` ist `<git-dir>/minds/journal`; zwei Ebenen zurück ist
     // das Git-Verzeichnis. `the_journal_sits_two_levels_below_the_git_dir` hält
     // diese Annahme fest — sonst schriebe eine Umbenennung in `minds-capture`
