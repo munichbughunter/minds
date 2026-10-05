@@ -43,7 +43,7 @@ use serde_json::{Map, Value};
 
 use minds_redact::{SECRET_FILE_PLACEHOLDER, secret_file_reason};
 
-use crate::journal::{EventKind, NewEvent};
+use crate::journal::{EventKind, NewEvent, SessionKey};
 
 /// Prüft ein Tool-Event und ersetzt seinen Payload, falls er eine
 /// Zugangsdaten-Datei berührt. Gibt den Regelnamen zurück, wenn die Mauer
@@ -63,6 +63,42 @@ pub fn guard(event: &mut NewEvent) -> Option<&'static str> {
 
     event.payload = sanitized(&name, path_key, path, reason);
     Some(reason)
+}
+
+/// Baut die Hook-Bytes neu, nachdem [`guard`] gegriffen hat — für die
+/// Weitergabe an den Witness (EA-07).
+///
+/// Der Witness-Frame trägt rohes stdin, und der Witness parst es mit
+/// demselben [`hook_event::parse`](crate::hook_event::parse) wie der Hook. Die
+/// Mauer läuft aber schon auf der Agent-Seite, damit der Inhalt einer
+/// Zugangsdaten-Datei den Socket gar nicht erst überquert. Also muss aus dem
+/// gewallten Event wieder ein Hook-Payload werden: der Ersatz-Payload
+/// (`tool_name` plus gewalltes `tool_input`) und daneben genau die
+/// Umschlagfelder, aus denen `parse` Session, Eventnamen, `cwd` und
+/// `transcript_path` liest. Maßgeblich für diese Felder ist `Envelope` in
+/// [`hook_event`](crate::hook_event): Wächst er, muss er hier mitwachsen —
+/// `walled_bytes_reproduce_the_local_event_at_the_witness` fällt sonst um.
+///
+/// Was der Witness daraus macht, ist dasselbe Event wie im lokalen Journal:
+/// Er findet im `tool_input` denselben Pfad, seine eigene Mauer greift erneut
+/// und ersetzt den Payload durch exakt denselben Ersatz. Die Umschlagfelder
+/// in diesen Bytes sind damit nur Transport, kein Beweismittel.
+///
+/// `None`, wenn der Payload kein JSON-Objekt ist — nach [`guard`] ist er das
+/// immer; für jeden anderen Aufrufer heißt `None`: nicht weitergeben.
+pub fn walled_hook_bytes(key: &SessionKey, event: &NewEvent) -> Option<Vec<u8>> {
+    let Ok(Value::Object(mut body)) = serde_json::from_str::<Value>(event.payload.get()) else {
+        return None;
+    };
+    body.insert("session_id".into(), key.local_id().into());
+    body.insert("hook_event_name".into(), event.raw_kind.clone().into());
+    if let Some(cwd) = &event.cwd {
+        body.insert("cwd".into(), cwd.clone().into());
+    }
+    if let Some(path) = &event.transcript_path {
+        body.insert("transcript_path".into(), path.clone().into());
+    }
+    serde_json::to_vec(&Value::Object(body)).ok()
 }
 
 /// Der zweite Weg zur selben Mauer: prüft die `input`-Map eines
@@ -184,6 +220,7 @@ fn looks_like_path_key(key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hook_event::ParsedEvent;
 
     fn tool_event(kind: EventKind, payload: &str) -> NewEvent {
         NewEvent {
@@ -401,5 +438,70 @@ mod tests {
             assert_eq!(guard(&mut e), None, "Fehlalarm auf {payload}");
             assert_eq!(e.payload.get(), payload);
         }
+    }
+
+    // --- Weitergabe an den Witness (EA-07) ------------------------------------
+
+    /// Der Hook-Weg bis zum Witness: Agent-Seite parst und wallt, baut die
+    /// Bytes neu; der Witness parst und wallt dieselben Bytes erneut.
+    fn through_witness(stdin: &str, event_override: Option<&str>) -> (ParsedEvent, ParsedEvent) {
+        let at = ("2026-07-23T09:12:04.512Z".to_string(), 7);
+        let mut local = crate::hook_event::parse(
+            stdin.as_bytes().to_vec(),
+            "claude-code",
+            event_override,
+            at.clone(),
+        )
+        .unwrap();
+        guard(&mut local.event).expect("die Mauer greift");
+        let bytes = walled_hook_bytes(&local.key, &local.event).unwrap();
+        let mut remote =
+            crate::hook_event::parse(bytes, "claude-code", event_override, at).unwrap();
+        assert!(
+            guard(&mut remote.event).is_some(),
+            "die Mauer greift beim Witness erneut"
+        );
+        (local, remote)
+    }
+
+    fn assert_same_event(local: &ParsedEvent, remote: &ParsedEvent) {
+        assert_eq!(remote.key, local.key);
+        assert_eq!(remote.cwd, local.cwd);
+        assert_eq!(remote.event.kind, local.event.kind);
+        assert_eq!(remote.event.raw_kind, local.event.raw_kind);
+        assert_eq!(remote.event.cwd, local.event.cwd);
+        assert_eq!(remote.event.transcript_path, local.event.transcript_path);
+        assert_eq!(remote.event.payload.get(), local.event.payload.get());
+    }
+
+    #[test]
+    fn walled_bytes_reproduce_the_local_event_at_the_witness() {
+        let stdin = r#"{"session_id":"s-1","transcript_path":"/t/s-1.jsonl","cwd":"/w/demo","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":".env"},"tool_response":"DB_PASSWORD=hunter2"}"#;
+        let (local, remote) = through_witness(stdin, None);
+        assert_same_event(&local, &remote);
+
+        let bytes = walled_hook_bytes(&local.key, &local.event).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("hunter2"), "kein Geheimnis auf dem Socket");
+        assert!(!text.contains("tool_response"));
+        assert!(text.contains(SECRET_FILE_PLACEHOLDER));
+    }
+
+    #[test]
+    fn walled_bytes_keep_a_session_key_taken_from_the_transcript() {
+        // Ohne `session_id` kommt der Schlüssel aus dem Transkript-Namen, ohne
+        // `hook_event_name` aus der Registrierung — beides muss beim Witness
+        // zum selben Ergebnis führen.
+        let stdin = r#"{"transcript_path":"/t/from-stem.jsonl","tool_name":"Read","tool_input":{"path":"certs/server.pem"}}"#;
+        let (local, remote) = through_witness(stdin, Some("PreToolUse"));
+        assert_eq!(local.key.local_id(), "from-stem");
+        assert_same_event(&local, &remote);
+    }
+
+    #[test]
+    fn walled_bytes_refuse_a_non_object_payload() {
+        let e = tool_event(EventKind::ToolPost, r#""kaputt""#);
+        let key = SessionKey::new("claude-code", "s").unwrap();
+        assert_eq!(walled_hook_bytes(&key, &e), None);
     }
 }
