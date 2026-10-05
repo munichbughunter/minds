@@ -332,6 +332,41 @@ impl KeyValueRedactor {
         Self::build(&extra)
     }
 
+    /// **Nur** die zusätzlichen Schlüsselwörter, als eigener Detektor im
+    /// Strict-Tier — ohne die eingebauten Regeln.
+    ///
+    /// Für eine Policy, deren Datei fremd ist (der Witness, EA-06d): In einer
+    /// gemeinsamen Alternation mit den eingebauten Schlüsseln könnte ein früher
+    /// passender Zusatzschlüssel mit ausgenommenem Wert (`note=$x…`) den
+    /// eingebauten Treffer dahinter (`password=…`) verschlucken. Als eigener
+    /// Detektor kommen seine Funde nur **hinzu** — die Pipeline vereinigt.
+    pub fn only_extra_keys<S: AsRef<str>>(keys: &[S]) -> Result<Self, regex::Error> {
+        let keys: Vec<String> = keys
+            .iter()
+            .map(|k| k.as_ref().trim())
+            .filter(|k| !k.is_empty())
+            .map(regex::escape)
+            .collect();
+        if keys.is_empty() {
+            return Ok(Self { rules: Vec::new() });
+        }
+        let pattern = format!(
+            "(?i)(?:{}){}{}{}",
+            keys.join("|"),
+            KEY_SUFFIX,
+            SEPARATOR,
+            VALUE
+        );
+        Ok(Self {
+            rules: vec![CompiledKeyRule {
+                name: "assignment-extra",
+                category: Category::Secret,
+                tier: Tier::Strict,
+                re: Regex::new(&pattern)?,
+            }],
+        })
+    }
+
     fn build(extra: &[String]) -> Result<Self, regex::Error> {
         let mut rules = Vec::with_capacity(KEY_RULES.len());
         for rule in KEY_RULES {

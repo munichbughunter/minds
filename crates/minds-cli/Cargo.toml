@@ -28,7 +28,7 @@ blake3.workspace = true
 # Nur für `setsid` im losgelösten Sync (#85) — ohnehin transitiv über gix im
 # Graphen, hier nur noch direkt benannt.
 [target.'cfg(unix)'.dependencies]
-libc = "0.2"
+libc.workspace = true
 
 # `tui` ist Default der Release-Builds; `--no-default-features` baut die
 # Kern-CLI ohne Oberfläche (und ohne ratatui/crossterm im Binary).

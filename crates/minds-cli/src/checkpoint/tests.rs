@@ -321,3 +321,129 @@ fn core_selects_explicit_signer_and_namespace_or_no_signing() {
     assert!(!failed.sealed[0].signed);
     assert!(fixture.journal.sessions().unwrap().keys.is_empty());
 }
+
+/// Eine gültige Session-Id aus einem wiederholten Hex-Zeichen.
+fn session(hex: char) -> SessionId {
+    format!("b3-{}", hex.to_string().repeat(64))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn trailer_attach_is_idempotent_across_writers() {
+    // EA-06d: Witness und lokaler Pfad trailern an denselben Commit, in dieser
+    // Reihenfolge, und jeder darf erneut laufen. Am Ende steht jede Session
+    // genau einmal in der Message, und kein Wiederholungslauf schreibt HEAD um.
+    let f = Fixture::new(false);
+    let guard = f.repo.head().unwrap().commit().unwrap();
+    let (witnessed, local) = (session('a'), session('b'));
+
+    // Der Witness rüstet nach; HEAD wandert dabei.
+    let first = attach_trailers(&f.repo, Some(&guard.to_string()), &[witnessed], &|_| {})
+        .unwrap()
+        .unwrap();
+    assert!(first.rewrote_head());
+
+    // Der lokale Pfad hält noch den alten Wächter. HEAD ist aber nur derselbe
+    // Commit mit mehr Trailern — also folgt er und trailert dorthin.
+    assert!(f.repo.is_trailer_retrofit(guard, first.commit()).unwrap());
+    let second = attach_trailers(&f.repo, Some(&guard.to_string()), &[local], &|_| {})
+        .unwrap()
+        .unwrap();
+    assert!(second.rewrote_head());
+
+    // Ein echter neuer Commit obendrauf: Dorthin folgt der alte Wächter nicht.
+    let after = second.commit();
+    git(
+        &f.root,
+        &["commit", "-q", "--allow-empty", "-m", "dazwischen"],
+    );
+    assert!(
+        attach_trailers(&f.repo, Some(&after.to_string()), &[local], &|_| {})
+            .unwrap()
+            .is_none()
+    );
+    git(&f.root, &["reset", "-q", "--soft", &after.to_string()]);
+
+    // Beide Schreiber noch einmal, mit altem wie neuem Wächter: nichts zu tun.
+    let head = second.commit();
+    for (expected, sessions) in [(guard, [witnessed]), (head, [local]), (guard, [local])] {
+        let again = attach_trailers(&f.repo, Some(&expected.to_string()), &sessions, &|_| {})
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, TrailerUpdate::Unchanged(head));
+    }
+    assert_eq!(f.repo.head().unwrap().commit(), Some(head));
+    assert_eq!(
+        f.repo.session_ids_of(head).unwrap(),
+        vec![witnessed, local],
+        "jede Session genau einmal, in Schreib-Reihenfolge"
+    );
+    assert!(f.repo.is_trailer_retrofit(guard, head).unwrap());
+}
+
+/// Der andere Schreiber rüstet genau zwischen Prüfung und Amend nach: Der
+/// Compare-and-Swap merkt es (`RefRaced`), der zweite Versuch folgt dem
+/// Nachtrag. Kommt er zweimal dazwischen, endet es im benannten Fehler.
+#[test]
+fn trailer_attach_retries_once_after_a_race() {
+    let f = Fixture::new(false);
+    let guard = f.repo.head().unwrap().commit().unwrap();
+    let (local, other, third) = (session('a'), session('b'), session('c'));
+    let raced = std::cell::Cell::new(0);
+
+    // Einmal überholt: folgt und trailert.
+    let update = attach_with(
+        &f.repo,
+        Some(&guard.to_string()),
+        &[local],
+        &|_| {},
+        &|| {
+            if raced.get() == 0 {
+                raced.set(1);
+                f.repo.amend_head_with_sessions(&[other]).unwrap();
+            }
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(raced.get(), 1);
+    assert_eq!(
+        f.repo.session_ids_of(update.commit()).unwrap(),
+        vec![other, local]
+    );
+
+    // Jedes Mal überholt: nach dem zweiten Versuch der getypte Fehler.
+    let guard = update.commit();
+    let next = std::cell::Cell::new(0u8);
+    let err = attach_with(
+        &f.repo,
+        Some(&guard.to_string()),
+        &[third],
+        &|_| {},
+        &|| {
+            next.set(next.get() + 1);
+            let id = format!(
+                "b3-{}",
+                char::from(b'0' + next.get()).to_string().repeat(64)
+            )
+            .parse()
+            .unwrap();
+            f.repo.amend_head_with_sessions(&[id]).unwrap();
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<minds_git::GitError>(),
+            Some(minds_git::GitError::RefRaced { .. })
+        ),
+        "{err}"
+    );
+    assert!(
+        !f.repo
+            .session_ids_of(f.repo.head().unwrap().commit().unwrap())
+            .unwrap()
+            .contains(&third)
+    );
+}

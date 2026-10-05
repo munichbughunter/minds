@@ -537,7 +537,114 @@ fn read_artifact(root: Option<&Path>, path: &str) -> Option<Vec<u8>> {
             None => candidate,
         }
     };
-    fs::read(full).ok()
+    // Der Pfad liegt lexikalisch im Repo; ein Symlink darin kann trotzdem
+    // hinaus zeigen. Beim Witness (EA-06d) liegt „hinaus" auf dem Host, in
+    // einer anderen Vertrauensdomäne — der Hash einer Datei, die der Agent
+    // selbst nicht lesen kann, wäre ein Orakel. Also zählt der echte Ort.
+    let real = full.canonicalize().ok()?;
+    // Die Mauer prüft den Namen im Event; ein Symlink `notes.rs -> .env`
+    // hieße dort harmlos. Maßgeblich ist auch hier der echte Ort.
+    if real.to_str().is_none_or(minds_redact::is_secret_file) {
+        return None;
+    }
+    let beneath = match root {
+        Some(root) => {
+            let root = root.canonicalize().ok()?;
+            if !real.starts_with(&root) {
+                return None;
+            }
+            Some(root)
+        }
+        None => None,
+    };
+    read_regular_file(&real, MAX_ARTIFACT_BYTES, beneath.as_deref())
+}
+
+/// Obergrenze für eine Artefakt-Datei. Quelltext liegt Größenordnungen
+/// darunter; eine größere Datei bekommt keinen Hash, statt den Speicher zu
+/// füllen und — bei Schreib-Effekten — die ganze Redaction-Pipeline über
+/// sich laufen zu lassen. Eng, weil der Agent beliebig viele Events auf
+/// dieselbe große Datei zeigen lassen kann und der Witness jede davon im
+/// Checkpoint liest.
+const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Liest `path` nur, wenn es eine gewöhnliche Datei bis `max` Bytes ist.
+///
+/// Der Pfad stammt aus dem Event, also vom Agenten — und seit EA-06d kann der
+/// Agent den Checkpoint des Witness jederzeit auslösen. Ein FIFO an dieser
+/// Stelle hielte den einzigen Schreiber an, ein Gerät wie `/dev/zero` füllte
+/// seinen Speicher. Deshalb: nichtblockierend öffnen, am offenen Deskriptor
+/// prüfen (kein Zeitfenster zwischen Prüfen und Lesen), begrenzt lesen.
+///
+/// Mit `beneath` zählt außerdem, wo die **geöffnete** Datei tatsächlich liegt
+/// (vom Deskriptor erfragt): Wer zwischen Prüfung und Öffnen einen Teil des
+/// Pfads gegen einen Symlink tauscht, landet außerhalb — und bekommt nichts.
+fn read_regular_file(path: &Path, max: u64, beneath: Option<&Path>) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max {
+        return None;
+    }
+    // Ein harter Link `notes.rs` ⇄ `.env` hätte einen harmlosen Namen und
+    // läge im Repo. Ein Checkout legt nie harte Links an; Werkzeuge wie pnpm
+    // tun es — solche Dateien bekommen bewusst keinen Hash (fail-closed).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() > 1 {
+            return None;
+        }
+    }
+    if let Some(beneath) = beneath {
+        if let Some(opened) = opened_path(&file) {
+            // Am geöffneten Deskriptor noch einmal: Wer den Symlink zwischen
+            // Auflösen und Öffnen umbiegt, landet sonst doch bei `.env`.
+            if !opened.starts_with(beneath)
+                || opened.to_str().is_none_or(minds_redact::is_secret_file)
+            {
+                return None;
+            }
+        }
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes).ok()?;
+    (bytes.len() as u64 <= max).then_some(bytes)
+}
+
+/// Der Pfad, unter dem der Kern eine geöffnete Datei kennt — `None`, wo
+/// sich das nicht erfragen lässt (dann gilt allein die Prüfung vor dem
+/// Öffnen).
+#[cfg(target_os = "linux")]
+fn opened_path(file: &fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn opened_path(file: &fs::File) -> Option<PathBuf> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: `F_GETPATH` schreibt höchstens `MAXPATHLEN` Bytes samt NUL in
+    // einen Puffer dieser Größe; der Deskriptor gehört `file`.
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|b| *b == 0)?;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_path(_: &fs::File) -> Option<PathBuf> {
+    None
 }
 
 fn unknown() -> String {
@@ -780,6 +887,55 @@ fn lineage(key: &SessionKey, events: &[JournalEvent]) -> Lineage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ein FIFO oder Gerät unter einem Artefakt-Pfad: kein Hash, kein Hängen,
+    /// kein voller Speicher (EA-06d — der Agent löst den Checkpoint aus).
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_that_is_not_a_regular_file_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: nul-terminierter Pfad, keine weiteren Vorbedingungen.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let started = std::time::Instant::now();
+        assert_eq!(read_regular_file(&fifo, 1024, None), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(read_regular_file(Path::new("/dev/zero"), 1024, None), None);
+
+        let file = dir.path().join("f.rs");
+        fs::write(&file, b"abc").unwrap();
+        assert_eq!(read_regular_file(&file, 3, None), Some(b"abc".to_vec()));
+        assert_eq!(read_regular_file(&file, 2, None), None, "über der Grenze");
+    }
+
+    /// Ein Symlink im Repo, der hinaus zeigt, liefert keinen Hash — beim
+    /// Witness läge „hinaus" auf dem Host (Hash-Orakel). Einer, der im Repo
+    /// bleibt, schon.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_symlink_out_of_the_repo_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("id_ed25519");
+        fs::write(&outside, b"host secret").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("leak.rs")).unwrap();
+        fs::write(root.join("real.rs"), b"fn main() {}").unwrap();
+        std::os::unix::fs::symlink(root.join("real.rs"), root.join("alias.rs")).unwrap();
+
+        assert_eq!(read_artifact(Some(&root), "leak.rs"), None);
+        // Ein harmloser Name vor einer Zugangsdatei im Repo: kein Fingerabdruck.
+        fs::write(root.join(".env"), b"DB_PASSWORD=hunter2").unwrap();
+        std::os::unix::fs::symlink(root.join(".env"), root.join("notes.rs")).unwrap();
+        assert_eq!(read_artifact(Some(&root), "notes.rs"), None);
+        fs::hard_link(root.join(".env"), root.join("linked.rs")).unwrap();
+        assert_eq!(read_artifact(Some(&root), "linked.rs"), None);
+        assert_eq!(
+            read_artifact(Some(&root), "alias.rs"),
+            Some(b"fn main() {}".to_vec())
+        );
+    }
 
     /// Die strenge Default-Policy — dieselbe, die `minds checkpoint` ohne
     /// `.minds/redact.json` verwendet.

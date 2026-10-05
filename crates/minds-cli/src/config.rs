@@ -121,6 +121,63 @@ pub fn load_redaction(repo_root: &Path) -> Result<RedactionConfig, Box<dyn std::
     }
 }
 
+/// Obergrenze für eine Policy-Datei, die ein Fremder geschrieben haben kann.
+#[cfg(unix)]
+const MAX_UNTRUSTED_POLICY: u64 = 64 * 1024;
+
+/// Wie [`load_redaction`], für einen Leser, dem der Worktree nicht gehört —
+/// den Witness, dessen Checkpoint der Agent jederzeit auslösen kann (EA-06d).
+///
+/// Die Datei muss eine gewöhnliche Datei bis 64 KiB sein: Kein Symlink am
+/// Blatt (`O_NOFOLLOW`), geöffnet ohne zu blockieren (ein FIFO hielte den
+/// einzigen Schreiber an), geprüft am offenen Deskriptor, begrenzt gelesen
+/// (`/dev/zero` füllte sonst den Speicher). Alles andere bricht ab — der
+/// Aufrufer vertagt, wie bei einer kaputten Policy.
+#[cfg(unix)]
+pub fn load_redaction_untrusted(
+    repo_root: &Path,
+) -> Result<RedactionConfig, Box<dyn std::error::Error>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // `O_NOFOLLOW` schützt nur das Blatt: Auch `.minds` selbst darf kein
+    // Symlink an einen Ort außerhalb des Worktrees sein.
+    let dir = repo_root.join(".minds");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!("{}: not a plain directory", dir.display()).into());
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RedactionConfig::default());
+        }
+        Err(err) => return Err(err.into()),
+    }
+    let path = repo_root.join(REDACT_CONFIG);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RedactionConfig::default());
+        }
+        Err(err) => return Err(format!("{}: cannot be read safely: {err}", path.display()).into()),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > MAX_UNTRUSTED_POLICY {
+        return Err(format!("{}: not a regular file of at most 64 KiB", path.display()).into());
+    }
+    let mut text = String::new();
+    file.take(MAX_UNTRUSTED_POLICY + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_UNTRUSTED_POLICY {
+        return Err(format!("{}: larger than 64 KiB", path.display()).into());
+    }
+    Ok(serde_json::from_str(&text).map_err(|err| policy_error(&path, &err))?)
+}
+
 /// Die Fehlermeldung zu einer kaputten Policy — **ohne den Wert, an dem sie
 /// scheiterte.**
 ///

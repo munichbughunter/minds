@@ -14,5 +14,10 @@ serde = { workspace = true, features = ["derive"] }
 blake3 = { workspace = true }
 thiserror.workspace = true
 
+# Nur für `O_NONBLOCK` beim Lesen von Artefakten (ein FIFO darf den
+# Checkpoint nicht anhalten) — ohnehin über minds-cli und gix im Graphen.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,5 +1,9 @@
 //! Pure framing for `minds-witness-v1`; no socket I/O or authentication.
 //!
+//! A client that sent a `CheckpointRequest` keeps its connection fully open until
+//! it has read the answer — no half-close (`shutdown(SHUT_WR)`). The witness reads
+//! end-of-stream as "the requester is gone" and then does not amend the commit.
+//!
 //! The 12-byte header is [`MAGIC`] followed by a little-endian u32 length.
 //! Length counts **kind + body**, excluding the header, and is capped at
 //! [`MAX_FRAME`] independently of the CLI's stdin limit. Hooks are fire-and-forget;
