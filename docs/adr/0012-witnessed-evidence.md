@@ -202,7 +202,7 @@ signed under `minds-witness`, outcome **`observations_stored`**. The seal format
 13 lines; for this outcome the `session=` line carries the **id of the observation
 object** (`b3-` + blake3 of its RFC 8785 bytes), not a session id. Older binaries reject
 the unknown outcome word rather than misread the id — the same accepted trade-off as
-schema 2. The object `{"schema":1,"first_at","last_at","observations":[{"seq","at","path",
+schema 2. The object `{"schema":2,"started_at","first_at","last_at","observations":[{"seq","at","path",
 "content","reason"}]}` passes the redaction pipeline fail-closed (`RedactedObservations`,
 no public constructor; an observation whose path the pipeline refuses is dropped, not the
 whole epoch) and is stored under `refs/minds/observations/<64 hex>`, one ref per object,
@@ -221,11 +221,9 @@ checkpoint's observation epoch: the earliest **trusted** `witness-fs/v1` epoch e
 after the session's witnessed range. The witness seals that epoch before the sessions and
 closes it with a monotonically stamped `fs.checkpoint` event, so work continued after the
 commit lands in the next epoch. From that epoch the signed `previous` chain is followed back
-to the first epoch ending before the window starts; only observations from the epochs in
-between count. A chain that starts (first checkpoint after a witness start) before reaching
-such an epoch is not enough — no seal records when it began — so a session spanning or
-directly following a witness start gets no observations (follow-up: sign the epoch's
-start, or let the session seal name its checkpoint epoch). If a link is
+to the first epoch ending before the window starts, or to the chain's start (`previous`
+absent: the first checkpoint after a witness start) if that epoch began no later than the
+window start; only observations from the epochs in between count. If a link is
 missing (deleted), untrusted or a block seal (observations not stored), the session gets
 **no** observations — the latest remaining reading would not be the latest. Untrusted seals
 are ignored entirely. With a single trusted witness key, deleting or planting seals can
@@ -248,7 +246,35 @@ it says nothing about who wrote them (an agent can re-surface existing content w
 `touch` after an epoch boundary). The witness seals the observation epoch **before** the sessions of the same checkpoint;
 if that epoch cannot be sealed, the sessions are deferred — a trusted `witness/v1` seal
 exists only together with its checkpoint's epoch. The `fs.checkpoint` mark is stamped
-monotonically (never before the last session event). A window in which an observation
+monotonically (never before the last session event).
+
+**As implemented (EA-08a).** The observation object (schema 2) carries `started_at`: the
+stamp of the epoch's first event in the witness stream (`witness.start` for a run's first
+epoch — the watcher is armed before it — otherwise the first event after the previous
+seal). It is signed transitively through the object id on the seal's `session=` line; no
+seal-format change. Schema-1 objects stay readable (`started_at` absent, never serialized)
+but a schema-1 chain start never anchors — nor does an unknown future schema (the reader
+anchors on exactly schema 2 until it learns the next one). The window starts
+`WINDOW_SLACK` (30 s) before the session's first witnessed stamp, so the first commit of a
+run gets observations only if the witness was started at least that long before the
+session's first activity; a session starting sooner stays `reported only`. Every witness stamp (lifecycle, `fs.observed`,
+`fs.gap`, `fs.checkpoint`, accepted hook events, the stream key of a run) comes from a
+monotonic clock: `max(now, ⌊high-water⌋ms + 1 ms)` — one millisecond, so that every stamp is
+also later **as RFC 3339 text**, which carries milliseconds. Bursts above 1000 events per
+second run ahead of the wall clock briefly. The clock persists a reservation (an upper bound
+of every stamp issued, raised to stamp + 1 s before the stamp is appended) in
+`evidence/clock` of the witness home (0600, atomic, fsync) — not under `evidence/state/`,
+where `clock` would be a valid agent directory. A missing file means first run (the mark is
+raised to the newest journal event and the newest seal in the witness ledger); an
+unreadable or corrupt one refuses to start (`corrupt witness clock state`), never a silent
+reset. To repair it, do not delete it: write a value not before the current time and not
+before the last sealed stamp. Stamps are journal times: an `fs.observed` stamp is never
+before its classification but may trail it by the bounded queue latency. After a quick restart, stamps may run
+up to one second ahead of the wall clock (the safe direction: a later start anchors less
+often). A clock that once jumped far ahead keeps the witness there until wall time catches
+up; an agent able to push more than 1000 accepted events per second can make it run ahead
+the same way (consistent within the witness's time base, but heuristics comparing witness
+stamps with commit times may lose matches — the safe direction). A window in which an observation
 epoch ended as a block seal (observations not stored) yields no observations, since the
 latest remaining reading would not be the latest. The chain rule assumes a single witness key per repository: with several
 witnesses pushing to one remote, a deleted epoch of one can be bridged by another's (until

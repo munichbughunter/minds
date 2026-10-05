@@ -7,10 +7,26 @@
 //!
 //! ```text
 //! {"first_at":…,"last_at":…,"observations":[{"at":…,"content":"b3-…"|null,
-//!  "path":…,"reason":null|"…","seq":…}],"schema":1}
+//!  "path":…,"reason":null|"…","seq":…}],"schema":2,"started_at":…}
 //! ```
 //!
 //! Alle Schlüssel stehen immer da, auch mit `null` — eine Form, ein Hash.
+//!
+//! # Beginn der Epoche (EA-08a)
+//!
+//! `started_at` ist der Zeitstempel des **ersten Events der Epoche** im
+//! Stream des Witness (`witness.start` für die erste Epoche eines Laufs,
+//! sonst das erste Event nach dem vorigen Seal) — gestempelt von der
+//! monotonen Uhr des Witness, nie aus Agent-Eingaben. Weil die Objekt-Id in
+//! der `session=`-Zeile des signierten Seals steht, ist auch `started_at`
+//! signiert. Der Leser verankert damit den Anfang einer Epochen-Kette
+//! (`previous = None`): Begann die Epoche vor dem Fenster einer Session,
+//! ist die Kette vollständig.
+//!
+//! Schema 1 (ohne `started_at`) bleibt lesbar: Das Feld fehlt dort und wird
+//! dann auch nicht serialisiert — die gespeicherten Bytes eines alten
+//! Objekts ergeben neu serialisiert dieselben. Ein Schema-1-Kettenanfang
+//! verankert nie.
 //!
 //! # Identität
 //!
@@ -35,8 +51,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CanonError, ContentHash};
 
-/// Schema-Version des Observation-Objekts.
-pub const OBSERVATIONS_SCHEMA: u32 = 1;
+/// Schema-Version des Observation-Objekts, die dieses Binary schreibt.
+/// Schema 1 (EA-08) wird nur noch gelesen.
+pub const OBSERVATIONS_SCHEMA: u32 = 2;
 
 /// Größte Datei, die der Beobachter liest und hasht (16 MiB); größere
 /// erscheinen mit [`ObservationReason::TooLarge`] ohne Hash.
@@ -47,6 +64,10 @@ pub const MAX_OBSERVED_BYTES: u64 = 16 * 1024 * 1024;
 pub struct Observations {
     /// [`OBSERVATIONS_SCHEMA`].
     pub schema: u32,
+    /// Beginn der Epoche (RFC 3339): das erste Event der Epoche im Stream des
+    /// Witness. Ab Schema 2 immer gesetzt; `None` nur in Schema-1-Objekten.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
     /// Zeitstempel der ersten Beobachtung (RFC 3339), `None` ohne Beobachtung.
     pub first_at: Option<String>,
     /// Zeitstempel der letzten Beobachtung.
@@ -125,14 +146,18 @@ pub enum ObservationError {
     Order(usize),
     #[error("observation window does not match the observations")]
     Window,
+    #[error("observation epoch start is missing, unreadable or after the first observation")]
+    Start,
 }
 
 impl Observations {
-    /// Baut das Objekt aus Beobachtungen in `seq`-Reihenfolge; das Fenster
-    /// ergibt sich aus der ersten und letzten.
-    pub fn new(observations: Vec<Observation>) -> Self {
+    /// Baut das Objekt einer Epoche, die um `started_at` begann, aus
+    /// Beobachtungen in `seq`-Reihenfolge; das Fenster ergibt sich aus der
+    /// ersten und letzten.
+    pub fn new(started_at: impl Into<String>, observations: Vec<Observation>) -> Self {
         Self {
             schema: OBSERVATIONS_SCHEMA,
+            started_at: Some(started_at.into()),
             first_at: observations.first().map(|o| o.at.clone()),
             last_at: observations.last().map(|o| o.at.clone()),
             observations,
@@ -140,12 +165,15 @@ impl Observations {
     }
 
     /// Die Schreib-Regeln: Schema bekannt, Pfade schlicht repo-relativ,
-    /// `content` xor `reason`, `seq` streng steigend, Fenster passend.
+    /// `content` xor `reason`, `seq` streng steigend, Fenster passend, der
+    /// Beginn gesetzt, lesbar und nicht nach der ersten Beobachtung
+    /// (verglichen werden geparste Zeitpunkte, nicht Zeichenketten).
     /// Der Leser ist tolerant; geschrieben wird nur, was hier besteht.
     pub fn check(&self) -> Result<(), ObservationError> {
         if self.schema != OBSERVATIONS_SCHEMA {
             return Err(ObservationError::Schema);
         }
+        let started = self.started_at().ok_or(ObservationError::Start)?;
         let mut last = None;
         for (index, o) in self.observations.iter().enumerate() {
             if !plain_relative(&o.path) {
@@ -165,7 +193,19 @@ impl Observations {
         {
             return Err(ObservationError::Window);
         }
+        if let Some(first) = &self.first_at {
+            let first: jiff::Timestamp = first.parse().map_err(|_| ObservationError::Window)?;
+            if started > first {
+                return Err(ObservationError::Start);
+            }
+        }
         Ok(())
+    }
+
+    /// Der Beginn der Epoche als Zeitpunkt — `None` ohne `started_at`
+    /// (Schema 1) oder wenn er nicht lesbar ist.
+    pub fn started_at(&self) -> Option<jiff::Timestamp> {
+        self.started_at.as_deref()?.parse().ok()
     }
 
     /// Die kanonischen Bytes (RFC 8785).
@@ -202,35 +242,49 @@ mod tests {
     use super::*;
 
     fn sample() -> Observations {
-        Observations::new(vec![
-            Observation {
-                seq: 1,
-                at: "2026-10-05T10:00:00.250Z".into(),
-                path: "src/sort/merge.rs".into(),
-                content: Some(ContentHash::from_bytes(
-                    *blake3::hash(b"fn merge() {}\n").as_bytes(),
-                )),
-                reason: None,
-            },
-            Observation {
-                seq: 2,
-                at: "2026-10-05T10:00:01Z".into(),
-                path: ".env".into(),
-                content: None,
-                reason: Some(ObservationReason::SecretFile),
-            },
-            Observation {
-                seq: 4,
-                at: "2026-10-05T10:00:02Z".into(),
-                path: "old.txt".into(),
-                content: None,
-                reason: Some(ObservationReason::Deleted),
-            },
-        ])
+        Observations::new(
+            "2026-10-05T09:59:58.125Z",
+            vec![
+                Observation {
+                    seq: 1,
+                    at: "2026-10-05T10:00:00.250Z".into(),
+                    path: "src/sort/merge.rs".into(),
+                    content: Some(ContentHash::from_bytes(
+                        *blake3::hash(b"fn merge() {}\n").as_bytes(),
+                    )),
+                    reason: None,
+                },
+                Observation {
+                    seq: 2,
+                    at: "2026-10-05T10:00:01Z".into(),
+                    path: ".env".into(),
+                    content: None,
+                    reason: Some(ObservationReason::SecretFile),
+                },
+                Observation {
+                    seq: 4,
+                    at: "2026-10-05T10:00:02Z".into(),
+                    path: "old.txt".into(),
+                    content: None,
+                    reason: Some(ObservationReason::Deleted),
+                },
+            ],
+        )
     }
 
+    /// Die eingefrorene kanonische Form eines Schema-1-Objekts (EA-08), wie
+    /// sie in bestehenden Repositories liegt.
+    const SCHEMA1: &str = concat!(
+        r#"{"first_at":"2026-10-05T10:00:00.250Z","last_at":"2026-10-05T10:00:02Z","#,
+        r#""observations":[{"at":"2026-10-05T10:00:00.250Z","#,
+        r#""content":"b3-77d93191302c0026c78d4347b6b5b6ecff6225060cb3128e487a849f474f0857","path":"src/sort/merge.rs","reason":null,"seq":1},"#,
+        r#"{"at":"2026-10-05T10:00:01Z","content":null,"path":".env","reason":"secret_file","seq":2},"#,
+        r#"{"at":"2026-10-05T10:00:02Z","content":null,"path":"old.txt","reason":"deleted","seq":4}],"#,
+        r#""schema":1}"#
+    );
+
     #[test]
-    fn observation_object_canonical_golden() {
+    fn observation_object_schema2_golden() {
         let object = sample();
         object.check().unwrap();
         let text = String::from_utf8(object.canonical_bytes().unwrap()).unwrap();
@@ -242,12 +296,69 @@ mod tests {
                 r#""content":"b3-77d93191302c0026c78d4347b6b5b6ecff6225060cb3128e487a849f474f0857","path":"src/sort/merge.rs","reason":null,"seq":1},"#,
                 r#"{"at":"2026-10-05T10:00:01Z","content":null,"path":".env","reason":"secret_file","seq":2},"#,
                 r#"{"at":"2026-10-05T10:00:02Z","content":null,"path":"old.txt","reason":"deleted","seq":4}],"#,
-                r#""schema":1}"#
+                r#""schema":2,"started_at":"2026-10-05T09:59:58.125Z"}"#
             )
         );
         assert_eq!(
             object.id().unwrap().as_str(),
+            "b3-3d7c5cd8fbc5e3ff126d5bb75a218f6750e924da8ec2c2f0761e389d3586a26f"
+        );
+    }
+
+    #[test]
+    fn observation_object_schema1_still_reads() {
+        // Gelesen wird gegen die gespeicherten Bytes; die Id bleibt die alte.
+        assert_eq!(
+            Observations::id_of_bytes(SCHEMA1.as_bytes()).as_str(),
             "b3-f5817f8e867da041c4993e0efb23b7c1ce4bc318f18312c08d2f323b3aca81f0"
+        );
+        let old: Observations = serde_json::from_str(SCHEMA1).unwrap();
+        assert_eq!(old.schema, 1);
+        assert_eq!(old.started_at, None);
+        assert_eq!(old.started_at(), None);
+        assert_eq!(old.observations, sample().observations);
+        // Neu serialisiert: dieselben Bytes — kein `started_at: null`.
+        assert_eq!(old.canonical_bytes().unwrap(), SCHEMA1.as_bytes());
+        // Geschrieben wird Schema 1 nicht mehr.
+        assert_eq!(old.check(), Err(ObservationError::Schema));
+    }
+
+    #[test]
+    fn the_epoch_start_is_required_readable_and_not_after_the_first_observation() {
+        let at = |s: &str| s.parse::<jiff::Timestamp>().unwrap();
+        assert_eq!(sample().started_at(), Some(at("2026-10-05T09:59:58.125Z")));
+        // Gleichstand ist erlaubt; der Vergleich läuft über Zeitpunkte, nicht
+        // über Zeichenketten (".250Z" < "Z" wäre lexikalisch falsch herum).
+        for ok in ["2026-10-05T10:00:00.250Z", "2026-10-05T10:00:00Z"] {
+            let mut object = sample();
+            object.started_at = Some(ok.into());
+            assert_eq!(object.check(), Ok(()), "{ok}");
+        }
+        for bad in [
+            None,
+            Some("2026-10-05T10:00:00.251Z"),
+            Some("2026-10-05T10:00:01Z"),
+            Some("gestern"),
+            Some(""),
+        ] {
+            let mut object = sample();
+            object.started_at = bad.map(str::to_owned);
+            assert_eq!(object.check(), Err(ObservationError::Start), "{bad:?}");
+        }
+        // Ein unlesbares `first_at` ist ein Fehler des Fensters.
+        let mut object = sample();
+        object.first_at = Some("kein datum".into());
+        object.observations[0].at = "kein datum".into();
+        assert_eq!(object.check(), Err(ObservationError::Window));
+        // Ohne Beobachtung zählt nur, dass der Beginn lesbar ist.
+        assert!(
+            Observations::new("2026-10-05T10:00:00Z", Vec::new())
+                .check()
+                .is_ok()
+        );
+        assert_eq!(
+            Observations::new("kein datum", Vec::new()).check(),
+            Err(ObservationError::Start)
         );
     }
 
@@ -262,7 +373,7 @@ mod tests {
         let future = String::from_utf8(bytes)
             .unwrap()
             .replace("\"deleted\"", "\"renamed\"")
-            .replace("\"schema\":1", "\"schema\":1,\"extra\":true");
+            .replace("\"schema\":2", "\"schema\":2,\"extra\":true");
         let read: Observations = serde_json::from_str(&future).unwrap();
         assert_eq!(
             read.observations[2].reason,
@@ -294,9 +405,15 @@ mod tests {
         let mut window = sample();
         window.last_at = None;
         assert_eq!(window.check(), Err(ObservationError::Window));
-        let mut schema = sample();
-        schema.schema = 2;
-        assert_eq!(schema.check(), Err(ObservationError::Schema));
-        assert!(Observations::new(Vec::new()).check().is_ok());
+        for version in [1, 3] {
+            let mut schema = sample();
+            schema.schema = version;
+            assert_eq!(schema.check(), Err(ObservationError::Schema));
+        }
+        assert!(
+            Observations::new("2026-10-05T10:00:00Z", Vec::new())
+                .check()
+                .is_ok()
+        );
     }
 }

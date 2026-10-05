@@ -203,12 +203,15 @@ const MAX_CHAIN: usize = 100_000;
 ///   liegt in der nächsten. Untergeschobene (unbestätigte) Seals zählen
 ///   nicht — weder als Ende noch als Hindernis.
 /// - **Epochen:** Von dieser Epoche aus führt die signierte `previous`-Kette
-///   zurück bis zur ersten, die vor dem Fensterbeginn endet. Nur die
-///   Beobachtungen der Epochen dazwischen zählen. Endet die Kette vorher
-///   (erster Checkpoint nach einem Witness-Start), ist nicht belegt, dass
-///   sie vor dem Commit begann — kein Fenster. Eine Session, die über einen
-///   Witness-Start reicht oder direkt danach beginnt, steht damit wie ohne
-///   Witness da.
+///   zurück, bis sie vollständig ist: an einer Epoche, die **vor** dem
+///   Fensterbeginn endet, oder an ihrem Anfang (`previous = None`, der erste
+///   Checkpoint nach einem Witness-Start), wenn dessen Objekt belegt, dass
+///   die Epoche **nicht nach** dem Fensterbeginn begann (`started_at`,
+///   EA-08a — über die Objekt-Id im Seal mitsigniert). Nur die Beobachtungen
+///   der Epochen dazwischen (samt Anfang) zählen. Begann der Anfang später
+///   (Neustart während der Session) oder trägt sein Objekt keinen Beginn
+///   (Schema 1), ist nicht belegt, dass die Kette vor dem Commit begann —
+///   kein Fenster; die Session steht wie ohne Witness da.
 /// - **Beginn:** der früheste Zeitpunkt der Session, minus [`WINDOW_SLACK`]
 ///   — vom Witness gestempelt.
 ///
@@ -228,7 +231,8 @@ pub fn witness_windows(
         last: Timestamp,
         text: String,
         previous: Option<ContentHash>,
-        rejected: bool,
+        /// Das Observation-Objekt; `None` bei einem Block-Seal.
+        object: Option<String>,
     }
     let ids: Vec<SessionId> = sessions.iter().map(|(id, _)| *id).collect();
     let witnessed = witnessed_sessions(store, &ids, trusted);
@@ -244,9 +248,9 @@ pub fn witness_windows(
         let Ok(seal) = Seal::parse(&text) else {
             continue;
         };
-        let rejected = match seal.outcome {
-            SealOutcome::ObservationsStored { .. } => false,
-            SealOutcome::Rejected => true,
+        let object = match seal.outcome {
+            SealOutcome::ObservationsStored { observations } => Some(observations),
+            SealOutcome::Rejected => None,
             SealOutcome::Stored { .. } => continue,
         };
         if seal.scope != SCOPE_WITNESS_FS_V1 {
@@ -259,7 +263,7 @@ pub fn witness_windows(
                     last,
                     text,
                     previous: seal.previous,
-                    rejected,
+                    object,
                 },
             );
         }
@@ -302,11 +306,11 @@ pub fn witness_windows(
         else {
             continue;
         };
-        // Vollständig ist die Kette nur, wenn sie eine Epoche erreicht, die
-        // **vor** dem Fensterbeginn endet. Der Anfang einer Kette (der erste
-        // Checkpoint nach einem Witness-Start) reicht nicht: Wann sie begann,
-        // steht in keinem Seal — nach einem Neustart und einer gelöschten
-        // Epoche des alten Laufs könnte sie ganz nach dem Commit liegen.
+        // Vollständig ist die Kette, wenn sie eine Epoche erreicht, die
+        // **vor** dem Fensterbeginn endet — oder ihren Anfang, sofern der
+        // belegt nicht nach dem Fensterbeginn begann. Ohne diesen Beleg
+        // könnte ein Anfang nach einem Neustart und einer gelöschten Epoche
+        // des alten Laufs ganz nach dem Commit liegen.
         let mut chain = std::collections::BTreeSet::new();
         let mut cursor = Some(end_id.clone());
         let mut complete = false;
@@ -323,8 +327,14 @@ pub fn witness_windows(
                 complete = true;
                 break;
             }
-            if epoch.rejected {
+            let Some(object) = &epoch.object else {
+                // Block-Seal: Beobachtungen fehlen.
                 complete = false;
+                break;
+            };
+            if epoch.previous.is_none() {
+                complete = began_by(store, object, from);
+                chain.insert(seal_id);
                 break;
             }
             cursor = epoch.previous.clone();
@@ -344,6 +354,22 @@ pub fn witness_windows(
         }
     }
     windows
+}
+
+/// Ob die Epoche mit dem Observation-Objekt `object` belegt spätestens um
+/// `from` begann: Das Objekt liegt vor, besteht die Hash-Prüfung des Stores,
+/// hat genau Schema 2 und trägt einen lesbaren `started_at <= from`.
+/// Alles andere verankert nicht — Schema 1 (kein Beginn) ebenso wie ein
+/// künftiges Schema, dessen Bedeutung von `started_at` dieses Binary nicht
+/// kennt (fail-closed; wer das Schema anhebt, nimmt es hier auf).
+fn began_by(store: &dyn ContextStore, object: &str, from: Timestamp) -> bool {
+    let Ok(id) = object.parse::<ContentHash>() else {
+        return false;
+    };
+    let Ok(Some(object)) = store.get_observations(&id) else {
+        return false;
+    };
+    object.schema == 2 && object.started_at().is_some_and(|start| start <= from)
 }
 
 /// Die vom Witness bezeugten unter den `sessions`, je mit dem Ende ihres
