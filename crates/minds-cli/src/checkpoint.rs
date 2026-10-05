@@ -342,6 +342,7 @@ fn attach_with(
 /// Ob HEAD auf `expected` steht — oder auf `expected` mit zusätzlichen
 /// Session-Trailern, nachgerüstet vom jeweils anderen Schreiber (Witness oder
 /// lokaler Pfad, EA-06d).
+#[cfg(unix)]
 pub(crate) fn head_carries(repo: &Repo, expected: CommitId) -> Fallible<bool> {
     Ok(repo
         .head()?

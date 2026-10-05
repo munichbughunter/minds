@@ -923,25 +923,30 @@ mod tests {
 
         // Ein nicht beschreibbares `refs/heads/`: Der Lock lässt sich gar nicht
         // anlegen. (Als root greifen Rechte nicht — dann nichts zu prüfen.)
-        use std::os::unix::fs::PermissionsExt;
-        let heads = path.join(".git/refs/heads");
-        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o555)).unwrap();
-        // Scheitert eine Prüfung, muss das Verzeichnis trotzdem wieder
-        // beschreibbar werden — sonst räumt `TempRepo` nicht auf.
-        struct Writable(std::path::PathBuf);
-        impl Drop for Writable {
-            fn drop(&mut self) {
-                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        // Unix-Rechte gibt es nur dort.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let heads = path.join(".git/refs/heads");
+            std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o555)).unwrap();
+            // Scheitert eine Prüfung, muss das Verzeichnis trotzdem wieder
+            // beschreibbar werden — sonst räumt `TempRepo` nicht auf.
+            struct Writable(std::path::PathBuf);
+            impl Drop for Writable {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+                }
             }
+            let restore = Writable(heads.clone());
+            let probe = heads.join("probe");
+            if std::fs::write(&probe, "").is_err() {
+                assert_fails_in_time(&path);
+            } else {
+                std::fs::remove_file(&probe).unwrap();
+            }
+            drop(restore);
         }
-        let restore = Writable(heads.clone());
-        let probe = heads.join("probe");
-        if std::fs::write(&probe, "").is_err() {
-            assert_fails_in_time(&path);
-        } else {
-            std::fs::remove_file(&probe).unwrap();
-        }
-        drop(restore);
         assert_eq!(fixture.rev_parse("HEAD"), before, "HEAD unberührt");
 
         // Ohne Hindernis geht es wieder durch — auch über einen Alias.

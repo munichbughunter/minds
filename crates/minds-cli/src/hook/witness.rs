@@ -57,6 +57,7 @@
 //! Binary, und `minds` stellt das nirgends zurück.
 
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::Duration;
 
 use minds_capture::witness_proto::{self, Frame, ProtoError};
@@ -65,9 +66,11 @@ use minds_capture::witness_proto::{self, Frame, ProtoError};
 pub(super) const SOCKET_ENV: &str = "MINDS_WITNESS_SOCKET";
 
 /// Obergrenze für den Verbindungsaufbau.
+#[cfg(unix)]
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Obergrenze für das Schreiben des ganzen Frames, ab erfolgreicher Verbindung.
+#[cfg(unix)]
 const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Der Socket-Pfad aus der Umgebung. Eine leere Variable zählt als nicht
