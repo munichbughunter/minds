@@ -46,7 +46,7 @@
 //! und das Event geht wie bisher ins lokale Journal. Ohne die Variable ist
 //! alles wie vorher. Die Einzelheiten stehen in [`witness`].
 
-mod witness;
+pub(crate) mod witness;
 
 use std::io::Read;
 use std::path::PathBuf;

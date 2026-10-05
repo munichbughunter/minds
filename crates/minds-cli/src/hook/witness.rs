@@ -29,6 +29,14 @@
 //! `Ok` und schreibt keine Logzeile. Sichtbar wird das erst auf der Seite des
 //! Witness (`log/witness.log`) oder als Lücke beim Checkpoint.
 //!
+//! # Der eine Rückkanal: [`request`]
+//!
+//! `minds checkpoint` (EA-06d) braucht eine Antwort — ob der Witness seine
+//! Sessions versiegelt hat. Dafür gibt es [`request`]: derselbe Pfad, dieselbe
+//! Pfadprüfung, dieselben festen Fehlerarten, aber mit einer Frist, die das
+//! Lesen der Antwort einschließt, und einer Obergrenze für deren Größe. Der
+//! Hook selbst benutzt ihn nie.
+//!
 //! # Wem der Socket-Pfad vertraut wird
 //!
 //! Der Hook prüft nicht, wer am anderen Ende lauscht: In den Profilen
@@ -65,7 +73,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_millis(100);
 /// Der Socket-Pfad aus der Umgebung. Eine leere Variable zählt als nicht
 /// gesetzt — sonst wäre `MINDS_WITNESS_SOCKET=` ein Dauer-Rückfall mit
 /// Logzeile bei jedem Event.
-pub(super) fn socket_path() -> Option<PathBuf> {
+pub(crate) fn socket_path() -> Option<PathBuf> {
     std::env::var_os(SOCKET_ENV)
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -127,6 +135,119 @@ pub(super) fn forward(
     send(socket, &frame).map_err(|err| kind(&err))
 }
 
+/// Obergrenze für eine Antwort des Witness: Kopf plus `request_id` plus eine
+/// Statuszeile von höchstens 4 KiB (`witness_proto`), mit etwas Luft. Mehr
+/// liest der Client nie — ein Witness, der mehr schickt, ist kein Witness.
+#[cfg(unix)]
+const MAX_RESPONSE: usize = 8 * 1024;
+
+/// Schickt eine Anfrage, die eine Antwort erwartet (EA-06d: der Checkpoint),
+/// und wartet bis `deadline` auf genau einen `Ack` oder `Nack` mit derselben
+/// `request_id`.
+///
+/// Derselbe Weg wie [`forward`] — Pfadprüfung, nichtblockierendes Verbinden,
+/// Fristen —, aber mit Rückkanal. Die Frist gilt für alles zusammen:
+/// Verbinden, Schreiben, Lesen. Der Fehler ist wie bei [`forward`] eine feste
+/// Bezeichnung, nie fremder Text.
+pub(crate) fn request(
+    socket: &Path,
+    frame: &Frame,
+    deadline: std::time::Instant,
+) -> Result<Frame, &'static str> {
+    let request_id = match frame {
+        Frame::CheckpointRequest { request_id, .. } | Frame::IntentActivate { request_id, .. } => {
+            *request_id
+        }
+        _ => return Err("invalid frame"),
+    };
+    let bytes = witness_proto::encode(frame).map_err(|_| "invalid frame")?;
+    let response = exchange(socket, &bytes, deadline).map_err(|err| {
+        // Nur hier gibt es eine Antwort, die unpassend sein kann.
+        if err.kind() == std::io::ErrorKind::InvalidData {
+            "unexpected response"
+        } else {
+            kind(&err)
+        }
+    })?;
+    let (answer, _) = witness_proto::decode(&response).map_err(|_| "unexpected response")?;
+    let answered = match &answer {
+        Frame::Ack { request_id: id, .. } | Frame::Nack { request_id: id, .. } => *id == request_id,
+        _ => false,
+    };
+    if answered {
+        Ok(answer)
+    } else {
+        Err("unexpected response")
+    }
+}
+
+#[cfg(not(unix))]
+fn exchange(_: &Path, _: &[u8], _: std::time::Instant) -> std::io::Result<Vec<u8>> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+/// Schreibt `request` und liest genau einen vollständigen Antwort-Frame —
+/// beides bis `deadline`.
+#[cfg(unix)]
+fn exchange(
+    socket: &Path,
+    request: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::{ErrorKind, Read, Write};
+    use std::time::Instant;
+
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(std::io::Error::from(ErrorKind::TimedOut))
+    };
+    // macOS meldet `EINVAL` beim Setzen einer Frist, sobald die Gegenseite
+    // die Verbindung geschlossen hat — auch wenn ihre Antwort noch im Puffer
+    // liegt. Dann blockiert weder `read` (liefert Puffer, danach 0) noch
+    // `write` (liefert `EPIPE`); weiterlesen ist richtig, abbrechen wäre es
+    // nicht.
+    let tolerate_closed_peer = |result: std::io::Result<()>| match result {
+        Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    };
+    let mut stream = connect(socket, deadline)?;
+    let mut rest = request;
+    while !rest.is_empty() {
+        tolerate_closed_peer(stream.set_write_timeout(Some(remaining()?)))?;
+        match stream.write(rest) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => rest = &rest[n..],
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match witness_proto::decode(&bytes) {
+            Ok((_, used)) => {
+                bytes.truncate(used);
+                return Ok(bytes);
+            }
+            Err(ProtoError::Incomplete) if bytes.len() < MAX_RESPONSE => {}
+            Err(_) => return Err(ErrorKind::InvalidData.into()),
+        }
+        tolerate_closed_peer(stream.set_read_timeout(Some(remaining()?)))?;
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Die Fehlerart „Frist abgelaufen" — eigens benannt, weil die
+/// Checkpoint-Delegation sie von den anderen unterscheidet.
+pub(crate) const TIMEOUT: &str = "timeout";
+
 /// Die Fehlerart einer I/O-Störung, in Worten, die in einer Logzeile taugen.
 fn kind(err: &std::io::Error) -> &'static str {
     use std::io::ErrorKind as K;
@@ -139,11 +260,13 @@ fn kind(err: &std::io::Error) -> &'static str {
     match err.kind() {
         K::NotFound => "socket missing",
         K::ConnectionRefused => "connection refused",
-        K::TimedOut | K::WouldBlock => "timeout",
+        K::TimedOut | K::WouldBlock => TIMEOUT,
         K::PermissionDenied => "permission denied",
-        K::BrokenPipe | K::ConnectionReset | K::ConnectionAborted | K::WriteZero => {
-            "connection closed"
-        }
+        K::BrokenPipe
+        | K::ConnectionReset
+        | K::ConnectionAborted
+        | K::WriteZero
+        | K::UnexpectedEof => "connection closed",
         K::InvalidInput => "invalid socket path",
         K::Unsupported => "unsupported platform",
         _ => "io error",
@@ -425,10 +548,19 @@ mod tests {
 
         let stale = dir.path().join("stale.sock");
         drop(UnixListener::bind(&stale).unwrap());
-        assert_eq!(
-            forward(&stale, "a", None, vec![]),
-            Err("connection refused")
-        );
+        // Ein Kindprozess, den ein parallel laufender Test gerade startet, kann
+        // den gebundenen Socket kurz erben (macOS hat kein `SOCK_CLOEXEC`) —
+        // solange er lebt, nimmt der Socket noch an. Erst wenn er wirklich tot
+        // ist, zählt die Antwort.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stale_result = loop {
+            let result = forward(&stale, "a", None, vec![]);
+            if result.is_err() || Instant::now() >= deadline {
+                break result;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(stale_result, Err("connection refused"));
 
         let long = Path::new("/tmp").join("x".repeat(200));
         assert_eq!(
@@ -474,6 +606,105 @@ mod tests {
             Err("untrusted socket dir")
         );
         assert!(listener.accept().is_err(), "keine Verbindung über den Link");
+    }
+
+    /// Ein Witness-Ersatz, der genau einen Frame liest und `reply` zurückgibt.
+    fn answering(path: &Path, reply: Vec<u8>) -> std::thread::JoinHandle<Frame> {
+        use std::io::Write;
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 256];
+            let frame = loop {
+                let n = stream.read(&mut chunk).unwrap();
+                bytes.extend_from_slice(&chunk[..n]);
+                if let Ok((frame, _)) = witness_proto::decode(&bytes) {
+                    break frame;
+                }
+            };
+            // Der Client darf mitten in einer zu großen Antwort auflegen.
+            let _ = stream.write_all(&reply);
+            frame
+        })
+    }
+
+    fn checkpoint_request(id: u8) -> Frame {
+        Frame::CheckpointRequest {
+            commit: None,
+            request_id: [id; 16],
+        }
+    }
+
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_secs(5)
+    }
+
+    #[test]
+    fn a_request_returns_the_matching_answer() {
+        let dir = short_dir();
+        let path = dir.path().join("w.sock");
+        let ack = Frame::Ack {
+            request_id: [7; 16],
+            status: "sealed".into(),
+        };
+        let witness = answering(&path, witness_proto::encode(&ack).unwrap());
+
+        assert_eq!(request(&path, &checkpoint_request(7), soon()), Ok(ack));
+        assert_eq!(witness.join().unwrap(), checkpoint_request(7));
+    }
+
+    #[test]
+    fn a_foreign_or_oversized_answer_is_unexpected() {
+        let dir = short_dir();
+        let path = dir.path().join("a.sock");
+        let other = Frame::Nack {
+            request_id: [1; 16],
+            reason: "no".into(),
+        };
+        let witness = answering(&path, witness_proto::encode(&other).unwrap());
+        assert_eq!(
+            request(&path, &checkpoint_request(2), soon()),
+            Err("unexpected response")
+        );
+        witness.join().unwrap();
+
+        // Ein Kopf, der mehr ankündigt, als der Client je lesen würde.
+        let path = dir.path().join("b.sock");
+        let mut huge = witness_proto::MAGIC.to_vec();
+        huge.extend_from_slice(&(1024 * 1024u32).to_le_bytes());
+        huge.extend(std::iter::repeat_n(0x81, 16 * 1024));
+        let witness = answering(&path, huge);
+        assert_eq!(
+            request(&path, &checkpoint_request(2), soon()),
+            Err("unexpected response")
+        );
+        witness.join().unwrap();
+
+        // Nur Anfragen mit `request_id` erwarten eine Antwort.
+        assert_eq!(request(&path, &Frame::Ping, soon()), Err("invalid frame"));
+    }
+
+    #[test]
+    fn a_witness_that_never_answers_costs_the_deadline() {
+        let dir = short_dir();
+        let path = dir.path().join("mute.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let _held = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+            drop(stream);
+        });
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+
+        assert_eq!(
+            request(&path, &checkpoint_request(3), deadline),
+            Err("timeout")
+        );
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200), "zu früh: {took:?}");
+        assert!(took < Duration::from_millis(1500), "zu lange: {took:?}");
     }
 
     #[test]

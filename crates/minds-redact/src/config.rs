@@ -338,6 +338,14 @@ pub struct RedactionConfig {
     pub deny_secrets: Vec<String>,
     /// Zusätzliche Begriffe, die als [`Category::Pii`] gelten.
     pub deny_pii: Vec<String>,
+    /// [`secret_keys`](Self::secret_keys) als **eigenen** Detektor führen
+    /// statt in der Alternation der eingebauten Schlüssel — gesetzt von
+    /// [`floored_at_default`](Self::floored_at_default), nie aus der Datei.
+    /// Nicht serialisiert: Eine begrenzte Policy ist ein Zustand im Speicher
+    /// des Witness, keine Datei — wer sie speichert und wieder liest, muss
+    /// `floored_at_default` erneut anwenden.
+    #[serde(skip)]
+    pub isolate_secret_keys: bool,
 }
 
 impl Default for RedactionConfig {
@@ -353,11 +361,80 @@ impl Default for RedactionConfig {
             allow: Vec::new(),
             deny_secrets: Vec::new(),
             deny_pii: Vec::new(),
+            isolate_secret_keys: false,
         }
     }
 }
 
 impl RedactionConfig {
+    /// Diese Policy, nach unten begrenzt durch den strengen Default: Sie darf
+    /// **verschärfen, nie abschwächen**.
+    ///
+    /// Für Schreiber, denen die Policy-Datei nicht gehört — der Witness liest
+    /// `.minds/redact.json` aus einem Worktree, den der beobachtete Agent
+    /// ändern kann (EA-06d). Dort gilt:
+    ///
+    /// - Jeder eingebaute Detektor ist an, gleich was die Datei sagt.
+    /// - Die Entropie-Schwellen sind höchstens so hoch wie im Default (eine
+    ///   niedrigere Schwelle aus der Datei bleibt — sie findet mehr).
+    /// - Die [`allow`](Self::allow)-Liste entfällt: Sie nimmt Funde zurück.
+    /// - [`secret_keys`](Self::secret_keys) bleiben, laufen aber als
+    ///   **eigener** Detektor ([`isolate_secret_keys`](Self::isolate_secret_keys)).
+    ///   In derselben Alternation wie die eingebauten Schlüssel verschluckte
+    ///   ein früher passender Zusatzschlüssel mit ausgenommenem Wert
+    ///   (`note=$x…`) den eingebauten Treffer dahinter (`password=…`). Als
+    ///   eigener Detektor kommen seine Funde nur hinzu.
+    /// - `deny_secrets` und `deny_pii` bleiben: ebenfalls ein eigener
+    ///   Detektor, dessen Funde zu den übrigen **hinzukommen**.
+    ///
+    /// Ein Team, das eine Allowlist für Fehlalarme pflegt, sieht in bezeugten
+    /// Sessions also mehr Platzhalter als in lokalen. Das ist die gewollte
+    /// Richtung: fail-closed. Die Kehrseite: Wer die Datei schreibt, kann
+    /// bezeugte Sessions mit sehr breiten Deny-Begriffen oder Schwellen bis
+    /// zur Unlesbarkeit schwärzen — nichts geht verloren, aber der Inhalt wird
+    /// unbrauchbar. Ebenso kann ein Begriff, der im Platzhalter selbst
+    /// vorkommt (`secret_keys: ["redacted"]`), jede redigierte Session
+    /// instabil machen: Sie wird vertagt statt versiegelt. Eine Witness-eigene
+    /// Policy schließt beides erst (EA-10).
+    ///
+    /// Jedes Feld wird hier ausdrücklich entschieden (kein `..self`): Ein
+    /// neues Feld, das abschwächen könnte, muss diese Funktion anfassen.
+    pub fn floored_at_default(self) -> Self {
+        let strict = Self::default();
+        let Self {
+            known_tokens: _,
+            email: _,
+            keyed_values: _,
+            url_credentials: _,
+            short_flags: _,
+            high_entropy,
+            secret_keys,
+            allow: _,
+            deny_secrets,
+            deny_pii,
+            isolate_secret_keys: _,
+        } = self;
+        Self {
+            known_tokens: true,
+            email: true,
+            keyed_values: true,
+            url_credentials: true,
+            short_flags: true,
+            high_entropy: HighEntropyConfig {
+                enabled: true,
+                min_len: high_entropy.min_len.min(strict.high_entropy.min_len),
+                min_entropy_bits: high_entropy
+                    .min_entropy_bits
+                    .min(strict.high_entropy.min_entropy_bits),
+            },
+            secret_keys,
+            allow: Vec::new(),
+            deny_secrets,
+            deny_pii,
+            isolate_secret_keys: true,
+        }
+    }
+
     /// Die konfigurierte [`AllowList`].
     pub fn allowlist(&self) -> AllowList {
         self.allow.iter().collect()
@@ -397,7 +474,15 @@ impl RedactionConfig {
             pipeline.push(EmailRedactor::new());
         }
         if self.keyed_values {
-            pipeline.push(KeyValueRedactor::with_extra_keys(&self.secret_keys)?);
+            if self.isolate_secret_keys {
+                pipeline.push(KeyValueRedactor::new());
+                let extra = KeyValueRedactor::only_extra_keys(&self.secret_keys)?;
+                if !extra.rule_names().is_empty() {
+                    pipeline.push(extra);
+                }
+            } else {
+                pipeline.push(KeyValueRedactor::with_extra_keys(&self.secret_keys)?);
+            }
         }
         if self.url_credentials {
             pipeline.push(UrlCredentialRedactor::new());
@@ -419,6 +504,92 @@ impl RedactionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- floored_at_default -----------------------------------------------------
+
+    /// Eine Policy, wie ein beobachteter Agent sie schriebe: alles aus, und
+    /// was trotzdem gefunden würde, steht in `allow`.
+    fn hostile() -> RedactionConfig {
+        serde_json::from_str(
+            r#"{"known_tokens":false,"email":false,"keyed_values":false,
+                "url_credentials":false,"short_flags":false,
+                "high_entropy":{"enabled":false,"min_len":4096,"min_entropy_bits":99.0},
+                "allow":["ghp_1234567890abcdefghijklmnopqrstuvwxyzAB","AKIAIOSFODNN7EXAMPLE"],
+                "secret_keys":["note"],
+                "deny_secrets":["projekt-zander"]}"#,
+        )
+        .unwrap()
+    }
+
+    /// MUST_REDACT unter feindlicher Policy: Was der Default findet, findet
+    /// auch die begrenzte Policy — die Datei kann nichts zurücknehmen.
+    #[test]
+    fn a_floored_policy_cannot_weaken_redaction() {
+        let pipeline = hostile().floored_at_default().pipeline().unwrap();
+        for secret in [
+            // Ein Zusatzschlüssel, dessen ausgenommener Wert den eingebauten
+            // Treffer dahinter verschluckte (Security-Review EA-06d).
+            "note=$xpassword=geheim88",
+            "note=/a/b/password=geheim88",
+            "export GITHUB_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyzAB",
+            "aws_access_key_id = AKIAIOSFODNN7EXAMPLE",
+            "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "postgres://svc:S3cr3t-Pa55@db.internal:5432/app",
+            "curl -u admin:hunter2-hunter2 https://x.invalid",
+            "anna@example.com",
+        ] {
+            let strict = RedactionConfig::default()
+                .pipeline()
+                .unwrap()
+                .redact(secret);
+            let floored = pipeline.redact(secret);
+            assert_eq!(floored.text, strict.text, "{secret}");
+            assert_ne!(floored.text, secret, "{secret}");
+        }
+    }
+
+    /// MUST_SURVIVE: Verschärfungen aus der Datei bleiben erhalten — auch
+    /// ein eigener Schlüsselname des Teams.
+    #[test]
+    fn a_floored_policy_keeps_every_tightening() {
+        let floored = hostile().floored_at_default();
+        assert_eq!(floored.deny_secrets, vec!["projekt-zander".to_owned()]);
+        let out = floored
+            .pipeline()
+            .unwrap()
+            .redact("Codename projekt-zander");
+        assert!(!out.text.contains("projekt-zander"), "{}", out.text);
+
+        let team = RedactionConfig {
+            secret_keys: vec!["VAULT_ROLE_ID".into()],
+            ..RedactionConfig::default()
+        }
+        .floored_at_default();
+        let out = team.pipeline().unwrap().redact("VAULT_ROLE_ID=r0le-1d-abc");
+        assert!(!out.text.contains("r0le-1d-abc"), "{}", out.text);
+
+        let stricter = RedactionConfig {
+            high_entropy: HighEntropyConfig {
+                enabled: true,
+                min_len: 8,
+                min_entropy_bits: 2.0,
+            },
+            ..RedactionConfig::default()
+        };
+        assert_eq!(
+            stricter.clone().floored_at_default().high_entropy,
+            stricter.high_entropy
+        );
+        // Der strenge Default bleibt, was er ist — nur die Zusatzschlüssel
+        // laufen getrennt.
+        assert_eq!(
+            RedactionConfig::default().floored_at_default(),
+            RedactionConfig {
+                isolate_secret_keys: true,
+                ..RedactionConfig::default()
+            }
+        );
+    }
 
     // --- AllowList ------------------------------------------------------------
 

@@ -21,6 +21,21 @@ use std::path::Path;
 
 use crate::error::{GitError, Result, Source};
 
+/// Feste Fristen für Ref-Locks, gesetzt über der Repo-Konfiguration.
+///
+/// `core.filesRefLockTimeout` und `core.packedRefsTimeout` stehen in
+/// `.git/config`, und ein negativer Wert heißt dort „ewig warten". Seit EA-06d
+/// schreibt der Witness in ein Repo, dessen Konfiguration der beobachtete
+/// Agent ändern kann: Ein `-1` plus eine liegengelassene `.lock`-Datei hielte
+/// seinen einzigen Schreiber für immer an. Zwei Sekunden liegen über Gits
+/// Vorgaben (100 ms bzw. 1 s); wer bewusst länger warten lässt, wartet bei
+/// Minds trotzdem höchstens zwei Sekunden — Minds schreibt Refs nur kurz und
+/// selten, ein verpasster Lock ist dort ein vertagter Schreibvorgang.
+const LOCK_TIMEOUTS: [&str; 2] = [
+    "core.filesRefLockTimeout=2000",
+    "core.packedRefsTimeout=2000",
+];
+
 /// Ein geöffnetes Git-Repository.
 ///
 /// Das Handle ist billig zu halten, aber nicht `Sync` — gix cacht intern beim
@@ -37,9 +52,20 @@ impl Repo {
     /// Fall „hier ist kein Repo", nicht ein Defekt.
     pub fn discover(start: impl AsRef<Path>) -> Result<Self> {
         let start = start.as_ref();
-        gix::discover(start)
-            .map(Self::from_gix)
-            .map_err(|err| GitError::discover(start, err))
+        let mut options = gix::sec::trust::Mapping::<gix::open::Options>::default();
+        options
+            .full
+            .modify(|opts| opts.config_overrides(LOCK_TIMEOUTS));
+        options
+            .reduced
+            .modify(|opts| opts.config_overrides(LOCK_TIMEOUTS));
+        gix::ThreadSafeRepository::discover_opts(
+            start,
+            gix::discover::upwards::Options::default(),
+            options,
+        )
+        .map(|repo| Self::from_gix(repo.into()))
+        .map_err(|err| GitError::discover(start, err))
     }
 
     /// Öffnet genau `path` — entweder das Arbeitsverzeichnis eines Repos oder
@@ -49,9 +75,19 @@ impl Repo {
     /// [`GitError::Open`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        gix::open(path)
-            .map(Self::from_gix)
-            .map_err(|err| GitError::open(path, err))
+        gix::open_opts(
+            path,
+            gix::open::Options::default().config_overrides(LOCK_TIMEOUTS),
+        )
+        .map(Self::from_gix)
+        .map_err(|err| GitError::open(path, err))
+    }
+
+    /// Ob gix Refs in einem Namespace führt (`gitoxide.core.refsNamespace`,
+    /// `GIT_NAMESPACE`): Dann liegen alle Refs — auch `refs/minds/*` — unter
+    /// `refs/namespaces/<ns>/…`.
+    pub fn has_ref_namespace(&self) -> bool {
+        self.inner.namespace().is_some()
     }
 
     /// Das Git-Verzeichnis dieses Repositories (`…/.git`, bei einem baren Repo
@@ -70,7 +106,7 @@ impl Repo {
     /// gemeinsamen Verzeichnis. Alles, was Ref-Schreiber **repo-weit**
     /// serialisieren muss (das Sidecar-Lock aus `refs.rs`), gehört hierher —
     /// sonst nähmen zwei Worktrees verschiedene Locks für dieselben Refs.
-    pub(crate) fn common_dir(&self) -> &Path {
+    pub fn common_dir(&self) -> &Path {
         self.inner.common_dir()
     }
 

@@ -116,7 +116,23 @@ pub fn run_checkpoint_guarded(
         if guard.is_some_and(|guard| !guard.includes(&key)) {
             continue;
         }
-        let read = journal.read(&key)?;
+        // Beim Witness (EA-06d) wurden vorige Sessions in diesem Lauf womöglich
+        // schon versiegelt und verworfen. Ein Lesefehler dieser einen Session
+        // darf den Lauf dann nicht abbrechen — sonst bekäme die Agent-Seite
+        // ein „bleiben offen" für Sessions, die längst versiegelt sind, und
+        // deren Trailer fehlten. Der lokale Pfad bleibt, wie er war.
+        let read = match journal.read(&key) {
+            Ok(read) => read,
+            Err(err) if guard.is_some() => {
+                report(
+                    log_dir,
+                    guard,
+                    &format!("{} skipped: {err}", key.display_redacted(pipeline)),
+                );
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         if read.events.is_empty() {
             // Nur Beschädigtes ohne ein einziges Event: kein Zeitstempel, kein
             // Bereich — nichts, was ein Seal ehrlich claimen könnte. fsck
@@ -185,7 +201,19 @@ pub fn run_checkpoint_guarded(
                 // Erst nach erfolgreicher Ablage UND Versiegelung verwerfen:
                 // Ein Absturz dazwischen darf weder Rohdaten noch Beweis
                 // verlieren.
-                journal.discard(&key)?;
+                // Scheitert beim Witness nur das Verwerfen, ist die Session
+                // trotzdem gespeichert und versiegelt: Sie zählt, ihr Trailer
+                // kommt dran, und der nächste Lauf verwendet den Seal
+                // idempotent wieder.
+                match journal.discard(&key) {
+                    Ok(()) => {}
+                    Err(err) if guard.is_some() => report(
+                        log_dir,
+                        guard,
+                        &format!("journal not discarded after sealing: {err}"),
+                    ),
+                    Err(err) => return Err(err.into()),
+                }
                 if guard.is_none() {
                     println!("  {}: {id}", key.display_redacted(pipeline));
                     print_session_sealed(&sealed);
@@ -417,6 +445,37 @@ fn print_session_sealed(sealed: &SealSummary) {
             println!("    ✓ block seal recorded — the payload was rejected, the range is attested");
         }
     }
+}
+
+/// Die „SESSION SEALED"-Zusammenfassung als **eine** Zeile — für den Witness,
+/// der sie über den Socket zurückgibt (EA-06d). Das Protokoll trägt nur eine
+/// Statuszeile ohne Steuerzeichen; der mehrzeilige Block aus
+/// [`print_session_sealed`] passt dort nicht hinein.
+///
+/// Dieselben Tatsachen wie der Block, dasselbe Vokabular („recorded", nie
+/// „valid"). Kein Pfad, kein Intent, kein Payload: nur Hashes, Zahlen und der
+/// Scope aus dem Seal selbst.
+#[cfg(unix)]
+pub fn session_sealed_line(sealed: &SealSummary) -> String {
+    let seal = &sealed.seal;
+    let head = match &seal.outcome {
+        SealOutcome::Stored { session } => format!("SESSION SEALED {session}"),
+        SealOutcome::Rejected => "RANGE SEALED (payload rejected)".to_owned(),
+    };
+    let gaps = if seal.gaps == 0 && seal.pre_chain == 0 {
+        "no gaps".to_owned()
+    } else {
+        format!("{} gap(s), {} pre-chain", seal.gaps, seal.pre_chain)
+    };
+    format!(
+        "{head} · seal {} · scope {} · {} event(s) · seq {}–{} · {gaps} · {}",
+        sealed.seal_id,
+        crate::text::sanitize(&seal.scope),
+        seal.events,
+        seal.first_seq,
+        seal.last_seq,
+        if sealed.signed { "signed" } else { "unsigned" },
+    )
 }
 
 /// Signiert einen frisch abgelegten Seal mit dem gewählten Signer.

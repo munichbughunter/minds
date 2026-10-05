@@ -202,7 +202,34 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                 return Ok(false);
             }
         }
-        Frame::CheckpointRequest { request_id, .. } | Frame::IntentActivate { request_id, .. } => {
+        Frame::CheckpointRequest { commit, request_id } => {
+            // Ein gescheiterter oder abgewiesener Checkpoint ist kein Grund,
+            // den einzigen Schreiber zu beenden: Die Sessions bleiben offen,
+            // die Agent-Seite bekommt einen festen Grund.
+            let stream = &client.stream;
+            let answer =
+                match writer.checkpoint_requested(commit.as_deref(), &|| !peer_gone(stream)) {
+                    Ok(status) => Frame::Ack { request_id, status },
+                    Err(reason) => Frame::Nack {
+                        request_id,
+                        reason: reason.into(),
+                    },
+                };
+            // Eine nicht kodierbare Statuszeile ist ein Fehler der Antwort,
+            // nicht des eigenen Speichers — sie darf den Schreiber nicht
+            // beenden.
+            let bytes = witness_proto::encode(&answer).or_else(|_| {
+                log(&writer.home, "checkpoint status not encodable");
+                witness_proto::encode(&Frame::Nack {
+                    request_id,
+                    reason: "status not encodable".into(),
+                })
+            })?;
+            if client.stream.write_all(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        Frame::IntentActivate { request_id, .. } => {
             let bytes = witness_proto::encode(&Frame::Nack {
                 request_id,
                 reason: "not supported".into(),
@@ -217,6 +244,36 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
         }
     }
     Ok(true)
+}
+
+/// Ob die Gegenseite aufgelegt hat — ohne zu warten und ohne ein Byte zu
+/// verbrauchen. Die Agent-Seite schickt nach ihrer Anfrage nichts mehr;
+/// lesbar wird die Verbindung erst, wenn sie sie schließt (Frist abgelaufen).
+fn peer_gone(stream: &UnixStream) -> bool {
+    let mut poll = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: genau ein gültiges `pollfd`, Frist 0.
+    if unsafe { libc::poll(&raw mut poll, 1, 0) } <= 0 {
+        return false;
+    }
+    if poll.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+        return true;
+    }
+    let mut byte = 0u8;
+    // SAFETY: ein Byte großer, beschreibbarer Puffer; `MSG_PEEK` verbraucht
+    // nichts, der Socket ist nichtblockierend.
+    let read = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    read == 0
 }
 
 /// Höchstens eine Zeile pro Sekunde: Ein dauerhafter accept-Fehler (EMFILE)
@@ -382,6 +439,26 @@ mod tests {
             eof: false,
             pending: false,
         }
+    }
+
+    #[test]
+    fn peer_gone_sees_a_hang_up_but_not_silence_or_data() {
+        use std::io::Write;
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        assert!(!peer_gone(&ours), "still wartend ist nicht gegangen");
+        theirs.write_all(b"x").unwrap();
+        assert!(!peer_gone(&ours), "ein ungelesenes Byte ist kein Auflegen");
+        let mut byte = [0u8; 1];
+        std::io::Read::read_exact(&mut &ours, &mut byte).unwrap();
+        drop(theirs);
+        // Das Auflegen wird unter macOS einen Augenblick später sichtbar; im
+        // Betrieb ist der Absender da längst Sekunden weg.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !peer_gone(&ours) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(peer_gone(&ours), "aufgelegt");
     }
 
     #[test]

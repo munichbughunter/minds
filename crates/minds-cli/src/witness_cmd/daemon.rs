@@ -270,7 +270,23 @@ struct Writer {
     epochs: EpochState,
     folders: BTreeMap<SessionKey, ChainFolder>,
     follow: bool,
+    /// Ob seit dem letzten vollständigen Checkpoint ein Agent-Event kam oder
+    /// eine Session vertagt blieb. Ohne das gibt es nichts zu versiegeln.
+    dirty: bool,
+    /// Ende des letzten Checkpoint-Laufs auf Anfrage, gleich mit welchem
+    /// Ausgang.
+    last_run: Option<std::time::Instant>,
+    /// Der zuletzt geloggte Fehlschlag und wie oft er sich seither still
+    /// wiederholt hat — ein erzwungener Fehlschlag je Sekunde darf ältere
+    /// Diagnosen nicht aus dem rotierenden Log drängen.
+    last_failure: Option<(String, usize)>,
 }
+
+/// Mindestabstand zwischen zwei versiegelnden Checkpoints auf Anfrage der
+/// Agent-Seite. Ohne ihn könnte der Agent zwischen je zwei Events einen
+/// Checkpoint anfordern — jedes Event ein eigener Bereich, Store, Ledger und
+/// Signaturen wüchsen ohne Grenze, und die Eventloop stünde für Hooks still.
+const MIN_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Writer {
     fn open(home: &Path, config: Config, follow: bool) -> Fallible<Self> {
@@ -281,6 +297,9 @@ impl Writer {
             epochs: EpochState::at(home.join("evidence/state")),
             folders: BTreeMap::new(),
             follow,
+            dirty: true,
+            last_run: None,
+            last_failure: None,
         };
         writer.recover_all()?;
         Ok(writer)
@@ -333,6 +352,9 @@ impl Writer {
             self.recover(key)?;
         }
         let event = self.journal.append(key, event)?;
+        if self.includes(key) {
+            self.dirty = true;
+        }
         let hash = event.event_hash.clone().ok_or("missing event hash")?;
         let folder = self.folders.get_mut(key).ok_or("missing chain folder")?;
         let seen = folder.snapshot().coverage;
@@ -422,10 +444,129 @@ impl Writer {
         Ok(())
     }
 
-    /// Interner Einstieg für EA-06d; absichtlich noch kein Socket-Kommando.
-    #[allow(dead_code)]
-    fn checkpoint_now(&mut self, commit: Option<&str>) -> Fallible<()> {
-        let result = self.checkpoint_sessions(commit);
+    /// Der Einstieg für `CheckpointRequest` vom Socket (EA-06d): ein Lauf von
+    /// [`Self::checkpoint_now`] mit Schutz gegen Fluten.
+    ///
+    /// - Ohne konkreten Commit kein Lauf: Ohne ihn gäbe es keine Vorprüfung,
+    ///   und der Witness trailerte, was immer gerade an HEAD steht.
+    /// - Gibt es seit dem letzten vollständigen Lauf nichts Neues, lautet die
+    ///   Antwort sofort „nothing to seal".
+    /// - Sonst höchstens ein Lauf je [`MIN_CHECKPOINT_INTERVAL`], gemessen
+    ///   vom **Ende** des letzten Laufs — gezählt wird jeder Lauf, auch ein
+    ///   gescheiterter: Sonst ließe sich die Grenze mit absichtlich
+    ///   scheiternden oder langsamen Läufen umgehen, und die Eventloop käme
+    ///   zwischen zwei Läufen nie zu den Hooks.
+    ///
+    /// `requester_alive` sagt, ob die anfragende Agent-Seite noch wartet. Ist
+    /// sie gegangen (Frist abgelaufen), wird nach dem Versiegeln **nicht**
+    /// mehr getrailert: Ihr `git commit` ist längst zurück, vielleicht schon
+    /// gepusht — ein später Amend schriebe Historie um, die der Nutzer schon
+    /// weitergegeben hat.
+    ///
+    /// Der Fehler ist der feste Grund für den `Nack`. Ins eigene Log kommt
+    /// nur ein gescheiterter Lauf, keine abgewiesene Anfrage — eine Flut von
+    /// Anfragen darf ältere Diagnosen nicht aus dem rotierenden Log drängen.
+    pub(super) fn checkpoint_requested(
+        &mut self,
+        commit: Option<&str>,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Result<String, &'static str> {
+        let Some(commit) = commit else {
+            return Err("commit required");
+        };
+        // Wartete die Anfrage im Backlog, während ein langer Lauf lief, kann
+        // ihr Absender längst gegangen sein. Dann gar nicht erst versiegeln:
+        // Seals ohne Trailer fände `minds verify` an keinem Commit, und der
+        // Absender hat „bleiben offen" gemeldet — das soll stimmen. Kein Lauf,
+        // keine Frist, keine Logzeile.
+        if !requester_alive() {
+            return Err("requester gone");
+        }
+        if !self.dirty {
+            return Ok(checkpoint_status(&[], 0, Ok(None)));
+        }
+        if self
+            .last_run
+            .is_some_and(|at| at.elapsed() < MIN_CHECKPOINT_INTERVAL)
+        {
+            return Err("rate limited");
+        }
+        // Ein Panic in gix über feindlichen Objekt- oder Pack-Daten darf den
+        // einzigen Schreiber nicht beenden. Danach sind die Live-Folds
+        // fraglich: verwerfen — `append` lädt sie über `recover` samt
+        // Präfixprüfung neu von der Platte.
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.checkpoint_now_for(Some(commit), requester_alive)
+        }));
+        self.last_run = Some(std::time::Instant::now());
+        let result = match run {
+            Ok(result) => result,
+            Err(_) => {
+                self.folders.clear();
+                self.dirty = true;
+                Err("checkpoint panicked".into())
+            }
+        };
+        match result {
+            Ok(status) => {
+                self.note_failure(None);
+                Ok(status)
+            }
+            Err(err) => {
+                self.note_failure(Some(format!("checkpoint failed: {err}")));
+                Err("checkpoint failed")
+            }
+        }
+    }
+
+    /// Loggt einen Fehlschlag nur, wenn er sich vom vorigen unterscheidet;
+    /// Wiederholungen werden gezählt und beim nächsten anderen Ausgang in
+    /// einer Zeile nachgetragen.
+    fn note_failure(&mut self, failure: Option<String>) {
+        if let (Some(new), Some((old, _))) = (&failure, &self.last_failure) {
+            if new == old {
+                if let Some((_, repeats)) = &mut self.last_failure {
+                    *repeats += 1;
+                }
+                return;
+            }
+        }
+        if let Some((_, repeats)) = self.last_failure.take() {
+            if repeats > 0 {
+                log(
+                    &self.home,
+                    &format!("previous checkpoint failure repeated {repeats} more time(s)"),
+                );
+            }
+        }
+        if let Some(failure) = failure {
+            log(&self.home, &failure);
+            self.last_failure = Some((failure, 0));
+        }
+    }
+
+    /// Versiegelt alle offenen Agent-Sessions und gibt die Statuszeile für
+    /// den `Ack` zurück: die „SESSION SEALED"-Zusammenfassung, die die
+    /// Agent-Seite druckt, weil sie selbst nichts vom Witness-Zustand lesen
+    /// darf (W1).
+    ///
+    /// `Err` heißt: Es wurde **nichts** versiegelt — alle Prüfungen, die
+    /// scheitern können, laufen vor dem ersten Seal, und Fehler einzelner
+    /// Sessions danach vertagt der Kern nur diese Session. Was nach dem
+    /// Versiegeln scheitert (Trailer), steht in der Statuszeile, nicht im
+    /// Fehler.
+    #[cfg(test)]
+    fn checkpoint_now(&mut self, commit: Option<&str>) -> Fallible<String> {
+        self.checkpoint_now_for(commit, &|| true)
+    }
+
+    /// [`Self::checkpoint_now`] für eine Anfrage, deren Anfragender gehen kann.
+    fn checkpoint_now_for(
+        &mut self,
+        commit: Option<&str>,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Fallible<String> {
+        let result = self.checkpoint_sessions(commit, requester_alive);
         // Auch ein Fehler mitten im Lauf kann Sessions bereits verworfen haben.
         // Ihr alter Fold darf nie die nächste Epoche fortsetzen; `append` lädt
         // ihn über `recover` samt `.sealed`-Prüfung neu. Alle übrigen Folds
@@ -445,11 +586,66 @@ impl Writer {
         Ok(())
     }
 
-    fn checkpoint_sessions(&mut self, commit: Option<&str>) -> Fallible<()> {
+    fn checkpoint_sessions(
+        &mut self,
+        commit: Option<&str>,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Fallible<String> {
         let root = &self.config.repo_root;
+        // Der Worktree gehört dem Agenten; seit EA-06d kann er diesen Lauf
+        // jederzeit auslösen. Was er dort ändern kann, darf den Witness nicht
+        // umlenken (00-conventions: „Nothing in `.git/config` may influence
+        // trust decisions") — geprüft, bevor gix oder git etwas daraus lesen.
+        plain_repo_layout(root)?;
         let repo = minds_git::Repo::discover(root)?;
-        let store = crate::config::load(root).open(root)?;
-        let pipeline = crate::config::load_redaction(root)?.pipeline()?;
+        // Ein Ref-Namespace aus der Konfiguration des Agenten verschöbe alle
+        // Schreibzugriffe unter `refs/namespaces/<ns>/…` — heraus aus
+        // `refs/minds/`.
+        if repo.has_ref_namespace() {
+            return Err("refs namespaces are not supported; checkpoint deferred".into());
+        }
+        let dot_git = root.join(".git").canonicalize()?;
+        if repo.git_dir().canonicalize()? != dot_git || repo.common_dir().canonicalize()? != dot_git
+        {
+            return Err(
+                "witness repository must own its .git directory; checkpoint deferred".into(),
+            );
+        }
+        // Erst prüfen, dann versiegeln: Steht der angefragte Commit nicht an
+        // HEAD dieses Repos (anderer Checkout, inzwischen weitergewandert),
+        // entstünden Seals ohne Trailer — und die Sessions wären geschlossen,
+        // obwohl die Agent-Seite „bleiben offen" meldet.
+        if let Some(commit) = commit {
+            let expected: minds_git::CommitId = commit.parse()?;
+            if !crate::checkpoint::head_carries(&repo, expected)? {
+                return Err(
+                    "requested commit is not at the witness HEAD; checkpoint deferred".into(),
+                );
+            }
+        }
+        // Der Store schreibt nur im eigenen Repo und nur unter `refs/minds/`.
+        // TODO(EA-10): Backend und Ref in `witness.json` festhalten; bis dahin
+        // nimmt der Witness nur das In-Repo-Backend — ein `minds.childPath`
+        // aus `.git/config` lenkte seine Schreibzugriffe sonst an einen
+        // beliebigen Ort auf dem Host.
+        let store_config = crate::config::load(root);
+        if !matches!(store_config.backend(), minds_store::Backend::InRepo) {
+            return Err(
+                "witness supports only the in-repo store backend; checkpoint deferred".into(),
+            );
+        }
+        if !store_config
+            .reference()
+            .starts_with(minds_git::MINDS_REF_NAMESPACE)
+        {
+            return Err("context ref outside refs/minds/; checkpoint deferred".into());
+        }
+        let store = store_config.open(root)?;
+        // Die Policy darf verschärfen, nie abschwächen — und ihre Datei ist
+        // fremd: gewöhnliche Datei, begrenzt, ohne zu blockieren gelesen.
+        let pipeline = crate::config::load_redaction_untrusted(root)?
+            .floored_at_default()
+            .pipeline()?;
         let tracked = crate::checkpoint::tracked_files(root);
         fingerprint(&self.home)?;
         let key = self.home.join("key/witness_ed25519");
@@ -475,10 +671,169 @@ impl Writer {
             },
             Some(self),
         )?;
-        if let Some(commit) = crate::checkpoint::attach_trailers(&repo, commit, &outcome.stored)? {
-            crate::checkpoint::record_index(store.as_ref(), commit, &outcome.stored)?;
+        // Ab hier ist versiegelt und verworfen. Ein Fehler beim Trailern macht
+        // daraus keinen `Nack` mehr — die Agent-Seite meldete sonst „bleiben
+        // offen". Er steht als fester Grund in der Statuszeile.
+        let home = self.home.clone();
+        let report = |note: &str| log(&home, note);
+        let attached = if !outcome.stored.is_empty() && !requester_alive() {
+            log(&self.home, "trailer not attached: the requester is gone");
+            Err("the requester is gone")
+        } else {
+            match crate::checkpoint::attach_trailers(&repo, commit, &outcome.stored, &report) {
+                Ok(attached) => Ok(attached),
+                Err(err) => {
+                    log(&self.home, &format!("trailer not attached: {err}"));
+                    Err(trailer_miss(err.as_ref()))
+                }
+            }
+        };
+        if let Ok(Some(update)) = attached {
+            if let Err(err) = crate::checkpoint::index_trailered(
+                &repo,
+                store.as_ref(),
+                commit,
+                update,
+                &outcome.stored,
+            ) {
+                // Der Index ist aus den Trailern rekonstruierbar.
+                log(&self.home, &format!("commit index not recorded: {err}"));
+            }
         }
-        Ok(())
+        // Was nach dem Lauf noch offen ist, wurde vertagt (Store, Redaction,
+        // Integrität — der Grund steht im eigenen Log). Die Agent-Seite soll
+        // das nicht als „nichts zu tun" lesen. Lässt sich das nicht zählen,
+        // bleibt `dirty` gesetzt: Lieber ein Lauf zu viel als offene Sessions,
+        // die keiner mehr anfasst.
+        let deferred = match self.journal.sessions() {
+            Ok(open) => {
+                let deferred = open.keys.iter().filter(|key| self.includes(key)).count();
+                self.dirty = deferred > 0;
+                deferred
+            }
+            Err(err) => {
+                log(&self.home, &format!("open sessions not counted: {err}"));
+                self.dirty = true;
+                0
+            }
+        };
+        Ok(checkpoint_status(&outcome.sealed, deferred, attached))
+    }
+}
+
+/// `.git` muss vollständig schlicht sein, bevor gix oder git daraus lesen
+/// oder hineinschreiben: Der Witness arbeitet dort mit **seinen** Rechten auf
+/// dem Host, und der Baum gehört dem Agenten.
+///
+/// - Jeder Eintrag ist ein echtes Verzeichnis oder eine gewöhnliche Datei.
+///   Ein Symlink (`logs/HEAD`, `refs/heads/main` → Host-Datei) lenkte die
+///   Ref- und Reflog-Schreibzugriffe des Witness an einen fremden Ort; ein
+///   FIFO oder Gerät (auch hinter dem Ref, auf den HEAD zeigt) hielte den
+///   einzigen Schreiber an. Zwei Ausnahmen, die der Witness nie öffnet:
+///   `hooks/` (dort sind Symlinks üblich; weder gix noch `git ls-files`
+///   starten Hooks) und Sockets (etwa der des fsmonitor-Daemons — ein
+///   Socket lässt sich nicht wie eine Datei öffnen, lesen oder anhängen).
+/// - Außerhalb von `objects/` hat keine Datei einen zweiten harten Link —
+///   sonst schriebe ein Append (Reflog) in eine Datei anderswo. In
+///   `objects/` sind harte Links normal (`git clone --local`) und werden dort
+///   nur gelesen oder neu angelegt.
+/// - Kein `commondir` (geteiltes Verzeichnis anderswo) und keine
+///   `objects/info/alternates` (fremde Objektbank).
+///
+/// Ehrliche Grenze: Das ist eine Prüfung vor dem Lauf. Wer zwischen Prüfung
+/// und Zugriff tauscht, oder über `include.path` in der Konfiguration auf
+/// eine fremde Datei verweist, wird hiervon nicht erfasst — das schließt erst
+/// ein auf ein festgehaltenes Git-Verzeichnis eingeschränkter Lauf (EA-10).
+fn plain_repo_layout(root: &Path) -> Fallible<()> {
+    plain_repo_layout_within(root, MAX_GIT_ENTRIES)
+}
+
+/// Höchstzahl der Einträge, die [`plain_repo_layout`] in `.git` ansieht —
+/// und höchste Tiefe. Ein Agent, der `.git` mit Millionen Dateien füllt, soll
+/// den einzigen Schreiber nicht minutenlang beschäftigen; ein Repo dieser
+/// Größe wird vertagt statt geprüft.
+const MAX_GIT_ENTRIES: usize = 200_000;
+const MAX_GIT_DEPTH: usize = 16;
+
+fn plain_repo_layout_within(root: &Path, max_entries: usize) -> Fallible<()> {
+    let dot_git = root.join(".git");
+    let refused = |what: &str| -> Fallible<()> {
+        Err(format!(
+            "witness repository layout is not plain ({}); checkpoint deferred",
+            crate::text::sanitize(what)
+        )
+        .into())
+    };
+    if !fs::symlink_metadata(&dot_git).is_ok_and(|meta| meta.is_dir()) {
+        return refused(".git");
+    }
+    for redirect in ["commondir", "objects/info/alternates"] {
+        if fs::symlink_metadata(dot_git.join(redirect)).is_ok() {
+            return refused(redirect);
+        }
+    }
+    let objects = dot_git.join("objects");
+    // `hooks/` liest und startet der Witness nie (weder gix noch
+    // `git ls-files` rufen Hooks); dort sind Symlinks üblich.
+    let hooks = dot_git.join("hooks");
+    let mut seen = 0usize;
+    let mut stack = vec![(dot_git.clone(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        // Git räumt während des Laufs auf (gc, gelöschte Branches): Was
+        // inzwischen fehlt, ist kein unsicherer Eintrag.
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err.into()),
+        };
+        for entry in entries {
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            seen += 1;
+            if seen > max_entries {
+                return refused("too many entries");
+            }
+            if path == hooks {
+                continue;
+            }
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err.into()),
+            };
+            let kind = meta.file_type();
+            let relative = path.strip_prefix(&dot_git).unwrap_or(&path);
+            if kind.is_dir() {
+                if depth + 1 > MAX_GIT_DEPTH {
+                    return refused("too deep");
+                }
+                stack.push((path, depth + 1));
+            } else if kind.is_socket() {
+                // Ein Socket lässt sich nicht öffnen wie eine Datei — weder
+                // lesen noch anhängen leitet dorthin um (fsmonitor-Daemon).
+            } else if !kind.is_file() {
+                return refused(&relative.display().to_string());
+            } else if meta.nlink() != 1 && !path.starts_with(&objects) {
+                return refused(&format!("{} has another hard link", relative.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Der feste Grund, aus dem ein Trailer nach dem Versiegeln fehlt — für die
+/// Statuszeile, nie fremder Text.
+fn trailer_miss(err: &(dyn std::error::Error + 'static)) -> &'static str {
+    use minds_git::GitError;
+    match err.downcast_ref::<GitError>() {
+        Some(GitError::SignedCommit { .. }) => "the commit is signed",
+        Some(GitError::RefRaced { .. }) => "HEAD kept moving",
+        Some(GitError::NothingToAmend { .. }) => "no commit at HEAD",
+        Some(GitError::MessageNotUtf8 { .. }) => "the commit message is not UTF-8",
+        _ => "trailer error",
     }
 }
 
@@ -543,6 +898,81 @@ impl CheckpointGuard for Writer {
     fn report(&self, message: &str) {
         log(&self.home, message);
     }
+}
+
+/// Obergrenze der Statuszeile im `Ack` (`witness_proto`: 4 KiB).
+const MAX_STATUS: usize = 4 * 1024;
+
+/// Die Statuszeile eines Witness-Checkpoints: Kopfzeile (mit der Zahl der
+/// vertagten Sessions), eine Zeile je Seal,
+/// gegebenenfalls der nachgerüstete Commit — verbunden mit
+/// [`LINE_SEPARATOR`](crate::checkpoint::delegate::LINE_SEPARATOR), weil das
+/// Protokoll nur eine Zeile trägt. Passt nicht alles in 4 KiB, endet sie mit
+/// der Zahl der ausgelassenen Seals; vollständig ist der Ledger.
+///
+/// Die Zahl der vertagten Sessions erfährt jeder, der den Socket erreicht —
+/// über alle Agents dieses Witness. Das ist bewusst: Der Socket ist ohnehin
+/// nur der Agent-Seite dieses einen Repositorys zugänglich, und eine Zahl
+/// verrät keinen Inhalt.
+fn checkpoint_status(
+    sealed: &[SealSummary],
+    deferred: usize,
+    attached: Result<Option<minds_git::TrailerUpdate>, &'static str>,
+) -> String {
+    use crate::checkpoint::delegate::LINE_SEPARATOR;
+    let head = match (sealed.len(), deferred) {
+        (0, 0) => "witness: nothing to seal".to_owned(),
+        (0, m) => format!(
+            "witness: nothing sealed, {m} session(s) deferred — they stay open, see the witness log"
+        ),
+        (n, 0) => format!("witness: {n} range(s) sealed"),
+        (n, m) => format!(
+            "witness: {n} range(s) sealed, {m} session(s) deferred — they stay open, see the witness log"
+        ),
+    };
+    let stored = sealed.iter().any(|s| {
+        matches!(
+            s.seal.outcome,
+            minds_core::evidence::SealOutcome::Stored { .. }
+        )
+    });
+    // Gespeichert, aber nicht getrailert (HEAD ist während des Laufs
+    // weitergewandert): Das muss die Agent-Seite sehen, sonst hielte sie die
+    // Sessions für verknüpft.
+    let tail = match attached {
+        Ok(Some(update)) if update.rewrote_head() => {
+            Some(format!("Trailer retrofitted to {}", update.commit()))
+        }
+        Ok(None) if stored => {
+            Some("Trailer not attached — HEAD moved; see `minds fsck`".to_owned())
+        }
+        Err(reason) if stored => Some(format!("Trailer not attached — {reason}; see `minds fsck`")),
+        _ => None,
+    };
+    let omission = |n: usize| format!("… {n} more — see `minds witness status`");
+    // Platz für Schwanz und Auslassungszeile, aus ihrer tatsächlichen Länge
+    // (SHA-256-Repos haben längere Commit-Ids).
+    let reserve = tail.as_ref().map_or(0, |t| LINE_SEPARATOR.len() + t.len())
+        + LINE_SEPARATOR.len()
+        + omission(sealed.len()).len();
+    let budget = MAX_STATUS.saturating_sub(reserve);
+    let mut lines = vec![head];
+    let mut used = lines[0].len();
+    let mut omitted = 0;
+    for summary in sealed {
+        let line = crate::checkpoint::core::session_sealed_line(summary);
+        if omitted == 0 && used + LINE_SEPARATOR.len() + line.len() <= budget {
+            used += LINE_SEPARATOR.len() + line.len();
+            lines.push(line);
+        } else {
+            omitted += 1;
+        }
+    }
+    if omitted > 0 {
+        lines.push(omission(omitted));
+    }
+    lines.extend(tail);
+    lines.join(LINE_SEPARATOR)
 }
 
 fn is_damaged(item: &ChainItem) -> bool {

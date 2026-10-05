@@ -126,17 +126,43 @@ impl Repo {
     /// - [`GitError::NothingToAmend`] — HEAD hat noch keinen Commit.
     /// - [`GitError::SignedCommit`] — der Commit ist signiert.
     /// - [`GitError::MessageNotUtf8`] — die Message ist kein gültiges UTF-8.
-    /// - [`GitError::RefRaced`] — HEAD hat sich zwischenzeitlich bewegt.
+    /// - [`GitError::RefRaced`] — HEAD hat sich zwischenzeitlich bewegt (auch
+    ///   wenn nichts anzuhängen war: dann steht HEAD nicht mehr auf dem
+    ///   gelesenen Commit, und `Unchanged` wäre eine falsche Auskunft).
     pub fn amend_head_with_sessions(&self, sessions: &[SessionId]) -> Result<TrailerUpdate> {
-        let trailers: Vec<Trailer> = sessions.iter().copied().map(Trailer::SessionId).collect();
-
         let Some(before) = self.head()?.commit() else {
             return Err(GitError::nothing_to_amend(self.git_dir().to_path_buf()));
         };
+        self.amend_commit_with_sessions(before, sessions)
+    }
+
+    /// Wie [`Repo::amend_head_with_sessions`], aber gegen einen **vom
+    /// Aufrufer beobachteten** HEAD-Commit: Der Compare-and-Swap prüft gegen
+    /// genau `before`, nicht gegen einen zweiten Blick auf HEAD.
+    ///
+    /// Für Aufrufer, die HEAD erst prüfen und dann trailern (Wächter-Commit,
+    /// zwei Schreiber, EA-06d): Zwischen Prüfung und Amend darf HEAD nicht
+    /// unbemerkt auf einen anderen Commit springen.
+    ///
+    /// # Fehler
+    ///
+    /// Wie [`Repo::amend_head_with_sessions`]; [`GitError::RefRaced`] auch
+    /// dann, wenn nichts anzuhängen ist, HEAD aber nicht mehr auf `before`
+    /// steht.
+    pub fn amend_commit_with_sessions(
+        &self,
+        before: CommitId,
+        sessions: &[SessionId],
+    ) -> Result<TrailerUpdate> {
+        let trailers: Vec<Trailer> = sessions.iter().copied().map(Trailer::SessionId).collect();
 
         let message = self.message_utf8(before)?;
         let extended = Trailer::append_all(&message, &trailers);
         if extended == message {
+            let current = self.head()?.commit();
+            if current != Some(before) {
+                return Err(GitError::ref_raced("HEAD", Some(before), current));
+            }
             return Ok(TrailerUpdate::Unchanged(before));
         }
 
@@ -144,6 +170,65 @@ impl Repo {
         self.move_head(before, after)?;
 
         Ok(TrailerUpdate::Amended { before, after })
+    }
+
+    /// Ob `after` aus `before` allein durch nachgerüstete Session-Trailer
+    /// hervorgegangen sein kann — also genau das, was
+    /// [`Repo::amend_head_with_sessions`] erzeugt.
+    ///
+    /// Gebraucht wird das, wo **zwei Schreiber** an denselben Commit trailern
+    /// (EA-06d: erst der Witness, dann der lokale Checkpoint). Der erste
+    /// Amend verschiebt HEAD; der zweite Schreiber hält noch den alten
+    /// Wächter-Commit in der Hand und muss erkennen können, dass HEAD nicht
+    /// weitergewandert ist, sondern nur denselben Commit mit mehr Trailern
+    /// trägt.
+    ///
+    /// Geprüft wird streng und ohne Heuristik:
+    ///
+    /// - Der Kopf des Commit-Objekts (Baum, Eltern, Autor, Committer, Encoding,
+    ///   Extra-Header) ist Byte für Byte gleich.
+    /// - Die Message von `after` ist exakt `before` plus die Session-Trailer
+    ///   von `after`, angehängt nach den Regeln von
+    ///   [`Trailer::append_all`]. Jede andere Änderung an der Message — auch
+    ///   ein fremder Trailer — ergibt `false`.
+    ///
+    /// `before == after` ergibt `true` (null nachgerüstete Trailer).
+    ///
+    /// Die Strenge ist gewollt einseitig: Im Zweifel `false`. Das kostet
+    /// schlimmstenfalls einen fehlenden Trailer (sichtbar über `minds fsck`),
+    /// nie einen Trailer am falschen Commit.
+    ///
+    /// # Fehler
+    ///
+    /// Wie beim Nachrüsten: nicht lesbare Objekte und Messages, die kein UTF-8
+    /// sind ([`GitError::MessageNotUtf8`]) — ein solcher Commit wird ohnehin
+    /// nie umgeschrieben.
+    pub fn is_trailer_retrofit(&self, before: CommitId, after: CommitId) -> Result<bool> {
+        if self.header_bytes(before)? != self.header_bytes(after)? {
+            return Ok(false);
+        }
+        let old = self.message_utf8(before)?;
+        let new = self.message_utf8(after)?;
+        let trailers: Vec<Trailer> = Trailer::session_ids(&new)
+            .into_iter()
+            .map(Trailer::SessionId)
+            .collect();
+        Ok(Trailer::append_all(&old, &trailers) == new)
+    }
+
+    /// Der Kopf eines Commit-Objekts: alle Bytes vor der Leerzeile, hinter der
+    /// die Message beginnt.
+    fn header_bytes(&self, commit: CommitId) -> Result<Vec<u8>> {
+        let object = self
+            .gix()
+            .find_commit(commit.to_gix())
+            .map_err(|err| GitError::read_object(commit, err))?;
+        let data = &object.data;
+        let end = data
+            .windows(2)
+            .position(|pair| pair == b"\n\n")
+            .unwrap_or(data.len());
+        Ok(data[..end].to_vec())
     }
 
     /// Die Message eines Commits, **streng** nach UTF-8 gewandelt.
@@ -213,11 +298,28 @@ impl Repo {
     /// `before`.
     ///
     /// `deref: true` lässt die Transaktion dem symbolischen HEAD folgen: Steht
-    /// er auf einem Branch, bewegt sich der Branch (wie bei `git commit`);
-    /// ist er detached, bewegt sich HEAD selbst. Genau das tut auch
-    /// `git commit --amend` — und es ist der Grund, warum dieser Helfer im
-    /// Rebase funktioniert, wo es keinen Branch gibt.
+    /// er auf einem Branch, bewegt sich der Branch (wie bei `git commit`), und
+    /// beide Reflogs bekommen eine vollständige Zeile — `HEAD@{1}` zeigt danach
+    /// auf den Commit vor dem Amend. Ist HEAD detached, bewegt sich HEAD
+    /// selbst. Genau das tut auch `git commit --amend` — und es ist der Grund,
+    /// warum dieser Helfer im Rebase funktioniert, wo es keinen Branch gibt.
+    ///
+    /// # Der Lock des Branches, vorher geprüft
+    ///
+    /// gix-ref 0.65 läuft in eine Endlosschleife, wenn der Lock eines Refs,
+    /// den die Transaktion aus HEAD **abgeleitet** hat, nicht zu bekommen ist
+    /// (`file/transaction/prepare.rs`, Fehlerzweig für `LockAcquire`: Beim
+    /// Suchen des Namens rückt der Cursor nie vor). Eine liegengelassene
+    /// Lock-Datei, ein nicht beschreibbares `refs/heads/`, ein Pfadkonflikt —
+    /// beim Witness (EA-06d) alles vom Agenten herstellbar — hielte den
+    /// Schreiber für immer an. Deshalb nehmen wir den Lock des Branches vorher
+    /// einmal selbst, genau wie gix ihn nähme, und geben ihn sofort wieder ab:
+    /// Was ihn verhindert, ist dann ein gewöhnlicher Fehler. Welche Ketten
+    /// hinter HEAD erlaubt sind und wie aufgelöst wird, steht an
+    /// [`Repo::probe_branch_lock`]. Offen bleibt nur ein Lock, der genau
+    /// zwischen Probe und Erwerb entsteht, bis gix den Fehler behebt.
     fn move_head(&self, before: CommitId, after: CommitId) -> Result<()> {
+        self.probe_branch_lock()?;
         let edit = RefEdit {
             change: Change::Update {
                 log: LogChange {
@@ -248,7 +350,100 @@ impl Repo {
             }
         }
     }
+
+    /// Nimmt die Locks aller Refs, die gix aus HEAD ableiten wird, einmal
+    /// selbst und gibt sie wieder ab (siehe [`Repo::move_head`]). Detached
+    /// HEAD: nichts zu prüfen — dort gibt es keinen abgeleiteten Ref.
+    ///
+    /// Gefolgt wird der symbolischen Kette wie bei Git höchstens
+    /// [`MAX_SYMREF_DEPTH`] Stufen weit (ein Alias `master → main` bleibt
+    /// möglich). Jede Stufe muss unter `refs/heads/` liegen: Nur dort liegt der
+    /// Ref sicher im gemeinsamen Git-Verzeichnis, wo die Probe ihn sucht.
+    /// Worktree-private Refs (`refs/worktree/*`, `refs/bisect/*`, …) legt gix
+    /// anderswo ab; eine Probe am falschen Ort ließe die Endlosschleife offen.
+    /// `git commit` legt einen solchen HEAD nie an — also benannt ablehnen.
+    ///
+    /// Gewartet wird so lange, wie gix selbst warten würde ([`LOCK_WAIT`]): Hält
+    /// der andere Minds-Schreiber oder ein paralleles `git` den Lock kurz,
+    /// ist das kein Fehler. Bei einer Kette aus n Gliedern sind das höchstens
+    /// n × 2 s, danach wartet gix selbst noch einmal bis zu 2 s.
+    fn probe_branch_lock(&self) -> Result<()> {
+        let refused = |why: &str| GitError::commit("HEAD", std::io::Error::other(why.to_owned()));
+        // Mit einem Ref-Namespace legt gix jeden Lock unter
+        // `refs/namespaces/<ns>/…` an — die Probe säße am falschen Ort.
+        if self.has_ref_namespace() {
+            return Err(refused("refs namespaces are not supported"));
+        }
+        // Auch HEAD selbst so, wie die Transaktion es liest: nur lose, und nur
+        // unter seinem eigenen Namen.
+        let head = self
+            .gix()
+            .refs
+            .try_find_packed("HEAD", None)
+            .map_err(|err| GitError::commit("HEAD", err))?
+            .ok_or_else(|| refused("HEAD cannot be resolved"))?;
+        if head.name.as_bstr() != "HEAD" {
+            return Err(refused("HEAD resolves through an ambiguous ref name"));
+        }
+        let gix::refs::Target::Symbolic(first) = head.target else {
+            return Ok(());
+        };
+        let mut chain = vec![first];
+        loop {
+            let name = chain.last().expect("die Kette ist nie leer").clone();
+            if !name.as_bstr().starts_with(b"refs/heads/") {
+                return Err(refused("HEAD points at a ref outside refs/heads/"));
+            }
+            // Genau so auflösen wie die Transaktion von gix: nur lose Refs,
+            // mit ihrer Teilnamen-Suche (`tags/…`, `heads/…`, `remotes/…`).
+            // Findet die etwas unter einem anderen Namen, folgte gix einem
+            // Ref, den diese Probe nie gesehen hätte.
+            match self.gix().refs.try_find_packed(name.as_bstr(), None) {
+                Ok(Some(found)) => {
+                    if found.name != name {
+                        return Err(refused("HEAD resolves through an ambiguous ref name"));
+                    }
+                    match found.target {
+                        gix::refs::Target::Symbolic(next) => {
+                            if chain.len() >= MAX_SYMREF_DEPTH {
+                                return Err(refused(
+                                    "HEAD points at a too long symbolic ref chain",
+                                ));
+                            }
+                            chain.push(next);
+                        }
+                        gix::refs::Target::Object(_) => break,
+                    }
+                }
+                // Nur gepackt oder ungeboren: gix legt den Lock am losen Ort
+                // an — genau dort prüft die Probe unten.
+                Ok(None) => break,
+                Err(err) => return Err(GitError::commit("HEAD", err)),
+            }
+        }
+        let base = self.common_dir().to_owned();
+        for name in &chain {
+            let path = base.join(gix::path::from_bstr(name.as_bstr()));
+            gix::lock::File::acquire_to_update_resource(
+                &path,
+                gix::lock::acquire::Fail::AfterDurationWithBackoff(LOCK_WAIT),
+                Some(base.clone()),
+            )
+            .map(drop)
+            .map_err(|err| GitError::commit("HEAD", err))?;
+        }
+        Ok(())
+    }
 }
+
+/// Höchste Zahl symbolischer Glieder hinter HEAD — so viele, wie gix (vier
+/// Runden) und Git (`SYMREF_MAXDEPTH` samt HEAD) folgen. Begrenzt zugleich, wie
+/// lange die Probe auf Locks warten kann.
+const MAX_SYMREF_DEPTH: usize = 4;
+
+/// So lange wartet die Lock-Probe, so lange wartet gix danach selbst
+/// (`core.filesRefLockTimeout`, festgelegt in `repo.rs`).
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Übernimmt Autor bzw. Committer aus dem alten Commit.
 ///
@@ -493,6 +688,9 @@ mod tests {
         repo.amend_head_with_sessions(&[id('a')]).unwrap();
 
         let reflog = fixture.git(&["reflog", "--format=%H %gs"]);
+        // `HEAD@{1}` ist der Weg zurück, den ein Nutzer nach dem Amend nimmt:
+        // Er muss auf den Commit davor zeigen.
+        assert_eq!(fixture.rev_parse("HEAD@{1}"), before);
         assert!(
             reflog.contains("minds"),
             "Vorgang nicht benannt: {reflog:?}"
@@ -605,6 +803,258 @@ mod tests {
             let update = repo.amend_head_with_sessions(&[id('a')]).unwrap();
             assert_eq!(repo.session_ids_of(update.commit()).unwrap(), vec![id('a')]);
         }
+    }
+
+    #[test]
+    fn a_retrofit_by_another_writer_is_recognized() {
+        // EA-06d: Erst trailert der Witness, dann der lokale Checkpoint — der
+        // zweite muss den Commit des ersten als „denselben" erkennen, auch
+        // über zwei Amends und einen schon vorhandenen fremden Trailer hinweg.
+        let (_fixture, repo, before) =
+            repo_with_commit("fix: etwas\n\nSigned-off-by: A <a@x.invalid>\n");
+        assert!(repo.is_trailer_retrofit(before, before).unwrap());
+
+        let witness = repo.amend_head_with_sessions(&[id('a')]).unwrap().commit();
+        assert!(repo.is_trailer_retrofit(before, witness).unwrap());
+
+        let local = repo.amend_head_with_sessions(&[id('b')]).unwrap().commit();
+        assert!(repo.is_trailer_retrofit(before, local).unwrap());
+        assert!(repo.is_trailer_retrofit(witness, local).unwrap());
+        // Die Richtung zählt: Trailer verschwinden nie.
+        assert!(!repo.is_trailer_retrofit(local, witness).unwrap());
+    }
+
+    #[test]
+    fn anything_but_a_session_trailer_is_not_a_retrofit() {
+        let (fixture, repo, before) = repo_with_commit("feat: eins");
+
+        // Ein neuer Commit obendrauf: andere Eltern, anderer Baum.
+        fixture.write_file("b.txt", "b\n");
+        let next = fixture.commit("feat: eins");
+        assert!(!repo.is_trailer_retrofit(before, next).unwrap());
+
+        // Gleicher Baum und gleiche Eltern, aber die Message wurde umformuliert
+        // (`git commit --amend -m`, mit festgehaltenem Zeitstempel).
+        fixture.git(&["reset", "--quiet", "--hard", &before.to_string()]);
+        let reworded = amend_message(&fixture, "feat: zwei");
+        assert!(!repo.is_trailer_retrofit(before, reworded).unwrap());
+
+        // Ein fremder Trailer ist kein Session-Trailer.
+        fixture.git(&["reset", "--quiet", "--hard", &before.to_string()]);
+        let foreign = amend_message(&fixture, "feat: eins\n\nSigned-off-by: B <b@x.invalid>");
+        assert!(!repo.is_trailer_retrofit(before, foreign).unwrap());
+    }
+
+    /// `git commit --amend` mit neuer Message. Die Fixture hält Identität und
+    /// Zeitstempel fest — der Kopf des Objekts bleibt gleich, und nur die
+    /// Message entscheidet.
+    fn amend_message(fixture: &TempRepo, message: &str) -> CommitId {
+        fixture.git(&[
+            "commit",
+            "--quiet",
+            "--amend",
+            "--allow-empty",
+            "-m",
+            message,
+        ]);
+        fixture.rev_parse("HEAD")
+    }
+
+    #[test]
+    fn a_locked_branch_fails_fast_even_with_a_forever_lock_timeout() {
+        // EA-06d: `.git/config` gehört dem Agenten. „Ewig warten" in der
+        // Konfiguration gilt nicht, und eine liegengelassene Lock-Datei des
+        // Branches endet in einem benannten Fehler statt in der Endlosschleife
+        // von gix-ref (siehe `move_head`).
+        let (fixture, _, before) = repo_with_commit("feat: eins");
+        fixture.git(&["config", "core.filesRefLockTimeout", "-1"]);
+        fixture.git(&["config", "core.packedRefsTimeout", "-1"]);
+        let path = fixture.path().to_owned();
+        {
+            let repo = Repo::open(&path).unwrap();
+            let snapshot = repo.gix().config_snapshot();
+            assert_eq!(snapshot.integer("core.filesRefLockTimeout"), Some(2000));
+            assert_eq!(snapshot.integer("core.packedRefsTimeout"), Some(2000));
+            let discovered = Repo::discover(path.join("src")).unwrap();
+            assert_eq!(
+                discovered
+                    .gix()
+                    .config_snapshot()
+                    .integer("core.filesRefLockTimeout"),
+                Some(2000)
+            );
+        }
+        std::fs::write(path.join(".git/refs/heads/main.lock"), "").unwrap();
+        assert_fails_in_time(&path);
+        assert_eq!(fixture.rev_parse("HEAD"), before, "HEAD unberührt");
+        std::fs::remove_file(path.join(".git/refs/heads/main.lock")).unwrap();
+
+        // Eine symbolische Kette HEAD → a → main mit gesperrtem Ende: früher
+        // die Endlosschleife in gix-ref, jetzt ein benannter Fehler.
+        fixture.git(&["symbolic-ref", "refs/heads/a", "refs/heads/main"]);
+        fixture.git(&["symbolic-ref", "HEAD", "refs/heads/a"]);
+        std::fs::write(path.join(".git/refs/heads/main.lock"), "").unwrap();
+        assert_fails_in_time(&path);
+        std::fs::remove_file(path.join(".git/refs/heads/main.lock")).unwrap();
+
+        // HEAD auf einen Ref außerhalb von `refs/heads/` (worktree-privat):
+        // benannt abgelehnt, ohne gix zu fragen.
+        fixture.git(&["update-ref", "refs/worktree/x", &before.to_string()]);
+        fixture.git(&["symbolic-ref", "HEAD", "refs/worktree/x"]);
+        let err = assert_fails_in_time(&path);
+        assert!(err.contains("outside refs/heads/"), "{err}");
+        fixture.git(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+
+        // Dieselbe Falle über die Präfixe, die gix auf `refs/heads/main`
+        // abbildet (`main-worktree/…`, `worktrees/<n>/…`), mit gesperrtem
+        // Ziel: Die Probe säße am falschen Ort — also benannt abgelehnt.
+        std::fs::write(path.join(".git/refs/heads/main.lock"), "").unwrap();
+        for target in [
+            "main-worktree/refs/heads/main",
+            "worktrees/x/refs/heads/main",
+        ] {
+            std::fs::write(path.join(".git/HEAD"), format!("ref: {target}\n")).unwrap();
+            let err = assert_fails_in_time(&path);
+            assert!(err.contains("outside refs/heads/"), "{target}: {err}");
+        }
+        std::fs::remove_file(path.join(".git/refs/heads/main.lock")).unwrap();
+        // `git` selbst erkennt das Repo mit so einem HEAD nicht mehr.
+        std::fs::write(path.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        // Ein nicht beschreibbares `refs/heads/`: Der Lock lässt sich gar nicht
+        // anlegen. (Als root greifen Rechte nicht — dann nichts zu prüfen.)
+        use std::os::unix::fs::PermissionsExt;
+        let heads = path.join(".git/refs/heads");
+        std::fs::set_permissions(&heads, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Scheitert eine Prüfung, muss das Verzeichnis trotzdem wieder
+        // beschreibbar werden — sonst räumt `TempRepo` nicht auf.
+        struct Writable(std::path::PathBuf);
+        impl Drop for Writable {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let restore = Writable(heads.clone());
+        let probe = heads.join("probe");
+        if std::fs::write(&probe, "").is_err() {
+            assert_fails_in_time(&path);
+        } else {
+            std::fs::remove_file(&probe).unwrap();
+        }
+        drop(restore);
+        assert_eq!(fixture.rev_parse("HEAD"), before, "HEAD unberührt");
+
+        // Ohne Hindernis geht es wieder durch — auch über einen Alias.
+        fixture.git(&["symbolic-ref", "HEAD", "refs/heads/a"]);
+        let repo = Repo::open(&path).unwrap();
+        assert!(
+            repo.amend_head_with_sessions(&[id('a')])
+                .unwrap()
+                .rewrote_head()
+        );
+        assert_ne!(
+            fixture.rev_parse("refs/heads/main"),
+            before,
+            "der Alias bewegt main"
+        );
+    }
+
+    #[test]
+    fn a_briefly_held_branch_lock_is_waited_for() {
+        // Zwei Schreiber (EA-06d): Hält der andere den Lock kurz, wartet die
+        // Probe wie gix selbst, statt zu scheitern.
+        let (fixture, repo, before) = repo_with_commit("feat: eins");
+        let lock = fixture.path().join(".git/refs/heads/main.lock");
+        std::fs::write(&lock, "").unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::remove_file(lock).unwrap();
+        });
+        let update = repo.amend_head_with_sessions(&[id('a')]).unwrap();
+        release.join().unwrap();
+        assert!(update.rewrote_head());
+        assert_ne!(fixture.rev_parse("HEAD"), before);
+    }
+
+    /// Der Amend muss scheitern — und zwar binnen Frist, nicht nie. Gibt den
+    /// Fehlertext zurück.
+    fn assert_fails_in_time(path: &std::path::Path) -> String {
+        let path = path.to_owned();
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Repo::open(&path)
+                .and_then(|repo| repo.amend_head_with_sessions(&[id('a')]).map(drop));
+            let _ = done.send(result.err().map(|err| format!("{err} {err:?}")));
+        });
+        outcome
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("der Amend hängt")
+            .expect("das Hindernis muss den Amend scheitern lassen")
+    }
+
+    #[test]
+    fn a_planted_partial_name_or_a_namespace_is_refused() {
+        // Nur gepackt: Die Transaktion von gix sucht den Branch lose und fällt
+        // auf Teilnamen zurück — ein gepflanztes `tags/refs/heads/main` mit
+        // symbolischem Ziel lenkte sie an einen Lock, den die Probe nie sähe.
+        let (fixture, _, _) = repo_with_commit("feat: eins");
+        let path = fixture.path().to_owned();
+        fixture.git(&["pack-refs", "--all"]);
+        assert!(!path.join(".git/refs/heads/main").exists());
+        std::fs::create_dir_all(path.join(".git/tags/refs/heads")).unwrap();
+        std::fs::write(
+            path.join(".git/tags/refs/heads/main"),
+            "ref: refs/worktree/z\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(path.join(".git/refs/worktree")).unwrap();
+        std::fs::write(path.join(".git/refs/worktree/z.lock"), "").unwrap();
+        let err = assert_fails_in_time(&path);
+        assert!(err.contains("ambiguous ref name"), "{err}");
+        std::fs::remove_dir_all(path.join(".git/tags")).unwrap();
+        std::fs::remove_file(path.join(".git/refs/worktree/z.lock")).unwrap();
+
+        // Nur gepackt, ohne Falle: geht durch.
+        let repo = Repo::open(&path).unwrap();
+        assert!(
+            repo.amend_head_with_sessions(&[id('a')])
+                .unwrap()
+                .rewrote_head()
+        );
+
+        // Ein Ref-Namespace verschiebt jeden Lock-Pfad: benannt abgelehnt.
+        fixture.git(&["config", "gitoxide.core.refsNamespace", "agent"]);
+        assert!(Repo::open(&path).unwrap().has_ref_namespace());
+        // Schon HEAD löst gix dann im Namespace auf; ob das oder die Probe
+        // ablehnt — es endet benannt und binnen Frist.
+        assert_fails_in_time(&path);
+    }
+
+    #[test]
+    fn amending_a_commit_that_is_no_longer_head_is_a_race() {
+        // EA-06d: Geprüft wurde HEAD = `first`; inzwischen steht HEAD woanders.
+        // Ob noch etwas anzuhängen ist oder nicht — HEAD wird nicht angefasst.
+        let (fixture, repo, first) = repo_with_commit("feat: eins");
+        let trailered = repo.amend_head_with_sessions(&[id('a')]).unwrap().commit();
+        fixture.write_file("b.txt", "b\n");
+        let second = fixture.commit("feat: zwei");
+
+        for sessions in [vec![id('b')], vec![]] {
+            let err = repo
+                .amend_commit_with_sessions(first, &sessions)
+                .unwrap_err();
+            assert!(matches!(err, GitError::RefRaced { .. }), "{err}");
+        }
+        // Auch „schon alles da" am alten Commit ist kein stiller Erfolg.
+        let err = repo
+            .amend_commit_with_sessions(trailered, &[id('a')])
+            .unwrap_err();
+        assert!(matches!(err, GitError::RefRaced { .. }), "{err}");
+        assert_eq!(
+            fixture.rev_parse("HEAD"),
+            second,
+            "HEAD bleibt unangetastet"
+        );
     }
 
     #[test]
