@@ -16,6 +16,37 @@ Prepares the repository for Minds: registers the hooks with the agent and the re
 minds enable --agent claude-code -v
 ```
 
+### minds enable --witness
+
+```
+minds enable [--agent <name>] --witness container|user|managed
+```
+
+Runs the normal `enable` steps first, then sets up a witnessed configuration. No step runs a privileged command, no existing file is overwritten — when a file already exists with different content, `<name>.minds-proposed` is written next to it and the report says so — and no service is started. Reruns are idempotent.
+
+- **`container`** (run on the host, in the repository): `minds witness init` with `--path-map /workspaces/<name>=<root> --profile container` and `minds witness keygen` (skipped when the key pair exists; an incomplete pair stops `enable` — remove `key/witness_ed25519*` and rerun) in the witness home (`MINDS_WITNESS_HOME`, otherwise `$XDG_STATE_HOME/minds-witness/<repo-id>`; it must lie outside the repository, symlinks resolved). Writes `.devcontainer/devcontainer.json` and `.devcontainer/compose.yaml` from the EA-S2 templates, which mount only `$MINDS_WITNESS_HOME/run` at `/run/minds-witness` and set `MINDS_WITNESS_SOCKET`. Installs a user service — `~/.config/systemd/user/minds-witness-<repo-id>.service` on Linux, `~/Library/LaunchAgents/dev.minds.witness.<repo-id>.plist` on macOS — and prints the exact command to enable it. If a different service file already exists, it is left alone, the template goes next to it as `*.minds-proposed`, and the report asks you to review and move it into place before starting. The service file must not lie inside the repository. Prints the host variables Compose needs and the witness key's `allowed_signers` line: keep it in a file outside the repository that the team distributes out of band, and pass that file to `minds verify --signers`. The report also shows the pins `init` recorded (git dir, store, policy source). The service runs the `minds` binary you ran `enable` with; a binary inside the repository (e.g. `target/release/minds`) or a writable one with more than one hard link is refused, because the agent could replace it and the service would run it on the host. A child-repo store is pinned only from `--child-repo` given to this `enable`, never from `.git/config` alone. `.devcontainer/` is part of the isolation boundary and lives in the agent-writable repository: review every change to it; `minds doctor` on the host fails when `.devcontainer/` holds anything but the two unchanged templates (and `*.minds-proposed`), e.g. a `.env` or a second `devcontainer.json`, or when `.devcontainer.json` exists at the repository root. On macOS, container recording stays unqualified until the EA-S2 measurements pass.
+- **`user`**: prints the exact steps for a dedicated OS user `minds-witness` and group `minds-agents` (install minds from a verified release artifact, never from the agent's account; home ownership with group traverse on `/var/lib/minds-witness`; sharing the repository with the group as its owner, never as root, inside a block that stops on a planted symlink; socket group; `witness init --profile user --socket-group minds-agents`) including the systemd unit for that user. Nothing is executed.
+- **`managed`**: writes only `managed-settings.minds-proposed.json` (the EA-S1 settings, aimed at this repository's witness home, `.claude/` and binary) with a `$comment` header: the profile yields A1 until EA-S1 says otherwise. Paths with glob or rule metacharacters are refused, since a rule could not protect them. The file lies in the agent-writable repository, so the report prints its BLAKE3 digest: compare it before installing.
+
+```
+minds enable --agent claude-code --witness container
+```
+
+### minds doctor
+
+```
+minds doctor [--probe-home <dir>]
+```
+
+Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of reason; exit 0 without `fail`, otherwise 1. Checks the agent hook registrations, the Git hooks and the store config (same wording as `minds fsck`), then the witness:
+
+- **Agent side** (`MINDS_WITNESS_SOCKET` set or `--probe-home` given): the socket variable is set, the witness answers `ping`, and the **isolation probe** — `doctor` tries to open the witness home given with `--probe-home` and the private files in it (non-blocking; a FIFO does not hang it). If anything opens, the result is `fail` ("agent can reach the witness home"). A home that exists but is refused (`EACCES`, e.g. the `user` profile) is `ok` — that is proof. A home that is simply absent (the `container` profile) is only `warn`: absence in another mount namespace proves nothing. On Linux, `doctor` also reads `/proc/self/mountinfo` and fails if a mount exposes the witness home other than its `run/` — a heuristic that does not recognise a mount of a parent directory or a source on another partition, so "nothing found" stays `warn`. Check the container's mounts yourself. An empty `--probe-home` is `fail`, and so is an unclear error (anything but `EACCES`/`ENOENT`/`ENOTDIR`) with `--probe-home`. Without it, `doctor` probes `MINDS_WITNESS_HOME` or the default location: nothing there is at most `warn`, since a missing default path proves little; something that opens is still `fail`. Nothing is read; an opened path is closed immediately.
+- **Host side** (`witness.json` in the witness home): profile, pins (`fail` without them), whether the witness answers, the key private, and — for the `container` profile — whether `.devcontainer/` holds exactly the two unchanged templates plus at most their two proposals (`devcontainer.json.minds-proposed`, `compose.yaml.minds-proposed`), all as regular files, and the repository root has no `.devcontainer.json` (`fail` if not). It also looks for code a `git` on the host would run — hooks other than the minds blocks (and `*.sample`), and `.git/config` keys known to run commands (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, `filter.*`, `diff.*.textconv`, `include.path`, `!`-aliases and others) — and reports findings as `warn`. This is a heuristic, not proof: a list cannot cover everything an agent can put into `.git` (`commondir`, `config.worktree`, new git keys, nested repositories). Do not run git on the host in a tree the agent wrote. A `.env` at the repository root is a `warn`. If a witness dev container is set up but no witness home is found, that is `fail`, not "not configured". The home is derived from the repository directory itself, never via `git rev-parse` (which follows `core.worktree`). Run it right before every reopen or rebuild of the container. A host-side `ok` is a snapshot of the files, not proof of how the running container was built; an agent-side `ok` comes from a binary running in the agent's environment and is advisory.
+
+```
+minds doctor --probe-home /home/alice/.local/state/minds-witness/86f649449fc18941
+```
+
 ## Daily use
 
 ### minds show
@@ -220,24 +251,87 @@ minds seals --session b3a1f0e --limit 5
 
 ```sh
 minds witness init --repo /host/project --home /private/witness \
-  --path-map /workspaces/project=/host/project
+  --path-map /workspaces/project=/host/project [--profile container|user|managed] \
+  [--socket-group <group>] [--child-repo <path>] [--policy-rev <rev>]
 minds witness keygen --home /private/witness
 minds witness run --home /private/witness --follow
 minds witness status --home /private/witness
 ```
 
-The Unix-only daemon owns one repository. `init` creates schema-version-1
+The Unix-only daemon owns one repository. `init` creates a schema-version-2
 `witness.json` and private journal, epoch, key, ledger, log and runtime directories.
-Omit `--path-map` for a local user profile; with a map the profile is `container`.
-The map must connect an absolute agent repository root to the canonical host root.
-Configuration may also select `managed` and a numeric `socket_group`; profile
-selection alone does not establish an assurance level.
+Without `--profile`, omitting `--path-map` selects `user` and a map selects
+`container`; `container` requires a map, `user` and `managed` refuse one, and
+`--socket-group` (name or number; `user` only) lets that group traverse the home
+and `run/` (mode 0710) to reach the socket. The map must connect an absolute agent
+repository root to the canonical host root. Profile selection alone does not
+establish an assurance level. `minds enable --witness` runs `init` for you.
+
+`init` **pins** what the witness trusts, so nothing the agent can edit later
+redirects it, and prints what it pinned:
+
+- the canonical git directory (exactly `<root>/.git`; linked worktrees are refused);
+- the store: in-repo with the context ref from the repository config (only under
+  `refs/minds/`), or a child repository — only when you name it with
+  `--child-repo <path>` (outside the observed repository). If the repository
+  config selects a child repository you did not name, `init` stops instead of
+  pinning a path the agent may have written;
+- a witness-owned redaction policy: `.minds/redact.json` from a **commit** —
+  HEAD, or the revision you name with `--policy-rev` — preferably the full id of
+  the reviewed commit, which the agent cannot redirect (a full id is taken as a
+  commit even if a ref of that name exists; ref names like `origin/main` are
+  agent-writable locally) — never the worktree. It is read through the pinned git directory
+  without config includes and without `refs/replace/*`, size-checked before it is
+  read, and verified: commit, every tree on the path and the blob are re-hashed
+  from the bytes read and must match their ids (gix does not verify on read, and
+  the agent may own `.git/objects`). It is floored at the strict default. Only "the file is not in that commit"
+  (or "no commit yet") falls back to the strict default; any other error stops
+  `init`. A policy that would redact its own placeholders (e.g. a term like
+  `redacted`) is refused — it would make every redacted session unstable. Local
+  refs belong to the agent too, so the report names the full commit and blob id
+  (also when `init` finds the home unchanged): compare them with the version your
+  team reviewed. Trees on the path must be sorted without duplicates (as `git fsck`
+  requires), commits and trees are size-limited, and `init` refuses when
+  `refs/replace` or `info/grafts` exists — your own `git` would show other content. On a pinned home, a `--policy-rev` whose policy differs is
+  refused, not ignored.
+
+The running witness never reads `.minds/redact.json` or the store keys in
+`.git/config` again. `init` is idempotent: the same configuration is left as it is
+(pins included); a different one — including a `--child-repo` other than the
+pinned store — is never overwritten, and the error names what differs. A schema-1 `witness.json` (from before the pins) still loads, but the
+witness refuses to run or seal with it — fail-closed, since the team's extra
+redaction terms would otherwise be dropped silently. Running `init` again with the
+same arguments adds the pins (stop the witness first).
 
 `run` requires a generated key and refuses symlinked, foreign-owned or insufficiently
 private state. A process lock enforces a single writer even during stale-socket
 recovery. Only `run/witness.sock` (0660) belongs in the agent's namespace; keep
-the rest of the 0700 state directory on the host. Deployment and group access
-configuration remain part of the later enable integration.
+the rest of the state directory on the host.
+
+**Checkpoint requests run in a worker process.** The witness starts its own binary
+(`minds witness __checkpoint`, internal) per request, with a 60-second deadline,
+CPU, file-size, open-file and core limits (plus a data-segment limit on Linux), and its own process group. It opens the
+pinned git directory once, without following `include.path`/`includeIf`, and reads
+tracked paths from the index directly instead of running `git ls-files`. A worker
+that blocks (a FIFO swapped in after the layout check, the gix-ref lock loop), dies
+(`SIGBUS` from a truncated mapped pack) or overruns the deadline costs only that
+request — the witness keeps running and the sessions stay open. At the deadline the
+worker first gets `SIGTERM` (it removes the lock files gix holds) and `SIGKILL` two
+seconds later; lock files still left behind are named in `log/witness.log`. The
+worker's diagnostics reach the witness log through the witness, deduplicated and
+redacted; an overlong line is dropped, never cut. The rate limit applies **per
+client**, where the client is the requested commit (and the commit the trailers
+were retrofitted to): one run per second each, so an agent requesting checkpoints
+for its commit every second does not make the human's post-commit request for a
+new commit see `rate limited`. A **failed** run blocks every client for that
+second, so made-up commit ids get at most one run per second. Every repeated line
+in `log/witness.log` is deduplicated within a minute and the count is written
+later; a panic prints a fixed line instead of the panic message.
+
+Honest limit: the layout check before a run cannot stop the agent from swapping an
+entry inside `.git` for a symlink between the check and the worker's write — the
+worker runs as the witness user. Closing that needs file access relative to an open
+directory descriptor, which gix does not offer.
 
 Hook frames are parsed and secret-file-filtered using the same code as local hooks.
 Each journal append advances a salted, atomically persisted chain. Restart checks
@@ -248,14 +342,11 @@ prompts, arguments or tool responses. Redacted diagnostics go to `log/witness.lo
 `status` shows the profile, repository, socket health, open hook sessions, most recent
 event, key fingerprint and the ten latest ledger entries.
 
-The internal checkpoint entry point checks the live root before sealing, signs under
-`minds-witness` with scope `witness/v1`, records each seal once in the fsynced ledger,
-and attaches the standard session trailers. Path mapping affects artifact reads only;
-stored hook paths and payloads retain the agent namespace. Host transcripts are never
-loaded from hook-supplied paths. Lifecycle events remain chained in the witness stream
-and are not yet sealed. Socket checkpoint delegation, hook forwarding, filesystem
-observation and enable integration are separate follow-up features; checkpoint and
-intent requests currently receive `not supported`.
+The checkpoint checks the live root before sealing, signs under `minds-witness` with
+scope `witness/v1`, records each seal once in the fsynced ledger, and attaches the
+standard session trailers. Path mapping affects artifact reads only; stored hook paths
+and payloads retain the agent namespace. Host transcripts are never loaded from
+hook-supplied paths. Intent requests currently receive `not supported`.
 
 On non-Unix platforms, `minds witness` exits 4 with
 `not supported on this platform`.

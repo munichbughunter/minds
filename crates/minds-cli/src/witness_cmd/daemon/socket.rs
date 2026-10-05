@@ -109,7 +109,7 @@ impl Drop for Socket {
     }
 }
 
-pub(super) fn ping(path: &Path) -> bool {
+pub(crate) fn ping(path: &Path) -> bool {
     let request = witness_proto::encode(&Frame::Ping).expect("static ping");
     let Ok(mut stream) = UnixStream::connect(path) else {
         return false;
@@ -294,12 +294,26 @@ struct Marker {
 pub fn run(home: &Path, follow: bool) -> Fallible<()> {
     let home: PathBuf = home.components().collect();
     let config = load(&home)?;
+    if !config.pinned() {
+        return Err(UNPINNED.into());
+    }
     refuse_home_in_repo(&home, &config)?;
     let _lock = lock(&home)?;
     let _signals = Signals::install()?;
+    // Eine feste Zeile statt der Panic-Meldung aus gix (EA-10).
+    worker::install_panic_hook(&home);
     let key_fingerprint = fingerprint(&home)?;
     let socket = Socket::bind(&home, config.socket_group)?;
     let mut writer = Writer::open(&home, config, follow)?;
+    // Der Checkpoint läuft als eigener Prozess desselben Binaries (EA-10).
+    // Unter Linux über `/proc/self/exe`: Das ist auch nach einem Update an Ort
+    // und Stelle genau das laufende Binary — kein Worker einer anderen
+    // Version, kein „(deleted)"-Pfad, der jeden Lauf scheitern ließe.
+    writer.worker = Some(if cfg!(target_os = "linux") {
+        PathBuf::from("/proc/self/exe")
+    } else {
+        std::env::current_exe()?
+    });
     let marker_path = home.join("run/lifecycle.json");
     let previous = match fs::read(&marker_path) {
         Ok(bytes) => {
@@ -335,11 +349,9 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
     // Kette, nicht nur im Log.
     // Scharf geschaltet wird er vor `witness.start` ([`Writer::start_stream`]).
     let root = writer.config.repo_root.clone();
-    // Inhalte prüft dieselbe Policy wie der Checkpoint, nie schwächer als
-    // der Standard; ist sie nicht lesbar, gilt der Standard.
-    let pipeline = crate::config::load_redaction_untrusted(&root)
-        .ok()
-        .and_then(|config| config.floored_at_default().pipeline().ok());
+    // Inhalte prüft dieselbe Policy wie der Checkpoint: die Witness-eigene
+    // aus `witness.json`, nie schwächer als der Standard (EA-10).
+    let pipeline = writer.config.policy().pipeline().ok();
     let watched = writer.start_stream(
         &key,
         serde_json::json!({"previous_stop": previous, "profile": profile, "key": key_fingerprint}),
@@ -380,6 +392,7 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
             "witness storage failure; daemon stopped without a clean marker",
         );
     }
+    flush_log(&home);
     result
 }
 

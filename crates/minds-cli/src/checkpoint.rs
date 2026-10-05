@@ -260,6 +260,22 @@ pub(crate) fn tracked_files(root: &Path) -> Option<std::collections::BTreeSet<St
     )
 }
 
+/// Größter Index, den der Witness liest.
+#[cfg(unix)]
+const MAX_TRACKED_INDEX: u64 = 64 * 1024 * 1024;
+
+/// [`tracked_files`] für den Witness (EA-10): aus dem Index des
+/// festgehaltenen, ohne Includes geöffneten Repos statt über einen
+/// `git`-Prozess — der folgte einem `include.path` aus der Konfiguration des
+/// Agenten, etwa auf ein FIFO. Begrenzt gelesen: Ein Index, den der Agent auf
+/// Millionen Einträge aufbläht, füllt nicht den Speicher; über der Grenze
+/// heißt die Antwort `None` — Grenze unbekannt, keine Read-Hashes
+/// (fail-closed).
+#[cfg(unix)]
+pub(crate) fn tracked_files_pinned(repo: &Repo) -> Option<std::collections::BTreeSet<String>> {
+    Some(repo.tracked_paths(MAX_TRACKED_INDEX)?.into_iter().collect())
+}
+
 /// Rüstet die Trailer an HEAD nach — aber nur, wenn HEAD noch auf dem
 /// Wächter-Commit steht. Gibt zurück, was an HEAD geschah; der Commit, an dem
 /// die Trailer nun stehen, ist [`TrailerUpdate::commit`] (der

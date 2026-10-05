@@ -394,8 +394,11 @@ impl RedactionConfig {
     /// zur Unlesbarkeit schwärzen — nichts geht verloren, aber der Inhalt wird
     /// unbrauchbar. Ebenso kann ein Begriff, der im Platzhalter selbst
     /// vorkommt (`secret_keys: ["redacted"]`), jede redigierte Session
-    /// instabil machen: Sie wird vertagt statt versiegelt. Eine Witness-eigene
-    /// Policy schließt beides erst (EA-10).
+    /// instabil machen: Sie wird vertagt statt versiegelt. Deshalb liest der
+    /// Witness seit EA-10 die Datei gar nicht mehr: Seine Policy hält
+    /// `minds witness init` in `witness.json` fest, und diese Begrenzung gilt
+    /// dort weiter — auch eine von Hand geänderte `witness.json` schwächt
+    /// nicht ab.
     ///
     /// Jedes Feld wird hier ausdrücklich entschieden (kein `..self`): Ein
     /// neues Feld, das abschwächen könnte, muss diese Funktion anfassen.

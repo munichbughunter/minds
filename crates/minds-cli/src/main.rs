@@ -43,7 +43,9 @@ mod checkpoint;
 mod config;
 mod context;
 mod distill;
+mod doctor;
 mod enable;
+mod enable_witness;
 mod forget_cmd;
 mod fsck;
 mod gitlab_cmd;
@@ -95,6 +97,12 @@ Usage:
         --global-hooks: confirms a hooks directory outside the repo
         (e.g. a globally set core.hooksPath) — hooks there apply to all
         repositories. Without the flag, enable asks or aborts.
+        --witness <profile>: also sets up a witnessed configuration.
+        container: witness home + key, .devcontainer/ templates, a user
+        service (systemd/launchd, not started). user: prints the setup
+        steps. managed: writes managed-settings.minds-proposed.json.
+        Never runs privileged commands, never overwrites existing files
+        (a *.minds-proposed file is written next to them instead).
 
   minds hook --agent <name> [--event <name>]
         Accepts an agent hook event on stdin and stores it in the local
@@ -107,6 +115,13 @@ Usage:
         HEAD. Called by the post-commit hook.
 
   minds witness init --repo <host-path> [--home <directory>] [--path-map <agent>=<host>]
+                     [--profile container|user|managed] [--socket-group <group>]
+                     [--child-repo <path>] [--policy-rev <rev>]
+        init pins git dir, store and redaction policy (.minds/redact.json at
+        HEAD or --policy-rev, read without config includes or replace refs)
+        in witness.json and prints them with commit and blob id; a
+        child-repo store only with --child-repo. Idempotent; never
+        overwrites a different configuration.
   minds witness run [--home <directory>] [--follow]
   minds witness status [--home <directory>]
   minds witness keygen [--home <directory>]
@@ -165,6 +180,12 @@ Usage:
         Checks that every trailer is resolvable and reports journal gaps.
         Exit code ≠ 0 on orphaned trailers. --require-review: demands an
         approve for every agent-authored change (policy gate for CI).
+
+  minds doctor [--probe-home <directory>]
+        Checks the setup, one line per check (ok / warn / fail): agent
+        hooks, Git hooks, store config and the witness wiring.
+        --probe-home (agent side): fails if the agent can open the witness
+        home. Exit code 1 if any check fails.
 
   minds forget <session> [--reason <text>]
         GDPR erasure: replaces a session's payload with a tombstone.
@@ -306,7 +327,13 @@ const fn spec(
 const SPECS: &[Spec] = &[
     Spec {
         name: "enable",
-        value_flags: &["--agent", "--child-repo", "--child-remote", "--ref"],
+        value_flags: &[
+            "--agent",
+            "--child-repo",
+            "--child-remote",
+            "--ref",
+            "--witness",
+        ],
         bool_flags: &["-v", "--verbose", "--recall", "--global-hooks"],
         hidden_flags: &[enable::BACKGROUND_IMPORT_FLAG],
         positionals: 0,
@@ -315,7 +342,15 @@ const SPECS: &[Spec] = &[
     spec("checkpoint", &["--commit"], &[], 0),
     spec(
         "witness",
-        &["--home", "--repo", "--path-map"],
+        &[
+            "--home",
+            "--repo",
+            "--path-map",
+            "--profile",
+            "--socket-group",
+            "--child-repo",
+            "--policy-rev",
+        ],
         &["--follow"],
         1,
     ),
@@ -331,6 +366,7 @@ const SPECS: &[Spec] = &[
     spec("agent-help", &[], &[], 0),
     spec("metrics", &["--format"], &[], 0),
     spec("fsck", &[], &["--require-review", "--require-seal"], 0),
+    spec("doctor", &["--probe-home"], &[], 0),
     spec("forget", &["--reason"], &[], 1),
     spec("reinterpret", &[], &[], 1),
     spec("sign", &["--key", "--seal"], &[], 1),
@@ -656,6 +692,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                     parsed.has("-v") || parsed.has("--verbose"),
                     parsed.has("--recall"),
                     parsed.has("--global-hooks"),
+                    parsed.value("--witness"),
                 )
             }
         }
@@ -751,6 +788,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         ),
 
         "fsck" => fsck::run(parsed.has("--require-review"), parsed.has("--require-seal")),
+
+        "doctor" => doctor::run(parsed.value("--probe-home")),
 
         "forget" => forget_cmd::run(parsed.positional(0), parsed.value("--reason")),
 

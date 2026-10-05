@@ -49,6 +49,9 @@ use crate::error::{GitError, Result};
 use crate::oid::{BlobId, CommitId, TreeId};
 use crate::repo::Repo;
 
+/// Größter Commit oder Baum, den [`Repo::read_blob_bounded`] nachprüft.
+const MAX_VERIFIED_OBJECT: u64 = 16 * 1024 * 1024;
+
 impl Repo {
     /// Der Baum, auf den `reference` zeigt — `None`, wenn es den Ref nicht gibt.
     ///
@@ -110,6 +113,125 @@ impl Repo {
         // herausbewegen lässt. `detach()` kappt die Verbindung zum Repository
         // und gibt die Daten heraus — ohne zu kopieren.
         Ok(Some(object.detach().data))
+    }
+
+    /// Liest den Blob unter `path` im Baum von `commit` — **nachgeprüft**:
+    /// Commit, jeder Baum auf dem Weg und der Blob werden aus ihren gelesenen
+    /// Bytes neu gehasht und müssen ihre Id tragen. Der Blob ist höchstens
+    /// `max_bytes` groß, geprüft am Objekt-Header, bevor der Inhalt gelesen
+    /// wird, und noch einmal am Gelesenen. Gibt die volle Blob-Id (Hex) mit
+    /// (EA-10: die festgehaltene Witness-Policy).
+    ///
+    /// Warum nachprüfen: Die Objektdatenbank gehört womöglich dem
+    /// beobachteten Agenten, und gix prüft beim Lesen nicht nach. Wer die
+    /// Bytes hinter einer geprüften Id austauscht, fiele sonst nicht auf — die
+    /// gedruckte Id stimmte, der Inhalt nicht.
+    ///
+    /// `None` nur, wenn es den Pfad im Baum nicht gibt oder dort kein Blob
+    /// steht; jeder andere Fehler ist ein Fehler.
+    pub fn read_blob_bounded(
+        &self,
+        commit: CommitId,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        validate_path(path)?;
+        let repo = self.gix();
+        let hash_kind = repo.object_hash();
+        // Jedes Objekt erst am Header begrenzen, dann lesen — auch Commit und
+        // Bäume: Ein Commit mit gigabytegroßer Nachricht (als zlib-Bombe nur
+        // wenige MB) füllte sonst den Speicher des Menschen, der `init`
+        // ausführt.
+        let verified = |id: gix::ObjectId, kind: gix::objs::Kind, limit: u64| -> Result<Vec<u8>> {
+            let size = repo
+                .find_header(id)
+                .map_err(|err| GitError::read_object(id, err))?
+                .size();
+            if size > limit {
+                return Err(GitError::read_object(
+                    id,
+                    format!("object of {size} bytes exceeds the limit of {limit}"),
+                ));
+            }
+            let object = repo
+                .find_object(id)
+                .map_err(|err| GitError::read_object(id, err))?
+                .detach();
+            if object.data.len() as u64 > limit {
+                return Err(GitError::read_object(id, "object grew beyond the limit"));
+            }
+            if object.kind != kind {
+                return Err(GitError::read_object(
+                    id,
+                    format!("expected a {kind}, found a {}", object.kind),
+                ));
+            }
+            let actual = gix::objs::compute_hash(hash_kind, kind, &object.data)
+                .map_err(|err| GitError::read_object(id, err))?;
+            if actual != id {
+                return Err(GitError::read_object(
+                    id,
+                    "object content does not match its id",
+                ));
+            }
+            Ok(object.data)
+        };
+        let commit_data = verified(
+            commit.to_gix(),
+            gix::objs::Kind::Commit,
+            MAX_VERIFIED_OBJECT,
+        )?;
+        let mut tree = gix::objs::CommitRef::from_bytes(&commit_data, hash_kind)
+            .map_err(|err| GitError::read_object(commit, err))?
+            .tree();
+        let parts: Vec<&str> = path.split('/').collect();
+        for (index, part) in parts.iter().enumerate() {
+            let tree_data = verified(tree, gix::objs::Kind::Tree, MAX_VERIFIED_OBJECT)?;
+            let parsed = gix::objs::TreeRef::from_bytes(&tree_data, hash_kind)
+                .map_err(|err| GitError::read_object(tree, err))?;
+            // Wie `git fsck`: streng sortiert nach Gits Regel (Verzeichnisse
+            // mit nachgestelltem `/`), ohne Duplikate. Sonst fänden git und
+            // gix in demselben Baum verschiedene Einträge — der Mensch sähe
+            // mit `git` einen anderen als den festgehaltenen.
+            let sort_key = |entry: &gix::objs::tree::EntryRef<'_>| {
+                let mut key = entry.filename.to_vec();
+                if entry.mode.is_tree() {
+                    key.push(b'/');
+                }
+                key
+            };
+            if parsed
+                .entries
+                .windows(2)
+                .any(|pair| sort_key(&pair[0]) >= sort_key(&pair[1]))
+            {
+                return Err(GitError::read_object(
+                    tree,
+                    "tree is not sorted or has duplicate entries",
+                ));
+            }
+            let Some(entry) = parsed
+                .entries
+                .iter()
+                .find(|entry| entry.filename == part.as_bytes())
+            else {
+                return Ok(None);
+            };
+            let id = entry.oid.to_owned();
+            if index + 1 < parts.len() {
+                if !entry.mode.is_tree() {
+                    return Ok(None);
+                }
+                tree = id;
+                continue;
+            }
+            if !entry.mode.is_blob() {
+                return Ok(None);
+            }
+            let data = verified(id, gix::objs::Kind::Blob, max_bytes)?;
+            return Ok(Some((id.to_string(), data)));
+        }
+        Ok(None)
     }
 
     /// Alle Blob-Pfade in `tree`, rekursiv und sortiert.

@@ -1,0 +1,64 @@
+The `user` profile runs the witness as its own OS user `minds-witness`; the
+agent stays in the developer's account and reaches only the socket through
+the group `minds-agents`. minds never runs these commands itself. Review
+them, then run them as an administrator (Linux with systemd):
+
+1. Install minds where the witness user can run it — from a verified release
+   artifact (checksum or signature checked), never from this account: the
+   agent runs as {{USER}} and can replace any binary {{USER}} can write.
+   sudo install -o root -g root -m 0755 <verified-release>/minds /usr/local/bin/minds
+
+2. User and groups
+   sudo groupadd --system minds-agents
+   sudo useradd --system --create-home --home-dir /var/lib/minds-witness \
+        --shell /usr/sbin/nologin minds-witness
+   sudo usermod -aG minds-agents minds-witness
+   sudo usermod -aG minds-agents {{USER}}
+   The agent group may only traverse the witness base directory (no read):
+   sudo chgrp minds-agents /var/lib/minds-witness
+   sudo chmod 0710 /var/lib/minds-witness
+   Log out and back in so that {{USER}} is in minds-agents.
+
+3. Repository access for the witness
+   The witness reads the worktree and writes refs/minds/* and the trailer
+   amend into .git. Share the repository with the group — as {{USER}}, who
+   owns it, never as root: a symlink or hard link the agent planted in the
+   tree then reaches nothing {{USER}} could not change anyway. The block
+   still stops before any chmod if the repository or its .git is a symlink:
+   git -C {{ROOT}} config core.sharedRepository group
+   sh -euc '
+     R=$1
+     if [ -L "$R" ] || [ -L "$R/.git" ] || [ ! -d "$R/.git" ]; then
+       echo "stop: $R or $R/.git is a symlink or not a directory" >&2
+       exit 1
+     fi
+     chgrp -R minds-agents "$R"
+     chmod -R g+rwX "$R/.git"
+     chmod -R g+rX "$R"
+     find "$R/.git" -type d -exec chmod g+s {} +
+   ' sh {{ROOT}}
+   sudo -u minds-witness git config --global --add safe.directory {{ROOT}}
+   Every directory above {{ROOT}} must let minds-witness traverse (g+x or o+x).
+   safe.directory lets git, run as minds-witness, read the agent-writable
+   .git/config — the witness itself opens the repository without config
+   includes and runs no git command against it; do not run git as
+   minds-witness yourself.
+
+4. Witness home (owned by minds-witness; minds-agents may only traverse to
+   the socket, mode 0710)
+   sudo -u minds-witness env MINDS_WITNESS_HOME=/var/lib/minds-witness/{{REPO_ID}} \
+        /usr/local/bin/minds witness init --repo {{ROOT}} --profile user --socket-group minds-agents
+   sudo -u minds-witness env MINDS_WITNESS_HOME=/var/lib/minds-witness/{{REPO_ID}} \
+        /usr/local/bin/minds witness keygen
+   keygen prints the allowed_signers line. Distribute it out of band, in a
+   location outside the repository that the team trusts.
+
+5. Service unit
+   sudo tee /etc/systemd/system/minds-witness-{{REPO_ID}}.service >/dev/null <<'EOF'
+{{UNIT}}EOF
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now minds-witness-{{REPO_ID}}.service
+
+6. Agent side (every shell the agent runs in)
+   export MINDS_WITNESS_SOCKET=/var/lib/minds-witness/{{REPO_ID}}/run/witness.sock
+   minds doctor --probe-home /var/lib/minds-witness/{{REPO_ID}}

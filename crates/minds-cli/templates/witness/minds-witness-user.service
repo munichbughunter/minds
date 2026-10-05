@@ -1,0 +1,15 @@
+[Unit]
+Description=Minds witness ({{REPO_ID}}, user profile)
+
+[Service]
+Type=simple
+User=minds-witness
+Group=minds-witness
+SupplementaryGroups=minds-agents
+ExecStart=/usr/local/bin/minds witness run --home /var/lib/minds-witness/{{REPO_ID}}
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

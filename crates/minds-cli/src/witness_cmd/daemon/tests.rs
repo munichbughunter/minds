@@ -42,7 +42,18 @@ impl Fixture {
         }
         git(&root, &["commit", "-qm", "initial", "--allow-empty"]);
         let home = dir.path().join("home");
-        init(&home, root.to_str().unwrap(), None).unwrap();
+        init(
+            &home,
+            &InitRequest {
+                repo: root.to_str().unwrap(),
+                mapping: None,
+                profile: None,
+                socket_group: None,
+                child_repo: None,
+                policy_rev: None,
+            },
+        )
+        .unwrap();
         Self {
             _dir: dir,
             home,
@@ -1025,30 +1036,230 @@ fn witness_refuses_a_git_dir_that_points_elsewhere() {
     assert_eq!(sealed_roots(&f).len(), 1);
 }
 
-/// Die Policy-Datei gehört dem Agenten: Ein FIFO oder `/dev/zero` an ihrer
-/// Stelle hält den einzigen Schreiber nicht an.
+/// Die Policy-Datei im Worktree gehört dem Agenten; seit EA-10 liest der
+/// Witness sie gar nicht mehr. Ein FIFO oder `/dev/zero` an ihrer Stelle hält
+/// ihn nicht an und vertagt auch nichts.
 #[test]
-fn witness_refuses_a_policy_file_that_is_not_regular() {
+fn witness_ignores_the_worktree_policy_file() {
     let f = Fixture::new();
     f.keygen();
     let mut writer = f.writer();
     append(&mut writer);
     fs::create_dir_all(f.root.join(".minds")).unwrap();
     let policy = f.root.join(".minds/redact.json");
-    let head = git(&f.root, &["rev-parse", "HEAD"]);
-
-    std::os::unix::fs::symlink("/dev/zero", &policy).unwrap();
-    let started = std::time::Instant::now();
-    writer.checkpoint_now(Some(head.trim())).unwrap_err();
-    fs::remove_file(&policy).unwrap();
-
     let name = std::ffi::CString::new(policy.as_os_str().as_encoded_bytes()).unwrap();
     // SAFETY: nul-terminierter Pfad, keine weiteren Vorbedingungen.
     assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
-    writer.checkpoint_now(Some(head.trim())).unwrap_err();
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+
+    let started = std::time::Instant::now();
+    let status = writer.checkpoint_now(Some(head.trim())).unwrap();
+    assert!(status.starts_with("witness: 1 range(s) sealed"), "{status}");
     assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    assert_eq!(sealed_roots(&f).len(), 1);
+}
+
+/// EA-10: Die Policy hält `init` fest. Was danach im Worktree steht — etwa
+/// ein Deny-Begriff, der jeden Prompt schwärzte —, erreicht bezeugte
+/// Sessions nicht; was beim Einrichten dastand, gilt.
+#[test]
+fn witness_policy_is_pinned_at_init() {
+    let f = Fixture::new();
+    f.keygen();
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"deny_secrets":["Projekt-Kranich"]}"#,
+    )
+    .unwrap();
+    // Festgehalten wird, was committet ist — nicht der Worktree.
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "team policy"]);
+    let home = f._dir.path().join("pinned-home");
+    init(
+        &home,
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+        },
+    )
+    .unwrap();
+    super::super::keygen(&home).unwrap();
+    // Nach dem Einrichten schreibt der Agent einen Begriff, der alles träfe.
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"deny_secrets":["sorting"]}"#,
+    )
+    .unwrap();
+    let mut writer = Writer::open(&home, load(&home).unwrap(), false).unwrap();
+    let payload = br#"{"session_id":"test-session","hook_event_name":"UserPromptSubmit","prompt":"Implement sorting for Projekt-Kranich"}"#;
+    writer
+        .hook("claude-code", None, payload.to_vec(), at())
+        .unwrap();
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+
+    let status = writer.checkpoint_now(Some(head.trim())).unwrap();
+    assert!(status.starts_with("witness: 1 range(s) sealed"), "{status}");
+    // Der Begriff steht selbst im committeten Policy-Blob; geprüft wird die
+    // Stelle in der Session.
+    let objects = all_objects(&f);
+    assert!(
+        objects.contains("Implement sorting for [redacted:secret]"),
+        "Prompt lesbar, Begriff von init geschwärzt"
+    );
+    assert!(!objects.contains("sorting for Projekt-Kranich"));
+}
+
+/// EA-10: Backend und Ref hält `init` fest. Ein `minds.childPath`, das der
+/// Agent danach in `.git/config` schreibt, lenkt den Witness nicht um.
+#[test]
+fn witness_store_is_pinned_at_init() {
+    let f = Fixture::new();
+    f.keygen();
+    let elsewhere = f._dir.path().join("elsewhere");
+    git(f._dir.path(), &["init", "-q", "--bare", "elsewhere"]);
+    git(&f.root, &["config", "minds.backend", "child-repo"]);
+    git(
+        &f.root,
+        &["config", "minds.childPath", elsewhere.to_str().unwrap()],
+    );
+    git(&f.root, &["config", "minds.contextRef", "refs/heads/main"]);
+    let mut writer = f.writer();
+    append(&mut writer);
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+
+    let status = writer.checkpoint_now(Some(head.trim())).unwrap();
+    assert!(status.starts_with("witness: 1 range(s) sealed"), "{status}");
+    assert_eq!(sealed_roots(&f).len(), 1, "im festgehaltenen In-Repo-Store");
+    let refs = git(&elsewhere, &["for-each-ref"]);
+    assert!(refs.trim().is_empty(), "nichts im fremden Repo: {refs}");
+}
+
+/// EA-10: Ein `include.path` in `.git/config` auf ein FIFO hält den
+/// Checkpoint nicht an — der Witness öffnet das festgehaltene Verzeichnis
+/// ohne Includes und liest den Index selbst statt über `git ls-files`.
+#[test]
+fn witness_ignores_config_includes() {
+    let f = Fixture::new();
+    f.keygen();
+    let mut writer = f.writer();
+    append(&mut writer);
+    let fifo = f._dir.path().join("include.fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: nul-terminierter Pfad, keine weiteren Vorbedingungen.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+    let config = f.root.join(".git/config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("[include]\n\tpath = {}\n", fifo.display()));
+    fs::write(&config, text).unwrap();
+
+    let started = std::time::Instant::now();
+    let status = writer.checkpoint_now(Some(head.trim())).unwrap();
+    assert!(status.starts_with("witness: 1 range(s) sealed"), "{status}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+}
+
+/// `init` ist idempotent und überschreibt nie eine andere Konfiguration.
+#[test]
+fn witness_init_is_idempotent_and_never_overwrites() {
+    let f = Fixture::new();
+    let request = |profile| InitRequest {
+        repo: f.root.to_str().unwrap(),
+        mapping: None,
+        profile,
+        socket_group: None,
+        child_repo: None,
+        policy_rev: None,
+    };
+    let before = fs::read(f.home.join("witness.json")).unwrap();
+    // Auch „unverändert" nennt die Pins, die gelten.
+    let Initialized::Unchanged(pins) = init_config(&f.home, &request(None)).unwrap() else {
+        panic!("expected unchanged");
+    };
+    assert!(pins.store.starts_with("in-repo"), "{pins:?}");
+    assert!(matches!(
+        init_config(&f.home, &request(Some("user"))).unwrap(),
+        Initialized::Unchanged(_)
+    ));
+    let err = init_config(&f.home, &request(Some("managed"))).unwrap_err();
+    assert!(err.to_string().contains("refusing to overwrite"), "{err}");
+    assert_eq!(fs::read(f.home.join("witness.json")).unwrap(), before);
+    let config = load(&f.home).unwrap();
+    assert!(config.pinned());
+    assert_eq!(
+        config.git_dir(),
+        f.root.join(".git").canonicalize().unwrap()
+    );
+    // Container ohne Pfadabbildung, Pfadabbildung ohne Container: abgelehnt.
+    let err = init_config(&f.home, &request(Some("container"))).unwrap_err();
+    assert!(err.to_string().contains("requires --path-map"), "{err}");
+}
+
+/// Tolerant lesen: Ein `witness.json` von vor EA-10 (Schema 1, ohne Pins)
+/// lädt weiter — mit dem In-Repo-Store, dem Standard-Ref und der strengen
+/// Standard-Policy.
+#[test]
+fn witness_loads_a_schema_1_config_with_defaults() {
+    let f = Fixture::new();
+    let path = f.home.join("witness.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let object = value.as_object_mut().unwrap();
+    object.insert("schema_version".into(), 1.into());
+    for pin in ["git_dir", "store", "redaction"] {
+        object.remove(pin);
+    }
+    atomic(&path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    let config = load(&f.home).unwrap();
+    assert!(!config.pinned());
+    assert_eq!(config.store(), PinnedStore::default_in_repo());
+    assert_eq!(
+        config.git_dir(),
+        f.root.canonicalize().unwrap().join(".git")
+    );
+
+    // Fail-closed: Ohne Pins versiegelt der Witness nichts — die Extras des
+    // Teams fielen sonst still weg.
+    f.keygen();
+    let mut writer = Writer::open(&f.home, load(&f.home).unwrap(), false).unwrap();
+    append(&mut writer);
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+    let err = writer.checkpoint_now(Some(head.trim())).unwrap_err();
+    assert!(err.to_string().contains("no pins (schema 1)"), "{err}");
     assert!(sealed_roots(&f).is_empty());
-    assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
+
+    // Ein erneutes `init` mit denselben Argumenten ergänzt die Pins.
+    let repinned = init_config(
+        &f.home,
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(repinned, Initialized::Pinned(_)), "{repinned:?}");
+    assert!(load(&f.home).unwrap().pinned());
+
+    // Ein Pin, der aus dem Repo herausführt, lädt nicht.
+    object_with(&path, "git_dir", "/etc".into());
+    assert!(load(&f.home).is_err());
+}
+
+fn object_with(path: &Path, key: &str, value: serde_json::Value) {
+    let mut config: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    config
+        .as_object_mut()
+        .unwrap()
+        .insert(key.to_owned(), value);
+    atomic(path, &serde_json::to_vec(&config).unwrap()).unwrap();
 }
 
 /// MUST_REDACT unter feindlicher Policy: Eine vom Agenten geschriebene
@@ -1085,8 +1296,8 @@ fn witness_redaction_ignores_a_weakened_repo_policy() {
 }
 
 /// Schutz der Eventloop: Ohne Commit keine Anfrage; ohne neues Event kein
-/// Lauf; Läufe — auch gescheiterte — nicht schneller als
-/// `MIN_CHECKPOINT_INTERVAL`.
+/// Lauf; Läufe je Client (Commit) — auch gescheiterte — nicht schneller als
+/// `MIN_CHECKPOINT_INTERVAL` (EA-10: je Client, nicht global).
 #[test]
 fn witness_coalesces_and_rate_limits_checkpoint_requests() {
     let f = Fixture::new();
@@ -1095,49 +1306,45 @@ fn witness_coalesces_and_rate_limits_checkpoint_requests() {
     append(&mut writer);
     let head = git(&f.root, &["rev-parse", "HEAD"]);
     let head = head.trim();
-    let backdate = |writer: &mut Writer| {
-        writer.last_run = Some(std::time::Instant::now() - MIN_CHECKPOINT_INTERVAL);
-    };
-    let pin = |writer: &mut Writer| {
-        writer.last_run = Some(std::time::Instant::now());
-    };
+    let backdate = |writer: &mut Writer| writer.limits.backdate(MIN_CHECKPOINT_INTERVAL);
+    let wrong = "0".repeat(40);
 
     assert_eq!(
         writer.checkpoint_requested(None, &|| true),
         Err("commit required")
     );
 
-    // Ein gescheiterter Lauf (falscher Commit) zählt mit: Die nächste Anfrage
-    // kommt zu früh, auch mit dem richtigen Commit.
-    let before = std::time::Instant::now();
+    // Ein gescheiterter Lauf sperrt alle Clients für das Intervall: Sonst
+    // brächte jeder erfundene Commit einen eigenen Lauf …
     assert_eq!(
-        writer.checkpoint_requested(Some(&"0".repeat(40)), &|| true),
+        writer.checkpoint_requested(Some(&wrong), &|| true),
         Err("checkpoint failed")
     );
-    assert!(writer.last_run.is_some_and(|at| at >= before));
-    // Wie lange der Lauf selbst dauerte, darf den Test nicht entscheiden:
-    // Unter Last kann er länger als die Frist brauchen.
-    pin(&mut writer);
-    assert_eq!(
-        writer.checkpoint_requested(Some(head), &|| true),
-        Err("rate limited")
-    );
+    for commit in [wrong.as_str(), head, &"1".repeat(40)] {
+        assert_eq!(
+            writer.checkpoint_requested(Some(commit), &|| true),
+            Err("rate limited")
+        );
+    }
     assert!(sealed_roots(&f).is_empty());
-    assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
-
+    // … danach läuft der richtige Commit.
     backdate(&mut writer);
     let first = writer.checkpoint_requested(Some(head), &|| true).unwrap();
     assert!(first.starts_with("witness: 1 range(s) sealed"), "{first}");
-    let head = git(&f.root, &["rev-parse", "HEAD"]);
-    let head = head.trim();
+    let retrofitted = git(&f.root, &["rev-parse", "HEAD"]);
+    let retrofitted = retrofitted.trim();
+    assert_ne!(retrofitted, head, "Trailer nachgerüstet");
     // Nichts Neues: sofort, ohne Lauf, auch innerhalb der Frist.
     for _ in 0..10 {
         assert_eq!(
-            writer.checkpoint_requested(Some(head), &|| true).as_deref(),
+            writer
+                .checkpoint_requested(Some(retrofitted), &|| true)
+                .as_deref(),
             Ok("witness: nothing to seal")
         );
     }
-    // Neues Event, aber zu früh: abgelehnt, die Session bleibt offen.
+    // Neues Event, aber zu früh: Der nachgerüstete Commit ist derselbe
+    // Client wie der angefragte — abgelehnt, die Session bleibt offen.
     writer
         .hook(
             "claude-code",
@@ -1146,21 +1353,60 @@ fn witness_coalesces_and_rate_limits_checkpoint_requests() {
             ("2026-10-04T10:00:01Z".into(), at().1 + 1),
         )
         .unwrap();
-    pin(&mut writer);
-    assert_eq!(
-        writer.checkpoint_requested(Some(head), &|| true),
-        Err("rate limited")
-    );
+    for commit in [head, retrofitted] {
+        assert_eq!(
+            writer.checkpoint_requested(Some(commit), &|| true),
+            Err("rate limited")
+        );
+    }
     assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
     assert_eq!(sealed_roots(&f).len(), 1);
 
     backdate(&mut writer);
-    let later = writer.checkpoint_requested(Some(head), &|| true).unwrap();
+    let later = writer
+        .checkpoint_requested(Some(retrofitted), &|| true)
+        .unwrap();
     assert!(later.starts_with("witness: 1 range(s) sealed"), "{later}");
     assert_eq!(sealed_roots(&f).len(), 2);
     // Abgewiesene Anfragen füllen das eigene Log nicht.
     let log = fs::read_to_string(f.home.join("log/witness.log")).unwrap_or_default();
     assert_eq!(log.matches("checkpoint failed").count(), 1, "{log}");
+}
+
+/// EA-10: Ein Agent, der im Sekundentakt Checkpoints anfordert, lässt den
+/// post-commit-Hook des Menschen für seinen frischen Commit nicht
+/// `rate limited` sehen.
+#[test]
+fn rate_limit_is_per_client() {
+    let f = Fixture::new();
+    f.keygen();
+    let mut writer = f.writer();
+    append(&mut writer);
+    let agent_head = git(&f.root, &["rev-parse", "HEAD"]);
+    let first = writer
+        .checkpoint_requested(Some(agent_head.trim()), &|| true)
+        .unwrap();
+    assert!(first.starts_with("witness: 1 range(s) sealed"), "{first}");
+    writer
+        .hook(
+            "claude-code",
+            None,
+            payload(),
+            ("2026-10-04T10:00:01Z".into(), at().1 + 1),
+        )
+        .unwrap();
+    assert_eq!(
+        writer.checkpoint_requested(Some(agent_head.trim()), &|| true),
+        Err("rate limited")
+    );
+
+    // Der Mensch committet; sein Hook fragt sofort für den neuen Commit.
+    git(&f.root, &["commit", "-qm", "human", "--allow-empty"]);
+    let human_head = git(&f.root, &["rev-parse", "HEAD"]);
+    let status = writer
+        .checkpoint_requested(Some(human_head.trim()), &|| true)
+        .unwrap();
+    assert!(status.starts_with("witness: 1 range(s) sealed"), "{status}");
 }
 
 /// Ist die Agent-Seite gegangen (Frist abgelaufen), wird versiegelt, aber
@@ -1180,7 +1426,7 @@ fn witness_does_not_amend_for_a_requester_that_is_gone() {
         Err("requester gone")
     );
     assert!(sealed_roots(&f).is_empty());
-    assert!(writer.last_run.is_none());
+    assert!(!writer.limits.blocked(head.trim(), MIN_CHECKPOINT_INTERVAL));
     assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
     let log = fs::read_to_string(f.home.join("log/witness.log")).unwrap_or_default();
     assert!(!log.contains("checkpoint"), "keine Logzeile: {log}");
@@ -1242,10 +1488,10 @@ fn witness_defers_a_git_dir_beyond_the_entry_limit() {
     assert!(err.to_string().contains("junk/evil"), "{err}");
 }
 
-/// Ein `.minds`, das als Symlink an einen fremden Ort zeigt, wird nicht
-/// gelesen.
+/// Ein `.minds`, das als Symlink an einen fremden Ort zeigt: Der laufende
+/// Witness liest es nicht (EA-10), und `init` hält daraus keine Policy fest.
 #[test]
-fn witness_refuses_a_symlinked_policy_directory() {
+fn witness_ignores_a_symlinked_policy_directory() {
     let f = Fixture::new();
     f.keygen();
     let mut writer = f.writer();
@@ -1256,9 +1502,95 @@ fn witness_refuses_a_symlinked_policy_directory() {
     std::os::unix::fs::symlink(&elsewhere, f.root.join(".minds")).unwrap();
     let head = git(&f.root, &["rev-parse", "HEAD"]);
 
-    let err = writer.checkpoint_now(Some(head.trim())).unwrap_err();
-    assert!(err.to_string().contains("not a plain directory"), "{err}");
-    assert!(sealed_roots(&f).is_empty());
+    let status = writer.checkpoint_now(Some(head.trim())).unwrap();
+    assert!(status.starts_with("witness: 1 range(s) sealed"), "{status}");
+
+    // `init` liest die Policy aus HEAD; der Symlink im Worktree spielt
+    // keine Rolle — ohne committete Policy gilt der strenge Default.
+    let initialized = init_config(
+        &f._dir.path().join("second-home"),
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+        },
+    )
+    .unwrap();
+    let Initialized::Created(pins) = initialized else {
+        panic!("expected a new home");
+    };
+    assert!(pins.policy.starts_with("strict default"), "{pins:?}");
+}
+
+/// EA-10: Eine Policy, die ihre eigenen Platzhalter träfe, macht jede
+/// redigierte Session instabil — `init` hält sie nicht fest.
+#[test]
+fn witness_init_refuses_an_unstable_policy() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"secret_keys":["redacted"]}"#,
+    )
+    .unwrap();
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "hostile policy"]);
+    let err = init_config(
+        &f._dir.path().join("unstable-home"),
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("matches its own placeholders"),
+        "{err}"
+    );
+    assert!(!f._dir.path().join("unstable-home").exists());
+}
+
+/// EA-10: Ein Child-Repo, das nur die `.git/config` nennt (der Agent kann
+/// sie schreiben), hält `init` nicht still fest — nur ausdrücklich genannt.
+#[test]
+fn witness_init_pins_a_child_repo_only_when_named() {
+    let f = Fixture::new();
+    git(f._dir.path(), &["init", "-q", "--bare", "context"]);
+    let context = f._dir.path().join("context");
+    git(&f.root, &["config", "minds.backend", "child-repo"]);
+    git(
+        &f.root,
+        &["config", "minds.childPath", context.to_str().unwrap()],
+    );
+    let request = |child_repo| InitRequest {
+        repo: f.root.to_str().unwrap(),
+        mapping: None,
+        profile: None,
+        socket_group: None,
+        child_repo,
+        policy_rev: None,
+    };
+    let err = init_config(&f._dir.path().join("h1"), &request(None)).unwrap_err();
+    assert!(err.to_string().contains("pass --child-repo"), "{err}");
+
+    let Initialized::Created(pins) =
+        init_config(&f._dir.path().join("h2"), &request(Some(&context))).unwrap()
+    else {
+        panic!("expected a new home");
+    };
+    assert!(pins.store.starts_with("child repo"), "{pins:?}");
+    // Ein Child-Repo im beobachteten Repo wird abgelehnt.
+    let inside = f.root.join("nested");
+    git(&f.root, &["init", "-q", "nested"]);
+    let err = init_config(&f._dir.path().join("h3"), &request(Some(&inside))).unwrap_err();
+    assert!(err.to_string().contains("outside the observed"), "{err}");
 }
 
 /// Derselbe Fehlschlag Sekunde um Sekunde erzeugt eine Logzeile, nicht
@@ -1271,7 +1603,7 @@ fn witness_logs_a_repeated_failure_once() {
     append(&mut writer);
     let wrong = "0".repeat(40);
     for _ in 0..5 {
-        writer.last_run = None;
+        writer.limits = Default::default();
         assert_eq!(
             writer.checkpoint_requested(Some(&wrong), &|| true),
             Err("checkpoint failed")
@@ -1280,7 +1612,7 @@ fn witness_logs_a_repeated_failure_once() {
     let log = || fs::read_to_string(f.home.join("log/witness.log")).unwrap_or_default();
     assert_eq!(log().matches("checkpoint failed").count(), 1, "{}", log());
 
-    writer.last_run = None;
+    writer.limits = Default::default();
     let head = git(&f.root, &["rev-parse", "HEAD"]);
     writer
         .checkpoint_requested(Some(head.trim()), &|| true)
@@ -1312,4 +1644,383 @@ fn witness_refuses_a_refs_namespace() {
     );
     assert!(sealed_roots(&f).is_empty());
     assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
+}
+
+/// EA-10: Jede Zeile von `witness.log` wird dedupliziert — auch
+/// abwechselnde Wiederholungen; die Zahl kommt mit der nächsten Ausgabe nach
+/// Ablauf des Fensters oder beim Beenden.
+#[test]
+fn witness_log_deduplicates_repeated_lines() {
+    let home = Path::new("/witness-home");
+    let mut dedup = LogDedup::default();
+    let mut written = Vec::new();
+    for _ in 0..5 {
+        written.extend(dedup.admit(home, "accept failed"));
+        written.extend(dedup.admit(home, "frame dropped"));
+    }
+    assert_eq!(written, ["accept failed", "frame dropped"]);
+    for entry in dedup.homes.values_mut().flatten() {
+        entry.since -= DEDUP_WINDOW;
+    }
+    assert_eq!(
+        dedup.admit(home, "accept failed"),
+        [
+            "previous line repeated 4 more time(s): accept failed",
+            "accept failed"
+        ]
+    );
+    // Andere Homes zählen getrennt.
+    assert_eq!(
+        dedup.admit(Path::new("/other"), "frame dropped"),
+        ["frame dropped"]
+    );
+
+    // Beim Beenden kommt der Rest nach, in die Datei des eigenen Homes.
+    let f = Fixture::new();
+    let mut dedup = LogDedup::default();
+    for _ in 0..3 {
+        for line in dedup.admit(&f.home, "flood") {
+            write_log(&f.home, &line);
+        }
+    }
+    for line in dedup.flush(&f.home) {
+        write_log(&f.home, &line);
+    }
+    let log = fs::read_to_string(f.home.join("log/witness.log")).unwrap();
+    assert_eq!(log.matches("flood").count(), 2, "{log}");
+    assert!(
+        log.contains("previous line repeated 2 more time(s): flood"),
+        "{log}"
+    );
+}
+
+/// EA-10: Der Worker übernimmt die persistierten Live-Folds, statt sie aus
+/// dem Journal neu abzuleiten — ein am Witness vorbei angehängter
+/// Journal-Schwanz fällt deshalb auch im Worker auf: vertagt, nichts
+/// versiegelt.
+#[test]
+fn worker_writer_detects_a_journal_tail_appended_behind_the_witness() {
+    let f = Fixture::new();
+    f.keygen();
+    let mut writer = f.writer();
+    append(&mut writer);
+    let mut forged =
+        hook_event::parse(payload(), "claude-code", None, (at().0, at().1 + 5)).unwrap();
+    secretwall::guard(&mut forged.event);
+    Journal::at(f.home.join("journal"))
+        .append(&forged.key, forged.event)
+        .unwrap();
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+
+    let worker = Writer::for_worker(&f.home, load(&f.home).unwrap()).unwrap();
+    let ran = worker
+        .checkpoint_sessions(Some(head.trim()), &|| true)
+        .unwrap();
+    assert!(
+        ran.status.contains("1 session(s) deferred"),
+        "{}",
+        ran.status
+    );
+    assert!(sealed_roots(&f).is_empty());
+    assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 2);
+}
+
+/// Ohne persistierten Fold weiß der Worker nicht, was der Witness gefaltet
+/// hat — die Session wird vertagt, nicht aus dem Journal gewaschen.
+#[test]
+fn worker_writer_defers_a_session_without_a_persisted_fold() {
+    let f = Fixture::new();
+    f.keygen();
+    let mut writer = f.writer();
+    append(&mut writer);
+    fs::remove_file(folder_path(&f.home, &key())).unwrap();
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+
+    let worker = Writer::for_worker(&f.home, load(&f.home).unwrap()).unwrap();
+    let ran = worker
+        .checkpoint_sessions(Some(head.trim()), &|| true)
+        .unwrap();
+    assert!(
+        ran.status.contains("1 session(s) deferred"),
+        "{}",
+        ran.status
+    );
+    assert!(sealed_roots(&f).is_empty());
+}
+
+/// Nach einem abgebrochenen Worker-Lauf (das Kind kann schon versiegelt
+/// und verworfen haben): versiegelte Sessions fallen aus den Live-Folds,
+/// `dirty` bleibt gesetzt, und der nächste Append lädt sauber neu.
+#[test]
+fn finish_after_an_aborted_run_keeps_the_writer_consistent() {
+    let f = Fixture::new();
+    f.keygen();
+    let mut writer = f.writer();
+    append(&mut writer);
+    let head = git(&f.root, &["rev-parse", "HEAD"]);
+    // Wie ein Kind, das versiegelt hat und dann starb.
+    let worker = Writer::for_worker(&f.home, load(&f.home).unwrap()).unwrap();
+    worker
+        .checkpoint_sessions(Some(head.trim()), &|| false)
+        .unwrap();
+    assert_eq!(sealed_roots(&f).len(), 1);
+
+    writer.finish_checkpoint(false);
+    assert!(writer.dirty, "ein gescheiterter Lauf lässt dirty stehen");
+    assert!(
+        !writer.folders.contains_key(&key()),
+        "verworfene Session raus"
+    );
+    writer
+        .hook(
+            "claude-code",
+            None,
+            payload(),
+            ("2026-10-04T10:00:09Z".into(), at().1 + 9),
+        )
+        .unwrap();
+    assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
+}
+
+/// Ein ausdrücklich genannter Store, der nicht der festgehaltene ist, geht
+/// nicht still als „unverändert" durch.
+#[test]
+fn witness_init_names_a_differing_store() {
+    let f = Fixture::new();
+    git(f._dir.path(), &["init", "-q", "--bare", "context"]);
+    let context = f._dir.path().join("context");
+    let err = init_config(
+        &f.home,
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: Some(&context),
+            policy_rev: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("(store differ)"), "{err}");
+}
+
+/// Die Policy kommt aus dem Commit, den der Mensch nennt — etwa dem
+/// geprüften Stand —, auch wenn HEAD inzwischen etwas anderes trägt. Die
+/// Quelle nennt Commit und Blob.
+#[test]
+fn witness_init_reads_the_policy_from_the_named_revision() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"deny_secrets":["Projekt-Kranich","Projekt-Reiher"]}"#,
+    )
+    .unwrap();
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "reviewed policy"]);
+    git(&f.root, &["tag", "reviewed"]);
+    fs::write(f.root.join(".minds/redact.json"), "{}").unwrap();
+    git(&f.root, &["commit", "-qam", "agent weakens the policy"]);
+    let request = |policy_rev| InitRequest {
+        repo: f.root.to_str().unwrap(),
+        mapping: None,
+        profile: None,
+        socket_group: None,
+        child_repo: None,
+        policy_rev,
+    };
+
+    let Initialized::Created(pins) =
+        init_config(&f._dir.path().join("h1"), &request(Some("reviewed"))).unwrap()
+    else {
+        panic!("expected a new home");
+    };
+    assert!(pins.policy.contains("2 custom term(s)"), "{pins:?}");
+    assert!(pins.policy.contains("at commit "), "{pins:?}");
+    assert!(pins.policy.contains(", blob "), "{pins:?}");
+
+    let Initialized::Created(head) =
+        init_config(&f._dir.path().join("h2"), &request(None)).unwrap()
+    else {
+        panic!("expected a new home");
+    };
+    assert!(head.policy.contains("0 custom term(s)"), "{head:?}");
+
+    let err = init_config(&f._dir.path().join("h3"), &request(Some("no-such-rev"))).unwrap_err();
+    assert!(err.to_string().contains("names no commit"), "{err}");
+
+    // Eine volle Commit-Id gilt als Commit — auch wenn der Agent einen Ref
+    // gleichen Namens auf seinen Commit gelegt hat. Die Quelle nennt die
+    // volle Id.
+    let reviewed = git(&f.root, &["rev-parse", "reviewed"]);
+    let reviewed = reviewed.trim();
+    git(&f.root, &["branch", reviewed, "HEAD"]);
+    let Initialized::Created(by_id) =
+        init_config(&f._dir.path().join("h4"), &request(Some(reviewed))).unwrap()
+    else {
+        panic!("expected a new home");
+    };
+    assert!(by_id.policy.contains("2 custom term(s)"), "{by_id:?}");
+    assert!(by_id.policy.contains(reviewed), "{by_id:?}");
+
+    // Ein schon gepinntes Home übernimmt eine andere Policy-Revision nicht
+    // still: Der Fehler nennt "policy".
+    let err = init_config(&f._dir.path().join("h2"), &request(Some(reviewed))).unwrap_err();
+    assert!(err.to_string().contains("(policy differ)"), "{err}");
+    // Dieselbe Policy ist dagegen „unverändert".
+    assert!(matches!(
+        init_config(&f._dir.path().join("h4"), &request(Some(reviewed))).unwrap(),
+        Initialized::Unchanged(_)
+    ));
+}
+
+/// Ein `refs/replace/…` hinter Füllzeilen über der Lesegrenze bleibt nicht
+/// unsichtbar: Was ungelesen bleibt, gilt als vorhanden.
+#[test]
+fn packed_refs_beyond_the_limit_count_as_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut text = String::new();
+    for i in 0..200 {
+        text.push_str(&format!("{:040x} refs/heads/filler-{i}\n", i));
+    }
+    text.push_str(&format!("{:040x} refs/replace/{:040x}\n", 1, 2));
+    fs::write(dir.path().join("packed-refs"), &text).unwrap();
+    // Die Grenze endet vor der Replace-Zeile: Ein abschneidendes Lesen sähe
+    // sie gar nicht — nur „über der Grenze = vorhanden" findet sie.
+    let head_len = text.find("refs/replace").unwrap() - 41;
+    let limit = head_len as u64;
+    assert!(packed_refs_mention_within(
+        dir.path(),
+        "refs/replace/",
+        limit
+    ));
+    // Genau an der Grenze und ohne Replace-Zeile: nicht vorhanden.
+    fs::write(dir.path().join("packed-refs"), &text[..head_len]).unwrap();
+    assert!(!packed_refs_mention_within(
+        dir.path(),
+        "refs/replace/",
+        limit
+    ));
+    // Keine gewöhnliche Datei (hier ein Verzeichnis): gilt als vorhanden.
+    fs::remove_file(dir.path().join("packed-refs")).unwrap();
+    fs::create_dir(dir.path().join("packed-refs")).unwrap();
+    assert!(packed_refs_mention_within(
+        dir.path(),
+        "refs/replace/",
+        limit
+    ));
+}
+
+/// Ein erneutes `init` nennt die gespeicherte Quelle — volle Commit- und
+/// Blob-Id —, damit der Mensch sie auch später abgleichen kann.
+#[test]
+fn witness_init_unchanged_names_the_stored_policy_source() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"deny_secrets":["Projekt-Kranich"]}"#,
+    )
+    .unwrap();
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "policy"]);
+    let blob = git(&f.root, &["rev-parse", "HEAD:.minds/redact.json"]);
+    let home = f._dir.path().join("source-home");
+    let request = InitRequest {
+        repo: f.root.to_str().unwrap(),
+        mapping: None,
+        profile: None,
+        socket_group: None,
+        child_repo: None,
+        policy_rev: None,
+    };
+    assert!(matches!(
+        init_config(&home, &request).unwrap(),
+        Initialized::Created(_)
+    ));
+    let Initialized::Unchanged(pins) = init_config(&home, &request).unwrap() else {
+        panic!("expected unchanged");
+    };
+    assert!(pins.policy.contains(blob.trim()), "{pins:?}");
+    let commit = git(&f.root, &["rev-parse", "HEAD"]);
+    assert!(pins.policy.contains(commit.trim()), "{pins:?}");
+}
+
+/// `refs/replace` liest minds nicht, das `git` des Menschen schon: Er sähe
+/// bei der Kontrolle anderen Inhalt als den festgehaltenen. `init` bricht ab.
+#[test]
+fn witness_init_refuses_replace_refs() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(f.root.join(".minds/redact.json"), "{}").unwrap();
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "policy"]);
+    let weak = git(&f.root, &["rev-parse", "HEAD:.minds/redact.json"]);
+    fs::write(
+        f.root.join("strong.json"),
+        r#"{"deny_secrets":["Projekt-Kranich"]}"#,
+    )
+    .unwrap();
+    let strong = git(&f.root, &["hash-object", "-w", "strong.json"]);
+    git(&f.root, &["replace", weak.trim(), strong.trim()]);
+    let err = init_config(
+        &f._dir.path().join("replaced-home"),
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("refs/replace"), "{err}");
+}
+
+/// Ein Repository ohne Commit pinnt den strengen Default — und sagt es.
+#[test]
+fn witness_init_on_an_unborn_head_pins_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q", "--template="]);
+    let Initialized::Created(pins) = init_config(
+        &dir.path().join("home"),
+        &InitRequest {
+            repo: root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+        },
+    )
+    .unwrap() else {
+        panic!("expected a new home");
+    };
+    assert!(
+        pins.policy.starts_with("strict default (no commit yet)"),
+        "{pins:?}"
+    );
+}
+
+/// Liegengebliebene Lock-Dateien: höchstens acht beim Namen, dann eine
+/// Zeile mit der Zahl — der Agent bestimmt, wie viele dort liegen.
+#[test]
+fn stale_lock_reports_are_bounded() {
+    let f = Fixture::new();
+    let refs = f.root.join(".git/refs/heads");
+    for i in 0..20 {
+        fs::write(refs.join(format!("x{i}.lock")), "").unwrap();
+    }
+    assert_eq!(stale_locks(&f.root.join(".git")).len(), 20);
+    let writer = f.writer();
+    writer.report_stale_locks();
+    let log = fs::read_to_string(f.home.join("log/witness.log")).unwrap();
+    assert_eq!(
+        log.matches("lock file left behind").count(),
+        MAX_REPORTED_LOCKS
+    );
+    assert!(log.contains("and 12 more lock file(s)"), "{log}");
 }
