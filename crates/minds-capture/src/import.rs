@@ -338,6 +338,7 @@ impl Segment {
                 started_at: self.first_ts,
                 ended_at: self.last_ts,
                 cwd: cwd.map(str::to_string),
+                closed: false,
             }),
             edges: Vec::new(),
         }

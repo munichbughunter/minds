@@ -51,6 +51,8 @@ pub mod reconcile;
 
 pub mod observations;
 
+pub mod assurance;
+
 pub mod artifact;
 
 mod query;

@@ -485,6 +485,7 @@ mod tests {
             started_at: Some("2026-07-23T09:12:04.512Z".into()),
             ended_at: Some("2026-07-23T09:31:57.004Z".into()),
             cwd: Some("/home/anna/projects/minds".into()),
+            closed: false,
         });
         s.edges.push(Edge {
             kind: EdgeKind::SpawnedBy,

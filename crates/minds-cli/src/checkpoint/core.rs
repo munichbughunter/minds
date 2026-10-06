@@ -167,7 +167,7 @@ pub fn run_checkpoint_guarded(
             }
         }
 
-        match store_one(env, &key, &read.events, guard) {
+        match store_one(env, &key, &read.events, read.is_complete(), guard) {
             Ok(id) => {
                 let sealed = seal_epoch(
                     env,
@@ -734,6 +734,7 @@ fn store_one(
     env: &CheckpointEnv<'_>,
     key: &minds_capture::SessionKey,
     events: &[minds_capture::JournalEvent],
+    complete: bool,
     guard: Option<&dyn CheckpointGuard>,
 ) -> Fallible<SessionId> {
     let root = env.root;
@@ -753,10 +754,19 @@ fn store_one(
         // Bytes hinter jedem Schreib-Hash (EA-01a).
         redaction: Some(pipeline),
     };
-    let session = match guard {
+    let mut session = match guard {
         Some(guard) => adapter::checkpoint_witness(key, events, &ctx, guard.path_map()),
         None => adapter::checkpoint(key, events, &ctx),
     };
+    // Das Ende der Session (`closed`, EA-11) behauptet nur ein lückenloser,
+    // unbeschädigter Bereich. Die Session-Id hängt damit auch vom Lesestand
+    // ab: Ändert der sich zwischen einem gescheiterten und dem nächsten Lauf,
+    // bleibt ein verwaistes Objekt mit anderer Id im Store — harmlos. Ebenso
+    // nach einem Upgrade über ein liegengebliebenes Journal eines älteren
+    // Binarys (ohne `closed`): Die neue Id verfehlt die idempotente
+    // Wiederverwendung in `seal_epoch`, und ein zweiter Seal mit gleichem
+    // Root wird angehängt — für die Stufe ohne Folgen.
+    adapter::settle_closed(&mut session, complete);
     let redacted = pipeline.redact_session(session)?;
     let put = store.put(&redacted)?;
 

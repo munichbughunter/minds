@@ -1613,6 +1613,7 @@ mod tests {
                 started_at: None,
                 ended_at: Some(ended.into()),
                 cwd: None,
+                closed: false,
             });
             s
         }
@@ -1656,6 +1657,7 @@ mod tests {
                 started_at: Some(started.into()),
                 ended_at: Some(started.into()),
                 cwd: None,
+                closed: false,
             });
             s
         }

@@ -240,6 +240,7 @@ mod tests {
             started_at: Some("1970-01-01T00:00:00Z".into()),
             ended_at: Some("1970-01-01T01:00:00Z".into()),
             cwd: None,
+            closed: false,
         });
 
         let info = SessionInfo::of(sid('a'), &s);
