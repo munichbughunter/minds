@@ -28,12 +28,15 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use minds_core::evidence::{ProofSentence, limits_at, proves_at};
 use minds_core::{ChangeId, Review, SessionId, Trailer, attestation_payload, review_payload};
 use minds_git::{CommitId, Repo};
+use minds_reader::assurance::Assurance;
 use minds_store::{ContextStore, ReviewStore};
 use serde::Serialize;
 
 use crate::config;
+use crate::verify_cmd::witness_trust::WitnessTrust;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -42,7 +45,12 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// v2 (ADR-0011): je Session ihre Evidence-Seals (byte-genauer Text plus
 /// Signatur), dazu die sessionlosen Block-Seals unter `rejected_seals` —
 /// zurückgehaltene Sessions sind Teil der Kette, nicht ihr blinder Fleck.
-const BUNDLE_SCHEMA_VERSION: u32 = 2;
+///
+/// v3 (EA-13): das Bündel nennt seine Assurance-Stufe (`assurance`, die
+/// schwächste Session) und je Session deren Stufe; `proves` und
+/// `does_not_prove` sind die Sätze **dieser** Stufe, jeder mit stabiler
+/// `id` statt als bloßer Text.
+const BUNDLE_SCHEMA_VERSION: u32 = 3;
 
 /// Der Zuschnitt des Bündels (Phase 7).
 ///
@@ -71,7 +79,13 @@ impl Mode {
 }
 
 /// Führt `minds audit` aus.
-pub fn run(export: bool, out: Option<&str>, base: Option<&str>, mode: Option<&str>) -> ExitCode {
+pub fn run(
+    export: bool,
+    out: Option<&str>,
+    base: Option<&str>,
+    mode: Option<&str>,
+    signers: Option<&str>,
+) -> ExitCode {
     if !export {
         eprintln!("minds audit: expected --export");
         return ExitCode::FAILURE;
@@ -87,7 +101,7 @@ pub fn run(export: bool, out: Option<&str>, base: Option<&str>, mode: Option<&st
             return ExitCode::FAILURE;
         }
     };
-    match audit(out, base, mode) {
+    match audit(out, base, mode, signers) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("minds audit: {err}");
@@ -105,16 +119,70 @@ struct Bundle {
     mode: &'static str,
     generated_at: String,
     repository: RepositoryInfo,
-    /// Was dieses Bündel belegt — und was nicht. Im Artefakt selbst, nicht nur
-    /// in der Doku: Es wird weitergereicht, die Doku bleibt zurück.
-    proves: Vec<String>,
-    does_not_prove: Vec<String>,
+    /// Die Stufe des Bündels und was es auf ihr belegt — und was nicht. Im
+    /// Artefakt selbst, nicht nur in der Doku: Es wird weitergereicht, die
+    /// Doku bleibt zurück.
+    #[serde(flatten)]
+    proof: ProofSection,
     changes: Vec<ChangeRecord>,
     /// Block-Seals (ADR-0011): Sessions, deren Nutzlast die Speicher-Policy
     /// zurückwies. Es gibt keine Session-Id — der Seal ist der Beweis, dass
     /// der Bereich existierte.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     rejected_seals: Vec<SealRecord>,
+}
+
+/// Stufe und Proof-Vokabular des Bündels (EA-13): `proves` und
+/// `does_not_prove` sind genau die Sätze, die auf `assurance.level` gelten
+/// ([`minds_core::evidence::proves_at`], [`minds_core::evidence::limits_at`])
+/// — dasselbe Vokabular wie TUI und `minds verify`.
+#[derive(Debug, Serialize)]
+struct ProofSection {
+    assurance: BundleAssurance,
+    proves: Vec<SentenceRecord>,
+    does_not_prove: Vec<SentenceRecord>,
+}
+
+/// Die Stufe des Bündels: die schwächste seiner Sessions — ein Bündel
+/// verspricht nie mehr als sein schwächster Teil. Ohne Session `A0`, mit
+/// ausdrücklichem Grund. Berechnet beim Export, nie gespeichert (W2) — und
+/// eine Einschätzung des Exporteurs, die sich aus dem Bündel allein nicht
+/// nachrechnen lässt (`bundle_level_self_reported`).
+#[derive(Debug, Serialize)]
+struct BundleAssurance {
+    /// `A0` … `A3`.
+    level: &'static str,
+    /// `A1 observed` …
+    name: &'static str,
+    /// Ob für die Witness-Prüfung eine vertrauenswürdige Signer-Datei
+    /// (`--signers` oder `~/.ssh/allowed_signers`) samt `ssh-keygen`
+    /// **verfügbar** war — nicht, dass eine Witness-Signatur geprüft wurde.
+    /// Ohne sie gibt es kein A2; das Feld sagt dem Prüfer, warum.
+    trusted_signers_available: bool,
+    /// Warum das Bündel keine Session-Stufe trägt (leerer Bereich).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<&'static str>,
+}
+
+/// Der Grund eines Bündels ohne Session.
+const NO_SESSION_IN_RANGE: &str = "no agent session in the exported range";
+
+/// Ein Satz des Proof-Vokabulars: stabile Id und voller Text.
+#[derive(Debug, Serialize)]
+struct SentenceRecord {
+    id: &'static str,
+    text: &'static str,
+}
+
+/// Die Stufe einer Session im Bündel.
+#[derive(Debug, Clone, Serialize)]
+struct SessionAssurance {
+    /// `A0` … `A3`.
+    level: &'static str,
+    /// Der erste Grund, warum die Stufe nicht höher liegt — derselbe
+    /// Wortlaut wie die `Assurance`-Zeile von `minds verify`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -152,6 +220,8 @@ struct SessionRecord {
     /// bleibt in der Kette **sichtbar** — das ist der Punkt an einer redigierbaren
     /// Nutzlast: Die Referenz ist auflösbar, der Inhalt weg.
     payload: PayloadState,
+    /// Die Assurance-Stufe der Session (EA-11), beim Export berechnet.
+    assurance: SessionAssurance,
     /// Die Evidence-Seals der Session (ADR-0011), in Epochen-Reihenfolge.
     /// Byte-genau — `seal_id = derive_key(\"minds/evidence/v1/seal\", text)`
     /// lässt sich extern nachrechnen, eine Signatur dagegen prüfen.
@@ -212,12 +282,28 @@ struct CommentRecord {
 
 // --- Der Aufbau -------------------------------------------------------------
 
-fn audit(out: Option<&str>, base: Option<&str>, mode: Mode) -> Fallible<()> {
+fn audit(out: Option<&str>, base: Option<&str>, mode: Mode, signers: Option<&str>) -> Fallible<()> {
     let cwd = std::env::current_dir()?;
     let repo = Repo::discover(&cwd)?;
     let root = repo_root(&repo);
     let store = config::load(&root).open(&root)?;
     let reviews = ReviewStore::new(Repo::open(&root)?);
+    // Vertrauen für die Witness-Prüfung: nur `--signers` oder
+    // `~/.ssh/allowed_signers`, nie die Repo-Konfiguration (wie `verify`).
+    // Ein ausdrücklich genanntes `--signers`, das sich nicht lesen lässt,
+    // ist ein Fehler — sonst fiele ein Tippfehler still auf A1 zurück.
+    if let Some(path) = signers {
+        // Dieselben Grenzen wie `WitnessTrust::new` (reguläre Datei, höchstens
+        // `MAX_SIGNERS_BYTES`) — was sie verwürfe, scheitert hier laut.
+        let readable = std::fs::metadata(path).is_ok_and(|meta| {
+            meta.is_file() && meta.len() <= crate::verify_cmd::witness_trust::MAX_SIGNERS_BYTES
+        }) && std::fs::read_to_string(path).is_ok();
+        if !readable {
+            return Err(format!("--signers {path}: not a readable file").into());
+        }
+    }
+    let trust = WitnessTrust::new(store.as_ref(), signers);
+    let mut levels: BTreeMap<SessionId, (Assurance, SessionAssurance)> = BTreeMap::new();
 
     let head = repo.head()?.commit().ok_or("HEAD has no commit yet")?;
 
@@ -250,7 +336,10 @@ fn audit(out: Option<&str>, base: Option<&str>, mode: Mode) -> Fallible<()> {
             if record.sessions.iter().any(|s| s.id == id.to_string()) {
                 continue;
             }
-            record.sessions.push(session_record(store.as_ref(), id)?);
+            let assurance = session_level(store.as_ref(), &trust, signers, &root, id, &mut levels);
+            record
+                .sessions
+                .push(session_record(store.as_ref(), id, assurance)?);
         }
     }
 
@@ -307,8 +396,14 @@ fn audit(out: Option<&str>, base: Option<&str>, mode: Mode) -> Fallible<()> {
                     .map(|url| crate::text::without_url_credentials(&url)),
             },
         },
-        proves: proves(),
-        does_not_prove: does_not_prove(),
+        proof: match levels.values().map(|(level, _)| *level).min() {
+            Some(weakest) => proof_section(weakest, trust.trusted(), None),
+            None => proof_section(
+                Assurance::A0Claimed,
+                trust.trusted(),
+                Some(NO_SESSION_IN_RANGE),
+            ),
+        },
         changes: grouped.into_values().collect(),
         rejected_seals: rejected_seal_records(store.as_ref()),
     };
@@ -331,25 +426,82 @@ fn bundle_len(changes: &[ChangeRecord]) -> usize {
     changes.len()
 }
 
-/// Was das Bündel belegt — das kanonische Vokabular aus
-/// [`minds_core::evidence::PROVES`]: dieselben Sätze wie in der TUI.
-fn proves() -> Vec<String> {
-    minds_core::evidence::PROVES
-        .iter()
-        .map(|line| line.to_string())
-        .collect()
+/// Stufe und Vokabular des Bündels: was es auf `level` belegt und was
+/// nicht — das kanonische Vokabular aus `minds-core`, dieselben Sätze wie
+/// in TUI und `minds verify`. Die Grenzen gehören ins Artefakt, nicht nur
+/// in die Doku.
+fn proof_section(
+    level: Assurance,
+    trusted_signers_available: bool,
+    reason: Option<&'static str>,
+) -> ProofSection {
+    let record = |sentence: &'static ProofSentence| SentenceRecord {
+        id: sentence.id,
+        text: sentence.text,
+    };
+    ProofSection {
+        assurance: BundleAssurance {
+            level: level.code(),
+            name: level.word(),
+            trusted_signers_available,
+            reason,
+        },
+        proves: proves_at(level.level()).map(record).collect(),
+        does_not_prove: limits_at(level.level()).map(record).collect(),
+    }
 }
 
-/// Was es nicht belegt ([`minds_core::evidence::DOES_NOT_PROVE`]). Gehört
-/// ins Artefakt, nicht nur in die Doku.
-fn does_not_prove() -> Vec<String> {
-    minds_core::evidence::DOES_NOT_PROVE
-        .iter()
-        .map(|line| line.to_string())
-        .collect()
+/// Die Stufe einer Session — derselbe Pfad wie `minds verify` und `minds
+/// fsck --require-assurance` ([`crate::verify_cmd::session_assurance`]),
+/// je Session einmal gerechnet. Lässt sie sich nicht rechnen, steht `A0`
+/// da (fail-closed: die niedrigste Stufe, die meisten Grenzen) — das Bündel
+/// bricht daran nicht ab.
+fn session_level(
+    store: &dyn ContextStore,
+    trust: &WitnessTrust<'_>,
+    signers: Option<&str>,
+    root: &Path,
+    id: SessionId,
+    levels: &mut BTreeMap<SessionId, (Assurance, SessionAssurance)>,
+) -> SessionAssurance {
+    if let Some((_, known)) = levels.get(&id) {
+        return known.clone();
+    }
+    let (level, reason) = match crate::verify_cmd::session_assurance(
+        store,
+        trust,
+        signers,
+        root,
+        id,
+        Some(minds_core::EvidenceSource::Observed),
+    ) {
+        Ok(report) => (
+            report.overall,
+            crate::verify_cmd::assurance::first_reason(&report),
+        ),
+        Err(err) => {
+            // Die Ursache nur auf stderr — sie kann Pfade tragen und gehört
+            // nicht ins Bündel.
+            eprintln!("minds audit: assurance of {id} not assessed: {err}");
+            (
+                Assurance::A0Claimed,
+                Some("assurance not assessed — evidence unreadable".to_owned()),
+            )
+        }
+    };
+    let record = SessionAssurance {
+        level: level.code(),
+        reason,
+    };
+    levels.insert(id, (level, record.clone()));
+    record
 }
 
-fn session_record(store: &dyn ContextStore, id: SessionId) -> Fallible<SessionRecord> {
+fn session_record(
+    store: &dyn ContextStore,
+    id: SessionId,
+    assurance: SessionAssurance,
+) -> Fallible<SessionRecord> {
     match store.get(id) {
         Ok(Some(session)) => {
             // Ein manipuliertes Feld legt nicht den ganzen Audit lahm — genau
@@ -367,20 +519,26 @@ fn session_record(store: &dyn ContextStore, id: SessionId) -> Fallible<SessionRe
                 intent: session.intent.request.clone(),
                 attestation_payload: payload_text,
                 payload,
+                assurance,
                 seals: seal_records_of(store, id),
             })
         }
         // Getilgt: Die Referenz bleibt in der Kette, der Inhalt fehlt. Genau das
         // soll ein Auditor sehen können.
         Err(minds_store::StoreError::Forgotten { .. }) => {
-            Ok(forgotten(store, id, PayloadState::Forgotten))
+            Ok(forgotten(store, id, PayloadState::Forgotten, assurance))
         }
-        Ok(None) => Ok(forgotten(store, id, PayloadState::Missing)),
+        Ok(None) => Ok(forgotten(store, id, PayloadState::Missing, assurance)),
         Err(err) => Err(err.into()),
     }
 }
 
-fn forgotten(store: &dyn ContextStore, id: SessionId, payload: PayloadState) -> SessionRecord {
+fn forgotten(
+    store: &dyn ContextStore,
+    id: SessionId,
+    payload: PayloadState,
+    assurance: SessionAssurance,
+) -> SessionRecord {
     SessionRecord {
         id: id.to_string(),
         agent: String::new(),
@@ -388,6 +546,7 @@ fn forgotten(store: &dyn ContextStore, id: SessionId, payload: PayloadState) -> 
         intent: String::new(),
         attestation_payload: String::new(),
         payload,
+        assurance,
         // Auch eine getilgte Session behält ihre Seals — der payload-freie
         // Beweis überlebt das forget (ADR-0011, Entscheidung 4).
         seals: seal_records_of(store, id),
@@ -499,4 +658,94 @@ fn repo_root(repo: &Repo) -> PathBuf {
         .parent()
         .unwrap_or_else(|| repo.git_dir())
         .to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn section_json(level: Assurance, trusted_signers_available: bool) -> String {
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&proof_section(level, trusted_signers_available, None))
+                .unwrap()
+        )
+    }
+
+    // --- Golden: der Proof-Abschnitt des Bündels je Stufe -------------------
+    //
+    // Eingefroren als Datei (lesbar im Review) **und** als Hash (fängt jede
+    // Byte-Änderung, auch eine, die beim Lesen untergeht). Neu erzeugen mit:
+    //   cargo test -p minds-cli --bin minds -- --ignored --nocapture audit_proof_reference
+
+    const GOLDEN_A1: &str = include_str!("../tests/fixtures/audit-proof/a1.json");
+    const GOLDEN_A2: &str = include_str!("../tests/fixtures/audit-proof/a2.json");
+    const GOLDEN_A1_HASH: &str = "2efb2b2ba207272e5cc755a1e85b1bf8213d84d8848936499433a6565b2aadf2";
+    const GOLDEN_A2_HASH: &str = "174a69ffd3db901d8badfb51f1339093249e8b7c1fcee513fcf88bc7cdf24bf8";
+
+    #[test]
+    fn audit_bundle_carries_level_golden() {
+        let a1 = section_json(Assurance::A1Observed, false);
+        let a2 = section_json(Assurance::A2Witnessed, true);
+        assert_eq!(a1, GOLDEN_A1);
+        assert_eq!(a2, GOLDEN_A2);
+        assert_eq!(
+            blake3::hash(a1.as_bytes()).to_hex().as_str(),
+            GOLDEN_A1_HASH
+        );
+        assert_eq!(
+            blake3::hash(a2.as_bytes()).to_hex().as_str(),
+            GOLDEN_A2_HASH
+        );
+    }
+
+    /// Ein A1-Bündel nennt die append→seal-Lücke, ein A2-Bündel nicht —
+    /// dafür die A2-Grenzen und die A2-Zusagen.
+    #[test]
+    fn the_bundle_states_exactly_the_sentences_of_its_level() {
+        let ids = |records: &[SentenceRecord]| records.iter().map(|r| r.id).collect::<Vec<_>>();
+        let a1 = proof_section(Assurance::A1Observed, false, None);
+        assert_eq!(a1.assurance.level, "A1");
+        assert_eq!(a1.assurance.name, "A1 observed");
+        assert!(ids(&a1.does_not_prove).contains(&"append_to_seal_window"));
+        assert!(!ids(&a1.proves).contains(&"witness_chaining"));
+
+        let a2 = proof_section(Assurance::A2Witnessed, true, None);
+        assert_eq!(a2.assurance.level, "A2");
+        let limits = ids(&a2.does_not_prove);
+        assert!(!limits.contains(&"append_to_seal_window"));
+        assert!(limits.contains(&"who_controls_keys_witnessed"));
+        assert!(limits.contains(&"only_actor_witnessed"));
+        assert!(ids(&a2.proves).contains(&"witness_chaining"));
+        // Die Stufe trägt den Abgleich mit dem Commit nicht.
+        assert!(limits.contains(&"lines_attributed"));
+        // Jedes Bündel sagt, dass es seine Stufe nur behauptet.
+        assert!(ids(&a1.does_not_prove).contains(&"bundle_level_self_reported"));
+        assert!(limits.contains(&"bundle_level_self_reported"));
+
+        // Jede Stufe: genau die Sätze aus `minds-core`, in derselben Folge.
+        for level in Assurance::ALL {
+            let section = proof_section(level, false, None);
+            let proves: Vec<&str> = proves_at(level.level()).map(|s| s.id).collect();
+            let limits: Vec<&str> = limits_at(level.level()).map(|s| s.id).collect();
+            assert_eq!(ids(&section.proves), proves);
+            assert_eq!(ids(&section.does_not_prove), limits);
+        }
+    }
+
+    #[test]
+    #[ignore = "Golden-Dateien neu erzeugen: --ignored --nocapture"]
+    fn audit_proof_reference() {
+        for (name, level, signers) in [
+            ("a1", Assurance::A1Observed, false),
+            ("a2", Assurance::A2Witnessed, true),
+        ] {
+            let json = section_json(level, signers);
+            println!(
+                "--- {name}.json  blake3 {}",
+                blake3::hash(json.as_bytes()).to_hex()
+            );
+            print!("{json}");
+        }
+    }
 }

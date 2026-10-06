@@ -640,14 +640,66 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
     assert!(out.contains("nobody vouches for them with a key"), "{out}");
     assert!(out.contains("minds sign --seal"), "{out}");
 
-    // GRENZEN: does_not_prove gehört in die Oberfläche, nicht nur in die Doku.
+    // GRENZEN: does_not_prove gehört in die Oberfläche, nicht nur in die Doku
+    // — und zwar die der Stufe, die das Material trägt (EA-13).
     app.reduce(Action::End);
     let out = render(&mut app);
-    assert!(out.contains("Minds does NOT prove:"), "{out}");
-    assert!(out.contains("fail-open"), "{out}");
+    assert!(
+        out.contains("At A1 observed, Minds does NOT prove:"),
+        "{out}"
+    );
+    assert!(
+        out.contains("model name is what the agent reported"),
+        "{out}"
+    );
 
     app.reduce(Action::Back);
     assert!(app.top().is_none());
+}
+
+/// Snapshot der LIMITS-Sektion (EA-13): Die Fixture-Session trägt einen
+/// sauberen `agent-hooks/v1`-Seal, also A1 — und genau die A1-Grenzen, samt
+/// der append→seal-Lücke, in der Reihenfolge des Vokabulars. Eingefroren
+/// als Text, unabhängig vom Layout.
+#[test]
+fn evidence_mode_limits_snapshot_a1() {
+    let (_dir, repo) = repo();
+    let app = App::new(filled(), &repo, None);
+    let report = app.inspection.evidence_report(sid('a')).expect("Seal");
+    let text: Vec<String> = super::evidence::limitations(&report)
+        .iter()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(
+        text.join("\n"),
+        "\
+At A1 observed, Minds does NOT prove:
+Level from the repository alone.
+
+• Not which model produced the answers: the model name is what the agent reported.
+• Not that the decision was right: the evidence shows what happened, not whether it was the correct thing to do.
+• Not what happened outside the observation boundary: activity that neither the hooks nor the witness observe is not recorded.
+• Not integrity against whoever controls the host (root, the witness account or its key): they can rewrite the evidence and the witness alike.
+• Not that the record is complete: the hot path is fail-open, and a lost event is silently absent here (`minds fsck` makes gaps visible).
+• Not that a session actually produced the lines attributed to it — the mapping comes from trailers (observed) and heuristics (inferred); the provenance is stated on every edge.
+• Not that a model did what the transcript says — what is recorded is what the agent reported.
+• Not that reported results (tests, builds) are real: they are what the agent reported until a CI replay reproduces them.
+• Not who controls the signing keys. Without an allowed_signers file from a trusted source, a signature is only a self-attestation.
+• Not that unsigned entries are genuine: they are content-addressed, but nobody vouches for them with a key.
+• Not that the bundle alone can recompute the chain: the chain root is reproducible only with the local journal and session salt — the bundle proves the sealed claim (identity, signature, coverage), not the chain itself.
+• Not the assurance level as a portable fact: it is assessed when the evidence is read, from the repository and the trusted signers at hand; a level stated elsewhere (an exported bundle, a report) cannot be recomputed from that document alone — re-run `minds verify --signers` against the repository.
+• Not that nothing happened outside sealed ranges — a seal claims only the sequence range its epoch actually read.
+• Not the integrity between append and seal: until the checkpoint, only the file system protects the journal; a local write before sealing is undetectable (ADR-0011, decision 1).
+• Not that the agent process was the only actor: subprocesses, network access and plugins outside the hook boundary (scope in the seal) are not captured — coverage means complete within the boundary, never system activity.
+• Not the effect of uninterpreted tool calls: capture=uninterpreted means observed, but the effects are not normalized — the interpretation axis is separate from integrity and coverage.
+• Not real wall-clock time: timestamps come from the hook's local clock, with no external time anchor."
+    );
+
+    // Die Übersicht nennt dieselbe Stufe und Zahl.
+    let mut app = app;
+    app.reduce(Action::Evidence);
+    let out = render(&mut app);
+    assert!(out.contains("17 named limits at A1 observed"), "{out}");
 }
 
 #[test]

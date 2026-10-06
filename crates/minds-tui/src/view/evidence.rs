@@ -274,8 +274,9 @@ fn rows(
     out.push((
         "·".into(),
         format!(
-            "{} named limits of the proof model",
-            report.limitations.len()
+            "{} named limits at {}",
+            report.limitations.len(),
+            report.assurance.word()
         ),
         theme::dim(),
     ));
@@ -718,15 +719,37 @@ fn interpretation(uninterpreted: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn limitations(report: &EvidenceReport) -> Vec<Line<'static>> {
+/// Der Hinweis unter der Überschrift: Nur wo eine Signaturprüfung die
+/// Stufe ändern könnte — A1 mit einem Witness-Seal —, verweist er auf
+/// `minds verify --signers`; sonst versprach er etwas, das nicht kommt.
+fn limits_note(report: &EvidenceReport) -> &'static str {
+    let witnessed = report
+        .epochs
+        .iter()
+        .any(|epoch| epoch.scope == minds_core::evidence::SCOPE_WITNESS_V1);
+    if report.assurance == minds_reader::assurance::Assurance::A1Observed && witnessed {
+        "Level from the repository alone, witness signatures unchecked — `minds verify --signers` may rate differently."
+    } else {
+        "Level from the repository alone."
+    }
+}
+
+/// Die Grenzen der Stufe, die das Material aus dem Repository allein trägt
+/// (EA-13) — die Stufe steht über der Liste, damit niemand die Grenzen
+/// einer anderen Stufe unterstellt.
+pub(super) fn limitations(report: &EvidenceReport) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(Span::styled("Minds does NOT prove:", theme::title())),
+        Line::from(Span::styled(
+            format!("At {}, Minds does NOT prove:", report.assurance.word()),
+            theme::title(),
+        )),
+        Line::from(Span::styled(limits_note(report), theme::dim())),
         Line::default(),
     ];
-    for limit in report.limitations {
+    for limit in &report.limitations {
         lines.push(Line::from(vec![
             Span::styled("• ", theme::dim()),
-            Span::raw(*limit),
+            Span::raw(limit.text),
         ]));
     }
     lines

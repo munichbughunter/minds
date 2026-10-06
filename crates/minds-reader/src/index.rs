@@ -161,6 +161,9 @@ pub struct Index {
     seals: BTreeMap<SessionId, Vec<(ContentHash, Seal, bool)>>,
     /// Sessions, deren Seal-Material beim Lesen als manipuliert auffiel.
     seal_tampered: BTreeSet<SessionId>,
+    /// Sessions mit einem Rückverweis auf einen Seal, der nicht (mehr)
+    /// vorliegt — für die Stufe eine offene Kette, wie in `minds verify`.
+    seal_unresolved: BTreeSet<SessionId>,
     /// Sessionlose Block-Seals: zurückgehaltene Sessions, deren einziger
     /// Beleg der Seal ist (`outcome=storage_policy_rejected_payload`).
     rejected: Vec<(ContentHash, Seal)>,
@@ -375,6 +378,15 @@ impl Index {
         self
     }
 
+    /// Markiert einen baumelnden Seal-Rückverweis der Session — für Tests
+    /// der Stufe ohne Store (im Betrieb setzt das ausschließlich
+    /// `load_seals`, wenn der Seal fehlt).
+    #[doc(hidden)]
+    pub fn with_unresolved_seal(mut self, id: SessionId) -> Self {
+        self.seal_unresolved.insert(id);
+        self
+    }
+
     /// Liest Trailer und Betreff eines Commits, den der Revwalk ab HEAD
     /// nicht erreicht. Fail-closed: Fehlt er im Klon (noch nicht geholt,
     /// anderes Hash-Format), ist seine Message unlesbar oder ist er durch ein
@@ -447,12 +459,18 @@ impl Index {
                     Ok(None) => {
                         // Baumelnder Rückverweis: kein Beweis, keine
                         // Manipulation — die Session gilt schlicht als (noch)
-                        // unversiegelt an dieser Stelle.
+                        // unversiegelt an dieser Stelle. Für die Stufe ist
+                        // die Kette damit offen (wie `minds verify`).
+                        self.seal_unresolved.insert(*id);
                     }
                     Err(StoreError::SealMismatch { .. }) => {
                         self.seal_tampered.insert(*id);
                     }
-                    Err(_) => {}
+                    // Nicht lesbar (etwa ein Ref auf ein Nicht-Blob): Für
+                    // die Stufe ist die Kette offen — wie `minds verify`.
+                    Err(_) => {
+                        self.seal_unresolved.insert(*id);
+                    }
                 }
             }
         }
@@ -509,7 +527,11 @@ impl Index {
 
         let tampered = self.seal_tampered.contains(&id);
         let seals = self.seals.get(&id);
-        if !tampered && seals.is_none_or(|s| s.is_empty()) {
+        // Rückverweise, die alle ins Leere zeigen, sind kein Legacy: Die
+        // Session war versiegelt, das Material fehlt — ein Report mit offener
+        // Kette (A0), wie in `minds verify`.
+        let unresolved = self.seal_unresolved.contains(&id);
+        if !tampered && !unresolved && seals.is_none_or(|s| s.is_empty()) {
             return None;
         }
         let seals = seals.map(Vec::as_slice).unwrap_or(&[]);
@@ -597,6 +619,11 @@ impl Index {
         let scope = epochs
             .first()
             .map(|epoch: &EpochReport| epoch.scope.clone());
+        let assurance = repository_assurance(
+            seals,
+            verdict,
+            chain_closed && !self.seal_unresolved.contains(&id),
+        );
         Some(EvidenceReport {
             state: EvidenceState {
                 verdict,
@@ -610,7 +637,8 @@ impl Index {
             },
             scope,
             epochs,
-            limitations: minds_core::evidence::DOES_NOT_PROVE,
+            assurance,
+            limitations: minds_core::evidence::limits_at(assurance.level()).collect(),
         })
     }
 
@@ -889,6 +917,64 @@ fn push_unique<T: PartialEq>(ids: &mut Vec<T>, id: T) {
     if !ids.contains(&id) {
         ids.push(id);
     }
+}
+
+/// Die Stufe, die das Seal-Material einer Session aus dem Repository allein
+/// trägt — [`crate::assurance::assess`] über dieselben Seals und dasselbe
+/// Verdikt wie der [`crate::model::EvidenceReport`] (EA-13).
+///
+/// Ohne vertrauenswürdige Signer, fail-closed: Eine vorhandene Signatur ist
+/// hier nur „nicht geprüft", es gibt kein Beobachtungsfenster, keinen
+/// Witness-Start und keinen gebundenen Intent. Damit ist A1 das Höchste,
+/// was der Reader allein zuspricht — ein `agent-hooks/v1`-Seal trägt es, ein
+/// Witness-Seal ohne Prüfung ebenso. Wer A2 belegen will, prüft die
+/// Witness-Signatur gegen `--signers` (`minds verify`).
+fn repository_assurance(
+    seals: &[(ContentHash, Seal, bool)],
+    verdict: crate::model::EvidenceVerdict,
+    chain_closed: bool,
+) -> crate::assurance::Assurance {
+    use crate::assurance::{
+        AssuranceInput, FsCoverage, IntentState, LedgerCheck, RangeInput, SealSignature, Seals,
+        assess,
+    };
+    // Zeitliche Reihenfolge wie in `minds verify`: Der letzte Bereich ist
+    // das Ende der Session.
+    let mut ordered: Vec<&(ContentHash, Seal, bool)> = seals.iter().collect();
+    ordered.sort_by_key(|(_, seal, _)| {
+        (
+            seal.last_event_at.parse::<jiff::Timestamp>().ok(),
+            seal.first_seq,
+        )
+    });
+    let ranges: Vec<RangeInput> = ordered
+        .into_iter()
+        .map(|(seal_id, seal, signed)| RangeInput {
+            seal: seal_id.clone(),
+            scope: seal.scope.clone(),
+            signature: if *signed {
+                SealSignature::NotChecked
+            } else {
+                SealSignature::Missing
+            },
+            // Ohne geprüfte Witness-Signatur ist kein Ende bezeugt.
+            closes_session: false,
+        })
+        .collect();
+    assess(&AssuranceInput {
+        seals: Seals::Sealed(&ranges),
+        integrity: verdict,
+        chain_closed,
+        ledger: &LedgerCheck::NotChecked,
+        link: None,
+        trusted_signers: false,
+        observations: &FsCoverage::Unavailable { cause: None },
+        witness_starts: &[],
+        intent: &IntentState::Unbound,
+        replay: None,
+        anchors: None,
+    })
+    .overall
 }
 
 #[cfg(test)]
@@ -1201,8 +1287,25 @@ mod tests {
         assert!(!epoch.signed);
         assert_eq!((epoch.first_seq, epoch.last_seq, epoch.events), (0, 3, 4));
         // Die Grenzen sind Teil des Reports — dasselbe Vokabular wie das
-        // Audit-Bundle, nie eine eigene Liste.
-        assert_eq!(report.limitations, minds_core::evidence::DOES_NOT_PROVE);
+        // Audit-Bundle, nie eine eigene Liste, und zwar die der Stufe: Ein
+        // `agent-hooks/v1`-Seal trägt A1.
+        use minds_core::evidence::{DOES_NOT_PROVE, Level, limits_at};
+        assert_eq!(report.assurance, crate::assurance::Assurance::A1Observed);
+        assert_eq!(report.limitations, limits_at(Level::A1).collect::<Vec<_>>());
+        assert_eq!(
+            report
+                .limitations
+                .iter()
+                .map(|s| s.text)
+                .collect::<Vec<_>>(),
+            DOES_NOT_PROVE
+        );
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|s| s.id == "append_to_seal_window")
+        );
         assert!(
             report
                 .sentence()
@@ -1210,6 +1313,61 @@ mod tests {
         );
         // Und das Verdikt ist DASSELBE Objekt wie evidence_state.
         assert_eq!(index.evidence_state(sid), Some(report.state));
+    }
+
+    /// Der Reader prüft keine Signaturen: Ein signierter Witness-Seal
+    /// trägt hier A1, nie A2 — die Grenzen der Stufe A1 bleiben stehen
+    /// (fail-closed, EA-13). Verändertes Material fällt auf A0.
+    #[test]
+    fn the_report_level_is_fail_closed_without_signers() {
+        use crate::assurance::Assurance;
+        use minds_core::evidence::{Level, SCOPE_WITNESS_V1, limits_at};
+        let sid: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid, session("x"));
+
+        let (_, seal, _) = seal_for(sid, 0, None);
+        let witnessed = Seal {
+            scope: SCOPE_WITNESS_V1.into(),
+            ..seal
+        };
+        let witnessed_id = Seal::id_of_text(&witnessed.to_text().unwrap());
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![(witnessed_id, witnessed, true)]);
+        let report = index.evidence_report(sid).unwrap();
+        assert_eq!(report.assurance, Assurance::A1Observed);
+        assert!(
+            report
+                .limitations
+                .iter()
+                .any(|s| s.id == "append_to_seal_window")
+        );
+
+        // Ein Rückverweis auf einen fehlenden Seal ⇒ offene Kette ⇒ A0,
+        // wie in `minds verify`.
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 0, None)])
+            .with_unresolved_seal(sid);
+        let report = index.evidence_report(sid).unwrap();
+        assert_eq!(report.assurance, Assurance::A0Claimed);
+
+        // Zeigen **alle** Rückverweise ins Leere, ist das kein Legacy: ein
+        // Report mit offener Kette, A0.
+        let index = Index::from_parts(sessions.clone(), BTreeMap::new()).with_unresolved_seal(sid);
+        let report = index.evidence_report(sid).expect("kein Legacy");
+        assert_eq!(report.assurance, Assurance::A0Claimed);
+        assert_eq!(
+            report.state.verdict,
+            crate::model::EvidenceVerdict::Incomplete
+        );
+
+        // Manipuliert ⇒ A0, mit den Grenzen von A0.
+        let index = Index::from_parts(sessions, BTreeMap::new())
+            .with_seals(sid, vec![seal_for(sid, 0, None)])
+            .with_tampered_seal(sid);
+        let report = index.evidence_report(sid).unwrap();
+        assert_eq!(report.assurance, Assurance::A0Claimed);
+        assert_eq!(report.limitations, limits_at(Level::A0).collect::<Vec<_>>());
     }
 
     #[test]

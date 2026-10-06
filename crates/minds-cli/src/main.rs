@@ -280,10 +280,15 @@ Usage:
         in constant time; without a match the payload is discarded.
 
   minds audit --export [--out <file>] [--base <ref>] [--mode redacted|proof]
+             [--signers <file>]
         Bundles the provenance chain (change → session → attribution →
         verdict) as a portable JSON file. Carries the canonical payloads
-        and signatures — verifiable without this tool. Without --out, to
-        stdout.
+        and signatures — verifiable without this tool. States the bundle's
+        assurance level (its weakest session) and exactly what it proves
+        and does not prove at that level. --signers is the trusted
+        allowed_signers for witness signatures (default
+        ~/.ssh/allowed_signers); without it, no level above A1. Without
+        --out, to stdout.
 
   minds render [--out <directory>]
         Builds a static HTML page over the context (default ./site):
@@ -419,7 +424,12 @@ const SPECS: &[Spec] = &[
         &["--approve", "--write"],
         2,
     ),
-    spec("audit", &["--out", "--base", "--mode"], &["--export"], 0),
+    spec(
+        "audit",
+        &["--out", "--base", "--mode", "--signers"],
+        &["--export"],
+        0,
+    ),
     spec("render", &["--out"], &[], 0),
     spec("prepare-commit-msg", &[], &[], 1),
 ];
@@ -774,6 +784,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--out"),
             parsed.value("--base"),
             parsed.value("--mode"),
+            parsed.value("--signers"),
         ),
 
         "witness" => witness_cmd::run(parsed),

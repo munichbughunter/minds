@@ -685,7 +685,11 @@ mod tests {
         );
         assert_eq!(full.len(), count + 1);
         // A1 nennt die Lücke zwischen Anhängen und Versiegeln, A2 nicht mehr.
-        let append = minds_core::evidence::DOES_NOT_PROVE[7];
+        let append = minds_core::evidence::DOES_NOT_PROVE_V2
+            .iter()
+            .find(|s| s.id == "append_to_seal_window")
+            .unwrap()
+            .text;
         assert!(full.iter().any(|line| line.ends_with(append)));
         let a2 = not_proven_lines(Assurance::A2Witnessed, true);
         assert!(!a2.iter().any(|line| line.ends_with(append)));

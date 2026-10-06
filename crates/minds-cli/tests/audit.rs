@@ -130,15 +130,17 @@ fn the_bundle_carries_the_whole_chain_and_its_limits() {
     assert!(out.status.success(), "{}", stdout(&out));
     let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
 
-    assert_eq!(bundle["schema_version"], 2);
+    assert_eq!(bundle["schema_version"], 3);
 
-    // Die Grenzen stehen im Artefakt, nicht nur in der Doku.
+    // Die Grenzen stehen im Artefakt, nicht nur in der Doku — jede mit
+    // stabiler Id.
     let limits = bundle["does_not_prove"].as_array().expect("does_not_prove");
     assert!(!limits.is_empty());
     assert!(
-        limits
-            .iter()
-            .any(|line| line.as_str().is_some_and(|text| text.contains("fail-open"))),
+        limits.iter().any(|line| line["id"] == "record_complete"
+            && line["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("fail-open"))),
         "die fail-open-Lücke muss benannt sein: {limits:?}"
     );
 
@@ -214,6 +216,8 @@ fn a_forgotten_session_stays_visible_in_the_chain() {
         session["intent"].as_str().unwrap_or_default().is_empty(),
         "der Inhalt darf nicht mehr im Bündel stehen: {session:?}"
     );
+    // Die Seals überleben das forget — und mit ihnen die Stufe (EA-13).
+    assert_eq!(session["assurance"]["level"], "A1", "{session:?}");
 }
 
 /// Schickt ein Hook-Event über stdin — wie der Agent es täte.
@@ -294,14 +298,14 @@ fn the_bundle_proves_a_rejected_session_without_leaking_its_content() {
     // reproduzierbar. Das Bündel darf nie mehr behaupten.
     let proves = bundle["proves"].as_array().unwrap();
     assert!(
-        proves.iter().any(|l| l.as_str().is_some_and(|t| t
+        proves.iter().any(|l| l["text"].as_str().is_some_and(|t| t
             .contains("commits cryptographically to chain root and coverage")
             && t.contains("only with the local journal and session salt"))),
         "{proves:?}"
     );
     let limits = bundle["does_not_prove"].as_array().unwrap();
     assert!(
-        limits.iter().any(|l| l
+        limits.iter().any(|l| l["text"]
             .as_str()
             .is_some_and(|t| t.contains("between append and seal"))),
         "{limits:?}"
@@ -413,4 +417,219 @@ fn the_bundle_never_carries_remote_credentials() {
     let proof = stdout(&minds(dir, &["audit", "--export", "--mode", "proof"]));
     let bundle: serde_json::Value = serde_json::from_str(&proof).unwrap();
     assert!(bundle["repository"]["origin"].is_null(), "{proof}");
+}
+
+/// EA-13: Das Bündel nennt seine Stufe und genau die Sätze dieser Stufe. Ein
+/// Repo, dessen Session nur die Hooks des Agenten versiegelt haben, trägt A1
+/// — und damit die Lücke zwischen Anhängen und Versiegeln. Auch im
+/// Proof-Zuschnitt: Stufe und Grenzen sind Beweisgerüst, kein Inhalt.
+#[test]
+fn an_a1_bundle_carries_its_level_and_the_append_window() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    minds(dir, &["checkpoint"]);
+
+    for mode in ["redacted", "proof"] {
+        let out = minds(dir, &["audit", "--export", "--mode", mode]);
+        assert!(out.status.success(), "{}", stdout(&out));
+        let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
+
+        assert_eq!(bundle["assurance"]["level"], "A1", "{mode}: {bundle}");
+        assert_eq!(bundle["assurance"]["name"], "A1 observed");
+        assert!(bundle["assurance"]["trusted_signers_available"].is_boolean());
+        assert!(bundle["assurance"].get("reason").is_none(), "{bundle}");
+
+        let ids = |key: &str| -> Vec<String> {
+            bundle[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key}"))
+                .iter()
+                .map(|s| s["id"].as_str().expect("id").to_owned())
+                .collect()
+        };
+        let limits = ids("does_not_prove");
+        assert!(
+            limits.iter().any(|id| id == "append_to_seal_window"),
+            "{limits:?}"
+        );
+        assert!(!limits.iter().any(|id| id == "only_actor_witnessed"));
+        let proves = ids("proves");
+        assert!(
+            proves.iter().any(|id| id == "seal_verifiable"),
+            "{proves:?}"
+        );
+        assert!(!proves.iter().any(|id| id == "witness_chaining"));
+
+        // Je Session ihre Stufe samt Grund — derselbe Wortlaut wie `verify`.
+        let session = &bundle["changes"][0]["sessions"][0];
+        assert_eq!(session["assurance"]["level"], "A1", "{session}");
+        assert!(
+            session["assurance"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("agent's hooks only")),
+            "{session}"
+        );
+    }
+}
+
+/// Das Bündel verspricht nie mehr als sein schwächster Teil: eine Session
+/// ohne Seal-Material (A0) neben einer versiegelten (A1) ⇒ Bündel A0 — mit
+/// den Sätzen von A0, also ohne Seal-Zusagen.
+#[test]
+fn the_bundle_level_is_its_weakest_session() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    // Die erste Session verliert ihr Seal-Material — kein Seal, A0 …
+    let refs = stdout(&git(
+        dir,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/minds/evidence/",
+        ],
+    ));
+    assert!(!refs.trim().is_empty(), "kein Seal angelegt");
+    // Hängt am Ref-Layout des Stores (`refs/minds/evidence/<seal-id>`):
+    // Ohne diese Refs lässt sich kein Seal mehr lesen.
+    for name in refs.lines() {
+        assert!(git(dir, &["update-ref", "-d", name]).status.success());
+    }
+    // … eine zweite wird beim Commit versiegelt.
+    let payload = format!(
+        r#"{{"session_id":"sess-second","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"Zweiter Schritt"}}"#,
+        dir.display()
+    );
+    feed_hook(dir, &payload);
+    std::fs::write(dir.join("a.txt"), "drei\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "fix: second"]);
+
+    let out = minds(dir, &["audit", "--export"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
+    let mut levels: Vec<&str> = bundle["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|change| change["sessions"].as_array().unwrap())
+        .map(|session| session["assurance"]["level"].as_str().unwrap())
+        .collect();
+    levels.sort_unstable();
+    assert_eq!(levels, ["A0", "A1"], "{bundle}");
+    let reasons: Vec<&str> = bundle["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|change| change["sessions"].as_array().unwrap())
+        .filter(|session| session["assurance"]["level"] == "A0")
+        .filter_map(|session| session["assurance"]["reason"].as_str())
+        .collect();
+    assert_eq!(reasons, ["no seal"], "{bundle}");
+    assert_eq!(bundle["assurance"]["level"], "A0", "{bundle}");
+    let proves: Vec<&str> = bundle["proves"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(!proves.contains(&"seal_verifiable"), "{proves:?}");
+    assert!(proves.contains(&"session_content_addressed"), "{proves:?}");
+}
+
+/// Ein Bereich ohne Agent-Session: A0, mit ausdrücklichem Grund — ein leeres
+/// Bündel darf nicht wie ein schwach belegtes aussehen.
+#[test]
+fn an_empty_range_says_why_it_is_a0() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    let out = minds(dir, &["audit", "--export", "--base", "HEAD"]);
+    assert!(out.status.success(), "{}", stdout(&out));
+    let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
+    assert_eq!(bundle["changes"], serde_json::json!([]), "{bundle}");
+    assert_eq!(bundle["assurance"]["level"], "A0", "{bundle}");
+    assert_eq!(
+        bundle["assurance"]["reason"], "no agent session in the exported range",
+        "{bundle}"
+    );
+}
+
+/// Ein ausdrücklich genanntes `--signers`, das fehlt, ist ein Fehler — kein
+/// stiller Rückfall auf „ungeprüft".
+#[test]
+fn a_missing_signers_file_is_an_error() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    let out = minds(
+        dir,
+        &[
+            "audit",
+            "--export",
+            "--signers",
+            "/does/not/exist/allowed_signers",
+        ],
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("--signers"), "{err}");
+    assert!(
+        stdout(&out).trim().is_empty(),
+        "kein Bündel: {}",
+        stdout(&out)
+    );
+}
+
+/// Dieselbe Grenze für eine zu große Signer-Datei: Was die Witness-Prüfung
+/// verwürfe, ist bei ausdrücklichem `--signers` ein Fehler.
+#[test]
+fn an_oversized_signers_file_is_an_error() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    let big = dir.join("big_allowed_signers");
+    std::fs::write(&big, vec![b'#'; 1024 * 1024 + 1]).unwrap();
+    let out = minds(
+        dir,
+        &["audit", "--export", "--signers", big.to_str().unwrap()],
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(stdout(&out).trim().is_empty(), "kein Bündel");
+}
+
+/// Ein lesbares `--signers` wird angenommen: Das Bündel entsteht, und
+/// `trusted_signers_available` sagt, ob mit `ssh-keygen` geprüft werden
+/// könnte. Die Stufe bleibt A1 — Agent-Hook-Seals trägt keine Signatur
+/// höher (und A2 ist ohne gebundenen Intent ohnehin nicht erreichbar).
+#[test]
+fn a_readable_signers_file_is_accepted() {
+    let Some(dir) = repo_with_session() else {
+        return;
+    };
+    let dir = dir.path();
+    let signers = dir.join("trusted_allowed_signers");
+    std::fs::write(&signers, "# keine Principals\n").unwrap();
+    let out = minds(
+        dir,
+        &["audit", "--export", "--signers", signers.to_str().unwrap()],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bundle: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("gültiges JSON");
+    assert_eq!(
+        bundle["assurance"]["trusted_signers_available"],
+        minds_attest::ssh_keygen_available(),
+        "{bundle}"
+    );
+    assert_eq!(bundle["assurance"]["level"], "A1", "{bundle}");
 }

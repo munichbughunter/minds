@@ -1,0 +1,107 @@
+{
+  "assurance": {
+    "level": "A1",
+    "name": "A1 observed",
+    "trusted_signers_available": false
+  },
+  "proves": [
+    {
+      "id": "session_content_addressed",
+      "text": "Every session id is the blake3 hash of its canonical content — the content can be recomputed against it."
+    },
+    {
+      "id": "attestation_payload",
+      "text": "The attestation_payload is byte-for-byte the text `minds sign` signs; a shipped signature is verifiable against it."
+    },
+    {
+      "id": "review_payload",
+      "text": "The review_payload binds the hash of the verdict; a valid signature over it shows who reviewed."
+    },
+    {
+      "id": "verdicts_survive_rebase",
+      "text": "Verdicts attach to the change id and therefore survive rebase and force-push."
+    },
+    {
+      "id": "forgotten_visible",
+      "text": "A forgotten session stays visible as a reference (payload: forgotten) — deletion is provable, not traceless."
+    },
+    {
+      "id": "seal_verifiable",
+      "text": "Seal identity and signature are externally verifiable: seal_id = blake3::derive_key(\"minds/evidence/v1/seal\", text). The seal commits cryptographically to chain root and coverage; the underlying chain is reproducible only with the local journal and session salt (ADR-0011)."
+    },
+    {
+      "id": "block_seal",
+      "text": "A block seal (rejected_seals) proves that a session existed whose payload the storage policy rejected — without disclosing its content."
+    }
+  ],
+  "does_not_prove": [
+    {
+      "id": "model_identity",
+      "text": "Not which model produced the answers: the model name is what the agent reported."
+    },
+    {
+      "id": "decision_correct",
+      "text": "Not that the decision was right: the evidence shows what happened, not whether it was the correct thing to do."
+    },
+    {
+      "id": "outside_boundary",
+      "text": "Not what happened outside the observation boundary: activity that neither the hooks nor the witness observe is not recorded."
+    },
+    {
+      "id": "root_compromise",
+      "text": "Not integrity against whoever controls the host (root, the witness account or its key): they can rewrite the evidence and the witness alike."
+    },
+    {
+      "id": "record_complete",
+      "text": "Not that the record is complete: the hot path is fail-open, and a lost event is silently absent here (`minds fsck` makes gaps visible)."
+    },
+    {
+      "id": "lines_attributed",
+      "text": "Not that a session actually produced the lines attributed to it — the mapping comes from trailers (observed) and heuristics (inferred); the provenance is stated on every edge."
+    },
+    {
+      "id": "transcript_reported",
+      "text": "Not that a model did what the transcript says — what is recorded is what the agent reported."
+    },
+    {
+      "id": "reported_results",
+      "text": "Not that reported results (tests, builds) are real: they are what the agent reported until a CI replay reproduces them."
+    },
+    {
+      "id": "who_controls_keys",
+      "text": "Not who controls the signing keys. Without an allowed_signers file from a trusted source, a signature is only a self-attestation."
+    },
+    {
+      "id": "unsigned_entries",
+      "text": "Not that unsigned entries are genuine: they are content-addressed, but nobody vouches for them with a key."
+    },
+    {
+      "id": "bundle_chain",
+      "text": "Not that the bundle alone can recompute the chain: the chain root is reproducible only with the local journal and session salt — the bundle proves the sealed claim (identity, signature, coverage), not the chain itself."
+    },
+    {
+      "id": "bundle_level_self_reported",
+      "text": "Not the assurance level as a portable fact: it is assessed when the evidence is read, from the repository and the trusted signers at hand; a level stated elsewhere (an exported bundle, a report) cannot be recomputed from that document alone — re-run `minds verify --signers` against the repository."
+    },
+    {
+      "id": "outside_sealed_ranges",
+      "text": "Not that nothing happened outside sealed ranges — a seal claims only the sequence range its epoch actually read."
+    },
+    {
+      "id": "append_to_seal_window",
+      "text": "Not the integrity between append and seal: until the checkpoint, only the file system protects the journal; a local write before sealing is undetectable (ADR-0011, decision 1)."
+    },
+    {
+      "id": "only_actor",
+      "text": "Not that the agent process was the only actor: subprocesses, network access and plugins outside the hook boundary (scope in the seal) are not captured — coverage means complete within the boundary, never system activity."
+    },
+    {
+      "id": "uninterpreted_effects",
+      "text": "Not the effect of uninterpreted tool calls: capture=uninterpreted means observed, but the effects are not normalized — the interpretation axis is separate from integrity and coverage."
+    },
+    {
+      "id": "wall_clock_time",
+      "text": "Not real wall-clock time: timestamps come from the hook's local clock, with no external time anchor."
+    }
+  ]
+}

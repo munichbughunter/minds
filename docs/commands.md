@@ -497,10 +497,12 @@ minds reinterpret b3a1f0e
 ### minds audit
 
 ```
-minds audit --export [--out <file>] [--base <ref>] [--mode redacted|proof]
+minds audit --export [--out <file>] [--base <ref>] [--mode redacted|proof] [--signers <file>]
 ```
 
 Bundles the provenance chain (change → session → attribution → verdict) into a portable JSON file. It contains the canonical payloads and signatures and is verifiable without this tool. Without `--out` it writes to stdout.
+
+The bundle states its assurance level (`assurance`, the weakest session; each session carries its own) and, under `proves` / `does_not_prove`, exactly the sentences that hold at that level, each with a stable `id` (see [verification-guide.md](verification-guide.md)). `--signers` is the trusted `allowed_signers` for witness signatures (default `~/.ssh/allowed_signers`, never the repo's git config); without them there is no level above A1, and a `--signers` file that cannot be read is an error. The level is the exporter's statement — re-check it with `minds verify --signers` before relying on it.
 
 ```
 minds audit --export --base origin/main --mode proof --out audit.json

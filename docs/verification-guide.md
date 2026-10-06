@@ -27,12 +27,62 @@ byte-exact seal text of every checkpoint epoch, including signature) and, under
 `rejected_seals`, the block seals: sessions whose payload the storage policy
 rejected — the seal proves they existed, without disclosing their content.
 
+Since schema 3, the bundle states its **assurance level** (ADR-0012) and speaks
+only for that level:
+
+```json
+"assurance": { "level": "A1", "name": "A1 observed", "trusted_signers_available": false },
+"proves":         [ { "id": "seal_verifiable",       "text": "…" }, … ],
+"does_not_prove": [ { "id": "append_to_seal_window", "text": "…" }, … ],
+```
+
+- `assurance.level` is the **weakest** session in the bundle — a bundle never
+  promises more than its weakest part. Each session carries its own
+  `assurance` (`level`, and the first `reason` it is not higher, in the same
+  words as `minds verify`). A bundle without any agent session is `A0` with
+  `assurance.reason` saying so. The level is computed at export, never stored.
+- **The level is the exporter's statement, not a fact the bundle proves.** The
+  bundle is unsigned, and the level cannot be recomputed from it: the witness
+  observations, the trusted signers and the witness ledger are not part of it
+  (`bundle_level_self_reported` says so in every bundle). Re-run
+  `minds verify --signers <trusted file> [--witness-home <dir>]` against the
+  repository before you rely on a level. `audit` does not check the witness
+  ledger.
+- `proves` / `does_not_prove` are exactly the sentences that hold at that
+  level, from the one vocabulary every surface speaks (bundle, TUI,
+  `minds verify --limits`). Each has a stable `id`; refer to sentences by id,
+  never by position.
+- `trusted_signers_available` says whether a trusted `allowed_signers` plus
+  `ssh-keygen` was **available** for checking witness signatures
+  (`--signers <file>`, else `~/.ssh/allowed_signers` — never the repo's git
+  config); it does not mean that a witness signature was actually checked.
+  Without it there is no A2: the bundle then states at most the A1 level and
+  its limits. The default `~/.ssh/allowed_signers` is only trustworthy if the
+  agent cannot write it (an agent running as your user can) — in CI, pass
+  `--signers` explicitly. A `--signers` file that cannot be read is an error.
+
+What changes between levels (ids):
+
+| Level | Limits retired | Limits narrowed | Promises added |
+|---|---|---|---|
+| A2 witnessed | `append_to_seal_window` | `who_controls_keys` → `who_controls_keys_witnessed`, `only_actor` → `only_actor_witnessed` | `witness_chaining`, `intent_approved`, `fs_observed` |
+| A3 reproduced | `reported_results` | `wall_clock_time` → `wall_clock_time_anchored` | `results_reproduced`, `first_sight_bound` |
+
+`model_identity`, `decision_correct`, `outside_boundary`, `root_compromise` and
+`bundle_level_self_reported` hold at every level. So does `lines_attributed`:
+the level says who observed the session, not which commit's lines came from
+it — line reconciliation is the coverage axis of `minds verify`, not an input
+to the level. At A0 (no sound seal) the seal promises (`seal_verifiable`,
+`block_seal`) are absent, even if the bundle lists block seals under
+`rejected_seals`.
+
 Generate:
 
 ```sh
 minds audit --export --out audit.json           # everything reachable from HEAD
 minds audit --export --base main --out mr.json  # only this stack
 minds audit --export --mode proof --out p.json  # only the proof scaffold
+minds audit --export --signers trusted_signers  # trusted signers for witness seals (A2 possible)
 ```
 
 Two modes: **`redacted`** (default) carries everything the store yields — the
@@ -263,8 +313,9 @@ epoch chain closed via `previous=` ⇒ complete. Everything else is
 `minds fsck --require-seal`.
 
 What even the seal does **not** prove sits in the bundle under `does_not_prove` —
-in particular: nothing about events outside sealed ranges, and nothing about
-the window between append and seal.
+in particular: nothing about events outside sealed ranges
+(`outside_sealed_ranges`), and, below A2, nothing about the window between
+append and seal (`append_to_seal_window`).
 
 ## Retention
 
