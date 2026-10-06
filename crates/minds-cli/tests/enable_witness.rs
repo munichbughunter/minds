@@ -7,6 +7,27 @@ use std::process::{Command, Output};
 
 const MINDS: &str = env!("CARGO_BIN_EXE_minds");
 
+/// Das Binary, mit dem diese Tests `enable --witness` aufrufen: eine eigene
+/// Kopie mit genau einem Namen. Unter Linux ist `target/debug/minds` ein
+/// harter Link auf `target/debug/deps/minds-<hash>` — `enable --witness`
+/// lehnt ein beschreibbares Binary mit mehreren Namen zu Recht ab (ein
+/// zweiter Name könnte dort liegen, wo der Agent schreibt). Ein installiertes
+/// `minds` hat einen Namen; so auch diese Kopie.
+fn minds() -> &'static Path {
+    static COPY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    COPY.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("enable-witness-bin");
+        fs::create_dir_all(&dir).unwrap();
+        let copy = dir.join("minds");
+        // Erst unter eigenem Namen kopieren, dann umbenennen: Ein parallel
+        // laufender Testprozess sieht nie eine halb geschriebene Datei.
+        let temp = dir.join(format!("minds.{}", std::process::id()));
+        fs::copy(MINDS, &temp).unwrap();
+        fs::rename(&temp, &copy).unwrap();
+        copy
+    })
+}
+
 fn template(name: &str) -> String {
     fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -67,7 +88,7 @@ impl Fixture {
     }
 
     fn minds(&self, args: &[&str]) -> Output {
-        Command::new(MINDS)
+        Command::new(minds())
             .current_dir(&self.root)
             .args(args)
             .env("HOME", self.path("user-home"))
@@ -571,7 +592,7 @@ fn doctor_fails_when_the_isolation_boundary_changes() {
 #[test]
 fn doctor_refuses_an_empty_probe_home() {
     let f = Fixture::new();
-    let out = Command::new(MINDS)
+    let out = Command::new(minds())
         .current_dir(&f.root)
         .args(["doctor", "--probe-home", ""])
         .env("HOME", f.path("user-home"))
@@ -603,7 +624,7 @@ fn enable_witness_refuses_a_symlinked_devcontainer_directory() {
 #[test]
 fn enable_witness_refuses_a_home_inside_the_repository() {
     let f = Fixture::new();
-    let out = Command::new(MINDS)
+    let out = Command::new(minds())
         .current_dir(&f.root)
         .args(["enable", "--agent", "claude-code", "--witness", "container"])
         .env("HOME", f.path("user-home"))
@@ -770,7 +791,7 @@ fn enable_witness_refuses_a_service_file_inside_the_repository() {
     let f = Fixture::new();
     let inside = f.root.join("dotfiles");
     fs::create_dir_all(&inside).unwrap();
-    let out = Command::new(MINDS)
+    let out = Command::new(minds())
         .current_dir(&f.root)
         .args(["enable", "--agent", "claude-code", "--witness", "container"])
         .env("HOME", &inside)
@@ -804,7 +825,7 @@ fn enable_witness_refuses_an_equals_sign_in_the_directory_name() {
     fs::create_dir(&root).unwrap();
     git(&root, &["init", "-q", "--template="]);
     fs::create_dir(dir.path().join("state")).unwrap();
-    let out = Command::new(MINDS)
+    let out = Command::new(minds())
         .current_dir(&root)
         .args(["enable", "--agent", "claude-code", "--witness", "container"])
         .env("HOME", dir.path())
@@ -843,7 +864,7 @@ fn enable_witness_refuses_an_incomplete_key_pair() {
 #[test]
 fn enable_witness_managed_refuses_unsafe_paths_and_prints_a_digest() {
     let f = Fixture::new();
-    let out = Command::new(MINDS)
+    let out = Command::new(minds())
         .current_dir(&f.root)
         .args(["enable", "--agent", "claude-code", "--witness", "managed"])
         .env("HOME", f.path("user-home"))
@@ -905,7 +926,7 @@ fn doctor_probes_a_default_home_once() {
     let f = Fixture::new();
     assert!(f.enable("container").status.success());
     let home = f.home();
-    let out = Command::new(MINDS)
+    let out = Command::new(minds())
         .current_dir(&f.root)
         .args(["doctor"])
         .env("HOME", f.path("user-home"))
