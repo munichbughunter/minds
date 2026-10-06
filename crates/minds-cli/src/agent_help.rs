@@ -42,12 +42,12 @@ fn card() -> serde_json::Value {
             {"name": "inspect", "usage": "minds inspect [<search> | <file>:<line>]", "summary": "Terminal UI: sessions, a session's graph, a line's why chain. In a pipe: tab-separated lines."},
             {"name": "agent-help", "usage": "minds agent-help", "summary": "This machine-readable command card."},
             {"name": "metrics", "usage": "minds metrics [--format prometheus|openmetrics|json]", "summary": "Metrics from the store — Prometheus, OpenMetrics, or JSON."},
-            {"name": "fsck", "usage": "minds fsck [--require-review] [--require-seal]", "summary": "Is every trailer resolvable? Journal gaps? With --require-review: policy gate."},
+            {"name": "fsck", "usage": "minds fsck [--require-review] [--require-seal] [--require-assurance <A0|A1|A2|A3>] [--signers <file>]", "summary": "Is every trailer resolvable? Journal gaps? With --require-review: policy gate. --require-assurance: every session of an agent-authored commit must reach the level (exit 2 when not; findings stay exit 1)."},
             {"name": "forget", "usage": "minds forget <session> [--reason <text>]", "summary": "GDPR erasure: the payload becomes a tombstone, the reference stays resolvable."},
             {"name": "reinterpret", "usage": "minds reinterpret <session>", "summary": "Reinterpret stored tool calls with the current adapter — strictly read-only, evidence unchanged."},
             {"name": "sign", "usage": "minds sign <session> [--key <path>] | minds sign --seal <seal-id> [--key <path>]", "summary": "Sign a session's attribution (to stdout) or retroactively sign an evidence seal (into the store)."},
             {"name": "seals", "usage": "minds seals [--session <id>] [--limit <n>]", "summary": "List Evidence-Chain seals — id, session, event range, gaps, signature presence; most recent first."},
-            {"name": "verify", "usage": "minds verify [<session|rev>] [--signers <file>] [--commit <rev>] [--require-explained <percent>] [--all] | minds verify <session> --sig <file> | minds verify --evidence <seal-id>", "summary": "Evidence verdict for a session or the sessions linked to a revision (default HEAD); exit: 0 VERIFIED, 1 TAMPERED, 2 VERIFIED, INCOMPLETE, 3 NOT VERIFIABLE, 4 operational failure. Multiple sessions: worst wins (4 > 1 > 3 > 2 > 0). The Coverage line adds artifact coverage (explained/changed lines of the commit) and lists unexplained lines (20 max, --all for every line); --require-explained <0-100> is a gate that fails with exit 2 but never masks 1/3/4. Or check a signed attribution."},
+            {"name": "verify", "usage": "minds verify [<session|rev>] [--signers <file>] [--commit <rev>] [--require-explained <percent>] [--all] [--witness-home <dir>] [--require-assurance <A0|A1|A2|A3>] [--limits] | minds verify <session> --sig <file> | minds verify --evidence <seal-id>", "summary": "Evidence verdict for a session or the sessions linked to a revision (default HEAD); exit: 0 VERIFIED, 1 TAMPERED, 2 VERIFIED, INCOMPLETE, 3 NOT VERIFIABLE, 4 operational failure. Multiple sessions: worst wins (4 > 1 > 3 > 2 > 0). The Coverage line adds artifact coverage (explained/changed lines of the commit) and lists unexplained lines (20 max, --all for every line); --require-explained <0-100> is a gate that fails with exit 2 but never masks 1/3/4. Each block ends with Assurance (A0 claimed … A3 reproduced, computed at read time, with the first reason it is not higher), Not proven (the limits at that level; --limits prints them in full) and lists write claims no witness observation confirms as uncorroborated. --require-assurance <A0-A3> gates on the weakest session (exit 2, never masks 1/3/4); --witness-home <dir> checks the witness ledger: a witnessed seal missing from the repository is TAMPERED. Or check a signed attribution."},
             {"name": "review", "usage": "minds review <change-id|session-id> --approve|--reject|--needs-work [--summary <text>] [--sign]", "summary": "Create a verdict as a Git object; --sign turns it into proof."},
             {"name": "reviews", "usage": "minds reviews <subject> [--signers <file>]", "summary": "Verdicts and thread for a change; --signers checks the signatures."},
             {"name": "comment", "usage": "minds comment <subject> [--on <file:line|turn:<n>>] \"<text>\"", "summary": "Attach a remark to the review thread — append-only, mergeable without conflicts."},
@@ -131,7 +131,15 @@ mod tests {
         );
         assert!(verify["summary"].as_str().unwrap().contains("default HEAD"));
         // EA-02: die Artefakt-Flags stehen auf der Karte.
-        for flag in ["--commit <rev>", "--require-explained <percent>", "--all"] {
+        // EA-12: die Assurance-Flags ebenso.
+        for flag in [
+            "--commit <rev>",
+            "--require-explained <percent>",
+            "--all",
+            "--witness-home <dir>",
+            "--require-assurance <A0|A1|A2|A3>",
+            "--limits",
+        ] {
             assert!(verify["usage"].as_str().unwrap().contains(flag), "{flag}");
         }
     }

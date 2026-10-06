@@ -258,7 +258,7 @@ fn details(files: &[FileRecon], structural: &[Structural]) -> Vec<Detail> {
 /// Ein Pfad zur Anzeige: entschärft und auf [`PATH_CAP`] Zeichen gekürzt —
 /// Git erlaubt beliebig lange Namen, und die Spaltenbreite folgt dem
 /// längsten.
-fn shown_path(path: &str) -> String {
+pub(super) fn shown_path(path: &str) -> String {
     let path = crate::text::sanitize(path);
     if path.chars().count() <= PATH_CAP {
         return path;

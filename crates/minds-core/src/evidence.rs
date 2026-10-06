@@ -856,6 +856,204 @@ pub const DOES_NOT_PROVE: &[&str] = &[
     "Not real wall-clock time: timestamps come from the hook's local clock, with no external time anchor.",
 ];
 
+/// Die Assurance-Stufe als Ordinal — der `minds-core`-Spiegel von
+/// `minds_reader::assurance::Assurance`, damit `core` frei von Reader-Typen
+/// bleibt (EA-13). Kein `Serialize`: Eine Stufe wird berechnet, nie
+/// gespeichert (W2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Level {
+    /// A0 claimed.
+    A0,
+    /// A1 observed.
+    A1,
+    /// A2 witnessed.
+    A2,
+    /// A3 reproduced.
+    A3,
+}
+
+impl Level {
+    /// Alle Stufen, aufsteigend.
+    pub const ALL: [Level; 4] = [Level::A0, Level::A1, Level::A2, Level::A3];
+}
+
+/// Ein Satz des Proof-Vokabulars mit dem Stufenbereich, in dem er gilt:
+/// ab `holds_from`, bis **ausschließlich** `holds_until` (`None`: nie
+/// zurückgezogen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofSentence {
+    /// Stabile Kennung — für Tests und Doku, nie umbenennen.
+    pub id: &'static str,
+    /// Die Kurzform für eine Zeile (`minds verify`: `Not proven`).
+    pub short: &'static str,
+    /// Der volle Satz.
+    pub text: &'static str,
+    /// Ab dieser Stufe gilt der Satz.
+    pub holds_from: Level,
+    /// Ab dieser Stufe gilt er nicht mehr.
+    pub holds_until: Option<Level>,
+}
+
+impl ProofSentence {
+    /// Ob der Satz auf Stufe `level` gilt.
+    pub fn holds_at(&self, level: Level) -> bool {
+        self.holds_from <= level && self.holds_until.is_none_or(|until| level < until)
+    }
+}
+
+/// Was das Proof-Modell **nicht** belegt, je Stufe (EA-13, vorgezogen für
+/// die `Not proven`-Zeile von `minds verify`, EA-12). Die Sätze, die auf
+/// keiner Stufe fallen, stehen vorn: Die Kurzzeile nennt höchstens drei,
+/// und die drei sollen die sein, die keine Stufe je einlöst.
+///
+/// Auf A1 sind die Texte aus [`DOES_NOT_PROVE`] wörtlich enthalten (ein
+/// Test hält das fest); dazu kommen die Grenzen, die keine Stufe aufhebt.
+/// Ab A2 fallen die Sätze, die der Witness einlöst, weg oder werden enger
+/// gefasst.
+pub const DOES_NOT_PROVE_V2: &[ProofSentence] = &[
+    ProofSentence {
+        id: "model_identity",
+        short: "model identity",
+        text: "Not which model produced the answers: the model name is what the agent reported.",
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "decision_correct",
+        short: "correctness of the decision",
+        text: "Not that the decision was right: the evidence shows what happened, not whether it was the correct thing to do.",
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "outside_boundary",
+        short: "actions outside the boundary",
+        text: "Not what happened outside the observation boundary: activity that neither the hooks nor the witness observe is not recorded.",
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "root_compromise",
+        short: "a compromised host",
+        text: "Not integrity against whoever controls the host (root, the witness account or its key): they can rewrite the evidence and the witness alike.",
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "record_complete",
+        short: "completeness of the record",
+        text: DOES_NOT_PROVE[0],
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "lines_attributed",
+        short: "line attribution",
+        text: DOES_NOT_PROVE[1],
+        holds_from: Level::A0,
+        holds_until: Some(Level::A2),
+    },
+    ProofSentence {
+        id: "transcript_reported",
+        short: "the transcript's account",
+        text: DOES_NOT_PROVE[2],
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "reported_results",
+        short: "reported results",
+        text: "Not that reported results (tests, builds) are real: they are what the agent reported until a CI replay reproduces them.",
+        holds_from: Level::A0,
+        holds_until: Some(Level::A3),
+    },
+    ProofSentence {
+        id: "who_controls_keys",
+        short: "key custody",
+        text: DOES_NOT_PROVE[3],
+        holds_from: Level::A0,
+        holds_until: Some(Level::A2),
+    },
+    ProofSentence {
+        id: "who_controls_keys_witnessed",
+        short: "human key custody",
+        text: "Not who controls the human signing keys: witness key control is shown; human key custody still depends on allowed_signers.",
+        holds_from: Level::A2,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "unsigned_entries",
+        short: "unsigned entries",
+        text: DOES_NOT_PROVE[4],
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "bundle_chain",
+        short: "the chain from the bundle alone",
+        text: DOES_NOT_PROVE[5],
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "outside_sealed_ranges",
+        short: "unsealed ranges",
+        text: DOES_NOT_PROVE[6],
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "append_to_seal_window",
+        short: "integrity between append and seal",
+        text: DOES_NOT_PROVE[7],
+        holds_from: Level::A0,
+        holds_until: Some(Level::A2),
+    },
+    ProofSentence {
+        id: "only_actor",
+        short: "the agent as the only actor",
+        text: DOES_NOT_PROVE[8],
+        holds_from: Level::A0,
+        holds_until: Some(Level::A2),
+    },
+    ProofSentence {
+        id: "only_actor_witnessed",
+        short: "actors beyond the worktree",
+        text: "Not that the agent was the only actor: changes in the worktree are observed; processes, network and other machines are not.",
+        holds_from: Level::A2,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "uninterpreted_effects",
+        short: "effects of uninterpreted calls",
+        text: DOES_NOT_PROVE[9],
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "wall_clock_time",
+        short: "wall-clock time",
+        text: DOES_NOT_PROVE[10],
+        holds_from: Level::A0,
+        holds_until: Some(Level::A3),
+    },
+    ProofSentence {
+        id: "wall_clock_time_anchored",
+        short: "a lower time bound",
+        text: "Not the exact time: the CI anchor gives an upper bound, there is no lower bound.",
+        holds_from: Level::A3,
+        holds_until: None,
+    },
+];
+
+/// Die Grenzen, die auf Stufe `level` gelten — in der Reihenfolge von
+/// [`DOES_NOT_PROVE_V2`].
+pub fn limits_at(level: Level) -> impl Iterator<Item = &'static ProofSentence> {
+    DOES_NOT_PROVE_V2
+        .iter()
+        .filter(move |sentence| sentence.holds_at(level))
+}
+
 // ---------------------------------------------------------------------------
 // Kodierung
 // ---------------------------------------------------------------------------
@@ -1396,5 +1594,64 @@ mod tests {
         }
         assert_eq!(WitnessProfile::parse("Container"), None);
         assert_eq!(WitnessProfile::parse(""), None);
+    }
+
+    #[test]
+    fn proof_sentences_have_unique_ids() {
+        let mut ids: Vec<&str> = DOES_NOT_PROVE_V2.iter().map(|s| s.id).collect();
+        ids.sort_unstable();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(ids.len(), before);
+        for sentence in DOES_NOT_PROVE_V2 {
+            assert!(!sentence.short.is_empty() && !sentence.short.contains('·'));
+            // Ein Bereich, der nie gilt, wäre ein toter Satz.
+            assert!(Level::ALL.iter().any(|level| sentence.holds_at(*level)));
+        }
+    }
+
+    /// A1 ist der heutige Stand: Jeder Satz aus `DOES_NOT_PROVE` gilt dort
+    /// wörtlich — die Stufen-Tabelle nimmt nichts weg, was heute gesagt wird.
+    #[test]
+    fn a1_limits_include_every_current_sentence() {
+        let a1: Vec<&str> = limits_at(Level::A1).map(|s| s.text).collect();
+        for text in DOES_NOT_PROVE {
+            assert!(a1.contains(text), "{text}");
+        }
+        assert!(
+            limits_at(Level::A1).any(|s| s.id == "append_to_seal_window"),
+            "A1 keeps the append→seal limitation"
+        );
+    }
+
+    #[test]
+    fn a2_limits_retire_what_the_witness_proves() {
+        let a2: Vec<&str> = limits_at(Level::A2).map(|s| s.id).collect();
+        for retired in ["append_to_seal_window", "lines_attributed", "only_actor"] {
+            assert!(!a2.contains(&retired), "{retired}");
+        }
+        for narrowed in ["only_actor_witnessed", "who_controls_keys_witnessed"] {
+            assert!(a2.contains(&narrowed), "{narrowed}");
+        }
+        let a3: Vec<&str> = limits_at(Level::A3).map(|s| s.id).collect();
+        assert!(!a3.contains(&"reported_results"));
+        assert!(a3.contains(&"wall_clock_time_anchored"));
+    }
+
+    /// Die Kurzzeile nennt höchstens drei — auf jeder Stufe dieselben drei,
+    /// die keine Stufe einlöst.
+    #[test]
+    fn the_first_three_limits_hold_at_every_level() {
+        for level in Level::ALL {
+            let first: Vec<&str> = limits_at(level).take(3).map(|s| s.short).collect();
+            assert_eq!(
+                first,
+                [
+                    "model identity",
+                    "correctness of the decision",
+                    "actions outside the boundary"
+                ]
+            );
+        }
     }
 }

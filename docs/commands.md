@@ -377,6 +377,7 @@ print `signature not checked`. See the [verification guide](verification-guide.m
 ```
 minds verify [<session|rev>] [--signers <file>] [--identity <id>]
              [--commit <rev>] [--require-explained <percent>] [--all]
+             [--witness-home <dir>] [--require-assurance <A0|A1|A2|A3>] [--limits]
 minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
 minds verify --evidence <seal-id>
 ```
@@ -413,11 +414,33 @@ done
 
 The flags apply only to the evidence verdict, not to `--sig` or `--evidence`. A human commit without a linked session exits 3 (NOT VERIFIABLE) in that loop — which also stops it.
 
+**Assurance and limits.** Below the three axes each block states who observed the material and what it does not prove:
+
 ```
-minds verify --signers .minds/allowed_signers
+Integrity      intact
+Coverage       complete within the boundary (boundary: witness/v1 — activity outside it is not captured · 0 gaps · artifact 1/1 lines explained)
+  uncorroborated  turn 1 call 1  Write src/sort/merge.rs  b3-deadbeef…  no file-system observation
+Interpretation complete
+Assurance      A1 observed    (range 1: witness signature not checked — no trusted allowed_signers)
+Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
+Overall        VERIFIED
+```
+
+- **`Assurance`** is computed at read time, never stored: `A0 claimed`, `A1 observed`, `A2 witnessed`, `A3 reproduced` — the weakest sealed range of the session. Below A2 the parenthesis names the first reason the level is not higher, with the range it comes from (ranges count from 1 in time order). From A2 on it names the verified witness principal, the profile and the intent signature. Witness signatures count only against a trusted signer file: `--signers`, otherwise `~/.ssh/allowed_signers` — never `gpg.ssh.allowedSignersFile` from the repository — and only for principals restricted to `namespaces="minds-witness"`. The witness profile and its isolation proof are not yet part of the signed material, and intent binding does not exist yet; A2 is therefore not reachable today (`witness profile unknown`, `intent not bound`). A session linked only through the store index with an inferred (heuristic) edge is `A0`. The level says who observed the session, not whether the session explains the commit — that is the Coverage axis. **A1 is no promise against the agent:** an agent can write its own `agent-hooks/v1` seals, trailers and index edges, so `--require-assurance A1` guards against missing or broken capture, not against a malicious agent; only the witness levels (A2+) are observed outside the agent's control. A signer file the agent can write (one inside the repository, or `~/.ssh/allowed_signers` when the agent runs under your user) makes witness signatures self-attestations — keep the trusted file out of the agent's reach. All seals that name the session count, not only those in its back-reference (`evidence.json`, which the agent can rewrite); a seal found only through the namespace is printed as a `Note`.
+- **`uncorroborated`** lists write claims of a witnessed session that no witness observation confirms (same path, same bytes, between 2 s before and 30 s after the claim). The location is turn and call in the stored session; the hash is the first 8 hex digits of the claimed write-time hash — already stored in the repository and never formed for secret files, but in a job log it lets a reader confirm a guess for a file with very little content. Only sessions with a witness observation window get these lines; they are capped like the artifact lines (`--all`). An uncorroborated claim does not lower the level and does not change the verdict.
+- **`Not proven`** lists the short forms of the limits that hold at the achieved level, at most three, then `(minds verify --limits)`. `--limits` prints every limit as a full sentence instead.
+
+`--witness-home <dir>` compares the witness ledger (`<dir>/ledger`, the append-only list of seals the witness produced) with `refs/minds/evidence/`. A seal in the ledger that is missing from the repository makes the block `Integrity      VIOLATED  witnessed seal b3-… missing from the repository` and the verdict TAMPERED (exit 1) — for every session of the run, since the ledger names no session (also when the revision has no linked session). A ledger seal whose ref holds different bytes is reported the same way (`… altered in the repository`). A torn last line (the witness crashed while appending; it appends nothing afterwards) is not counted and prints `Note           witness ledger ends in a torn line — seals after it are not ledgered`. An unreadable ledger, or a line other than the last that is not `<seal-id> <scope> <last_event_at>`, exits 4. The ledger is read, never written.
+
+`--require-assurance <A0|A1|A2|A3>` is a gate on the weakest session of the run: `Gate           assurance A1 observed < required A2 witnessed`, exit 2 — never masking 1, 3 or 4. Any other value exits 4.
+
+```
+minds verify --signers ~/trusted/allowed_signers
 minds verify HEAD~1
 minds verify --require-explained 100
 minds verify b3a1f0e --commit HEAD~2 --all
+minds verify --signers ~/trusted/allowed_signers --require-assurance A2
+minds verify --witness-home "$MINDS_WITNESS_HOME" --limits
 ```
 
 ### minds sign
@@ -436,13 +459,15 @@ minds sign b3a1f0e --key ~/.ssh/id_ed25519 > attribution.sig
 ### minds fsck
 
 ```
-minds fsck [--require-review]
+minds fsck [--require-review] [--require-seal]
+           [--require-assurance <A0|A1|A2|A3> [--signers <file>]]
 ```
 
-Checks that every trailer resolves and reports journal gaps. Exits non-zero when orphaned trailers exist. `--require-review` also requires an approval for every agent-authored change — a policy gate for CI.
+Checks that every trailer resolves and reports journal gaps. Exits 1 when orphaned trailers exist. `--require-review` also requires an approval for every agent-authored change — a policy gate for CI. `--require-assurance` requires every session that a reachable `Minds-Session-Id` trailer names to reach at least that assurance level (computed as in `minds verify`, with `--signers` as the trusted signer file and without a ledger). Each session below it is listed (`below A2: <session> — A1 observed (range 1: …)`), followed by `Gate           assurance A1 observed < required A2 witnessed`; a failed assurance gate exits 2, any other finding still exits 1. Only sessions named by a reachable trailer are gated: a history without such a trailer passes (the agent controls commit messages — combine with `minds verify --require-assurance` per commit). An invalid level exits 1, like every fsck usage error; `--signers` without `--require-assurance` is refused.
 
 ```
 minds fsck --require-review
+minds fsck --require-assurance A2 --signers ~/trusted/allowed_signers
 ```
 
 ### minds forget

@@ -18,6 +18,17 @@
 //! `--require-explained <prozent>` macht daraus ein Gate: verfehlt ⇒ Exit 2,
 //! außer das Verdikt ist schon schlechter (das Schlechteste gewinnt, W6).
 //!
+//! Unter den drei Achsen stehen die **Assurance** der Session (EA-11/EA-12,
+//! siehe [`assurance`]: wer das Material beobachtet hat, mit dem ersten
+//! Grund, warum es nicht mehr ist) und **`Not proven`** — die Grenzen, die
+//! auf dieser Stufe gelten (`--limits`: ausgeschrieben). Bestätigt der
+//! Witness einen Schreib-Claim nicht, steht er als `uncorroborated` unter
+//! der Coverage-Zeile — ein Coverage-Fakt, kein Abzug an der Stufe.
+//! `--require-assurance <A0|A1|A2|A3>` ist ein Gate wie
+//! `--require-explained` (Exit 2, maskiert nie 1/3/4). `--witness-home
+//! <dir>` gleicht das Ledger des Witness mit dem Repository ab: Ein dort
+//! genannter, hier fehlender Seal ist `TAMPERED`.
+//!
 //! # VALID ≠ COMPLETE
 //!
 //! Die zwei Achsen sind getrennte Urteile (ADR-0011, Entscheidung 7):
@@ -51,9 +62,12 @@ use minds_store::{ContextStore, StoreError};
 use crate::context::Context;
 
 mod artifact;
-mod witness_trust;
+pub(crate) mod assurance;
+pub(crate) mod witness_trust;
 
 use artifact::Artifact;
+use minds_core::EvidenceSource;
+use minds_reader::assurance::{Assurance, FsCoverage, LedgerCheck};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -119,6 +133,35 @@ impl ArtifactOptions<'_> {
     }
 }
 
+/// Die Assurance-Optionen des Verdikt-Modus (EA-12).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AssuranceOptions<'a> {
+    /// `--witness-home <dir>`: das Ledger des Witness abgleichen.
+    pub witness_home: Option<&'a str>,
+    /// `--require-assurance <A0|A1|A2|A3>`: das Gate, roh wie übergeben.
+    pub require_assurance: Option<&'a str>,
+    /// `--limits`: die Grenzen ausgeschrieben statt der Kurzzeile.
+    pub limits: bool,
+}
+
+impl AssuranceOptions<'_> {
+    fn any(&self) -> bool {
+        self.witness_home.is_some() || self.require_assurance.is_some() || self.limits
+    }
+}
+
+/// Was ein Verdikt-Lauf für jede Session mitbringt.
+struct RunOptions<'a> {
+    signers: Option<&'a str>,
+    identity: Option<&'a str>,
+    /// Die Witness-Prüfung — einmal je Lauf, ihr Urteil je Seal gecacht.
+    trust: witness_trust::WitnessTrust<'a>,
+    ledger: assurance::Ledger,
+    limits: bool,
+    /// `--all`: auch die `uncorroborated`-Zeilen ungekappt.
+    all: bool,
+}
+
 /// Liest `--require-explained`: eine ganze Zahl 0–100.
 fn parse_required(raw: &str) -> Result<u8, String> {
     // Nur Ziffern: `+50` wäre für `u8::from_str` gültig.
@@ -140,17 +183,29 @@ pub fn run(
     identity: Option<&str>,
     evidence: Option<&str>,
     options: ArtifactOptions<'_>,
+    assurance_options: AssuranceOptions<'_>,
 ) -> ExitCode {
-    // Die Artefakt-Flags gehören nur zum Verdikt-Modus. Ein Fehlgebrauch ist
-    // ein operativer Fehler (4), nie ein Verdikt — ein CI-Gate, das still
-    // wegfällt, wäre schlimmer als ein lauter Abbruch.
-    if options.any() && (evidence.is_some() || sig.is_some()) {
+    // Die Artefakt- und Assurance-Flags gehören nur zum Verdikt-Modus. Ein
+    // Fehlgebrauch ist ein operativer Fehler (4), nie ein Verdikt — ein
+    // CI-Gate, das still wegfällt, wäre schlimmer als ein lauter Abbruch.
+    if (options.any() || assurance_options.any()) && (evidence.is_some() || sig.is_some()) {
         eprintln!(
-            "minds verify: --commit, --require-explained and --all apply only to the evidence verdict (not with --evidence/--sig)"
+            "minds verify: --commit, --require-explained, --all, --witness-home, --require-assurance and --limits apply only to the evidence verdict (not with --evidence/--sig)"
         );
         return ExitCode::from(4);
     }
     let required = match options.require_explained.map(parse_required).transpose() {
+        Ok(required) => required,
+        Err(err) => {
+            eprintln!("minds verify: {err}");
+            return ExitCode::from(4);
+        }
+    };
+    let required_assurance = match assurance_options
+        .require_assurance
+        .map(assurance::parse_required)
+        .transpose()
+    {
         Ok(required) => required,
         Err(err) => {
             eprintln!("minds verify: {err}");
@@ -190,6 +245,8 @@ pub fn run(
             identity,
             options,
             required,
+            assurance_options,
+            required_assurance,
         ),
         (None, None, Some(_)) => {
             eprintln!("minds verify: --sig expects <session-id>");
@@ -204,22 +261,70 @@ fn verify_target(
     identity: Option<&str>,
     options: ArtifactOptions<'_>,
     required: Option<u8>,
+    assurance_options: AssuranceOptions<'_>,
+    required_assurance: Option<Assurance>,
 ) -> ExitCode {
     let ctx = match Context::open() {
         Ok(ctx) => ctx,
         Err(err) => return operational_failure(err.as_ref()),
     };
-    let (ids, revision) = if let Ok(id) = target.parse::<SessionId>() {
-        (vec![id], None)
-    } else {
-        match sessions_of_revision(&ctx, target) {
-            Ok((commit, ids)) => (ids, Some(commit)),
+    // Das Ledger zuerst: Ist es nicht lesbar, gibt es kein Verdikt (4) —
+    // und fehlt ein bezeugter Seal, ist das Repository verändert, gleich
+    // welche Session dieser Lauf prüft.
+    let ledger = match assurance_options.witness_home {
+        Some(home) => match assurance::check_ledger(Path::new(home), ctx.store.as_ref()) {
+            Ok(ledger) => ledger,
             Err(err) => return operational_failure(err.as_ref()),
-        }
+        },
+        None => assurance::Ledger::not_checked(),
     };
+    if ledger.torn {
+        println!("{}", assurance::TORN_LEDGER_NOTE);
+    }
+    // Ohne Commit-Kontext (eine Session-Id) gibt es keine Verknüpfung, deren
+    // Herkunft zählte.
+    let (links, revision): (Vec<(SessionId, Option<EvidenceSource>)>, _) =
+        if let Ok(id) = target.parse::<SessionId>() {
+            (vec![(id, None)], None)
+        } else {
+            match sessions_of_revision(&ctx, target) {
+                Ok((commit, ids)) => (
+                    ids.into_iter()
+                        .map(|(id, source)| (id, Some(source)))
+                        .collect(),
+                    Some(commit),
+                ),
+                Err(err) => return operational_failure(err.as_ref()),
+            }
+        };
+    let ids: Vec<SessionId> = links.iter().map(|(id, _)| *id).collect();
     if ids.is_empty() {
+        // Ohne Session bleibt der Ledger-Befund trotzdem einer: Das
+        // Repository hat bezeugte Seals verloren.
+        let findings = assurance::ledger_findings(&ledger);
+        if let Some((first, rest)) = findings.split_first() {
+            println!("Integrity      VIOLATED  {first}");
+            for line in rest {
+                println!("               {line}");
+            }
+            println!("{}", Verdict::Tampered.word());
+            return Verdict::Tampered.exit();
+        }
+        if let Some(required) = required_assurance
+            && let Some(line) = assurance::gate_failure(&[], required)
+        {
+            println!("{line}");
+        }
         return Verdict::Unverifiable.exit();
     }
+    let run = RunOptions {
+        signers,
+        identity,
+        trust: witness_trust::WitnessTrust::new(ctx.store.as_ref(), signers),
+        ledger,
+        limits: assurance_options.limits,
+        all: options.all,
+    };
     let artifact = match artifact_of(&ctx, &options, required, revision, &ids, signers) {
         Ok(artifact) => artifact,
         Err(err) => return operational_failure(err.as_ref()),
@@ -235,15 +340,17 @@ fn verify_target(
         }
         _ => false,
     };
-    for (i, id) in ids.into_iter().enumerate() {
+    let mut levels = Vec::new();
+    for (i, (id, link)) in links.into_iter().enumerate() {
         if i > 0 {
             println!();
         }
-        match verify_session(&ctx, id, signers, identity, &artifact) {
-            Ok(verdict) => {
+        match verify_session(&ctx, id, &run, link, &artifact) {
+            Ok((verdict, level)) => {
                 if verdict.severity() > worst.severity() {
                     worst = verdict;
                 }
+                levels.push(level);
             }
             Err(err) => {
                 operational_failure(err.as_ref());
@@ -251,6 +358,12 @@ fn verify_target(
             }
         }
     }
+    // Das Assurance-Gate urteilt über die schwächste Session des Laufs.
+    let assurance_failed = required_assurance.is_some_and(|required| {
+        assurance::gate_failure(&levels, required)
+            .map(|line| println!("{line}"))
+            .is_some()
+    });
     // Das Gate steht einmal, nach allen Blöcken: Es urteilt über den Commit,
     // nicht über eine einzelne Session.
     // `--require-explained 0` verlangt nichts — auch keinen beurteilbaren
@@ -272,7 +385,7 @@ fn verify_target(
     });
     if failed {
         ExitCode::from(4)
-    } else if gate_failed && worst == Verdict::Verified {
+    } else if (gate_failed || assurance_failed) && worst == Verdict::Verified {
         // Ein verfehltes Gate ist Exit 2 — es maskiert nie 1/3/4 (W6).
         Verdict::Incomplete.exit()
     } else {
@@ -400,23 +513,37 @@ fn trailer_commits(ctx: &Context, id: SessionId) -> Fallible<Vec<CommitId>> {
     Ok(ctx.repo.commits_with_session(head, id)?)
 }
 
-fn sessions_of_revision(ctx: &Context, rev: &str) -> Fallible<(CommitId, Vec<SessionId>)> {
+/// Die Sessions der Revision, je mit der Herkunft ihrer Verknüpfung: aus
+/// dem Trailer (`Observed`) oder — ohne Trailer — die Quelle, die der
+/// Store-Index für die Kante festhält (ein Import steht dort als
+/// `Heuristic`, und eine Vermutung hebt keine Stufe über A0). Beides kann
+/// auch der Agent schreiben; über den Commit sagt die Stufe deshalb nichts
+/// (das tut die Coverage-Achse, siehe `minds_reader::assurance`).
+fn sessions_of_revision(
+    ctx: &Context,
+    rev: &str,
+) -> Fallible<(CommitId, Vec<(SessionId, EvidenceSource)>)> {
     // resolve_rev passes one argument after --end-of-options and peels to a commit.
     let commit = ctx
         .resolve_rev(rev)
         .ok_or_else(|| format!("no such revision: {rev}"))?;
-    let mut ids = ctx.repo.session_ids_of(commit)?;
+    let mut ids: Vec<(SessionId, EvidenceSource)> = ctx
+        .repo
+        .session_ids_of(commit)?
+        .into_iter()
+        .map(|id| (id, EvidenceSource::Observed))
+        .collect();
     if ids.is_empty() {
         ids = ctx
             .store
             .index()?
             .links_of(&commit.to_string())
             .iter()
-            .map(|link| link.session)
+            .map(|link| (link.session, link.evidence.source))
             .collect();
     }
     let mut seen = BTreeSet::new();
-    ids.retain(|id| seen.insert(*id));
+    ids.retain(|(id, _)| seen.insert(*id));
     if ids.is_empty() {
         println!(
             "No session is linked to {} ({}).",
@@ -443,6 +570,8 @@ fn operational_failure(err: &dyn std::error::Error) -> ExitCode {
 struct CheckedSeal {
     id: ContentHash,
     seal: Seal,
+    /// Der gespeicherte Text — gegen ihn prüft die Witness-Signatur.
+    text: String,
     signature: SignatureState,
 }
 
@@ -498,11 +627,12 @@ impl SignatureState {
 fn verify_session(
     ctx: &Context,
     id: SessionId,
-    signers: Option<&str>,
-    identity: Option<&str>,
+    run: &RunOptions<'_>,
+    link: Option<EvidenceSource>,
     artifact: &ArtifactState,
-) -> Fallible<Verdict> {
+) -> Fallible<(Verdict, Assurance)> {
     println!("Session        {id}");
+    let store = ctx.store.as_ref();
 
     // 1. Die Session selbst: vorhanden, vergessen (payload-freier Beweis
     //    bleibt) — oder manipuliert.
@@ -514,6 +644,7 @@ fn verify_session(
     // und KEIN Coverage-Problem — es ist eine Deutungslücke, und sie bekommt
     // ihre eigene Zeile statt das Verdikt zu vermischen (ADR-0011).
     let mut interpretation: Option<(usize, usize)> = None; // (gedeutet, ungedeutet)
+    let mut loaded: Option<Session> = None;
     match ctx.store.get(id) {
         Ok(Some(session)) => {
             if let Some(l) = &session.lineage {
@@ -540,6 +671,7 @@ fn verify_session(
                 "Payload        in store (schema {})",
                 session.schema_version
             );
+            loaded = Some(session);
         }
         Ok(None) => payload_missing = true,
         Err(StoreError::Forgotten { reason, .. }) => {
@@ -557,33 +689,63 @@ fn verify_session(
         Err(err) => return Err(err.into()),
     }
 
-    // 2. Die Seals: erst der Rückverweis, dann — falls der fehlt — der
-    //    Namensraum (der Rückverweis ist best-effort).
-    let mut seal_ids = ctx.store.seals_of(id)?;
-    if seal_ids.is_empty() {
-        seal_ids = seals_naming(ctx.store.as_ref(), id)?;
-        if !seal_ids.is_empty() {
-            notes.push(
-                "the seal back-reference (evidence.json) was missing — found via the namespace"
-                    .into(),
-            );
+    // 2. Die Seals: der Rückverweis **und** der Namensraum. Der Rückverweis
+    //    ist best-effort und agent-schreibbar — ließe er einen Seal aus, der
+    //    diese Session nennt, bliebe dessen Befund (Lücke, Ablehnung, erster
+    //    Bereich der Kette) ungeprüft.
+    let (seal_ids, unreferenced) = session_seal_ids(store, id)?;
+    if !unreferenced.is_empty() && unreferenced.len() == seal_ids.len() {
+        notes.push(
+            "the seal back-reference (evidence.json) was missing — found via the namespace".into(),
+        );
+    } else {
+        for seal_id in &unreferenced {
+            notes.push(format!(
+                "seal {seal_id} names this session but is missing from the back-reference (evidence.json) — checked anyway"
+            ));
         }
     }
-    if seal_ids.is_empty() && !tampered {
+    // Ein bezeugter Seal, der im Repository fehlt, trifft jede Session des
+    // Laufs: Das Ledger nennt keine Session, und ein verändertes Repository
+    // ist für keine intakt.
+    let ledger_findings = assurance::ledger_findings(&run.ledger);
+    let ledger_tampered = !ledger_findings.is_empty();
+    let legacy = seal_ids.is_empty() && !tampered;
+    if legacy {
         println!("Seals          none — captured before the evidence chain");
+    }
+    if legacy && !ledger_tampered {
+        let report = assurance::report(
+            &run.trust,
+            &assurance::Facts {
+                id,
+                session: loaded.as_ref(),
+                seals: &[],
+                legacy: true,
+                tampered: false,
+                complete: false,
+                chain_closed: true,
+                link,
+                ledger: &run.ledger.check,
+                observations: &FsCoverage::Unavailable { cause: None },
+            },
+        );
+        print_assurance(&report, run.limits);
         println!("{}", Verdict::Unverifiable.word());
-        return Ok(Verdict::Unverifiable);
+        return Ok((Verdict::Unverifiable, report.overall));
     }
 
-    let (checked, mut incomplete_reasons, seal_tampered) = check_seals(
-        ctx.store.as_ref(),
+    let (mut checked, mut incomplete_reasons, seal_tampered) = check_seals(
+        store,
         &seal_ids,
-        signers,
-        identity,
+        run.signers,
+        run.identity,
         &ctx.root,
         Some(id),
     )?;
     tampered |= seal_tampered;
+    // In zeitlicher Ordnung — `range N` der Assurance-Zeile zählt genauso.
+    checked.sort_by_key(|c| assurance::range_order(&c.seal));
 
     // 3. Jeder stored-Seal muss DIESE Session nennen — und wenn ein Seal
     //    `stored` sagt, muss die Nutzlast auch auffindbar sein (kein
@@ -605,7 +767,9 @@ fn verify_session(
     }
 
     // 4. Coverage: gap-frei je Seal + geschlossene Epochenkette.
-    let complete = coverage_complete(ctx.store.as_ref(), &checked, &mut incomplete_reasons)?;
+    let pairs: Vec<(&ContentHash, &Seal)> = checked.iter().map(|c| (&c.id, &c.seal)).collect();
+    let chain = coverage_complete(store, &pairs, &mut incomplete_reasons)?;
+    let complete = chain.complete;
 
     for c in &checked {
         print_seal_line(c);
@@ -621,7 +785,7 @@ fn verify_session(
     }
 
     // 5. Heuristischer Epochen-Hinweis — wertet NIE auf.
-    if !complete && !tampered {
+    if !complete && !tampered && !ledger_tampered {
         if let Some((agent, local_id)) = lineage {
             let siblings = sibling_sessions(ctx.store.as_ref(), id, &agent, &local_id)?;
             if siblings > 0 {
@@ -633,7 +797,7 @@ fn verify_session(
         }
     }
 
-    let verdict = if tampered {
+    let verdict = if tampered || ledger_tampered {
         Verdict::Tampered
     } else if complete && incomplete_reasons.is_empty() {
         Verdict::Verified
@@ -646,10 +810,18 @@ fn verify_session(
     // innerhalb der Beobachtungsgrenze) und Deutung („was bedeutet es?").
     // Das Gesamt-Verdikt und die Exit-Codes bleiben der CI-Vertrag aus
     // Integrität × Coverage; die Deutung wertet nie auf oder ab.
-    println!(
-        "Integrity      {}",
-        if tampered { "VIOLATED" } else { "intact" }
-    );
+    match ledger_findings.split_first() {
+        Some((first, rest)) => {
+            println!("Integrity      VIOLATED  {first}");
+            for line in rest {
+                println!("               {line}");
+            }
+        }
+        None => println!(
+            "Integrity      {}",
+            if tampered { "VIOLATED" } else { "intact" }
+        ),
+    }
     let scopes: Vec<String> = {
         // Zweite Schicht neben der Parse-Härtung: Der Scope stammt aus dem
         // Repo — fremdbestimmt, also entschärft ausgeben.
@@ -683,7 +855,7 @@ fn verify_session(
     };
     println!(
         "Coverage       {}{boundary}",
-        if tampered {
+        if tampered || ledger_tampered {
             "not assessable"
         } else if complete && incomplete_reasons.is_empty() {
             "complete within the boundary"
@@ -700,6 +872,30 @@ fn verify_session(
         ArtifactState::NoCommit => println!("Artifact       not assessed (no linked commit)"),
         ArtifactState::Unavailable(why) => println!("Artifact       not assessed ({why})"),
         ArtifactState::Failed(err) => println!("Artifact       not assessed (error: {err})"),
+    }
+
+    // Was der Witness sah: Fenster und Beobachtungen nur aus Seals, die er
+    // gültig signiert hat (`witness_trust`) — dieselbe Quelle für die
+    // Korroboration und für die Abdeckung, aus der die Stufe rechnet.
+    let trusted = |seal_id: &ContentHash, text: &str| {
+        matches!(
+            run.trust.signature(seal_id, text),
+            minds_reader::assurance::SealSignature::Witness { .. }
+        )
+    };
+    let windows = match &loaded {
+        Some(session) => {
+            minds_reader::observations::witness_windows(store, &[(id, session)], &trusted)
+        }
+        None => Vec::new(),
+    };
+    if let (Some(session), false) = (&loaded, windows.is_empty()) {
+        let observations =
+            minds_reader::observations::observations_in_windows(store, &windows, &trusted);
+        for line in assurance::uncorroborated_lines(&ctx.root, id, session, &observations, run.all)
+        {
+            println!("{line}");
+        }
     }
     let interpretation_note = match interpretation {
         Some((_, 0)) => {
@@ -718,12 +914,43 @@ fn verify_session(
             None
         }
     };
+    let seals: Vec<(ContentHash, Seal, String)> = checked
+        .iter()
+        .map(|c| (c.id.clone(), c.seal.clone(), c.text.clone()))
+        .collect();
+    let observations = assurance::fs_coverage(store, &windows);
+    let report = assurance::report(
+        &run.trust,
+        &assurance::Facts {
+            id,
+            session: loaded.as_ref(),
+            seals: &seals,
+            legacy,
+            tampered,
+            complete: complete && incomplete_reasons.is_empty(),
+            // Ein genannter, aber nicht lesbarer Seal ist eine Range, deren
+            // Stufe niemand kennt — wie eine offene Kette.
+            chain_closed: chain.chain_closed && checked.len() == seal_ids.len(),
+            link,
+            ledger: &run.ledger.check,
+            observations: &observations,
+        },
+    );
+    print_assurance(&report, run.limits);
     println!(
         "Overall        {}{}",
         verdict.word(),
         interpretation_note.unwrap_or("")
     );
-    Ok(verdict)
+    Ok((verdict, report.overall))
+}
+
+/// Die `Assurance`- und `Not proven`-Zeilen eines Session-Blocks.
+fn print_assurance(report: &minds_reader::assurance::AssuranceReport, limits: bool) {
+    println!("{}", assurance::assurance_line(report));
+    for line in assurance::not_proven_lines(report.overall, limits) {
+        println!("{line}");
+    }
 }
 
 /// Benennt einen manipulierten Seal, so weit die Repo-Lage es hergibt:
@@ -848,6 +1075,7 @@ fn check_seals(
         checked.push(CheckedSeal {
             id: id.clone(),
             seal,
+            text,
             signature,
         });
     }
@@ -926,31 +1154,32 @@ fn signature_state(
 /// Lücke), alles Baumelnde bleibt offen.
 fn coverage_complete(
     store: &dyn ContextStore,
-    checked: &[CheckedSeal],
+    checked: &[(&ContentHash, &Seal)],
     reasons: &mut Vec<String>,
-) -> Fallible<bool> {
+) -> Fallible<ChainState> {
     let mut complete = true;
+    // Nur die Ketten-Befunde (Gabelung, offener oder zurückgewiesener
+    // Vorgänger, mehrere Anfänge) — Lücken innerhalb eines Seals schließen
+    // die Kette nicht auf (EA-11: Eingang `chain_closed`).
+    let mut chain_open = false;
 
-    for c in checked {
-        if c.seal.gaps > 0 {
+    for (id, seal) in checked {
+        if seal.gaps > 0 {
             reasons.push(format!(
-                "seal {}: {} gap(s) in range {}–{}",
-                c.id, c.seal.gaps, c.seal.first_seq, c.seal.last_seq
+                "seal {id}: {} gap(s) in range {}–{}",
+                seal.gaps, seal.first_seq, seal.last_seq
             ));
             complete = false;
         }
-        if c.seal.pre_chain > 0 {
+        if seal.pre_chain > 0 {
             reasons.push(format!(
-                "seal {}: {} event(s) captured before the evidence chain (unbound)",
-                c.id, c.seal.pre_chain
+                "seal {id}: {} event(s) captured before the evidence chain (unbound)",
+                seal.pre_chain
             ));
             complete = false;
         }
-        if matches!(c.seal.outcome, SealOutcome::Rejected) {
-            reasons.push(format!(
-                "seal {}: payload rejected by the storage policy",
-                c.id
-            ));
+        if matches!(seal.outcome, SealOutcome::Rejected) {
+            reasons.push(format!("seal {id}: payload rejected by the storage policy"));
             complete = false;
         }
     }
@@ -963,12 +1192,12 @@ fn coverage_complete(
     // gespeichert); sonst eine zurückgewiesene Epoche. Baumelnde oder
     // unlesbare Vorgänger bleiben offen. Innerhalb der Menge: eine Linie,
     // kein Fork.
-    let in_set: BTreeMap<&ContentHash, &CheckedSeal> = checked.iter().map(|c| (&c.id, c)).collect();
+    let in_set: BTreeMap<&ContentHash, &Seal> = checked.iter().copied().collect();
     let mut entry_points = 0usize;
     let mut internal_targets: std::collections::BTreeSet<&ContentHash> =
         std::collections::BTreeSet::new();
-    for c in checked {
-        match &c.seal.previous {
+    for (id, seal) in checked {
+        match &seal.previous {
             None => entry_points += 1,
             Some(prev) if in_set.contains_key(prev) => {
                 if !internal_targets.insert(prev) {
@@ -976,6 +1205,7 @@ fn coverage_complete(
                         "epoch fork: multiple seals build on {prev} — order not attested"
                     ));
                     complete = false;
+                    chain_open = true;
                 }
             }
             Some(prev) => match store.seal_text(prev) {
@@ -987,20 +1217,21 @@ fn coverage_complete(
                         SealOutcome::Stored { .. } | SealOutcome::ObservationsStored { .. } => {
                             entry_points += 1
                         }
-                        SealOutcome::Rejected if prev_seal.root == c.seal.root => {
+                        SealOutcome::Rejected if prev_seal.root == seal.root => {
                             entry_points += 1;
                         }
                         SealOutcome::Rejected => {
                             reasons.push(format!(
-                                "the epoch before seal {} was rejected (block seal {prev})",
-                                c.id
+                                "the epoch before seal {id} was rejected (block seal {prev})"
                             ));
                             complete = false;
+                            chain_open = true;
                         }
                     },
                     Err(_) => {
                         reasons.push(format!("predecessor seal {prev} is unreadable"));
                         complete = false;
+                        chain_open = true;
                     }
                 },
                 Ok(None) => {
@@ -1008,26 +1239,63 @@ fn coverage_complete(
                         "predecessor seal {prev} is not in the store — epoch chain open"
                     ));
                     complete = false;
+                    chain_open = true;
                 }
                 Err(StoreError::SealMismatch { .. }) => {
                     reasons.push(format!("predecessor seal {prev} was altered"));
                     complete = false;
+                    chain_open = true;
                 }
                 Err(err) => return Err(err.into()),
             },
         }
     }
-    if !checked.is_empty() && entry_points != 1 && complete {
-        reasons.push(format!(
-            "the epoch chain has {entry_points} starting points instead of one — order not attested"
-        ));
-        complete = false;
+    // Mehrere Anfänge öffnen die Kette auch neben anderen Befunden; als
+    // Grund steht es (wie bisher) nur da, wenn sonst nichts fehlt.
+    if !checked.is_empty() && entry_points != 1 {
+        chain_open = true;
+        if complete {
+            reasons.push(format!(
+                "the epoch chain has {entry_points} starting points instead of one — order not attested"
+            ));
+            complete = false;
+        }
     }
 
-    Ok(complete && !checked.is_empty())
+    Ok(ChainState {
+        complete: complete && !checked.is_empty(),
+        chain_closed: !chain_open,
+    })
 }
 
-/// Fallback, wenn der Rückverweis fehlt: alle Seals des Namensraums lesen und
+/// Was [`coverage_complete`] über die Seals einer Session sagt.
+struct ChainState {
+    /// Coverage vollständig: gap-frei, gespeichert, Kette geschlossen.
+    complete: bool,
+    /// Nur die Kette: kein offener, veränderter oder zurückgewiesener
+    /// Vorgänger, keine Gabelung, genau ein Anfang.
+    chain_closed: bool,
+}
+
+/// Die Seals einer Session: der Rückverweis (`evidence.json`) vereinigt mit
+/// allen Seals des Namensraums, die diese Session nennen — in dieser
+/// Reihenfolge, ohne Dubletten. Dazu die, die nur der Namensraum kennt.
+fn session_seal_ids(
+    store: &dyn ContextStore,
+    id: SessionId,
+) -> Fallible<(Vec<ContentHash>, Vec<ContentHash>)> {
+    let mut ids = store.seals_of(id)?;
+    let mut unreferenced = Vec::new();
+    for seal_id in seals_naming(store, id)? {
+        if !ids.contains(&seal_id) {
+            ids.push(seal_id.clone());
+            unreferenced.push(seal_id);
+        }
+    }
+    Ok((ids, unreferenced))
+}
+
+/// Alle Seals des Namensraums lesen und
 /// die behalten, deren `session=`-Zeile diese Session nennt.
 ///
 /// Auch ein **manipulierter** Seal zählt hier, wenn sein (unverifizierter)
@@ -1073,6 +1341,90 @@ fn seals_naming(store: &dyn ContextStore, id: SessionId) -> Fallible<Vec<Content
         }
     }
     Ok(found)
+}
+
+/// Die Assurance einer Session ohne Ausgabe — für `minds fsck
+/// --require-assurance`. Dieselben Fakten wie der Verdikt-Block: dieselben
+/// Seals (Rückverweis vereinigt mit dem Namensraum, `session_seal_ids`),
+/// dieselbe Kette, dieselbe
+/// Signaturprüfung ([`signature_state`], ohne `--identity`) und dieselbe
+/// Witness-Prüfung. Was dort `TAMPERED` hieße (veränderte oder unlesbare
+/// Seals, eine ungültige Witness-Signatur, eine Nutzlast, die nicht auf
+/// ihre Id hasht), ist hier A0 — ein Gate in `fsck` ist nie milder als
+/// `verify`. Die Coverage-Gründe des Blocks (Schritt 3) fehlen hier — sie
+/// berühren die Stufe nicht (`assess` liest aus der Integrität nur
+/// `Tampered`).
+pub(crate) fn session_assurance(
+    store: &dyn ContextStore,
+    trust: &witness_trust::WitnessTrust<'_>,
+    signers: Option<&str>,
+    root: &Path,
+    id: SessionId,
+    link: Option<EvidenceSource>,
+) -> Fallible<minds_reader::assurance::AssuranceReport> {
+    let mut tampered = false;
+    let session = match store.get(id) {
+        Ok(session) => session,
+        Err(StoreError::Corrupt { .. }) => {
+            tampered = true;
+            None
+        }
+        Err(StoreError::Forgotten { .. }) => None,
+        Err(err) => return Err(err.into()),
+    };
+    let (seal_ids, _) = session_seal_ids(store, id)?;
+    let mut seals: Vec<(ContentHash, Seal, String)> = Vec::new();
+    let mut unreadable = false;
+    for seal_id in &seal_ids {
+        match store.seal_text(seal_id) {
+            Ok(Some(text)) => match Seal::parse(&text) {
+                Ok(seal) => {
+                    // Wie `verify_session`: Eine ungültige Witness-Signatur
+                    // ist Manipulation.
+                    if signature_state(store, seal_id, &text, &seal.scope, signers, None, root)?
+                        .is_invalid()
+                    {
+                        tampered = true;
+                    }
+                    seals.push((seal_id.clone(), seal, text));
+                }
+                Err(_) => tampered = true,
+            },
+            Ok(None) => unreadable = true,
+            Err(StoreError::SealMismatch { .. }) => tampered = true,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let pairs: Vec<(&ContentHash, &Seal)> = seals.iter().map(|(id, seal, _)| (id, seal)).collect();
+    let chain = coverage_complete(store, &pairs, &mut Vec::new())?;
+    let trusted = |seal_id: &ContentHash, text: &str| {
+        matches!(
+            trust.signature(seal_id, text),
+            minds_reader::assurance::SealSignature::Witness { .. }
+        )
+    };
+    let windows = match &session {
+        Some(session) => {
+            minds_reader::observations::witness_windows(store, &[(id, session)], &trusted)
+        }
+        None => Vec::new(),
+    };
+    let observations = assurance::fs_coverage(store, &windows);
+    Ok(assurance::report(
+        trust,
+        &assurance::Facts {
+            id,
+            session: session.as_ref(),
+            seals: &seals,
+            legacy: seal_ids.is_empty() && !tampered,
+            tampered,
+            complete: chain.complete && !unreadable,
+            chain_closed: chain.chain_closed && !unreadable,
+            link,
+            ledger: &LedgerCheck::NotChecked,
+            observations: &observations,
+        },
+    ))
 }
 
 /// Wie viele **andere** Sessions dieselbe `(agent, local_id)` tragen — der
@@ -1160,6 +1512,7 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
     let checked = CheckedSeal {
         id,
         seal,
+        text,
         signature,
     };
     print_seal_line(&checked);
@@ -1180,9 +1533,10 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
             let mut reasons = Vec::new();
             let complete = coverage_complete(
                 ctx.store.as_ref(),
-                std::slice::from_ref(&checked),
+                &[(&checked.id, &checked.seal)],
                 &mut reasons,
-            )?;
+            )?
+            .complete;
             // Wie bei `stored`: Der Seal sagt „abgelegt" — dann muss das
             // Objekt hier auch liegen und auf seine Id hashen.
             match observations
@@ -1201,7 +1555,7 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
             // eine Zeile erklären dürfen, entscheidet die strengere
             // Witness-Prüfung — das wird hier dazugesagt, nicht verschwiegen.
             let trusted = witness_trust::observation_trust(ctx.store.as_ref(), signers);
-            if !trusted(&checked.id, &text) {
+            if !trusted(&checked.id, &checked.text) {
                 println!(
                     "Note           not trusted for reconciliation — needs a principal restricted to minds-witness in --signers or ~/.ssh/allowed_signers"
                 );
@@ -1220,9 +1574,10 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
             let mut reasons = Vec::new();
             let complete = coverage_complete(
                 ctx.store.as_ref(),
-                std::slice::from_ref(&checked),
+                &[(&checked.id, &checked.seal)],
                 &mut reasons,
-            )?;
+            )?
+            .complete;
             for reason in &reasons {
                 println!("Gap            {reason}");
             }
