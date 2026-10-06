@@ -29,7 +29,7 @@ use minds_reader::assurance::SealSignature;
 use minds_store::ContextStore;
 
 /// Höchstgröße der Signer-Datei, die gelesen wird.
-const MAX_SIGNERS_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_SIGNERS_BYTES: u64 = 1024 * 1024;
 
 /// Das Vertrauens-Prädikat für `witness-fs/v1`-Seals.
 pub(super) fn observation_trust<'a>(

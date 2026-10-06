@@ -824,37 +824,20 @@ impl SealOutcome {
     }
 }
 
-/// Was das Proof-Modell belegt — das **kanonische Vokabular**, das
-/// `minds audit --export` (`proves`), die TUI und die Doku gemeinsam
-/// sprechen. Eine Quelle, drei Oberflächen: Wer hier einen Satz ändert,
-/// ändert die Zusage überall — und nirgends kann eine Oberfläche mehr
-/// behaupten als die andere.
-pub const PROVES: &[&str] = &[
-    "Every session id is the blake3 hash of its canonical content — the content can be recomputed against it.",
-    "The attestation_payload is byte-for-byte the text `minds sign` signs; a shipped signature is verifiable against it.",
-    "The review_payload binds the hash of the verdict; a valid signature over it shows who reviewed.",
-    "Verdicts attach to the change id and therefore survive rebase and force-push.",
-    "A forgotten session stays visible as a reference (payload: forgotten) — deletion is provable, not traceless.",
-    "Seal identity and signature are externally verifiable: seal_id = blake3::derive_key(\"minds/evidence/v1/seal\", text). The seal commits cryptographically to chain root and coverage; the underlying chain is reproducible only with the local journal and session salt (ADR-0011).",
-    "A block seal (rejected_seals) proves that a session existed whose payload the storage policy rejected — without disclosing its content.",
-];
-
-/// Was das Proof-Modell **nicht** belegt — dieselbe Quelle wie [`PROVES`].
-/// Die Grenzen gehören in jedes Artefakt (Audit-Bundle, TUI), nicht nur in
-/// die Doku, die beim Weiterreichen zurückbleibt.
-pub const DOES_NOT_PROVE: &[&str] = &[
-    "Not that the record is complete: the hot path is fail-open, and a lost event is silently absent here (`minds fsck` makes gaps visible).",
-    "Not that a session actually produced the lines attributed to it — the mapping comes from trailers (observed) and heuristics (inferred); the provenance is stated on every edge.",
-    "Not that a model did what the transcript says — what is recorded is what the agent reported.",
-    "Not who controls the signing keys. Without an allowed_signers file from a trusted source, a signature is only a self-attestation.",
-    "Not that unsigned entries are genuine: they are content-addressed, but nobody vouches for them with a key.",
-    "Not that the bundle alone can recompute the chain: the chain root is reproducible only with the local journal and session salt — the bundle proves the sealed claim (identity, signature, coverage), not the chain itself.",
-    "Not that nothing happened outside sealed ranges — a seal claims only the sequence range its epoch actually read.",
-    "Not the integrity between append and seal: until the checkpoint, only the file system protects the journal; a local write before sealing is undetectable (ADR-0011, decision 1).",
-    "Not that the agent process was the only actor: subprocesses, network access and plugins outside the hook boundary (scope in the seal) are not captured — coverage means complete within the boundary, never system activity.",
-    "Not the effect of uninterpreted tool calls: capture=uninterpreted means observed, but the effects are not normalized — the interpretation axis is separate from integrity and coverage.",
-    "Not real wall-clock time: timestamps come from the hook's local clock, with no external time anchor.",
-];
+// ---------------------------------------------------------------------------
+// Proof-Vokabular (EA-13)
+// ---------------------------------------------------------------------------
+//
+// **Eine** Quelle für Audit-Bundle, TUI, `minds verify` und Doku: Wer hier
+// einen Satz ändert, ändert die Zusage überall — und keine Oberfläche kann
+// mehr behaupten als eine andere. Jeder Satz trägt den Stufenbereich, in dem
+// er gilt; jede Oberfläche druckt genau die Sätze der Stufe, die das
+// geprüfte Material trägt.
+//
+// Die Texte stehen einzeln als Konstanten, damit die stufenlosen Listen
+// (`PROVES`, `DOES_NOT_PROVE`) und die Stufen-Tabellen
+// (`PROVES_V2`, `DOES_NOT_PROVE_V2`) dieselben Bytes teilen. Dass die
+// stufenlosen Listen genau die A1-Sätze sind, hält ein Test fest.
 
 /// Die Assurance-Stufe als Ordinal — der `minds-core`-Spiegel von
 /// `minds_reader::assurance::Assurance`, damit `core` frei von Reader-Typen
@@ -901,150 +884,310 @@ impl ProofSentence {
     }
 }
 
-/// Was das Proof-Modell **nicht** belegt, je Stufe (EA-13, vorgezogen für
-/// die `Not proven`-Zeile von `minds verify`, EA-12). Die Sätze, die auf
-/// keiner Stufe fallen, stehen vorn: Die Kurzzeile nennt höchstens drei,
-/// und die drei sollen die sein, die keine Stufe je einlöst.
+// --- Was belegt ist: die Texte -----------------------------------------------
+
+const P_SESSION_CONTENT_ADDRESSED: &str = "Every session id is the blake3 hash of its canonical content — the content can be recomputed against it.";
+const P_ATTESTATION_PAYLOAD: &str = "The attestation_payload is byte-for-byte the text `minds sign` signs; a shipped signature is verifiable against it.";
+const P_REVIEW_PAYLOAD: &str = "The review_payload binds the hash of the verdict; a valid signature over it shows who reviewed.";
+const P_VERDICTS_SURVIVE_REBASE: &str =
+    "Verdicts attach to the change id and therefore survive rebase and force-push.";
+const P_FORGOTTEN_VISIBLE: &str = "A forgotten session stays visible as a reference (payload: forgotten) — deletion is provable, not traceless.";
+const P_SEAL_VERIFIABLE: &str = "Seal identity and signature are externally verifiable: seal_id = blake3::derive_key(\"minds/evidence/v1/seal\", text). The seal commits cryptographically to chain root and coverage; the underlying chain is reproducible only with the local journal and session salt (ADR-0011).";
+const P_BLOCK_SEAL: &str = "A block seal (rejected_seals) proves that a session existed whose payload the storage policy rejected — without disclosing its content.";
+const P_WITNESS_CHAINING: &str = "Events were chained live by the witness, outside the agent's trust domain, and sealed under its key (minds-witness): a write between append and seal breaks a witness-signed chain.";
+const P_INTENT_APPROVED: &str = "The intent the session worked against is bound by version, and its approver signed it (minds-intent).";
+const P_FS_OBSERVED: &str = "The witness observed the worktree's file-system changes during the session, gap-free and under its key (witness-fs/v1) — a second observer besides the agent's own report. Whether they explain a given commit's lines is a separate check (`minds verify`, coverage axis).";
+const P_RESULTS_REPRODUCED: &str = "The decisive results (tests, builds) are real: CI re-ran the decisive commands and reproduced the outcomes the agent reported.";
+const P_FIRST_SIGHT_BOUND: &str = "An upper time bound: CI countersigned every seal on first sight (minds-anchor), so the evidence existed no later than that.";
+
+// --- Was nicht belegt ist: die Texte -----------------------------------------
+
+const N_MODEL_IDENTITY: &str =
+    "Not which model produced the answers: the model name is what the agent reported.";
+const N_DECISION_CORRECT: &str = "Not that the decision was right: the evidence shows what happened, not whether it was the correct thing to do.";
+const N_OUTSIDE_BOUNDARY: &str = "Not what happened outside the observation boundary: activity that neither the hooks nor the witness observe is not recorded.";
+const N_ROOT_COMPROMISE: &str = "Not integrity against whoever controls the host (root, the witness account or its key): they can rewrite the evidence and the witness alike.";
+const N_RECORD_COMPLETE: &str = "Not that the record is complete: the hot path is fail-open, and a lost event is silently absent here (`minds fsck` makes gaps visible).";
+const N_LINES_ATTRIBUTED: &str = "Not that a session actually produced the lines attributed to it — the mapping comes from trailers (observed) and heuristics (inferred); the provenance is stated on every edge.";
+const N_TRANSCRIPT_REPORTED: &str =
+    "Not that a model did what the transcript says — what is recorded is what the agent reported.";
+const N_REPORTED_RESULTS: &str = "Not that reported results (tests, builds) are real: they are what the agent reported until a CI replay reproduces them.";
+const N_WHO_CONTROLS_KEYS: &str = "Not who controls the signing keys. Without an allowed_signers file from a trusted source, a signature is only a self-attestation.";
+const N_WHO_CONTROLS_KEYS_WITNESSED: &str = "Not who controls the human signing keys: witness key control is shown; human key custody still depends on allowed_signers.";
+const N_UNSIGNED_ENTRIES: &str = "Not that unsigned entries are genuine: they are content-addressed, but nobody vouches for them with a key.";
+const N_BUNDLE_LEVEL_SELF_REPORTED: &str = "Not the assurance level as a portable fact: it is assessed when the evidence is read, from the repository and the trusted signers at hand; a level stated elsewhere (an exported bundle, a report) cannot be recomputed from that document alone — re-run `minds verify --signers` against the repository.";
+const N_BUNDLE_CHAIN: &str = "Not that the bundle alone can recompute the chain: the chain root is reproducible only with the local journal and session salt — the bundle proves the sealed claim (identity, signature, coverage), not the chain itself.";
+const N_OUTSIDE_SEALED_RANGES: &str = "Not that nothing happened outside sealed ranges — a seal claims only the sequence range its epoch actually read.";
+const N_APPEND_TO_SEAL_WINDOW: &str = "Not the integrity between append and seal: until the checkpoint, only the file system protects the journal; a local write before sealing is undetectable (ADR-0011, decision 1).";
+const N_ONLY_ACTOR: &str = "Not that the agent process was the only actor: subprocesses, network access and plugins outside the hook boundary (scope in the seal) are not captured — coverage means complete within the boundary, never system activity.";
+const N_ONLY_ACTOR_WITNESSED: &str = "Not that the agent was the only actor: changes in the worktree are observed; processes, network and other machines are not.";
+const N_UNINTERPRETED_EFFECTS: &str = "Not the effect of uninterpreted tool calls: capture=uninterpreted means observed, but the effects are not normalized — the interpretation axis is separate from integrity and coverage.";
+const N_WALL_CLOCK_TIME: &str = "Not real wall-clock time: timestamps come from the hook's local clock, with no external time anchor.";
+const N_WALL_CLOCK_TIME_ANCHORED: &str =
+    "Not the exact time: the CI anchor gives an upper bound, there is no lower bound.";
+
+// --- Die Tabellen ------------------------------------------------------------
+
+/// Was das Proof-Modell belegt, je Stufe (EA-13). Bis A1 sind es die
+/// Zusagen über Inhaltsadressierung, Payloads und Seals; ab A2 kommt dazu,
+/// was der Witness einlöst (Live-Verkettung, Intent, Datei-Beobachtung), ab A3, was
+/// CI einlöst (Replay, Erstsichtung).
 ///
-/// Auf A1 sind die Texte aus [`DOES_NOT_PROVE`] wörtlich enthalten (ein
-/// Test hält das fest); dazu kommen die Grenzen, die keine Stufe aufhebt.
-/// Ab A2 fallen die Sätze, die der Witness einlöst, weg oder werden enger
-/// gefasst.
+/// Die Inhaltsadressierung gilt schon auf A0: Sie hängt an keinem Seal.
+/// Die Seal-Zusagen gelten ab A1 — auf A0 trägt kein intakter Seal das
+/// Material.
+pub const PROVES_V2: &[ProofSentence] = &[
+    ProofSentence {
+        id: "session_content_addressed",
+        short: "session content",
+        text: P_SESSION_CONTENT_ADDRESSED,
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "attestation_payload",
+        short: "the attestation payload",
+        text: P_ATTESTATION_PAYLOAD,
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "review_payload",
+        short: "who reviewed",
+        text: P_REVIEW_PAYLOAD,
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "verdicts_survive_rebase",
+        short: "verdicts across rebase",
+        text: P_VERDICTS_SURVIVE_REBASE,
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "forgotten_visible",
+        short: "forgotten sessions",
+        text: P_FORGOTTEN_VISIBLE,
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "seal_verifiable",
+        short: "seal identity and coverage",
+        text: P_SEAL_VERIFIABLE,
+        holds_from: Level::A1,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "block_seal",
+        short: "rejected sessions existed",
+        text: P_BLOCK_SEAL,
+        holds_from: Level::A1,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "witness_chaining",
+        short: "witness live chaining",
+        text: P_WITNESS_CHAINING,
+        holds_from: Level::A2,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "intent_approved",
+        short: "intent version and approver",
+        text: P_INTENT_APPROVED,
+        holds_from: Level::A2,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "fs_observed",
+        short: "file-system observation",
+        text: P_FS_OBSERVED,
+        holds_from: Level::A2,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "results_reproduced",
+        short: "decisive results reproduced",
+        text: P_RESULTS_REPRODUCED,
+        holds_from: Level::A3,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "first_sight_bound",
+        short: "first-sight time bound",
+        text: P_FIRST_SIGHT_BOUND,
+        holds_from: Level::A3,
+        holds_until: None,
+    },
+];
+
+/// Was das Proof-Modell **nicht** belegt, je Stufe. Die Sätze, die auf
+/// keiner Stufe fallen, stehen vorn: Die Kurzzeile von `minds verify`
+/// (`Not proven`, EA-12) nennt höchstens drei, und die drei sollen die
+/// sein, die keine Stufe je einlöst.
+///
+/// Ab A2 fallen die Sätze, die der Witness einlöst, weg
+/// (`append_to_seal_window`) oder werden enger gefasst
+/// (`who_controls_keys` → `who_controls_keys_witnessed`, `only_actor` →
+/// `only_actor_witnessed`); ab A3 die, die CI einlöst (`reported_results`;
+/// `wall_clock_time` → `wall_clock_time_anchored`).
 pub const DOES_NOT_PROVE_V2: &[ProofSentence] = &[
     ProofSentence {
         id: "model_identity",
         short: "model identity",
-        text: "Not which model produced the answers: the model name is what the agent reported.",
+        text: N_MODEL_IDENTITY,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "decision_correct",
         short: "correctness of the decision",
-        text: "Not that the decision was right: the evidence shows what happened, not whether it was the correct thing to do.",
+        text: N_DECISION_CORRECT,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "outside_boundary",
         short: "actions outside the boundary",
-        text: "Not what happened outside the observation boundary: activity that neither the hooks nor the witness observe is not recorded.",
+        text: N_OUTSIDE_BOUNDARY,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "root_compromise",
         short: "a compromised host",
-        text: "Not integrity against whoever controls the host (root, the witness account or its key): they can rewrite the evidence and the witness alike.",
+        text: N_ROOT_COMPROMISE,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "record_complete",
         short: "completeness of the record",
-        text: DOES_NOT_PROVE[0],
+        text: N_RECORD_COMPLETE,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "lines_attributed",
         short: "line attribution",
-        text: DOES_NOT_PROVE[1],
+        text: N_LINES_ATTRIBUTED,
         holds_from: Level::A0,
-        holds_until: Some(Level::A2),
+        // Nicht ab A2 zurückgezogen (Abweichung von der EA-13-Tabelle): Die
+        // Stufe sagt, wer beobachtet hat, nicht, welcher Commit aus der
+        // Session stammt — die Reconciliation ist kein Eingang von
+        // `assess`, und den Trailer kann der Agent schreiben. Erst wenn
+        // die Stufe den Abgleich trägt, darf dieser Satz fallen.
+        holds_until: None,
     },
     ProofSentence {
         id: "transcript_reported",
         short: "the transcript's account",
-        text: DOES_NOT_PROVE[2],
+        text: N_TRANSCRIPT_REPORTED,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "reported_results",
         short: "reported results",
-        text: "Not that reported results (tests, builds) are real: they are what the agent reported until a CI replay reproduces them.",
+        text: N_REPORTED_RESULTS,
         holds_from: Level::A0,
         holds_until: Some(Level::A3),
     },
     ProofSentence {
         id: "who_controls_keys",
         short: "key custody",
-        text: DOES_NOT_PROVE[3],
+        text: N_WHO_CONTROLS_KEYS,
         holds_from: Level::A0,
         holds_until: Some(Level::A2),
     },
     ProofSentence {
         id: "who_controls_keys_witnessed",
         short: "human key custody",
-        text: "Not who controls the human signing keys: witness key control is shown; human key custody still depends on allowed_signers.",
+        text: N_WHO_CONTROLS_KEYS_WITNESSED,
         holds_from: Level::A2,
         holds_until: None,
     },
     ProofSentence {
         id: "unsigned_entries",
         short: "unsigned entries",
-        text: DOES_NOT_PROVE[4],
+        text: N_UNSIGNED_ENTRIES,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "bundle_chain",
         short: "the chain from the bundle alone",
-        text: DOES_NOT_PROVE[5],
+        text: N_BUNDLE_CHAIN,
+        holds_from: Level::A0,
+        holds_until: None,
+    },
+    ProofSentence {
+        id: "bundle_level_self_reported",
+        short: "a stated level on its own",
+        text: N_BUNDLE_LEVEL_SELF_REPORTED,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "outside_sealed_ranges",
         short: "unsealed ranges",
-        text: DOES_NOT_PROVE[6],
+        text: N_OUTSIDE_SEALED_RANGES,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "append_to_seal_window",
         short: "integrity between append and seal",
-        text: DOES_NOT_PROVE[7],
+        text: N_APPEND_TO_SEAL_WINDOW,
         holds_from: Level::A0,
         holds_until: Some(Level::A2),
     },
     ProofSentence {
         id: "only_actor",
         short: "the agent as the only actor",
-        text: DOES_NOT_PROVE[8],
+        text: N_ONLY_ACTOR,
         holds_from: Level::A0,
         holds_until: Some(Level::A2),
     },
     ProofSentence {
         id: "only_actor_witnessed",
         short: "actors beyond the worktree",
-        text: "Not that the agent was the only actor: changes in the worktree are observed; processes, network and other machines are not.",
+        text: N_ONLY_ACTOR_WITNESSED,
         holds_from: Level::A2,
         holds_until: None,
     },
     ProofSentence {
         id: "uninterpreted_effects",
         short: "effects of uninterpreted calls",
-        text: DOES_NOT_PROVE[9],
+        text: N_UNINTERPRETED_EFFECTS,
         holds_from: Level::A0,
         holds_until: None,
     },
     ProofSentence {
         id: "wall_clock_time",
         short: "wall-clock time",
-        text: DOES_NOT_PROVE[10],
+        text: N_WALL_CLOCK_TIME,
         holds_from: Level::A0,
         holds_until: Some(Level::A3),
     },
     ProofSentence {
         id: "wall_clock_time_anchored",
         short: "a lower time bound",
-        text: "Not the exact time: the CI anchor gives an upper bound, there is no lower bound.",
+        text: N_WALL_CLOCK_TIME_ANCHORED,
         holds_from: Level::A3,
         holds_until: None,
     },
 ];
+
+/// Die Zusagen, die auf Stufe `level` gelten — in der Reihenfolge von
+/// [`PROVES_V2`].
+pub fn proves_at(level: Level) -> impl Iterator<Item = &'static ProofSentence> {
+    PROVES_V2
+        .iter()
+        .filter(move |sentence| sentence.holds_at(level))
+}
 
 /// Die Grenzen, die auf Stufe `level` gelten — in der Reihenfolge von
 /// [`DOES_NOT_PROVE_V2`].
@@ -1053,6 +1196,46 @@ pub fn limits_at(level: Level) -> impl Iterator<Item = &'static ProofSentence> {
         .iter()
         .filter(move |sentence| sentence.holds_at(level))
 }
+
+/// Was das Proof-Modell auf **A1** belegt — die stufenlose Form von
+/// [`proves_at`]`(Level::A1)`, Satz für Satz in derselben Reihenfolge (ein
+/// Test hält das fest). Nur zur Kompatibilität für Aufrufer ohne Stufe —
+/// keine Wahrheit für sich; jede
+/// Oberfläche, die eine kennt, nimmt [`proves_at`].
+pub const PROVES: &[&str] = &[
+    P_SESSION_CONTENT_ADDRESSED,
+    P_ATTESTATION_PAYLOAD,
+    P_REVIEW_PAYLOAD,
+    P_VERDICTS_SURVIVE_REBASE,
+    P_FORGOTTEN_VISIBLE,
+    P_SEAL_VERIFIABLE,
+    P_BLOCK_SEAL,
+];
+
+/// Was das Proof-Modell auf **A1** nicht belegt — die stufenlose Form von
+/// [`limits_at`]`(Level::A1)`, Satz für Satz in derselben Reihenfolge (ein
+/// Test hält das fest). Nur zur Kompatibilität für Aufrufer ohne Stufe —
+/// keine Wahrheit für sich; jede
+/// Oberfläche, die eine kennt, nimmt [`limits_at`].
+pub const DOES_NOT_PROVE: &[&str] = &[
+    N_MODEL_IDENTITY,
+    N_DECISION_CORRECT,
+    N_OUTSIDE_BOUNDARY,
+    N_ROOT_COMPROMISE,
+    N_RECORD_COMPLETE,
+    N_LINES_ATTRIBUTED,
+    N_TRANSCRIPT_REPORTED,
+    N_REPORTED_RESULTS,
+    N_WHO_CONTROLS_KEYS,
+    N_UNSIGNED_ENTRIES,
+    N_BUNDLE_CHAIN,
+    N_BUNDLE_LEVEL_SELF_REPORTED,
+    N_OUTSIDE_SEALED_RANGES,
+    N_APPEND_TO_SEAL_WINDOW,
+    N_ONLY_ACTOR,
+    N_UNINTERPRETED_EFFECTS,
+    N_WALL_CLOCK_TIME,
+];
 
 // ---------------------------------------------------------------------------
 // Kodierung
@@ -1598,44 +1781,226 @@ mod tests {
 
     #[test]
     fn proof_sentences_have_unique_ids() {
-        let mut ids: Vec<&str> = DOES_NOT_PROVE_V2.iter().map(|s| s.id).collect();
+        // Eindeutig über **beide** Tabellen: Doku und Tests nennen einen
+        // Satz nur über seine Id.
+        let mut ids: Vec<&str> = PROVES_V2
+            .iter()
+            .chain(DOES_NOT_PROVE_V2)
+            .map(|s| s.id)
+            .collect();
         ids.sort_unstable();
         let before = ids.len();
         ids.dedup();
         assert_eq!(ids.len(), before);
-        for sentence in DOES_NOT_PROVE_V2 {
+        for sentence in PROVES_V2.iter().chain(DOES_NOT_PROVE_V2) {
+            assert!(
+                !sentence.id.is_empty()
+                    && sentence
+                        .id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{}",
+                sentence.id
+            );
             assert!(!sentence.short.is_empty() && !sentence.short.contains('·'));
+            assert!(!sentence.text.is_empty());
             // Ein Bereich, der nie gilt, wäre ein toter Satz.
             assert!(Level::ALL.iter().any(|level| sentence.holds_at(*level)));
         }
     }
 
-    /// A1 ist der heutige Stand: Jeder Satz aus `DOES_NOT_PROVE` gilt dort
-    /// wörtlich — die Stufen-Tabelle nimmt nichts weg, was heute gesagt wird.
+    /// Die Ids sind Schnittstelle (Bundle, Doku, Tests): eingefroren je
+    /// Stufe. Wer hier etwas ändert, ändert eine Zusage — bewusst.
     #[test]
-    fn a1_limits_include_every_current_sentence() {
-        let a1: Vec<&str> = limits_at(Level::A1).map(|s| s.text).collect();
-        for text in DOES_NOT_PROVE {
-            assert!(a1.contains(text), "{text}");
-        }
+    fn proof_sentence_ids_per_level_are_frozen() {
+        let proves = |level| proves_at(level).map(|s| s.id).collect::<Vec<_>>();
+        let limits = |level| limits_at(level).map(|s| s.id).collect::<Vec<_>>();
+        let a0_proves = [
+            "session_content_addressed",
+            "attestation_payload",
+            "review_payload",
+            "verdicts_survive_rebase",
+            "forgotten_visible",
+        ];
+        let a1_proves = [&a0_proves[..], &["seal_verifiable", "block_seal"]].concat();
+        let a2_proves = [
+            &a1_proves[..],
+            &["witness_chaining", "intent_approved", "fs_observed"],
+        ]
+        .concat();
+        let a3_proves = [&a2_proves[..], &["results_reproduced", "first_sight_bound"]].concat();
+        assert_eq!(proves(Level::A0), a0_proves);
+        assert_eq!(proves(Level::A1), a1_proves);
+        assert_eq!(proves(Level::A2), a2_proves);
+        assert_eq!(proves(Level::A3), a3_proves);
+
+        let a1_limits = [
+            "model_identity",
+            "decision_correct",
+            "outside_boundary",
+            "root_compromise",
+            "record_complete",
+            "lines_attributed",
+            "transcript_reported",
+            "reported_results",
+            "who_controls_keys",
+            "unsigned_entries",
+            "bundle_chain",
+            "bundle_level_self_reported",
+            "outside_sealed_ranges",
+            "append_to_seal_window",
+            "only_actor",
+            "uninterpreted_effects",
+            "wall_clock_time",
+        ];
+        assert_eq!(limits(Level::A0), a1_limits);
+        assert_eq!(limits(Level::A1), a1_limits);
+        assert_eq!(
+            limits(Level::A2),
+            [
+                "model_identity",
+                "decision_correct",
+                "outside_boundary",
+                "root_compromise",
+                "record_complete",
+                "lines_attributed",
+                "transcript_reported",
+                "reported_results",
+                "who_controls_keys_witnessed",
+                "unsigned_entries",
+                "bundle_chain",
+                "bundle_level_self_reported",
+                "outside_sealed_ranges",
+                "only_actor_witnessed",
+                "uninterpreted_effects",
+                "wall_clock_time",
+            ]
+        );
+        assert_eq!(
+            limits(Level::A3),
+            [
+                "model_identity",
+                "decision_correct",
+                "outside_boundary",
+                "root_compromise",
+                "record_complete",
+                "lines_attributed",
+                "transcript_reported",
+                "who_controls_keys_witnessed",
+                "unsigned_entries",
+                "bundle_chain",
+                "bundle_level_self_reported",
+                "outside_sealed_ranges",
+                "only_actor_witnessed",
+                "uninterpreted_effects",
+                "wall_clock_time_anchored",
+            ]
+        );
+    }
+
+    /// Die stufenlosen Listen sind die A1-Sätze — Satz für Satz, in
+    /// derselben Reihenfolge. Wer eine Liste ändert, ohne die Tabelle zu
+    /// ändern, fällt hier auf.
+    #[test]
+    fn the_flat_lists_are_derived_from_a1() {
+        let proves: Vec<&str> = proves_at(Level::A1).map(|s| s.text).collect();
+        assert_eq!(proves, PROVES);
+        let limits: Vec<&str> = limits_at(Level::A1).map(|s| s.text).collect();
+        assert_eq!(limits, DOES_NOT_PROVE);
+    }
+
+    #[test]
+    fn a1_limits_include_append_window() {
         assert!(
             limits_at(Level::A1).any(|s| s.id == "append_to_seal_window"),
             "A1 keeps the append→seal limitation"
         );
+        assert!(
+            DOES_NOT_PROVE
+                .iter()
+                .any(|t| t.contains("between append and seal"))
+        );
+        // A0 nennt mindestens so viel Grenze wie A1.
+        assert!(limits_at(Level::A0).any(|s| s.id == "append_to_seal_window"));
     }
 
     #[test]
-    fn a2_limits_retire_what_the_witness_proves() {
+    fn a2_limits_exclude_append_window() {
+        for level in [Level::A2, Level::A3] {
+            let ids: Vec<&str> = limits_at(level).map(|s| s.id).collect();
+            assert!(!ids.contains(&"append_to_seal_window"), "{level:?}");
+            assert!(
+                limits_at(level).all(|s| !s.text.contains("between append and seal")),
+                "{level:?}"
+            );
+        }
+        // … und nennt dafür die A2-Grenzen.
         let a2: Vec<&str> = limits_at(Level::A2).map(|s| s.id).collect();
-        for retired in ["append_to_seal_window", "lines_attributed", "only_actor"] {
+        for retired in ["only_actor", "who_controls_keys"] {
             assert!(!a2.contains(&retired), "{retired}");
         }
-        for narrowed in ["only_actor_witnessed", "who_controls_keys_witnessed"] {
-            assert!(a2.contains(&narrowed), "{narrowed}");
+        for kept in [
+            "only_actor_witnessed",
+            "who_controls_keys_witnessed",
+            "reported_results",
+            "wall_clock_time",
+        ] {
+            assert!(a2.contains(&kept), "{kept}");
+        }
+        // Die Stufe trägt den Abgleich mit dem Commit nicht: Die
+        // Zuordnung von Zeilen bleibt auf jeder Stufe eine Grenze, und das
+        // Bündel sagt auf jeder Stufe, dass es seine Stufe nur behauptet.
+        for level in Level::ALL {
+            let ids: Vec<&str> = limits_at(level).map(|s| s.id).collect();
+            assert!(ids.contains(&"lines_attributed"), "{level:?}");
+            assert!(ids.contains(&"bundle_level_self_reported"), "{level:?}");
         }
         let a3: Vec<&str> = limits_at(Level::A3).map(|s| s.id).collect();
         assert!(!a3.contains(&"reported_results"));
+        assert!(!a3.contains(&"wall_clock_time"));
         assert!(a3.contains(&"wall_clock_time_anchored"));
+    }
+
+    /// Eine höhere Stufe sagt nie weniger zu als eine niedrigere.
+    #[test]
+    fn proves_only_grow_with_the_level() {
+        for pair in Level::ALL.windows(2) {
+            let lower: Vec<&str> = proves_at(pair[0]).map(|s| s.id).collect();
+            let upper: Vec<&str> = proves_at(pair[1]).map(|s| s.id).collect();
+            for id in &lower {
+                assert!(upper.contains(id), "{id} lost at {:?}", pair[1]);
+            }
+        }
+    }
+
+    /// Jede zurückgezogene Grenze ist ab genau ihrer Stufe durch eine
+    /// Zusage gedeckt oder durch eine engere Grenze ersetzt — die Tabelle
+    /// lässt nichts stillschweigend fallen.
+    #[test]
+    fn every_retired_limit_is_covered() {
+        // (zurückgezogen, ersetzt durch Zusage oder engere Grenze)
+        let covered = [
+            ("append_to_seal_window", "witness_chaining"),
+            ("who_controls_keys", "who_controls_keys_witnessed"),
+            ("only_actor", "only_actor_witnessed"),
+            ("reported_results", "results_reproduced"),
+            ("wall_clock_time", "wall_clock_time_anchored"),
+        ];
+        for sentence in DOES_NOT_PROVE_V2 {
+            let Some(until) = sentence.holds_until else {
+                continue;
+            };
+            let (_, by) = covered
+                .iter()
+                .find(|(id, _)| *id == sentence.id)
+                .unwrap_or_else(|| panic!("{} retires without cover", sentence.id));
+            let cover = PROVES_V2
+                .iter()
+                .chain(DOES_NOT_PROVE_V2)
+                .find(|s| s.id == *by)
+                .unwrap();
+            assert_eq!(cover.holds_from, until, "{}", sentence.id);
+        }
     }
 
     /// Die Kurzzeile nennt höchstens drei — auf jeder Stufe dieselben drei,
