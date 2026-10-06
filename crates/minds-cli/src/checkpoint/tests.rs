@@ -277,6 +277,130 @@ fn a_session_is_stored_closed_only_from_a_complete_range() {
     assert!(!closed_after(true));
 }
 
+/// EA-14, A1: Ohne Witness bindet der lokale Checkpoint die aktive
+/// Anker-Id aus dem Git-Verzeichnis — als schwächere, nicht verkettete
+/// Bindung. Ein `minds.intent`-Event im lokalen Journal ist eine Behauptung
+/// des Agenten und wird nie als verkettetes Intent übernommen.
+#[test]
+fn the_local_checkpoint_binds_the_active_intent_unchained() {
+    use minds_core::intent_anchor::{
+        INTENT_EVENT_KIND, IntentAnchor, IntentEventPayload, IntentSource, content_hash,
+    };
+
+    let pipeline = RedactionConfig::default().pipeline().unwrap();
+    // Belegt: über `redact_intent` gebaut und im Store abgelegt.
+    let intent = pipeline
+        .redact_intent(IntentSource::Prompt, Vec::new(), b"x".to_vec())
+        .unwrap();
+    let anchor = intent.text().to_owned();
+    let id = intent.id().clone();
+    // Unbelegt: dieselbe Form, nie abgelegt (etwa `content=` über
+    // unredigiertes Material, von einem fremden Client gerechnet).
+    let unproven = IntentAnchor::id_of_text(
+        &IntentAnchor {
+            source: IntentSource::Prompt,
+            content: content_hash(b"DB_PASSWORD=hunter2"),
+            scope: Vec::new(),
+        }
+        .to_text()
+        .unwrap(),
+    );
+    let stored_with = |active: Option<&str>| {
+        let fixture = Fixture::new(true);
+        fixture.store.put_intent(&intent).unwrap();
+        fixture.feed(0);
+        // Ein gefälschtes Intent-Event im lokalen Journal.
+        let forged =
+            serde_json::to_string(&IntentEventPayload::new(&anchor, None).unwrap()).unwrap();
+        fixture
+            .journal
+            .append(
+                &key(),
+                NewEvent {
+                    at: "2026-01-01T00:00:05Z".into(),
+                    at_nanos: 1_767_225_605_000_000_000,
+                    kind: EventKind::Other,
+                    raw_kind: INTENT_EVENT_KIND.into(),
+                    cwd: None,
+                    transcript_path: None,
+                    payload: serde_json::value::RawValue::from_string(forged).unwrap(),
+                },
+            )
+            .unwrap();
+        if let Some(active) = active {
+            let path = fixture.repo.git_dir().join(core::ACTIVE_INTENT_FILE);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, active).unwrap();
+        }
+        let outcome = fixture.run(&pipeline, SCOPE_AGENT_HOOKS_V1, SealSigner::None);
+        assert_eq!(outcome.stored.len(), 1);
+        let session = fixture.store.get(outcome.stored[0]).unwrap().unwrap();
+        assert!(session.intent_events.is_empty(), "never chained on A1");
+        let log = fs::read_to_string(crate::hooklog::path(&fixture.log_dir)).unwrap_or_default();
+        (session.intent_anchor, log)
+    };
+
+    assert_eq!(stored_with(Some(&format!("{id}\n"))).0, Some(id.clone()));
+    // Tolerant gelesen, kanonisch gespeichert.
+    assert_eq!(
+        stored_with(Some(&format!("  {}\n", id.hex().to_uppercase()))).0,
+        Some(id.clone())
+    );
+    assert_eq!(stored_with(None).0, None);
+    assert_eq!(stored_with(Some("-\n")).0, None);
+    let (bound, log) = stored_with(Some("ghp_not-an-anchor\n"));
+    assert_eq!(bound, None);
+    assert!(log.contains("active intent is not an anchor id"), "{log}");
+    assert!(!log.contains("ghp_not-an-anchor"), "{log}");
+    // Eine Id ohne Beleg im Store bindet nicht.
+    let (bound, log) = stored_with(Some(&format!("{unproven}\n")));
+    assert_eq!(bound, None);
+    assert!(
+        log.contains("active intent not bound: intent anchor is not in the store"),
+        "{log}"
+    );
+}
+
+/// Die Datei liegt im Zugriff des Agenten: Ein FIFO (direkt oder hinter
+/// einem Symlink) darf den lokalen Checkpoint nicht hängen lassen, und ein
+/// Symlink auf eine gültige Id bindet nicht.
+#[cfg(unix)]
+#[test]
+fn a_fifo_or_symlink_as_active_intent_binds_nothing_and_never_blocks() {
+    let pipeline = RedactionConfig::default().pipeline().unwrap();
+    for kind in ["fifo", "symlink-to-fifo", "symlink-to-id"] {
+        let fixture = Fixture::new(true);
+        fixture.feed(0);
+        let path = fixture.repo.git_dir().join(core::ACTIVE_INTENT_FILE);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let fifo = fixture.dir.path().join("fifo");
+        let mkfifo = |at: &Path| {
+            assert!(Command::new("mkfifo").arg(at).status().unwrap().success());
+        };
+        match kind {
+            "fifo" => mkfifo(&path),
+            "symlink-to-fifo" => {
+                mkfifo(&fifo);
+                std::os::unix::fs::symlink(&fifo, &path).unwrap();
+            }
+            _ => {
+                let target = fixture.dir.path().join("id");
+                fs::write(&target, format!("{}\n", "b3-".to_owned() + &"a".repeat(64))).unwrap();
+                std::os::unix::fs::symlink(&target, &path).unwrap();
+            }
+        }
+        let outcome = fixture.run(&pipeline, SCOPE_AGENT_HOOKS_V1, SealSigner::None);
+        assert_eq!(
+            outcome.stored.len(),
+            1,
+            "{kind}: {}",
+            fs::read_to_string(crate::hooklog::path(&fixture.log_dir)).unwrap_or_default()
+        );
+        let session = fixture.store.get(outcome.stored[0]).unwrap().unwrap();
+        assert_eq!(session.intent_anchor, None, "{kind}");
+    }
+}
+
 #[test]
 fn core_reports_rejected_seals_and_reuses_them_without_discard() {
     let fixture = Fixture::new(true);

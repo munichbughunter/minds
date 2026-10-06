@@ -1289,6 +1289,98 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
     assert!(redacted.audit().fields_changed() >= cases.len() * 2);
 }
 
+#[test]
+fn the_whole_corpus_as_intent_snapshots_is_fail_closed() {
+    // EA-14: Der Snapshot einer Anforderung wird redigiert, **bevor** er
+    // gehasht und abgelegt wird. Jedes Fixture einmal als Prompt-Text und
+    // einmal in der Issue-Form (kanonisches JSON, EA-16). Als Datei-Quelle
+    // gibt es mit Secret gar keinen Anker (Blob-SHA als Orakel, unten).
+    use minds_core::intent_anchor::{IntentAnchor, IntentSource, content_hash};
+
+    let pipeline = policy();
+    let mut report = Report::default();
+    for case in must_redact() {
+        let issue_json = serde_json::json!({ "description": case.text, "title": "Anforderung" });
+        let mut forms = vec![("prompt", case.text.clone())];
+        // Dieselbe Regel wie bei `JSON_ARG_CASES`: Fixtures, die schon
+        // escaptes JSON tragen (`triple-escaped-json-argument`), werden nicht
+        // ein weiteres Mal verpackt — eine vierfache Verschachtelung kommt
+        // real nicht vor. EA-16 redigiert Titel und Beschreibung zusätzlich
+        // vor dem Kanonisieren.
+        if !case.text.contains("\\\"") {
+            forms.push(("issue", issue_json.to_string()));
+        }
+        for (form, snapshot) in forms {
+            let redacted = match pipeline.redact_intent(
+                IntentSource::Prompt,
+                Vec::new(),
+                snapshot.clone().into_bytes(),
+            ) {
+                Ok(redacted) => redacted,
+                Err(err) => {
+                    report.note(format!("{} ({form}): kein Anker: {err}", case.id));
+                    continue;
+                }
+            };
+            for needle in case.gone {
+                if redacted.snapshot().contains(needle) || redacted.text().contains(needle) {
+                    report.note(format!(
+                        "{} ({form}): {needle:?} im Anker-Material",
+                        case.id
+                    ));
+                }
+            }
+            if redacted.anchor().content != content_hash(redacted.snapshot().as_bytes()) {
+                report.note(format!(
+                    "{} ({form}): content ≠ Hash des Snapshots",
+                    case.id
+                ));
+            }
+            if redacted.anchor().content == content_hash(snapshot.as_bytes()) {
+                report.note(format!(
+                    "{} ({form}): content ist der Hash des Klartexts — ein Orakel",
+                    case.id
+                ));
+            }
+            if redacted.id() != &IntentAnchor::id_of_text(redacted.text()) {
+                report.note(format!("{} ({form}): anchor_id ≠ Hash des Texts", case.id));
+            }
+        }
+    }
+    report.finish("Der Korpus leckt durch den Intent-Snapshot");
+
+    // Datei-Quelle: Jedes Fixture verweigert den Anker — die Blob-SHA hasht
+    // die rohen Bytes.
+    let mut report = Report::default();
+    for case in must_redact() {
+        let source = IntentSource::File {
+            path: "docs/spec.md".into(),
+            blob: "3f9c1e2a4b5d6e7f8091a2b3c4d5e6f708192a3b".into(),
+        };
+        if !matches!(
+            pipeline.redact_intent(source, Vec::new(), case.text.clone().into_bytes()),
+            Err(minds_redact::RedactionError::IntentSourceWouldOracle)
+        ) {
+            report.note(format!("{}: Datei mit Secret bekäme einen Anker", case.id));
+        }
+    }
+    report.finish("Datei-Anker über Secrets");
+
+    // Die Gegenrichtung: Harmloses bleibt byte-gleich, der Hash ist der des
+    // Originals.
+    let mut report = Report::default();
+    for (id, text) in MUST_SURVIVE {
+        match pipeline.redact_intent(IntentSource::Prompt, Vec::new(), text.as_bytes().to_vec()) {
+            Ok(redacted) if redacted.snapshot() == *text => {
+                assert_eq!(redacted.anchor().content, content_hash(text.as_bytes()));
+            }
+            Ok(_) => report.note(format!("{id}: Snapshot verändert")),
+            Err(err) => report.note(format!("{id}: kein Anker: {err}")),
+        }
+    }
+    report.finish("Harmlose Anforderungen werden verändert");
+}
+
 /// Klartext-Werte, wie ein Agent sie als Tool-Argument übergibt — der
 /// **rohe** Inhalt, bevor die Erfassung ihn in JSON serialisiert.
 ///

@@ -33,9 +33,10 @@
 //! **gespeicherten Bytes**, nicht gegen das, was wir daraus wieder machen
 //! würden.
 
+use minds_core::intent_anchor::IntentAnchor;
 use minds_core::observation::Observations;
 use minds_core::{ContentHash, EvidenceMark, Session, SessionId};
-use minds_redact::{RedactedObservations, RedactedSession};
+use minds_redact::{RedactedIntent, RedactedObservations, RedactedSession};
 
 use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
@@ -109,6 +110,19 @@ impl ForgottenPlace {
             ForgottenPlace::ContextTree => "context tree (legacy format)",
         }
     }
+}
+
+/// Ein abgelegter Intent-Anker, wie [`ContextStore::get_intent`] ihn liest:
+/// Id und Textform geprüft, der Snapshot roh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredIntent {
+    /// Der Ankertext, hash-geprüft gegen die Id.
+    pub text: String,
+    /// Der geparste Anker.
+    pub anchor: IntentAnchor,
+    /// Die abgelegten (redigierten) Snapshot-Bytes — **ungeprüft** gegen
+    /// `content=`.
+    pub snapshot: Vec<u8>,
 }
 
 /// Was [`ContextStore::forget`] bewirkt hat.
@@ -391,6 +405,88 @@ pub trait ContextStore {
     /// Alle abgelegten Observation-Objekte.
     fn list_observations(&self) -> Result<Vec<ContentHash>> {
         Ok(Vec::new())
+    }
+
+    /// Legt einen Intent-Anker samt redigiertem Snapshot ab (EA-14) und gibt
+    /// seine `anchor_id` zurück: ein elternloser Commit unter
+    /// `refs/minds/intents/<64 hex>`, Baum `anchor` + `snapshot`.
+    ///
+    /// Dass hier [`RedactedIntent`] verlangt wird, ist dieselbe
+    /// fail-closed-Zusage in Typform wie bei [`put`](Self::put): Ein
+    /// un-redigierter Snapshot kann den Store nicht erreichen. Idempotent je
+    /// Id; liegt unter der Id ein **anderer** Snapshot, ist das ein Fehler.
+    /// Der Default lehnt ab, statt den Anker still zu verlieren.
+    fn put_intent(&self, _intent: &RedactedIntent) -> Result<ContentHash> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store intent anchors",
+        )))
+    }
+
+    /// Die rohen Bytes des Ankertexts unter `id` — **ungeprüft**.
+    fn intent_anchor_bytes(&self, _id: &ContentHash) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Die rohen Bytes des Snapshots unter `id` — **ungeprüft**.
+    fn intent_snapshot_bytes(&self, _id: &ContentHash) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Alle abgelegten Intent-Anker.
+    fn list_intents(&self) -> Result<Vec<ContentHash>> {
+        Ok(Vec::new())
+    }
+
+    /// Legt die `ssh-sig`-Signatur (Namespace `minds-intent`) neben den Anker
+    /// (`anchor.sig`) — neben die signierten Bytes, nie hinein. Der Anker
+    /// muss bereits liegen, die Signatur armiert sein. Eine neue Signatur
+    /// ersetzt die alte (erneut signieren, etwa mit einem anderen Schlüssel);
+    /// geprüft wird sie ohnehin erst beim Lesen. Das Signieren legt einen
+    /// Kind-Commit an — elternlos ist nur der erste Commit des Ankers.
+    fn put_intent_signature(&self, _id: &ContentHash, _signature: &str) -> Result<()> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store intent signatures",
+        )))
+    }
+
+    /// Die Signatur zu einem Anker — `None`, wenn er unsigniert ist.
+    fn intent_signature(&self, _id: &ContentHash) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Der Anker unter `id` samt Snapshot — `None`, wenn er hier nicht liegt.
+    ///
+    /// Prüft beim Lesen `id == derive_key("minds/intent/v1/anchor", text)`
+    /// ([`StoreError::IntentMismatch`]) und die Textform
+    /// ([`StoreError::MalformedIntent`]). Ob der Snapshot zu `content=` passt,
+    /// prüft bewusst **nicht** der Store: Das ist eine Aussage über das
+    /// Material, die der Reader trifft (`snapshot_matches`, W5).
+    fn get_intent(&self, id: &ContentHash) -> Result<Option<StoredIntent>> {
+        let Some(bytes) = self.intent_anchor_bytes(id)? else {
+            return Ok(None);
+        };
+        let malformed = |reason: &'static str| StoreError::MalformedIntent {
+            id: id.clone(),
+            reason,
+        };
+        let text = String::from_utf8(bytes).map_err(|_| malformed("anchor is not UTF-8"))?;
+        let actual = IntentAnchor::id_of_text(&text);
+        if actual != *id {
+            return Err(StoreError::IntentMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        let anchor =
+            IntentAnchor::parse(&text).map_err(|_| malformed("anchor is not minds-intent-v1"))?;
+        let snapshot = self
+            .intent_snapshot_bytes(id)?
+            .ok_or_else(|| malformed("snapshot missing"))?;
+        Ok(Some(StoredIntent {
+            text,
+            anchor,
+            snapshot,
+        }))
     }
 
     /// Das Observation-Objekt unter `id` — `None`, wenn es hier nicht liegt.

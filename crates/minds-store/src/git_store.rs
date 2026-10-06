@@ -191,6 +191,26 @@ const OBSERVATIONS_REF_PREFIX: &str = "refs/minds/observations/";
 /// Dateiname des Objekts im Baum seines Refs.
 const OBSERVATIONS_FILE: &str = "observations.json";
 
+/// Namensraum der Intent-Anker (EA-14): ein elternloser Commit je Anker,
+/// adressiert über die volle `anchor_id`. Gesynct wie alles unter
+/// `refs/minds/`.
+const INTENT_REF_PREFIX: &str = "refs/minds/intents/";
+
+/// Der Ankertext (`minds-intent-v1`) im Baum eines Intent-Refs.
+const INTENT_ANCHOR_FILE: &str = "anchor";
+
+/// Der redigierte Snapshot daneben — die Bytes hinter `content=`.
+const INTENT_SNAPSHOT_FILE: &str = "snapshot";
+
+/// Die `ssh-sig`-Signatur (`minds-intent`) — nie im Anker selbst.
+const INTENT_SIG_FILE: &str = "anchor.sig";
+
+/// Höchstgrößen der Intent-Dateien, geprüft am Objekt-Header vor dem Lesen:
+/// Die Refs werden gesynct, also kann jeder mit Push-Recht dort einen
+/// (komprimiert winzigen) Riesen-Blob ablegen.
+const INTENT_ANCHOR_MAX: u64 = minds_core::intent_anchor::MAX_ANCHOR as u64;
+const INTENT_SNAPSHOT_MAX: u64 = minds_core::intent_anchor::MAX_SNAPSHOT as u64;
+
 /// Rückverweise Session → Seals im Baum des Session-Refs, neben
 /// `session.json` und `links.json`. Veränderlich wie `links.json`, nie
 /// kanonisch; `forget` ersetzt nur `session.json`, die Rückverweise bleiben.
@@ -888,6 +908,84 @@ fn observations_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
     (id.hex() == hex).then_some(id)
 }
 
+impl GitStore {
+    /// Anker und Snapshot aus genau `commit` — dieselben Prüfungen wie
+    /// [`ContextStore::get_intent`]: Id gegen den Ankertext, Textform,
+    /// Snapshot vorhanden; beides begrenzt gelesen. `None`, wenn dort kein
+    /// Anker liegt.
+    fn intent_at(
+        &self,
+        id: &minds_core::ContentHash,
+        commit: minds_git::CommitId,
+    ) -> Result<Option<crate::StoredIntent>> {
+        let read = |file: &str, max: u64| {
+            self.repo
+                .read_blob_bounded(commit, file, max)
+                .map(|found| found.map(|(_, bytes)| bytes))
+                .map_err(StoreError::backend)
+        };
+        let Some(bytes) = read(INTENT_ANCHOR_FILE, INTENT_ANCHOR_MAX)? else {
+            return Ok(None);
+        };
+        let malformed = |reason: &'static str| StoreError::MalformedIntent {
+            id: id.clone(),
+            reason,
+        };
+        let text = String::from_utf8(bytes).map_err(|_| malformed("anchor is not UTF-8"))?;
+        let actual = minds_core::intent_anchor::IntentAnchor::id_of_text(&text);
+        if actual != *id {
+            return Err(StoreError::IntentMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        let anchor = minds_core::intent_anchor::IntentAnchor::parse(&text)
+            .map_err(|_| malformed("anchor is not minds-intent-v1"))?;
+        let snapshot = read(INTENT_SNAPSHOT_FILE, INTENT_SNAPSHOT_MAX)?
+            .ok_or_else(|| malformed("snapshot missing"))?;
+        Ok(Some(crate::StoredIntent {
+            text,
+            anchor,
+            snapshot,
+        }))
+    }
+
+    /// Eine Datei im Baum eines Intent-Refs, höchstens `max` Bytes groß —
+    /// geprüft am Objekt-Header, bevor gelesen wird, und gegen die Ids
+    /// nachgerechnet.
+    fn intent_file(
+        &self,
+        id: &minds_core::ContentHash,
+        file: &str,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(commit) = self
+            .repo
+            .commit_at(&intent_ref(id))
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .repo
+            .read_blob_bounded(commit, file, max)
+            .map_err(StoreError::backend)?
+            .map(|(_, bytes)| bytes))
+    }
+}
+
+/// Der Ref eines Intent-Ankers.
+fn intent_ref(id: &minds_core::ContentHash) -> String {
+    format!("{INTENT_REF_PREFIX}{}", id.hex())
+}
+
+/// Die Id hinter einem Intent-Ref — `None` für Fremdes.
+fn intent_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(INTENT_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
 /// Die Form der `evidence.json`: ein Objekt, damit spätere Nachbarn (etwa
 /// Signatur-Verweise) additiv Platz finden.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1400,6 +1498,170 @@ impl ContextStore for GitStore {
             .iter()
             .filter_map(|(name, _)| observations_id_of_ref(name))
             .collect())
+    }
+
+    fn put_intent(&self, intent: &minds_redact::RedactedIntent) -> Result<minds_core::ContentHash> {
+        let id = intent.id().clone();
+        // Nicht größer, als `get_intent` zurückliest — sonst wäre die Id für
+        // immer gesperrt.
+        if intent.snapshot().len() as u64 > INTENT_SNAPSHOT_MAX {
+            return Err(StoreError::backend(std::io::Error::other(
+                "intent snapshot is larger than the store reads back",
+            )));
+        }
+        let reference = intent_ref(&id);
+        // Content-adressiert: Liegt schon ein Anker unter der Id, muss es
+        // genau dieser sein — samt Snapshot. Ein anderer Snapshot unter
+        // derselben Id widerspräche `content=` und fällt hier auf, statt
+        // still als „schon da" durchzugehen.
+        let same = |stored: crate::StoredIntent| {
+            if stored.snapshot == intent.snapshot().as_bytes() {
+                Ok(id.clone())
+            } else {
+                Err(StoreError::IntentSnapshotConflict { id: id.clone() })
+            }
+        };
+        if let Some(stored) = self.get_intent(&id)? {
+            return same(stored);
+        }
+        // Ein Ref ohne lesbaren Anker (leerer Baum, nur `anchor.sig`) ist
+        // vorbelegt — darauf wird nicht aufgebaut.
+        if self
+            .repo
+            .commit_at(&reference)
+            .map_err(StoreError::backend)?
+            .is_some()
+        {
+            return Err(StoreError::IntentSnapshotConflict { id });
+        }
+        let write = || -> minds_git::Result<()> {
+            let anchor = self.repo.write_blob(intent.text().as_bytes())?;
+            let snapshot = self.repo.write_blob(intent.snapshot().as_bytes())?;
+            let tree = self.repo.write_tree(
+                None,
+                [
+                    (INTENT_ANCHOR_FILE, anchor),
+                    (INTENT_SNAPSHOT_FILE, snapshot),
+                ],
+            )?;
+            // Elternlos — und nur, wenn der Ref noch fehlt: Wer dazwischen
+            // schreibt, wird nicht überschrieben (`RefRaced` unten).
+            self.repo.commit_tree_onto_expected(
+                &reference,
+                tree,
+                None,
+                &format!("minds: intent {id}"),
+            )?;
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(id),
+            Err(GitError::RefRaced { .. }) => match self.get_intent(&id)? {
+                Some(stored) => same(stored),
+                None => Err(StoreError::backend(std::io::Error::other(
+                    "the intent ref moved but carries no intent anchor",
+                ))),
+            },
+            Err(err) => Err(StoreError::backend(err)),
+        }
+    }
+
+    fn intent_anchor_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.intent_file(id, INTENT_ANCHOR_FILE, INTENT_ANCHOR_MAX)
+    }
+
+    fn intent_snapshot_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.intent_file(id, INTENT_SNAPSHOT_FILE, INTENT_SNAPSHOT_MAX)
+    }
+
+    fn list_intents(&self) -> Result<Vec<minds_core::ContentHash>> {
+        Ok(self
+            .repo
+            .refs_under(INTENT_REF_PREFIX)
+            .map_err(StoreError::backend)?
+            .iter()
+            .filter_map(|(name, _)| intent_id_of_ref(name))
+            .collect())
+    }
+
+    fn put_intent_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
+        // Nur die Form einer `ssh-sig`-Signatur: Der Ref wird gesynct, und
+        // Freitext hat dort nichts verloren.
+        if !minds_core::intent_anchor::is_armored_signature(signature) {
+            return Err(StoreError::IntentSignatureMalformed { id: id.clone() });
+        }
+        let reference = intent_ref(id);
+        let message = format!("minds: signature for intent {id}");
+        let max = minds_core::intent_anchor::MAX_SIGNATURE as u64;
+        let mut attempts_left = PUT_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            // Geprüft und geschrieben wird gegen **denselben** Commit: Der
+            // Anker liegt dort unverändert, und nur auf ihn wird aufgebaut —
+            // verschwindet oder wandert der Ref dazwischen, gibt es keinen
+            // elternlosen Signatur-Ref, der die Id für `put_intent` sperrte.
+            let Some(commit) = self
+                .repo
+                .commit_at(&reference)
+                .map_err(StoreError::backend)?
+            else {
+                return Err(StoreError::IntentNotStored { id: id.clone() });
+            };
+            if self.intent_at(id, commit)?.is_none() {
+                return Err(StoreError::IntentNotStored { id: id.clone() });
+            }
+            // Begrenzt gelesen: Ein gepflanzter Riesen-Blob wird nicht
+            // geladen, sondern ersetzt.
+            let current = self
+                .repo
+                .read_blob_bounded(commit, INTENT_SIG_FILE, max)
+                .ok()
+                .flatten();
+            if current.is_some_and(|(_, bytes)| bytes == signature.as_bytes()) {
+                return Ok(()); // schon signiert, idempotent
+            }
+            let write = || -> minds_git::Result<()> {
+                let blob = self.repo.write_blob(signature.as_bytes())?;
+                let base = self.repo.tree_of(commit)?;
+                let tree = self
+                    .repo
+                    .write_tree(Some(base), [(INTENT_SIG_FILE, blob)])?;
+                self.repo
+                    .commit_tree_onto_expected(&reference, tree, Some(commit), &message)?;
+                Ok(())
+            };
+            match write() {
+                Ok(()) => return Ok(()),
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
+    }
+
+    fn get_intent(&self, id: &minds_core::ContentHash) -> Result<Option<crate::StoredIntent>> {
+        // Ein Commit, aus dem Anker **und** Snapshot gelesen werden — nie ein
+        // Paar aus zwei Ständen des Refs.
+        match self
+            .repo
+            .commit_at(&intent_ref(id))
+            .map_err(StoreError::backend)?
+        {
+            Some(commit) => self.intent_at(id, commit),
+            None => Ok(None),
+        }
+    }
+
+    fn intent_signature(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        let max = minds_core::intent_anchor::MAX_SIGNATURE as u64;
+        let Some(bytes) = self.intent_file(id, INTENT_SIG_FILE, max)? else {
+            return Ok(None);
+        };
+        // Dieselbe Formprüfung wie beim Schreiben: Was keine armierte
+        // Signatur ist, geht nicht an den Prüfer (EA-15: `ssh-keygen`).
+        match String::from_utf8(bytes) {
+            Ok(text) if minds_core::intent_anchor::is_armored_signature(&text) => Ok(Some(text)),
+            _ => Err(StoreError::IntentSignatureMalformed { id: id.clone() }),
+        }
     }
 
     fn index(&self) -> Result<CommitIndex> {
@@ -2176,6 +2438,263 @@ mod tests {
         ));
         // Auch ein zweites `put` repariert nicht still über Fremdes hinweg.
         assert!(store.put_observations(&sample_observations()).is_err());
+    }
+
+    /// Ein Token, das die Default-Policy sicher erkennt.
+    const INTENT_TOKEN: &str = "ghp_u8jzPde0IgxLd6GncfBAepfJBd0Kh8oOOL8d";
+
+    fn sample_intent(snapshot: &str) -> minds_redact::RedactedIntent {
+        use minds_core::intent_anchor::IntentSource;
+        minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_intent(
+                IntentSource::File {
+                    path: "docs/spec.md".into(),
+                    blob: "3f9c1e2a4b5d6e7f8091a2b3c4d5e6f708192a3b".into(),
+                },
+                vec!["src/**".into()],
+                snapshot.as_bytes().to_vec(),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn an_intent_anchor_roundtrips_idempotently_and_fsck_stays_clean() {
+        let (fixture, store) = fresh_store();
+        let before: Vec<String> = fixture
+            .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        let intent = sample_intent("Retry exponentiell.\n");
+        let id = store.put_intent(&intent).unwrap();
+        assert_eq!(&id, intent.id());
+        let stored = store.get_intent(&id).unwrap().unwrap();
+        assert_eq!(stored.text, intent.text());
+        assert_eq!(&stored.anchor, intent.anchor());
+        assert_eq!(stored.snapshot, intent.snapshot().as_bytes());
+        assert_eq!(store.list_intents().unwrap(), vec![id.clone()]);
+        // Idempotent je Id: kein zweiter Commit.
+        assert_eq!(store.put_intent(&intent).unwrap(), id);
+        let reference = intent_ref(&id);
+        assert_eq!(reference, format!("refs/minds/intents/{}", id.hex()));
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "1"
+        );
+        assert_eq!(store.intent_signature(&id).unwrap(), None);
+        store
+            .put_intent_signature(
+                &id,
+                "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n",
+            )
+            .unwrap();
+        assert!(
+            store
+                .intent_signature(&id)
+                .unwrap()
+                .unwrap()
+                .starts_with("-----BEGIN")
+        );
+        // Die Signatur ändert weder Anker noch Snapshot.
+        assert_eq!(store.get_intent(&id).unwrap().unwrap(), stored);
+        // Unsichtbar für Git-Nutzer: nur `refs/minds/` neu, `fsck` sauber.
+        let after: Vec<String> = fixture
+            .git(&["for-each-ref", "--format=%(refname) %(objectname)"])
+            .lines()
+            .filter(|line| !line.starts_with("refs/minds/"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            after,
+            before
+                .into_iter()
+                .filter(|line| !line.starts_with("refs/minds/"))
+                .collect::<Vec<_>>()
+        );
+        fixture.git(&["fsck", "--strict", "--no-progress"]);
+        let absent = minds_core::ContentHash::from_bytes([0; 32]);
+        assert!(store.get_intent(&absent).unwrap().is_none());
+        assert!(
+            store
+                .put_intent_signature(
+                    &absent,
+                    "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n"
+                )
+                .is_err()
+        );
+        assert!(store.put_intent_signature(&id, "free text").is_err());
+    }
+
+    #[test]
+    fn intent_snapshot_secret_never_reaches_the_store() {
+        let (fixture, store) = fresh_store();
+        // Prompt-Quelle: Eine Datei mit Secret bekäme gar keinen Anker
+        // (Blob-SHA als Orakel, `IntentSourceWouldOracle`).
+        let intent = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_intent(
+                minds_core::intent_anchor::IntentSource::Prompt,
+                Vec::new(),
+                format!("Use {INTENT_TOKEN} for the deploy.\n").into_bytes(),
+            )
+            .unwrap();
+        let id = store.put_intent(&intent).unwrap();
+        let stored = store.get_intent(&id).unwrap().unwrap();
+        assert!(!String::from_utf8_lossy(&stored.snapshot).contains(INTENT_TOKEN));
+        assert_eq!(
+            stored.anchor.content,
+            minds_core::intent_anchor::content_hash(&stored.snapshot),
+            "content= is recomputable from stored material"
+        );
+        // Kein Objekt im ganzen Repository trägt den Klartext.
+        let objects = fixture.git(&[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ]);
+        for object in objects.lines() {
+            let body = fixture.git(&["cat-file", "-p", object]);
+            assert!(!body.contains(INTENT_TOKEN), "object {object} leaks");
+        }
+    }
+
+    #[test]
+    fn a_tampered_intent_anchor_is_caught_on_read() {
+        let (fixture, store) = fresh_store();
+        let intent = sample_intent("Retry exponentiell.\n");
+        let id = store.put_intent(&intent).unwrap();
+        let forge = |anchor: &str, snapshot: &str| {
+            let a = fixture.path().join("forged-anchor");
+            let s = fixture.path().join("forged-snapshot");
+            std::fs::write(&a, anchor).unwrap();
+            std::fs::write(&s, snapshot).unwrap();
+            let a = fixture.git(&["hash-object", "-w", a.to_str().unwrap()]);
+            let s = fixture.git(&["hash-object", "-w", s.to_str().unwrap()]);
+            let tree_input = format!(
+                "100644 blob {}\t{INTENT_ANCHOR_FILE}\n100644 blob {}\t{INTENT_SNAPSHOT_FILE}\n",
+                a.trim(),
+                s.trim()
+            );
+            let tree = fixture.git_with_stdin(&["mktree"], &tree_input);
+            let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "forged"]);
+            fixture.git(&["update-ref", &intent_ref(&id), commit.trim()]);
+        };
+        // Anderer Ankertext unter derselben Id.
+        forge(&intent.text().replace("src/**", "**"), intent.snapshot());
+        assert!(matches!(
+            store.get_intent(&id),
+            Err(StoreError::IntentMismatch { .. })
+        ));
+        assert!(store.put_intent(&intent).is_err());
+        // Derselbe Anker, anderer Snapshot: lesbar (der Reader meldet
+        // `snapshot_matches = false`), aber ein `put` deckt es nicht zu.
+        forge(intent.text(), "untergeschoben\n");
+        let stored = store.get_intent(&id).unwrap().unwrap();
+        assert_ne!(
+            stored.anchor.content,
+            minds_core::intent_anchor::content_hash(&stored.snapshot)
+        );
+        assert!(store.put_intent(&intent).is_err());
+    }
+
+    /// Was unter einem gesyncten Intent-Ref liegt, kann jeder mit
+    /// Push-Recht pflanzen: Freitext als Signatur und Riesen-Blobs werden
+    /// nicht gelesen bzw. nicht weitergereicht.
+    #[test]
+    fn planted_intent_files_are_bounded_and_checked() {
+        let (fixture, store) = fresh_store();
+        let intent = sample_intent("Retry exponentiell.\n");
+        let id = store.put_intent(&intent).unwrap();
+        let plant = |files: &[(&str, Vec<u8>)]| {
+            let mut tree_input = String::new();
+            for (name, bytes) in files {
+                let path = fixture.path().join(format!("planted-{name}"));
+                std::fs::write(&path, bytes).unwrap();
+                let blob = fixture.git(&["hash-object", "-w", path.to_str().unwrap()]);
+                tree_input.push_str(&format!("100644 blob {}\t{name}\n", blob.trim()));
+            }
+            let tree = fixture.git_with_stdin(&["mktree"], &tree_input);
+            let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "planted"]);
+            fixture.git(&["update-ref", &intent_ref(&id), commit.trim()]);
+        };
+        let anchor = intent.text().as_bytes().to_vec();
+        let snapshot = intent.snapshot().as_bytes().to_vec();
+
+        plant(&[
+            (INTENT_ANCHOR_FILE, anchor.clone()),
+            (INTENT_SNAPSHOT_FILE, snapshot),
+            (INTENT_SIG_FILE, b"just some free text".to_vec()),
+        ]);
+        assert!(store.get_intent(&id).unwrap().is_some());
+        assert!(matches!(
+            store.intent_signature(&id),
+            Err(StoreError::IntentSignatureMalformed { .. })
+        ));
+        // Ein gepflanzter Riesen-Blob als Signatur wird nicht geladen,
+        // sondern beim Signieren ersetzt.
+        plant(&[
+            (INTENT_ANCHOR_FILE, intent.text().as_bytes().to_vec()),
+            (INTENT_SNAPSHOT_FILE, intent.snapshot().as_bytes().to_vec()),
+            (
+                INTENT_SIG_FILE,
+                vec![b'A'; minds_core::intent_anchor::MAX_SIGNATURE + 1],
+            ),
+        ]);
+        let signature = "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+        store.put_intent_signature(&id, signature).unwrap();
+        assert_eq!(
+            store.intent_signature(&id).unwrap().as_deref(),
+            Some(signature)
+        );
+
+        plant(&[
+            (INTENT_ANCHOR_FILE, anchor),
+            (
+                INTENT_SNAPSHOT_FILE,
+                vec![b'x'; INTENT_SNAPSHOT_MAX as usize + 1],
+            ),
+        ]);
+        assert!(store.get_intent(&id).is_err());
+
+        plant(&[
+            (INTENT_ANCHOR_FILE, intent.text().as_bytes().to_vec()),
+            (INTENT_SNAPSHOT_FILE, b"untergeschoben\n".to_vec()),
+        ]);
+        assert!(matches!(
+            store.put_intent(&intent),
+            Err(StoreError::IntentSnapshotConflict { .. })
+        ));
+
+        // Vorbelegt ohne Anker (nur eine Signatur): Darauf wird nicht
+        // aufgebaut — kein Kind-Commit auf fremder Geschichte.
+        plant(&[(
+            INTENT_SIG_FILE,
+            b"-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n".to_vec(),
+        )]);
+        let before = fixture.git(&["rev-parse", &intent_ref(&id)]);
+        assert!(store.get_intent(&id).unwrap().is_none());
+        assert!(matches!(
+            store.put_intent(&intent),
+            Err(StoreError::IntentSnapshotConflict { .. })
+        ));
+        assert_eq!(fixture.git(&["rev-parse", &intent_ref(&id)]), before);
+    }
+
+    #[test]
+    fn foreign_refs_in_the_intent_namespace_are_not_anchors() {
+        for name in [
+            "refs/minds/intents/x",
+            "refs/minds/intents/ABCDEF",
+            &format!("refs/minds/intents/{}", "A".repeat(64)),
+            &format!("refs/minds/observations/{}", "a".repeat(64)),
+        ] {
+            assert_eq!(intent_id_of_ref(name), None, "{name}");
+        }
+        let id = minds_core::ContentHash::from_bytes([1; 32]);
+        assert_eq!(intent_id_of_ref(&intent_ref(&id)), Some(id));
     }
 
     #[test]

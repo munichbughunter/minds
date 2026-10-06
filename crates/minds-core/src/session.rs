@@ -48,7 +48,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::lineage::{Edge, Effect, Lineage};
+use crate::intent_anchor::IntentEvent;
+use crate::lineage::{ContentHash, Edge, Effect, Lineage};
 
 pub const SCHEMA_VERSION: u32 = 2;
 
@@ -80,6 +81,28 @@ pub struct Session {
     /// später aus dem Store-Index abgeleitet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub edges: Vec<Edge>,
+
+    /// Der aktive Intent-Anker zum Zeitpunkt des lokalen Checkpoints (A1,
+    /// EA-14): die Id aus `<git-dir>/minds/intent/active`. Schwächer als ein
+    /// verkettetes Intent-Event — die Datei liegt im Zugriff des Agenten und
+    /// steht in keiner Kette; der Reader meldet das als „bound (unchained)".
+    /// Gebunden wird jede Session, die dieser Checkpoint-Lauf ablegt — auch
+    /// eine, die schon vor der Aktivierung endete und erst jetzt gespeichert
+    /// wird. Mehr als A1 trägt diese Bindung ohnehin nie.
+    ///
+    /// Additiv: `None` wird nicht geschrieben — Sessions ohne Anker behalten
+    /// Bytes und Id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_anchor: Option<ContentHash>,
+
+    /// Die vom Witness verketteten `minds.intent`-Events dieses Bereichs, in
+    /// Journal-Reihenfolge (EA-14). Eine Beobachtung wie `lineage.closed`,
+    /// über die Session-Id im Seal mitsigniert; was sie bedeutet, rechnet der
+    /// Reader (W2).
+    ///
+    /// Additiv: leer wird nicht geschrieben.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intent_events: Vec<IntentEvent>,
 }
 
 impl Session {
@@ -102,6 +125,8 @@ impl Session {
             redaction: Redaction::default(),
             lineage: None,
             edges: Vec::new(),
+            intent_anchor: None,
+            intent_events: Vec::new(),
         }
     }
 }

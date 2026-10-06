@@ -53,6 +53,8 @@ pub mod observations;
 
 pub mod assurance;
 
+pub mod intent;
+
 pub mod artifact;
 
 mod query;

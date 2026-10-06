@@ -27,6 +27,10 @@ pub mod evidence;
 /// Das Observation-Objekt des Datei-Beobachters (EA-08).
 pub mod observation;
 
+/// Der Intent-Anker: eine versionierte Anforderung als erstes Kettenglied
+/// einer Session (EA-14).
+pub mod intent_anchor;
+
 mod attribution;
 pub use attribution::{Attribution, AttributionError};
 

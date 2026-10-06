@@ -145,6 +145,34 @@ impl ContextStore for InRepoStore {
         self.0.list_observations()
     }
 
+    fn put_intent(&self, intent: &minds_redact::RedactedIntent) -> Result<minds_core::ContentHash> {
+        self.0.put_intent(intent)
+    }
+
+    fn intent_anchor_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.intent_anchor_bytes(id)
+    }
+
+    fn intent_snapshot_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.intent_snapshot_bytes(id)
+    }
+
+    fn list_intents(&self) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.list_intents()
+    }
+
+    fn put_intent_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
+        self.0.put_intent_signature(id, signature)
+    }
+
+    fn intent_signature(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        self.0.intent_signature(id)
+    }
+
+    fn get_intent(&self, id: &minds_core::ContentHash) -> Result<Option<crate::StoredIntent>> {
+        self.0.get_intent(id)
+    }
+
     fn put_seal_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
         self.0.put_seal_signature(id, signature)
     }

@@ -333,6 +333,8 @@ impl Segment {
                 files,
             },
             redaction: minds_core::Redaction::default(),
+            intent_anchor: None,
+            intent_events: Vec::new(),
             lineage: Some(Lineage {
                 local_id: local_id.to_string(),
                 started_at: self.first_ts,

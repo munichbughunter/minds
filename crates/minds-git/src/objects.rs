@@ -307,6 +307,16 @@ impl Repo {
         Ok(BlobId::from_gix(id))
     }
 
+    /// Die Blob-Id (Hex), die `content` in diesem Repository hätte —
+    /// gerechnet mit dessen Hash-Art, **nicht** geschrieben. Für den Abgleich
+    /// „diese Bytes sind genau dieser Blob" (EA-14: Intent-Anker mit
+    /// Datei-Quelle).
+    pub fn blob_id_of(&self, content: &[u8]) -> Result<String> {
+        let id = gix::objs::compute_hash(self.gix().object_hash(), gix::objs::Kind::Blob, content)
+            .map_err(GitError::write_object)?;
+        Ok(id.to_hex().to_string())
+    }
+
     /// Baut aus `base` und `entries` einen neuen Baum und schreibt ihn.
     ///
     /// `base` ist der Ausgangsbaum (typisch: [`Repo::tree_at`] auf
