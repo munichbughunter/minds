@@ -323,6 +323,17 @@ impl Assurance {
         }
     }
 
+    /// Der Ordinal-Spiegel in `minds-core` — der Schlüssel zum
+    /// stufenabhängigen Proof-Vokabular ([`minds_core::evidence::limits_at`]).
+    pub const fn level(self) -> minds_core::evidence::Level {
+        match self {
+            Self::A0Claimed => minds_core::evidence::Level::A0,
+            Self::A1Observed => minds_core::evidence::Level::A1,
+            Self::A2Witnessed => minds_core::evidence::Level::A2,
+            Self::A3Reproduced => minds_core::evidence::Level::A3,
+        }
+    }
+
     /// Das Anzeige-Wort (`00-conventions.md`): `A0 claimed` … `A3
     /// reproduced`.
     pub const fn word(self) -> &'static str {

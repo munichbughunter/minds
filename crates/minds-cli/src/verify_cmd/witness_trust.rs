@@ -20,9 +20,12 @@
 //!
 //! Fehlt eines davon, gilt keine Beobachtung — fail-closed.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use minds_core::ContentHash;
+use minds_reader::assurance::SealSignature;
 use minds_store::ContextStore;
 
 /// Höchstgröße der Signer-Datei, die gelesen wird.
@@ -33,38 +36,99 @@ pub(super) fn observation_trust<'a>(
     store: &'a dyn ContextStore,
     signers: Option<&str>,
 ) -> impl Fn(&ContentHash, &str) -> bool + 'a {
-    let file = trusted_signers_file(signers);
-    let content = file.as_deref().and_then(|path| {
-        let meta = std::fs::metadata(path).ok()?;
-        if !meta.is_file() || meta.len() > MAX_SIGNERS_BYTES {
-            return None;
-        }
-        std::fs::read_to_string(path).ok()
-    });
+    let trust = WitnessTrust::new(store, signers);
     move |seal_id: &ContentHash, text: &str| {
-        let (Some(path), Some(content)) = (file.as_deref(), content.as_deref()) else {
-            return false;
-        };
-        if !minds_attest::ssh_keygen_available() {
-            return false;
+        matches!(
+            trust.signature(seal_id, text),
+            SealSignature::Witness { .. }
+        )
+    }
+}
+
+/// Die Witness-Prüfung mit denselben Regeln wie [`observation_trust`], aber
+/// mit dem ganzen Befund je Seal — für die Assurance (EA-11/EA-12). Jedes
+/// Urteil wird einmal gerechnet: Jede Prüfung startet `ssh-keygen`.
+pub(crate) struct WitnessTrust<'a> {
+    store: &'a dyn ContextStore,
+    file: Option<PathBuf>,
+    content: Option<String>,
+    keygen: bool,
+    verdicts: RefCell<HashMap<ContentHash, SealSignature>>,
+}
+
+impl<'a> WitnessTrust<'a> {
+    pub(crate) fn new(store: &'a dyn ContextStore, signers: Option<&str>) -> Self {
+        let file = trusted_signers_file(signers);
+        let content = file.as_deref().and_then(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            if !meta.is_file() || meta.len() > MAX_SIGNERS_BYTES {
+                return None;
+            }
+            std::fs::read_to_string(path).ok()
+        });
+        let keygen = content.is_some() && minds_attest::ssh_keygen_available();
+        Self {
+            store,
+            file,
+            content,
+            keygen,
+            verdicts: RefCell::new(HashMap::new()),
         }
-        let Ok(Some(signature)) = store.seal_signature(seal_id) else {
-            return false;
+    }
+
+    /// Ob eine vertrauenswürdige Signer-Datei vorliegt und geprüft werden
+    /// kann ([`minds_reader::assurance::AssuranceInput::trusted_signers`]).
+    pub(crate) fn trusted(&self) -> bool {
+        self.keygen
+    }
+
+    /// Der Signaturbefund eines Seals unter `minds-witness`: ohne
+    /// vertrauenswürdige Signer `NotChecked`, mit ihnen jede misslungene
+    /// Prüfung `NotWitness` (fail-closed).
+    pub(crate) fn signature(&self, seal_id: &ContentHash, text: &str) -> SealSignature {
+        if let Some(verdict) = self.verdicts.borrow().get(seal_id) {
+            return verdict.clone();
+        }
+        let verdict = self.check(seal_id, text);
+        self.verdicts
+            .borrow_mut()
+            .insert(seal_id.clone(), verdict.clone());
+        verdict
+    }
+
+    fn check(&self, seal_id: &ContentHash, text: &str) -> SealSignature {
+        let signature = match self.store.seal_signature(seal_id) {
+            Ok(None) => return SealSignature::Missing,
+            Ok(Some(signature)) => Some(signature),
+            Err(_) => None,
+        };
+        let (Some(path), Some(content), true) =
+            (self.file.as_deref(), self.content.as_deref(), self.keygen)
+        else {
+            return SealSignature::NotChecked;
+        };
+        let Some(signature) = signature else {
+            return SealSignature::NotWitness;
         };
         let Ok(principals) = minds_attest::ssh_find_principals(&signature, path) else {
-            return false;
+            return SealSignature::NotWitness;
         };
-        principals.iter().any(|principal| {
-            witness_only(content, principal)
-                && minds_attest::ssh_verify_ns(
-                    text,
-                    &signature,
-                    path,
-                    principal,
-                    minds_attest::NS_WITNESS,
-                )
-                .unwrap_or(false)
-        })
+        principals
+            .into_iter()
+            .find(|principal| {
+                witness_only(content, principal)
+                    && minds_attest::ssh_verify_ns(
+                        text,
+                        &signature,
+                        path,
+                        principal,
+                        minds_attest::NS_WITNESS,
+                    )
+                    .unwrap_or(false)
+            })
+            .map_or(SealSignature::NotWitness, |principal| {
+                SealSignature::Witness { principal }
+            })
     }
 }
 

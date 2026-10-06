@@ -176,10 +176,14 @@ Usage:
         Metrics from the store (throughput, iteration, continuity, streak,
         redaction, context coverage). Default Prometheus, for Grafana.
 
-  minds fsck [--require-review]
+  minds fsck [--require-review] [--require-seal]
+             [--require-assurance <A0|A1|A2|A3>] [--signers <file>]
         Checks that every trailer is resolvable and reports journal gaps.
-        Exit code ≠ 0 on orphaned trailers. --require-review: demands an
+        Exit code 1 on orphaned trailers. --require-review: demands an
         approve for every agent-authored change (policy gate for CI).
+        --require-assurance <level> demands that every session of an
+        agent-authored commit reaches the level (exit 2 when not; never
+        masks exit 1).
 
   minds doctor [--probe-home <directory>]
         Checks the setup, one line per check (ok / warn / fail): agent
@@ -208,6 +212,8 @@ Usage:
 
   minds verify [<session|rev>] [--signers <file>] [--identity <id>]
                [--commit <rev>] [--require-explained <percent>] [--all]
+               [--witness-home <dir>] [--require-assurance <A0|A1|A2|A3>]
+               [--limits]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
         Multiple sessions print separate blocks; the worst verdict wins.
@@ -215,6 +221,12 @@ Usage:
         revision, --commit, or the session's trailer commit) and lists
         unexplained lines (at most 20 without --all). --require-explained
         fails with exit 2 below the given percentage (never masks 1/3/4).
+        Each block states the Assurance level (who observed, A0–A3) and
+        what is Not proven at that level (--limits: in full), and lists
+        write claims no witness observation confirms (uncorroborated).
+        --require-assurance gates on the weakest session (exit 2, never
+        masks 1/3/4). --witness-home checks the witness ledger: a witnessed
+        seal missing from the repository is TAMPERED.
         Exit codes: 0 VERIFIED, 1 TAMPERED, 2 \"VERIFIED, INCOMPLETE\",
         3 NOT VERIFIABLE, 4 operational failure (priority: 4 > 1 > 3 > 2 > 0).
   minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
@@ -365,7 +377,12 @@ const SPECS: &[Spec] = &[
     spec("search", &[], &[], 1),
     spec("agent-help", &[], &[], 0),
     spec("metrics", &["--format"], &[], 0),
-    spec("fsck", &[], &["--require-review", "--require-seal"], 0),
+    spec(
+        "fsck",
+        &["--require-assurance", "--signers"],
+        &["--require-review", "--require-seal"],
+        0,
+    ),
     spec("doctor", &["--probe-home"], &[], 0),
     spec("forget", &["--reason"], &[], 1),
     spec("reinterpret", &[], &[], 1),
@@ -380,8 +397,10 @@ const SPECS: &[Spec] = &[
             "--evidence",
             "--commit",
             "--require-explained",
+            "--witness-home",
+            "--require-assurance",
         ],
-        &["--all"],
+        &["--all", "--limits"],
         1,
     ),
     spec(
@@ -787,7 +806,12 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--identity"),
         ),
 
-        "fsck" => fsck::run(parsed.has("--require-review"), parsed.has("--require-seal")),
+        "fsck" => fsck::run(fsck::Options {
+            require_review: parsed.has("--require-review"),
+            require_seal: parsed.has("--require-seal"),
+            require_assurance: parsed.value("--require-assurance"),
+            signers: parsed.value("--signers"),
+        }),
 
         "doctor" => doctor::run(parsed.value("--probe-home")),
 
@@ -813,6 +837,11 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 commit: parsed.value("--commit"),
                 require_explained: parsed.value("--require-explained"),
                 all: parsed.has("--all"),
+            },
+            verify_cmd::AssuranceOptions {
+                witness_home: parsed.value("--witness-home"),
+                require_assurance: parsed.value("--require-assurance"),
+                limits: parsed.has("--limits"),
             },
         ),
 

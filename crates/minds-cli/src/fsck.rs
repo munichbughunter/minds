@@ -32,6 +32,7 @@ use std::process::{Command, ExitCode};
 use minds_capture::Journal;
 use minds_core::{ChangeId, Decision, SessionId, Trailer};
 use minds_git::{CommitId, Repo};
+use minds_reader::assurance::Assurance;
 use minds_store::ReviewStore;
 
 use crate::config;
@@ -40,14 +41,58 @@ use crate::hooklog;
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Führt `minds fsck` aus. Rückgabewert ≠ 0 genau dann, wenn ein Trailer nicht
-/// auflösbar ist, die Evidence-Chain gebrochen ist (Hash-Mismatch im Journal,
-/// manipulierter Seal) — oder ein Policy-Gate greift (`--require-review`,
-/// `--require-seal`).
-pub fn run(require_review: bool, require_seal: bool) -> ExitCode {
-    match fsck(require_review, require_seal) {
-        Ok(true) => ExitCode::SUCCESS,
-        Ok(false) => ExitCode::FAILURE,
+/// Die Flags von `minds fsck`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Options<'a> {
+    /// `--require-review`.
+    pub require_review: bool,
+    /// `--require-seal`.
+    pub require_seal: bool,
+    /// `--require-assurance <A0|A1|A2|A3>`, roh wie übergeben (EA-12).
+    pub require_assurance: Option<&'a str>,
+    /// `--signers <file>`: die vertrauenswürdige `allowed_signers`-Datei für
+    /// die Witness-Prüfung — wie bei `minds verify`.
+    pub signers: Option<&'a str>,
+}
+
+/// Was `fsck` herausfand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Keine Befunde, kein verfehltes Gate.
+    Clean,
+    /// Ein Befund (verwaister Trailer, gebrochene Chain, Review-/Seal-Gate).
+    Findings,
+    /// Nur das Assurance-Gate ist verfehlt.
+    AssuranceGate,
+}
+
+/// Führt `minds fsck` aus. Rückgabewert 1, wenn ein Trailer nicht auflösbar
+/// ist, die Evidence-Chain gebrochen ist (Hash-Mismatch im Journal,
+/// manipulierter Seal) oder ein Policy-Gate greift (`--require-review`,
+/// `--require-seal`). Das Assurance-Gate (`--require-assurance`) ist ein Gate
+/// wie in `minds verify`: verfehlt ⇒ **2**, und es maskiert nie die 1 (W6).
+pub fn run(options: Options<'_>) -> ExitCode {
+    // `--signers` allein prüft nichts — still ignoriert, läse es sich wie
+    // eine Prüfung.
+    if options.signers.is_some() && options.require_assurance.is_none() {
+        eprintln!("minds fsck: --signers applies only with --require-assurance");
+        return ExitCode::FAILURE;
+    }
+    let required = match options
+        .require_assurance
+        .map(crate::verify_cmd::assurance::parse_required)
+        .transpose()
+    {
+        Ok(required) => required,
+        Err(err) => {
+            eprintln!("minds fsck: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match fsck(options, required) {
+        Ok(Outcome::Clean) => ExitCode::SUCCESS,
+        Ok(Outcome::Findings) => ExitCode::FAILURE,
+        Ok(Outcome::AssuranceGate) => ExitCode::from(2),
         Err(err) => {
             eprintln!("minds fsck: {err}");
             ExitCode::FAILURE
@@ -55,9 +100,15 @@ pub fn run(require_review: bool, require_seal: bool) -> ExitCode {
     }
 }
 
-/// Gibt `true` zurück, wenn kein Trailer verwaist ist (und, falls verlangt, jeder
-/// agent-authored Change ein Approve trägt).
-fn fsck(require_review: bool, require_seal: bool) -> Fallible<bool> {
+/// Liefert [`Outcome::Clean`], wenn kein Trailer verwaist ist (und, falls
+/// verlangt, jeder agent-authored Change ein Approve trägt).
+fn fsck(options: Options<'_>, required: Option<Assurance>) -> Fallible<Outcome> {
+    let Options {
+        require_review,
+        require_seal,
+        signers,
+        ..
+    } = options;
     let cwd = std::env::current_dir()?;
     let repo = Repo::discover(&cwd)?;
     let root = repo_root(&repo);
@@ -83,6 +134,10 @@ fn fsck(require_review: bool, require_seal: bool) -> Fallible<bool> {
     if require_seal {
         total += check_require_seal(&repo, store.as_ref())?;
     }
+    let assurance_failed = match required {
+        Some(required) => check_require_assurance(&repo, &root, store.as_ref(), signers, required)?,
+        None => false,
+    };
 
     if total == 0 {
         // Ein Hinweis bricht die Integrität nicht — verschweigen darf ihn die
@@ -92,14 +147,86 @@ fn fsck(require_review: bool, require_seal: bool) -> Fallible<bool> {
             0 => println!("fsck: OK"),
             n => println!("fsck: OK, {n} note(s)"),
         }
-        Ok(true)
+        Ok(if assurance_failed {
+            Outcome::AssuranceGate
+        } else {
+            Outcome::Clean
+        })
     } else {
         match hints {
             0 => println!("fsck: {total} finding(s)"),
             n => println!("fsck: {total} finding(s), {n} note(s)"),
         }
-        Ok(false)
+        Ok(Outcome::Findings)
     }
+}
+
+/// Das Assurance-Gate (`--require-assurance`, EA-12): Jede Session, auf die
+/// ein erreichbarer Trailer zeigt (ein agent-authored Commit), muss
+/// mindestens die verlangte Stufe tragen. Gibt `true` zurück, wenn das Gate
+/// verfehlt ist — dann steht die `Gate`-Zeile da.
+///
+/// Die Stufe rechnet derselbe Pfad wie `minds verify`; ohne Ledger (das
+/// prüft nur `verify --witness-home`). Ohne agent-authored Commit gibt es
+/// nichts zu verlangen: Das Gate ist bestanden — anders als in `verify`,
+/// das über eine genannte Revision urteilt und ohne Session fail-closed
+/// ist. `fsck` prüft eine Historie, und eine Historie ohne Agent-Commit ist
+/// kein Befund; wer eine bestimmte Revision gaten will, nimmt `verify`.
+fn check_require_assurance(
+    repo: &Repo,
+    root: &Path,
+    store: &dyn minds_store::ContextStore,
+    signers: Option<&str>,
+    required: Assurance,
+) -> Fallible<bool> {
+    let Some(head) = repo.head()?.commit() else {
+        println!("Assurance: HEAD has no commit yet — nothing to check");
+        return Ok(false);
+    };
+    let trust = crate::verify_cmd::witness_trust::WitnessTrust::new(store, signers);
+    let mut seen: BTreeSet<SessionId> = BTreeSet::new();
+    let mut levels = Vec::new();
+    for commit in repo.revwalk(head)? {
+        let commit = commit?;
+        for id in repo.session_ids_of(commit)? {
+            if !seen.insert(id) {
+                continue;
+            }
+            let report = crate::verify_cmd::session_assurance(
+                store,
+                &trust,
+                signers,
+                root,
+                id,
+                Some(minds_core::EvidenceSource::Observed),
+            )?;
+            if report.overall < required {
+                let why = crate::verify_cmd::assurance::first_reason(&report)
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default();
+                println!(
+                    "  below {}: {id} — {}{why}",
+                    required.code(),
+                    report.overall
+                );
+            }
+            levels.push(report.overall);
+        }
+    }
+    let below = levels.iter().filter(|level| **level < required).count();
+    println!(
+        "Assurance: {} session(s) checked, {below} below {}",
+        levels.len(),
+        required.word()
+    );
+    if levels.is_empty() {
+        return Ok(false);
+    }
+    Ok(
+        crate::verify_cmd::assurance::gate_failure(&levels, required)
+            .map(|line| println!("{line}"))
+            .is_some(),
+    )
 }
 
 /// Das Policy-Gate (R5): Jeder erreichbare, agent-authored Commit (trägt ≥1
