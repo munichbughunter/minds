@@ -40,6 +40,11 @@ const LOCK_TIMEOUTS: [&str; 2] = [
 ///
 /// Das Handle ist billig zu halten, aber nicht `Sync` — gix cacht intern beim
 /// Lesen. Wer parallel arbeiten will, öffnet pro Thread ein eigenes `Repo`.
+///
+/// `Clone` teilt die einmal geladene Konfiguration: Wer ein festgehaltenes
+/// Repo an einen Store weitergibt, prüft und schreibt über dieselbe
+/// Konfiguration — nicht über eine zweite, später gelesene (EA-10).
+#[derive(Clone)]
 pub struct Repo {
     inner: gix::Repository,
 }
@@ -81,6 +86,78 @@ impl Repo {
         )
         .map(Self::from_gix)
         .map_err(|err| GitError::open(path, err))
+    }
+
+    /// Öffnet genau das Git-Verzeichnis `git_dir`, ohne `include.path` und
+    /// `includeIf` aus seiner Konfiguration zu folgen.
+    ///
+    /// Der Weg für den Witness (EA-10): Er arbeitet auf dem Host in einem
+    /// `.git`, dessen Konfiguration der beobachtete Agent schreiben kann. Ein
+    /// Include auf ein FIFO hielte ihn an, eines auf eine fremde Datei lenkte
+    /// seine Konfiguration um. Das Verzeichnis selbst ist in `witness.json`
+    /// festgehalten; gesucht wird nichts. Die übrigen Quellen (System, Nutzer)
+    /// bleiben, damit etwa die Committer-Identität des Hosts gilt.
+    pub fn open_pinned(git_dir: impl AsRef<Path>) -> Result<Self> {
+        let git_dir = git_dir.as_ref();
+        let mut permissions = gix::open::Permissions::all();
+        permissions.config.includes = false;
+        gix::open_opts(
+            git_dir,
+            gix::open::Options::default()
+                .permissions(permissions)
+                .open_path_as_is(true)
+                // Eine Liste: `config_overrides` ersetzt, statt zu ergänzen.
+                // `refs/replace/*` tauschte Objekte still aus — ein Blob, den
+                // niemand im Review sah, stünde für den Witness an HEAD.
+                .config_overrides(
+                    LOCK_TIMEOUTS
+                        .iter()
+                        .copied()
+                        .chain(["gitoxide.objects.noReplace=true"]),
+                ),
+        )
+        .map(Self::from_gix)
+        .map_err(|err| GitError::open(git_dir, err))
+    }
+
+    /// Die repo-relativen Pfade im Index — was `git ls-files` liefert, ohne
+    /// einen `git`-Prozess, der Includes oder `core.fsmonitor` aus der
+    /// Repo-Konfiguration folgte (EA-10).
+    ///
+    /// `None`, wenn der Index nicht lesbar ist oder größer als `max_bytes`:
+    /// Ein Index, den jemand auf Millionen Einträge aufbläht, füllt so nicht
+    /// den Speicher. Fehlt der Index, ist die Menge leer. Pfade, die kein
+    /// UTF-8 sind, fehlen in der Menge — wie bei `git ls-files` zuvor: Sie
+    /// gelten als untracked und bekommen keinen Read-Hash (die fail-closed
+    /// Richtung). Die Größe wird vor dem Öffnen geprüft; wer die Datei
+    /// dazwischen tauscht, trifft im Witness den Worker mit Frist und
+    /// Ressourcengrenzen.
+    pub fn tracked_paths(&self, max_bytes: u64) -> Option<Vec<String>> {
+        match std::fs::symlink_metadata(self.inner.index_path()) {
+            Ok(meta) if meta.is_file() && meta.len() <= max_bytes => {}
+            Ok(_) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
+        }
+        let index = self.inner.open_index().ok()?;
+        Some(
+            index
+                .entries()
+                .iter()
+                .filter_map(|entry| std::str::from_utf8(entry.path(&index)).ok())
+                .map(str::to_owned)
+                .collect(),
+        )
+    }
+
+    /// Entfernt die Lock-Dateien, die gix gerade hält — aus einem
+    /// Signal-Handler heraus, best effort (gix vermeidet Locks und
+    /// Freigaben; das Entfernen eines sehr langen Pfads kann allokieren). Der
+    /// Witness-Worker ruft das bei `SIGTERM` an der Frist, damit kein
+    /// `HEAD.lock` oder `refs/minds/….lock` den nächsten Lauf oder das nächste
+    /// `git commit` blockiert (EA-10).
+    pub fn cleanup_lock_files_signal_safe() {
+        gix::tempfile::registry::cleanup_tempfiles_signal_safe();
     }
 
     /// Ob gix Refs in einem Namespace führt (`gitoxide.core.refsNamespace`,
@@ -155,6 +232,170 @@ mod tests {
     fn open_accepts_git_dir_directly() {
         let fixture = TempRepo::init();
         assert!(Repo::open(fixture.path().join(".git")).is_ok());
+    }
+
+    #[test]
+    fn open_pinned_ignores_config_includes() {
+        let fixture = TempRepo::init();
+        let git_dir = fixture.path().join(".git");
+        let included = fixture.path().join("included.config");
+        std::fs::write(&included, "[gitoxide \"core\"]\n\trefsNamespace = agent\n").unwrap();
+        let config = git_dir.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!("[include]\n\tpath = {}\n", included.display()));
+        std::fs::write(&config, text).unwrap();
+
+        // Gegenprobe: Der gewöhnliche Weg folgt dem Include.
+        assert!(Repo::open(&git_dir).unwrap().has_ref_namespace());
+        let pinned = Repo::open_pinned(&git_dir).unwrap();
+        assert!(!pinned.has_ref_namespace());
+        assert!(pinned.git_dir().ends_with(".git"));
+    }
+
+    /// `refs/replace/*` tauscht für den festgehaltenen Zugriff nichts aus.
+    #[test]
+    fn open_pinned_ignores_replace_refs() {
+        let fixture = TempRepo::init();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(fixture.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        std::fs::write(fixture.path().join("policy.json"), "reviewed").unwrap();
+        git(&["add", "policy.json"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-qm",
+            "policy",
+        ]);
+        let original = git(&["rev-parse", "HEAD:policy.json"]);
+        std::fs::write(fixture.path().join("other"), "swapped").unwrap();
+        let swapped = git(&["hash-object", "-w", "other"]);
+        git(&["replace", &original, &swapped]);
+        assert_eq!(git(&["cat-file", "blob", "HEAD:policy.json"]), "swapped");
+
+        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
+        let head: crate::oid::CommitId = git(&["rev-parse", "HEAD"]).parse().unwrap();
+        let (id, bytes) = repo
+            .read_blob_bounded(head, "policy.json", 1024)
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"reviewed");
+        assert_eq!(id, original);
+        assert!(repo.read_blob_bounded(head, "policy.json", 3).is_err());
+        assert_eq!(repo.read_blob_bounded(head, "missing", 1024).unwrap(), None);
+
+        // Die Bytes hinter der geprüften Id austauschen: Die Loose-Datei des
+        // geprüften Blobs bekommt den Inhalt eines anderen. gix prüft beim
+        // Lesen nicht nach — `read_blob_bounded` schon.
+        let objects = fixture.path().join(".git/objects");
+        let loose = |id: &str| objects.join(&id[..2]).join(&id[2..]);
+        std::fs::remove_file(loose(&original)).unwrap();
+        std::fs::copy(loose(&swapped), loose(&original)).unwrap();
+        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
+        let err = repo
+            .read_blob_bounded(head, "policy.json", 1024)
+            .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("does not match its id"),
+            "{err:?}"
+        );
+    }
+
+    /// Ein unsortierter Baum (git und gix fänden darin Verschiedenes) wird
+    /// abgelehnt, nicht gelesen.
+    #[test]
+    fn read_blob_bounded_refuses_an_unsorted_tree() {
+        let fixture = TempRepo::init();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(fixture.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        std::fs::write(fixture.path().join("policy"), "weak").unwrap();
+        let blob = git(&["hash-object", "-w", "policy"]);
+        let raw = |hex: &str| {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<u8>>()
+        };
+        // Innerer Baum `.minds/redact.json`, sortiert.
+        let mut inner = b"100644 redact.json\0".to_vec();
+        inner.extend(raw(&blob));
+        std::fs::write(fixture.path().join("inner"), &inner).unwrap();
+        let inner_id = git(&["hash-object", "-t", "tree", "-w", "--literally", "inner"]);
+        // Äußerer Baum: `zz` vor `.minds` — falsch herum.
+        let mut outer = b"100644 zz\0".to_vec();
+        outer.extend(raw(&blob));
+        outer.extend(b"40000 .minds\0");
+        outer.extend(raw(&inner_id));
+        std::fs::write(fixture.path().join("outer"), &outer).unwrap();
+        let outer_id = git(&["hash-object", "-t", "tree", "-w", "--literally", "outer"]);
+        let commit = git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit-tree",
+            &outer_id,
+            "-m",
+            "unsorted",
+        ]);
+        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
+        let commit: crate::oid::CommitId = commit.parse().unwrap();
+        let err = repo
+            .read_blob_bounded(commit, ".minds/redact.json", 1024)
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("not sorted"), "{err:?}");
+    }
+
+    #[test]
+    fn tracked_paths_reads_the_index_and_respects_the_limit() {
+        let fixture = TempRepo::init();
+        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
+        assert_eq!(repo.tracked_paths(1024), Some(Vec::new()), "kein Index");
+        std::fs::write(fixture.path().join("a.txt"), "a").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(fixture.path())
+            .args(["add", "a.txt"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            repo.tracked_paths(1024 * 1024),
+            Some(vec!["a.txt".to_owned()])
+        );
+        assert_eq!(repo.tracked_paths(8), None, "über der Grenze");
     }
 
     #[test]

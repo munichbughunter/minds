@@ -113,6 +113,7 @@ pub fn run(
     verbose: bool,
     recall: bool,
     global_hooks: bool,
+    witness: Option<&str>,
 ) -> ExitCode {
     let paths = match locate() {
         Ok(paths) => paths,
@@ -139,7 +140,24 @@ pub fn run(
         }
     };
 
-    match enable_agents(
+    // Das Profil vor jedem Schreibzugriff prüfen: Ein Tippfehler soll kein
+    // halb eingerichtetes Repo hinterlassen.
+    let profile = match witness
+        .map(crate::enable_witness::Profile::parse)
+        .transpose()
+    {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("minds enable: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if profile.is_some() && !crate::enable_witness::supported() {
+        eprintln!("minds enable: --witness is not supported on this platform");
+        return ExitCode::FAILURE;
+    }
+
+    let enabled = enable_agents(
         &paths,
         agents,
         store,
@@ -147,7 +165,14 @@ pub fn run(
         verbose,
         recall,
         global_hooks,
-    ) {
+    )
+    // Die bezeugte Konfiguration setzt auf die gewöhnliche auf (EA-10):
+    // Hooks und Git-Hooks wie immer, dann Witness, Container und Dienst.
+    .and_then(|()| match profile {
+        Some(profile) => crate::enable_witness::run(&paths.root, profile, store),
+        None => Ok(()),
+    });
+    match enabled {
         // Im Regelfall still — den Nutzer interessiert das Setup nicht. `-v`
         // zeigt jeden Schritt; nur echte Fehler kommen immer durch.
         Ok(()) => ExitCode::SUCCESS,
@@ -155,6 +180,16 @@ pub fn run(
             eprintln!("minds enable: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+impl RepoPaths {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub(crate) fn git_dir(&self) -> &Path {
+        &self.git_dir
     }
 }
 
@@ -2510,7 +2545,11 @@ fn write_hook(path: &Path, content: &str) -> std::io::Result<()> {
 /// über `fs::write` — und das folgt einem Symlink. Ein eingechecktes
 /// `.claude/settings.json` als Link (im Diff nur ein Moduswechsel auf
 /// `120000`) ließ `enable` die fremde Zieldatei überschreiben.
-fn write_atomic_no_follow(path: &Path, content: &str, executable: bool) -> std::io::Result<()> {
+pub(crate) fn write_atomic_no_follow(
+    path: &Path,
+    content: &str,
+    executable: bool,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     // Der Modus des bestehenden Ziels, **bevor** es ersetzt wird. `rename`
@@ -2602,7 +2641,7 @@ pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 /// Zeitfenster; wer dort einen Link unterschiebt, braucht Schreibrechte im
 /// selben Verzeichnis unter derselben Kennung. Der *Schreib*pfad ist über
 /// [`write_atomic_no_follow`] auch dann sicher — `rename` ersetzt den Namen.
-fn check_agent_path(root: &Path, path: &Path) -> std::io::Result<()> {
+pub(crate) fn check_agent_path(root: &Path, path: &Path) -> std::io::Result<()> {
     // Von der Datei aufwärts bis zur Wurzel (ausschließlich): jedes
     // Verzeichnis, das der Checkout gestellt haben könnte.
     for ancestor in path.ancestors().skip(1) {
@@ -2719,7 +2758,7 @@ fn make_executable(_file: &fs::File, _existing: Option<&fs::Metadata>) -> std::i
 // ---------------------------------------------------------------------------
 
 /// Wo Konfiguration hingehört und wo die Git-Hooks liegen.
-struct RepoPaths {
+pub(crate) struct RepoPaths {
     /// Die Repo-Wurzel (Elternverzeichnis von `.git`).
     root: PathBuf,
     /// Das Git-Verzeichnis selbst. In einem Linked Worktree das **private**
@@ -2877,7 +2916,7 @@ impl HooksDir {
 /// Sucht von der aktuellen Position aufwärts das Repository. Eigene, dumme
 /// Suche wie im Journal — `enable` braucht kein `minds-git`, nur die
 /// Verzeichnisse.
-fn locate() -> std::io::Result<RepoPaths> {
+pub(crate) fn locate() -> std::io::Result<RepoPaths> {
     let start = std::env::current_dir()?;
     for dir in start.ancestors() {
         let candidate = dir.join(".git");
@@ -3018,7 +3057,7 @@ fn as_object(value: &mut Value) -> &mut Map<String, Value> {
     value.as_object_mut().expect("gerade zum Objekt gemacht")
 }
 
-fn create_parent(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_parent(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

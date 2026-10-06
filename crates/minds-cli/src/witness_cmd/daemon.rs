@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -22,39 +22,152 @@ use crate::checkpoint::core::{
     CheckpointEnv, CheckpointGuard, EvidenceSource, SealSigner, run_checkpoint_guarded,
 };
 
+mod limits;
 mod observer;
 mod socket;
 #[cfg(test)]
 mod tests;
 mod witness_clock;
+mod worker;
+pub(crate) use socket::ping;
 pub use socket::run;
+pub(crate) use worker::worker;
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// Das Isolationsprofil (00-conventions, ADR-0012): wie Agent und Witness
+/// voneinander getrennt sind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum WitnessProfile {
+pub(crate) enum WitnessProfile {
     Container,
     User,
     Managed,
 }
 
 impl WitnessProfile {
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Container => "container",
             Self::User => "user",
             Self::Managed => "managed",
         }
     }
+
+    pub(crate) fn parse(name: &str) -> Fallible<Self> {
+        match name {
+            "container" => Ok(Self::Container),
+            "user" => Ok(Self::User),
+            "managed" => Ok(Self::Managed),
+            _ => Err("profile must be container, user or managed".into()),
+        }
+    }
+}
+
+/// Der festgehaltene Store des Witness (EA-10).
+///
+/// Backend, Kontext-Ref und Child-Pfad stehen in `witness.json` — nie in der
+/// `.git/config` des beobachteten Repos, die der Agent schreiben kann. Ein
+/// `minds.childPath` von dort lenkte die Schreibzugriffe des Witness sonst an
+/// einen beliebigen Ort auf dem Host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "backend", rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) enum PinnedStore {
+    InRepo {
+        context_ref: String,
+    },
+    ChildRepo {
+        context_ref: String,
+        child_path: PathBuf,
+    },
+}
+
+impl PinnedStore {
+    fn context_ref(&self) -> &str {
+        match self {
+            Self::InRepo { context_ref } | Self::ChildRepo { context_ref, .. } => context_ref,
+        }
+    }
+
+    /// Das In-Repo-Backend mit dem Standard-Ref — was ein Witness von vor
+    /// EA-10 (Schema 1) implizit benutzte.
+    fn default_in_repo() -> Self {
+        Self::InRepo {
+            context_ref: minds_git::DEFAULT_CONTEXT_REF.to_owned(),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
-struct Config {
+pub(crate) struct Config {
     schema_version: u32,
     repo_root: PathBuf,
     path_map: Vec<(PathBuf, PathBuf)>,
     profile: WitnessProfile,
     #[serde(default)]
     socket_group: Option<u32>,
+    /// Das festgehaltene Git-Verzeichnis (Schema 2): kanonisch, gleich
+    /// `<repo_root>/.git`. Fehlt es (Schema 1), gilt genau dieser Pfad.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git_dir: Option<PathBuf>,
+    /// Der festgehaltene Store (Schema 2). Fehlt er, gilt das In-Repo-Backend
+    /// mit dem Standard-Ref.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    store: Option<PinnedStore>,
+    /// Die Witness-eigene Redaction-Policy (Schema 2). Eine
+    /// `.minds/redact.json` im Worktree liest der Witness nicht mehr: Der
+    /// Agent könnte bezeugte Sessions sonst mit sehr breiten Deny-Begriffen
+    /// unlesbar oder jede Redaction instabil machen. Fehlt sie, gilt der
+    /// strenge Default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redaction: Option<minds_redact::RedactionConfig>,
+    /// Woher die Policy stammt — Commit- und Blob-Id —, damit auch ein
+    /// späteres `init` sie nennen kann.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_source: Option<String>,
+}
+
+/// Die Schema-Version, die `init` schreibt. Gelesen wird auch 1 (ohne Pins).
+const SCHEMA_VERSION: u32 = 2;
+
+/// Der feste Grund, aus dem ein Witness ohne Pins nicht arbeitet.
+pub(crate) const UNPINNED: &str = "witness.json has no pins (schema 1) — run `minds witness init` \
+     again with the same arguments to pin git dir, store and redaction policy";
+
+impl Config {
+    pub(crate) fn profile(&self) -> WitnessProfile {
+        self.profile
+    }
+
+    pub(crate) fn socket_group(&self) -> Option<u32> {
+        self.socket_group
+    }
+
+    /// Ob `git_dir`, Store und Policy in der Datei stehen (Schema 2).
+    pub(crate) fn pinned(&self) -> bool {
+        self.git_dir.is_some() && self.store.is_some() && self.redaction.is_some()
+    }
+
+    /// Das Git-Verzeichnis, in dem der Witness arbeitet.
+    fn git_dir(&self) -> PathBuf {
+        self.git_dir
+            .clone()
+            .unwrap_or_else(|| self.repo_root.join(".git"))
+    }
+
+    fn store(&self) -> PinnedStore {
+        self.store
+            .clone()
+            .unwrap_or_else(PinnedStore::default_in_repo)
+    }
+
+    /// Die Policy für Checkpoint und Beobachter: die festgehaltene, nach
+    /// unten begrenzt durch den strengen Default — auch eine von Hand
+    /// geänderte `witness.json` schwächt nicht ab.
+    fn policy(&self) -> minds_redact::RedactionConfig {
+        self.redaction
+            .clone()
+            .unwrap_or_default()
+            .floored_at_default()
+    }
 }
 
 const DIRECTORIES: &[&str] = &[
@@ -66,18 +179,127 @@ const DIRECTORIES: &[&str] = &[
     "log",
     "run",
 ];
+/// Was `init` vorfand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Initialized {
+    /// Neu angelegt; die Pins zum Anzeigen.
+    Created(Pins),
+    /// Dieselbe Konfiguration stand schon da, mit Pins; nichts wurde
+    /// geschrieben. Die Pins zum Anzeigen — wer erneut `init` ausführt, soll
+    /// sehen, was gilt.
+    Unchanged(Pins),
+    /// Dieselbe Konfiguration stand da, aber ohne Pins (Schema 1); sie sind
+    /// jetzt ergänzt.
+    Pinned(Pins),
+}
 
-pub fn init(home: &Path, repo: &str, mapping: Option<&str>) -> Fallible<String> {
-    let home: PathBuf = home.components().collect();
-    let output = Command::new("git")
-        .args(["-C", repo, "rev-parse", "--show-toplevel"])
-        .stdin(Stdio::null())
-        .output()?;
-    if !output.status.success() {
-        return Err("--repo must identify a Git worktree".into());
+/// Was `init` festgehalten hat — für den Bericht an den Menschen, der es
+/// prüfen soll. Keine Policy-Werte: Deny-Begriffe können selbst Geheimnisse
+/// sein; genannt wird nur, woher die Policy stammt und wie viele Begriffe sie
+/// trägt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pins {
+    pub(crate) git_dir: PathBuf,
+    pub(crate) store: String,
+    pub(crate) policy: String,
+}
+
+impl Pins {
+    fn of(config: &Config, policy_source: &str) -> Self {
+        let store = match config.store() {
+            PinnedStore::InRepo { context_ref } => format!("in-repo, {context_ref}"),
+            PinnedStore::ChildRepo {
+                context_ref,
+                child_path,
+            } => format!("child repo {}, {context_ref}", child_path.display()),
+        };
+        let policy = config.policy();
+        let terms = policy.deny_secrets.len() + policy.deny_pii.len() + policy.secret_keys.len();
+        Self {
+            git_dir: config.git_dir(),
+            store,
+            policy: format!("{policy_source}, {terms} custom term(s), floored at the default"),
+        }
     }
-    let repo_root = Path::new(String::from_utf8(output.stdout)?.trim()).canonicalize()?;
-    let path_map = if let Some(mapping) = mapping {
+
+    /// Die Zeilen für den Bericht.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        vec![
+            format!("pinned git dir: {}", self.git_dir.display()),
+            format!("pinned store:   {}", self.store),
+            format!("pinned policy:  {}", self.policy),
+        ]
+    }
+}
+
+/// Die Wünsche an `init`, wie sie von der Kommandozeile oder aus
+/// `minds enable --witness` kommen.
+pub(crate) struct InitRequest<'a> {
+    pub(crate) repo: &'a str,
+    pub(crate) mapping: Option<&'a str>,
+    pub(crate) profile: Option<&'a str>,
+    pub(crate) socket_group: Option<&'a str>,
+    /// Ein Child-Repo als Store — nur ausdrücklich vom Menschen genannt,
+    /// nie aus der `.git/config`, die der Agent schreiben kann.
+    pub(crate) child_repo: Option<&'a Path>,
+    /// Aus welchem Commit die Policy gelesen wird (Standard: HEAD) — etwa der
+    /// geprüfte Stand `origin/main`.
+    pub(crate) policy_rev: Option<&'a str>,
+}
+
+pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
+    let mut lines = Vec::new();
+    match init_config(home, request)? {
+        Initialized::Created(pins) => {
+            lines.push(
+                "Witness initialized. Run `minds witness keygen` before `minds witness run`."
+                    .to_owned(),
+            );
+            lines.extend(pins.lines());
+        }
+        Initialized::Pinned(pins) => {
+            lines.push("Witness configuration pinned (schema 2).".to_owned());
+            lines.extend(pins.lines());
+        }
+        Initialized::Unchanged(pins) => {
+            lines.push("Witness already initialized with this configuration.".to_owned());
+            lines.extend(pins.lines());
+        }
+    }
+    Ok(lines
+        .iter()
+        .map(|line| crate::text::sanitize(line))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+/// Legt das Witness-Home an und hält Repository, Git-Verzeichnis, Store und
+/// Policy in `witness.json` fest.
+///
+/// Idempotent: Steht dort schon dieselbe Konfiguration (Repository,
+/// Pfadabbildung, Profil, Socket-Gruppe), bleibt alles, wie es ist —
+/// insbesondere die einmal festgehaltenen Pins. Fehlen dort die Pins
+/// (Schema 1), werden sie ergänzt. Eine **andere** Konfiguration wird nie
+/// überschrieben; der Fehler nennt, was abweicht.
+///
+/// Woher die Pins kommen, entscheidet, wem sie gehören:
+///
+/// - **Store:** In-Repo mit dem Ref aus der Konfiguration (nur unter
+///   `refs/minds/`). Ein Child-Repo nur, wenn der Mensch es nennt
+///   (`--child-repo`) — wählt die `.git/config` eines, ohne dass es genannt
+///   ist, bricht `init` ab, statt still einen Pfad des Agenten festzuhalten.
+/// - **Policy:** `.minds/redact.json` aus dem **committeten** HEAD, nicht
+///   aus dem Worktree — was gepinnt wird, steht in der Historie. Eine
+///   Policy, die ihre eigenen Platzhalter träfe (jede redigierte Session
+///   würde instabil und vertagt), wird abgelehnt.
+pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<Initialized> {
+    let home: PathBuf = home.components().collect();
+    // Die Wurzel über das Dateisystem, nicht über `git rev-parse`: Das
+    // folgte `core.worktree` aus der `.git/config` des Agenten und hielte
+    // ein anderes Verzeichnis als Repository fest.
+    let repo_root = super::repo_root_of(&Path::new(request.repo).canonicalize()?)
+        .ok_or("--repo must identify a Git worktree")?;
+    let path_map = if let Some(mapping) = request.mapping {
         let (agent, host) = mapping
             .split_once('=')
             .ok_or("path map must be <agent>=<host>")?;
@@ -92,22 +314,136 @@ pub fn init(home: &Path, repo: &str, mapping: Option<&str>) -> Fallible<String> 
     } else {
         Vec::new()
     };
+    let profile = match request.profile {
+        Some(name) => WitnessProfile::parse(name)?,
+        None if path_map.is_empty() => WitnessProfile::User,
+        None => WitnessProfile::Container,
+    };
+    match (profile, path_map.is_empty()) {
+        (WitnessProfile::Container, true) => {
+            return Err("the container profile requires --path-map".into());
+        }
+        (WitnessProfile::User | WitnessProfile::Managed, false) => {
+            return Err("--path-map is only valid for the container profile".into());
+        }
+        _ => {}
+    }
+    let socket_group = request.socket_group.map(group_id).transpose()?;
+    if socket_group.is_some() && profile != WitnessProfile::User {
+        return Err("--socket-group is only valid for the user profile".into());
+    }
+
+    // Schon eingerichtet? Dann nur vergleichen — ohne Lock, damit ein
+    // erneutes `enable --witness` auch neben einem laufenden Witness gelingt.
+    if fs::symlink_metadata(home.join("witness.json")).is_ok() {
+        let mut existing = load(&home)?;
+        let mut differs = Vec::new();
+        if existing.repo_root != repo_root {
+            differs.push("repository");
+        }
+        if existing.path_map != path_map {
+            differs.push("path map");
+        }
+        if existing.profile != profile {
+            differs.push("profile");
+        }
+        if existing.socket_group != socket_group {
+            differs.push("socket group");
+        }
+        // Ausdrücklich Genanntes, das nicht dem Festgehaltenen entspricht,
+        // darf nicht still als „unverändert" durchgehen: weder ein Store noch
+        // eine Policy-Revision. Verglichen wird nur, was der Mensch nennt —
+        // nicht ein Context-Ref, den der Agent inzwischen umgeschrieben hat.
+        if existing.pinned() {
+            if let Some(child) = request.child_repo {
+                let wanted = child_store_path(&repo_root, child)?;
+                let pinned = match existing.store() {
+                    PinnedStore::ChildRepo { child_path, .. } => Some(child_path),
+                    PinnedStore::InRepo { .. } => None,
+                };
+                if pinned.as_ref() != Some(&wanted) {
+                    differs.push("store");
+                }
+            }
+            if request.policy_rev.is_some() {
+                let (wanted, _) = pinned_policy(&existing.git_dir(), request.policy_rev)?;
+                if Some(wanted) != existing.redaction.clone().map(|p| p.floored_at_default()) {
+                    differs.push("policy");
+                }
+            }
+        }
+        if !differs.is_empty() {
+            return Err(format!(
+                "witness home already holds a different configuration ({} differ); \
+                 refusing to overwrite",
+                differs.join(", ")
+            )
+            .into());
+        }
+        if existing.pinned() {
+            // Die gespeicherte Quelle (volle Commit- und Blob-Id), damit auch
+            // ein späterer Lauf sie zum Abgleich nennt. Bereinigt: `load`
+            // prüft das Feld nicht, und die Datei ist von Hand änderbar.
+            let source = existing
+                .policy_source
+                .as_deref()
+                .map(crate::text::sanitize)
+                .unwrap_or_else(|| "pinned earlier (source not recorded)".to_owned());
+            return Ok(Initialized::Unchanged(Pins::of(&existing, &source)));
+        }
+        // Schema 1 ergänzen: dieselben Quellen wie bei einer neuen Einrichtung.
+        let (pins, source) = gather_pins(&repo_root, request.child_repo, request.policy_rev)?;
+        let _lock = lock(&home)?;
+        existing.schema_version = SCHEMA_VERSION;
+        existing.git_dir = Some(pins.0);
+        existing.store = Some(pins.1);
+        existing.redaction = Some(pins.2);
+        existing.policy_source = Some(source.clone());
+        atomic(
+            &home.join("witness.json"),
+            &serde_json::to_vec_pretty(&existing)?,
+        )?;
+        return Ok(Initialized::Pinned(Pins::of(&existing, &source)));
+    }
+
+    let (pins, source) = gather_pins(&repo_root, request.child_repo, request.policy_rev)?;
+
+    // Vor dem Anlegen prüfen: Ein abgelehntes Home soll nicht als leeres
+    // Verzeichnis im Repo zurückbleiben.
+    if let Some(parent) = home.parent().and_then(|parent| parent.canonicalize().ok()) {
+        if parent.starts_with(&repo_root) {
+            return Err("witness home must not be inside the repository".into());
+        }
+    }
     private_directory(&home)?;
     validate_tree(&home)?;
+    if refuse_home_in(&home, &repo_root).is_err() {
+        return Err("witness home must not be inside the repository".into());
+    }
     for dir in DIRECTORIES {
         private_directory(&home.join(dir))?;
     }
     let _lock = lock(&home)?;
+    if let Some(group) = socket_group {
+        // Das `user`-Profil: Die Agent-Gruppe darf Home und `run/`
+        // durchqueren (0710, ohne Lesen), um den Socket zu erreichen. Alles
+        // darunter bleibt 0700/0600. Vor `witness.json`: Scheitert das (etwa
+        // weil dieser Nutzer nicht in der Gruppe ist), behauptet keine
+        // Konfiguration eine Gruppe, die nie gesetzt wurde.
+        for dir in [home.clone(), home.join("run")] {
+            share_with_group(&dir, group)?;
+        }
+    }
     let config = Config {
-        schema_version: 1,
+        schema_version: SCHEMA_VERSION,
         repo_root,
-        profile: if path_map.is_empty() {
-            WitnessProfile::User
-        } else {
-            WitnessProfile::Container
-        },
+        profile,
         path_map,
-        socket_group: None,
+        socket_group,
+        git_dir: Some(pins.0),
+        store: Some(pins.1),
+        redaction: Some(pins.2),
+        policy_source: Some(source.clone()),
     };
     let mut file = private_new(&home.join("witness.json"))?;
     file.write_all(&serde_json::to_vec_pretty(&config)?)?;
@@ -115,14 +451,273 @@ pub fn init(home: &Path, repo: &str, mapping: Option<&str>) -> Fallible<String> 
     let ledger = private_append(&home.join("ledger"))?;
     ledger.sync_all()?;
     sync_dir(&home)?;
-    Ok("Witness initialized. Run `minds witness keygen` before `minds witness run`.".into())
+    Ok(Initialized::Created(Pins::of(&config, &source)))
+}
+
+/// Git-Verzeichnis, Store und Policy für `init`, samt der Quelle der Policy.
+type Gathered = (PathBuf, PinnedStore, minds_redact::RedactionConfig);
+
+fn gather_pins(
+    repo_root: &Path,
+    child_repo: Option<&Path>,
+    policy_rev: Option<&str>,
+) -> Fallible<(Gathered, String)> {
+    let git_dir = pinned_git_dir(repo_root)?;
+    let store = pinned_store(repo_root, child_repo)?;
+    let (redaction, source) = pinned_policy(&git_dir, policy_rev)?;
+    Ok(((git_dir, store, redaction), source))
+}
+
+/// Gruppen-Id aus Zahl oder Gruppenname.
+fn group_id(name: &str) -> Fallible<u32> {
+    if let Ok(gid) = name.parse::<u32>() {
+        return Ok(gid);
+    }
+    let cname = std::ffi::CString::new(name).map_err(|_| "invalid socket group")?;
+    // SAFETY: nul-terminierter Name; getgrnam liefert NULL oder einen Zeiger
+    // auf eine statische Struktur, die hier sofort gelesen wird.
+    let entry = unsafe { libc::getgrnam(cname.as_ptr()) };
+    if entry.is_null() {
+        return Err(format!("unknown group {}", crate::text::sanitize(name)).into());
+    }
+    // SAFETY: nicht NULL, siehe oben.
+    Ok(unsafe { (*entry).gr_gid })
+}
+
+/// Gibt `dir` der Gruppe `group` zum Durchqueren frei (0710).
+fn share_with_group(dir: &Path, group: u32) -> Fallible<()> {
+    let name = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())?;
+    // SAFETY: nul-terminierter Pfad; uid=-1 lässt den Eigentümer stehen.
+    if unsafe { libc::chown(name.as_ptr(), !0, group) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o710))?;
+    Ok(())
+}
+
+/// Das Git-Verzeichnis, das der Witness festhält: kanonisch und genau
+/// `<repo_root>/.git`. Verlinkte Worktrees und ausgelagerte Git-Verzeichnisse
+/// teilen ihr Verzeichnis mit Orten außerhalb dessen, was der Witness
+/// festhalten kann — sie werden abgelehnt.
+fn pinned_git_dir(repo_root: &Path) -> Fallible<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    if !fs::symlink_metadata(&dot_git).is_ok_and(|meta| meta.is_dir()) {
+        return Err(
+            "the witness requires a plain .git directory (no linked worktree or gitdir file)"
+                .into(),
+        );
+    }
+    Ok(dot_git.canonicalize()?)
+}
+
+/// Der Store aus der Konfiguration des Repos zum Zeitpunkt von `init` — der
+/// Mensch richtet den Witness ein, nicht der Agent. Ein Child-Repo muss
+/// außerhalb des beobachteten Repos liegen, der Ref unter `refs/minds/`.
+fn pinned_store(repo_root: &Path, child_repo: Option<&Path>) -> Fallible<PinnedStore> {
+    let config = crate::config::load(repo_root);
+    let context_ref = config.reference().to_owned();
+    if !context_ref.starts_with(minds_git::MINDS_REF_NAMESPACE) {
+        return Err("context ref outside refs/minds/ cannot be pinned for the witness".into());
+    }
+    match (child_repo, config.backend()) {
+        (None, minds_store::Backend::InRepo) => Ok(PinnedStore::InRepo { context_ref }),
+        // Die Konfiguration nennt ein Child-Repo, der Mensch nicht: Diesen
+        // Pfad kann der Agent geschrieben haben — nicht still festhalten.
+        (None, minds_store::Backend::ChildRepo { .. }) => Err(
+            "the repository config selects a child-repo store; pass --child-repo <path> \
+             to pin it for the witness explicitly"
+                .into(),
+        ),
+        (Some(path), _) => Ok(PinnedStore::ChildRepo {
+            context_ref,
+            child_path: child_store_path(repo_root, path)?,
+        }),
+    }
+}
+
+/// Der kanonische Pfad eines ausdrücklich genannten Child-Repos — außerhalb
+/// des beobachteten Repos, und das Repo nicht darin.
+fn child_store_path(repo_root: &Path, path: &Path) -> Fallible<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let child_path = path
+        .canonicalize()
+        .map_err(|_| "the child repository for the witness store must exist")?;
+    if child_path.starts_with(repo_root) || repo_root.starts_with(&child_path) {
+        return Err("the child repository must lie outside the observed repository".into());
+    }
+    Ok(child_path)
+}
+
+/// Größte Policy-Datei, die `init` liest.
+const MAX_PINNED_POLICY: u64 = 64 * 1024;
+
+/// Die Policy für den Witness: `.minds/redact.json` aus einem Commit — HEAD
+/// oder der Revision, die der Mensch mit `--policy-rev` nennt —, nach unten
+/// begrenzt. Gibt die Quelle samt Commit- und Blob-Id für den Bericht mit.
+///
+/// Gelesen über das festgehaltene Git-Verzeichnis, ohne Config-Includes und
+/// ohne `refs/replace/*`, mit einer Größengrenze am Objekt-Header — kein
+/// `git`-Prozess, der der Konfiguration des Agenten folgte. Nur „die Datei
+/// steht nicht im Baum" (oder es gibt noch keinen Commit) ergibt den
+/// strengen Default; jeder andere Fehler bricht `init` ab, statt still den
+/// Default festzuhalten.
+///
+/// Ehrliche Grenze: Lokale Refs gehören dem Agenten — er kann eine
+/// geschwächte Policy committen, bevor ein Mensch `init` ausführt. Deshalb
+/// stehen Commit- und Blob-Id im Bericht: Der Mensch vergleicht sie mit der
+/// Version, die sein Team geprüft hat. Eine Policy, die ihre eigenen
+/// Platzhalter trifft, wird abgelehnt — sie machte jede redigierte Session
+/// instabil.
+fn pinned_policy(
+    git_dir: &Path,
+    policy_rev: Option<&str>,
+) -> Fallible<(minds_redact::RedactionConfig, String)> {
+    // Dieselbe Layout-Prüfung wie vor jedem Witness-Lauf: keine
+    // `alternates`, kein `commondir`, keine Symlinks in `.git`.
+    plain_git_dir_within(git_dir, MAX_GIT_ENTRIES).map_err(|err| {
+        err.to_string()
+            .replace("; checkpoint deferred", "; witness init refused")
+    })?;
+    // `refs/replace/*` und `info/grafts` liest minds nicht — das `git` des
+    // Menschen schon. Er sähe bei der Kontrolle der gedruckten Ids einen
+    // anderen Inhalt als den festgehaltenen. Lieber abbrechen.
+    let replace = git_dir.join("refs/replace");
+    let loose_replacements = match fs::read_dir(&replace) {
+        Ok(mut dir) => dir.next().is_some(),
+        Err(err) => err.kind() != std::io::ErrorKind::NotFound,
+    };
+    let has_replacements = loose_replacements || packed_refs_mention(git_dir, "refs/replace/");
+    if has_replacements || fs::symlink_metadata(git_dir.join("info/grafts")).is_ok() {
+        return Err(
+            "refs/replace or info/grafts exists — your own git would show other content than \
+             minds pins; remove them (`git replace -d …`) and rerun"
+                .into(),
+        );
+    }
+    let repo = minds_git::Repo::open_pinned(git_dir)?;
+    let commit = match policy_rev {
+        None => repo.head()?.commit(),
+        // Eine volle Commit-Id zuerst: Sie ist die einzige Angabe, die der
+        // Agent nicht umlenken kann — Refs (auch einer, der so heißt wie die
+        // Id) gehören ihm. Dass der Commit stimmt, prüft das Nachhashen.
+        Some(rev) => match rev.parse::<minds_git::CommitId>() {
+            Ok(id) => Some(id),
+            _ => Some(repo.commit_at(rev)?.ok_or_else(|| {
+                format!(
+                    "--policy-rev {} names no commit",
+                    crate::text::sanitize(rev)
+                )
+            })?),
+        },
+    };
+    let Some(commit) = commit else {
+        let config = minds_redact::RedactionConfig::default();
+        return Ok((config, "strict default (no commit yet)".to_owned()));
+    };
+    let commit_hex = commit.to_string();
+    let (config, source) =
+        match repo.read_blob_bounded(commit, ".minds/redact.json", MAX_PINNED_POLICY)? {
+            Some((blob, bytes)) => {
+                let config: minds_redact::RedactionConfig =
+                serde_json::from_slice(&bytes).map_err(|err| {
+                    format!(
+                        ".minds/redact.json at {commit_hex} is not a valid redaction policy — {} \
+                             at line {}",
+                        match err.classify() {
+                            serde_json::error::Category::Syntax => "syntax error",
+                            serde_json::error::Category::Data =>
+                                "unexpected value or unknown field",
+                            serde_json::error::Category::Eof => "unexpected end of file",
+                            serde_json::error::Category::Io => "read error",
+                        },
+                        err.line()
+                    )
+                })?;
+                (
+                    config,
+                    format!(".minds/redact.json at commit {commit_hex}, blob {blob}"),
+                )
+            }
+            None => (
+                minds_redact::RedactionConfig::default(),
+                format!("strict default (no .minds/redact.json at commit {commit_hex})"),
+            ),
+        };
+    let config = config.floored_at_default();
+    refuse_unstable_policy(&config)?;
+    Ok((config, source))
+}
+
+/// Ob `packed-refs` einen Ref unter `prefix` nennt — begrenzt gelesen.
+fn packed_refs_mention(git_dir: &Path, prefix: &str) -> bool {
+    packed_refs_mention_within(git_dir, prefix, MAX_PACKED_REFS)
+}
+
+/// Größte `packed-refs`, die `init` durchsucht.
+const MAX_PACKED_REFS: u64 = 64 * 1024 * 1024;
+
+fn packed_refs_mention_within(git_dir: &Path, prefix: &str, limit: u64) -> bool {
+    // Nur „gibt es nicht" heißt „nichts ersetzt". Jeder andere Fehler (ein
+    // inzwischen getauschter Symlink, EACCES) und jede Datei, die keine
+    // gewöhnliche ist (ein FIFO liest sich leer), gelten als vorhanden.
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(git_dir.join("packed-refs"))
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return true;
+    }
+    // Ein Byte mehr als die Grenze lesen: Liegt die Datei darüber, ist der
+    // Rest ungelesen — er gilt als vorhanden. `take` allein schnitte still
+    // ab, und ein `refs/replace/…` hinter genug Füllzeilen bliebe unsichtbar.
+    let mut bytes = Vec::new();
+    if file.take(limit + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > limit {
+        return true;
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    text.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|name| name.starts_with(prefix))
+    })
+}
+
+/// Ein Text aus Platzhaltern in den Lagen, in denen Detektoren suchen —
+/// redigiert ihn die Policy um, wäre jede redigierte Session instabil.
+fn refuse_unstable_policy(config: &minds_redact::RedactionConfig) -> Fallible<()> {
+    const PROBE: &str = "[redacted:secret] [redacted:pii] token=[redacted:secret] \
+         password: [redacted:secret] user=[redacted:pii] \
+         \"api_key\": \"[redacted:secret]\" Authorization: Bearer [redacted:secret]";
+    let pipeline = config.pipeline()?;
+    let once = pipeline.redact(PROBE).text;
+    if once != PROBE || pipeline.redact(&once).text != once {
+        return Err(
+            "the redaction policy matches its own placeholders (e.g. a term like \"redacted\") — \
+             every redacted session would be unstable; refusing to pin it"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Liegt das Witness-Home im beobachteten Repo, sähe der Beobachter die
 /// eigenen Schreibzugriffe — und der Agent das Home. Der Witness startet
 /// dann nicht (EA-08).
 fn refuse_home_in_repo(home: &Path, config: &Config) -> Fallible<()> {
-    if home.canonicalize()?.starts_with(&config.repo_root) {
+    refuse_home_in(home, &config.repo_root)
+}
+
+fn refuse_home_in(home: &Path, repo_root: &Path) -> Fallible<()> {
+    if home.canonicalize()?.starts_with(repo_root) {
         return Err("witness home must not be inside the repository".into());
     }
     Ok(())
@@ -134,11 +729,13 @@ fn plain(path: &Path) -> bool {
         .any(|part| matches!(part, std::path::Component::ParentDir))
 }
 
-fn load(home: &Path) -> Fallible<Config> {
+pub(crate) fn load(home: &Path) -> Fallible<Config> {
     let home: PathBuf = home.components().collect();
-    validate_tree(&home)?;
-    let config: Config = serde_json::from_slice(&fs::read(home.join("witness.json"))?)?;
-    if config.schema_version != 1
+    // Erst die Konfiguration, privat und ohne Symlink gelesen — sie sagt, ob
+    // Home und `run/` der Socket-Gruppe offenstehen dürfen. Dann der Baum.
+    let config: Config = serde_json::from_slice(&read_private(&home, "witness.json")?)?;
+    validate_tree_shared(&home, config.socket_group.map(|gid| (home.as_path(), gid)))?;
+    if !matches!(config.schema_version, 1 | SCHEMA_VERSION)
         || !config.repo_root.is_absolute()
         || config.repo_root.canonicalize()? != config.repo_root
     {
@@ -149,12 +746,47 @@ fn load(home: &Path) -> Fallible<Config> {
             return Err("invalid witness path map".into());
         }
     }
+    // Die Pins sind nur so gut wie ihre Prüfung beim Laden: Auch eine von
+    // Hand geänderte Datei lenkt den Witness nicht aus dem Repo heraus.
+    if let Some(git_dir) = &config.git_dir {
+        if git_dir != &config.repo_root.join(".git") || !plain(git_dir) {
+            return Err("invalid pinned git directory".into());
+        }
+    }
+    let store = config.store();
+    if !store
+        .context_ref()
+        .starts_with(minds_git::MINDS_REF_NAMESPACE)
+    {
+        return Err("pinned context ref outside refs/minds/".into());
+    }
+    if let PinnedStore::ChildRepo { child_path, .. } = &store {
+        // Kanonisch wie `repo_root`: Ein Symlink im Pfad lenkte die
+        // Schreibzugriffe des Workers sonst an einen anderen Ort.
+        if !child_path.is_absolute()
+            || !plain(child_path)
+            || child_path.starts_with(&config.repo_root)
+            || config.repo_root.starts_with(child_path)
+            || child_path.canonicalize().ok().as_ref() != Some(child_path)
+        {
+            return Err("invalid pinned child repository".into());
+        }
+    }
     Ok(config)
 }
 
 /// Private Zustandsbäume enthalten weder Symlinks noch fremde/hart verlinkte
 /// Dateien. Der Socket ist die einzige Ausnahme von 0700/0600.
 fn validate_tree(path: &Path) -> Fallible<()> {
+    validate_tree_shared(path, None)
+}
+
+/// Wie [`validate_tree`]; mit `shared = Some((home, gid))` (das `user`-Profil)
+/// dürfen genau das Home und `run/` der Gruppe `gid` das Durchqueren erlauben
+/// (0710): Ohne Lesen sieht sie keine Namen, und alles darunter bleibt
+/// 0700/0600. Jedes andere Verzeichnis, eine andere Gruppe oder ein anderes
+/// Profil bleibt bei 0700.
+fn validate_tree_shared(path: &Path, shared: Option<(&Path, u32)>) -> Fallible<()> {
     let meta = fs::symlink_metadata(path)?;
     // SAFETY: geteuid hat keine Vorbedingungen.
     if meta.uid() != unsafe { libc::geteuid() } || meta.file_type().is_symlink() {
@@ -166,12 +798,22 @@ fn validate_tree(path: &Path) -> Fallible<()> {
         }
         return Ok(());
     }
-    if meta.mode() & 0o077 != 0 || (!meta.is_dir() && (!meta.is_file() || meta.nlink() != 1)) {
+    let traverse = match shared {
+        Some((home, gid))
+            if meta.is_dir() && meta.gid() == gid && (path == home || path == home.join("run")) =>
+        {
+            0o010
+        }
+        _ => 0,
+    };
+    if meta.mode() & 0o077 & !traverse != 0
+        || (!meta.is_dir() && (!meta.is_file() || meta.nlink() != 1))
+    {
         return Err("witness home requires private directories and files (0700/0600)".into());
     }
     if meta.is_dir() {
         for entry in fs::read_dir(path)? {
-            match validate_tree(&entry?.path()) {
+            match validate_tree_shared(&entry?.path(), shared) {
                 // Der laufende Schreiber benennt um und verwirft Sessions; ein
                 // inzwischen verschwundener Eintrag ist kein unsicherer.
                 Err(err)
@@ -183,6 +825,34 @@ fn validate_tree(path: &Path) -> Fallible<()> {
         }
     }
     Ok(())
+}
+
+/// Liest `home/name`: Das Home ist ein eigenes Verzeichnis, kein Symlink;
+/// die Datei wird ohne Folgen und ohne Blockieren geöffnet und am offenen
+/// Deskriptor geprüft (eigen, gewöhnlich, 0600, ein Link, höchstens 1 MiB).
+fn read_private(home: &Path, name: &str) -> Fallible<Vec<u8>> {
+    let meta = fs::symlink_metadata(home)?;
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let me = unsafe { libc::geteuid() };
+    if !meta.is_dir() || meta.file_type().is_symlink() || meta.uid() != me {
+        return Err("witness home must be owned by this user and contain no symlinks".into());
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(home.join(name))?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.uid() != me
+        || meta.mode() & 0o077 != 0
+        || meta.nlink() != 1
+        || meta.len() > 1024 * 1024
+    {
+        return Err("witness home requires private directories and files (0700/0600)".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn private_new(path: &Path) -> std::io::Result<File> {
@@ -253,6 +923,117 @@ fn fingerprint(home: &Path) -> Fallible<String> {
 }
 
 fn log(home: &Path, message: &str) {
+    // Der Worker schreibt nicht selbst: Seine Zeilen legt der Witness ab,
+    // dedupliziert und bereinigt wie die eigenen (EA-10).
+    if worker::is_worker() {
+        println!("L {}", worker::one_line(message));
+        return;
+    }
+    // Erst entscheiden, dann schreiben: Der Mutex ist frei, bevor Redaktion
+    // und Datei-I/O laufen.
+    let lines = LOG_DEDUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .admit(home, message);
+    for line in lines {
+        write_log(home, &line);
+    }
+}
+
+/// Wie lange eine Logzeile als Wiederholung gilt.
+const DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+/// So viele verschiedene Zeilen merkt sich die Deduplizierung je Home.
+const DEDUP_SLOTS: usize = 16;
+
+/// Die Deduplizierung aller Zeilen von `witness.log` (EA-10).
+///
+/// Dieselbe Zeile innerhalb von [`DEDUP_WINDOW`] wird nur gezählt, nicht
+/// geschrieben; ihre nächste Ausgabe danach — oder ihr Herausfallen aus den
+/// [`DEDUP_SLOTS`] — trägt die Zahl nach. Eine Flut gleicher Zeilen (ein
+/// Agent, der Fehler im Sekundentakt auslöst) drängt ältere Diagnosen so
+/// nicht aus dem rotierenden Log; auch abwechselnde Zeilen nicht. Der Stand
+/// ist je Home getrennt: Was ein Home verdrängt, landet nie im Log eines
+/// anderen.
+#[derive(Default)]
+struct LogDedup {
+    homes: BTreeMap<PathBuf, std::collections::VecDeque<Recent>>,
+}
+
+struct Recent {
+    message: String,
+    since: std::time::Instant,
+    suppressed: usize,
+}
+
+static LOG_DEDUP: std::sync::Mutex<LogDedup> = std::sync::Mutex::new(LogDedup {
+    homes: BTreeMap::new(),
+});
+
+fn repeated(n: usize, message: &str) -> String {
+    format!("previous line repeated {n} more time(s): {message}")
+}
+
+impl LogDedup {
+    /// Die Zeilen, die für `message` jetzt zu schreiben sind — keine, wenn
+    /// sie eine Wiederholung ist.
+    fn admit(&mut self, home: &Path, message: &str) -> Vec<String> {
+        let recent = self.homes.entry(home.to_path_buf()).or_default();
+        if let Some(entry) = recent.iter_mut().find(|entry| entry.message == message) {
+            if entry.since.elapsed() < DEDUP_WINDOW {
+                entry.suppressed += 1;
+                return Vec::new();
+            }
+            let mut lines = Vec::new();
+            if entry.suppressed > 0 {
+                lines.push(repeated(entry.suppressed, message));
+            }
+            lines.push(message.to_owned());
+            entry.since = std::time::Instant::now();
+            entry.suppressed = 0;
+            return lines;
+        }
+        let mut lines = Vec::new();
+        recent.push_back(Recent {
+            message: message.to_owned(),
+            since: std::time::Instant::now(),
+            suppressed: 0,
+        });
+        while recent.len() > DEDUP_SLOTS {
+            if let Some(evicted) = recent.pop_front() {
+                if evicted.suppressed > 0 {
+                    lines.push(repeated(evicted.suppressed, &evicted.message));
+                }
+            }
+        }
+        lines.push(message.to_owned());
+        lines
+    }
+
+    /// Was beim Beenden noch nachzutragen ist: gezählt, aber nicht
+    /// geschrieben.
+    fn flush(&mut self, home: &Path) -> Vec<String> {
+        self.homes
+            .remove(home)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|entry| entry.suppressed > 0)
+            .map(|entry| repeated(entry.suppressed, &entry.message))
+            .collect()
+    }
+}
+
+/// Schreibt beim Beenden des Witness die noch gezählten Wiederholungen.
+fn flush_log(home: &Path) {
+    let lines = LOG_DEDUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .flush(home);
+    for line in lines {
+        write_log(home, &line);
+    }
+}
+
+fn write_log(home: &Path, message: &str) {
     // Kein fremder Payload wird als Diagnose übergeben. Auch vertrauenswürdige
     // Fehlertexte durchlaufen dieselbe Redaktion wie hook.log.
     let path = home.join("log/witness.log");
@@ -294,9 +1075,12 @@ struct Writer {
     /// Ob seit dem letzten vollständigen Checkpoint ein Agent-Event kam oder
     /// eine Session vertagt blieb. Ohne das gibt es nichts zu versiegeln.
     dirty: bool,
-    /// Ende des letzten Checkpoint-Laufs auf Anfrage, gleich mit welchem
-    /// Ausgang.
-    last_run: Option<std::time::Instant>,
+    /// Ende des letzten Checkpoint-Laufs auf Anfrage je Client (Commit),
+    /// gleich mit welchem Ausgang (EA-10).
+    limits: limits::Limits,
+    /// Das Binary, das den Checkpoint als eigenen Prozess ausführt (EA-10).
+    /// `None` im Test: Dort läuft er im eigenen Prozess.
+    worker: Option<PathBuf>,
     /// Der zuletzt geloggte Fehlschlag und wie oft er sich seither still
     /// wiederholt hat — ein erzwungener Fehlschlag je Sekunde darf ältere
     /// Diagnosen nicht aus dem rotierenden Log drängen.
@@ -337,8 +1121,8 @@ const FS_APPENDS_ON_CHECKPOINT: usize = 256;
 const MIN_CHECKPOINT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl Writer {
-    fn open(home: &Path, config: Config, follow: bool) -> Fallible<Self> {
-        let mut writer = Self {
+    fn new(home: &Path, config: Config, follow: bool) -> Fallible<Self> {
+        Ok(Self {
             home: home.into(),
             config,
             journal: Journal::at(home.join("journal")),
@@ -347,7 +1131,8 @@ impl Writer {
             folders: BTreeMap::new(),
             follow,
             dirty: true,
-            last_run: None,
+            limits: limits::Limits::default(),
+            worker: None,
             last_failure: None,
             stream: None,
             observer: None,
@@ -356,9 +1141,33 @@ impl Writer {
             fs_ready: std::collections::VecDeque::new(),
             settled_this_step: false,
             last_gap: std::collections::HashMap::new(),
-        };
+        })
+    }
+
+    fn open(home: &Path, config: Config, follow: bool) -> Fallible<Self> {
+        let mut writer = Self::new(home, config, follow)?;
         writer.recover_all()?;
         writer.witness_ledger()?;
+        Ok(writer)
+    }
+
+    /// Der Schreiber im Worker-Prozess (EA-10): Er hängt nichts an und
+    /// übernimmt die Live-Folds so, wie der Witness sie nach jedem Append
+    /// persistiert hat — **ohne** sie aus dem Journal neu abzuleiten. Nur so
+    /// prüft `validate` weiter, dass das Journal genau das Gefaltete enthält.
+    /// Fehlt der Stand einer Session, bleibt sie ohne Fold und wird vertagt.
+    fn for_worker(home: &Path, config: Config) -> Fallible<Self> {
+        let mut writer = Self::new(home, config, false)?;
+        for key in writer.journal.sessions()?.keys {
+            match fs::read(folder_path(home, &key)) {
+                Ok(bytes) => {
+                    let state: FolderState = serde_json::from_slice(&bytes)?;
+                    writer.folders.insert(key, ChainFolder::from_state(state));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(writer)
     }
 
@@ -671,11 +1480,15 @@ impl Writer {
     ///   und der Witness trailerte, was immer gerade an HEAD steht.
     /// - Gibt es seit dem letzten vollständigen Lauf nichts Neues, lautet die
     ///   Antwort sofort „nothing to seal".
-    /// - Sonst höchstens ein Lauf je [`MIN_CHECKPOINT_INTERVAL`], gemessen
-    ///   vom **Ende** des letzten Laufs — gezählt wird jeder Lauf, auch ein
-    ///   gescheiterter: Sonst ließe sich die Grenze mit absichtlich
-    ///   scheiternden oder langsamen Läufen umgehen, und die Eventloop käme
-    ///   zwischen zwei Läufen nie zu den Hooks.
+    /// - Sonst höchstens ein Lauf je [`MIN_CHECKPOINT_INTERVAL`] **je Client**
+    ///   (Commit, siehe [`limits`]), gemessen vom **Ende** des letzten Laufs
+    ///   für ihn — gezählt wird jeder Lauf, auch ein gescheiterter: Sonst
+    ///   ließe sich die Grenze mit absichtlich scheiternden oder langsamen
+    ///   Läufen umgehen. Die Anfrage des Menschen für seinen frischen Commit
+    ///   hält eine Flut des Agenten nicht auf (EA-10).
+    /// - Der Lauf selbst geschieht im Witness als eigener Prozess
+    ///   ([`worker`]): mit Frist und Ressourcengrenzen, gegen das
+    ///   festgehaltene Git-Verzeichnis (EA-10).
     ///
     /// `requester_alive` sagt, ob die anfragende Agent-Seite noch wartet. Ist
     /// sie gegangen (Frist abgelaufen), wird nach dem Versiegeln **nicht**
@@ -711,12 +1524,34 @@ impl Writer {
         if !self.dirty && !self.fs_dirty {
             return Ok(checkpoint_status(&[], 0, Ok(None)));
         }
-        if self
-            .last_run
-            .is_some_and(|at| at.elapsed() < MIN_CHECKPOINT_INTERVAL)
-        {
+        if self.limits.blocked(commit, MIN_CHECKPOINT_INTERVAL) {
             return Err("rate limited");
         }
+        let result = match self.worker.clone() {
+            Some(exe) => self.checkpoint_in_worker(&exe, commit, requester_alive),
+            None => self.checkpoint_in_process(commit, requester_alive),
+        };
+        match result {
+            Ok(ran) => {
+                self.limits.record(commit, ran.retrofitted.as_deref());
+                self.note_failure(None);
+                Ok(ran.status)
+            }
+            Err(err) => {
+                self.limits.record_failure(commit);
+                self.note_failure(Some(format!("checkpoint failed: {err}")));
+                Err("checkpoint failed")
+            }
+        }
+    }
+
+    /// Der Lauf im eigenen Prozess — im Test, und überall dort, wo kein
+    /// Worker-Binary feststeht.
+    fn checkpoint_in_process(
+        &mut self,
+        commit: &str,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Fallible<Ran> {
         // Ein Panic in gix über feindlichen Objekt- oder Pack-Daten darf den
         // einzigen Schreiber nicht beenden. Danach sind die Live-Folds
         // fraglich: verwerfen — `append` lädt sie über `recover` samt
@@ -724,24 +1559,77 @@ impl Writer {
         let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.checkpoint_now_for(Some(commit), requester_alive)
         }));
-        self.last_run = Some(std::time::Instant::now());
-        let result = match run {
+        match run {
             Ok(result) => result,
             Err(_) => {
                 self.folders.clear();
                 self.dirty = true;
                 Err("checkpoint panicked".into())
             }
-        };
-        match result {
-            Ok(status) => {
-                self.note_failure(None);
-                Ok(status)
+        }
+    }
+
+    /// Der Lauf im Worker-Prozess (EA-10). Der Witness wartet währenddessen
+    /// und hängt nichts an; seine Live-Folds bleiben unberührt, auch wenn das
+    /// Kind stirbt — was es schon versiegelt und verworfen hat, fällt mit
+    /// [`Self::finish_checkpoint`] heraus.
+    fn checkpoint_in_worker(
+        &mut self,
+        exe: &Path,
+        commit: &str,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Fallible<Ran> {
+        self.begin_checkpoint()?;
+        let result = worker::run(
+            exe,
+            &self.home,
+            commit,
+            self.stream.as_ref(),
+            requester_alive,
+        );
+        self.finish_checkpoint(result.is_ok());
+        result.map_err(|failure| match failure {
+            worker::Failure::Failed(reason) => reason.into(),
+            worker::Failure::Aborted(reason) => {
+                self.report_stale_locks();
+                reason.into()
             }
-            Err(err) => {
-                self.note_failure(Some(format!("checkpoint failed: {err}")));
-                Err("checkpoint failed")
-            }
+        })
+    }
+
+    /// Nach einem abgebrochenen Lauf: Lock-Dateien, die das Kind trotz
+    /// `SIGTERM`-Aufräumen hinterlassen haben könnte, beim Namen nennen — ein
+    /// liegengebliebenes `HEAD.lock` blockiert sonst das nächste
+    /// `git commit` des Menschen, ohne dass jemand weiß, woher es kommt.
+    /// Entfernt wird nichts: Ob das Lock noch einem anderen Git-Prozess
+    /// gehört, weiß der Witness nicht.
+    fn report_stale_locks(&self) {
+        let mut roots = vec![self.config.git_dir()];
+        if let PinnedStore::ChildRepo { child_path, .. } = self.config.store() {
+            roots.push(child_path.join(".git"));
+            roots.push(child_path);
+        }
+        // Höchstens [`MAX_REPORTED_LOCKS`] Zeilen: Wie viele Lock-Dateien
+        // dort liegen, bestimmt der Agent — jede eine eigene Zeile drängte
+        // sonst jede andere Diagnose aus dem rotierenden Log.
+        let locks: Vec<PathBuf> = roots.iter().flat_map(|root| stale_locks(root)).collect();
+        for lock in locks.iter().take(MAX_REPORTED_LOCKS) {
+            log(
+                &self.home,
+                &format!(
+                    "checkpoint aborted; lock file left behind: {}",
+                    lock.display()
+                ),
+            );
+        }
+        if locks.len() > MAX_REPORTED_LOCKS {
+            log(
+                &self.home,
+                &format!(
+                    "checkpoint aborted; and {} more lock file(s)",
+                    locks.len() - MAX_REPORTED_LOCKS
+                ),
+            );
         }
     }
 
@@ -786,6 +1674,7 @@ impl Writer {
     #[cfg(test)]
     fn checkpoint_now(&mut self, commit: Option<&str>) -> Fallible<String> {
         self.checkpoint_now_for(commit, &|| true)
+            .map(|ran| ran.status)
     }
 
     /// [`Self::checkpoint_now`] für eine Anfrage, deren Anfragender gehen kann.
@@ -793,7 +1682,16 @@ impl Writer {
         &mut self,
         commit: Option<&str>,
         requester_alive: &dyn Fn() -> bool,
-    ) -> Fallible<String> {
+    ) -> Fallible<Ran> {
+        self.begin_checkpoint()?;
+        let result = self.checkpoint_sessions(commit, requester_alive);
+        self.finish_checkpoint(result.is_ok());
+        result
+    }
+
+    /// Was vor jedem Lauf im Witness selbst geschieht: Beobachtungen
+    /// übernehmen und die Grenze der Beobachtungs-Epoche setzen.
+    fn begin_checkpoint(&mut self) -> Fallible<()> {
         // Was bis zum Commit geschrieben wurde, soll in diese Epoche — nicht
         // erst nach der Entprellung in die nächste.
         self.settle_once()?;
@@ -823,17 +1721,46 @@ impl Writer {
                 },
             )?;
         }
-        let result = self.checkpoint_sessions(commit, requester_alive);
+        Ok(())
+    }
+
+    /// Was nach jedem Lauf im Witness selbst geschieht — gleich, ob er im
+    /// eigenen Prozess oder im Worker lief, und gleich mit welchem Ausgang.
+    fn finish_checkpoint(&mut self, completed: bool) {
         // Auch ein Fehler mitten im Lauf kann Sessions bereits verworfen haben.
         // Ihr alter Fold darf nie die nächste Epoche fortsetzen; `append` lädt
         // ihn über `recover` samt `.sealed`-Prüfung neu. Alle übrigen Folds
         // bleiben der Live-Stand: Neu aus dem Journal gelesen würde ein
         // vertagter Integritätsfehler still übernommen.
-        match self.journal.sessions() {
-            Ok(open) => self.folders.retain(|key, _| open.keys.contains(key)),
+        let open = self.journal.sessions().map(|open| open.keys);
+        match &open {
+            Ok(open) => self.folders.retain(|key, _| open.contains(key)),
             Err(_) => self.folders.clear(),
         }
-        result
+        // Ist die Beobachtungs-Epoche geschlossen, beginnt die nächste ohne
+        // Gedächtnis: Schreibt jemand danach denselben Inhalt erneut, ist das
+        // in ihr eine eigene Beobachtung. Auch eine verbliebene Lücke will
+        // versiegelt werden.
+        self.fs_dirty = match &self.stream {
+            Some(stream) => self.journal.read(stream).map_or(true, |read| {
+                read.events.iter().any(|e| e.raw_kind.starts_with("fs."))
+            }),
+            None => false,
+        };
+        if !self.fs_dirty {
+            if let Some(observer) = self.observer.as_mut() {
+                observer.forget_states();
+            }
+        }
+        // Was nach einem vollständigen Lauf noch offen ist, wurde vertagt
+        // (Store, Redaction, Integrität — der Grund steht im eigenen Log).
+        // Lässt sich das nicht zählen, oder scheiterte der Lauf, bleibt
+        // `dirty` gesetzt: Lieber ein Lauf zu viel als offene Sessions, die
+        // keiner mehr anfasst.
+        self.dirty = match (completed, &open) {
+            (true, Ok(open)) => open.iter().any(|key| self.includes(key)),
+            _ => true,
+        };
     }
 
     /// Hebt die Uhr auf jeden Seal im Ledger an: Es überdauert das Verwerfen
@@ -868,24 +1795,38 @@ impl Writer {
     }
 
     fn checkpoint_sessions(
-        &mut self,
+        &self,
         commit: Option<&str>,
         requester_alive: &dyn Fn() -> bool,
-    ) -> Fallible<String> {
+    ) -> Fallible<Ran> {
         let root = &self.config.repo_root;
+        // Ohne Pins wüsste der Witness Policy und Store nur aus Dateien, die
+        // der Agent schreiben kann — oder aus Standards, die die Extras des
+        // Teams (`deny_secrets`, `secret_keys`) still fallen ließen.
+        // Fail-closed: erst nach einem erneuten `minds witness init`.
+        if !self.config.pinned() {
+            return Err(UNPINNED.into());
+        }
         // Der Worktree gehört dem Agenten; seit EA-06d kann er diesen Lauf
         // jederzeit auslösen. Was er dort ändern kann, darf den Witness nicht
         // umlenken (00-conventions: „Nothing in `.git/config` may influence
         // trust decisions") — geprüft, bevor gix oder git etwas daraus lesen.
         plain_repo_layout(root)?;
-        let repo = minds_git::Repo::discover(root)?;
+        // Das Git-Verzeichnis aus `witness.json`, einmal geöffnet, ohne
+        // Includes: Ein `include.path` auf ein FIFO oder eine fremde Datei
+        // erreicht den Witness nicht (EA-10).
+        let git_dir = self.config.git_dir();
+        let dot_git = root.join(".git").canonicalize()?;
+        if dot_git != git_dir {
+            return Err("witness git directory moved; checkpoint deferred".into());
+        }
+        let repo = minds_git::Repo::open_pinned(&git_dir)?;
         // Ein Ref-Namespace aus der Konfiguration des Agenten verschöbe alle
         // Schreibzugriffe unter `refs/namespaces/<ns>/…` — heraus aus
         // `refs/minds/`.
         if repo.has_ref_namespace() {
             return Err("refs namespaces are not supported; checkpoint deferred".into());
         }
-        let dot_git = root.join(".git").canonicalize()?;
         if repo.git_dir().canonicalize()? != dot_git || repo.common_dir().canonicalize()? != dot_git
         {
             return Err(
@@ -904,40 +1845,48 @@ impl Writer {
                 );
             }
         }
-        // Der Store schreibt nur im eigenen Repo und nur unter `refs/minds/`.
-        // TODO(EA-10): Backend und Ref in `witness.json` festhalten; bis dahin
-        // nimmt der Witness nur das In-Repo-Backend — ein `minds.childPath`
-        // aus `.git/config` lenkte seine Schreibzugriffe sonst an einen
-        // beliebigen Ort auf dem Host.
-        let store_config = crate::config::load(root);
-        if !matches!(store_config.backend(), minds_store::Backend::InRepo) {
-            return Err(
-                "witness supports only the in-repo store backend; checkpoint deferred".into(),
-            );
-        }
-        if !store_config
-            .reference()
-            .starts_with(minds_git::MINDS_REF_NAMESPACE)
-        {
-            return Err("context ref outside refs/minds/; checkpoint deferred".into());
-        }
-        let store = store_config.open(root)?;
-        // Die Policy darf verschärfen, nie abschwächen — und ihre Datei ist
-        // fremd: gewöhnliche Datei, begrenzt, ohne zu blockieren gelesen.
-        let policy = crate::config::load_redaction_untrusted(root)?.floored_at_default();
-        let pipeline = policy.pipeline()?;
-        // Der Beobachter prüft Inhalte ab jetzt mit derselben, frischen
-        // Policy — verschärft das Repo sie, hasht er nichts mehr, was sie
-        // ersetzen würde. Aus **derselben** Lesung gebaut: Die Datei gehört
-        // dem Agenten, und ein zweites Lesen könnte etwas anderes ergeben.
-        // Der Beobachter wird dabei nie herausgenommen, bevor die neue
-        // Pipeline feststeht — er kann nicht verloren gehen.
-        if let Ok(fresh) = policy.pipeline() {
-            if let Some(observer) = self.observer.take() {
-                self.observer = Some(observer.with_pipeline(fresh));
+        // Store und Policy aus `witness.json` (EA-10): Backend, Ref und
+        // Child-Pfad legt fest, wer den Witness eingerichtet hat — nicht die
+        // `.git/config` des Agenten. `load` hat den Ref unter `refs/minds/`
+        // und den Child-Pfad außerhalb des Repos schon geprüft.
+        //
+        // Der Store schreibt über **dasselbe** geöffnete Repo, das oben
+        // geprüft wurde — ein zweites Öffnen läse eine inzwischen geänderte
+        // Konfiguration (etwa einen Ref-Namespace). Ein Child-Repo wird
+        // ebenso ohne Includes geöffnet und auf denselben Namespace geprüft.
+        let store: Box<dyn minds_store::ContextStore> = match self.config.store() {
+            PinnedStore::InRepo { context_ref } => {
+                Box::new(minds_store::InRepoStore::from_repo(repo.clone()).with_ref(context_ref))
             }
-        }
-        let tracked = crate::checkpoint::tracked_files(root);
+            PinnedStore::ChildRepo {
+                context_ref,
+                child_path,
+            } => {
+                // Dieselbe Layout-Prüfung wie für das beobachtete Repo: Ein
+                // Symlink, `commondir` oder `alternates` im Child lenkte die
+                // Schreibzugriffe des Workers sonst an einen anderen Ort.
+                let child_git = if fs::symlink_metadata(child_path.join(".git"))
+                    .is_ok_and(|meta| meta.is_dir())
+                {
+                    child_path.join(".git")
+                } else {
+                    child_path.clone()
+                };
+                plain_git_dir_within(&child_git, MAX_GIT_ENTRIES)?;
+                let child = minds_git::Repo::open_pinned(&child_git)?;
+                if child.has_ref_namespace() {
+                    return Err(
+                        "refs namespaces are not supported in the child repository; checkpoint deferred"
+                            .into(),
+                    );
+                }
+                Box::new(minds_store::ChildRepoStore::from_repo(child).with_ref(context_ref))
+            }
+        };
+        // Die Witness-eigene Policy; `.minds/redact.json` im Worktree liest
+        // der Witness nicht mehr.
+        let pipeline = self.config.policy().pipeline()?;
+        let tracked = crate::checkpoint::tracked_files_pinned(&repo);
         fingerprint(&self.home)?;
         let key = self.home.join("key/witness_ed25519");
         let env = CheckpointEnv {
@@ -979,25 +1928,11 @@ impl Writer {
                 path: &key,
                 namespace: minds_attest::NS_WITNESS,
             },
-            &*self,
+            self,
             &streams,
         );
-        // Gleich nach dem Versiegeln, vor jedem frühen Ausstieg: Ist die
-        // Epoche geschlossen, beginnt die nächste ohne Gedächtnis.
-        self.fs_dirty = match &self.stream {
-            Some(stream) => self.journal.read(stream).map_or(true, |read| {
-                // Auch eine verbliebene Lücke will versiegelt werden.
-                read.events.iter().any(|e| e.raw_kind.starts_with("fs."))
-            }),
-            None => false,
-        };
-        // Eine neue Epoche beginnt ohne Gedächtnis: Schreibt jemand danach
-        // denselben Inhalt erneut, ist das in ihr eine eigene Beobachtung.
-        if !self.fs_dirty {
-            if let Some(observer) = self.observer.as_mut() {
-                observer.forget_states();
-            }
-        }
+        // Ob die Epoche geschlossen ist, wertet `finish_checkpoint` im
+        // Witness aus — auch nach einem Lauf im Worker.
         if let Some(stream) = &self.stream {
             if !self.journal.read(stream)?.events.is_empty() {
                 return Err("observation epoch not sealed; witnessed sessions deferred".into());
@@ -1044,23 +1979,34 @@ impl Writer {
         }
         // Was nach dem Lauf noch offen ist, wurde vertagt (Store, Redaction,
         // Integrität — der Grund steht im eigenen Log). Die Agent-Seite soll
-        // das nicht als „nichts zu tun" lesen. Lässt sich das nicht zählen,
-        // bleibt `dirty` gesetzt: Lieber ein Lauf zu viel als offene Sessions,
-        // die keiner mehr anfasst.
+        // das nicht als „nichts zu tun" lesen.
         let deferred = match self.journal.sessions() {
-            Ok(open) => {
-                let deferred = open.keys.iter().filter(|key| self.includes(key)).count();
-                self.dirty = deferred > 0;
-                deferred
-            }
+            Ok(open) => open.keys.iter().filter(|key| self.includes(key)).count(),
             Err(err) => {
                 log(&self.home, &format!("open sessions not counted: {err}"));
-                self.dirty = true;
                 0
             }
         };
-        Ok(checkpoint_status(&outcome.sealed, deferred, attached))
+        // Der Commit, an dem die Trailer jetzt stehen, ist für das Rate-Limit
+        // derselbe Client wie der angefragte ([`limits`]).
+        let retrofitted = match &attached {
+            Ok(Some(update)) if update.rewrote_head() => Some(update.commit().to_string()),
+            _ => None,
+        };
+        Ok(Ran {
+            status: checkpoint_status(&outcome.sealed, deferred, attached),
+            retrofitted,
+        })
     }
+}
+
+/// Das Ergebnis eines vollständigen Checkpoint-Laufs.
+struct Ran {
+    /// Die Statuszeile für den `Ack`.
+    status: String,
+    /// Der Commit, an den die Trailer nachgerüstet wurden — falls HEAD dabei
+    /// umgeschrieben wurde.
+    retrofitted: Option<String>,
 }
 
 /// `.git` muss vollständig schlicht sein, bevor gix oder git daraus lesen
@@ -1082,12 +2028,58 @@ impl Writer {
 /// - Kein `commondir` (geteiltes Verzeichnis anderswo) und keine
 ///   `objects/info/alternates` (fremde Objektbank).
 ///
+/// `include.path` erreicht den Witness seit EA-10 nicht mehr: Er öffnet das
+/// festgehaltene Git-Verzeichnis ohne Includes. Und was zwischen Prüfung und
+/// Zugriff zum FIFO wird oder eine gemappte Datei kürzt, trifft nur den
+/// Worker-Prozess mit seiner Frist.
+///
 /// Ehrliche Grenze: Das ist eine Prüfung vor dem Lauf. Wer zwischen Prüfung
-/// und Zugriff tauscht, oder über `include.path` in der Konfiguration auf
-/// eine fremde Datei verweist, wird hiervon nicht erfasst — das schließt erst
-/// ein auf ein festgehaltenes Git-Verzeichnis eingeschränkter Lauf (EA-10).
+/// und Zugriff einen Eintrag gegen einen **Symlink** tauscht, lenkt einen
+/// Schreibzugriff des Workers um — er läuft unter derselben Kennung wie der
+/// Witness. Das schlösse erst ein Zugriff relativ zu einem offenen
+/// Verzeichnis-Deskriptor (`openat` ohne Folgen), den gix nicht anbietet.
 fn plain_repo_layout(root: &Path) -> Fallible<()> {
     plain_repo_layout_within(root, MAX_GIT_ENTRIES)
+}
+
+/// So viele liegengebliebene Lock-Dateien nennt das Log je Abbruch beim Namen.
+const MAX_REPORTED_LOCKS: usize = 8;
+
+/// Die `*.lock`-Dateien eines Git-Verzeichnisses, die ein abgebrochener
+/// Lauf hinterlassen haben kann: an der Wurzel (`HEAD.lock`,
+/// `packed-refs.lock`, `index.lock`) und unter `refs/`. Begrenzt durchsucht,
+/// ohne einem Symlink zu folgen.
+fn stale_locks(git_dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for name in ["HEAD.lock", "packed-refs.lock", "index.lock", "config.lock"] {
+        let path = git_dir.join(name);
+        if fs::symlink_metadata(&path).is_ok() {
+            found.push(path);
+        }
+    }
+    let mut seen = 0usize;
+    let mut stack = vec![(git_dir.join("refs"), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > 10_000 {
+                return found;
+            }
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() && depth < MAX_GIT_DEPTH {
+                stack.push((path, depth + 1));
+            } else if path.extension().is_some_and(|ext| ext == "lock") {
+                found.push(path);
+            }
+        }
+    }
+    found
 }
 
 /// Höchstzahl der Einträge, die [`plain_repo_layout`] in `.git` ansieht —
@@ -1098,7 +2090,13 @@ const MAX_GIT_ENTRIES: usize = 200_000;
 const MAX_GIT_DEPTH: usize = 16;
 
 fn plain_repo_layout_within(root: &Path, max_entries: usize) -> Fallible<()> {
-    let dot_git = root.join(".git");
+    plain_git_dir_within(&root.join(".git"), max_entries)
+}
+
+/// [`plain_repo_layout`] für ein Git-Verzeichnis selbst — auch das eines
+/// baren Child-Repos, in das der Witness-Store schreibt (EA-10).
+fn plain_git_dir_within(dot_git: &Path, max_entries: usize) -> Fallible<()> {
+    let dot_git = dot_git.to_path_buf();
     let refused = |what: &str| -> Fallible<()> {
         Err(format!(
             "witness repository layout is not plain ({}); checkpoint deferred",

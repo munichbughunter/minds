@@ -967,6 +967,68 @@ fn report_agents(root: &Path) -> usize {
     usize::from(!only_summary)
 }
 
+/// Ein Befund für `minds doctor` (EA-10): in Ordnung oder nicht, mit dem Satz
+/// aus dem `fsck`-Bericht — derselbe Wortlaut an beiden Orten.
+pub(crate) struct Verdict {
+    pub(crate) ok: bool,
+    pub(crate) reason: String,
+}
+
+/// Die Agent-Registrierungen als ein Befund; `None`, wenn hier kein Agent
+/// eingerichtet ist (keine seiner Dateien liegt da).
+pub(crate) fn agents_verdict(root: &Path) -> Option<Verdict> {
+    let reports: Vec<_> = crate::enable::Which::ALL
+        .iter()
+        .map(|&which| crate::enable::inspect_agent(root, which))
+        .collect();
+    if !reports.iter().any(|report| report.present) {
+        return None;
+    }
+    let lines = agent_report_lines(&reports);
+    let summary = "Agents: registered for";
+    let problem = lines
+        .iter()
+        .find(|line| line.starts_with("Agents: ") && !line.starts_with(summary));
+    Some(match (problem, lines.first()) {
+        (None, Some(first)) if first.starts_with(summary) => Verdict {
+            ok: true,
+            reason: first.trim_start_matches("Agents: ").to_owned(),
+        },
+        (Some(problem), _) => Verdict {
+            ok: false,
+            reason: format!(
+                "{} — `minds enable`",
+                problem.trim_start_matches("Agents: ")
+            ),
+        },
+        _ => Verdict {
+            ok: false,
+            reason: "no complete registration — `minds enable`".to_owned(),
+        },
+    })
+}
+
+/// Die Git-Hooks als ein Befund.
+pub(crate) fn hooks_verdict(root: &Path, git_dir: &Path) -> Verdict {
+    let state = hook_state(root, git_dir);
+    let ok = matches!(
+        &state,
+        HookState::Checked { missing, outdated, refused, not_executable, .. }
+            if missing.is_empty()
+                && outdated.is_empty()
+                && refused.is_empty()
+                && not_executable.is_empty()
+    );
+    let first = hook_report_lines(root, &state)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    Verdict {
+        ok,
+        reason: first.trim_start_matches("Hooks: ").to_owned(),
+    }
+}
+
 /// Der Log-Abschnitt des Berichts, Zeile für Zeile — leer, wenn es kein Log
 /// gibt, und das ist der Normalfall.
 ///
