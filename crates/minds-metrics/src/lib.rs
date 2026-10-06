@@ -365,6 +365,7 @@ mod tests {
             started_at: Some("2026-07-25T09:00:00Z".into()),
             ended_at: Some("2026-07-25T09:10:00Z".into()),
             cwd: None,
+            closed: false,
         });
         let mut long = session("x");
         long.lineage = Some(Lineage {
@@ -372,6 +373,7 @@ mod tests {
             started_at: Some("2026-07-25T09:00:00Z".into()),
             ended_at: Some("2026-07-25T11:00:00Z".into()),
             cwd: None,
+            closed: false,
         });
         assert_eq!(
             Metrics::from_sessions(&[short, long]).continuity_seconds,
@@ -389,6 +391,7 @@ mod tests {
                 started_at: Some(format!("2026-07-{d}T09:00:00Z")),
                 ended_at: None,
                 cwd: None,
+                closed: false,
             });
             s
         };

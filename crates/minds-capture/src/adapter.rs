@@ -110,8 +110,8 @@ impl std::fmt::Debug for Checkpoint<'_> {
 pub fn build(journal: &Journal) -> crate::Result<Vec<Session>> {
     let mut out = Vec::new();
     for key in journal.sessions()?.keys {
-        let events = journal.read(&key)?.events;
-        if events.is_empty() {
+        let read = journal.read(&key)?;
+        if read.events.is_empty() {
             continue;
         }
         // Default-Kontext: keine Repo-Wurzel, kein Commit. Damit unterbleiben
@@ -119,7 +119,9 @@ pub fn build(journal: &Journal) -> crate::Result<Vec<Session>> {
         // event-abgeleiteten Sub-Agent-Kanten kommen mit, weil sie nichts
         // Externes brauchen. `minds capture` (M6) ruft `checkpoint` mit vollem
         // Kontext, wenn Wurzel und Commit feststehen.
-        out.push(checkpoint(&key, &events, &Checkpoint::default()));
+        let mut session = checkpoint(&key, &read.events, &Checkpoint::default());
+        settle_closed(&mut session, read.is_complete());
+        out.push(session);
     }
     Ok(out)
 }
@@ -874,13 +876,35 @@ fn basename(path: &str) -> &str {
 }
 
 /// Die Herkunft: Kennung, Zeitfenster aus dem ersten und letzten Event, `cwd`
-/// aus dem ersten Event, das eines nennt.
+/// aus dem ersten Event, das eines nennt, und ob der Bereich mit dem
+/// `SessionEnd` des Harness schließt — nur wenn es das **letzte** Event ist:
+/// Ging die Session danach weiter (`--resume`), ist sie hier nicht zu Ende.
+/// Maßgeblich ist der von der Kette gebundene `raw_kind` (der Event-Hash
+/// deckt ihn, das gespeicherte `kind` nicht); `kind` muss dazu passen.
+///
+/// Ob der Bereich **vollständig** gelesen wurde, weiß dieser Pfad nicht —
+/// wer nur Events übergibt, muss [`settle_closed`] mit dem Lesestand
+/// aufrufen.
 fn lineage(key: &SessionKey, events: &[JournalEvent]) -> Lineage {
     Lineage {
         local_id: key.local_id().to_string(),
         started_at: events.first().map(|e| e.at.clone()),
         ended_at: events.last().map(|e| e.at.clone()),
         cwd: events.iter().find_map(|e| e.cwd.clone()),
+        closed: events
+            .last()
+            .is_some_and(|e| e.raw_kind == "SessionEnd" && e.kind == crate::EventKind::SessionEnd),
+    }
+}
+
+/// Zieht das Ende der Session (`lineage.closed`) zurück, wenn der Bereich
+/// nicht vollständig gelesen wurde ([`crate::ReadOutcome::is_complete`]):
+/// Ein abgestürzter Schreibvorgang oder eine Lücke kann hinter dem
+/// `SessionEnd` liegen — dann ist nicht belegt, dass es das letzte Event war.
+/// Jeder Pfad, der aus einem Journal-Lesestand eine Session baut, ruft das.
+pub fn settle_closed(session: &mut Session, read_complete: bool) {
+    if !read_complete && let Some(lineage) = session.lineage.as_mut() {
+        lineage.closed = false;
     }
 }
 
@@ -1033,6 +1057,53 @@ mod tests {
         assert_eq!(lin.started_at.as_deref(), Some("t0"));
         assert_eq!(lin.ended_at.as_deref(), Some("t4"));
         assert_eq!(lin.cwd.as_deref(), Some("/home/anna/projects/minds"));
+        // Kein `SessionEnd`: Die Session läuft über diesen Bereich hinaus.
+        assert!(!lin.closed);
+    }
+
+    /// `closed` heißt: Das letzte Event des Bereichs ist das `SessionEnd`
+    /// des Harness. Folgt danach noch etwas (`--resume`), ist die Session
+    /// hier nicht zu Ende.
+    #[test]
+    fn a_range_is_closed_only_when_session_end_is_its_last_event() {
+        let prompt = || {
+            ev(
+                0,
+                EventKind::Prompt,
+                "UserPromptSubmit",
+                "t0",
+                r#"{"prompt":"x"}"#,
+            )
+        };
+        let end = |seq| ev(seq, EventKind::SessionEnd, "SessionEnd", "t1", r#"{}"#);
+        let closed = |events: &[JournalEvent]| build_one(&key(), events).lineage.unwrap().closed;
+
+        assert!(closed(&[prompt(), end(1)]));
+        assert!(!closed(&[prompt()]));
+        assert!(!closed(&[
+            prompt(),
+            end(1),
+            ev(2, EventKind::SessionStart, "SessionStart", "t2", r#"{}"#),
+        ]));
+        // Auch ein unbekanntes Event danach hält den Bereich offen.
+        assert!(!closed(&[
+            prompt(),
+            end(1),
+            ev(2, EventKind::Other, "Notification", "t2", r#"{}"#),
+        ]));
+        // Maßgeblich ist der kettengebundene `raw_kind`: Ein umgeschriebenes
+        // `kind` allein schließt nichts.
+        assert!(!closed(&[
+            prompt(),
+            ev(1, EventKind::SessionEnd, "Notification", "t1", r#"{}"#),
+        ]));
+
+        // Ohne vollständigen Lesestand kein Ende.
+        let mut session = build_one(&key(), &[prompt(), end(1)]);
+        settle_closed(&mut session, true);
+        assert!(session.lineage.as_ref().unwrap().closed);
+        settle_closed(&mut session, false);
+        assert!(!session.lineage.unwrap().closed);
     }
 
     #[test]

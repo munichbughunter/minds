@@ -33,34 +33,9 @@ pub(crate) use socket::ping;
 pub use socket::run;
 pub(crate) use worker::worker;
 
-/// Das Isolationsprofil (00-conventions, ADR-0012): wie Agent und Witness
-/// voneinander getrennt sind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum WitnessProfile {
-    Container,
-    User,
-    Managed,
-}
-
-impl WitnessProfile {
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Container => "container",
-            Self::User => "user",
-            Self::Managed => "managed",
-        }
-    }
-
-    pub(crate) fn parse(name: &str) -> Fallible<Self> {
-        match name {
-            "container" => Ok(Self::Container),
-            "user" => Ok(Self::User),
-            "managed" => Ok(Self::Managed),
-            _ => Err("profile must be container, user or managed".into()),
-        }
-    }
-}
+/// Das Isolationsprofil (00-conventions, ADR-0012) — ein Typ für Witness-
+/// Konfiguration und Reader.
+pub(crate) use minds_core::evidence::WitnessProfile;
 
 /// Der festgehaltene Store des Witness (EA-10).
 ///
@@ -315,7 +290,9 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
         Vec::new()
     };
     let profile = match request.profile {
-        Some(name) => WitnessProfile::parse(name)?,
+        Some(name) => {
+            WitnessProfile::parse(name).ok_or("profile must be container, user or managed")?
+        }
         None if path_map.is_empty() => WitnessProfile::User,
         None => WitnessProfile::Container,
     };

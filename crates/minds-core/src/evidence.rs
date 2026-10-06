@@ -465,6 +465,43 @@ pub const SCOPE_WITNESS_V1: &str = "witness/v1";
 /// der eigene Stream des Witness mit `fs.observed`-Events.
 pub const SCOPE_WITNESS_FS_V1: &str = "witness-fs/v1";
 
+/// Das Isolationsprofil des Witness (ADR-0012, Entscheidung 2): wie Agent
+/// und Witness voneinander getrennt sind. Steht in `witness.json` und im
+/// Payload von `witness.start` — Konfiguration des Witness, keine Aussage
+/// über eine einzelne Session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WitnessProfile {
+    /// Der Agent läuft in einem Container, der Witness auf dem Host.
+    Container,
+    /// Der Witness läuft unter einer eigenen Benutzerkennung.
+    User,
+    /// Verwaltete Einstellungen des Harness trennen Agent und Witness.
+    Managed,
+}
+
+impl WitnessProfile {
+    /// Der Name in Konfiguration und Ausgabe (`container`, `user`,
+    /// `managed`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Container => "container",
+            Self::User => "user",
+            Self::Managed => "managed",
+        }
+    }
+
+    /// Liest einen Namen strikt zurück — `None` für alles andere.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "container" => Some(Self::Container),
+            "user" => Some(Self::User),
+            "managed" => Some(Self::Managed),
+            _ => None,
+        }
+    }
+}
+
 /// Was der Checkpoint mit der Session gemacht hat.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SealOutcome {
@@ -1337,5 +1374,27 @@ mod tests {
         };
         assert_ne!(gap_hash(&bare), gap_hash(&with_seq));
         assert_ne!(gap_hash(&with_seq), gap_hash(&with_bytes));
+    }
+
+    /// Name, Parser und JSON-Form (`witness.json`) sind dieselben drei
+    /// Wörter — ein Profil, eine Schreibweise.
+    #[test]
+    fn witness_profile_names_round_trip() {
+        for (profile, name) in [
+            (WitnessProfile::Container, "container"),
+            (WitnessProfile::User, "user"),
+            (WitnessProfile::Managed, "managed"),
+        ] {
+            assert_eq!(profile.name(), name);
+            assert_eq!(WitnessProfile::parse(name), Some(profile));
+            let json = serde_json::to_string(&profile).unwrap();
+            assert_eq!(json, format!("\"{name}\""));
+            assert_eq!(
+                serde_json::from_str::<WitnessProfile>(&json).unwrap(),
+                profile
+            );
+        }
+        assert_eq!(WitnessProfile::parse("Container"), None);
+        assert_eq!(WitnessProfile::parse(""), None);
     }
 }

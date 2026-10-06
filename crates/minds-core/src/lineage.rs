@@ -100,6 +100,26 @@ pub struct Lineage {
     /// Feldlauf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+
+    /// Der Bereich endet mit dem Ende der Session: Sein letztes Event ist
+    /// das `SessionEnd` des Harness. Eine Beobachtung, keine Ableitung —
+    /// und über die Session-Id im Seal mitsigniert: Steht das Feld in einer
+    /// Session, die ein Witness versiegelt hat, hat der Witness das
+    /// `SessionEnd` empfangen. Ein später gelöschter Bereich fällt damit auf
+    /// — nicht aber nach einem vom Agenten vorgetäuschten Ende oder nach
+    /// `--resume` (EA-11, `minds_reader::assurance`, „Bekannte Grenzen").
+    /// Nur ein lückenloser, unbeschädigter Bereich setzt es (Checkpoint).
+    ///
+    /// Additiv: `false` wird nicht geschrieben — alte Sessions behalten
+    /// Bytes und Id, alte Binaries lesen neue tolerant (kein
+    /// `deny_unknown_fields`). Wie bei jedem additiven Feld: Ein Binary ohne
+    /// Kenntnis des Feldes, das eine Session mit `closed: true` liest und
+    /// ihre Id aus der geparsten Form **neu berechnet** oder sie neu
+    /// schreibt, kommt auf eine andere Id. Gemischte Versionen in einer
+    /// Prüfkette sind deshalb zu vermeiden; die Store-Id (Hash über die
+    /// gespeicherten Bytes) bleibt die maßgebliche.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closed: bool,
 }
 
 impl Lineage {
@@ -111,6 +131,7 @@ impl Lineage {
             started_at: None,
             ended_at: None,
             cwd: None,
+            closed: false,
         }
     }
 }
@@ -928,5 +949,30 @@ mod tests {
         };
         let json = serde_json::to_string(&c).unwrap();
         assert!(json.contains(r#""type":"commit""#));
+    }
+
+    /// `closed` ist additiv: `false` fehlt in den Bytes — jede bestehende
+    /// Session behält ihre kanonische Form und damit ihre Id; `true` steht
+    /// da und liest sich zurück; ein Envelope ohne das Feld liest `false`.
+    #[test]
+    fn closed_is_additive_and_round_trips() {
+        let mut lineage = Lineage::new("31f3f224");
+        lineage.ended_at = Some("2026-07-23T09:31:57Z".into());
+        let open = crate::to_canonical_string(&lineage).unwrap();
+        assert_eq!(
+            open,
+            r#"{"ended_at":"2026-07-23T09:31:57Z","local_id":"31f3f224"}"#
+        );
+
+        lineage.closed = true;
+        let closed = crate::to_canonical_string(&lineage).unwrap();
+        assert_eq!(
+            closed,
+            r#"{"closed":true,"ended_at":"2026-07-23T09:31:57Z","local_id":"31f3f224"}"#
+        );
+        assert_eq!(serde_json::from_str::<Lineage>(&closed).unwrap(), lineage);
+
+        let old: Lineage = serde_json::from_str(&open).unwrap();
+        assert!(!old.closed);
     }
 }

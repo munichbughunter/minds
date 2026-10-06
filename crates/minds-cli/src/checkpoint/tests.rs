@@ -223,6 +223,60 @@ fn checkpoint_core_is_byte_identical_to_command_path() {
     }
 }
 
+/// `lineage.closed` (EA-11): Ein lückenloser Bereich, dessen letztes Event
+/// das `SessionEnd` ist, wird als beendet gespeichert. Liegt daneben ein
+/// abgestürzter Schreibvorgang, ist nicht belegt, dass das `SessionEnd` das
+/// letzte Event war — dann nicht.
+#[test]
+fn a_session_is_stored_closed_only_from_a_complete_range() {
+    let pipeline = RedactionConfig::default().pipeline().unwrap();
+    let closed_after = |damage: bool| {
+        let fixture = Fixture::new(true);
+        for (second, kind, raw_kind, payload) in [
+            (
+                0,
+                EventKind::Prompt,
+                "UserPromptSubmit",
+                r#"{"prompt":"x"}"#,
+            ),
+            (1, EventKind::SessionEnd, "SessionEnd", "{}"),
+        ] {
+            fixture
+                .journal
+                .append(
+                    &key(),
+                    NewEvent {
+                        at: format!("2026-01-01T00:00:0{second}Z"),
+                        at_nanos: 1_767_225_600_000_000_000 + second * 1_000_000_000,
+                        kind,
+                        raw_kind: raw_kind.into(),
+                        cwd: None,
+                        transcript_path: None,
+                        payload: serde_json::value::RawValue::from_string(payload.into()).unwrap(),
+                    },
+                )
+                .unwrap();
+        }
+        if damage {
+            // Genau das hinterlässt ein Absturz zwischen `create_new` und
+            // `rename`: eine leere Reservierung hinter dem `SessionEnd`.
+            let agent = fixture.dir.path().join("capture/inbox").join(key().agent());
+            let sessions: Vec<_> = fs::read_dir(&agent)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(sessions.len(), 1);
+            fs::File::create_new(sessions[0].join("0000000002.json")).unwrap();
+        }
+        let outcome = fixture.run(&pipeline, SCOPE_AGENT_HOOKS_V1, SealSigner::None);
+        assert_eq!(outcome.stored.len(), 1);
+        let session = fixture.store.get(outcome.stored[0]).unwrap().unwrap();
+        session.lineage.unwrap().closed
+    };
+    assert!(closed_after(false));
+    assert!(!closed_after(true));
+}
+
 #[test]
 fn core_reports_rejected_seals_and_reuses_them_without_discard() {
     let fixture = Fixture::new(true);

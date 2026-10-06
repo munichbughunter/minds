@@ -838,6 +838,7 @@ impl RedactionPipeline {
             started_at,
             ended_at,
             cwd,
+            closed,
         }) = lineage
         else {
             return Ok(None);
@@ -854,11 +855,14 @@ impl RedactionPipeline {
         let cwd = cwd
             .map(|cwd| self.redact_field(Field::LineageCwd, cwd, audit))
             .transpose()?;
+        // `closed` ist ein Bool ohne Text — nichts zu scannen, aber es muss
+        // durch: sonst verlöre die redigierte Session das bezeugte Ende.
         Ok(Some(Lineage {
             local_id,
             started_at,
             ended_at,
             cwd,
+            closed,
         }))
     }
 
@@ -1099,6 +1103,7 @@ mod tests {
             started_at: Some(TERM.into()),
             ended_at: Some(TERM.into()),
             cwd: Some(TERM.into()),
+            closed: false,
         });
         s.edges = vec![
             Edge {
@@ -1205,6 +1210,8 @@ mod tests {
             started_at: Some("2026-07-23T09:12:04.512Z".into()),
             ended_at: Some("2026-07-23T11:12:04+02:00".into()),
             cwd: Some("/srv/projekt".into()),
+            // Das bezeugte Ende (EA-11) darf die Pipeline nicht verlieren.
+            closed: true,
         });
         s.edges = vec![
             Edge {
@@ -1239,6 +1246,7 @@ mod tests {
             lineage.started_at.as_deref(),
             Some("2026-07-23T09:12:04.512Z")
         );
+        assert!(lineage.closed, "das bezeugte Ende ging verloren");
         assert_eq!(r.turns[0].at.as_deref(), Some("2026-07-23T09:12:04.512Z"));
     }
 
@@ -1368,6 +1376,8 @@ mod tests {
             started_at: Some("2026-07-23T09:12:04.512Z".into()),
             ended_at: None,
             cwd: Some("/home/anna@example.com/projekt".into()),
+            // Auch wenn daneben redigiert wird: das Ende bleibt (EA-11).
+            closed: true,
         });
 
         let out = pipeline().redact_session(s).unwrap();
@@ -1392,6 +1402,8 @@ mod tests {
             lineage.started_at.as_deref(),
             Some("2026-07-23T09:12:04.512Z")
         );
+        // MUST_SURVIVE: Das bezeugte Ende übersteht die Redaction daneben.
+        assert!(lineage.closed);
     }
 
     #[test]
@@ -1525,6 +1537,7 @@ mod tests {
             started_at: None,
             ended_at: None,
             cwd: Some("/home/dev/projekt/minds".into()),
+            closed: false,
         });
 
         let out = pipeline().redact_session(s).unwrap();
