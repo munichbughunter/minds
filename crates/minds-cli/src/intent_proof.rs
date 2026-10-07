@@ -15,12 +15,15 @@
 //!    (`check_intent_anchor`, dieselbe Prüfung wie beim Bauen);
 //! 5. bei `file:` ist die Blob-Id genau der Git-Hash dieser Snapshot-Bytes —
 //!    sie hasht also nichts anderes als den bereinigten Text.
+//!
+//! Punkt 4 schließt seit EA-15 die Secretfile-Mauer ein: Ein `file:`-Anker
+//! über `.env`, `.pgpass`, … ist nie belegt — auch von Hand gepflanzt nicht.
 
 use minds_core::ContentHash;
 use minds_core::intent_anchor::{IntentSource, content_hash};
 use minds_git::Repo;
 use minds_redact::RedactionPipeline;
-use minds_store::ContextStore;
+use minds_store::{ContextStore, StoredIntent};
 
 /// Prüft den Beleg für `id`. Der Fehler ist ein fester Grund — nie ein
 /// Wert aus dem Store.
@@ -35,6 +38,18 @@ pub(crate) fn proven(
         Ok(None) => return Err("intent anchor is not in the store"),
         Err(_) => return Err("intent anchor in the store is unreadable or altered"),
     };
+    proven_stored(&stored, repo, pipeline)
+}
+
+/// Wie [`proven`], über einen schon gelesenen Anker — für Aufrufer, die
+/// genau diesen Stand auch anzeigen oder signieren: Ein zweites Lesen
+/// könnte (der Ref ist beschreibbar) einen anderen Snapshot liefern als den
+/// geprüften.
+pub(crate) fn proven_stored(
+    stored: &StoredIntent,
+    repo: &Repo,
+    pipeline: &RedactionPipeline,
+) -> Result<(), &'static str> {
     if content_hash(&stored.snapshot) != stored.anchor.content {
         return Err("intent snapshot does not match its anchor");
     }

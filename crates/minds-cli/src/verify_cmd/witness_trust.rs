@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use minds_core::ContentHash;
-use minds_reader::assurance::SealSignature;
+use minds_reader::assurance::{IntentSignature, SealSignature, SignerKind};
 use minds_store::ContextStore;
 
 /// Höchstgröße der Signer-Datei, die gelesen wird.
@@ -54,6 +54,9 @@ pub(crate) struct WitnessTrust<'a> {
     content: Option<String>,
     keygen: bool,
     verdicts: RefCell<HashMap<ContentHash, SealSignature>>,
+    /// Intent-Urteile je (Ankertext, Signatur) — eine Prüfung startet
+    /// mehrere `ssh-keygen`-Prozesse, und viele Sessions teilen einen Anker.
+    intents: RefCell<HashMap<[u8; 32], IntentSignature>>,
 }
 
 impl<'a> WitnessTrust<'a> {
@@ -73,6 +76,7 @@ impl<'a> WitnessTrust<'a> {
             content,
             keygen,
             verdicts: RefCell::new(HashMap::new()),
+            intents: RefCell::new(HashMap::new()),
         }
     }
 
@@ -94,6 +98,85 @@ impl<'a> WitnessTrust<'a> {
             .borrow_mut()
             .insert(seal_id.clone(), verdict.clone());
         verdict
+    }
+
+    /// Der Store, aus dem die Seals gelesen werden.
+    pub(crate) fn store(&self) -> &'a dyn ContextStore {
+        self.store
+    }
+
+    /// Ob `seal_id` ein gültig signierter Witness-Seal ist — gelesen aus dem
+    /// Store, geprüft wie [`signature`](Self::signature). Das Prädikat
+    /// `TrustSeal` für [`minds_reader::intent::epoch_chain`].
+    pub(crate) fn witnessed(&self, seal_id: &ContentHash) -> bool {
+        self.store
+            .seal_text(seal_id)
+            .ok()
+            .flatten()
+            .is_some_and(|text| {
+                matches!(
+                    self.signature(seal_id, &text),
+                    SealSignature::Witness { .. }
+                )
+            })
+    }
+
+    /// Die Signaturlage eines Intent-Ankers unter `minds-intent` (EA-15):
+    /// ohne vertrauenswürdige Signer `NotChecked`; gültig, wenn ein
+    /// Principal, dessen **sämtliche** Zeilen auf genau
+    /// `namespaces="minds-intent"` beschränkt sind ([`intent_only`]), die
+    /// Signatur über genau den Ankertext unter `minds-intent` trägt. Sonst
+    /// `Invalid` — ein Schlüssel nur für `minds` ebenso wie ein
+    /// unbeschränkter: ein Assurance-Fakt, keine Manipulation der Evidence.
+    ///
+    /// `sk key` heißt: Der in der geprüften Signatur stehende Schlüssel ist
+    /// ein FIDO-Schlüssel **und** die Signatur trägt das User-Presence-Flag.
+    /// Eine Hardware-Attestierung ist das nicht — wer die Signer-Datei
+    /// schreiben kann, kann auch einen Software-„sk"-Schlüssel eintragen.
+    pub(crate) fn intent_signature(&self, anchor: &str, signature: &str) -> IntentSignature {
+        let key = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&(anchor.len() as u64).to_le_bytes());
+            hasher.update(anchor.as_bytes());
+            hasher.update(signature.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        if let Some(verdict) = self.intents.borrow().get(&key) {
+            return *verdict;
+        }
+        let verdict = self.check_intent(anchor, signature);
+        self.intents.borrow_mut().insert(key, verdict);
+        verdict
+    }
+
+    fn check_intent(&self, anchor: &str, signature: &str) -> IntentSignature {
+        let (Some(path), Some(content), true) =
+            (self.file.as_deref(), self.content.as_deref(), self.keygen)
+        else {
+            return IntentSignature::NotChecked;
+        };
+        let Ok(principals) = minds_attest::ssh_find_principals(signature, path) else {
+            return IntentSignature::NotChecked;
+        };
+        let valid = principals.iter().any(|principal| {
+            intent_only(content, principal)
+                && minds_attest::ssh_verify_ns(
+                    anchor,
+                    signature,
+                    path,
+                    principal,
+                    minds_attest::NS_INTENT,
+                )
+                .unwrap_or(false)
+        });
+        if !valid {
+            return IntentSignature::Invalid;
+        }
+        // `sk key` nur mit gesetztem User-Presence-Flag: `ssh-keygen -Y
+        // verify` erzwingt es nicht, und ein `no-touch-required`-Schlüssel
+        // signiert ohne Berührung — dann ist er nicht mehr als ein
+        // Software-Schlüssel.
+        IntentSignature::Valid(signer_kind(minds_attest::signature_key(signature).as_ref()))
     }
 
     fn check(&self, seal_id: &ContentHash, text: &str) -> SealSignature {
@@ -132,6 +215,20 @@ impl<'a> WitnessTrust<'a> {
     }
 }
 
+/// Die Schlüsselart einer **gültigen** Intent-Signatur: `sk key` nur für
+/// einen FIDO-Schlüssel mit gesetztem User-Presence-Flag — `ssh-keygen -Y
+/// verify` erzwingt das Flag nicht, und ein `no-touch-required`-Schlüssel
+/// signiert ohne Berührung. Alles andere ist nicht mehr als ein
+/// Software-Schlüssel.
+fn signer_kind(key: Option<&minds_attest::SignatureKey>) -> SignerKind {
+    match key {
+        Some(key) if key.user_presence && minds_attest::is_security_key_type(&key.key_type) => {
+            SignerKind::SecurityKey
+        }
+        _ => SignerKind::SoftwareKey,
+    }
+}
+
 /// `--signers`, sonst `~/.ssh/allowed_signers` — nie aus der Repo-Konfiguration.
 fn trusted_signers_file(signers: Option<&str>) -> Option<PathBuf> {
     if let Some(signers) = signers {
@@ -153,6 +250,21 @@ fn trusted_signers_file(signers: Option<&str>) -> Option<PathBuf> {
 /// `false`. `principal` darf das ganze Principal-Feld sein, wie
 /// `ssh-keygen -Y find-principals` es ausgibt.
 fn witness_only(allowed_signers: &str, principal: &str) -> bool {
+    restricted_to(allowed_signers, principal, minds_attest::NS_WITNESS)
+}
+
+/// Ob `principal` ein Intent-Signer ist — dieselbe Regel wie
+/// [`witness_only`], für `namespaces="minds-intent"` (EA-15). Ein
+/// unbeschränkter Entwickler-Schlüssel (Commit-Signing im ssh-agent, den
+/// ein Agent mitbenutzen kann) gibt so keinen Intent frei.
+fn intent_only(allowed_signers: &str, principal: &str) -> bool {
+    restricted_to(allowed_signers, principal, minds_attest::NS_INTENT)
+}
+
+/// Ob **jede** Zeile, die `principal` nennt oder einen seiner Schlüssel
+/// trägt, auf genau `namespaces="<namespace>"` beschränkt ist.
+fn restricted_to(allowed_signers: &str, principal: &str, namespace: &str) -> bool {
+    let only = format!("\"{namespace}\"");
     struct Line {
         principals: String,
         restricted: bool,
@@ -183,7 +295,7 @@ fn witness_only(allowed_signers: &str, principal: &str) -> bool {
                     .filter(|o| o.to_ascii_lowercase().starts_with("namespaces="))
                     .map(|o| &o["namespaces=".len()..])
                     .collect::<Vec<_>>()
-                    == ["\"minds-witness\""]
+                    == [only.as_str()]
         });
         let key = match rest {
             [kind, blob, ..] if is_key_type(kind) => Some(format!("{kind} {blob}")),
@@ -272,6 +384,41 @@ mod tests {
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample";
     const OTHER: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOther";
+
+    #[test]
+    fn only_a_touched_security_key_is_an_sk_key() {
+        let key = |key_type: &str, user_presence| minds_attest::SignatureKey {
+            key_type: key_type.into(),
+            user_presence,
+        };
+        let sk = "sk-ssh-ed25519@openssh.com";
+        assert_eq!(signer_kind(Some(&key(sk, true))), SignerKind::SecurityKey);
+        assert_eq!(signer_kind(Some(&key(sk, false))), SignerKind::SoftwareKey);
+        assert_eq!(
+            signer_kind(Some(&key("ssh-ed25519", true))),
+            SignerKind::SoftwareKey
+        );
+        assert_eq!(signer_kind(None), SignerKind::SoftwareKey);
+    }
+
+    /// EA-15: Intent-Signer folgen derselben Regel, unter `minds-intent` —
+    /// und ein Witness-Principal ist kein Intent-Signer (und umgekehrt).
+    #[test]
+    fn only_principals_restricted_to_the_intent_namespace_sign_intents() {
+        let restricted = format!("h@host namespaces=\"minds-intent\" {KEY}");
+        assert!(intent_only(&restricted, "h@host"));
+        assert!(!witness_only(&restricted, "h@host"));
+        for line in [
+            format!("h@host {KEY}"),
+            format!("h@host namespaces=\"minds\" {KEY}"),
+            format!("h@host namespaces=\"minds,minds-intent\" {KEY}"),
+            format!("h@host namespaces=\"minds-witness\" {KEY}"),
+            // Derselbe Schlüssel unbeschränkt unter anderem Namen.
+            format!("{restricted}\ndev@host {KEY}"),
+        ] {
+            assert!(!intent_only(&line, "h@host"), "{line}");
+        }
+    }
 
     #[test]
     fn only_principals_restricted_to_the_witness_namespace_count() {

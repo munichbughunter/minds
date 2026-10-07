@@ -30,8 +30,8 @@ mod socket;
 mod tests;
 mod witness_clock;
 mod worker;
-pub(crate) use socket::ping;
 pub use socket::run;
+pub(crate) use socket::{CONTROL_SOCKET, ping};
 pub(crate) use worker::worker;
 
 /// Das Isolationsprofil (00-conventions, ADR-0012) — ein Typ für Witness-

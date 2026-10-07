@@ -150,7 +150,10 @@ or scope globs contain something the policy would redact is refused, not
 rewritten. A requirement **file** whose text needs redaction gets no anchor
 at all: its Git blob id is a hash over the raw bytes and, next to the
 redacted snapshot, would let anyone test guesses for the removed value —
-clean the file first. Unlike observations, a snapshot **does** carry content (the
+clean the file first. Credential files (`.env`, `.pgpass`, `.netrc`, …, the
+same secret-file wall as capture) and files ignored by `.gitignore` are
+refused before they are read — a plain password in them is not always
+something a detector recognizes. Unlike observations, a snapshot **does** carry content (the
 requirement as written), and `minds forget <session>` does not remove it:
 the anchor belongs to the requirement, not to one session. Do not bind
 requirements whose text must later be erasable.

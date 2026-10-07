@@ -230,6 +230,12 @@ pub enum RedactionError {
     )]
     IntentSourceWouldOracle,
 
+    /// Die Anforderungsdatei ist eine Zugangsdaten-Datei (`.env`,
+    /// `.pgpass`, … — die Secretfile-Mauer). Deren Inhalt erkennen die
+    /// Detektoren nicht immer; er gehört nie in einen gesyncten Ref (EA-15).
+    #[error("intent anchor refused: the requirement file is a credential file")]
+    IntentSecretFile,
+
     /// Die Felder ergeben keinen gültigen `minds-intent-v1`-Text.
     #[error("intent anchor refused: {0}")]
     IntentAnchor(#[from] minds_core::intent_anchor::IntentAnchorError),

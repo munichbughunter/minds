@@ -98,7 +98,7 @@ pub(crate) fn configured_key(root: &Path) -> Option<String> {
 }
 
 /// Der Signaturschlüssel: `--key`, sonst `git config user.signingkey`.
-fn resolve_key(key: Option<&str>, root: &Path) -> Fallible<String> {
+pub(crate) fn resolve_key(key: Option<&str>, root: &Path) -> Fallible<String> {
     if let Some(key) = key {
         return Ok(key.to_string());
     }

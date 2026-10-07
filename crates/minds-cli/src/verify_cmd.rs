@@ -945,9 +945,10 @@ fn verify_session(
     Ok((verdict, report.overall))
 }
 
-/// Die `Assurance`- und `Not proven`-Zeilen eines Session-Blocks.
+/// Die `Assurance`-, `Intent`- und `Not proven`-Zeilen eines Session-Blocks.
 fn print_assurance(report: &minds_reader::assurance::AssuranceReport, limits: bool) {
     println!("{}", assurance::assurance_line(report));
+    println!("{}", assurance::intent_line(report));
     for line in assurance::not_proven_lines(report.overall, limits) {
         println!("{line}");
     }

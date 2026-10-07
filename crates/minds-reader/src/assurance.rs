@@ -521,7 +521,7 @@ pub enum IntentSignature {
 
 /// Ob die Session an eine Anforderung gebunden ist (EA-14/EA-15) — zur
 /// Lesezeit berechnet ([`crate::intent::intent_of`]), nie gespeichert (W2).
-/// Bis EA-15 übergibt `minds verify` hier `Unbound`.
+/// `minds verify` rechnet sie über `intent_of` (EA-15).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum IntentState {
     /// Kein Intent-Anker — nur der Prompt (`intent: unbound (prompt
