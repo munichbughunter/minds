@@ -448,11 +448,13 @@ Coverage       complete within the boundary (boundary: witness/v1 — activity o
   uncorroborated  turn 1 call 1  Write src/sort/merge.rs  b3-deadbeef…  no file-system observation
 Interpretation complete
 Assurance      A1 observed    (range 1: witness signature not checked — no trusted allowed_signers)
+Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        VERIFIED
 ```
 
-- **`Assurance`** is computed at read time, never stored: `A0 claimed`, `A1 observed`, `A2 witnessed`, `A3 reproduced` — the weakest sealed range of the session. Below A2 the parenthesis names the first reason the level is not higher, with the range it comes from (ranges count from 1 in time order). From A2 on it names the verified witness principal, the profile and the intent signature. Witness signatures count only against a trusted signer file: `--signers`, otherwise `~/.ssh/allowed_signers` — never `gpg.ssh.allowedSignersFile` from the repository — and only for principals restricted to `namespaces="minds-witness"`. The witness profile and its isolation proof are not yet part of the signed material, and intent binding does not exist yet; A2 is therefore not reachable today (`witness profile unknown`, `intent not bound`). A session linked only through the store index with an inferred (heuristic) edge is `A0`. The level says who observed the session, not whether the session explains the commit — that is the Coverage axis. **A1 is no promise against the agent:** an agent can write its own `agent-hooks/v1` seals, trailers and index edges, so `--require-assurance A1` guards against missing or broken capture, not against a malicious agent; only the witness levels (A2+) are observed outside the agent's control. A signer file the agent can write (one inside the repository, or `~/.ssh/allowed_signers` when the agent runs under your user) makes witness signatures self-attestations — keep the trusted file out of the agent's reach. All seals that name the session count, not only those in its back-reference (`evidence.json`, which the agent can rewrite); a seal found only through the namespace is printed as a `Note`.
+- **`Intent`** names the session's intent anchor (`minds intent`) as an assurance fact: `intent not bound`, `intent unsigned`, `intent signed, sk key`, `intent signed, software key`, `intent signature not checked` (no trusted signer file, the seal material is not intact, the anchor is not in this store — e.g. not synced yet — or its signature is unreadable) or `intent signature invalid for minds-intent` (also for a malformed `anchor.sig`) — then the anchor (shortened) and whether it is chained by seals verified against a witness principal (`chained`) or not (`unchained`: the local file, or witness seals that could not be verified), plus `intent changed mid-session` or a snapshot mismatch when they apply. The signature is checked over the anchor text under namespace `minds-intent` against the same trusted signer file as the witness (`--signers`, otherwise `~/.ssh/allowed_signers`), and — as for the witness — only for principals whose every line (and every line carrying their key) is restricted to exactly `namespaces="minds-intent"`: an unrestricted developer key, which an agent may reach through ssh-agent, or one restricted to `namespaces="minds"` makes it invalid. `sk key` means the key inside the verified signature is a FIDO key **and** the signature carries the user-presence flag (a key made with `-O no-touch-required` signs without a touch and counts as `software key`); it is a statement about the `allowed_signers` entry, not a hardware attestation. The signature checked is the one stored next to the anchor (`anchor.sig`), not one the witness saw at activation. A valid signature says a human approved this requirement version — not that it was approved for this session: an old approved anchor can be bound again (through the local file, or the control socket in a profile where the agent runs as the witness user). An unsigned or invalid intent never changes Integrity or the exit code — it is not tampering with evidence.
+- **`Assurance`** is computed at read time, never stored: `A0 claimed`, `A1 observed`, `A2 witnessed`, `A3 reproduced` — the weakest sealed range of the session. Below A2 the parenthesis names the first reason the level is not higher, with the range it comes from (ranges count from 1 in time order). From A2 on it names the verified witness principal, the profile and the intent signature. Witness signatures count only against a trusted signer file: `--signers`, otherwise `~/.ssh/allowed_signers` — never `gpg.ssh.allowedSignersFile` from the repository — and only for principals restricted to `namespaces="minds-witness"`. The witness profile and its isolation proof are not yet part of the signed material; A2 is therefore not reachable today (`witness profile unknown`). A session linked only through the store index with an inferred (heuristic) edge is `A0`. The level says who observed the session, not whether the session explains the commit — that is the Coverage axis. **A1 is no promise against the agent:** an agent can write its own `agent-hooks/v1` seals, trailers and index edges, so `--require-assurance A1` guards against missing or broken capture, not against a malicious agent; only the witness levels (A2+) are observed outside the agent's control. A signer file the agent can write (one inside the repository, or `~/.ssh/allowed_signers` when the agent runs under your user) makes witness signatures self-attestations — keep the trusted file out of the agent's reach. All seals that name the session count, not only those in its back-reference (`evidence.json`, which the agent can rewrite); a seal found only through the namespace is printed as a `Note`.
 - **`uncorroborated`** lists write claims of a witnessed session that no witness observation confirms (same path, same bytes, between 2 s before and 30 s after the claim). The location is turn and call in the stored session; the hash is the first 8 hex digits of the claimed write-time hash — already stored in the repository and never formed for secret files, but in a job log it lets a reader confirm a guess for a file with very little content. Only sessions with a witness observation window get these lines; they are capped like the artifact lines (`--all`). An uncorroborated claim does not lower the level and does not change the verdict.
 - **`Not proven`** lists the short forms of the limits that hold at the achieved level, at most three, then `(minds verify --limits)`. `--limits` prints every limit as a full sentence instead.
 
@@ -481,6 +483,98 @@ Signs the attribution of a session (ssh-sig) and writes the signature to stdout.
 ```
 minds sign b3a1f0e --key ~/.ssh/id_ed25519 > attribution.sig
 ```
+
+### minds intent
+
+```
+minds intent bind --file <path> [--scope <glob,glob>]
+minds intent sign [<anchor-id>] [--key <path>] [--witness-home <dir>]
+minds intent show [<anchor-id>]
+minds intent list
+```
+
+Binds a requirement version and lets a human approve it. `bind --file` hashes the
+file like `git hash-object --no-filters` (the raw worktree bytes; with clean filters
+such as `core.autocrlf` or LFS an unchanged file still counts as "not in HEAD") and
+stores an intent anchor
+`source=file:<path>@<blob>` with the redacted snapshot and the expected scope under
+`refs/minds/intents/<id>` (synced like everything under `refs/minds/`). The file
+must lie inside the worktree; if its version is not in `HEAD`, `bind` warns
+`requirement not committed — anchor refers to a working-tree version`. A file the
+redaction policy would change gets no anchor: its blob id would be an oracle for
+the removed secret — clean the file first. Credential files (`.env`, `.pgpass`,
+`.netrc`, `credentials*`, … — the same secret-file wall as capture) and files
+ignored by `.gitignore` or `info/exclude` are refused outright, before they are
+read: their content is not always something a detector recognizes. Ignore rules
+are evaluated in-process like the witness's file observer — case-folded, without
+a global excludes file — and no `git` process is started on the repository (its
+config, e.g. `core.fsmonitor`, is the agent's). Hard links, FIFOs, symlinks out of the
+worktree and anything inside the git directory (also with `--separate-git-dir`)
+are refused too; the hard-link and file-identity checks are Unix-only. `--issue` arrives with EA-16.
+
+`sign` signs the anchor text (default: the last bound one) under ssh-sig namespace
+`minds-intent` and stores `anchor.sig` next to it. It first prints what is being
+approved. The default "last bound" can be written by the agent, so without an
+explicit anchor id `sign` only approves a file version that is in `HEAD`; for a
+working-tree version, a prompt or an issue anchor it stops and asks for the id
+(with the id, a working-tree version gets the warning `this anchor is not the
+version in HEAD`). An agent with a shell can commit and bind too: before the
+touch, `sign` prints `review  anchor <full id>` and the full blob (or, for a prompt
+or issue anchor, its text) on stderr — compare the anchor id with the one your own
+`bind` printed, or pass it explicitly. The full content hash is shown as well. Non-ASCII characters in paths are shown
+escaped (`\u{430}`). With a software key there is no touch — `sign` signs right
+after printing them. The activation path is settled before
+the touch: if it is blocked, nothing is signed. The key comes from `--key` or `git config user.signingkey`; if its `.pub`
+is a FIDO key (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`)
+ssh-keygen's "Confirm user presence" prompt is shown (also when the `.pub` is
+missing) — a touch an agent with full shell access cannot give. The name in the
+`signed` line is the `.pub` comment, display only: `git config user.signingkey`
+can come from the repository config, which the agent can edit — `minds verify`
+decides who signed. Passphrase prompts are never answered (stdin is
+closed; use ssh-agent). Then the anchor is activated, and the last line says
+how:
+
+- `active  witness (<profile>)` — sent to the witness's host-side control socket
+  (`<home>/control/control.sock`). The home is `--witness-home`, otherwise
+  `MINDS_WITNESS_HOME` or the repository's XDG state path when a control socket
+  is there. A control socket that does not answer is an error before signing
+  (`did not answer — is the witness running`; remove a stale socket if no witness
+  should run); a witness that refuses the anchor is an error after it — no
+  fallback to the file. The profile is read from the home's `witness.json`: in a
+  profile where the agent runs as your user it can fake both socket and file, so
+  `active  witness (…)` there is a statement about the home, not proof — `minds
+  verify` decides what was bound. A witness running with a home that is neither given nor
+  found this way is not seen: `sign` then takes the local file and says
+  `no witness`.
+- `active  local file .git/minds/intent/active (A1, unchained — no witness)` —
+  without a witness the local checkpoint binds the id in that file to the
+  sessions it stores: weaker, the agent can edit the file.
+
+If `MINDS_WITNESS_SOCKET` is set but no control socket is reachable (the agent's
+side), `sign` refuses to fall back to the file, which the witness never reads:
+run it on the host. The signature is stored even when activation fails.
+
+```
+$ minds intent bind --file fachliche-anforderung.md --scope "src/sort/**,tests/**"
+$ minds intent sign --key ~/.ssh/id_ed25519_sk
+intent  file:fachliche-anforderung.md@3f9c1e2a  content b3-7a41…
+scope   src/sort/**, tests/**
+signed  patrick@doering-it (sk-ssh-ed25519, user presence)
+active  witness (container)
+```
+
+Further known limits: the redaction policy is read from the worktree's
+`.minds/redact.json`, which the agent can edit (the witness checks against its
+pinned policy); and a security key confirms whichever signature request reaches
+it first — a concurrent request through a shared ssh-agent can take the touch.
+
+`show` prints the anchor, the full content hash, whether the file version is in
+`HEAD`, whether the anchor is still proven (snapshot hashes to `content=`, clean
+under the policy), signature presence (not verified there) and the stored
+snapshot (not shown when the anchor is not proven); `list` lists
+all anchors. The default "last bound" lives in `<git-dir>/minds/intent/last-bound`
+— a convenience the agent can write, which is why `sign` shows the anchor before
+the touch. `minds verify` checks the signature (see `Intent` above).
 
 ### minds fsck
 

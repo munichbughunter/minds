@@ -135,6 +135,11 @@ impl RedactionPipeline {
         // Exhaustiv: Bekommt die Quelle eine neue Form, bricht hier der Build.
         match source {
             IntentSource::File { path, blob } => {
+                // Die Secretfile-Mauer gilt auch hier (EA-15): Was in `.env`
+                // steht, finden die Detektoren nicht immer.
+                if crate::is_secret_file(&format!("/{path}")) {
+                    return Err(RedactionError::IntentSecretFile);
+                }
                 self.unchanged(Field::IntentSource, path, audit)?;
                 self.unchanged(Field::IntentSource, blob, audit)?;
             }
@@ -196,6 +201,61 @@ mod tests {
         IntentSource::File {
             path: "docs/spec.md".into(),
             blob: "3f9c1e2a4b5d6e7f8091a2b3c4d5e6f708192a3b".into(),
+        }
+    }
+
+    /// EA-15: Eine Zugangsdaten-Datei bekommt keinen Anker — auch nicht mit
+    /// Inhalt, den kein Detektor erkennt; eine Anforderung, die nur über
+    /// Passwörter spricht, schon.
+    #[test]
+    fn credential_files_get_no_anchor() {
+        let pipeline = pipeline();
+        let text = b"DB_PASS=Winter2024orders\n".to_vec();
+        for path in [
+            ".env",
+            "config/.pgpass",
+            ".netrc",
+            "deploy/credentials.json",
+        ] {
+            let source = IntentSource::File {
+                path: path.into(),
+                blob: "3f9c1e2a4b5d6e7f8091a2b3c4d5e6f708192a3b".into(),
+            };
+            assert!(
+                matches!(
+                    pipeline.redact_intent(source.clone(), Vec::new(), text.clone()),
+                    Err(RedactionError::IntentSecretFile)
+                ),
+                "{path}"
+            );
+            let anchor = IntentAnchor {
+                source,
+                content: content_hash(&text),
+                scope: Vec::new(),
+            };
+            assert!(matches!(
+                pipeline.check_intent_anchor(&anchor),
+                Err(RedactionError::IntentSecretFile)
+            ));
+        }
+        for path in [
+            "docs/env-variables.md",
+            "docs/anforderung.md",
+            ".env.example",
+        ] {
+            let source = IntentSource::File {
+                path: path.into(),
+                blob: "3f9c1e2a4b5d6e7f8091a2b3c4d5e6f708192a3b".into(),
+            };
+            pipeline
+                .redact_intent(
+                    source,
+                    Vec::new(),
+                    "Passwörter werden mit Argon2 gehasht.\n"
+                        .as_bytes()
+                        .to_vec(),
+                )
+                .unwrap();
         }
     }
 

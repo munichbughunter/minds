@@ -118,6 +118,12 @@ fn material(
             let signature = match store.intent_signature(id) {
                 Ok(Some(signature)) => check(&stored.text, &signature),
                 Ok(None) => IntentSignature::Unsigned,
+                // Eine abgelegte Signatur ohne `ssh-sig`-Form gilt unter
+                // keinem Namespace (EA-15) — sonst machte eine kaputte
+                // `anchor.sig` aus „ungültig" ein „nicht geprüft".
+                Err(minds_store::StoreError::IntentSignatureMalformed { .. }) => {
+                    IntentSignature::Invalid
+                }
                 // Eine Signatur liegt vielleicht vor, ist aber nicht lesbar.
                 Err(_) => IntentSignature::NotChecked,
             };

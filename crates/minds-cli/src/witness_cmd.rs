@@ -13,7 +13,9 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 mod daemon;
 
 #[cfg(unix)]
-pub(crate) use daemon::{InitRequest, Initialized, UNPINNED, init_config, load, ping};
+pub(crate) use daemon::{
+    CONTROL_SOCKET, InitRequest, Initialized, UNPINNED, init_config, load, ping,
+};
 
 /// Das versteckte Unterkommando, unter dem der Witness seinen Checkpoint als
 /// eigenen Prozess startet (EA-10). Nicht in USAGE — niemand ruft es von Hand.

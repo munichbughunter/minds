@@ -54,6 +54,7 @@ mod hooklog;
 mod import_cmd;
 #[cfg(feature = "tui")]
 mod inspect;
+mod intent_cmd;
 mod intent_proof;
 mod metrics;
 mod prepare_commit_msg;
@@ -205,6 +206,26 @@ Usage:
         Signs a session's attribution (ssh-sig) to stdout.
         Key from --key or git config user.signingkey.
 
+  minds intent bind --file <path> [--scope <glob,glob>]
+        Binds a requirement version as an intent anchor
+        (refs/minds/intents): source file:<path>@<git blob>, the redacted
+        snapshot and the expected scope. Warns when the file's version is
+        not in HEAD. Refused: a file the redaction policy would change,
+        credential files (.env, .pgpass, …) and .gitignored files.
+  minds intent sign [<anchor-id>] [--key <path>] [--witness-home <dir>]
+        Signs the anchor (default: last bound, only a file version in
+        HEAD) under ssh-sig namespace minds-intent and activates it:
+        through the witness control socket (host side; --witness-home,
+        MINDS_WITNESS_HOME or the repository's XDG state path) or,
+        without a witness, the local file
+        <git-dir>/minds/intent/active (A1, unchained). Prints which.
+        A FIDO key (sk-…) asks for a touch; key from --key or git config
+        user.signingkey.
+  minds intent show [<anchor-id>]
+        Anchor, source, scope, signature and the redacted snapshot.
+  minds intent list
+        All stored intent anchors.
+
   minds seals [--session <id>] [--limit <n>]
         Lists Evidence-Chain seals — id, linked session (if any), event
         range, gap/signature status, timestamp. Most recent first.
@@ -222,7 +243,9 @@ Usage:
         revision, --commit, or the session's trailer commit) and lists
         unexplained lines (at most 20 without --all). --require-explained
         fails with exit 2 below the given percentage (never masks 1/3/4).
-        Each block states the Assurance level (who observed, A0–A3) and
+        Each block states the Assurance level (who observed, A0–A3), the
+        Intent (minds intent: not bound / unsigned / signed under
+        minds-intent, checked against --signers; never TAMPERED) and
         what is Not proven at that level (--limits: in full), and lists
         write claims no witness observation confirms (uncorroborated).
         --require-assurance gates on the weakest session (exit 2, never
@@ -393,6 +416,12 @@ const SPECS: &[Spec] = &[
     spec("forget", &["--reason"], &[], 1),
     spec("reinterpret", &[], &[], 1),
     spec("sign", &["--key", "--seal"], &[], 1),
+    spec(
+        "intent",
+        &["--file", "--scope", "--key", "--witness-home"],
+        &[],
+        2,
+    ),
     spec("seals", &["--session", "--limit"], &[], 0),
     spec(
         "verify",
@@ -836,6 +865,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--key"),
             parsed.value("--seal"),
         ),
+
+        "intent" => intent_cmd::run(parsed),
 
         "seals" => seals_cmd::run(parsed.value("--session"), parsed.value("--limit")),
 

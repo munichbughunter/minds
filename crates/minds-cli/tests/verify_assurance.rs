@@ -431,6 +431,7 @@ Coverage       complete within the boundary (boundary: witness/v1 — activity o
   unexplained    generated.rs:1  not observed in the session
 Interpretation complete
 Assurance      A1 observed    (range 1: witness signature not checked — no trusted allowed_signers)
+Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        VERIFIED
 "
@@ -452,6 +453,7 @@ Integrity      intact
 Coverage       complete within the boundary (boundary: agent-hooks/v1, witness/v1 — activity outside it is not captured · 0 gaps · artifact 1/1 lines explained)
 Interpretation complete
 Assurance      A1 observed    (range 1: observed by the agent's hooks only (scope agent-hooks/v1))
+Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        VERIFIED
 "
@@ -476,6 +478,7 @@ Coverage       complete within the boundary (boundary: witness/v1 — activity o
   uncorroborated  turn 1 call 1  Write generated.rs  {claimed}…  no file-system observation
 Interpretation complete
 Assurance      A1 observed    (range 1: witness profile unknown)
+Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        VERIFIED
 "
@@ -498,6 +501,7 @@ Coverage       complete within the boundary (boundary: witness/v1 — activity o
   unexplained    generated.rs:1  not observed in the session
 Interpretation complete
 Assurance      A1 observed    (range 1: no file-system observation window covering the session)
+Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        VERIFIED
 "
@@ -533,6 +537,7 @@ Coverage       not assessable (boundary: witness/v1 — activity outside it is n
   unexplained    generated.rs:1  not observed in the session
 Interpretation complete
 Assurance      A0 claimed     (witnessed seal(s) missing from the repository: b3-<hash>)
+Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        TAMPERED
 "

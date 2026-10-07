@@ -882,7 +882,7 @@ fn active_intent(git_dir: &Path, log_dir: &Path) -> Option<minds_core::ContentHa
 }
 
 #[cfg(unix)]
-fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .read(true)
@@ -894,7 +894,7 @@ fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
 // gleichwertig mit dem Unix-Pfad. Der Witness (und damit A2) ist Unix-only;
 // hier zählt nur, dass ein Sonderfile den lokalen Checkpoint nicht aufhält.
 #[cfg(not(unix))]
-fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
     if !std::fs::symlink_metadata(path)?.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }

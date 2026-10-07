@@ -14,8 +14,10 @@
 //!   Observation-Objekt trägt sie. Die Liste bleibt leer; A2 ist damit nicht
 //!   erreichbar (`witness profile unknown`), fail-closed. Erreichbar wird es,
 //!   sobald der Witness Profil und Trennung im signierten Material festhält.
-//! - **Intent** (EA-14/EA-15), **Replay** (EA-18b) und **Gegenzeichnungen**
-//!   (EA-19) gibt es noch nicht: `Unbound`, keine, keine.
+//! - **Replay** (EA-18b) und **Gegenzeichnungen** (EA-19) gibt es noch
+//!   nicht: keine, keine. Der **Intent** (EA-14/EA-15) wird gelesen
+//!   ([`minds_reader::intent::intent_of`]); seine Signatur gilt nur unter
+//!   `minds-intent` gegen dieselbe vertrauenswürdige Signer-Datei.
 //!
 //! # Das Ledger (`--witness-home`)
 //!
@@ -283,7 +285,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
     } else {
         EvidenceVerdict::Incomplete
     };
-    let intent = IntentState::Unbound;
+    let intent = intent_state(trust, facts);
     assess(&AssuranceInput {
         seals: if facts.legacy {
             Seals::Legacy
@@ -301,6 +303,33 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
         replay: None,
         anchors: None,
     })
+}
+
+/// Die Intent-Lage der Session (EA-14/EA-15), zur Lesezeit aus dem Store:
+/// die Epochen-Kette nur über gültig signierte Witness-Seals
+/// ([`WitnessTrust::witnessed`]), die Signatur des Ankers unter
+/// `minds-intent` gegen dieselbe vertrauenswürdige Signer-Datei. Ob davon
+/// etwas „bezeugt" heißen darf, entscheidet danach `assess` (ohne intaktes,
+/// geprüftes Material: nichts).
+fn intent_state(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> IntentState {
+    let Some(session) = facts.session else {
+        return IntentState::Unbound;
+    };
+    let seals: Vec<(ContentHash, Seal)> = facts
+        .seals
+        .iter()
+        .map(|(id, seal, _)| (id.clone(), seal.clone()))
+        .collect();
+    let witnessed = |seal_id: &ContentHash, _: &Seal| trust.witnessed(seal_id);
+    let chain = minds_reader::intent::epoch_chain(
+        trust.store(),
+        facts.id,
+        session.clone(),
+        &seals,
+        &witnessed,
+    );
+    let check = |anchor: &str, signature: &str| trust.intent_signature(anchor, signature);
+    minds_reader::intent::intent_of(&chain, trust.store(), &check)
 }
 
 /// Die zeitliche Ordnung der Bereiche — dieselbe für die `Seal`-Zeilen des
@@ -485,16 +514,60 @@ fn witness_detail(report: &AssuranceReport) -> Option<String> {
         let names: Vec<&str> = facts.profiles.iter().map(|p| p.name()).collect();
         parts.push(format!("profile {}", names.join("/")));
     }
-    let intent = match &report.intent {
-        IntentState::Unbound => "intent not bound".to_owned(),
+    // Ab A2 ist der Intent verkettet (sonst `intent bound (unchained)` als
+    // Grund) — die Signaturlage genügt.
+    let intent = intent_phrase(&report.intent);
+    Some(format!("{}; {intent}", parts.join(", ")))
+}
+
+/// Die Intent-Lage in festen Worten (EA-15): `intent not bound`, `intent
+/// unsigned`, `intent signed, sk key`, `intent signed, software key`,
+/// `intent signature not checked`, `intent signature invalid for
+/// minds-intent`. Dieselben Sätze wie die Gründe des Readers.
+fn intent_phrase(intent: &IntentState) -> String {
+    match intent {
+        IntentState::Unbound => Reason::IntentNotBound.text(),
         IntentState::Bound { signature, .. } => match signature {
             IntentSignature::Valid(kind) => format!("intent signed, {}", kind.word()),
-            IntentSignature::Unsigned => "intent unsigned".to_owned(),
-            IntentSignature::NotChecked => "intent signature not checked".to_owned(),
-            IntentSignature::Invalid => "intent signature invalid".to_owned(),
+            IntentSignature::Unsigned => Reason::IntentUnsigned.text(),
+            IntentSignature::NotChecked => Reason::IntentSignatureNotChecked.text(),
+            IntentSignature::Invalid => Reason::IntentSignatureInvalid.text(),
         },
+    }
+}
+
+/// Die `Intent`-Zeile des Session-Blocks: die Signaturlage, dann der Anker
+/// (gekürzt) und was über seine Bindung feststeht —
+/// `Intent         intent signed, software key (b3-7a41c2d9…, unchained)`.
+///
+/// Ein Assurance-Fakt, kein Verdikt: Eine fehlende oder ungültige
+/// Signatur ändert weder Integrität noch Exit-Code (W6).
+pub(super) fn intent_line(report: &AssuranceReport) -> String {
+    let phrase = intent_phrase(&report.intent);
+    let IntentState::Bound {
+        anchor_id,
+        chained,
+        snapshot_matches,
+        changed_mid_session,
+        ..
+    } = &report.intent
+    else {
+        return format!("Intent         {phrase}");
     };
-    Some(format!("{}; {intent}", parts.join(", ")))
+    let mut facts = vec![
+        format!(
+            "{}…",
+            anchor_id.as_str().get(..11).unwrap_or(anchor_id.as_str())
+        ),
+        if *chained { "chained" } else { "unchained" }.to_owned(),
+    ];
+    if *changed_mid_session {
+        facts.push(Reason::IntentChangedMidSession.text());
+    }
+    if !snapshot_matches {
+        facts.push(Reason::IntentSnapshotMismatch.text());
+    }
+    format!("Intent         {phrase} ({})", facts.join(", "))
 }
 
 /// Die `Not proven`-Zeile(n) für die erreichte Stufe: die Kurzformen, mit

@@ -149,7 +149,14 @@ pub(crate) fn ping(path: &Path) -> bool {
     }
     let mut bytes = Vec::new();
     let mut chunk = [0; 128];
+    // Eine Frist für die ganze Antwort, nicht nur je `read`: Eine
+    // Gegenseite, die Byte für Byte tröpfelt, hielte den Aufrufer sonst
+    // minutenlang auf (`minds intent sign` pingt vor der Berührung).
+    let deadline = Instant::now() + Duration::from_secs(1);
     while bytes.len() < 4096 {
+        if Instant::now() >= deadline {
+            return false;
+        }
         match stream.read(&mut chunk) {
             Ok(0) | Err(_) => return false,
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
