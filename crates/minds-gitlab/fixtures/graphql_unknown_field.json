@@ -1,0 +1,10 @@
+{
+  "errors": [
+    {
+      "message": "Field 'description' doesn't exist on type 'DescriptionVersion'",
+      "locations": [{ "line": 1, "column": 210 }],
+      "path": ["query", "project", "issue", "notes", "nodes", "systemNoteMetadata", "descriptionVersion", "description"],
+      "extensions": { "code": "undefinedField", "typeName": "DescriptionVersion", "fieldName": "description" }
+    }
+  ]
+}

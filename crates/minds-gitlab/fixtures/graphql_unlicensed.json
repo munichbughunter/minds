@@ -1,0 +1,19 @@
+{
+  "data": {
+    "project": {
+      "issue": {
+        "notes": {
+          "pageInfo": { "hasNextPage": false, "endCursor": "eyJpZCI6IjIifQ" },
+          "nodes": [
+            {
+              "systemNoteMetadata": { "action": "description", "descriptionVersion": null }
+            },
+            {
+              "systemNoteMetadata": { "action": "description", "descriptionVersion": { "description": null } }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -143,6 +143,110 @@ pub fn content_hash(snapshot: &[u8]) -> ContentHash {
     ContentHash::from_bytes(blake3::derive_key(CTX_INTENT_CONTENT, snapshot))
 }
 
+/// Die Snapshot-Bytes eines Issues (EA-16): kanonisches JSON nach RFC 8785,
+/// `{"description":…,"title":…}`.
+///
+/// Eine fehlende Beschreibung (GitLab liefert `null`) ist hier der leere
+/// String — tolerant gelesen, kanonisch geschrieben: Ob ein Issue keine oder
+/// eine leere Beschreibung hat, ist für die Anforderung derselbe Inhalt.
+///
+/// Das sind die **Rohbytes**; was in den Anker eingeht, ist ihre redigierte
+/// Fassung (`minds_redact::RedactionPipeline::redacted_issue_snapshot`).
+pub fn issue_snapshot(title: &str, description: &str) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Snapshot<'a> {
+        description: &'a str,
+        title: &'a str,
+    }
+    // Zwei Strings können nie an der JCS-Kanonisierung scheitern (keine
+    // Zahlen, keine Nicht-String-Schlüssel).
+    crate::canonical::to_canonical_json(&Snapshot { description, title })
+        .expect("zwei Strings sind immer kanonisierbar")
+}
+
+/// Liest eine Issue-Referenz `<projekt>#<iid>` (`team/minds#42`) — mit
+/// denselben Regeln wie die Quelle des Ankers: Projektpfad aus
+/// `[A-Za-z0-9._-]`-Segmenten, `iid` kanonisch (Ziffern, keine führende
+/// Null, nicht 0).
+pub fn parse_issue_ref(text: &str) -> Option<(String, u64)> {
+    let (project, iid) = text.split_once('#')?;
+    if !project_path(project)
+        || iid.is_empty()
+        || !iid.bytes().all(|b| b.is_ascii_digit())
+        || iid.starts_with('0')
+    {
+        return None;
+    }
+    Some((project.to_owned(), iid.parse().ok()?))
+}
+
+/// Ob die Fassung eines Issue-Ankers bei GitLab (noch) existiert — das
+/// Ergebnis der Versionsprüfung von `minds verify --online` (EA-16).
+///
+/// Ein Lesezeit-Befund, nie gespeichert (W2), und nie eine Aufwertung: Er
+/// ändert weder Assurance noch Verdikt noch Exit-Code. Gleiche Wörter für
+/// jede Ausgabe — deshalb hier und nicht in der CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueVersion {
+    /// Ohne `--online` wurde nichts gefragt — ausdrücklich **nicht** „gültig".
+    NotChecked,
+    /// Titel und Beschreibung des Issues ergeben heute noch genau `content=`.
+    Current,
+    /// Das Issue ergibt heute einen anderen Inhalt.
+    Changed(IssueHistory),
+    /// Die Prüfung lief, kam aber zu keinem Ergebnis. Der Grund ist ein
+    /// fester Text — nie etwas aus der Antwort des Servers.
+    Unavailable(&'static str),
+}
+
+/// Was die Beschreibungs-Historie über eine geänderte Fassung sagt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueHistory {
+    /// Eine frühere Fassung der Beschreibung ergibt (mit dem heutigen Titel)
+    /// genau `content=`: Die gebundene Fassung hat existiert.
+    Confirmed,
+    /// Die Historie ist nachweislich vollständig gelesen und enthält sie
+    /// nicht.
+    NotFound,
+    /// Im lesbaren Teil der Historie steht sie nicht — aber die Historie ist
+    /// nicht nachweislich vollständig: eine Fassung gelöscht oder nicht
+    /// ausgeliefert; mehr Notizen, als gelesen werden; vor der ersten
+    /// Änderung gebunden (die ursprüngliche Beschreibung listet GitLab
+    /// nicht); im Fenster nach einer Änderung gebunden (GitLab fasst
+    /// Änderungen in kurzer Folge zusammen); oder der Titel wurde seit dem
+    /// Binden geändert (Titel haben keine Fassungen — dann ist auch eine
+    /// passende Beschreibung keine Bestätigung).
+    Incomplete,
+    /// Diese GitLab-Instanz bietet keine Beschreibungs-Historie an (Edition,
+    /// Version oder Lizenz).
+    Unavailable,
+    /// Die Abfrage der Historie ist gescheitert (verweigert, vorübergehender
+    /// Fehler, keine Antwort).
+    QueryFailed,
+}
+
+impl IssueVersion {
+    /// Der feste Text der Ausgabe.
+    pub fn text(&self) -> String {
+        match self {
+            Self::NotChecked => "not checked (offline)".to_owned(),
+            Self::Current => "current".to_owned(),
+            Self::Changed(history) => format!(
+                "changed since binding — {}",
+                match history {
+                    IssueHistory::Confirmed => "bound version confirmed in description history",
+                    IssueHistory::NotFound => "bound version not found in description history",
+                    IssueHistory::Incomplete =>
+                        "bound version not in the readable description history",
+                    IssueHistory::Unavailable => "no description history available",
+                    IssueHistory::QueryFailed => "description history query failed",
+                }
+            ),
+            Self::Unavailable(reason) => format!("version check unavailable ({reason})"),
+        }
+    }
+}
+
 impl IntentAnchor {
     /// Die Textform — fail-closed: Erzeugt wird nur, was [`parse`](Self::parse)
     /// zu genau diesem Anker zurückliest. Ein Feld, das eine Zeile fälschen,
@@ -515,6 +619,72 @@ mod tests {
         let text = prompt.to_text().unwrap();
         assert!(text.contains("\nsource=prompt\n"));
         assert_eq!(IntentAnchor::parse(&text).unwrap(), prompt);
+    }
+
+    /// EA-16: Die Snapshot-Bytes eines Issues, eingefroren — ändern sie
+    /// sich, verifiziert kein gebundenes Issue mehr.
+    #[test]
+    fn issue_snapshot_golden() {
+        let bytes = issue_snapshot("Retry mit \"Backoff\"", "Zeile 1\nZeile 2 – ä\t\u{1}");
+        assert_eq!(
+            String::from_utf8(bytes.clone()).unwrap(),
+            "{\"description\":\"Zeile 1\\nZeile 2 – ä\\t\\u0001\",\"title\":\"Retry mit \\\"Backoff\\\"\"}"
+        );
+        assert_eq!(
+            content_hash(&bytes).as_str(),
+            "b3-d80dc33a10da59e9edf4fcb4cf01739f50e3c5f6c964f46f27fd91d11fb4b4ec"
+        );
+        // Deterministisch, und ein leerer Text ist ein leerer String.
+        assert_eq!(issue_snapshot("t", ""), issue_snapshot("t", ""));
+        assert_eq!(
+            issue_snapshot("t", ""),
+            b"{\"description\":\"\",\"title\":\"t\"}"
+        );
+    }
+
+    #[test]
+    fn issue_refs_follow_the_anchor_rules() {
+        assert_eq!(
+            parse_issue_ref("group/sub.group/my_project-2#7"),
+            Some(("group/sub.group/my_project-2".into(), 7))
+        );
+        for bad in [
+            "team/minds",
+            "team/minds#",
+            "team/minds#0",
+            "team/minds#07",
+            "team/minds#x",
+            "#42",
+            "team/../admin#1",
+            "team/minds?x=1#1",
+            "team%2Fminds#1",
+            "team/minds#1#2",
+            "team/minds#99999999999999999999999",
+        ] {
+            assert_eq!(parse_issue_ref(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn issue_version_words_never_say_valid() {
+        let all = [
+            IssueVersion::NotChecked,
+            IssueVersion::Current,
+            IssueVersion::Changed(IssueHistory::Confirmed),
+            IssueVersion::Changed(IssueHistory::NotFound),
+            IssueVersion::Changed(IssueHistory::Incomplete),
+            IssueVersion::Changed(IssueHistory::QueryFailed),
+            IssueVersion::Changed(IssueHistory::Unavailable),
+            IssueVersion::Unavailable("unauthorized (HTTP 401)"),
+        ];
+        assert_eq!(IssueVersion::NotChecked.text(), "not checked (offline)");
+        assert_eq!(
+            IssueVersion::Unavailable("issue not found (HTTP 404)").text(),
+            "version check unavailable (issue not found (HTTP 404))"
+        );
+        for version in all {
+            assert!(!version.text().contains("valid"), "{version:?}");
+        }
     }
 
     #[test]

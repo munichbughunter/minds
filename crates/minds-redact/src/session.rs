@@ -337,6 +337,10 @@ pub enum Field {
     IntentScope(usize),
     /// Die ganze Textform eines Intent-Ankers.
     IntentAnchor,
+    /// Der Titel eines Issues, vor dem Kanonisieren (EA-16).
+    IntentIssueTitle,
+    /// Die Beschreibung eines Issues, vor dem Kanonisieren (EA-16).
+    IntentIssueDescription,
 }
 
 impl fmt::Display for Field {
@@ -381,6 +385,8 @@ impl fmt::Display for Field {
             Field::IntentSource => f.write_str("intent.source"),
             Field::IntentScope(i) => write!(f, "intent.scope[{i}]"),
             Field::IntentAnchor => f.write_str("intent.anchor"),
+            Field::IntentIssueTitle => f.write_str("intent.issue.title"),
+            Field::IntentIssueDescription => f.write_str("intent.issue.description"),
         }
     }
 }

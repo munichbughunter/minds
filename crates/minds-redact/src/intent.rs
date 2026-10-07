@@ -16,10 +16,32 @@
 //! dort etwas, gibt es keinen Anker.
 
 use minds_core::ContentHash;
-use minds_core::intent_anchor::{IntentAnchor, IntentSource, content_hash};
+use minds_core::intent_anchor::{
+    IntentAnchor, IntentSource, MAX_SNAPSHOT, content_hash, issue_snapshot,
+};
 
 use crate::pipeline::RedactionPipeline;
 use crate::session::{Field, RedactionAudit, RedactionError};
+
+/// Ein Snapshot vor dem Bauen: roh, oder schon durch die Redaction
+/// gegangen (nur aus [`RedactionPipeline::redacted_issue_snapshot`]s
+/// Innerem — privat, kein Weg von außen).
+enum Snapshot {
+    Raw(String),
+    Redacted(String),
+}
+
+/// Welche Fassung welches Issues (EA-16): Projektpfad, Nummer und
+/// `updated_at` — die Bestandteile der `source=issue:…`-Zeile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueRef {
+    /// Projektpfad (`gruppe/projekt`).
+    pub project: String,
+    /// Die projektinterne Issue-Nummer.
+    pub iid: u64,
+    /// `updated_at` der Fassung, RFC 3339, wie GitLab es liefert.
+    pub updated_at: String,
+}
 
 /// Ein Intent-Anker samt redigiertem Snapshot, der die Redaction
 /// **nachweislich** durchlaufen hat. Einziger Weg dorthin:
@@ -78,15 +100,110 @@ impl RedactionPipeline {
         }
         // Nicht größer, als der Store zurückliest — sonst entstünde ein Anker,
         // der sich ablegen, aber nie wieder lesen ließe.
-        if snapshot.len() > minds_core::intent_anchor::MAX_SNAPSHOT {
+        if snapshot.len() > MAX_SNAPSHOT {
             return Err(RedactionError::IntentSnapshotTooLarge);
         }
         let snapshot = String::from_utf8(snapshot).map_err(|_| RedactionError::IntentNotUtf8)?;
+        self.build_intent(
+            source,
+            scope,
+            Snapshot::Raw(snapshot),
+            RedactionAudit::default(),
+        )
+    }
+
+    /// Baut den Anker eines Issues (EA-16) aus Titel und Beschreibung, wie
+    /// GitLab sie liefert. Jeder Fehler heißt: **es gibt keinen Anker**.
+    ///
+    /// Der Snapshot ist genau das Ergebnis von
+    /// [`redacted_issue_snapshot`](Self::redacted_issue_snapshot) — derselben
+    /// Funktion, mit der `minds verify --online` eine Fassung nachrechnet;
+    /// danach wird er nicht noch einmal redigiert. Bauen und Prüfen können
+    /// so nie verschieden urteilen, auch nicht mit einem Detektor, der auf
+    /// seiner eigenen Ausgabe nicht idempotent wäre.
+    pub fn redact_issue_intent(
+        &self,
+        issue: IssueRef,
+        scope: Vec<String>,
+        title: String,
+        description: String,
+    ) -> Result<RedactedIntent, RedactionError> {
+        let source = IntentSource::Issue {
+            project: issue.project,
+            iid: issue.iid,
+            updated_at: issue.updated_at,
+        };
         let mut audit = RedactionAudit::default();
+        let snapshot = self.issue_snapshot(title, description, &mut audit)?;
+        self.build_intent(source, scope, Snapshot::Redacted(snapshot), audit)
+    }
+
+    /// Der redigierte Snapshot eines Issues: Titel und Beschreibung **je für
+    /// sich** redigiert, dann kanonisches JSON (RFC 8785,
+    /// [`minds_core::intent_anchor::issue_snapshot`]), dann das JSON als
+    /// Ganzes noch einmal.
+    ///
+    /// Warum zuerst die Felder: Im JSON steht ein Zeilenumbruch als `\n`
+    /// mit literalem Backslash. Ein mehrzeiliges Secret (PEM-Block) oder ein
+    /// am Zeilenanfang verankertes Muster sähe ein Detektor in der escapten
+    /// Form womöglich nicht. Der zweite Lauf über das JSON fängt, was erst
+    /// über Feldgrenzen hinweg sichtbar wird.
+    ///
+    /// Deterministisch (feste Platzhalter, stabile Läufe): Dieselbe Policy
+    /// ergibt für denselben Titel und dieselbe Beschreibung dieselben Bytes —
+    /// und damit denselben `content=`.
+    pub fn redacted_issue_snapshot(
+        &self,
+        title: String,
+        description: String,
+    ) -> Result<String, RedactionError> {
+        self.issue_snapshot(title, description, &mut RedactionAudit::default())
+    }
+
+    fn issue_snapshot(
+        &self,
+        title: String,
+        description: String,
+        audit: &mut RedactionAudit,
+    ) -> Result<String, RedactionError> {
+        if self.is_empty() {
+            return Err(RedactionError::NoDetectors);
+        }
+        if title.len().saturating_add(description.len()) > MAX_SNAPSHOT {
+            return Err(RedactionError::IntentSnapshotTooLarge);
+        }
+        let title = self.redact_field(Field::IntentIssueTitle, title, audit)?;
+        let description = self.redact_field(Field::IntentIssueDescription, description, audit)?;
+        let json = String::from_utf8(issue_snapshot(&title, &description))
+            .map_err(|_| RedactionError::IntentNotUtf8)?;
+        self.redact_field(Field::IntentSnapshot, json, audit)
+    }
+
+    /// Der gemeinsame Rest: Quelle und Scope prüfen, den Snapshot
+    /// redigieren (falls er es nicht schon ist) — erst dann hashen.
+    fn build_intent(
+        &self,
+        source: IntentSource,
+        scope: Vec<String>,
+        snapshot: Snapshot,
+        mut audit: RedactionAudit,
+    ) -> Result<RedactedIntent, RedactionError> {
+        let (snapshot, already) = match snapshot {
+            Snapshot::Raw(text) => (text, false),
+            Snapshot::Redacted(text) => (text, true),
+        };
+        // Auch nach dem Kanonisieren: Escapes verlängern den Text.
+        if snapshot.len() > MAX_SNAPSHOT {
+            return Err(RedactionError::IntentSnapshotTooLarge);
+        }
         // Quelle und Scope zuerst: Findet die Policy dort etwas, wird der
         // Snapshot gar nicht erst angefasst.
         self.check_reference(&source, &scope, &mut audit)?;
-        let redacted = self.redact_field(Field::IntentSnapshot, snapshot.clone(), &mut audit)?;
+        let redacted = if already {
+            snapshot.clone()
+        } else {
+            self.redact_field(Field::IntentSnapshot, snapshot.clone(), &mut audit)?
+        };
         // Die Blob-SHA einer Datei ist ein Git-Hash über die **rohen** Bytes.
         // Hat die Redaction im Snapshot etwas entfernt, wäre sie neben dem
         // redigierten Snapshot ein Wörterbuch-Orakel für das Entfernte
@@ -486,6 +603,91 @@ mod tests {
         assert_eq!(
             empty.redact_intent(IntentSource::Prompt, Vec::new(), b"x".to_vec()),
             Err(RedactionError::NoDetectors)
+        );
+    }
+
+    fn issue() -> IssueRef {
+        IssueRef {
+            project: "team/minds".into(),
+            iid: 42,
+            updated_at: "2026-10-01T08:15:00Z".into(),
+        }
+    }
+
+    /// EA-16: Titel und Beschreibung werden je Feld redigiert, bevor sie in
+    /// das JSON gehen — ein PEM-Block mit echten Zeilenumbrüchen fällt, und
+    /// das Nachrechnen ergibt denselben Snapshot.
+    #[test]
+    fn issue_fields_are_redacted_before_canonicalizing() {
+        let pipeline = pipeline();
+        let description = "Deploy-Key:\n-----BEGIN RSA PRIVATE KEY-----\n\
+                           MIIEowIBAAKCAQEAx7Vn9pQmKtLb\n-----END RSA PRIVATE KEY-----\n";
+        let title = format!("Token {TOKEN} rotieren");
+        let intent = pipeline
+            .redact_issue_intent(issue(), Vec::new(), title.clone(), description.into())
+            .unwrap();
+        for secret in [TOKEN, "MIIEowIBAAKCAQEAx7Vn9pQmKtLb"] {
+            assert!(!intent.snapshot().contains(secret), "{}", intent.snapshot());
+            assert!(!intent.text().contains(secret));
+        }
+        assert!(
+            intent
+                .snapshot()
+                .starts_with("{\"description\":\"Deploy-Key:\\n")
+        );
+        assert!(!intent.audit().is_clean());
+        assert_eq!(
+            intent.anchor().content,
+            content_hash(intent.snapshot().as_bytes())
+        );
+        assert_eq!(
+            pipeline
+                .redacted_issue_snapshot(title, description.into())
+                .unwrap(),
+            intent.snapshot()
+        );
+        assert!(matches!(
+            &intent.anchor().source,
+            IntentSource::Issue { project, iid: 42, .. } if project == "team/minds"
+        ));
+    }
+
+    /// Ein sauberes Issue: Der Snapshot ist genau die kanonische Rohform.
+    #[test]
+    fn a_clean_issue_snapshot_is_the_canonical_form() {
+        let intent = pipeline()
+            .redact_issue_intent(
+                issue(),
+                vec!["src/retry/**".into()],
+                "Retry mit Backoff".into(),
+                "Exponentiell, max. 5×.".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            intent.snapshot().as_bytes(),
+            issue_snapshot("Retry mit Backoff", "Exponentiell, max. 5×.")
+        );
+        assert!(intent.audit().is_clean());
+    }
+
+    /// Ein Issue, das größer ist, als der Store zurückliest, bekommt keinen
+    /// Anker — weder roh noch erst nach dem Kanonisieren.
+    #[test]
+    fn an_oversized_issue_gets_no_anchor() {
+        let max = MAX_SNAPSHOT;
+        assert_eq!(
+            pipeline().redacted_issue_snapshot("t".into(), "a".repeat(max)),
+            Err(RedactionError::IntentSnapshotTooLarge)
+        );
+        // Escapes verlängern den Text: unter der Grenze roh, darüber als JSON.
+        assert_eq!(
+            pipeline().redact_issue_intent(
+                issue(),
+                Vec::new(),
+                "t".into(),
+                "\"".repeat(max / 2 + 1)
+            ),
+            Err(RedactionError::IntentSnapshotTooLarge)
         );
     }
 }

@@ -801,6 +801,16 @@ const ACCEPTED_OVER_REDACTION: &[(&str, &str, &str)] = &[
 /// löschen und in [`MUST_REDACT`] aufnehmen.
 const DOCUMENTED_GAPS: &[(&str, &str, &str)] = &[
     (
+        // EA-16 (Security-Review): Im GitLab-Editor umbricht ein Wert gern auf
+        // die nächste Zeile. Die Schlüssel-Wert-Regel endet am Zeilenende;
+        // sie über Umbrüche lesen zu lassen, träfe YAML-Listen
+        // (`password:\n  - …`) und Fließtext — eine Abwägung für ein
+        // eigenes Issue, nicht für den Issue-Snapshot.
+        "soft-wrapped-password",
+        "password:\r\n  hunter2-Sup3rS3cret!",
+        "hunter2-Sup3rS3cret!",
+    ),
+    (
         "prose-password",
         "das Passwort war uebrigens hunter2",
         "hunter2",
@@ -1379,6 +1389,213 @@ fn the_whole_corpus_as_intent_snapshots_is_fail_closed() {
         }
     }
     report.finish("Harmlose Anforderungen werden verändert");
+}
+
+#[test]
+fn the_whole_corpus_as_issue_fields_is_fail_closed() {
+    // EA-16: Titel und Beschreibung eines Issues, wie GitLab sie liefert —
+    // jedes Fixture einmal als Beschreibung, einmal als Titel. Redigiert
+    // wird je Feld **vor** dem Kanonisieren, damit kein Secret hinter einem
+    // JSON-Escape (`\n` mit literalem Backslash) verschwindet.
+    use minds_core::intent_anchor::{IntentAnchor, content_hash, issue_snapshot};
+    use minds_redact::IssueRef;
+
+    let issue = || IssueRef {
+        project: "team/minds".into(),
+        iid: 42,
+        updated_at: "2026-10-01T08:15:00.123Z".into(),
+    };
+    let pipeline = policy();
+    let mut report = Report::default();
+    for case in must_redact() {
+        for (form, title, description) in [
+            ("description", "Anforderung".to_owned(), case.text.clone()),
+            ("title", case.text.clone(), "Beschreibung".to_owned()),
+        ] {
+            let redacted = match pipeline.redact_issue_intent(
+                issue(),
+                Vec::new(),
+                title.clone(),
+                description.clone(),
+            ) {
+                Ok(redacted) => redacted,
+                Err(err) => {
+                    report.note(format!("{} ({form}): kein Anker: {err}", case.id));
+                    continue;
+                }
+            };
+            for needle in case.gone {
+                if redacted.snapshot().contains(needle) || redacted.text().contains(needle) {
+                    report.note(format!(
+                        "{} ({form}): {needle:?} im Anker-Material",
+                        case.id
+                    ));
+                }
+            }
+            if redacted.anchor().content != content_hash(redacted.snapshot().as_bytes()) {
+                report.note(format!(
+                    "{} ({form}): content ≠ Hash des Snapshots",
+                    case.id
+                ));
+            }
+            if redacted.anchor().content == content_hash(&issue_snapshot(&title, &description)) {
+                report.note(format!(
+                    "{} ({form}): content ist der Hash des Klartexts — ein Orakel",
+                    case.id
+                ));
+            }
+            if redacted.id() != &IntentAnchor::id_of_text(redacted.text()) {
+                report.note(format!("{} ({form}): anchor_id ≠ Hash des Texts", case.id));
+            }
+            // Die Versionsprüfung rechnet mit derselben Funktion nach — sie
+            // muss genau den abgelegten Snapshot ergeben.
+            match pipeline.redacted_issue_snapshot(title, description) {
+                Ok(again) if again == redacted.snapshot() => {}
+                _ => report.note(format!(
+                    "{} ({form}): Nachrechnen ergibt einen anderen Snapshot",
+                    case.id
+                )),
+            }
+        }
+    }
+    report.finish("Der Korpus leckt durch den Issue-Snapshot");
+
+    // Die Gegenrichtung: Harmloses bleibt die kanonische Rohform. Ausnahme,
+    // bewusst hingenommen (Over-Redaction, die sichere Richtung): Fixtures,
+    // die selbst JSON sind, stehen im Issue-JSON ein zweites Mal escapt —
+    // dort greift der Escape-Guard vor den Ausnahmen für Verweise und Pfade.
+    // Einen Anker bekommen sie trotzdem.
+    const ESCAPED_TWICE: &[&str] = &["percent-reference-in-json", "windows-path-in-json-argument"];
+    let mut report = Report::default();
+    for (id, text) in MUST_SURVIVE {
+        match pipeline.redact_issue_intent(
+            issue(),
+            Vec::new(),
+            "Retry mit Backoff".into(),
+            (*text).to_owned(),
+        ) {
+            Ok(redacted)
+                if redacted.snapshot().as_bytes() == issue_snapshot("Retry mit Backoff", text) =>
+            {
+                if ESCAPED_TWICE.contains(id) {
+                    report.note(format!(
+                        "{id}: überlebt jetzt — aus ESCAPED_TWICE entfernen"
+                    ));
+                }
+            }
+            Ok(_) if ESCAPED_TWICE.contains(id) => {}
+            Ok(_) => report.note(format!("{id}: Issue-Snapshot verändert")),
+            Err(err) => report.note(format!("{id}: kein Anker: {err}")),
+        }
+    }
+    report.finish("Harmlose Issues werden verändert");
+
+    // Was in Issues typisch ist (Security-Review EA-16): CRLF aus dem
+    // Web-Editor, Markdown-Code, Links mit Zugangsdaten, Secret im Titel.
+    let gl = concat!("glpat", "-AbCdEfGhIjKlMnOpQrSt");
+    let issue_cases: Vec<(&str, String, String, Vec<&str>)> = vec![
+        (
+            "crlf-openssh-key",
+            "Key".into(),
+            "Key:\r\n-----BEGIN OPENSSH PRIVATE KEY-----\r\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ\r\n-----END OPENSSH PRIVATE KEY-----\r\n".into(),
+            vec!["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQ"],
+        ),
+        (
+            "markdown-inline-code",
+            "Runner".into(),
+            format!("Nutze `{gl}` für den Runner"),
+            vec![gl],
+        ),
+        (
+            "markdown-code-block",
+            "Runner".into(),
+            format!("```\nexport GITLAB_TOKEN={gl}\n```"),
+            vec![gl],
+        ),
+        (
+            "markdown-link-with-credentials",
+            "Staging".into(),
+            "[Staging](https://deploy:S3cr3tPassw0rd@staging.internal/)".into(),
+            vec!["S3cr3tPassw0rd"],
+        ),
+        (
+            "token-in-markdown-table-cell",
+            "Runner".into(),
+            format!("| Name | Wert |\n|---|---|\n| Token | {gl} |"),
+            vec![gl],
+        ),
+        (
+            "token-in-html-comment",
+            "Runner".into(),
+            format!("Sichtbar.\n<!-- runner token {gl} -->"),
+            vec![gl],
+        ),
+        (
+            "token-in-link-query",
+            "Dashboard".into(),
+            format!("[Dashboard](https://grafana.internal/d/x?auth_token={gl})"),
+            vec![gl],
+        ),
+        (
+            "bidi-control-before-token-in-title",
+            format!("Token \u{202E}{gl}"),
+            String::new(),
+            vec![gl],
+        ),
+        (
+            "secret-in-title-empty-description",
+            "Rotate AKIAIOSFODNN7EXAMPLE now".into(),
+            String::new(),
+            vec!["AKIAIOSFODNN7EXAMPLE"],
+        ),
+    ];
+    let mut report = Report::default();
+    for (id, title, description, gone) in issue_cases {
+        match pipeline.redact_issue_intent(issue(), Vec::new(), title, description) {
+            Ok(redacted) => {
+                for needle in gone {
+                    if redacted.snapshot().contains(needle) {
+                        report.note(format!("{id}: {needle:?} im Snapshot"));
+                    }
+                }
+            }
+            Err(err) => report.note(format!("{id}: kein Anker: {err}")),
+        }
+    }
+    report.finish("Issue-typische Secrets lecken");
+
+    let mut report = Report::default();
+    for (id, description) in [
+        (
+            "gitlab-references",
+            "Siehe #42, !17 und team/minds#7; cc @anna ~backend %\"v1.2\"\n- [ ] Retry\n- [x] Backoff\n/-/issues/42",
+        ),
+        (
+            "quick-actions-and-mentions",
+            "/assign @anna\n/label ~\"prio::1\"\n/estimate 3h\nCloses #42",
+        ),
+        (
+            "commit-sha-reference",
+            "Revert 9f2c1e7a4b3d5f60718293a4b5c6d7e8f9012345",
+        ),
+        (
+            "literal-placeholder-written-by-a-person",
+            "Logs zeigen [redacted:secret] statt des Werts",
+        ),
+        (
+            "timestamp-and-duration",
+            "Seit 2026-10-03T11:40:27.512Z: max. 5 Versuche, 200 ms Basis",
+        ),
+    ] {
+        match pipeline.redact_issue_intent(issue(), Vec::new(), "Retry".into(), description.into())
+        {
+            Ok(redacted)
+                if redacted.snapshot().as_bytes() == issue_snapshot("Retry", description) => {}
+            Ok(redacted) => report.note(format!("{id}: verändert zu {}", redacted.snapshot())),
+            Err(err) => report.note(format!("{id}: kein Anker: {err}")),
+        }
+    }
+    report.finish("Issue-typische Syntax wird verändert");
 }
 
 /// Klartext-Werte, wie ein Agent sie als Tool-Argument übergibt — der

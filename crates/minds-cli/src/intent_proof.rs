@@ -14,7 +14,10 @@
 //! 4. die Policy findet in Quelle, Scope und Textform nichts
 //!    (`check_intent_anchor`, dieselbe Prüfung wie beim Bauen);
 //! 5. bei `file:` ist die Blob-Id genau der Git-Hash dieser Snapshot-Bytes —
-//!    sie hasht also nichts anderes als den bereinigten Text.
+//!    sie hasht also nichts anderes als den bereinigten Text;
+//! 6. bei `issue:` (EA-16) ist der Snapshot genau die redigierte kanonische
+//!    Form seiner zwei Felder (`redacted_issue_snapshot`) — Feld für Feld
+//!    bereinigt, nicht nur auf JSON-Ebene.
 //!
 //! Punkt 4 schließt seit EA-15 die Secretfile-Mauer ein: Ein `file:`-Anker
 //! über `.env`, `.pgpass`, … ist nie belegt — auch von Hand gepflanzt nicht.
@@ -65,11 +68,31 @@ pub(crate) fn proven_stored(
         Ok(text) if text == stored.text => {}
         _ => return Err("intent anchor refused by the redaction policy"),
     }
-    if let IntentSource::File { blob, .. } = &stored.anchor.source {
-        match repo.blob_id_of(&stored.snapshot) {
+    match &stored.anchor.source {
+        IntentSource::File { blob, .. } => match repo.blob_id_of(&stored.snapshot) {
             Ok(actual) if actual == *blob => {}
             _ => return Err("intent file snapshot is not the named blob"),
+        },
+        // EA-16: Ein Issue-Snapshot ist genau das, was `bind --issue` baut —
+        // kanonisches JSON aus zwei Strings, die Felder **je für sich**
+        // redigiert. Ein von Hand abgelegter Snapshot, der ein Secret hinter
+        // einem JSON-Escape versteckt, ist auf JSON-Ebene vielleicht ein
+        // Fixpunkt, aber nicht dieser.
+        IntentSource::Issue { .. } => {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Fields {
+                description: String,
+                title: String,
+            }
+            let fields: Fields = serde_json::from_str(snapshot)
+                .map_err(|_| "intent issue snapshot is not {\"description\",\"title\"} JSON")?;
+            match pipeline.redacted_issue_snapshot(fields.title, fields.description) {
+                Ok(rebuilt) if rebuilt == snapshot => {}
+                _ => return Err("intent issue snapshot is not the redacted canonical form"),
+            }
         }
+        IntentSource::Prompt => {}
     }
     Ok(())
 }
@@ -247,5 +270,65 @@ mod tests {
             repo.blob_id_of(b"hello\n").unwrap(),
             String::from_utf8(out.stdout).unwrap().trim()
         );
+    }
+
+    /// EA-16: Ein Issue-Anker, wie `bind --issue` ihn baut, ist belegt; ein
+    /// von Hand abgelegter Snapshot, der nicht genau die redigierte
+    /// kanonische Form ist, nicht — auch wenn er auf JSON-Ebene sauber ist.
+    #[test]
+    fn issue_snapshots_must_be_the_redacted_canonical_form() {
+        let (_dir, repo, store, pipeline) = fixture();
+        let intent = pipeline
+            .redact_issue_intent(
+                minds_redact::IssueRef {
+                    project: "team/minds".into(),
+                    iid: 42,
+                    updated_at: "2026-10-01T08:15:00Z".into(),
+                },
+                Vec::new(),
+                "Retry".into(),
+                "Max. 5 Versuche.\n".into(),
+            )
+            .unwrap();
+        let id = store.put_intent(&intent).unwrap();
+        assert_eq!(proven(&store, &repo, &pipeline, &id), Ok(()));
+
+        let planted = |snapshot: &str| {
+            let anchor = IntentAnchor {
+                source: IntentSource::Issue {
+                    project: "team/minds".into(),
+                    iid: 42,
+                    updated_at: "2026-10-01T08:15:00Z".into(),
+                },
+                content: content_hash(snapshot.as_bytes()),
+                scope: Vec::new(),
+            };
+            StoredIntent {
+                text: anchor.to_text().unwrap(),
+                anchor,
+                snapshot: snapshot.as_bytes().to_vec(),
+            }
+        };
+        for (snapshot, reason) in [
+            (
+                "Retry: Max. 5 Versuche.",
+                "intent issue snapshot is not {\"description\",\"title\"} JSON",
+            ),
+            (
+                r#"{"description":"x","title":"t","extra":"y"}"#,
+                "intent issue snapshot is not {\"description\",\"title\"} JSON",
+            ),
+            (
+                // Sauber, aber nicht kanonisch (Reihenfolge, Leerraum).
+                r#"{"title": "t", "description": "x"}"#,
+                "intent issue snapshot is not the redacted canonical form",
+            ),
+        ] {
+            assert_eq!(
+                proven_stored(&planted(snapshot), &repo, &pipeline),
+                Err(reason),
+                "{snapshot}"
+            );
+        }
     }
 }
