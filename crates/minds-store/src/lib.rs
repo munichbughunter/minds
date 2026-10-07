@@ -92,7 +92,7 @@ mod bytes;
 pub use bytes::SessionBytes;
 
 mod store;
-pub use store::{ContextStore, Forget, ForgottenPlace, Put};
+pub use store::{ContextStore, Forget, ForgottenPlace, Put, StoredIntent};
 
 pub mod tombstone;
 

@@ -487,7 +487,7 @@ fn witness_detail(report: &AssuranceReport) -> Option<String> {
     }
     let intent = match &report.intent {
         IntentState::Unbound => "intent not bound".to_owned(),
-        IntentState::Bound { signature } => match signature {
+        IntentState::Bound { signature, .. } => match signature {
             IntentSignature::Valid(kind) => format!("intent signed, {}", kind.word()),
             IntentSignature::Unsigned => "intent unsigned".to_owned(),
             IntentSignature::NotChecked => "intent signature not checked".to_owned(),
@@ -577,7 +577,12 @@ mod tests {
             key: None,
         }];
         let intent = IntentState::Bound {
+            anchor_id: ContentHash::from_bytes([0xa1; 32]),
+            chained: true,
             signature: IntentSignature::Valid(SignerKind::SecurityKey),
+            snapshot_matches: true,
+            from_session_start: true,
+            changed_mid_session: false,
         };
         assess(&AssuranceInput {
             seals: Seals::Sealed(&ranges),

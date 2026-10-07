@@ -397,7 +397,12 @@ fn fs_observer_coalesces_bursts() {
             .filter(|(path, _, _)| path.starts_with("burst/"))
             .count()
     };
-    tick_until(&mut writer, Duration::from_secs(20), |w| count(w) >= 1000);
+    // Die Frist ist Durchsatz, nicht Erwartung: Je Durchlauf höchstens
+    // `FS_APPENDS_PER_STEP` Appends, jeder mit fsync von Journal und Fold.
+    // Parallel laufende Suiten (Git, Checkpoints) drückten das unter Last
+    // auf 15 Durchläufe in 20 s (960 von 1000). `tick_until` kehrt zurück,
+    // sobald alle da sind — die Frist kostet nur im Fehlerfall.
+    tick_until(&mut writer, Duration::from_secs(90), |w| count(w) >= 1000);
     // Nachlaufende Meldungen derselben Endstände ergeben nichts Neues.
     tick_until(&mut writer, Duration::from_millis(500), |_| false);
     assert!(writer.observer.as_ref().unwrap().pending_len() <= observer::MAX_PENDING);

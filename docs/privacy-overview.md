@@ -140,6 +140,21 @@ global excludes (`core.excludesFile`, `~/.config/git/ignore`) are **not**
 consulted by the witness. Keep private scratch files in `.gitignore` or
 `.git/info/exclude`.
 
+**Intent anchors are not subject to `forget` either.** A session can be
+bound to a requirement (ADR-0012, decision 5). The anchor and a
+**redacted** snapshot of the requirement text are stored under
+`refs/minds/intents/<hash>`: the snapshot passes the same redaction
+pipeline fail-closed, and its hash is computed over the redacted bytes —
+never over removed secrets. An anchor whose source path, issue reference
+or scope globs contain something the policy would redact is refused, not
+rewritten. A requirement **file** whose text needs redaction gets no anchor
+at all: its Git blob id is a hash over the raw bytes and, next to the
+redacted snapshot, would let anyone test guesses for the removed value —
+clean the file first. Unlike observations, a snapshot **does** carry content (the
+requirement as written), and `minds forget <session>` does not remove it:
+the anchor belongs to the requirement, not to one session. Do not bind
+requirements whose text must later be erasable.
+
 ## 6. Known gaps — as of v0.1.3
 
 The list an approval decision needs. None of this is hidden; all of it is

@@ -201,6 +201,38 @@ pub enum RedactionError {
     /// der Bereinigung. Es gibt nichts zu speichern.
     #[error("observation object refused: {0}")]
     Observations(#[from] minds_core::observation::ObservationError),
+
+    /// Der Snapshot einer Anforderung ist kein UTF-8 (EA-14).
+    #[error("intent snapshot is not valid UTF-8")]
+    IntentNotUtf8,
+
+    /// Der Snapshot ist größer als [`minds_core::intent_anchor::MAX_SNAPSHOT`].
+    #[error("intent snapshot is larger than the store reads back")]
+    IntentSnapshotTooLarge,
+
+    /// Quelle oder Scope eines Intent-Ankers enthielten etwas, das die
+    /// Policy redigiert. Der Anker wird signiert und verweist auf genau
+    /// diese Werte — ein Platzhalter darin wäre ein anderer Verweis, der
+    /// Klartext ein Leck. Es gibt keinen Anker.
+    #[error("intent anchor refused: {field} contains content the redaction policy removes")]
+    IntentFieldRedacted {
+        /// Wo im Anker.
+        field: Field,
+    },
+
+    /// Die Anforderungsdatei enthält etwas, das die Policy entfernt. Ihre
+    /// Blob-SHA (`source=file:…@<blob>`) ist ein Hash über die rohen Bytes —
+    /// neben dem redigierten Snapshot ein Orakel für das Entfernte. Es gibt
+    /// keinen Anker; die Datei ist vorher zu bereinigen.
+    #[error(
+        "intent anchor refused: the requirement file contains content the redaction policy \
+         removes, and its blob id would be an oracle for it — clean the file first"
+    )]
+    IntentSourceWouldOracle,
+
+    /// Die Felder ergeben keinen gültigen `minds-intent-v1`-Text.
+    #[error("intent anchor refused: {0}")]
+    IntentAnchor(#[from] minds_core::intent_anchor::IntentAnchorError),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +323,14 @@ pub enum Field {
     ObservationPath(usize),
     /// `observations[i].at`
     ObservationAt(usize),
+    /// Der Snapshot einer Anforderung (EA-14).
+    IntentSnapshot,
+    /// Die `source=`-Zeile eines Intent-Ankers.
+    IntentSource,
+    /// `scope[i]` eines Intent-Ankers.
+    IntentScope(usize),
+    /// Die ganze Textform eines Intent-Ankers.
+    IntentAnchor,
 }
 
 impl fmt::Display for Field {
@@ -331,6 +371,10 @@ impl fmt::Display for Field {
             Field::ObservationsLastAt => f.write_str("last_at"),
             Field::ObservationPath(i) => write!(f, "observations[{i}].path"),
             Field::ObservationAt(i) => write!(f, "observations[{i}].at"),
+            Field::IntentSnapshot => f.write_str("intent.snapshot"),
+            Field::IntentSource => f.write_str("intent.source"),
+            Field::IntentScope(i) => write!(f, "intent.scope[{i}]"),
+            Field::IntentAnchor => f.write_str("intent.anchor"),
         }
     }
 }
@@ -534,6 +578,12 @@ impl RedactionPipeline {
             // Wird unten aus dem Audit neu gesetzt; der alte Wert ist per
             // `AlreadyRedacted`-Prüfung ohnehin der Default.
             redaction: _,
+            // Ungescannt **wegen ihres Typs** wie `effect.content` (siehe
+            // `redact_effect`): Anker-Ids sind [`ContentHash`], die Nummern
+            // `u64`, `opens_session` ein `bool` — kein Platz für Freitext. Der
+            // Ankertext selbst steht nie im Envelope (EA-14).
+            intent_anchor,
+            intent_events,
         } = session;
 
         let mut audit = RedactionAudit::default();
@@ -679,6 +729,8 @@ impl RedactionPipeline {
                 applied: true,
                 counts: audit.counts(),
             },
+            intent_anchor,
+            intent_events,
         };
 
         Ok(RedactedSession { session, audit })

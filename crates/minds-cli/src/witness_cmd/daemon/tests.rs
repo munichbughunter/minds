@@ -1,6 +1,7 @@
 use super::*;
 use minds_store::ContextStore;
 
+mod intent_tests;
 mod observer_tests;
 
 struct Fixture {
@@ -656,6 +657,7 @@ fn witness_processes_every_complete_frame_in_one_pass() {
         since: std::time::Instant::now(),
         eof: false,
         pending: false,
+        control: false,
     };
     assert!(socket::step(&mut client, &mut writer).unwrap());
     assert!(client.bytes.is_empty());
@@ -683,6 +685,7 @@ fn witness_caps_frames_per_pass_without_dropping_any() {
         since: std::time::Instant::now(),
         eof: false,
         pending: false,
+        control: false,
     };
     assert!(socket::step(&mut client, &mut writer).unwrap());
     assert!(client.pending);

@@ -48,8 +48,10 @@
 //!   belegter Trennung ([`WitnessStart::isolated`]) — der Profilname allein
 //!   gewährt nie A2; das **Ende der Session bezeugt** (der letzte Bereich
 //!   ist ein solcher Witness-Bereich und schließt mit `SessionEnd`,
-//!   [`RangeInput::closes_session`]); Intent gebunden **und** unter
-//!   `minds-intent` gültig signiert.
+//!   [`RangeInput::closes_session`]); Intent gebunden — vom Witness
+//!   **verkettet**, belegt ab dem Anfang der Session, ohne Wechsel,
+//!   Snapshot passend zum Anker (EA-14) — **und** unter `minds-intent`
+//!   gültig signiert.
 //! - **A3 reproduced** — A2, dazu ein signierter Replay ohne `claim not
 //!   reproduced`, mit mindestens einem entscheidenden Befehl und **ohne**
 //!   übersprungenen (jeder entscheidende Befehl nachvollzogen), und eine
@@ -517,19 +519,34 @@ pub enum IntentSignature {
     Valid(SignerKind),
 }
 
-/// Ob die Session an eine Anforderung gebunden ist (EA-14/EA-15). Bis
-/// EA-15 erzeugt kein Aufrufer `Bound` — A2 ist bis dahin nicht erreichbar
-/// (`intent not bound`). EA-14 ergänzt die Variante um Anker-Id und
-/// Verkettung — deshalb bewusst nicht `Copy`.
+/// Ob die Session an eine Anforderung gebunden ist (EA-14/EA-15) — zur
+/// Lesezeit berechnet ([`crate::intent::intent_of`]), nie gespeichert (W2).
+/// Bis EA-15 übergibt `minds verify` hier `Unbound`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum IntentState {
-    /// Kein Intent-Anker.
+    /// Kein Intent-Anker — nur der Prompt (`intent: unbound (prompt
+    /// only)`).
     #[default]
     Unbound,
     /// Gebunden.
     Bound {
+        /// Der Anker, der am Ende des geprüften Materials galt.
+        anchor_id: ContentHash,
+        /// Vom Witness als `minds.intent`-Event verkettet. `false`: nur die
+        /// lokale Datei (A1) — der Agent kann sie bearbeiten.
+        chained: bool,
         /// Die Signaturlage.
         signature: IntentSignature,
+        /// Der abgelegte Snapshot hasht auf `content=` des Ankers. `false`
+        /// auch, wenn Anker oder Snapshot nicht im Store liegen.
+        snapshot_matches: bool,
+        /// Positiv belegt: Das erste Intent-Event der Kette hat der Witness
+        /// vor dem ersten Hook-Event der Session geschrieben. `false` heißt
+        /// „nicht belegt" — die Session lief erst ungebunden, oder ihr
+        /// Anfang ist nicht lesbar.
+        from_session_start: bool,
+        /// Ein späteres Intent-Event nennt einen anderen Anker.
+        changed_mid_session: bool,
     },
 }
 
@@ -685,6 +702,15 @@ pub enum Reason {
     SessionEndNotWitnessed,
     /// Kein Intent-Anker.
     IntentNotBound,
+    /// Intent nur lokal gebunden, nicht vom Witness verkettet (EA-14).
+    IntentUnchained,
+    /// Kein Beleg, dass der Intent ab dem Anfang der Session galt (EA-14).
+    IntentStartUnproven,
+    /// Der Intent wechselte während der Session (EA-14).
+    IntentChangedMidSession,
+    /// Anker oder Snapshot fehlen im Store, oder der Snapshot passt nicht
+    /// zu `content=` (EA-14).
+    IntentSnapshotMismatch,
     /// Intent gebunden, aber nicht signiert.
     IntentUnsigned,
     /// Intent signiert, Signatur ungeprüft.
@@ -788,6 +814,12 @@ impl Reason {
                 "session end not witnessed — a later range could be missing".into()
             }
             Self::IntentNotBound => "intent not bound".into(),
+            Self::IntentUnchained => "intent bound (unchained)".into(),
+            Self::IntentStartUnproven => "intent not proven from session start".into(),
+            Self::IntentChangedMidSession => "intent changed mid-session".into(),
+            Self::IntentSnapshotMismatch => {
+                "intent snapshot missing or does not match its anchor".into()
+            }
             Self::IntentUnsigned => "intent unsigned".into(),
             Self::IntentSignatureNotChecked => "intent signature not checked".into(),
             Self::IntentSignatureInvalid => "intent signature invalid for minds-intent".into(),
@@ -935,7 +967,21 @@ pub fn assess(input: &AssuranceInput<'_>) -> AssuranceReport {
     // was davon ungeprüft erscheinen darf.
     let intent = match input.intent {
         IntentState::Unbound => IntentState::Unbound,
-        IntentState::Bound { signature } => IntentState::Bound {
+        IntentState::Bound {
+            anchor_id,
+            chained,
+            signature,
+            snapshot_matches,
+            from_session_start,
+            changed_mid_session,
+        } => IntentState::Bound {
+            anchor_id: anchor_id.clone(),
+            // Wie bei der Signatur: Ohne geprüftes, intaktes Material ist
+            // nichts davon bezeugt.
+            chained: *chained && checked,
+            snapshot_matches: *snapshot_matches,
+            from_session_start: *from_session_start && checked,
+            changed_mid_session: *changed_mid_session,
             signature: match signature {
                 IntentSignature::Valid(_) | IntentSignature::Invalid if !checked => {
                     IntentSignature::NotChecked
@@ -1035,19 +1081,41 @@ impl SessionFacts {
         }
         match input.intent {
             IntentState::Unbound => witnessed.push(Reason::IntentNotBound),
-            IntentState::Bound { signature } => match (signature, input.trusted_signers) {
-                (IntentSignature::Unsigned, _) => witnessed.push(Reason::IntentUnsigned),
-                (IntentSignature::Invalid, true) => {
-                    witnessed.push(Reason::IntentSignatureInvalid);
+            IntentState::Bound {
+                anchor_id: _,
+                chained,
+                signature,
+                snapshot_matches,
+                from_session_start,
+                changed_mid_session,
+            } => {
+                // Gebunden heißt für A2: bezeugt (verkettet), belegt ab dem
+                // Anfang, ohne Wechsel, Snapshot nachrechenbar (EA-14).
+                if !chained {
+                    witnessed.push(Reason::IntentUnchained);
+                } else if !from_session_start {
+                    witnessed.push(Reason::IntentStartUnproven);
                 }
-                // Wie bei den Seals: ohne vertrauenswürdige Signer ist eine
-                // gemeldete Prüfung — gültig wie ungültig — keine.
-                (IntentSignature::NotChecked, _)
-                | (IntentSignature::Valid(_) | IntentSignature::Invalid, false) => {
-                    witnessed.push(Reason::IntentSignatureNotChecked);
+                if *changed_mid_session {
+                    witnessed.push(Reason::IntentChangedMidSession);
                 }
-                (IntentSignature::Valid(_), true) => {}
-            },
+                if !snapshot_matches {
+                    witnessed.push(Reason::IntentSnapshotMismatch);
+                }
+                match (signature, input.trusted_signers) {
+                    (IntentSignature::Unsigned, _) => witnessed.push(Reason::IntentUnsigned),
+                    (IntentSignature::Invalid, true) => {
+                        witnessed.push(Reason::IntentSignatureInvalid);
+                    }
+                    // Wie bei den Seals: ohne vertrauenswürdige Signer ist eine
+                    // gemeldete Prüfung — gültig wie ungültig — keine.
+                    (IntentSignature::NotChecked, _)
+                    | (IntentSignature::Valid(_) | IntentSignature::Invalid, false) => {
+                        witnessed.push(Reason::IntentSignatureNotChecked);
+                    }
+                    (IntentSignature::Valid(_), true) => {}
+                }
+            }
         }
 
         let mut reproduced = Vec::new();
@@ -1309,6 +1377,59 @@ mod tests {
 
     const PRINCIPAL: &str = "minds-witness@build-07";
 
+    /// Ein vom Witness verketteter, von Anfang an gültiger Anker mit
+    /// passendem Snapshot — nur die Signaturlage variiert.
+    fn bound(signature: IntentSignature) -> IntentState {
+        IntentState::Bound {
+            anchor_id: ContentHash::from_bytes([0xa1; 32]),
+            chained: true,
+            signature,
+            snapshot_matches: true,
+            from_session_start: true,
+            changed_mid_session: false,
+        }
+    }
+
+    /// Was ein Bericht ohne geprüftes, intaktes Material von [`bound`]
+    /// übrig lässt: nichts davon gilt als bezeugt.
+    fn unchecked_intent() -> IntentState {
+        IntentState::Bound {
+            anchor_id: ContentHash::from_bytes([0xa1; 32]),
+            chained: false,
+            signature: IntentSignature::NotChecked,
+            snapshot_matches: true,
+            from_session_start: false,
+            changed_mid_session: false,
+        }
+    }
+
+    /// Wie [`bound`] (gültig signiert), mit abweichenden Merkmalen.
+    #[derive(Clone, Copy)]
+    struct Traits {
+        chained: bool,
+        matches: bool,
+        from_start: bool,
+        changed: bool,
+    }
+
+    fn bound_with(change: impl FnOnce(&mut Traits)) -> IntentState {
+        let mut t = Traits {
+            chained: true,
+            matches: true,
+            from_start: true,
+            changed: false,
+        };
+        change(&mut t);
+        IntentState::Bound {
+            anchor_id: ContentHash::from_bytes([0xa1; 32]),
+            chained: t.chained,
+            signature: IntentSignature::Valid(SignerKind::SecurityKey),
+            snapshot_matches: t.matches,
+            from_session_start: t.from_start,
+            changed_mid_session: t.changed,
+        }
+    }
+
     fn seal(n: u8) -> ContentHash {
         ContentHash::from_bytes([n; 32])
     }
@@ -1383,9 +1504,7 @@ mod tests {
                     isolated: true,
                     key: Some("SHA256:abc".into()),
                 }],
-                intent: IntentState::Bound {
-                    signature: IntentSignature::Valid(SignerKind::SecurityKey),
-                },
+                intent: bound(IntentSignature::Valid(SignerKind::SecurityKey)),
                 replay: Some(ReplaySummary {
                     signed: true,
                     decisive: 3,
@@ -1768,11 +1887,7 @@ mod tests {
             ),
             (
                 "intent signature not checked",
-                |f| {
-                    f.intent = IntentState::Bound {
-                        signature: IntentSignature::NotChecked,
-                    }
-                },
+                |f| f.intent = bound(IntentSignature::NotChecked),
                 Assurance::A1Observed,
                 &["intent signature not checked"],
             ),
@@ -1784,11 +1899,7 @@ mod tests {
             ),
             (
                 "intent unsigned",
-                |f| {
-                    f.intent = IntentState::Bound {
-                        signature: IntentSignature::Unsigned,
-                    }
-                },
+                |f| f.intent = bound(IntentSignature::Unsigned),
                 Assurance::A1Observed,
                 &["intent unsigned"],
             ),
@@ -1814,9 +1925,7 @@ mod tests {
                 "an invalid intent signature is unknown without signers",
                 |f| {
                     f.trusted_signers = false;
-                    f.intent = IntentState::Bound {
-                        signature: IntentSignature::Invalid,
-                    };
+                    f.intent = bound(IntentSignature::Invalid);
                 },
                 Assurance::A1Observed,
                 &[
@@ -1826,21 +1935,57 @@ mod tests {
             ),
             (
                 "intent signature invalid",
-                |f| {
-                    f.intent = IntentState::Bound {
-                        signature: IntentSignature::Invalid,
-                    }
-                },
+                |f| f.intent = bound(IntentSignature::Invalid),
                 Assurance::A1Observed,
                 &["intent signature invalid for minds-intent"],
             ),
             (
-                "intent signed with a software key",
+                "intent bound only through the local file",
                 |f| {
-                    f.intent = IntentState::Bound {
-                        signature: IntentSignature::Valid(SignerKind::SoftwareKey),
-                    }
+                    f.intent = bound_with(|t| {
+                        t.chained = false;
+                        t.from_start = false;
+                    })
                 },
+                Assurance::A1Observed,
+                // Unverkettet: kein zweiter Grund für den fehlenden Anfang.
+                &["intent bound (unchained)"],
+            ),
+            (
+                "intent start not proven",
+                |f| f.intent = bound_with(|t| t.from_start = false),
+                Assurance::A1Observed,
+                &["intent not proven from session start"],
+            ),
+            (
+                "intent changed mid-session",
+                |f| f.intent = bound_with(|t| t.changed = true),
+                Assurance::A1Observed,
+                &["intent changed mid-session"],
+            ),
+            (
+                "intent snapshot missing or altered",
+                |f| f.intent = bound_with(|t| t.matches = false),
+                Assurance::A1Observed,
+                &["intent snapshot missing or does not match its anchor"],
+            ),
+            (
+                "every intent defect is named",
+                |f| {
+                    f.intent = bound_with(|t| {
+                        (t.from_start, t.matches, t.changed) = (false, false, true);
+                    })
+                },
+                Assurance::A1Observed,
+                &[
+                    "intent not proven from session start",
+                    "intent changed mid-session",
+                    "intent snapshot missing or does not match its anchor",
+                ],
+            ),
+            (
+                "intent signed with a software key",
+                |f| f.intent = bound(IntentSignature::Valid(SignerKind::SoftwareKey)),
                 Assurance::A3Reproduced,
                 &[],
             ),
@@ -2245,12 +2390,7 @@ mod tests {
         assert_eq!(report.witness, None);
         // Auch Intent, Replay und Gegenzeichnungen erscheinen nicht als
         // geprüft.
-        assert_eq!(
-            report.intent,
-            IntentState::Bound {
-                signature: IntentSignature::NotChecked
-            }
-        );
+        assert_eq!(report.intent, unchecked_intent());
         assert_eq!(report.replay, None);
         assert_eq!(report.anchored, None);
     }
@@ -2301,12 +2441,7 @@ mod tests {
                 assert_eq!(range.level, Assurance::A0Claimed, "{range:?}");
             }
             assert_eq!(report.witness, None);
-            assert_eq!(
-                report.intent,
-                IntentState::Bound {
-                    signature: IntentSignature::NotChecked
-                }
-            );
+            assert_eq!(report.intent, unchecked_intent());
             assert_eq!(report.replay, None);
             assert_eq!(report.anchored, None);
         }

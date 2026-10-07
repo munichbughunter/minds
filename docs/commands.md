@@ -308,6 +308,32 @@ private state. A process lock enforces a single writer even during stale-socket
 recovery. Only `run/witness.sock` (0660) belongs in the agent's namespace; keep
 the rest of the state directory on the host.
 
+**Intent binding is host-side only (EA-14).** The witness also listens on
+`control/control.sock` (socket 0600 in its own 0700 directory, accepting only
+connections from the witness user) — never mount it into the agent's domain.
+Only there does it accept `IntentActivate`; on `run/witness.sock` the
+frame is refused with `intent activation is host-side only`, because a signature
+proves who approved a requirement, not that it applies to this session. The
+active intent (`evidence/intent.json`) becomes the first chain event of every
+new session and is entered as a change into a known session right before its
+next hook event; the anchor `-` clears it for new sessions. Per-session
+bookkeeping lives in `evidence/folders/*.intent`. `minds intent` (EA-15) is the
+client. Without a witness, the local checkpoint binds the anchor id in
+`<git-dir>/minds/intent/active` to every session it stores in that run — a
+weaker, unchained binding that never carries more than A1. Known limit: in a
+profile where the agent runs as the witness user (no
+isolation), the agent can reach the control socket too — such a session never
+reaches A2 (isolation not proven), but its intent still shows as chained.
+Further limits, by design: "from session start" means the first event the
+witness saw for that session was a `SessionStart` with `source` `startup` or
+`clear` — an agent that bypasses the witness entirely can still present a
+fabricated session that way (coverage is the corrective, not the intent).
+Clearing (`-`) leaves no trace in sessions already bound. An anchor names no
+repository, so anchor and signature can be copied elsewhere. Scope globs are
+comma-separated and cannot contain a comma themselves (no `{a,b}`). The
+witness checks an activation against its pinned policy; if the repository's
+policy differs, an anchor built there can be refused.
+
 **Checkpoint requests run in a worker process.** The witness starts its own binary
 (`minds witness __checkpoint`, internal) per request, with a 60-second deadline,
 CPU, file-size, open-file and core limits (plus a data-segment limit on Linux), and its own process group. It opens the

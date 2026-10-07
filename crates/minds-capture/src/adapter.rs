@@ -177,6 +177,8 @@ fn build_with_transcript(
         redaction: Redaction::default(),
         lineage: Some(lineage(key, events)),
         edges: Vec::new(),
+        intent_anchor: None,
+        intent_events: Vec::new(),
     };
     (session, call_events)
 }
@@ -233,7 +235,45 @@ pub fn checkpoint_witness(
     if let Some(commit) = ctx.commit {
         session.edges.push(edges::commit(commit));
     }
+    session.intent_events = intent_events(events);
     session
+}
+
+/// Die vom Witness verketteten Intent-Events eines Bereichs (EA-14) — eine
+/// Beobachtung wie [`lineage`]`.closed`: Nummer, Anker-Id und ob der Witness
+/// das Event als erstes der Session geschrieben hat (`opens_session`, aus dem
+/// Payload — nie aus der Position im Bereich). Bewertet wird nichts (W2).
+///
+/// Nur der Witness-Pfad ruft das: Dort nimmt der Witness ein Hook-Event mit
+/// dem reservierten Namen nie von der Agent-Seite an, jedes solche Event hat
+/// er selbst geschrieben. Das lokale Journal liegt dagegen im Zugriff des
+/// Agenten — dort wäre ein `minds.intent`-Event eine Behauptung, keine
+/// Beobachtung, und bleibt draußen. Ein Payload, dessen Anker nicht parst
+/// oder dessen Id nicht zum Text passt, wird nicht übernommen (fail-closed:
+/// lieber „nicht gebunden" als ein falscher Anker).
+pub fn intent_events(events: &[JournalEvent]) -> Vec<minds_core::intent_anchor::IntentEvent> {
+    use minds_core::intent_anchor::{INTENT_EVENT_KIND, IntentEvent, IntentEventPayload};
+
+    events
+        .iter()
+        .filter(|e| {
+            e.raw_kind == INTENT_EVENT_KIND
+                && e.kind == crate::EventKind::Other
+                // Synthetische Witness-Events tragen weder `cwd` noch ein
+                // Transkript — Hook-Events der Agent-Seite meist schon.
+                && e.cwd.is_none()
+                && e.transcript_path.is_none()
+        })
+        .filter_map(|e| {
+            let payload: IntentEventPayload = serde_json::from_str(e.payload.get()).ok()?;
+            payload.check().ok()?;
+            Some(IntentEvent {
+                seq: e.seq,
+                anchor_id: payload.anchor_id,
+                opens_session: payload.opens_session,
+            })
+        })
+        .collect()
 }
 
 /// Füllt die Inhalts-Hashes der Effekte, deren Datei sich lesen lässt.
@@ -1000,6 +1040,59 @@ mod tests {
 
     fn key() -> SessionKey {
         SessionKey::new("claude-code", "31f3f224").unwrap()
+    }
+
+    /// EA-14: Projiziert wird nur genau die Form, die der Witness schreibt
+    /// — kein Hook-Event der Agent-Seite, auch nicht eines, das ein älterer
+    /// Witness mit dem reservierten Namen noch angenommen hätte.
+    #[test]
+    fn only_witness_shaped_intent_events_are_projected() {
+        use minds_core::intent_anchor::{
+            INTENT_EVENT_KIND, IntentAnchor, IntentEventPayload, IntentSource, content_hash,
+        };
+        let anchor = IntentAnchor {
+            source: IntentSource::Prompt,
+            content: content_hash(b"x"),
+            scope: Vec::new(),
+        }
+        .to_text()
+        .unwrap();
+        let mut payload = IntentEventPayload::new(&anchor, None).unwrap();
+        payload.opens_session = true;
+        let genuine = serde_json::to_string(&payload).unwrap();
+        let mut hook_shaped: serde_json::Value = serde_json::from_str(&genuine).unwrap();
+        hook_shaped["session_id"] = "31f3f224".into();
+        hook_shaped["hook_event_name"] = INTENT_EVENT_KIND.into();
+        let synthetic = |seq, payload: &str| JournalEvent {
+            cwd: None,
+            ..ev(seq, EventKind::Other, INTENT_EVENT_KIND, "t", payload)
+        };
+        let events = vec![
+            // Ein Hook-Payload: trägt `session_id` — kein Witness-Event.
+            synthetic(0, &hook_shaped.to_string()),
+            // Richtige Form, aber mit `cwd` wie ein Hook-Event.
+            ev(1, EventKind::Other, INTENT_EVENT_KIND, "t", &genuine),
+            // Richtige Form, falsche Klassifikation.
+            JournalEvent {
+                cwd: None,
+                ..ev(2, EventKind::Prompt, INTENT_EVENT_KIND, "t", &genuine)
+            },
+            // Id passt nicht zum Text.
+            synthetic(
+                3,
+                &genuine.replace(
+                    IntentAnchor::id_of_text(&anchor).as_str(),
+                    content_hash(b"y").as_str(),
+                ),
+            ),
+            // Die echte Form.
+            synthetic(4, &genuine),
+        ];
+        let projected = intent_events(&events);
+        assert_eq!(projected.len(), 1, "{projected:?}");
+        assert_eq!(projected[0].seq, 4);
+        assert!(projected[0].opens_session);
+        assert_eq!(projected[0].anchor_id, IntentAnchor::id_of_text(&anchor));
     }
 
     #[test]

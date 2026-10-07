@@ -7,7 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 static STOP: AtomicBool = AtomicBool::new(false);
-const MAX_CLIENTS: usize = 128;
+/// Verbindungen der Agent-Seite.
+pub(super) const MAX_CLIENTS: usize = 128;
+/// Verbindungen über den Steuer-Socket — ein eigenes Budget: Die Agent-Seite
+/// darf die Host-Seite nicht aushungern, indem sie alle Plätze belegt.
+const MAX_CONTROL_CLIENTS: usize = 4;
 const MAX_BUFFERED: usize = 64 * 1024 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 /// Fairness: Ein Client mit vielen kleinen Frames hält die anderen höchstens
@@ -57,9 +61,28 @@ struct Socket {
     inode: u64,
     device: u64,
 }
+/// Der Steuer-Socket (EA-14), relativ zum Zustandsverzeichnis: in einem
+/// eigenen 0700-Verzeichnis — auch im `user`-Profil, in dem die
+/// Agent-Gruppe das Home durchqueren darf, kommt sie hier nicht hinein (und
+/// unter BSD/macOS erbte ein Socket direkt im Home dessen Gruppe). Außerhalb
+/// von `run/`, also nie in der Domäne des Agenten. Über ihn allein wird ein
+/// Intent aktiviert; angenommen werden nur Verbindungen des Witness-Nutzers.
+pub(crate) const CONTROL_SOCKET: &str = "control/control.sock";
+
 impl Socket {
+    /// Der Socket der Agent-Seite (`run/witness.sock`).
     fn bind(home: &Path, group: Option<u32>) -> Fallible<Self> {
-        let path = home.join("run/witness.sock");
+        Self::bind_at(home.join("run/witness.sock"), group, 0o660)
+    }
+
+    /// Der Steuer-Socket der Host-Seite ([`CONTROL_SOCKET`]).
+    fn bind_control(home: &Path) -> Fallible<Self> {
+        let path = home.join(CONTROL_SOCKET);
+        private_directory(path.parent().ok_or("missing control directory")?)?;
+        Self::bind_at(path, None, 0o600)
+    }
+
+    fn bind_at(path: PathBuf, group: Option<u32>, mode: u32) -> Fallible<Self> {
         match fs::symlink_metadata(&path) {
             Ok(meta) => {
                 if !meta.file_type().is_socket() {
@@ -79,6 +102,11 @@ impl Socket {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        // Zwischen `bind` und `chmod` unten trägt der Socket die Rechte der
+        // umask. Beim Steuer-Socket schützt in diesem Fenster sein
+        // 0700-Verzeichnis, danach zusätzlich die Prüfung der Gegenstelle
+        // (`same_user`) — eine prozessweite umask zu verbiegen, wäre in
+        // einem Prozess mit Threads selbst ein Rennen.
         let listener = UnixListener::bind(&path)?;
         let meta = fs::symlink_metadata(&path)?;
         let socket = Self {
@@ -94,7 +122,7 @@ impl Socket {
                 return Err(std::io::Error::last_os_error().into());
             }
         }
-        fs::set_permissions(&socket.path, fs::Permissions::from_mode(0o660))?;
+        fs::set_permissions(&socket.path, fs::Permissions::from_mode(mode))?;
         socket.listener.set_nonblocking(true)?;
         Ok(socket)
     }
@@ -137,6 +165,66 @@ pub(crate) fn ping(path: &Path) -> bool {
     false
 }
 
+/// Die UID der Gegenstelle einer Unix-Socket-Verbindung — `None`, wo das
+/// System sie nicht nennt.
+pub(super) fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: gültiger Socket, Puffer und Länge passen zu `ucred`.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &mut len,
+            )
+        };
+        (rc == 0).then_some(cred.uid)
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: gültiger Socket, zwei beschreibbare Ausgaben.
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+        (rc == 0).then_some(uid)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+/// Ob die Gegenstelle der Witness-Nutzer selbst ist — fail-closed: Eine
+/// UID, die das System nicht nennt, ist nicht die eigene.
+fn same_user(stream: &UnixStream) -> bool {
+    // SAFETY: `geteuid` hat keine Vorbedingungen.
+    peer_uid(stream) == Some(unsafe { libc::geteuid() })
+}
+
 pub(super) struct Client {
     pub(super) stream: UnixStream,
     pub(super) bytes: Vec<u8>,
@@ -145,6 +233,9 @@ pub(super) struct Client {
     /// Vollständige Frames warten noch im Puffer; bis sie verarbeitet sind,
     /// wird nicht nachgelesen und der Rest staut sich im Socket.
     pub(super) pending: bool,
+    /// Über den Steuer-Socket verbunden (Host-Seite), nicht über den der
+    /// Agent-Seite.
+    pub(super) control: bool,
 }
 
 pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
@@ -187,6 +278,15 @@ pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
 /// `Ok(false)` schließt die Verbindung; `Err` ist ausschließlich ein Fehler
 /// des eigenen Speichers.
 fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<bool> {
+    // Der Steuer-Socket nimmt nur Steuerung an: Hook-Events und
+    // Checkpoint-Anfragen gehören auf den Socket der Agent-Seite.
+    if client.control && !matches!(frame, Frame::Ping | Frame::IntentActivate { .. }) {
+        log(
+            &writer.home,
+            "control socket accepts only ping and intent frames",
+        );
+        return Ok(false);
+    }
     match frame {
         Frame::Hook {
             agent,
@@ -229,11 +329,34 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                 return Ok(false);
             }
         }
-        Frame::IntentActivate { request_id, .. } => {
-            let bytes = witness_proto::encode(&Frame::Nack {
-                request_id,
-                reason: "not supported".into(),
-            })?;
+        Frame::IntentActivate {
+            anchor,
+            signature,
+            request_id,
+        } => {
+            // Nur die Host-Seite bindet Sessions an eine Anforderung: Die
+            // Signatur belegt, wer eine Anforderung freigab — nicht, dass
+            // sie für diese Session gilt. Wählte der Agent den Anker selbst,
+            // wäre „gebunden" seine Behauptung.
+            // Ein abgewiesener Anker beendet den Schreiber nicht: Der
+            // Absender bekommt einen festen Grund, nie den Wert zurück.
+            let outcome = if !client.control {
+                Ok(Err("intent activation is host-side only"))
+            } else if anchor == intent::CLEAR_INTENT && signature.is_some() {
+                Ok(Err("clearing an intent takes no signature"))
+            } else if anchor == intent::CLEAR_INTENT {
+                writer.clear_intent().map(Ok)
+            } else {
+                writer.activate_intent(&anchor, signature)
+            };
+            let answer = match outcome? {
+                Ok(status) => Frame::Ack { request_id, status },
+                Err(reason) => Frame::Nack {
+                    request_id,
+                    reason: reason.into(),
+                },
+            };
+            let bytes = witness_proto::encode(&answer)?;
             if client.stream.write_all(&bytes).is_err() {
                 return Ok(false);
             }
@@ -304,6 +427,7 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
     worker::install_panic_hook(&home);
     let key_fingerprint = fingerprint(&home)?;
     let socket = Socket::bind(&home, config.socket_group)?;
+    let control = Socket::bind_control(&home)?;
     let mut writer = Writer::open(&home, config, follow)?;
     // Der Checkpoint läuft als eigener Prozess desselben Binaries (EA-10).
     // Unter Linux über `/proc/self/exe`: Das ist auch nach einem Update an Ort
@@ -376,7 +500,7 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
             writer.lifecycle(&key, "fs.gap", serde_json::json!({"reason": "unavailable"}))?;
         }
     }
-    let result = serve(&socket.listener, &mut writer);
+    let result = serve(&socket.listener, &control.listener, &mut writer);
     if result.is_ok() {
         writer.lifecycle(&key, "witness.stop", serde_json::json!({}))?;
         atomic(
@@ -396,45 +520,13 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
     result
 }
 
-fn serve(listener: &UnixListener, writer: &mut Writer) -> Fallible<()> {
+fn serve(listener: &UnixListener, control: &UnixListener, writer: &mut Writer) -> Fallible<()> {
     let mut clients: Vec<Client> = Vec::new();
     let mut accept_logged = None;
     while !STOP.load(Ordering::Relaxed) {
         writer.next_step();
-        for _ in clients.len()..MAX_CLIENTS {
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    if stream.set_nonblocking(true).is_err() {
-                        // Ohne nonblocking könnte ein Client die Schleife anhalten.
-                        log_throttled(
-                            &writer.home,
-                            &mut accept_logged,
-                            "client socket setup failed; connection closed",
-                        );
-                        continue;
-                    }
-                    clients.push(Client {
-                        stream,
-                        bytes: Vec::new(),
-                        since: Instant::now(),
-                        eof: false,
-                        pending: false,
-                    });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                // ECONNABORTED, EMFILE und Verwandte betreffen eine Verbindung
-                // oder sind vorübergehend; der einzige Schreiber bleibt stehen.
-                Err(e) => {
-                    log_throttled(
-                        &writer.home,
-                        &mut accept_logged,
-                        &format!("accept failed: {e}"),
-                    );
-                    break;
-                }
-            }
-        }
+        accept(control, true, &mut clients, writer, &mut accept_logged);
+        accept(listener, false, &mut clients, writer, &mut accept_logged);
         let mut idx = 0;
         while idx < clients.len() {
             if step(&mut clients[idx], writer)? {
@@ -453,6 +545,61 @@ fn serve(listener: &UnixListener, writer: &mut Writer) -> Fallible<()> {
         std::thread::sleep(Duration::from_millis(2));
     }
     Ok(())
+}
+
+/// Nimmt wartende Verbindungen an, bis [`MAX_CLIENTS`] erreicht ist.
+pub(super) fn accept(
+    listener: &UnixListener,
+    control: bool,
+    clients: &mut Vec<Client>,
+    writer: &Writer,
+    accept_logged: &mut Option<Instant>,
+) {
+    let limit = if control {
+        MAX_CONTROL_CLIENTS
+    } else {
+        MAX_CLIENTS
+    };
+    let open = clients.iter().filter(|c| c.control == control).count();
+    for _ in open..limit {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if control && !same_user(&stream) {
+                    log_throttled(
+                        &writer.home,
+                        accept_logged,
+                        "control connection from another user refused",
+                    );
+                    continue;
+                }
+                if stream.set_nonblocking(true).is_err() {
+                    // Ohne nonblocking könnte ein Client die Schleife anhalten.
+                    log_throttled(
+                        &writer.home,
+                        accept_logged,
+                        "client socket setup failed; connection closed",
+                    );
+                    continue;
+                }
+                clients.push(Client {
+                    stream,
+                    bytes: Vec::new(),
+                    since: Instant::now(),
+                    eof: false,
+                    pending: false,
+                    control,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // ECONNABORTED, EMFILE und Verwandte betreffen eine Verbindung
+            // oder sind vorübergehend; der einzige Schreiber bleibt stehen.
+            Err(e) => {
+                log_throttled(&writer.home, accept_logged, &format!("accept failed: {e}"));
+                break;
+            }
+        }
+    }
 }
 
 /// Es weichen die größten Puffer ohne wartende vollständige Frames, bis das
@@ -485,6 +632,7 @@ mod tests {
             since: Instant::now(),
             eof: false,
             pending: false,
+            control: false,
         }
     }
 
@@ -506,6 +654,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(peer_gone(&ours), "aufgelegt");
+    }
+
+    /// Der Steuer-Socket liegt in einem eigenen 0700-Verzeichnis außerhalb
+    /// von `run/` (das schützt ihn schon zwischen `bind` und `chmod`), gehört
+    /// allein dem Witness (0600) und wird beim Beenden wieder entfernt. Ein
+    /// vorhandenes Verzeichnis mit offeneren Rechten wird nicht benutzt.
+    #[test]
+    fn the_control_socket_is_private_to_the_host_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir(home.join("run")).unwrap();
+        let path = home.join(CONTROL_SOCKET);
+        {
+            let control = Socket::bind_control(home).unwrap();
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert!(meta.file_type().is_socket());
+            assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+            let parent = fs::symlink_metadata(path.parent().unwrap()).unwrap();
+            assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+            assert!(!control.path.starts_with(home.join("run")));
+        }
+        assert!(!path.exists());
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(Socket::bind_control(home).is_err());
+    }
+
+    #[test]
+    fn the_peer_of_a_local_socket_is_the_own_user() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        assert!(same_user(&ours));
+        // SAFETY: keine Vorbedingungen.
+        assert_eq!(peer_uid(&ours), Some(unsafe { libc::geteuid() }));
     }
 
     #[test]

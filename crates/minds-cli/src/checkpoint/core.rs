@@ -37,7 +37,6 @@ pub enum SealSigner<'a> {
 
 /// Abhängigkeiten des Checkpoints, unabhängig vom Ort des Journals.
 pub struct CheckpointEnv<'a> {
-    #[allow(dead_code)] // Bestandteil der gemeinsamen Umgebung für weitere Aufrufer.
     pub repo: &'a Repo,
     pub root: &'a Path,
     /// Basis für hook.log, beim CLI-Kommando das Git-Verzeichnis.
@@ -767,6 +766,29 @@ fn store_one(
     // Wiederverwendung in `seal_epoch`, und ein zweiter Seal mit gleichem
     // Root wird angehängt — für die Stufe ohne Folgen.
     adapter::settle_closed(&mut session, complete);
+    // A1 (EA-14): Ohne Witness gibt es kein verkettetes Intent-Event; die
+    // aktive Anker-Id aus dem Git-Verzeichnis wird als schwächere, nicht
+    // verkettete Bindung mitgeschrieben. Der Witness-Pfad liest die Datei
+    // nie (W1/W3: nichts auf der Agent-Seite beeinflusst bezeugtes Material).
+    if guard.is_none() {
+        // Nur eine belegte Id (`intent_proof`): Sie gelangt in eine
+        // gesyncte Session und darf kein Orakel über unredigiertes Material
+        // sein.
+        session.intent_anchor =
+            active_intent(env.repo.git_dir(), log_dir).filter(
+                |id| match crate::intent_proof::proven(store, env.repo, pipeline, id) {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        report(
+                            log_dir,
+                            guard,
+                            &format!("active intent not bound: {reason}"),
+                        );
+                        false
+                    }
+                },
+            );
+    }
     let redacted = pipeline.redact_session(session)?;
     let put = store.put(&redacted)?;
 
@@ -794,6 +816,89 @@ fn store_one(
     }
 
     Ok(put.id())
+}
+
+/// Wo der lokale Pfad (A1) den aktiven Intent-Anker findet, relativ zum
+/// Git-Verzeichnis: eine Zeile, die `anchor_id` (`b3-<64hex>`). Geschrieben
+/// von `minds intent` (EA-15), gelesen nur vom lokalen Checkpoint.
+///
+/// Bewusst je Worktree (`git_dir`, nicht `common_dir`) — wie das Journal,
+/// dessen Sessions die Bindung betrifft: Ein verlinkter Worktree arbeitet
+/// typischerweise an einer anderen Anforderung als der Hauptbaum.
+pub(crate) const ACTIVE_INTENT_FILE: &str = "minds/intent/active";
+
+/// Höchstgröße der Datei — eine Id mit Zeilenende passt mehrfach hinein.
+const ACTIVE_INTENT_MAX: u64 = 1024;
+
+/// Die aktive Anker-Id des lokalen Pfads — tolerant gelesen (Leerraum,
+/// Groß-/Kleinschreibung, fehlendes Präfix), kanonisch zurückgegeben. Fehlt
+/// die Datei, ist sie leer oder `-`, ist nichts gebunden. Ist sie unlesbar
+/// oder keine Id, wird das gemeldet und nichts gebunden: Der Checkpoint
+/// scheitert daran nicht, die Session bleibt `unbound`.
+fn active_intent(git_dir: &Path, log_dir: &Path) -> Option<minds_core::ContentHash> {
+    use std::io::Read;
+
+    let path = git_dir.join(ACTIVE_INTENT_FILE);
+    let mut text = String::new();
+    // Die Datei kann der Agent schreiben: Ein FIFO oder Symlink darauf darf
+    // den Checkpoint (im Git-Hook) nicht hängen lassen — geöffnet wird ohne
+    // zu blockieren und ohne Symlinks zu folgen, gelesen nur eine reguläre
+    // Datei.
+    let read = open_regular(&path).and_then(|file| {
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("not a regular file"));
+        }
+        file.take(ACTIVE_INTENT_MAX + 1).read_to_string(&mut text)
+    });
+    match read {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => {
+            hooklog::report_at(
+                log_dir,
+                Source::Checkpoint,
+                "active intent not readable; session left unbound",
+            );
+            return None;
+        }
+    }
+    let id = text.trim();
+    if id.is_empty() || id == "-" {
+        return None;
+    }
+    match id.parse() {
+        Ok(id) if text.len() as u64 <= ACTIVE_INTENT_MAX => Some(id),
+        _ => {
+            // Nie den Inhalt zitieren: Er kommt aus einer Datei, die der
+            // Agent schreiben kann.
+            hooklog::report_at(
+                log_dir,
+                Source::Checkpoint,
+                "active intent is not an anchor id; session left unbound",
+            );
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+// Ohne `O_NOFOLLOW`: Zwischen Prüfung und Öffnen bleibt ein Fenster — nicht
+// gleichwertig mit dem Unix-Pfad. Der Witness (und damit A2) ist Unix-only;
+// hier zählt nur, dass ein Sonderfile den lokalen Checkpoint nicht aufhält.
+#[cfg(not(unix))]
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    if !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    std::fs::File::open(path)
 }
 
 fn report(log_dir: &Path, guard: Option<&dyn CheckpointGuard>, message: &str) {

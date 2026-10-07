@@ -54,6 +54,7 @@ mod hooklog;
 mod import_cmd;
 #[cfg(feature = "tui")]
 mod inspect;
+mod intent_proof;
 mod metrics;
 mod prepare_commit_msg;
 mod recall;

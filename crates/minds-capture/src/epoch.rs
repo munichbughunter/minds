@@ -71,6 +71,18 @@ impl EpochState {
         std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
     }
 
+    /// Ob für diese Session schon eine Epoche versiegelt wurde —
+    /// fail-closed anders als [`last_seal`](Self::last_seal): Nur ein
+    /// **fehlender** Zustand heißt „nie"; ein vorhandener, aber unlesbarer
+    /// oder beschädigter heißt „ja". Wer daraus „die Session ist neu"
+    /// ableitet (EA-14), darf aus einem Lesefehler keinen Anfang machen.
+    pub fn was_sealed(&self, key: &SessionKey) -> bool {
+        !matches!(
+            fs::symlink_metadata(self.file(key)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        )
+    }
+
     /// Merkt sich die `seal_id` der eben geschriebenen Epoche.
     ///
     /// Atomar via tmp + rename (mit fsync — der Zustand soll einen Crash
@@ -237,6 +249,23 @@ mod tests {
             fs::metadata(target.path()).unwrap().permissions().mode() & 0o777,
             0o755
         );
+    }
+
+    /// Nur ein fehlender Zustand heißt „nie versiegelt"; ein beschädigter
+    /// zählt — anders als bei `last_seal` — als versiegelt.
+    #[test]
+    fn was_sealed_is_fail_closed_on_damage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = EpochState::at(tmp.path().join("epochs"));
+        assert!(!state.was_sealed(&key()));
+        // Der Salt allein ist noch keine Epoche.
+        state.salt(&key()).unwrap();
+        assert!(!state.was_sealed(&key()));
+        state.record(&key(), &id(1)).unwrap();
+        assert!(state.was_sealed(&key()));
+        fs::write(state.file(&key()), b"kaputt").unwrap();
+        assert_eq!(state.last_seal(&key()), None);
+        assert!(state.was_sealed(&key()));
     }
 
     fn key() -> SessionKey {

@@ -22,6 +22,7 @@ use crate::checkpoint::core::{
     CheckpointEnv, CheckpointGuard, EvidenceSource, SealSigner, run_checkpoint_guarded,
 };
 
+mod intent;
 mod limits;
 mod observer;
 mod socket;
@@ -1081,6 +1082,11 @@ struct Writer {
     /// ohne Entprellung beobachtet wurde. Eine Flut von Anfragen in einem
     /// Durchlauf kostet so höchstens einmal das Budget.
     settled_this_step: bool,
+    /// Der aktive Intent-Anker (EA-14), persistiert im Zustandsverzeichnis.
+    intent: Option<minds_core::intent_anchor::IntentEventPayload>,
+    /// Je Session der zuletzt eingetragene Anker (Cache der Einträge in
+    /// `evidence/folders/*.intent`, siehe `intent`).
+    intent_seen: BTreeMap<SessionKey, Option<minds_core::ContentHash>>,
 }
 
 /// Höchstzahl der `fs.observed`-Appends je Durchlauf der Eventloop.
@@ -1118,11 +1124,17 @@ impl Writer {
             fs_ready: std::collections::VecDeque::new(),
             settled_this_step: false,
             last_gap: std::collections::HashMap::new(),
+            // Erst `open` lädt den aktiven Intent (samt Beleg); der Worker
+            // eines Checkpoints braucht ihn nicht.
+            intent: None,
+            intent_seen: BTreeMap::new(),
         })
     }
 
     fn open(home: &Path, config: Config, follow: bool) -> Fallible<Self> {
         let mut writer = Self::new(home, config, follow)?;
+        writer.intent = intent::load(home, &writer.config);
+        writer.reprove_intent();
         writer.recover_all()?;
         writer.witness_ledger()?;
         Ok(writer)
@@ -1273,7 +1285,21 @@ impl Writer {
                 return Ok(());
             }
         };
+        // Synthetische Witness-Events (`minds.intent`, EA-14) schreibt nur
+        // der Witness selbst — von der Agent-Seite wären sie gefälscht.
+        if parsed
+            .event
+            .raw_kind
+            .to_ascii_lowercase()
+            .starts_with(intent::RESERVED_KIND_PREFIX)
+        {
+            log(&self.home, "reserved event rejected");
+            return Ok(());
+        }
         secretwall::guard(&mut parsed.event);
+        let stamp = (parsed.event.at.clone(), parsed.event.at_nanos);
+        let starts = intent::starts_session(&parsed.event);
+        self.bind_intent(&parsed.key, &stamp, starts)?;
         self.append(&parsed.key, parsed.event)?;
         Ok(())
     }
@@ -1711,8 +1737,17 @@ impl Writer {
         // vertagter Integritätsfehler still übernommen.
         let open = self.journal.sessions().map(|open| open.keys);
         match &open {
-            Ok(open) => self.folders.retain(|key, _| open.contains(key)),
-            Err(_) => self.folders.clear(),
+            Ok(open) => {
+                self.folders.retain(|key, _| open.contains(key));
+                // Der Intent-Cache wächst nicht mit jeder je gesehenen
+                // Session: Der Eintrag auf der Platte wird bei Bedarf neu
+                // gelesen.
+                self.intent_seen.retain(|key, _| open.contains(key));
+            }
+            Err(_) => {
+                self.folders.clear();
+                self.intent_seen.clear();
+            }
         }
         // Ist die Beobachtungs-Epoche geschlossen, beginnt die nächste ohne
         // Gedächtnis: Schreibt jemand danach denselben Inhalt erneut, ist das
@@ -1771,11 +1806,10 @@ impl Writer {
         Ok(())
     }
 
-    fn checkpoint_sessions(
-        &self,
-        commit: Option<&str>,
-        requester_alive: &dyn Fn() -> bool,
-    ) -> Fallible<Ran> {
+    /// Das festgehaltene Repository, geöffnet und geprüft wie für jeden
+    /// Checkpoint (EA-10) — ohne Includes, ohne Ref-Namespace, mit eigenem
+    /// `.git`.
+    fn pinned_repo(&self) -> Fallible<minds_git::Repo> {
         let root = &self.config.repo_root;
         // Ohne Pins wüsste der Witness Policy und Store nur aus Dateien, die
         // der Agent schreiben kann — oder aus Standards, die die Extras des
@@ -1810,27 +1844,15 @@ impl Writer {
                 "witness repository must own its .git directory; checkpoint deferred".into(),
             );
         }
-        // Erst prüfen, dann versiegeln: Steht der angefragte Commit nicht an
-        // HEAD dieses Repos (anderer Checkout, inzwischen weitergewandert),
-        // entstünden Seals ohne Trailer — und die Sessions wären geschlossen,
-        // obwohl die Agent-Seite „bleiben offen" meldet.
-        if let Some(commit) = commit {
-            let expected: minds_git::CommitId = commit.parse()?;
-            if !crate::checkpoint::head_carries(&repo, expected)? {
-                return Err(
-                    "requested commit is not at the witness HEAD; checkpoint deferred".into(),
-                );
-            }
-        }
-        // Store und Policy aus `witness.json` (EA-10): Backend, Ref und
-        // Child-Pfad legt fest, wer den Witness eingerichtet hat — nicht die
-        // `.git/config` des Agenten. `load` hat den Ref unter `refs/minds/`
-        // und den Child-Pfad außerhalb des Repos schon geprüft.
-        //
-        // Der Store schreibt über **dasselbe** geöffnete Repo, das oben
-        // geprüft wurde — ein zweites Öffnen läse eine inzwischen geänderte
-        // Konfiguration (etwa einen Ref-Namespace). Ein Child-Repo wird
-        // ebenso ohne Includes geöffnet und auf denselben Namespace geprüft.
+        Ok(repo)
+    }
+
+    /// Der festgehaltene Store auf `repo` (EA-10): Backend, Ref und
+    /// Child-Pfad aus `witness.json`, nie aus der `.git/config` des Agenten.
+    fn open_pinned_store(
+        &self,
+        repo: &minds_git::Repo,
+    ) -> Fallible<Box<dyn minds_store::ContextStore>> {
         let store: Box<dyn minds_store::ContextStore> = match self.config.store() {
             PinnedStore::InRepo { context_ref } => {
                 Box::new(minds_store::InRepoStore::from_repo(repo.clone()).with_ref(context_ref))
@@ -1860,6 +1882,38 @@ impl Writer {
                 Box::new(minds_store::ChildRepoStore::from_repo(child).with_ref(context_ref))
             }
         };
+        Ok(store)
+    }
+
+    fn checkpoint_sessions(
+        &self,
+        commit: Option<&str>,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Fallible<Ran> {
+        let root = &self.config.repo_root;
+        let repo = self.pinned_repo()?;
+        // Erst prüfen, dann versiegeln: Steht der angefragte Commit nicht an
+        // HEAD dieses Repos (anderer Checkout, inzwischen weitergewandert),
+        // entstünden Seals ohne Trailer — und die Sessions wären geschlossen,
+        // obwohl die Agent-Seite „bleiben offen" meldet.
+        if let Some(commit) = commit {
+            let expected: minds_git::CommitId = commit.parse()?;
+            if !crate::checkpoint::head_carries(&repo, expected)? {
+                return Err(
+                    "requested commit is not at the witness HEAD; checkpoint deferred".into(),
+                );
+            }
+        }
+        // Store und Policy aus `witness.json` (EA-10): Backend, Ref und
+        // Child-Pfad legt fest, wer den Witness eingerichtet hat — nicht die
+        // `.git/config` des Agenten. `load` hat den Ref unter `refs/minds/`
+        // und den Child-Pfad außerhalb des Repos schon geprüft.
+        //
+        // Der Store schreibt über **dasselbe** geöffnete Repo, das oben
+        // geprüft wurde — ein zweites Öffnen läse eine inzwischen geänderte
+        // Konfiguration (etwa einen Ref-Namespace). Ein Child-Repo wird
+        // ebenso ohne Includes geöffnet und auf denselben Namespace geprüft.
+        let store = self.open_pinned_store(&repo)?;
         // Die Witness-eigene Policy; `.minds/redact.json` im Worktree liest
         // der Witness nicht mehr.
         let pipeline = self.config.policy().pipeline()?;

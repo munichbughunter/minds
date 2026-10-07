@@ -206,6 +206,51 @@ pub enum StoreError {
         reason: String,
     },
 
+    /// Der unter einer Anker-Id abgelegte Text hasht nicht auf diese Id —
+    /// der Anker wurde nachträglich verändert (EA-14).
+    #[error("intent anchor at {requested} hashes to {actual} — it has been altered")]
+    IntentMismatch {
+        /// Die angefragte Id.
+        requested: ContentHash,
+        /// Die Id des abgelegten Texts.
+        actual: ContentHash,
+    },
+
+    /// Unter der Anker-Id liegt ein anderer Snapshot als der, der abgelegt
+    /// werden soll — der Ref wurde vorbelegt oder verändert. Nichts wird
+    /// überschrieben; der Reader meldet ihn als `snapshot_matches = false`.
+    #[error("intent anchor at {id} already carries a different snapshot")]
+    IntentSnapshotConflict {
+        /// Die Id.
+        id: ContentHash,
+    },
+
+    /// Eine Signatur hat nicht die Form einer armierten `ssh-sig`-Signatur —
+    /// beim Ablegen abgewiesen, beim Lesen ein vorbelegter oder veränderter
+    /// Ref (EA-14).
+    #[error("intent signature for {id} is not an armored ssh signature")]
+    IntentSignatureMalformed {
+        /// Die Anker-Id.
+        id: ContentHash,
+    },
+
+    /// Unter der Id liegt kein (lesbarer) Anker — nichts zu signieren.
+    #[error("intent anchor {id} is not in the store")]
+    IntentNotStored {
+        /// Die Anker-Id.
+        id: ContentHash,
+    },
+
+    /// Der Anker hasht korrekt, ist aber nicht lesbar (keine gültige
+    /// Textform, kein Snapshot daneben).
+    #[error("intent anchor at {id} is not readable: {reason}")]
+    MalformedIntent {
+        /// Die Id.
+        id: ContentHash,
+        /// Eine feste Kategorie — nie Bytes aus dem Ref.
+        reason: &'static str,
+    },
+
     /// Das Backend konnte nicht lesen oder schreiben.
     ///
     /// Die Fassade: Was darunter liegt (gix, Dateisystem, Rechte), erreicht den
