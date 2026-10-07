@@ -36,7 +36,7 @@ pub(super) const DETAIL_CAP: usize = 20;
 
 /// Die Spaltenbreite des Art-Felds einer Detailzeile (`unexplained`,
 /// `file only`), wie die Achsen-Spalte des Verdikt-Blocks.
-const KIND_WIDTH: usize = 15;
+pub(super) const KIND_WIDTH: usize = 15;
 
 /// Die Reconciliation eines Commits, fertig zum Drucken.
 pub(super) struct Artifact {
@@ -98,6 +98,26 @@ impl Artifact {
     /// Geänderte Zeilen mit irgendeinem Beleg (siehe Modul-Doku).
     fn explained(&self) -> u64 {
         self.recon.backed_lines()
+    }
+
+    /// Jeder geänderte Pfad des Commits — auch die ohne Blob-Inhalt
+    /// (Submodul-Zeiger, Modus-Wechsel, Symlinks), unentschärft.
+    pub(super) fn changed_paths(&self) -> impl Iterator<Item = &str> {
+        self.recon
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .chain(self.structural.iter().map(|s| s.path.as_str()))
+    }
+
+    /// Der abgeglichene Commit und sein erster Elternteil.
+    pub(super) fn commits(&self) -> (CommitId, Option<CommitId>) {
+        (self.recon.commit, self.recon.base)
+    }
+
+    /// Der Aufruf, der diesen Abgleich ungekappt wiederholt.
+    pub(super) fn rerun(&self) -> &str {
+        &self.rerun
     }
 
     /// Das Segment für die Coverage-Zeile.

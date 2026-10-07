@@ -87,6 +87,76 @@ pub fn observations_in_windows(
     windows: &[Window],
     trusted: &dyn Fn(&ContentHash, &str) -> bool,
 ) -> Vec<FsObservation> {
+    observations_in_windows_checked(store, windows, trusted).observations
+}
+
+/// Die Beobachtungen der Fenster und ob sie vollständig gelesen wurden.
+/// Bewusst ohne `Default`: „vollständig" muss jeder Aufrufer aussprechen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowObservations {
+    /// Was lesbar war — wie [`observations_in_windows`].
+    pub observations: Vec<FsObservation>,
+    /// `false`: Ein vertrauenswürdiger `witness-fs/v1`-Seal, dessen Epoche
+    /// in ein Fenster fallen kann, nennt ein Beobachtungs-Objekt, das fehlt
+    /// oder nicht lesbar ist, oder zählt Lücken (verlorene Ereignisse) —
+    /// oder die Seals selbst waren nicht auflistbar.
+    /// Unter `refs/minds/` kann auch der Agent schreiben: Wer ein Objekt
+    /// entfernt, entfernt Beobachtungen. Für eine Aussage über **alles**,
+    /// was beobachtet wurde (Scope-Befunde, EA-17), ist das Material dann
+    /// unvollständig.
+    pub complete: bool,
+}
+
+/// Fenster und Beobachtungen **einer** Session, wie `minds verify` sie
+/// liest: [`witness_windows`], dann [`observations_in_windows_checked`].
+///
+/// Ohne Fenster gibt es keine Beobachtungen. Hat der Witness die Session
+/// aber bezeugt ([`witnessed_sessions`]), fehlt dann ein Glied seiner
+/// Beobachtungskette — etwa das (vom Agenten gelöschte) Objekt der ersten
+/// Epoche, ein Neustart mitten in der Session, ein Block-Seal: Das ist
+/// „unvollständig", nicht „nichts beobachtet" (fail-closed).
+pub fn session_observations(
+    store: &dyn ContextStore,
+    id: SessionId,
+    session: &Session,
+    trusted: &dyn Fn(&ContentHash, &str) -> bool,
+) -> (Vec<Window>, WindowObservations) {
+    let windows = witness_windows(store, &[(id, session)], trusted);
+    if windows.is_empty() {
+        // Ist der Store nicht auflistbar, ist auch „nicht bezeugt" nicht
+        // belegt.
+        let witnessed =
+            store.list_seals().is_err() || !witnessed_sessions(store, &[id], trusted).is_empty();
+        return (
+            windows,
+            WindowObservations {
+                observations: Vec::new(),
+                complete: !witnessed,
+            },
+        );
+    }
+    let observations = observations_in_windows_checked(store, &windows, trusted);
+    (windows, observations)
+}
+
+/// Wie [`observations_in_windows`], meldet aber, ob jedes in Frage
+/// kommende Objekt lesbar war ([`WindowObservations::complete`]). In Frage
+/// kommt ein Objekt, dessen Seal vertrauenswürdig ist, dessen Epoche nicht
+/// vor dem frühesten Fenster endete und — nennen alle Fenster ihre Epochen —
+/// zu einer dieser Epochen gehört. Ob seine Beobachtungen ins Fenster
+/// fielen, ist ohne das Objekt nicht entscheidbar: fail-closed.
+pub fn observations_in_windows_checked(
+    store: &dyn ContextStore,
+    windows: &[Window],
+    trusted: &dyn Fn(&ContentHash, &str) -> bool,
+) -> WindowObservations {
+    let named = |seal_id: &ContentHash| {
+        windows.iter().any(|w| {
+            w.epochs
+                .as_ref()
+                .is_none_or(|epochs| epochs.contains(seal_id))
+        })
+    };
     let inside = |seal_id: &ContentHash, at: Timestamp| {
         windows.iter().any(|w| {
             w.from <= at
@@ -97,15 +167,25 @@ pub fn observations_in_windows(
         })
     };
     let Some(from) = windows.iter().map(|w| w.from).min() else {
-        return Vec::new();
+        return WindowObservations {
+            observations: Vec::new(),
+            complete: true,
+        };
     };
     let Ok(seals) = store.list_seals() else {
-        return Vec::new();
+        return WindowObservations {
+            observations: Vec::new(),
+            complete: false,
+        };
     };
+    let mut complete = true;
     let mut out: Vec<(Timestamp, FsObservation)> = Vec::new();
     let mut seen_objects = std::collections::BTreeSet::new();
     for seal_id in seals {
+        // Ein aufgelisteter, aber nicht lesbarer Seal kann eine Epoche des
+        // Fensters sein: unvollständig (fail-closed).
         let Ok(Some(text)) = store.seal_text(&seal_id) else {
+            complete = false;
             continue;
         };
         let Ok(seal) = Seal::parse(&text) else {
@@ -120,10 +200,18 @@ pub fn observations_in_windows(
         {
             continue;
         }
+        // Eine Epoche mit Lücken: Der Witness hat Ereignisse verloren.
+        if seal.gaps > 0 {
+            complete &= !named(&seal_id);
+        }
+        // Ein bezeugter Seal nennt ein Objekt, das hier fehlt oder nicht
+        // lesbar ist.
         let Ok(object_id) = observations.parse::<ContentHash>() else {
+            complete &= !named(&seal_id);
             continue;
         };
         let Ok(Some(object)) = store.get_observations(&object_id) else {
+            complete &= !named(&seal_id);
             continue;
         };
         // Aus den Beobachtungen selbst, nicht aus `first_at`/`last_at` (die
@@ -165,7 +253,10 @@ pub fn observations_in_windows(
         }
     }
     out.sort_by(|a, b| (a.0, &a.1.path, a.1.observed.seq).cmp(&(b.0, &b.1.path, b.1.observed.seq)));
-    out.into_iter().map(|(_, o)| o).collect()
+    WindowObservations {
+        observations: out.into_iter().map(|(_, o)| o).collect(),
+        complete,
+    }
 }
 
 /// Das Fenster der verknüpften Sessions: vom frühesten bis zum spätesten

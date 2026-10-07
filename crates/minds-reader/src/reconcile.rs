@@ -355,6 +355,12 @@ impl<'a> Claims<'a> {
         Self { by_path }
     }
 
+    /// The repo-relative paths with at least one write or delete claim,
+    /// sorted. Claims that name no path of this repository are not here.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.by_path.keys().map(String::as_str)
+    }
+
     /// Reconciles `changed` against these claims. No I/O, no mutation.
     pub fn reconcile(
         &self,

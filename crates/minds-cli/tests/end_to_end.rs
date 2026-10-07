@@ -4404,3 +4404,230 @@ fn verify_gate_sees_removals_submodules_modes_and_ambiguity() {
         "{text}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// EA-17: Scope-Befunde und das `--require-in-scope`-Gate
+// ---------------------------------------------------------------------------
+
+/// Committet eine Anforderung, bindet sie (mit `scope`, falls gegeben) und
+/// macht den Anker aktiv (A1, ohne Witness) — der nächste Checkpoint trägt
+/// ihn in die Session.
+fn bind_requirement(dir: &Path, scope: Option<&str>) {
+    std::fs::write(dir.join("requirement.md"), "Retry mit Backoff.\n").unwrap();
+    git(dir, &["add", "requirement.md"]);
+    assert!(
+        git(dir, &["commit", "-q", "-m", "docs: requirement"])
+            .status
+            .success()
+    );
+    let mut args = vec!["intent", "bind", "--file", "requirement.md"];
+    if let Some(scope) = scope {
+        args.extend(["--scope", scope]);
+    }
+    let out = minds(dir, &args, None);
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}");
+    let id = text
+        .lines()
+        .find(|l| l.starts_with("anchor"))
+        .and_then(|l| l.split_whitespace().last())
+        .unwrap_or_else(|| panic!("keine Anker-Id:\n{text}"));
+    std::fs::create_dir_all(dir.join(".git/minds/intent")).unwrap();
+    std::fs::write(dir.join(".git/minds/intent/active"), format!("{id}\n")).unwrap();
+}
+
+#[test]
+fn verify_reports_out_of_scope_findings() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    bind_requirement(dir, Some("src/retry/**,tests/retry_*.rs"));
+    artifact_commit(
+        dir,
+        &[
+            (
+                "src/retry/backoff.rs",
+                "fn backoff() {}\n",
+                "fn backoff() {}\n",
+            ),
+            (
+                "tests/retry_backoff.rs",
+                "#[test]\nfn t() {}\n",
+                "#[test]\nfn t() {}\n",
+            ),
+            ("docs/README.md", "# Retry\n", "# Retry\n"),
+        ],
+    );
+
+    let out = minds(dir, &["verify"], None);
+    let text = stdout(&out);
+    // Befunde ändern weder Verdikt noch Exit-Code.
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("Overall        VERIFIED\n"), "{text}");
+    assert_eq!(
+        coverage_block(&text),
+        format!(
+            "Coverage       complete within the boundary ({BOUNDARY} · 0 gaps · artifact 4/4 lines explained · 1 out of scope)\n  \
+             out of scope   docs/README.md  (commit, claim)"
+        )
+    );
+
+    // Das Gate: verfehlt ⇒ Exit 2, eine Zeile am Ende.
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.ends_with("Gate           1 path(s) out of scope — required in scope\n"),
+        "{text}"
+    );
+
+    // Ein Commit im Bereich besteht.
+    artifact_commit(
+        dir,
+        &[(
+            "src/retry/jitter.rs",
+            "fn jitter() {}\n",
+            "fn jitter() {}\n",
+        )],
+    );
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(" · 0 out of scope)\n"), "{text}");
+    assert!(!text.contains("Gate"), "{text}");
+
+    // Fehlgebrauch ist operativ (4), nie ein Verdikt.
+    let out = minds(
+        dir,
+        &["verify", "--evidence", "b3-00", "--require-in-scope"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(4), "{}", stdout(&out));
+}
+
+#[test]
+fn verify_scope_gate_is_fail_closed() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    // Ungebunden: kein Segment, keine Zeile — und das Gate fällt.
+    artifact_commit(dir, &[("docs/a.md", "a\n", "a\n")]);
+    let out = minds(dir, &["verify"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("out of scope"), "{text}");
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.ends_with(
+            "Gate           scope not assessed (intent not bound) — required in scope\n"
+        ),
+        "{text}"
+    );
+
+    // `scope=-` (kein Bereich): ebenso.
+    bind_requirement(dir, None);
+    artifact_commit(dir, &[("docs/b.md", "b\n", "b\n")]);
+    let out = minds(dir, &["verify"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("Intent         intent unsigned"), "{text}");
+    assert!(!text.contains("out of scope"), "{text}");
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.ends_with(
+            "Gate           scope not assessed (no scope declared) — required in scope\n"
+        ),
+        "{text}"
+    );
+
+    // Das Gate maskiert nie 1/3/4 (W6): Ein menschlicher Commit ohne
+    // Session bleibt NOT VERIFIABLE.
+    std::fs::write(dir.join("human.md"), "h\n").unwrap();
+    git(dir, &["add", "human.md"]);
+    commit_with_sessions(dir, &[]);
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stdout(&out));
+    assert!(
+        stdout(&out).ends_with(
+            "Gate           scope not assessed (no linked session) — required in scope\n"
+        ),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// Ein Claim zählt im Klon an anderem Ort wie im Erfassungs-Checkout —
+/// auch für eine Datei, die der Commit nicht ändert (geschrieben, dann
+/// zurückgesetzt). Und das Gate urteilt nie über einen geratenen Commit.
+#[test]
+fn verify_scope_claims_count_in_a_clone_and_never_on_a_guessed_commit() {
+    let Some(repo) = enabled_repo() else { return };
+    let src = repo.path();
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::write(src.join("docs/guide.md"), "original\n").unwrap();
+    git(src, &["add", "docs/guide.md"]);
+    commit_with_sessions(src, &[]);
+    bind_requirement(src, Some("src/**"));
+    // `docs/guide.md` wird geschrieben, liegt aber beim Commit wieder im
+    // Ausgangszustand: kein Commit-Pfad, nur der Claim.
+    let id = artifact_commit(
+        src,
+        &[
+            ("src/a.rs", "fn a() {}\n", "fn a() {}\n"),
+            ("docs/guide.md", "rewritten\n", "original\n"),
+        ],
+    );
+    let expected = "  out of scope   docs/guide.md  (claim)";
+    let out = minds(src, &["verify"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains(" · 1 out of scope)\n"), "{text}");
+    assert!(text.contains(&format!("{expected}\n")), "{text}");
+
+    // Ein Klon an anderem Ort: dieselbe Aussage.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dst = elsewhere.path().join("clone");
+    let source = format!("file://{}", src.display());
+    assert!(
+        git(
+            elsewhere.path(),
+            &["clone", "-q", &source, dst.to_str().unwrap()]
+        )
+        .status
+        .success()
+    );
+    let fetch = ["fetch", "-q", "origin", "refs/minds/*:refs/minds/*"];
+    assert!(git(&dst, &fetch).status.success());
+    let out = minds(&dst, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains(&format!("{expected}\n")), "{text}");
+
+    // Ein zweiter Commit mit demselben Trailer: Für die Session allein ist
+    // der Prüfgegenstand nicht eindeutig — das Gate verlangt `--commit`.
+    std::fs::write(src.join("src/b.rs"), "fn b() {}\n").unwrap();
+    git(src, &["add", "src/b.rs"]);
+    commit_with_sessions(src, &[&id]);
+    let out = minds(src, &["verify", &id, "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.ends_with(
+            "Gate           scope not assessed (several commits carry this session — pass --commit) — required in scope\n"
+        ),
+        "{text}"
+    );
+    let out = minds(
+        src,
+        &["verify", &id, "--commit", "HEAD~1", "--require-in-scope"],
+        None,
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.ends_with("Gate           1 path(s) out of scope — required in scope\n"),
+        "{text}"
+    );
+}

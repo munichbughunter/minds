@@ -245,6 +245,10 @@ pub(crate) struct Facts<'a> {
     pub ledger: &'a LedgerCheck,
     /// Die Abdeckung durch den Datei-Beobachter.
     pub observations: &'a FsCoverage,
+    /// Die Intent-Lage ([`intent_state`]) — einmal je Session gerechnet,
+    /// damit Coverage (Scope-Befunde, EA-17) und Stufe denselben Anker
+    /// sehen.
+    pub intent: &'a IntentState,
 }
 
 /// Rechnet die Assurance der Session aus.
@@ -285,7 +289,6 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
     } else {
         EvidenceVerdict::Incomplete
     };
-    let intent = intent_state(trust, facts);
     assess(&AssuranceInput {
         seals: if facts.legacy {
             Seals::Legacy
@@ -299,7 +302,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
         trusted_signers: trust.trusted(),
         observations: facts.observations,
         witness_starts: &[],
-        intent: &intent,
+        intent: facts.intent,
         replay: None,
         anchors: None,
     })
@@ -311,23 +314,22 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
 /// `minds-intent` gegen dieselbe vertrauenswürdige Signer-Datei. Ob davon
 /// etwas „bezeugt" heißen darf, entscheidet danach `assess` (ohne intaktes,
 /// geprüftes Material: nichts).
-fn intent_state(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> IntentState {
-    let Some(session) = facts.session else {
+pub(crate) fn intent_state(
+    trust: &WitnessTrust<'_>,
+    id: SessionId,
+    session: Option<&Session>,
+    seals: &[(ContentHash, Seal, String)],
+) -> IntentState {
+    let Some(session) = session else {
         return IntentState::Unbound;
     };
-    let seals: Vec<(ContentHash, Seal)> = facts
-        .seals
+    let seals: Vec<(ContentHash, Seal)> = seals
         .iter()
         .map(|(id, seal, _)| (id.clone(), seal.clone()))
         .collect();
     let witnessed = |seal_id: &ContentHash, _: &Seal| trust.witnessed(seal_id);
-    let chain = minds_reader::intent::epoch_chain(
-        trust.store(),
-        facts.id,
-        session.clone(),
-        &seals,
-        &witnessed,
-    );
+    let chain =
+        minds_reader::intent::epoch_chain(trust.store(), id, session.clone(), &seals, &witnessed);
     let check = |anchor: &str, signature: &str| trust.intent_signature(anchor, signature);
     minds_reader::intent::intent_of(&chain, trust.store(), &check)
 }

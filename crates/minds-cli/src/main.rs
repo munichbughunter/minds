@@ -234,8 +234,8 @@ Usage:
 
   minds verify [<session|rev>] [--signers <file>] [--identity <id>]
                [--commit <rev>] [--require-explained <percent>] [--all]
-               [--witness-home <dir>] [--require-assurance <A0|A1|A2|A3>]
-               [--limits]
+               [--require-in-scope] [--witness-home <dir>]
+               [--require-assurance <A0|A1|A2|A3>] [--limits]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
         Multiple sessions print separate blocks; the worst verdict wins.
@@ -243,6 +243,15 @@ Usage:
         revision, --commit, or the session's trailer commit) and lists
         unexplained lines (at most 20 without --all). --require-explained
         fails with exit 2 below the given percentage (never masks 1/3/4).
+        When the bound intent anchor declares a scope, the Coverage line
+        counts paths outside it (commit files, write claims, file
+        observations) and lists them as out of scope; --require-in-scope
+        fails with exit 2 on any such path or when no scope can be
+        assessed (never masks 1/3/4); combine with --require-assurance A2
+        (and --witness-home) so the scope and the observations are not the
+        agent's own, and with --require-explained 100: the session link
+        (trailer) decides whose scope applies, and only the explained gate
+        shows that this session produced the commit.
         Each block states the Assurance level (who observed, A0–A3), the
         Intent (minds intent: not bound / unsigned / signed under
         minds-intent, checked against --signers; never TAMPERED) and
@@ -435,7 +444,7 @@ const SPECS: &[Spec] = &[
             "--witness-home",
             "--require-assurance",
         ],
-        &["--all", "--limits"],
+        &["--all", "--limits", "--require-in-scope"],
         1,
     ),
     spec(
@@ -880,6 +889,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 commit: parsed.value("--commit"),
                 require_explained: parsed.value("--require-explained"),
                 all: parsed.has("--all"),
+                require_in_scope: parsed.has("--require-in-scope"),
             },
             verify_cmd::AssuranceOptions {
                 witness_home: parsed.value("--witness-home"),

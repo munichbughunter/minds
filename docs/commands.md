@@ -403,7 +403,8 @@ print `signature not checked`. See the [verification guide](verification-guide.m
 ```
 minds verify [<session|rev>] [--signers <file>] [--identity <id>]
              [--commit <rev>] [--require-explained <percent>] [--all]
-             [--witness-home <dir>] [--require-assurance <A0|A1|A2|A3>] [--limits]
+             [--require-in-scope] [--witness-home <dir>]
+             [--require-assurance <A0|A1|A2|A3>] [--limits]
 minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
 minds verify --evidence <seal-id>
 ```
@@ -439,6 +440,22 @@ done
 ```
 
 The flags apply only to the evidence verdict, not to `--sig` or `--evidence`. A human commit without a linked session exits 3 (NOT VERIFIABLE) in that loop — which also stops it.
+
+**Scope findings.** When the session is bound to an intent anchor (`minds intent bind --scope <glob,glob>`) that declares a scope, the Coverage line counts the paths outside it and lists each one with every source that names it:
+
+```
+Coverage       complete within the boundary (boundary: agent-hooks/v1 — activity outside it is not captured · 0 gaps · artifact 3/3 lines explained · 1 out of scope)
+  out of scope   docs/README.md  (commit, claim)
+```
+
+- **Which paths.** *commit*: a changed path of the reconciled commit, including submodule pointers, mode changes and symlinks. *claim*: a write or delete claim of the session that names a path of this repository (claims outside the checkout are beyond the observation boundary, not a scope question). *observation*: a file-system observation of the witness in the session's window, from witness-signed seals only.
+- **Glob syntax.** Anchored at the repository root (a leading `/` or `./` changes nothing), modelled on Git's `:(glob)` pathspec: `*` matches within one path segment, `?` one character (never `/`), `**` as a whole segment zero or more segments (`**/x`, `a/**/b`); a trailing `/**` or `/` matches everything inside a directory, not the directory path itself. A glob whose last segment has no wildcard also matches everything inside it, like a pathspec: `src/retry` covers `src/retry/backoff.rs`; `src/*` does not cover `src/a/b`. Dotfiles are not special. Everything else is literal — no character classes, no brace expansion, no escaping; matching is case-sensitive and without Unicode normalization.
+- **Which anchor.** The one bound at the end of the verified material. If the witness chained a change of anchor mid-session, the scope is not assessed (see below); without a chained intent (A1), the last locally bound anchor counts — the agent's own claim. Whether a human approved that scope is the Intent line's statement (signature under `minds-intent`, chained by the witness), not this one: combine with `--require-assurance A2` when the scope must not be the agent's own. A2 also brings the witness's file observations: below it, only commit paths and the agent's own claims are checked, and a shell write that never reaches the commit stays invisible. If a witness-signed seal names observations that are missing from this store, or a witnessed session has no closed observation window (an epoch missing, the witness restarted mid-session), or an epoch in the window lost events (gaps), the scope is `not assessed (witness observations incomplete)`. When the intent changed mid-session, the scope is `not assessed (intent changed mid-session)`: which scope governed which work cannot be told apart. Paths longer than 4096 bytes are always out of scope, and so is every path once the matching budget of a run is spent (a fail-closed bound against a hostile scope). Negated globs (`!…`) are not supported: `minds intent bind` refuses them, and an anchor that carries one is `not assessed (negated scope glob unsupported)`. Claim paths with `..` or backslashes (native Windows spellings) count as not resolvable. With several sessions on one commit, each session's scope is checked against all of the commit's paths. Claims are mapped to repository paths as in the artifact reconciliation (another checkout's spelling counts when exactly one candidate exists in the commit's trees, among the changed paths or among the witness's observations); a write or delete claim below the repository root that cannot be resolved (`src/../.github/…`, an ambiguous spelling, a deletion under another checkout's root) makes the scope `not assessed (claim paths not resolvable)`. Only the verified commit is checked — a session spanning several commits needs one run per commit, and with several trailer commits for a session id the gate requires `--commit`.
+- No scope declared (`scope=-`) or no bound anchor: the segment and the lines are omitted. A bound anchor missing from this store or unreadable prints `scope not assessed (intent anchor not in this store)` / `(intent anchor unreadable)` instead. When integrity is violated, scope findings are not shown. Findings never change the verdict or the exit code; at most 20 lines are printed, then `… N more (…)`.
+
+**Whose scope.** The session link decides: a revision is judged against the scope of the sessions its `Minds-Session-Id` trailers (or the store index) name, and an agent can write a trailer. A commit that carries the trailer of an older session with a wider scope is judged against that scope. Only `--require-explained 100` shows that the named session actually produced the commit — use both gates together.
+
+`--require-in-scope` turns this into a gate: it fails with exit 2 when any path of any verified session lies outside its scope (`Gate           1 path(s) out of scope — required in scope`) and — fail-closed — when no scope can be assessed, either for a session (`Gate           scope not assessed (no scope declared) — required in scope`) or because the commit is not reconciled (no linked commit, shallow or partial clone). Like the other gates it never masks 1, 3 or 4.
 
 **Assurance and limits.** Below the three axes each block states who observed the material and what it does not prove:
 
