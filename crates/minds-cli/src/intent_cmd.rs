@@ -2,6 +2,8 @@
 //!
 //! ```text
 //! minds intent bind --file <pfad> [--scope <glob,glob>]
+//! minds intent bind --issue <projekt#iid> [--scope <glob,glob>] [--gitlab-url <url>]
+//!                   [--allow-confidential]
 //! minds intent sign [<anchor-id>] [--key <pfad>] [--witness-home <dir>]
 //! minds intent show [<anchor-id>]
 //! minds intent list
@@ -15,6 +17,13 @@
 //! ist; dann warnt `bind`. Der Snapshot geht **nur** über `redact_intent`
 //! in den Store (fail-closed: Findet die Policy in der Datei etwas, gibt es
 //! keinen Anker, weil die Blob-Id sonst ein Orakel wäre).
+//!
+//! Mit `--issue` (EA-16) ist die Quelle ein GitLab-Issue in seiner heutigen
+//! Fassung: `issue:<projekt>#<iid>@<updated_at>`, der Snapshot ist das
+//! redigierte kanonische JSON `{"description":…,"title":…}`
+//! ([`minds_redact::RedactionPipeline::redact_issue_intent`]). Instanz und
+//! Token: [`crate::intent_issue`] — nie aus `.git/config`. Ob die Fassung
+//! später noch existiert, prüft `minds verify --online`.
 //!
 //! # Signieren und Aktivieren
 //!
@@ -88,7 +97,7 @@ fn dispatch(parsed: &crate::Parsed) -> Fallible<()> {
     // Jedes Flag nur dort, wo es etwas bedeutet — ein `--scope` an `sign`
     // stillschweigend zu übergehen hieße, der Aufrufer glaubte, er gelte.
     let allowed: &[&str] = match command {
-        "bind" => &["--file", "--scope"],
+        "bind" => &["--file", "--issue", "--scope", "--gitlab-url"],
         "sign" => &["--key", "--witness-home"],
         "show" | "list" => &[],
         other => {
@@ -99,22 +108,42 @@ fn dispatch(parsed: &crate::Parsed) -> Fallible<()> {
             .into());
         }
     };
-    for flag in ["--file", "--scope", "--key", "--witness-home"] {
+    for flag in [
+        "--file",
+        "--issue",
+        "--scope",
+        "--gitlab-url",
+        "--key",
+        "--witness-home",
+    ] {
         if parsed.value(flag).is_some() && !allowed.contains(&flag) {
             return Err(format!("{flag} does not apply to `minds intent {command}`").into());
         }
+    }
+    if parsed.has("--allow-confidential") && parsed.value("--issue").is_none() {
+        return Err("--allow-confidential applies only to `minds intent bind --issue`".into());
     }
     let target = parsed.positional(1);
     if target.is_some() && matches!(command, "bind" | "list") {
         return Err(format!("`minds intent {command}` takes no anchor id").into());
     }
     match command {
-        "bind" => bind(
-            parsed
-                .value("--file")
-                .ok_or("expected --file <path> (--issue arrives with EA-16)")?,
-            parsed.value("--scope"),
-        ),
+        "bind" => match (parsed.value("--file"), parsed.value("--issue")) {
+            (Some(file), None) => {
+                if parsed.value("--gitlab-url").is_some() {
+                    return Err("--gitlab-url applies only to --issue".into());
+                }
+                bind(file, parsed.value("--scope"))
+            }
+            (None, Some(issue)) => bind_issue(
+                issue,
+                parsed.value("--scope"),
+                parsed.value("--gitlab-url"),
+                parsed.has("--allow-confidential"),
+            ),
+            (Some(_), Some(_)) => Err("--file and --issue exclude each other".into()),
+            (None, None) => Err("expected --file <path> or --issue <project#iid>".into()),
+        },
         "sign" => sign(
             target,
             parsed.value("--key"),
@@ -147,6 +176,81 @@ fn bind(file: &str, scope: Option<&str>) -> Fallible<()> {
     println!("{}", labeled("anchor", id.as_str()));
     // Der Anker liegt schon im Store: Scheitert die Vorgabe, bleibt die Id
     // oben stehen — `sign <id>` geht trotzdem.
+    if let Err(err) = write_id_file(ctx.repo.git_dir(), LAST_BOUND_FILE, &id) {
+        eprintln!(
+            "warning: anchor stored, but the last-bound default was not updated: {}",
+            crate::text::sanitize(&err.to_string())
+        );
+    }
+    Ok(())
+}
+
+/// `bind --issue`: das Issue in seiner heutigen Fassung binden (EA-16).
+fn bind_issue(
+    issue: &str,
+    scope: Option<&str>,
+    gitlab_url: Option<&str>,
+    allow_confidential: bool,
+) -> Fallible<()> {
+    let (project, iid) = minds_core::intent_anchor::parse_issue_ref(issue).ok_or_else(|| {
+        format!(
+            "--issue expects <group/project#iid> (e.g. team/minds#42), got \"{}\"",
+            crate::text::sanitize(issue)
+        )
+    })?;
+    let scope = parse_scope(scope)?;
+    let ctx = Context::open()?;
+    // Die Policy vor dem Netz: Ist sie kaputt, geht keine Anfrage hinaus.
+    let pipeline = crate::config::load_redaction(&ctx.root)?.pipeline()?;
+    let base = crate::intent_issue::base_url(gitlab_url)?;
+    let access = crate::intent_issue::project(&base, &project)?;
+    let snapshot = access
+        .issue_snapshot(iid)
+        .map_err(|err| format!("cannot read issue {project}#{iid}: {err}"))?;
+    let web_url = snapshot.web_url;
+    // Ein vertrauliches Issue ist nicht geheim im Sinne der Detektoren —
+    // aber `refs/minds/` wird gesynct, auch an Remotes, die mehr Leute sehen
+    // als GitLab erlaubt. Fail-closed: nur mit ausdrücklicher Zustimmung.
+    if snapshot.confidential {
+        if !allow_confidential {
+            return Err(format!(
+                "issue {project}#{iid} is confidential — its text would be stored under \
+                 refs/minds/intents and pushed by minds sync; nothing was stored \
+                 (pass --allow-confidential to bind it anyway)"
+            )
+            .into());
+        }
+        eprintln!(
+            "warning: issue {project}#{iid} is confidential — its redacted text is stored \
+             under refs/minds/intents and pushed by minds sync"
+        );
+    }
+    let intent = pipeline.redact_issue_intent(
+        minds_redact::IssueRef {
+            project,
+            iid,
+            updated_at: snapshot.updated_at,
+        },
+        scope,
+        snapshot.title,
+        snapshot.description,
+    )?;
+    let id = ctx.store.put_intent(&intent)?;
+    let counts = intent.audit().counts();
+    if !intent.audit().is_clean() {
+        eprintln!(
+            "warning: the issue text contained {} secret(s) and {} personal value(s) — \
+             the anchor binds the redacted version",
+            counts.secrets, counts.pii
+        );
+    }
+    let summary = summary(intent.anchor());
+    println!("{}", labeled("intent", &summary.intent));
+    println!("{}", labeled("scope", &summary.scope));
+    println!("{}", labeled("anchor", id.as_str()));
+    if !web_url.is_empty() {
+        println!("{}", labeled("issue", &visible(&web_url)));
+    }
     if let Err(err) = write_id_file(ctx.repo.git_dir(), LAST_BOUND_FILE, &id) {
         eprintln!(
             "warning: anchor stored, but the last-bound default was not updated: {}",
@@ -781,7 +885,9 @@ fn list() -> Fallible<()> {
     let ctx = Context::open()?;
     let ids = ctx.store.list_intents()?;
     if ids.is_empty() {
-        println!("no intent anchors — bind one with: minds intent bind --file <path>");
+        println!(
+            "no intent anchors — bind one with: minds intent bind --file <path> (or --issue <project#iid>)"
+        );
         return Ok(());
     }
     let active = read_id_file(&ctx.repo.git_dir().join(ACTIVE_INTENT_FILE));

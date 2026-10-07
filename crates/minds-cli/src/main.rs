@@ -55,6 +55,7 @@ mod import_cmd;
 #[cfg(feature = "tui")]
 mod inspect;
 mod intent_cmd;
+mod intent_issue;
 mod intent_proof;
 mod metrics;
 mod prepare_commit_msg;
@@ -212,6 +213,15 @@ Usage:
         snapshot and the expected scope. Warns when the file's version is
         not in HEAD. Refused: a file the redaction policy would change,
         credential files (.env, .pgpass, …) and .gitignored files.
+  minds intent bind --issue <group/project#iid> [--scope <glob,glob>]
+                    [--gitlab-url <url>] [--allow-confidential]
+        Binds a GitLab issue in its current version: source
+        issue:<project>#<iid>@<updated_at>, snapshot = the redacted
+        canonical JSON of title and description. Instance from
+        --gitlab-url, MINDS_GITLAB_URL or CI_SERVER_URL (never
+        .git/config; https only, http only for 127.0.0.1/[::1]); token only
+        from MINDS_GITLAB_TOKEN. A confidential issue is refused unless
+        --allow-confidential is given (refs/minds/ is synced).
   minds intent sign [<anchor-id>] [--key <path>] [--witness-home <dir>]
         Signs the anchor (default: last bound, only a file version in
         HEAD) under ssh-sig namespace minds-intent and activates it:
@@ -236,6 +246,7 @@ Usage:
                [--commit <rev>] [--require-explained <percent>] [--all]
                [--require-in-scope] [--witness-home <dir>]
                [--require-assurance <A0|A1|A2|A3>] [--limits]
+               [--online [--gitlab-url <url>]]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
         Multiple sessions print separate blocks; the worst verdict wins.
@@ -260,6 +271,12 @@ Usage:
         --require-assurance gates on the weakest session (exit 2, never
         masks 1/3/4). --witness-home checks the witness ledger: a witnessed
         seal missing from the repository is TAMPERED.
+        An intent bound to a GitLab issue adds an Issue version line:
+        without --online \"not checked (offline)\"; with --online (token
+        in MINDS_GITLAB_TOKEN, instance as for intent bind --issue)
+        current, changed since binding (confirmed in, not found in or no
+        description history) or version check unavailable. Never changes
+        the assurance, the verdict or the exit code.
         Exit codes: 0 VERIFIED, 1 TAMPERED, 2 \"VERIFIED, INCOMPLETE\",
         3 NOT VERIFIABLE, 4 operational failure (priority: 4 > 1 > 3 > 2 > 0).
   minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
@@ -427,8 +444,15 @@ const SPECS: &[Spec] = &[
     spec("sign", &["--key", "--seal"], &[], 1),
     spec(
         "intent",
-        &["--file", "--scope", "--key", "--witness-home"],
-        &[],
+        &[
+            "--file",
+            "--issue",
+            "--scope",
+            "--gitlab-url",
+            "--key",
+            "--witness-home",
+        ],
+        &["--allow-confidential"],
         2,
     ),
     spec("seals", &["--session", "--limit"], &[], 0),
@@ -443,8 +467,9 @@ const SPECS: &[Spec] = &[
             "--require-explained",
             "--witness-home",
             "--require-assurance",
+            "--gitlab-url",
         ],
-        &["--all", "--limits", "--require-in-scope"],
+        &["--all", "--limits", "--require-in-scope", "--online"],
         1,
     ),
     spec(
@@ -895,6 +920,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 witness_home: parsed.value("--witness-home"),
                 require_assurance: parsed.value("--require-assurance"),
                 limits: parsed.has("--limits"),
+                online: parsed.has("--online"),
+                gitlab_url: parsed.value("--gitlab-url"),
             },
         ),
 

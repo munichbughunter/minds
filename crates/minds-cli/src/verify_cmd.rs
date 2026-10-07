@@ -61,6 +61,7 @@ use std::path::Path;
 use std::process::{Command, ExitCode};
 
 use minds_core::evidence::{Seal, SealOutcome};
+use minds_core::intent_anchor::{IssueHistory, IssueVersion};
 use minds_core::{ContentHash, Session, SessionId};
 use minds_git::CommitId;
 use minds_store::{ContextStore, StoreError};
@@ -154,11 +155,19 @@ pub struct AssuranceOptions<'a> {
     pub require_assurance: Option<&'a str>,
     /// `--limits`: die Grenzen ausgeschrieben statt der Kurzzeile.
     pub limits: bool,
+    /// `--online`: die Fassung eines Issue-Ankers bei GitLab prüfen (EA-16).
+    pub online: bool,
+    /// `--gitlab-url <url>`: die Instanz dafür (nur mit `--online`).
+    pub gitlab_url: Option<&'a str>,
 }
 
 impl AssuranceOptions<'_> {
     fn any(&self) -> bool {
-        self.witness_home.is_some() || self.require_assurance.is_some() || self.limits
+        self.witness_home.is_some()
+            || self.require_assurance.is_some()
+            || self.limits
+            || self.online
+            || self.gitlab_url.is_some()
     }
 }
 
@@ -172,6 +181,8 @@ struct RunOptions<'a> {
     limits: bool,
     /// `--all`: auch die `uncorroborated`-Zeilen ungekappt.
     all: bool,
+    /// Die Versionsprüfung von Issue-Ankern — je Anker einmal je Lauf.
+    issue: crate::intent_issue::OnlineCheck,
 }
 
 /// Liest `--require-explained`: eine ganze Zahl 0–100.
@@ -202,8 +213,12 @@ pub fn run(
     // CI-Gate, das still wegfällt, wäre schlimmer als ein lauter Abbruch.
     if (options.any() || assurance_options.any()) && (evidence.is_some() || sig.is_some()) {
         eprintln!(
-            "minds verify: --commit, --require-explained, --require-in-scope, --all, --witness-home, --require-assurance and --limits apply only to the evidence verdict (not with --evidence/--sig)"
+            "minds verify: --commit, --require-explained, --require-in-scope, --all, --witness-home, --require-assurance, --limits, --online and --gitlab-url apply only to the evidence verdict (not with --evidence/--sig)"
         );
+        return ExitCode::from(4);
+    }
+    if assurance_options.gitlab_url.is_some() && !assurance_options.online {
+        eprintln!("minds verify: --gitlab-url applies only with --online");
         return ExitCode::from(4);
     }
     let required = match options.require_explained.map(parse_required).transpose() {
@@ -339,6 +354,11 @@ fn verify_target(
         ledger,
         limits: assurance_options.limits,
         all: options.all,
+        issue: crate::intent_issue::OnlineCheck::new(
+            assurance_options.online,
+            assurance_options.gitlab_url,
+            ctx.root.clone(),
+        ),
     };
     let artifact = match artifact_of(&ctx, &options, required, revision, &ids, signers) {
         Ok(artifact) => artifact,
@@ -759,7 +779,7 @@ fn verify_session(
                 intent: &intent,
             },
         );
-        print_assurance(&report, run.limits);
+        print_assurance(&report, run);
         println!("{}", Verdict::Unverifiable.word());
         return Ok((Verdict::Unverifiable, report.overall, scope));
     }
@@ -1007,7 +1027,7 @@ fn verify_session(
             intent: &intent,
         },
     );
-    print_assurance(&report, run.limits);
+    print_assurance(&report, run);
     println!(
         "Overall        {}{}",
         verdict.word(),
@@ -1016,13 +1036,97 @@ fn verify_session(
     Ok((verdict, report.overall, scope))
 }
 
-/// Die `Assurance`-, `Intent`- und `Not proven`-Zeilen eines Session-Blocks.
-fn print_assurance(report: &minds_reader::assurance::AssuranceReport, limits: bool) {
+/// Die `Assurance`-, `Intent`-, `Issue version`- und `Not proven`-Zeilen
+/// eines Session-Blocks.
+fn print_assurance(report: &minds_reader::assurance::AssuranceReport, run: &RunOptions<'_>) {
     println!("{}", assurance::assurance_line(report));
     println!("{}", assurance::intent_line(report));
-    for line in assurance::not_proven_lines(report.overall, limits) {
+    if let Some(line) = issue_version_line(report, run) {
         println!("{line}");
     }
+    for line in assurance::not_proven_lines(report.overall, run.limits) {
+        println!("{line}");
+    }
+}
+
+/// Die `Issue version`-Zeile (EA-16) — nur, wenn der gebundene Anker im
+/// Store liegt und auf ein GitLab-Issue zeigt. Ein Befund neben dem Verdikt,
+/// keine Aufwertung: Er geht weder in Assurance noch Exit-Code ein.
+fn issue_version_line(
+    report: &minds_reader::assurance::AssuranceReport,
+    run: &RunOptions<'_>,
+) -> Option<String> {
+    let minds_reader::assurance::IntentState::Bound {
+        anchor_id,
+        signature,
+        snapshot_matches,
+        ..
+    } = &report.intent
+    else {
+        return None;
+    };
+    let stored = run.trust.store().get_intent(anchor_id).ok().flatten()?;
+    let version = run.issue.version(anchor_id, &stored.anchor)?;
+    Some(format!(
+        "Issue version  {}",
+        issue_version_text(
+            version,
+            signature,
+            *snapshot_matches,
+            snapshot_has_placeholders(&stored.snapshot)
+        )
+    ))
+}
+
+/// Der Text der `Issue version`-Zeile. Ein Befund, der wie eine Bestätigung
+/// klingt (`current`, `confirmed`), nennt, was er **nicht** sagt: Ein
+/// Anker ohne gültige Signatur kann der Agent selbst gebunden haben; passt
+/// der abgelegte Snapshot nicht zum Anker, ist offen, was redigiert war; und
+/// wo der Snapshot Platzhalter trägt, sagt der Hash nichts über die Stelle.
+fn issue_version_text(
+    version: IssueVersion,
+    signature: &minds_reader::assurance::IntentSignature,
+    snapshot_matches: bool,
+    placeholders: bool,
+) -> String {
+    use minds_reader::assurance::IntentSignature;
+    let positive = matches!(
+        version,
+        IssueVersion::Current | IssueVersion::Changed(IssueHistory::Confirmed)
+    );
+    let mut notes = Vec::new();
+    if positive {
+        if !snapshot_matches {
+            notes.push("stored snapshot does not match the anchor, redaction state unknown");
+        } else if placeholders {
+            notes.push("redacted spans not compared");
+        }
+        match signature {
+            IntentSignature::Valid(_) => {}
+            IntentSignature::Unsigned => notes.push("anchor unsigned"),
+            IntentSignature::NotChecked => notes.push("anchor signature not checked"),
+            IntentSignature::Invalid => notes.push("anchor signature invalid"),
+        }
+    }
+    if notes.is_empty() {
+        version.text()
+    } else {
+        format!("{} ({})", version.text(), notes.join(", "))
+    }
+}
+
+/// Ob der abgelegte Snapshot Redaction-Platzhalter trägt.
+fn snapshot_has_placeholders(snapshot: &[u8]) -> bool {
+    [
+        minds_redact::Category::Secret.placeholder(),
+        minds_redact::Category::Pii.placeholder(),
+    ]
+    .iter()
+    .any(|placeholder| {
+        snapshot
+            .windows(placeholder.len())
+            .any(|window| window == placeholder.as_bytes())
+    })
 }
 
 /// Benennt einen manipulierten Seal, so weit die Repo-Lage es hergibt:
@@ -1750,4 +1854,54 @@ fn git_config(root: &Path, key: &str) -> Option<String> {
         .ok()?;
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !value.is_empty()).then_some(value)
+}
+
+#[cfg(test)]
+mod issue_version_tests {
+    use super::*;
+    use minds_reader::assurance::{IntentSignature, SignerKind};
+
+    /// Ein Befund, der wie eine Bestätigung klingt, nennt seine Grenzen;
+    /// ein negativer bleibt, wie er ist.
+    #[test]
+    fn positive_findings_name_what_they_do_not_say() {
+        let signed = IntentSignature::Valid(SignerKind::SecurityKey);
+        let current = IssueVersion::Current;
+        assert_eq!(issue_version_text(current, &signed, true, false), "current");
+        assert_eq!(
+            issue_version_text(current, &signed, true, true),
+            "current (redacted spans not compared)"
+        );
+        assert_eq!(
+            issue_version_text(current, &IntentSignature::Unsigned, true, false),
+            "current (anchor unsigned)"
+        );
+        // Ein ausgetauschter Snapshot ohne Platzhalter verliert den Hinweis
+        // nicht still.
+        assert_eq!(
+            issue_version_text(current, &IntentSignature::Invalid, false, false),
+            "current (stored snapshot does not match the anchor, redaction state unknown, \
+             anchor signature invalid)"
+        );
+        assert_eq!(
+            issue_version_text(
+                IssueVersion::Changed(IssueHistory::Confirmed),
+                &IntentSignature::NotChecked,
+                true,
+                false
+            ),
+            "changed since binding — bound version confirmed in description history \
+             (anchor signature not checked)"
+        );
+        for negative in [
+            IssueVersion::NotChecked,
+            IssueVersion::Changed(IssueHistory::NotFound),
+            IssueVersion::Unavailable("unauthorized (HTTP 401)"),
+        ] {
+            assert_eq!(
+                issue_version_text(negative, &IntentSignature::Unsigned, false, true),
+                negative.text()
+            );
+        }
+    }
 }

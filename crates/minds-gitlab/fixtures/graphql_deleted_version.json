@@ -1,0 +1,34 @@
+{
+  "data": {
+    "project": {
+      "issue": {
+        "notes": {
+          "pageInfo": { "hasNextPage": false, "endCursor": "eyJpZCI6IjMifQ" },
+          "nodes": [
+            {
+              "createdAt": "2026-09-29T09:12:44Z",
+              "systemNoteMetadata": {
+                "action": "description",
+                "descriptionVersion": { "description": "Max. 3 Versuche." }
+              }
+            },
+            {
+              "createdAt": "2026-09-30T17:02:10Z",
+              "systemNoteMetadata": {
+                "action": "description",
+                "descriptionVersion": { "description": null }
+              }
+            },
+            {
+              "createdAt": "2026-10-03T11:40:27Z",
+              "systemNoteMetadata": {
+                "action": "description",
+                "descriptionVersion": { "description": "Max. 7 Versuche, 500 ms Basis, mit Jitter." }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "errors": [
+    {
+      "message": "Request timed out. Please try a less complex query or a smaller set of records.",
+      "extensions": { "code": "TIMEOUT" }
+    }
+  ]
+}

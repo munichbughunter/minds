@@ -1786,6 +1786,7 @@ dependencies = [
 name = "minds-gitlab"
 version = "0.1.0"
 dependencies = [
+ "jiff",
  "minds-core",
  "serde",
  "serde_json",

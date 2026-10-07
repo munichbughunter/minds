@@ -26,6 +26,14 @@
 //! überschreiben. Das ist die Eigenschaft, die eine Spiegelung braucht, die in
 //! einer CI bei jedem Push läuft.
 //!
+//! # Lesen: Issue-Fassungen für Intent-Anker (EA-16)
+//!
+//! Die einzige Richtung **herein** ohne Opt-in ist lesend und erzeugt selbst
+//! nichts: [`issue`] holt Titel und Beschreibung eines Issues für
+//! `minds intent bind --issue` und prüft für `minds verify --online`, ob eine
+//! gebundene Fassung (noch) existiert. Der Anker entsteht erst in der CLI,
+//! über die Redaction.
+//!
 //! # Warum `curl` und kein HTTP-Stack
 //!
 //! Dieselbe Linie wie beim Signieren, das `ssh-keygen` aufruft: Die eine harte
@@ -44,12 +52,17 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 use minds_core::{ContentHash, Decision, Review, Subject};
 
+pub mod issue;
+#[cfg(test)]
+mod stub;
 pub mod webhook;
+
+pub use issue::{GitlabError, History, IssueSnapshot, check_version};
 
 /// Der HTML-Kommentar, an dem eine gespiegelte Note wiedererkannt wird.
 ///
@@ -92,7 +105,10 @@ pub fn note_body(hash: &ContentHash, review: &Review) -> String {
 }
 
 /// Ein Zugang zur GitLab-API eines Projekts.
-#[derive(Debug, Clone)]
+///
+/// `Debug` ist von Hand geschrieben: Ein `{:?}` (auch in einem `unwrap`)
+/// zeigt den Token nie.
+#[derive(Clone)]
 pub struct Project {
     /// Basis-URL der Instanz, z. B. `https://gitlab.com`.
     pub base_url: String,
@@ -100,6 +116,19 @@ pub struct Project {
     pub project: String,
     /// Der Token. Kommt aus einer Umgebungsvariablen, nie aus einem Argument.
     token: String,
+    /// Der Name dieser Variablen — curl bekommt sie nicht mit: Der Token
+    /// geht nur über stdin.
+    token_env: String,
+}
+
+impl std::fmt::Debug for Project {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Project")
+            .field("base_url", &self.base_url)
+            .field("project", &self.project)
+            .field("token", &"[token]")
+            .finish()
+    }
 }
 
 impl Project {
@@ -110,12 +139,11 @@ impl Project {
     /// Wenn die Variable fehlt oder leer ist. Das ist der häufigste
     /// Konfigurationsfehler, und er soll benannt werden, statt sich als HTTP 401
     /// zu zeigen.
-    pub fn new(base_url: &str, project: &str, token_env: &str) -> Result<Self, String> {
-        let token = std::env::var(token_env)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| format!("environment variable {token_env} is not set"))?;
-        Ok(Self::with_token(base_url, project, token))
+    pub fn new(base_url: &str, project: &str, token_env: &str) -> Result<Self, TokenError> {
+        let token = read_token(std::env::var(token_env).ok(), token_env)?;
+        let mut project = Self::with_token(base_url, project, token);
+        project.token_env = token_env.to_owned();
+        Ok(project)
     }
 
     /// Wie [`new`](Self::new), aber mit schon gelesenem Token.
@@ -128,6 +156,7 @@ impl Project {
             base_url: base_url.trim_end_matches('/').to_string(),
             project: project.to_string(),
             token,
+            token_env: String::new(),
         }
     }
 
@@ -171,23 +200,56 @@ impl Project {
     }
 
     fn get(&self, path: &str) -> Result<String, String> {
-        self.curl(&["--request", "GET"], path, None)
+        self.curl(GET, path, None)
     }
 
     fn post(&self, path: &str, json: &str) -> Result<String, String> {
-        self.curl(
-            &[
-                "--request",
-                "POST",
-                "--header",
-                "Content-Type: application/json",
-            ],
-            path,
-            Some(json),
-        )
+        self.curl(POST_JSON, path, Some(json))
     }
 
-    /// Der eine Ort, an dem das Netz angefasst wird.
+    /// Ein Aufruf der REST-API (`/api/v4…`), der nur Erfolg kennt: Jeder
+    /// Status außerhalb von 2xx wird ein Fehler, der GitLabs eigene Ursache
+    /// (`{"message": …}`) zitiert.
+    fn curl(&self, extra: &[&str], path: &str, body: Option<&str>) -> Result<String, String> {
+        let response = self.exchange(extra, &self.rest_url(path), body)?;
+        if !(200..300).contains(&response.status) {
+            let mut message = format!("GitLab call failed ({path}): HTTP {}", response.status);
+            // Erst den Token entfernen, dann kürzen: Läge er über der
+            // Schnittkante, bliebe sonst sein Anfang stehen.
+            let scrubbed = self.scrub(&response.body);
+            let text = scrubbed.trim();
+            if !text.is_empty() {
+                message.push_str(" — response: ");
+                let mut chars = text.chars();
+                message.extend(chars.by_ref().take(500));
+                if chars.next().is_some() {
+                    message.push('…');
+                }
+            }
+            return Err(message);
+        }
+        Ok(response.body)
+    }
+
+    /// `<basis>/api/v4<pfad>`.
+    fn rest_url(&self, path: &str) -> String {
+        format!("{}/api/v4{path}", self.base_url)
+    }
+
+    /// Entfernt den Token aus einem Text, der nach außen geht (Fehler,
+    /// Diagnosen). Der Token geht zwar nur über stdin hinaus — aber ein
+    /// Server oder Proxy, der Request-Header in seiner Antwort spiegelt,
+    /// brächte ihn über das Zitat der Antwort zurück.
+    fn scrub(&self, text: &str) -> String {
+        if self.token.is_empty() {
+            return text.to_owned();
+        }
+        text.replace(&self.token, "[token]")
+    }
+
+    /// Der eine Ort, an dem das Netz angefasst wird. Gibt Status und Body
+    /// zurück; ein `Err` heißt: keine HTTP-Antwort (Verbindung, Zeitlimit,
+    /// Größenlimit) — sein Text ist schon vom Token befreit.
     ///
     /// Der Token geht über stdin an `--header @-`, damit er nicht in der
     /// Argumentliste des Prozesses steht. `curl` liest `@-` dabei bis EOF —
@@ -198,13 +260,65 @@ impl Project {
     /// Besitzer lesbar ist und mit dem Ende des Aufrufs verschwindet. Der
     /// Token bleibt stdin — er soll weder auf die Platte noch in die
     /// Argumentliste.
-    fn curl(&self, extra: &[&str], path: &str, body: Option<&str>) -> Result<String, String> {
-        let url = format!("{}/api/v4{path}", self.base_url);
+    ///
+    /// Den Status hängt `--write-out` als letzte Zeile an stdout an: Was
+    /// danach kommt, kann nur curl geschrieben haben, nie der Server.
+    /// Umleitungen folgt curl ohne `--location` nicht — der Token geht nie
+    /// an einen anderen Host als den genannten.
+    ///
+    /// `-q` steht **zuerst**: curl liest dann keine `.curlrc` (`$CURL_HOME`,
+    /// `$XDG_CONFIG_HOME`, `$HOME`). Die kann ein Agent unter demselben
+    /// Nutzer schreiben — `trace-ascii` schriebe den Token in eine Datei,
+    /// `location` schickte ihn einem Umleitungsziel hinterher, `proxy` mit
+    /// `insecure` ließe einen fremden Server ein „passendes" Issue liefern.
+    /// `--proto` nennt nur das Schema der Basis-URL, `--proto-redir -all`
+    /// schließt jede Umleitung aus, auch wenn eine Option sie doch erlaubte.
+    /// `SSLKEYLOGFILE` fällt weg: Damit ließe sich TLS mitlesen.
+    ///
+    /// Die übrige Umgebung (Proxy-, CA-Variablen) ist die des Menschen und
+    /// gilt als vertrauenswürdig — außer für Loopback: Dorthin geht nie ein
+    /// Proxy, sonst reiste der Token im Klartext zu ihm.
+    ///
+    /// stdout wird mit fester Obergrenze gelesen ([`MAX_RESPONSE_BYTES`]):
+    /// `--max-filesize` bricht eine Übertragung ohne `Content-Length` erst
+    /// ab curl 8.4 ab.
+    fn exchange(&self, extra: &[&str], url: &str, body: Option<&str>) -> Result<Response, String> {
+        let proto = if url.starts_with("https://") {
+            "=https"
+        } else {
+            "=http"
+        };
         let mut command = Command::new("curl");
         command
-            .args(["--silent", "--show-error", "--fail-with-body"])
+            .arg("-q")
+            .env_remove("SSLKEYLOGFILE")
+            .env_remove("CURL_HOME")
+            .env_remove(if self.token_env.is_empty() {
+                "MINDS_GITLAB_TOKEN"
+            } else {
+                &self.token_env
+            })
+            .args(["--proto", proto, "--proto-redir", "-all"])
+            .args(["--silent", "--show-error"])
+            .args(["--connect-timeout", CONNECT_TIMEOUT])
+            .args(["--max-time", MAX_TIME])
+            .args(["--max-filesize", MAX_RESPONSE])
+            .args(["--write-out", STATUS_TRAILER])
             .args(["--header", "@-"])
             .args(extra);
+        if is_loopback_http(url) {
+            for proxy in [
+                "http_proxy",
+                "HTTP_PROXY",
+                "https_proxy",
+                "HTTPS_PROXY",
+                "all_proxy",
+                "ALL_PROXY",
+            ] {
+                command.env_remove(proxy);
+            }
+            command.arg("--noproxy").arg("*");
+        }
 
         let body_file = match body {
             Some(body) => {
@@ -226,7 +340,7 @@ impl Project {
         };
 
         command
-            .arg(&url)
+            .arg(url)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -235,45 +349,173 @@ impl Project {
             .spawn()
             .map_err(|err| format!("curl cannot be started: {err}"))?;
         {
-            let mut stdin = child.stdin.take().ok_or("curl: no stdin")?;
+            let Some(mut stdin) = child.stdin.take() else {
+                reap(&mut child);
+                return Err("curl: no stdin".into());
+            };
             writeln!(stdin, "PRIVATE-TOKEN: {}", self.token)
                 .map_err(|err| format!("curl: cannot write header: {err}"))?;
         }
-        let output = child
-            .wait_with_output()
+        // stderr nebenher, damit eine volle Pipe curl nicht anhält.
+        let Some(mut stderr) = child.stderr.take() else {
+            reap(&mut child);
+            return Err("curl: no stderr".into());
+        };
+        let diagnostics = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = (&mut stderr).take(64 * 1024).read_to_end(&mut text);
+            // Den Rest verwerfen, damit curl nie an einer vollen Pipe hängt.
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            text
+        });
+        let mut stdout = Vec::new();
+        let read = child
+            .stdout
+            .take()
+            .ok_or("curl: no stdout")?
+            .take(MAX_RESPONSE_BYTES + 1)
+            .read_to_end(&mut stdout);
+        let too_large = stdout.len() as u64 > MAX_RESPONSE_BYTES;
+        if too_large || read.is_err() {
+            let _ = child.kill();
+        }
+        let status = child
+            .wait()
             .map_err(|err| format!("curl did not finish: {err}"))?;
+        let stderr = diagnostics.join().unwrap_or_default();
         // Erst wenn curl fertig ist, darf die Body-Datei verschwinden.
         drop(body_file);
-
-        if !output.status.success() {
-            // stderr trägt curls Diagnose, stdout dank `--fail-with-body` die
-            // Antwort des Servers — dort steht die eigentliche Ursache, etwa
-            // GitLabs `{"message": …}`. Der Token kann in beidem nicht stehen,
-            // er ging über stdin.
-            let mut message = format!(
-                "GitLab call failed ({}): {}",
-                path,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-            let response = String::from_utf8_lossy(&output.stdout);
-            let response = response.trim();
-            if !response.is_empty() {
-                message.push_str(" — response: ");
-                let mut chars = response.chars();
-                message.extend(chars.by_ref().take(500));
-                if chars.next().is_some() {
-                    message.push('…');
-                }
-            }
-            return Err(message);
+        if too_large {
+            return Err(format!(
+                "GitLab not reachable at {url}: response larger than {MAX_RESPONSE_BYTES} bytes"
+            ));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+
+        let stdout = String::from_utf8_lossy(&stdout);
+        let parsed = stdout
+            .rsplit_once(STATUS_MARKER)
+            .and_then(|(body, status)| Some((body, status.trim().parse::<u16>().ok()?)));
+        match parsed {
+            // `000`: curl bekam keine Antwort.
+            Some((body, code)) if status.success() && code != 0 => Ok(Response {
+                status: code,
+                body: body.to_owned(),
+            }),
+            _ => Err(self.scrub(&format!(
+                "GitLab not reachable at {url}: {}",
+                String::from_utf8_lossy(&stderr).trim()
+            ))),
+        }
     }
 }
+
+/// Der Token aus dem Wert der Variablen `token_env`.
+///
+/// Ein abschließender Zeilenumbruch (CI-Datei-Variablen, `$(cat …)`) gehört
+/// nicht zum Token — tolerant gelesen. Der Token wird eine Header-Zeile: Ein
+/// Zeilenumbruch **darin** schöbe weitere Header ein, Leerraum wäre ohnehin
+/// kein Token.
+fn read_token(raw: Option<String>, token_env: &str) -> Result<String, TokenError> {
+    let token = raw
+        .map(|value| value.trim_end_matches(['\r', '\n']).to_owned())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| TokenError::Missing(token_env.to_owned()))?;
+    if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(TokenError::Malformed(token_env.to_owned()));
+    }
+    Ok(token)
+}
+
+/// Warum aus der Umgebungsvariablen kein Token wurde. Nennt die Variable,
+/// nie ihren Wert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenError {
+    /// Die Variable fehlt oder ist leer.
+    Missing(String),
+    /// Der Wert enthält Leer- oder Steuerzeichen.
+    Malformed(String),
+}
+
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing(env) => write!(f, "environment variable {env} is not set"),
+            Self::Malformed(env) => write!(
+                f,
+                "environment variable {env} contains whitespace or control characters"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokenError {}
+
+/// Ob `url` Klartext-HTTP an ein Loopback-Literal ist (`127.0.0.1`,
+/// `[::1]`) — über den Host, nicht über ein Präfix: `127.0.0.1.example`
+/// ist ein fremder Host.
+fn is_loopback_http(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split_once(']').map_or("", |(host, _)| host),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    matches!(host, "127.0.0.1" | "::1")
+}
+
+/// Beendet einen curl-Prozess, der nicht zu Ende laufen soll, und wartet
+/// auf ihn — kein Zombie.
+fn reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Die Antwort eines Aufrufs: Status und Body.
+#[derive(Debug)]
+struct Response {
+    status: u16,
+    body: String,
+}
+
+/// `curl`-Argumente eines GET.
+const GET: &[&str] = &["--request", "GET"];
+
+/// `curl`-Argumente eines POST mit JSON-Body.
+const POST_JSON: &[&str] = &[
+    "--request",
+    "POST",
+    "--header",
+    "Content-Type: application/json",
+];
+
+/// Frist für den Verbindungsaufbau (Sekunden).
+const CONNECT_TIMEOUT: &str = "10";
+
+/// Frist für einen ganzen Aufruf (Sekunden): Ein hängender Server hält
+/// weder eine CI-Spiegelung noch `minds verify --online` unbegrenzt auf.
+const MAX_TIME: &str = "60";
+
+/// Höchstgröße einer Antwort (Bytes) — ein Issue-Snapshot darf ohnehin
+/// höchstens [`minds_core::intent_anchor::MAX_SNAPSHOT`] groß sein; eine
+/// Seite Notes mit Beschreibungs-Fassungen kann ein Vielfaches davon tragen.
+const MAX_RESPONSE: &str = "67108864";
+
+/// Dieselbe Grenze als Zahl — so viel liest [`Project::exchange`] höchstens
+/// (plus der Status-Zeile, die curl anhängt).
+const MAX_RESPONSE_BYTES: u64 = 67_108_864 + 64;
+
+/// Steht vor dem HTTP-Status, den `--write-out` an stdout anhängt.
+const STATUS_MARKER: &str = "\nminds-http-status:";
+
+/// Das Format für `--write-out`.
+const STATUS_TRAILER: &str = "\nminds-http-status:%{http_code}";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stub::stub_server;
     use minds_core::Review;
 
     fn review(decision: Decision, summary: &str) -> Review {
@@ -324,81 +566,6 @@ mod tests {
         let verdict = review(Decision::Approve, "");
         let body = note_body(&verdict.content_hash().unwrap(), &verdict);
         assert!(!body.contains("> \n"), "{body}");
-    }
-
-    // --- Stub-Server für den curl-Pfad --------------------------------------
-    //
-    // Ein echter `curl`-Prozess gegen einen lokalen `TcpListener`: Nur so ist
-    // sichtbar, was wirklich über die Leitung geht — die Aufteilung von stdin
-    // zwischen Header und Body war genau der Fehler, den ein Mock der eigenen
-    // Abstraktion nie gefunden hätte (#7).
-
-    struct Received {
-        method: String,
-        path: String,
-        headers: Vec<String>,
-        body: String,
-    }
-
-    /// Startet einen Server, der die `responses` der Reihe nach ausliefert und
-    /// jeden empfangenen Request in den Kanal legt. Nach der letzten Antwort
-    /// endet der Thread; der Kanal meldet dann `Err` — „kein weiterer Request".
-    fn stub_server(responses: Vec<(u16, String)>) -> (String, std::sync::mpsc::Receiver<Received>) {
-        use std::io::Write as _;
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            for (status, body) in responses {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                let request = read_request(&mut stream);
-                let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len(),
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = sender.send(request);
-            }
-        });
-        (format!("http://{address}"), receiver)
-    }
-
-    fn read_request(stream: &mut std::net::TcpStream) -> Received {
-        use std::io::{BufRead, BufReader, Read};
-
-        let mut reader = BufReader::new(stream);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).unwrap();
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_string();
-        let path = parts.next().unwrap_or_default().to_string();
-
-        let mut headers = Vec::new();
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            reader.read_line(&mut line).unwrap();
-            let line = line.trim_end_matches(['\r', '\n']).to_string();
-            if line.is_empty() {
-                break;
-            }
-            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_length = value.trim().parse().unwrap_or(0);
-            }
-            headers.push(line);
-        }
-        let mut body = vec![0u8; content_length];
-        reader.read_exact(&mut body).unwrap();
-        Received {
-            method,
-            path,
-            headers,
-            body: String::from_utf8_lossy(&body).into_owned(),
-        }
     }
 
     #[test]
@@ -492,6 +659,107 @@ mod tests {
         assert!(!err.contains("geheim123"), "{err}");
     }
 
+    /// EA-16: Spiegelt ein Server (oder ein Proxy davor) die Request-Header
+    /// in seiner Fehlerantwort, käme der Token über das Zitat zurück — er
+    /// wird vorher entfernt. Der Rest der Ursache bleibt lesbar.
+    #[test]
+    fn a_reflected_token_is_scrubbed_from_the_error() {
+        let verdict = review(Decision::Approve, "gut");
+        let hash = verdict.content_hash().unwrap();
+        let (url, _received) = stub_server(vec![(
+            403,
+            r#"{"message":"403 Forbidden","request_headers":{"PRIVATE-TOKEN":"geheim123"}}"#.into(),
+        )]);
+        let project = Project::with_token(&url, "1", "geheim123".into());
+
+        let err = project.mirror(4, &hash, &verdict).unwrap_err();
+        assert!(err.contains("403 Forbidden"), "{err}");
+        assert!(err.contains("[token]"), "{err}");
+        assert!(!err.contains("geheim123"), "{err}");
+    }
+
+    /// Keine Antwort (niemand lauscht): Auch curls Diagnose nennt den Token
+    /// nicht.
+    #[test]
+    fn an_unreachable_instance_is_named_without_the_token() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let verdict = review(Decision::Approve, "gut");
+        let project = Project::with_token(&url, "1", "geheim123".into());
+        let err = project
+            .mirror(4, &verdict.content_hash().unwrap(), &verdict)
+            .unwrap_err();
+        assert!(err.contains("not reachable"), "{err}");
+        assert!(!err.contains("geheim123"), "{err}");
+    }
+
+    /// Security-Review EA-16: Ein gespiegelter Token, der über der
+    /// 500-Zeichen-Kante des Zitats liegt, hinterlässt keinen Anfang.
+    #[test]
+    fn a_token_straddling_the_quote_limit_leaves_no_prefix() {
+        let verdict = review(Decision::Approve, "gut");
+        let token = "glpat-AbCdEfGhIjKlMnOpQrSt";
+        let body = format!("{}{token}", "x".repeat(490));
+        let (url, _received) = stub_server(vec![(500, body)]);
+        let project = Project::with_token(&url, "1", token.into());
+        let err = project
+            .mirror(4, &verdict.content_hash().unwrap(), &verdict)
+            .unwrap_err();
+        assert!(!err.contains(&token[..12]), "{err}");
+    }
+
+    #[test]
+    fn loopback_is_judged_by_the_host() {
+        for yes in [
+            "http://127.0.0.1:8080/x",
+            "http://[::1]:9000",
+            "http://127.0.0.1",
+        ] {
+            assert!(is_loopback_http(yes), "{yes}");
+        }
+        for no in [
+            "http://127.0.0.1.evil.example/",
+            "https://127.0.0.1",
+            "http://[::1",
+            "http://localhost",
+        ] {
+            assert!(!is_loopback_http(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn debug_never_shows_the_token() {
+        let project = Project::with_token("https://gitlab.example", "1", "geheim123".into());
+        let shown = format!("{project:?}");
+        assert!(!shown.contains("geheim123"), "{shown}");
+        assert!(shown.contains("[token]"), "{shown}");
+    }
+
+    /// Ein abschließender Zeilenumbruch ist kein Teil des Tokens; einer
+    /// mitten darin (Header-Injektion) und Leerraum sind ein Fehler.
+    #[test]
+    fn the_token_is_read_tolerantly_but_never_injects_headers() {
+        let read = |raw: &str| read_token(Some(raw.to_owned()), "T");
+        assert_eq!(read("glpat-abc\n").unwrap(), "glpat-abc");
+        assert_eq!(read("glpat-abc\r\n").unwrap(), "glpat-abc");
+        for bad in ["glpat-abc\nX-Evil: 1", "glpat abc", "glpat-\tabc"] {
+            assert_eq!(read(bad), Err(TokenError::Malformed("T".into())), "{bad:?}");
+        }
+        for empty in ["", "  ", "\n"] {
+            assert_eq!(
+                read(empty),
+                Err(TokenError::Missing("T".into())),
+                "{empty:?}"
+            );
+        }
+        assert_eq!(read_token(None, "T"), Err(TokenError::Missing("T".into())));
+        assert_eq!(
+            TokenError::Malformed("T".into()).to_string(),
+            "environment variable T contains whitespace or control characters"
+        );
+    }
+
     #[test]
     fn a_missing_token_is_named_not_deferred_to_a_401() {
         // SAFETY-freie Variante: eine Variable, die es sicher nicht gibt.
@@ -501,7 +769,10 @@ mod tests {
             "MINDS_TEST_TOKEN_GIBT_ES_NICHT",
         )
         .unwrap_err();
-        assert!(err.contains("MINDS_TEST_TOKEN_GIBT_ES_NICHT"), "{err}");
+        assert!(
+            err.to_string().contains("MINDS_TEST_TOKEN_GIBT_ES_NICHT"),
+            "{err}"
+        );
     }
 
     #[test]

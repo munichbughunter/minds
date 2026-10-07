@@ -1,0 +1,14 @@
+{
+  "id": 90142,
+  "iid": 42,
+  "project_id": 17,
+  "title": "Retry mit exponentiellem Backoff",
+  "description": "Max. 7 Versuche, 500 ms Basis, mit Jitter.",
+  "state": "opened",
+  "confidential": false,
+  "created_at": "2026-09-28T14:02:11.000Z",
+  "updated_at": "2026-10-03T11:40:27.512Z",
+  "labels": ["backend"],
+  "author": { "id": 3, "username": "anna", "name": "Anna" },
+  "web_url": "https://gitlab.example/team/minds/-/issues/42"
+}
