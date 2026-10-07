@@ -19,6 +19,7 @@ use ScopeSource::*;
 
 fn call(kind: EffectKind, path: &str) -> ToolCall {
     ToolCall {
+        outcome: None,
         name: if kind == EffectKind::Delete {
             "Delete"
         } else {

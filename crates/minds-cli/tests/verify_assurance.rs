@@ -146,9 +146,11 @@ impl Fixture {
         let tool_calls = claim
             .map(|bytes| {
                 vec![minds_core::ToolCall {
+                    outcome: None,
                     name: "Write".into(),
                     arguments: String::new(),
                     capture: Some(minds_core::Capture {
+                        note: None,
                         status: minds_core::CaptureStatus::Interpreted,
                         adapter: "claude-code".into(),
                         adapter_version: 1,

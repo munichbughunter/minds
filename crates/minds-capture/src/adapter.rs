@@ -42,11 +42,12 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use minds_core::{
-    Agent, ContentHash, EffectKind, Intent, Lineage, Model, Produced, Redaction, Role, Session,
-    ToolCall, Turn, WrittenUnavailable,
+    Agent, CaptureNote, ContentHash, EffectKind, Intent, Lineage, Model, Produced, Redaction, Role,
+    Session, ToolCall, Turn, WrittenUnavailable,
 };
 
 use crate::edges;
+use crate::exec_outcome;
 use crate::journal::{EventKind, Journal, JournalEvent, SessionKey};
 use crate::normalize;
 use crate::transcript::{self, Transcript};
@@ -194,6 +195,7 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
     let (mut session, call_events) = build_indexed(key, events);
 
     written_hashes(&mut session, events, &call_events, key.agent(), ctx);
+    exec_outcomes(&mut session, events, &call_events, key.agent());
     hash_artifacts(&mut session, ctx, &[]);
 
     session.edges.extend(edges::subagent(key.agent(), events));
@@ -230,6 +232,7 @@ pub fn checkpoint_witness(
         key.agent(),
         &written_ctx,
     );
+    exec_outcomes(&mut session, events, &call_events, key.agent());
     hash_artifacts(&mut session, ctx, path_map);
     session.edges.extend(edges::subagent(key.agent(), events));
     if let Some(commit) = ctx.commit {
@@ -417,27 +420,7 @@ fn written_hashes(
     // Datei.
     let canonical_root = root.and_then(|r| fs::canonicalize(r).ok());
     let roots: Vec<&Path> = root.into_iter().chain(canonical_root.as_deref()).collect();
-
-    // Pre-Kennungen zaehlen: Eine Kennung, die zwei Aufrufe tragen, ordnet
-    // keinem von beiden ein Post-Event zu.
-    let mut pre_ids: BTreeMap<String, usize> = BTreeMap::new();
-    for event in events.iter().filter(|e| e.kind == EventKind::ToolPre) {
-        if let Some(id) = adapter.call_id(event) {
-            *pre_ids.entry(id).or_default() += 1;
-        }
-    }
-
-    // Post-Events nach Kennung. Eine doppelt vergebene Kennung ist keine
-    // Zuordnung, sondern zwei — dann lieber keine (`None`).
-    let mut posts: BTreeMap<String, Option<&JournalEvent>> = BTreeMap::new();
-    for event in events.iter().filter(|e| e.kind == EventKind::ToolPost) {
-        if let Some(id) = adapter.call_id(event) {
-            posts
-                .entry(id)
-                .and_modify(|slot| *slot = None)
-                .or_insert(Some(event));
-        }
-    }
+    let posts = PostIndex::new(adapter, events);
 
     let calls = session.turns.iter_mut().flat_map(|t| &mut t.tool_calls);
     for (call, &pre_index) in calls.zip(call_events) {
@@ -453,23 +436,146 @@ fn written_hashes(
             Some(path) if !inside_repo_resolved(path, &roots) => {
                 Err(WrittenUnavailable::OutsideRepo)
             }
-            Some(path) => {
-                let post = events
-                    .get(pre_index)
-                    .and_then(|pre| adapter.call_id(pre))
-                    .filter(|id| pre_ids.get(id) == Some(&1))
-                    .and_then(|id| posts.get(&id).copied().flatten());
-                match post {
-                    Some(post) => adapter
-                        .written_bytes(post, path)
-                        .and_then(|bytes| scanned_hash(ctx.redaction, &bytes, bytes.as_bytes())),
-                    None => Err(WrittenUnavailable::PayloadWithoutContent),
-                }
-            }
+            Some(path) => match posts.post_for(events.get(pre_index)) {
+                Some(post) => adapter
+                    .written_bytes(post, path)
+                    .and_then(|bytes| scanned_hash(ctx.redaction, &bytes, bytes.as_bytes())),
+                None => Err(WrittenUnavailable::PayloadWithoutContent),
+            },
         };
         match outcome {
             Ok(hash) => effect.written = Some(hash),
             Err(reason) => effect.written_unavailable = Some(reason),
+        }
+    }
+}
+
+/// Die Brücke von einem Pre-Event zu seinem Post-Event über die Kennung des
+/// Adapters ([`ToolAdapter::call_id`](crate::ToolAdapter::call_id)) —
+/// geteilt von Schreibzeit-Hash und Runner-Ergebnis, damit beide nach
+/// derselben Regel zuordnen.
+///
+/// Fail-closed: Eine Kennung, die zwei Pre-Events tragen, ordnet keinem von
+/// beiden ein Post-Event zu; eine Kennung an zwei Post-Events ist keine
+/// Zuordnung, sondern zwei — dann keine. Über die Reihenfolge wird nicht
+/// geraten.
+struct PostIndex<'e> {
+    adapter: &'static dyn normalize::ToolAdapter,
+    pre_ids: BTreeMap<String, usize>,
+    posts: BTreeMap<String, Option<&'e JournalEvent>>,
+}
+
+impl<'e> PostIndex<'e> {
+    fn new(adapter: &'static dyn normalize::ToolAdapter, events: &'e [JournalEvent]) -> Self {
+        let mut pre_ids: BTreeMap<String, usize> = BTreeMap::new();
+        for event in events.iter().filter(|e| e.kind == EventKind::ToolPre) {
+            if let Some(id) = adapter.call_id(event) {
+                *pre_ids.entry(id).or_default() += 1;
+            }
+        }
+        let mut posts: BTreeMap<String, Option<&JournalEvent>> = BTreeMap::new();
+        for event in events.iter().filter(|e| e.kind == EventKind::ToolPost) {
+            if let Some(id) = adapter.call_id(event) {
+                posts
+                    .entry(id)
+                    .and_modify(|slot| *slot = None)
+                    .or_insert(Some(event));
+            }
+        }
+        Self {
+            adapter,
+            pre_ids,
+            posts,
+        }
+    }
+
+    /// Das eindeutige Post-Event zu diesem Pre-Event, falls es eines gibt.
+    fn post_for(&self, pre: Option<&JournalEvent>) -> Option<&'e JournalEvent> {
+        pre.and_then(|pre| self.adapter.call_id(pre))
+            .filter(|id| self.pre_ids.get(id) == Some(&1))
+            .and_then(|id| self.posts.get(&id).copied().flatten())
+    }
+}
+
+/// Füllt [`ToolCall::outcome`] der Shell-Aufrufe bekannter Test- und
+/// Benchmark-Runner — aus dem Post-Payload, nie aus einer Datei (EA-18a).
+///
+/// Die Reihenfolge:
+///
+/// 1. Nur Adapter, deren Payload-Form aufgezeichnet ist
+///    ([`ToolAdapter::exec_outcomes`](crate::ToolAdapter::exec_outcomes)),
+///    und nur `Exec`-Effekte.
+/// 2. **Einfaches Kommando** ([`exec_outcome::simple_argv`]). Sonst kein
+///    Ergebnis — und, wenn das Kommando einen bekannten Runner nennt, der
+///    Hinweis [`CaptureNote::CompoundCommandNotInterpreted`]. Ein Replay
+///    soll nie eine Shell brauchen.
+/// 3. **Bekannter Runner** ([`exec_outcome::recognize`]).
+/// 4. **Korrelation** mit dem Post-Event ([`PostIndex`]), Gegenprobe des
+///    Kommandos im Post-Payload durch den Adapter.
+/// 5. **Zusammenfassung parsen** ([`exec_outcome::interpret`]): Gespeichert
+///    werden nur Zahlen und Bench-Namen. Die Bench-Namen und das argv
+///    scannt die Redaction danach wie jedes Textfeld.
+///
+/// Eine Ableitung im Sinne der Invariante? Nein — eine **Deutung** des
+/// Adapters, versioniert über [`Capture::adapter_version`](minds_core::Capture),
+/// wie `effect` und `written`. Sie kann nur hier entstehen: Der Payload liegt
+/// nach dem Checkpoint nicht mehr vor. Ob die Behauptung stimmt, rechnet
+/// erst ein Replay im Reader (W5).
+fn exec_outcomes(
+    session: &mut Session,
+    events: &[JournalEvent],
+    call_events: &[usize],
+    agent: &str,
+) {
+    let Some(adapter) = normalize::adapter_for(agent).filter(|a| a.exec_outcomes()) else {
+        return;
+    };
+    let posts = PostIndex::new(adapter, events);
+
+    let calls = session.turns.iter_mut().flat_map(|t| &mut t.tool_calls);
+    for (call, &pre_index) in calls.zip(call_events) {
+        if call.effect.as_ref().map(|e| e.kind) != Some(EffectKind::Exec) {
+            continue;
+        }
+        let Some(command) = command_str(&call.arguments) else {
+            continue;
+        };
+        let argv = match exec_outcome::simple_argv(&command) {
+            Ok(argv) => argv,
+            Err(_) => {
+                if exec_outcome::mentions_runner(&command)
+                    && let Some(capture) = call.capture.as_mut()
+                {
+                    capture.note = Some(CaptureNote::CompoundCommandNotInterpreted);
+                }
+                continue;
+            }
+        };
+        let Some(runner) = exec_outcome::recognize(&argv) else {
+            // Ein einfaches Kommando, das einen Runner nur umhüllt
+            // (`timeout 600 cargo test`, `env X=1 pytest`): Gedeutet wird
+            // nur ein Runner an `argv[0]` — der Grund steht dabei.
+            if exec_outcome::wraps_runner(&argv)
+                && let Some(capture) = call.capture.as_mut()
+            {
+                capture.note = Some(CaptureNote::ResultNotCaptured);
+            }
+            continue;
+        };
+        call.outcome = posts
+            .post_for(events.get(pre_index))
+            .and_then(|post| adapter.exec_report(post, &command))
+            .and_then(|report| exec_outcome::interpret(runner, argv, &report));
+        // Erkannt, aber ohne Zusammenfassung — kein Ergebnis, oder nur ein
+        // Exit-Code (Build-Fehler, unlesbare Zusammenfassung): Das steht
+        // dabei, damit „kein `outcome`" nicht als „nicht versucht" und ein
+        // nackter Exit-Code nicht als „gelesen" erscheint.
+        let summarized = call
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.tests.is_some() || !o.benches.is_empty());
+        if !summarized && let Some(capture) = call.capture.as_mut() {
+            capture.note = Some(CaptureNote::ResultNotCaptured);
         }
     }
 }
@@ -754,6 +860,7 @@ fn build_turns(
                 let turn = open.get_or_insert_with(|| assistant_turn(&event.at));
                 if let Some(tool) = facts.tool {
                     turn.tool_calls.push(ToolCall {
+                        outcome: None,
                         name: tool.name,
                         arguments: tool.arguments,
                         effect: tool.effect,

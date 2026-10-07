@@ -498,6 +498,7 @@ mod tests {
             "",
             None,
             vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Write".into(),
                 arguments: String::new(),
@@ -517,6 +518,7 @@ mod tests {
             "",
             None,
             vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Read".into(),
                 arguments: String::new(),
@@ -588,6 +590,7 @@ mod tests {
 
     fn call(name: &str, args: &str, kind: Option<EffectKind>, path: Option<&str>) -> ToolCall {
         ToolCall {
+            outcome: None,
             capture: None,
             name: name.into(),
             arguments: args.into(),

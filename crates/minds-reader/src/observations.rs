@@ -704,6 +704,7 @@ mod tests {
     fn corroborations_cover_every_write_claim() {
         use minds_core::{Agent, Effect, Intent, Model, Role, ToolCall, Turn};
         let call = |path: &str, written: Option<ContentHash>| ToolCall {
+            outcome: None,
             name: "Write".into(),
             arguments: String::new(),
             capture: None,

@@ -19,6 +19,7 @@ fn commit() -> CommitId {
 }
 fn call(name: &str, path: &str, arguments: serde_json::Value, written: Option<&[u8]>) -> ToolCall {
     ToolCall {
+        outcome: None,
         name: name.into(),
         arguments: arguments.to_string(),
         capture: None,

@@ -246,6 +246,7 @@ mod tests {
 
     fn call(kind: EffectKind, path: &str) -> ToolCall {
         ToolCall {
+            outcome: None,
             capture: None,
             name: "T".into(),
             arguments: format!("{{\"command\":\"{path}\"}}"),

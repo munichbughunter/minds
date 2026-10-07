@@ -53,6 +53,7 @@ fn session(request: &str, started: &str) -> Session {
         text: "Ich lese und ändere.".into(),
         tool_calls: vec![
             ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Read".into(),
                 arguments: "{}".into(),
@@ -65,6 +66,7 @@ fn session(request: &str, started: &str) -> Session {
                 }),
             },
             ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Edit".into(),
                 arguments: "{}".into(),
@@ -77,6 +79,7 @@ fn session(request: &str, started: &str) -> Session {
                 }),
             },
             ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Bash".into(),
                 arguments: "{\"command\":\"cargo test\"}".into(),
@@ -867,7 +870,9 @@ fn an_uninterpreted_tool_call_shows_as_half_seen_not_as_a_plain_tool() {
     let mut sessions = BTreeMap::new();
     let mut s = session("Wende den Patch an", "2026-07-25T14:10:00Z");
     s.turns[0].tool_calls = vec![ToolCall {
+        outcome: None,
         capture: Some(minds_core::Capture {
+            note: None,
             status: minds_core::CaptureStatus::Uninterpreted,
             adapter: "generic".into(),
             adapter_version: 1,
@@ -1236,6 +1241,7 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
 /// Ein `Write`-Aufruf samt Schreibzeit-Hash — wie EA-01a ihn speichert.
 fn write_call(path: &str, text: &str) -> ToolCall {
     ToolCall {
+        outcome: None,
         capture: None,
         name: "Write".into(),
         arguments: serde_json::json!({ "content": text }).to_string(),

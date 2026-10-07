@@ -1033,6 +1033,7 @@ mod tests {
                 role: minds_core::Role::Assistant,
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    outcome: None,
                     name: "T".into(),
                     arguments: String::new(),
                     capture: None,

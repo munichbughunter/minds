@@ -68,6 +68,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn write(path: &str, text: &str) -> ToolCall {
     ToolCall {
+        outcome: None,
         name: "Write".into(),
         arguments: serde_json::json!({ "content": text }).to_string(),
         capture: None,

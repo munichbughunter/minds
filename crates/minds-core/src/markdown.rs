@@ -218,6 +218,7 @@ mod tests {
             role: Role::Assistant,
             text: "Ich sehe mir die Backoff-Logik an.".into(),
             tool_calls: vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Bash".into(),
                 arguments: r#"{"command":"cargo test retry"}"#.into(),
