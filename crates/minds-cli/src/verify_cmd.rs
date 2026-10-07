@@ -18,6 +18,12 @@
 //! `--require-explained <prozent>` macht daraus ein Gate: verfehlt ⇒ Exit 2,
 //! außer das Verdikt ist schon schlechter (das Schlechteste gewinnt, W6).
 //!
+//! Erklärt der gebundene Intent-Anker einen Bereich (`scope=`), zählt die
+//! Coverage-Zeile außerdem die Pfade außerhalb davon (EA-17, siehe
+//! [`scope`]): geänderte Dateien des Commits, Schreib-Claims und
+//! Beobachtungen der Session. `--require-in-scope` ist das Gate dazu —
+//! verfehlt oder nicht beurteilbar ⇒ Exit 2, nie über 1/3/4 hinweg.
+//!
 //! Unter den drei Achsen stehen die **Assurance** der Session (EA-11/EA-12,
 //! siehe [`assurance`]: wer das Material beobachtet hat, mit dem ersten
 //! Grund, warum es nicht mehr ist) und **`Not proven`** — die Grenzen, die
@@ -63,6 +69,7 @@ use crate::context::Context;
 
 mod artifact;
 pub(crate) mod assurance;
+mod scope;
 pub(crate) mod witness_trust;
 
 use artifact::Artifact;
@@ -125,11 +132,16 @@ pub struct ArtifactOptions<'a> {
     pub require_explained: Option<&'a str>,
     /// `--all`: alle Detailzeilen, ungekappt.
     pub all: bool,
+    /// `--require-in-scope`: das Scope-Gate (EA-17).
+    pub require_in_scope: bool,
 }
 
 impl ArtifactOptions<'_> {
     fn any(&self) -> bool {
-        self.commit.is_some() || self.require_explained.is_some() || self.all
+        self.commit.is_some()
+            || self.require_explained.is_some()
+            || self.all
+            || self.require_in_scope
     }
 }
 
@@ -190,7 +202,7 @@ pub fn run(
     // CI-Gate, das still wegfällt, wäre schlimmer als ein lauter Abbruch.
     if (options.any() || assurance_options.any()) && (evidence.is_some() || sig.is_some()) {
         eprintln!(
-            "minds verify: --commit, --require-explained, --all, --witness-home, --require-assurance and --limits apply only to the evidence verdict (not with --evidence/--sig)"
+            "minds verify: --commit, --require-explained, --require-in-scope, --all, --witness-home, --require-assurance and --limits apply only to the evidence verdict (not with --evidence/--sig)"
         );
         return ExitCode::from(4);
     }
@@ -315,6 +327,9 @@ fn verify_target(
         {
             println!("{line}");
         }
+        if options.require_in_scope {
+            println!("Gate           scope not assessed (no linked session) — required in scope");
+        }
         return Verdict::Unverifiable.exit();
     }
     let run = RunOptions {
@@ -341,16 +356,18 @@ fn verify_target(
         _ => false,
     };
     let mut levels = Vec::new();
+    let mut scopes = Vec::new();
     for (i, (id, link)) in links.into_iter().enumerate() {
         if i > 0 {
             println!();
         }
         match verify_session(&ctx, id, &run, link, &artifact) {
-            Ok((verdict, level)) => {
+            Ok((verdict, level, scope)) => {
                 if verdict.severity() > worst.severity() {
                     worst = verdict;
                 }
                 levels.push(level);
+                scopes.push(scope);
             }
             Err(err) => {
                 operational_failure(err.as_ref());
@@ -383,9 +400,14 @@ fn verify_target(
         };
         line.map(|line| println!("{line}")).is_some()
     });
+    // Das Scope-Gate: jede Session gegen ihren Bereich, fail-closed.
+    let scope_failed = options.require_in_scope
+        && scope::gate_failure(&scopes, &artifact)
+            .map(|line| println!("{line}"))
+            .is_some();
     if failed {
         ExitCode::from(4)
-    } else if (gate_failed || assurance_failed) && worst == Verdict::Verified {
+    } else if (gate_failed || assurance_failed || scope_failed) && worst == Verdict::Verified {
         // Ein verfehltes Gate ist Exit 2 — es maskiert nie 1/3/4 (W6).
         Verdict::Incomplete.exit()
     } else {
@@ -436,7 +458,9 @@ fn artifact_of(
                 // Ein Gate urteilt nicht über einen geratenen Commit: Wer
                 // einen späteren Commit mit demselben Trailer anlegt, könnte
                 // sonst den Prüfgegenstand wählen.
-                [_, _, ..] if required.is_some_and(|r| r > 0) => {
+                // Für das Scope-Gate ebenso: Ein früherer Commit derselben
+                // Session bliebe sonst ungeprüft.
+                [_, _, ..] if required.is_some_and(|r| r > 0) || options.require_in_scope => {
                     return Ok(ArtifactState::Unavailable(
                         "several commits carry this session — pass --commit",
                     ));
@@ -630,7 +654,7 @@ fn verify_session(
     run: &RunOptions<'_>,
     link: Option<EvidenceSource>,
     artifact: &ArtifactState,
-) -> Fallible<(Verdict, Assurance)> {
+) -> Fallible<(Verdict, Assurance, scope::ScopeState)> {
     println!("Session        {id}");
     let store = ctx.store.as_ref();
 
@@ -715,6 +739,10 @@ fn verify_session(
         println!("Seals          none — captured before the evidence chain");
     }
     if legacy && !ledger_tampered {
+        let intent = assurance::intent_state(&run.trust, id, loaded.as_ref(), &[]);
+        // Ohne Seals ist das Verdikt NOT VERIFIABLE (3): Über den Bereich
+        // ist nichts sagbar, und das Gate kann hier nie zu 0 führen.
+        let scope = scope::ScopeState::NotAssessed(minds_reader::scope::NoScope::NoEvidenceChain);
         let report = assurance::report(
             &run.trust,
             &assurance::Facts {
@@ -728,11 +756,12 @@ fn verify_session(
                 link,
                 ledger: &run.ledger.check,
                 observations: &FsCoverage::Unavailable { cause: None },
+                intent: &intent,
             },
         );
         print_assurance(&report, run.limits);
         println!("{}", Verdict::Unverifiable.word());
-        return Ok((Verdict::Unverifiable, report.overall));
+        return Ok((Verdict::Unverifiable, report.overall, scope));
     }
 
     let (mut checked, mut incomplete_reasons, seal_tampered) = check_seals(
@@ -822,7 +851,7 @@ fn verify_session(
             if tampered { "VIOLATED" } else { "intact" }
         ),
     }
-    let scopes: Vec<String> = {
+    let boundaries: Vec<String> = {
         // Zweite Schicht neben der Parse-Härtung: Der Scope stammt aus dem
         // Repo — fremdbestimmt, also entschärft ausgeben.
         let mut s: Vec<String> = checked
@@ -833,11 +862,51 @@ fn verify_session(
         s.dedup();
         s
     };
+    // Was der Witness sah: Fenster und Beobachtungen nur aus Seals, die er
+    // gültig signiert hat (`witness_trust`) — dieselbe Quelle für die
+    // Korroboration, die Scope-Befunde und die Abdeckung, aus der die Stufe
+    // rechnet.
+    let trusted = |seal_id: &ContentHash, text: &str| {
+        matches!(
+            run.trust.signature(seal_id, text),
+            minds_reader::assurance::SealSignature::Witness { .. }
+        )
+    };
+    // Ohne lesbare Nutzlast gibt es weder Fenster noch Bindung — der
+    // Bereich ist dann nicht beurteilbar (`session payload unreadable`).
+    let (windows, window_observations) = match &loaded {
+        Some(session) => {
+            minds_reader::observations::session_observations(store, id, session, &trusted)
+        }
+        None => (
+            Vec::new(),
+            minds_reader::observations::WindowObservations {
+                observations: Vec::new(),
+                complete: true,
+            },
+        ),
+    };
+    let seals: Vec<(ContentHash, Seal, String)> = checked
+        .iter()
+        .map(|c| (c.id.clone(), c.seal.clone(), c.text.clone()))
+        .collect();
+    // Einmal je Session: Der Bereich der Scope-Befunde und die Stufe
+    // stammen aus demselben Anker.
+    let intent = assurance::intent_state(&run.trust, id, loaded.as_ref(), &seals);
+    let scope = scope::assess(
+        store,
+        &ctx.repo,
+        &ctx.root,
+        &intent,
+        loaded.as_ref(),
+        artifact,
+        &window_observations,
+    );
     let mut segments = Vec::new();
-    if !scopes.is_empty() {
+    if !boundaries.is_empty() {
         segments.push(format!(
             "boundary: {} — activity outside it is not captured",
-            scopes.join(", ")
+            boundaries.join(", ")
         ));
     }
     if let ArtifactState::Assessed(artifact) = artifact {
@@ -847,6 +916,17 @@ fn verify_session(
             .fold(0u64, |sum, c| sum.saturating_add(c.seal.gaps));
         segments.push(format!("{gaps} {}", if gaps == 1 { "gap" } else { "gaps" }));
         segments.push(artifact.coverage_segment());
+    }
+    // Aus verändertem Material sind Scope-Befunde keine Fakten: Bei
+    // verletzter Integrität fehlen Segment und Detailzeilen.
+    let scope_shown = !(tampered || ledger_tampered);
+    let scope = if scope_shown {
+        scope
+    } else {
+        scope::ScopeState::NotAssessed(minds_reader::scope::NoScope::IntegrityViolated)
+    };
+    if scope_shown {
+        segments.extend(scope::segment(&scope));
     }
     let boundary = if segments.is_empty() {
         String::new()
@@ -863,37 +943,31 @@ fn verify_session(
             "incomplete"
         }
     );
-    match artifact {
-        ArtifactState::Assessed(artifact) => {
-            for line in artifact.detail_lines() {
-                println!("{line}");
-            }
+    if let ArtifactState::Assessed(artifact) = artifact {
+        for line in artifact.detail_lines() {
+            println!("{line}");
         }
+    }
+    if scope_shown {
+        for line in scope::detail_lines(&scope, run.all, &scope::rerun(artifact, id)) {
+            println!("{line}");
+        }
+    }
+    match artifact {
+        ArtifactState::Assessed(_) => {}
         ArtifactState::NoCommit => println!("Artifact       not assessed (no linked commit)"),
         ArtifactState::Unavailable(why) => println!("Artifact       not assessed ({why})"),
         ArtifactState::Failed(err) => println!("Artifact       not assessed (error: {err})"),
     }
 
-    // Was der Witness sah: Fenster und Beobachtungen nur aus Seals, die er
-    // gültig signiert hat (`witness_trust`) — dieselbe Quelle für die
-    // Korroboration und für die Abdeckung, aus der die Stufe rechnet.
-    let trusted = |seal_id: &ContentHash, text: &str| {
-        matches!(
-            run.trust.signature(seal_id, text),
-            minds_reader::assurance::SealSignature::Witness { .. }
-        )
-    };
-    let windows = match &loaded {
-        Some(session) => {
-            minds_reader::observations::witness_windows(store, &[(id, session)], &trusted)
-        }
-        None => Vec::new(),
-    };
     if let (Some(session), false) = (&loaded, windows.is_empty()) {
-        let observations =
-            minds_reader::observations::observations_in_windows(store, &windows, &trusted);
-        for line in assurance::uncorroborated_lines(&ctx.root, id, session, &observations, run.all)
-        {
+        for line in assurance::uncorroborated_lines(
+            &ctx.root,
+            id,
+            session,
+            &window_observations.observations,
+            run.all,
+        ) {
             println!("{line}");
         }
     }
@@ -914,10 +988,6 @@ fn verify_session(
             None
         }
     };
-    let seals: Vec<(ContentHash, Seal, String)> = checked
-        .iter()
-        .map(|c| (c.id.clone(), c.seal.clone(), c.text.clone()))
-        .collect();
     let observations = assurance::fs_coverage(store, &windows);
     let report = assurance::report(
         &run.trust,
@@ -934,6 +1004,7 @@ fn verify_session(
             link,
             ledger: &run.ledger.check,
             observations: &observations,
+            intent: &intent,
         },
     );
     print_assurance(&report, run.limits);
@@ -942,7 +1013,7 @@ fn verify_session(
         verdict.word(),
         interpretation_note.unwrap_or("")
     );
-    Ok((verdict, report.overall))
+    Ok((verdict, report.overall, scope))
 }
 
 /// Die `Assurance`-, `Intent`- und `Not proven`-Zeilen eines Session-Blocks.
@@ -1411,6 +1482,7 @@ pub(crate) fn session_assurance(
         None => Vec::new(),
     };
     let observations = assurance::fs_coverage(store, &windows);
+    let intent = assurance::intent_state(trust, id, session.as_ref(), &seals);
     Ok(assurance::report(
         trust,
         &assurance::Facts {
@@ -1424,6 +1496,7 @@ pub(crate) fn session_assurance(
             link,
             ledger: &LedgerCheck::NotChecked,
             observations: &observations,
+            intent: &intent,
         },
     ))
 }

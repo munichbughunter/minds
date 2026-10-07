@@ -341,6 +341,10 @@ fn parse_scope(raw: Option<&str>) -> Fallible<Vec<String>> {
             let glob = glob.trim();
             if glob.is_empty() || glob == "-" {
                 Err("--scope expects a comma-separated list of non-empty globs (not \"-\")".into())
+            } else if glob.starts_with('!') {
+                // Keine Verneinung: `minds verify` kennt sie nicht und
+                // wertete den Bereich als nicht beurteilbar.
+                Err("--scope does not support negated globs (\"!…\")".into())
             } else {
                 Ok(glob.to_owned())
             }
@@ -1036,7 +1040,7 @@ mod tests {
             parse_scope(Some("src/sort/**, tests/**")).unwrap(),
             vec!["src/sort/**", "tests/**"]
         );
-        for bad in ["", ",", "a,,b", "a, "] {
+        for bad in ["", ",", "a,,b", "a, ", "src/**,!src/auth/**"] {
             assert!(parse_scope(Some(bad)).is_err(), "{bad:?}");
         }
     }

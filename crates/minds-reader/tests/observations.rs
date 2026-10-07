@@ -1118,3 +1118,140 @@ fn put_raw_observations(repo: &Path, bytes: &[u8]) -> ContentHash {
     );
     id
 }
+
+/// EA-17: Nennt ein bezeugter Seal ein Objekt, das fehlt, ist das Material
+/// unvollständig — Scope-Befunde dürfen dann nicht „keine" heißen.
+#[test]
+fn a_missing_observations_object_makes_the_window_incomplete() {
+    use minds_reader::observations::{Window, observations_in_windows_checked};
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let window = |epochs: Option<std::collections::BTreeSet<ContentHash>>| Window {
+        from: "2026-10-02T10:00:00Z".parse().unwrap(),
+        to: "2026-10-02T10:00:09Z".parse().unwrap(),
+        epochs,
+    };
+    let readable = seal_observations(&store, vec![seen(1, "a.rs", Some(b"a\n"), None)]);
+    let trusted = |_: &ContentHash, _: &str| true;
+    let read = observations_in_windows_checked(&store, &[window(None)], &trusted);
+    assert!(read.complete);
+    assert_eq!(read.observations.len(), 1);
+
+    // Ein zweiter Seal nennt ein Objekt, das nicht (mehr) im Store liegt.
+    let orphan = Seal {
+        root: hash(b"other root"),
+        agent: "witness".into(),
+        scope: SCOPE_WITNESS_FS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 4,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: SealOutcome::ObservationsStored {
+            observations: hash(b"removed object").to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-10-02T10:00:05Z".into(),
+    };
+    let orphan = store.put_seal(&orphan.to_text().unwrap()).unwrap();
+    let read = observations_in_windows_checked(&store, &[window(None)], &trusted);
+    assert!(!read.complete);
+    // Was lesbar ist, bleibt lesbar.
+    assert_eq!(read.observations.len(), 1);
+
+    // Nur Epochen, die ein Fenster nennt, zählen; ein unbestätigter Seal nie.
+    let only_readable = window(Some([readable.clone()].into()));
+    assert!(observations_in_windows_checked(&store, &[only_readable], &trusted).complete);
+    let both = window(Some([readable, orphan.clone()].into()));
+    assert!(
+        !observations_in_windows_checked(&store, std::slice::from_ref(&both), &trusted).complete
+    );
+    let untrusted = |id: &ContentHash, _: &str| *id != orphan;
+    assert!(observations_in_windows_checked(&store, &[both], &untrusted).complete);
+
+    // Eine Epoche mit Lücken: Der Witness hat Ereignisse verloren — auch
+    // mit lesbarem Objekt unvollständig.
+    let object = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_observations(Observations::new(
+            UNANCHORED,
+            vec![seen(2, "b.rs", Some(b"b\n"), None)],
+        ))
+        .unwrap();
+    let gapped = Seal {
+        root: hash(b"gapped root"),
+        agent: "witness".into(),
+        scope: SCOPE_WITNESS_FS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 3,
+        gaps: 1,
+        pre_chain: 0,
+        outcome: SealOutcome::ObservationsStored {
+            observations: store.put_observations(&object).unwrap().to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-10-02T10:00:06Z".into(),
+    };
+    let gapped = store.put_seal(&gapped.to_text().unwrap()).unwrap();
+    let read = observations_in_windows_checked(&store, &[window(Some([gapped].into()))], &trusted);
+    assert!(!read.complete);
+    assert_eq!(read.observations.len(), 1);
+}
+
+/// EA-17: Eine bezeugte Session ohne geschlossenes Beobachtungsfenster (hier:
+/// kein `witness-fs/v1`-Seal mehr — etwa das Objekt der ersten Epoche
+/// gelöscht) ist unvollständig, nicht „nichts beobachtet". Eine unbezeugte
+/// Session ohne Fenster ist vollständig: Es gab nichts zu beobachten.
+#[test]
+fn a_witnessed_session_without_a_window_is_incomplete() {
+    use minds_reader::observations::session_observations;
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let pipeline = minds_redact::RedactionConfig::default().pipeline().unwrap();
+    let mut witnessed = session(vec![]);
+    witnessed.intent.request = "witnessed".into();
+    let mut local = session(vec![]);
+    local.intent.request = "local".into();
+    let put_session = |s: &Session| {
+        store
+            .put(&pipeline.redact_session(s.clone()).unwrap())
+            .unwrap()
+            .id()
+    };
+    let (witnessed_id, local_id) = (put_session(&witnessed), put_session(&local));
+    let seal = Seal {
+        root: hash(b"witnessed"),
+        agent: "claude-code".into(),
+        scope: "witness/v1".into(),
+        first_seq: 0,
+        last_seq: 1,
+        events: 2,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: SealOutcome::Stored {
+            session: witnessed_id.to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-10-02T10:05:00Z".into(),
+    };
+    store.put_seal(&seal.to_text().unwrap()).unwrap();
+    let all = |_: &ContentHash, _: &str| true;
+
+    let (windows, read) = session_observations(&store, witnessed_id, &witnessed, &all);
+    assert!(windows.is_empty());
+    assert!(!read.complete);
+    assert!(read.observations.is_empty());
+
+    let (windows, read) = session_observations(&store, local_id, &local, &all);
+    assert!(windows.is_empty());
+    assert!(read.complete);
+    // Unbestätigt bezeugt nichts — auch keine Unvollständigkeit.
+    let (_, read) = session_observations(&store, witnessed_id, &witnessed, &|_, _| false);
+    assert!(read.complete);
+}

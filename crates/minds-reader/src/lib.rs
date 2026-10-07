@@ -55,6 +55,8 @@ pub mod assurance;
 
 pub mod intent;
 
+pub mod scope;
+
 pub mod artifact;
 
 mod query;
