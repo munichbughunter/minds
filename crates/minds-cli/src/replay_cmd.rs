@@ -142,6 +142,16 @@ fn replay(rev: Option<&str>, unsigned: bool) -> Fallible<ExitCode> {
     if !cfg!(unix) {
         return Err(NOT_SUPPORTED.into());
     }
+    // Unsigniert läuft unreviewter Code (Merge Request) — liegt der
+    // Schlüssel trotzdem in der Umgebung, könnte er ihn lesen und danach
+    // Records und Gegenzeichnungen (EA-19) fälschen. Nie zusammen.
+    if unsigned && std::env::var_os(KEY_ENV).is_some_and(|value| !value.is_empty()) {
+        return Err(format!(
+            "refusing an unsigned replay while {KEY_ENV} is set — the replayed code could \
+             read the anchor key; unset it in this job"
+        )
+        .into());
+    }
     harden_process();
     let ctx = Context::open()?;
     let checkout = ctx
@@ -522,7 +532,14 @@ fn signing_key(
         &real,
         minds_attest::NS_ANCHOR,
     )
-    .map_err(|err| format!("the anchor key cannot sign: {err}"))?;
+    .map_err(|err| {
+        // Die Meldung von `ssh-keygen` kann den Pfad nennen — ersetzt.
+        let spellings = crate::anchor_cmd::spellings(&file, &real);
+        format!(
+            "the anchor key cannot sign: {}",
+            crate::anchor_cmd::scrub(&err.to_string(), &spellings)
+        )
+    })?;
     // Signiert wird mit dem aufgelösten Pfad — kein Symlink dazwischen.
     Ok(SigningKey {
         file: real,
@@ -534,7 +551,7 @@ fn signing_key(
 /// oder Pull-Request)? Verteidigung in der Tiefe: Im Merge Request ist auch
 /// die CI-Konfiguration fremd und kann diese Variablen löschen — die
 /// eigentliche Grenze ist der Schlüssel als **geschützte** Variable.
-fn review_pipeline(var: &dyn Fn(&str) -> Option<String>) -> bool {
+pub(crate) fn review_pipeline(var: &dyn Fn(&str) -> Option<String>) -> bool {
     let set = |name: &str| var(name).is_some_and(|value| !value.is_empty());
     set("CI_MERGE_REQUEST_IID")
         || set("CI_EXTERNAL_PULL_REQUEST_IID")
@@ -568,16 +585,22 @@ fn review_pipeline(var: &dyn Fn(&str) -> Option<String>) -> bool {
 
 /// Das erste `ssh-keygen` unter einem absoluten `PATH`-Eintrag außerhalb
 /// des Checkouts, kanonisch.
-fn find_ssh_keygen(path: &str, checkout: &Path) -> Option<PathBuf> {
+pub(crate) fn find_ssh_keygen(path: &str, checkout: &Path) -> Option<PathBuf> {
+    find_program("ssh-keygen", path, checkout)
+}
+
+/// Das erste Programm `name` (unter Windows `name.exe`) unter einem
+/// absoluten `PATH`-Eintrag außerhalb des Checkouts, kanonisch.
+pub(crate) fn find_program(name: &str, path: &str, checkout: &Path) -> Option<PathBuf> {
     let name = if cfg!(windows) {
-        "ssh-keygen.exe"
+        format!("{name}.exe")
     } else {
-        "ssh-keygen"
+        name.to_owned()
     };
     let checkout_real = std::fs::canonicalize(checkout).ok();
     std::env::split_paths(path)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join(name))
+        .map(|dir| dir.join(&name))
         .filter(|candidate| candidate.is_file())
         .filter_map(|found| std::fs::canonicalize(found).ok())
         .find(|real| {
@@ -591,7 +614,7 @@ fn find_ssh_keygen(path: &str, checkout: &Path) -> Option<PathBuf> {
 /// Unter Linux: Der Prozess wird nicht dumpbar — Kinder desselben
 /// Benutzers lesen dann weder `/proc/<pid>/environ` noch seinen Speicher.
 /// Verteidigung in der Tiefe, siehe Modul-Doku.
-fn harden_process() {
+pub(crate) fn harden_process() {
     #[cfg(target_os = "linux")]
     // SAFETY: `prctl(PR_SET_DUMPABLE, 0)` ändert nur ein Attribut dieses
     // Prozesses; die übrigen Argumente werden ignoriert.
@@ -1111,7 +1134,7 @@ fn ci_project(var: impl Fn(&str) -> Option<String>) -> Option<String> {
 }
 
 /// Findet die Redaction nichts in `text`?
-fn clean(redaction: &minds_redact::RedactionPipeline, text: &str) -> bool {
+pub(crate) fn clean(redaction: &minds_redact::RedactionPipeline, text: &str) -> bool {
     let out = redaction.redact(text);
     out.counts == RedactionCounts::default() && out.invalid_findings == 0
 }

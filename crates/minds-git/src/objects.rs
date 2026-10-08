@@ -148,10 +148,11 @@ impl Repo {
                 .map_err(|err| GitError::read_object(id, err))?
                 .size();
             if size > limit {
-                return Err(GitError::read_object(
-                    id,
-                    format!("object of {size} bytes exceeds the limit of {limit}"),
-                ));
+                return Err(GitError::TooLarge {
+                    id: id.to_string(),
+                    size,
+                    limit,
+                });
             }
             let object = repo
                 .find_object(id)

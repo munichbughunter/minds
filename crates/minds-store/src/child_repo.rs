@@ -202,6 +202,22 @@ impl ContextStore for ChildRepoStore {
         self.0.replay_signature(id)
     }
 
+    fn put_first_sight(
+        &self,
+        anchor: &minds_core::first_sight::FirstSight,
+        signature: &str,
+    ) -> Result<bool> {
+        self.0.put_first_sight(anchor, signature)
+    }
+
+    fn first_sight(&self, seal: &minds_core::ContentHash) -> Result<crate::FirstSightRef> {
+        self.0.first_sight(seal)
+    }
+
+    fn list_first_sights(&self) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.list_first_sights()
+    }
+
     fn put_intent(&self, intent: &minds_redact::RedactedIntent) -> Result<minds_core::ContentHash> {
         self.0.put_intent(intent)
     }

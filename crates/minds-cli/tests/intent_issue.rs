@@ -591,11 +591,13 @@ fn verify_reports_the_issue_version() {
         assert_eq!(version_line(&out), line, "{}", text(&out));
         assert_eq!(out.status.code(), code, "{}", text(&out));
         assert!(!text(&out).contains(TOKEN), "{}", text(&out));
-        // Alles andere im Block bleibt, wie es offline war.
+        // Alles andere im Block bleibt, wie es offline war — bis auf die
+        // Zeile, mit der `--online` auch die MR-Notes der Gegenzeichnungen
+        // prüft (EA-19).
         let strip = |o: &Output| {
             text(o)
                 .lines()
-                .filter(|l| !l.starts_with("Issue version"))
+                .filter(|l| !l.starts_with("Issue version") && !l.starts_with("Anchor notes"))
                 .collect::<Vec<_>>()
                 .join("\n")
         };

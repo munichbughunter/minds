@@ -68,6 +68,7 @@ use minds_store::{ContextStore, StoreError};
 
 use crate::context::Context;
 
+mod anchors;
 mod artifact;
 pub(crate) mod assurance;
 mod scope;
@@ -183,6 +184,9 @@ struct RunOptions<'a> {
     all: bool,
     /// Die Versionsprüfung von Issue-Ankern — je Anker einmal je Lauf.
     issue: crate::intent_issue::OnlineCheck,
+    /// Der Abgleich der Erstsicht-Gegenzeichnungen mit den MR-Notes
+    /// (EA-19) — je Commit einmal je Lauf.
+    anchors: anchors::OnlineAnchors,
 }
 
 /// Liest `--require-explained`: eine ganze Zahl 0–100.
@@ -350,7 +354,11 @@ fn verify_target(
     let run = RunOptions {
         signers,
         identity,
-        trust: witness_trust::WitnessTrust::new(ctx.store.as_ref(), signers),
+        trust: witness_trust::WitnessTrust::new(ctx.store.as_ref(), signers).with_anchor_program(
+            std::env::var("PATH")
+                .ok()
+                .and_then(|path| crate::replay_cmd::find_ssh_keygen(&path, &ctx.root)),
+        ),
         ledger,
         limits: assurance_options.limits,
         all: options.all,
@@ -358,6 +366,11 @@ fn verify_target(
             assurance_options.online,
             assurance_options.gitlab_url,
             ctx.root.clone(),
+        ),
+        anchors: anchors::OnlineAnchors::new(
+            assurance_options.online,
+            assurance_options.gitlab_url,
+            &ctx.root,
         ),
     };
     let artifact = match artifact_of(&ctx, &options, required, revision, &ids, signers) {
@@ -838,15 +851,57 @@ fn verify_session(
 
     for c in &checked {
         print_seal_line(c);
+        if let Some(line) = anchors::seal_line(&run.trust.first_sight_checked(&c.id)) {
+            println!("{line}");
+        }
         if c.signature.is_invalid() {
             tampered = true;
         }
+    }
+    // `--online`: Nennt eine gültig signierte MR-Note einen Seal, dessen
+    // Gegenzeichnung im Repository fehlt, wurde sie entfernt — ein
+    // Integritätsbefund wie ein fehlender bezeugter Seal (EA-19).
+    // Der geprüfte Commit und jeder, dessen Trailer die Session nennt.
+    let mut anchor_commits: Vec<String> = commit.map(str::to_owned).into_iter().collect();
+    if run.anchors.online() {
+        for found in trailer_commits(ctx, id)? {
+            let found = found.to_string();
+            if !anchor_commits.contains(&found) {
+                anchor_commits.push(found);
+            }
+        }
+    }
+    let anchor_notes = run
+        .anchors
+        .check(store, &run.trust, &anchor_commits, &seal_ids);
+    let mut anchor_findings = Vec::new();
+    if let anchors::NotesState::Checked(check, _, stale) = &anchor_notes {
+        for finding in &check.findings {
+            if finding.integrity() {
+                anchor_findings.push(finding.text());
+            } else {
+                notes.push(finding.text());
+            }
+        }
+        for text in stale {
+            notes.push(format!(
+                "{text} — may be an older clone (fetch refs/minds/* and rerun)"
+            ));
+        }
+    }
+    if let Some(line) = anchors::notes_line(&anchor_notes) {
+        println!("{line}");
     }
     for note in &notes {
         println!("Note           {note}");
     }
     for reason in &incomplete_reasons {
         println!("Gap            {reason}");
+    }
+
+    // Ein entfernter Anker ist verändertes Material: Integrität verletzt.
+    if !anchor_findings.is_empty() {
+        tampered = true;
     }
 
     // 5. Heuristischer Epochen-Hinweis — wertet NIE auf.
@@ -875,7 +930,12 @@ fn verify_session(
     // innerhalb der Beobachtungsgrenze) und Deutung („was bedeutet es?").
     // Das Gesamt-Verdikt und die Exit-Codes bleiben der CI-Vertrag aus
     // Integrität × Coverage; die Deutung wertet nie auf oder ab.
-    match ledger_findings.split_first() {
+    let integrity_findings: Vec<String> = ledger_findings
+        .iter()
+        .cloned()
+        .chain(anchor_findings)
+        .collect();
+    match integrity_findings.split_first() {
         Some((first, rest)) => {
             println!("Integrity      VIOLATED  {first}");
             for line in rest {
@@ -1050,6 +1110,11 @@ fn verify_session(
         verdict.word(),
         interpretation_note.unwrap_or("")
     );
+    // `--online` verlangt, aber die Prüfung der MR-Notes fand nicht statt:
+    // operativ (4), nie ein grünes Verdikt — der Block steht trotzdem da.
+    if let anchors::NotesState::Failed(reason) = &anchor_notes {
+        return Err(format!("anchor notes could not be checked: {reason}").into());
+    }
     Ok((verdict, report.overall, scope))
 }
 
@@ -1473,7 +1538,7 @@ struct ChainState {
 /// Die Seals einer Session: der Rückverweis (`evidence.json`) vereinigt mit
 /// allen Seals des Namensraums, die diese Session nennen — in dieser
 /// Reihenfolge, ohne Dubletten. Dazu die, die nur der Namensraum kennt.
-fn session_seal_ids(
+pub(crate) fn session_seal_ids(
     store: &dyn ContextStore,
     id: SessionId,
 ) -> Fallible<(Vec<ContentHash>, Vec<ContentHash>)> {

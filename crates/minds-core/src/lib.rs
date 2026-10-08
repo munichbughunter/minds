@@ -36,6 +36,10 @@ pub mod intent_anchor;
 /// Benchmark-Befehle einer Session beobachtet hat (EA-18b).
 pub mod replay;
 
+/// Die Erstsicht-Gegenzeichnung: CI bezeugt, dass ein Seal spätestens in
+/// einer bestimmten Pipeline existierte (EA-19).
+pub mod first_sight;
+
 mod attribution;
 pub use attribution::{Attribution, AttributionError};
 

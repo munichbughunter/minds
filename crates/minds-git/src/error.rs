@@ -99,6 +99,31 @@ pub enum GitError {
         source: Source,
     },
 
+    /// Ein Commit-Bereich (`base..tip`) hat mehr Commits, als gelesen
+    /// werden — eigene Variante: Der Aufrufer darf das nie mit „Vorgänger
+    /// nicht erreichbar" verwechseln und still kürzen.
+    #[error("more than {limit} commits since the base of {tip}")]
+    RangeTooLarge {
+        /// Der Tip des Bereichs.
+        tip: CommitId,
+        /// Die Grenze.
+        limit: usize,
+    },
+
+    /// Ein Objekt ist größer, als gelesen wird — geprüft am Objekt-Header,
+    /// bevor der Inhalt geladen wird. Eigene Variante: Ein übergroßes Objekt
+    /// liegt vor (jemand hat es so abgelegt), anders als ein fehlendes oder
+    /// unlesbares.
+    #[error("Git object {id} has {size} bytes, more than the {limit} that are read")]
+    TooLarge {
+        /// Textform des Objekt-Hashes.
+        id: String,
+        /// Die Größe laut Header.
+        size: u64,
+        /// Die Grenze.
+        limit: u64,
+    },
+
     /// Ein Objekt ließ sich nicht lesen — es fehlt, ist beschädigt oder hat
     /// nicht den erwarteten Typ.
     #[error("Git object {id} cannot be read")]

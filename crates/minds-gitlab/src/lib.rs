@@ -34,6 +34,12 @@
 //! gebundene Fassung (noch) existiert. Der Anker entsteht erst in der CLI,
 //! über die Redaction.
 //!
+//! # Erstsicht-Gegenzeichnungen (EA-19)
+//!
+//! [`anchor`] spiegelt die Gegenzeichnungen einer Pipeline als MR-Note —
+//! samt Signaturen, damit `minds verify --online` einen gelöschten Ref
+//! belegen kann — und liest sie dafür zurück.
+//!
 //! # Warum `curl` und kein HTTP-Stack
 //!
 //! Dieselbe Linie wie beim Signieren, das `ssh-keygen` aufruft: Die eine harte
@@ -57,6 +63,7 @@ use std::process::{Command, Stdio};
 
 use minds_core::{ContentHash, Decision, Review, Subject};
 
+pub mod anchor;
 pub mod issue;
 #[cfg(test)]
 mod stub;
@@ -119,6 +126,8 @@ pub struct Project {
     /// Der Name dieser Variablen — curl bekommt sie nicht mit: Der Token
     /// geht nur über stdin.
     token_env: String,
+    /// Das `curl`, das aufgerufen wird — Default `curl` aus dem `PATH`.
+    curl: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for Project {
@@ -157,7 +166,17 @@ impl Project {
             project: project.to_string(),
             token,
             token_env: String::new(),
+            curl: std::path::PathBuf::from("curl"),
         }
+    }
+
+    /// Ruft genau dieses `curl` auf (einen vorab aufgelösten, absoluten
+    /// Pfad) statt des ersten im `PATH` — für CI, wo ein `PATH`-Eintrag im
+    /// Checkout liegen kann und der Token über stdin an curl geht.
+    #[must_use]
+    pub fn with_curl(mut self, program: std::path::PathBuf) -> Self {
+        self.curl = program;
+        self
     }
 
     /// Spiegelt ein Verdict als Note an den Merge Request `mr` — **idempotent**.
@@ -288,7 +307,7 @@ impl Project {
         } else {
             "=http"
         };
-        let mut command = Command::new("curl");
+        let mut command = Command::new(&self.curl);
         command
             .arg("-q")
             .env_remove("SSLKEYLOGFILE")

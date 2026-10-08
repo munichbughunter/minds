@@ -14,8 +14,10 @@
 //!   Observation-Objekt trägt sie. Die Liste bleibt leer; A2 ist damit nicht
 //!   erreichbar (`witness profile unknown`), fail-closed. Erreichbar wird es,
 //!   sobald der Witness Profil und Trennung im signierten Material festhält.
-//! - **Gegenzeichnungen** (EA-19) gibt es noch nicht: keine. Der
-//!   **Intent** (EA-14/EA-15) wird gelesen
+//! - **Gegenzeichnungen** (EA-19) kommen aus
+//!   `refs/minds/anchors/first-sight/` ([`WitnessTrust::first_sight`]);
+//!   zählen kann eine nur unter `minds-anchor` gegen dieselbe Signer-Datei.
+//!   Der **Intent** (EA-14/EA-15) wird gelesen
 //!   ([`minds_reader::intent::intent_of`]); seine Signatur gilt nur unter
 //!   `minds-intent` gegen dieselbe vertrauenswürdige Signer-Datei. Der
 //!   **Replay** (EA-18b) kommt aus den Records unter
@@ -290,6 +292,14 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
     let ranges: Vec<RangeInput> = indexed.into_iter().map(|(_, range)| range).collect();
 
     let replay = trust.replay(facts.id, facts.session, facts.commit);
+    // Gegenzeichnungen (EA-19): nur gültig signierte zählen — gezählt wird
+    // ohnehin erst in `assess`, und nur über geprüftem, intaktem Material.
+    let states: Vec<(ContentHash, minds_reader::first_sight::FirstSightState)> = facts
+        .seals
+        .iter()
+        .map(|(seal_id, _, _)| (seal_id.clone(), trust.first_sight(seal_id)))
+        .collect();
+    let anchors = minds_reader::first_sight::summary(states.iter().map(|(id, state)| (id, state)));
     let integrity = if facts.tampered {
         EvidenceVerdict::Tampered
     } else if facts.complete {
@@ -312,7 +322,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
         witness_starts: &[],
         intent: facts.intent,
         replay: replay.as_ref(),
-        anchors: None,
+        anchors: Some(&anchors),
     })
 }
 
