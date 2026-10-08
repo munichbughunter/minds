@@ -59,6 +59,9 @@ pub mod scope;
 
 pub mod replay;
 
+/// Erstsicht-Gegenzeichnungen zur Lesezeit (EA-19).
+pub mod first_sight;
+
 pub mod artifact;
 
 mod query;

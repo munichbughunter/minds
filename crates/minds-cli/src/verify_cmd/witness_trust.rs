@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use minds_core::{ContentHash, Session, SessionId};
 use minds_reader::assurance::{IntentSignature, ReplaySummary, SealSignature, SignerKind};
+use minds_reader::first_sight::FirstSightState;
 use minds_store::ContextStore;
 
 /// Höchstgröße der Signer-Datei, die gelesen wird.
@@ -63,6 +64,21 @@ pub(crate) struct WitnessTrust<'a> {
     /// Signatur-Urteile je (Record-Id, Signatur) — jede Prüfung startet
     /// `ssh-keygen`.
     replay_verdicts: RefCell<HashMap<(ContentHash, String), bool>>,
+    /// Die Lage der Erstsicht-Gegenzeichnung je Seal (EA-19).
+    first_sights: RefCell<HashMap<ContentHash, Result<FirstSightState, String>>>,
+    /// Signatur-Urteile über Gegenzeichnungen je (Text, Signatur) — Ref und
+    /// MR-Note tragen oft denselben Eintrag.
+    anchor_verdicts: RefCell<HashMap<[u8; 32], bool>>,
+    /// Die Schlüssel der auf `minds-anchor` beschränkten Zeilen
+    /// ([`restricted_keys`]).
+    anchor_keys: OnceCell<Vec<Vec<u8>>>,
+    /// Das `ssh-keygen` für Anker-Prüfungen — `None`: keins außerhalb des
+    /// Checkouts gefunden (dann scheitert jede Anker-Prüfung, statt ein
+    /// `ssh-keygen` aus dem Checkout zu fragen).
+    anchor_program: Option<PathBuf>,
+    /// Der erste Fehler einer Anker-Prüfung (Prozess, Tempdatei) — ein
+    /// gescheiterter Prozess ist kein „ungültig".
+    anchor_error: RefCell<Option<String>>,
 }
 
 impl<'a> WitnessTrust<'a> {
@@ -85,7 +101,103 @@ impl<'a> WitnessTrust<'a> {
             intents: RefCell::new(HashMap::new()),
             replays: OnceCell::new(),
             replay_verdicts: RefCell::new(HashMap::new()),
+            first_sights: RefCell::new(HashMap::new()),
+            anchor_verdicts: RefCell::new(HashMap::new()),
+            anchor_keys: OnceCell::new(),
+            anchor_program: Some(PathBuf::from("ssh-keygen")),
+            anchor_error: RefCell::new(None),
         }
+    }
+
+    /// Prüft Anker mit genau diesem `ssh-keygen` (aufgelöst außerhalb des
+    /// Checkouts); `None` heißt: keins gefunden.
+    pub(crate) fn with_anchor_program(mut self, program: Option<PathBuf>) -> Self {
+        self.anchor_program = program;
+        self
+    }
+
+    /// Der erste Fehler einer Anker-Prüfung dieses Laufs, falls einer auftrat.
+    pub(crate) fn anchor_error(&self) -> Option<String> {
+        self.anchor_error.borrow().clone()
+    }
+
+    /// Die Erstsicht-Gegenzeichnung eines Seals (EA-19), einmal je Lauf
+    /// gelesen und geprüft — die Regeln stehen in
+    /// [`minds_reader::first_sight::state_of`]; hier kommt nur die
+    /// Signaturprüfung unter `minds-anchor` dazu. Für die Stufe zählt ein
+    /// Ref, der sich nicht lesen lässt, schlicht nicht (`Unreadable`).
+    pub(crate) fn first_sight(&self, seal: &ContentHash) -> FirstSightState {
+        self.first_sight_checked(seal)
+            .unwrap_or(FirstSightState::Unreadable)
+    }
+
+    /// Wie [`first_sight`](Self::first_sight), aber ein Lesefehler bleibt
+    /// einer: Der Abgleich mit den MR-Notes darf ihn nie als „ersetzt"
+    /// deuten (EA-19).
+    pub(crate) fn first_sight_checked(
+        &self,
+        seal: &ContentHash,
+    ) -> Result<FirstSightState, String> {
+        if let Some(state) = self.first_sights.borrow().get(seal) {
+            return state.clone();
+        }
+        let state = self
+            .store
+            .first_sight(seal)
+            .map(|raw| {
+                minds_reader::first_sight::state_of(seal, &raw, &|text, signature| {
+                    // Erst in-process: Ein Ref, dessen Signatur keinen
+                    // Anker-Schlüssel nennt, kostet keinen Prozess.
+                    if self.keygen && !self.anchor_key(signature) {
+                        return Some(false);
+                    }
+                    self.anchor_check(text, signature)
+                })
+            })
+            .map_err(|err| err.to_string());
+        self.first_sights
+            .borrow_mut()
+            .insert(seal.clone(), state.clone());
+        state
+    }
+
+    /// Kann `signature` von einem Schlüssel stammen, der in der Signer-Datei
+    /// auf `minds-anchor` beschränkt ist? In-process über den Schlüssel, den
+    /// die Signatur nennt — eine Vorauswahl ohne `ssh-keygen` (Notes kann
+    /// jeder schreiben). Ohne vertrauenswürdige Signer: ja (die Prüfung sagt
+    /// dann ohnehin „nicht geprüft").
+    pub(crate) fn anchor_key(&self, signature: &str) -> bool {
+        let Some(content) = self.content.as_deref().filter(|_| self.keygen) else {
+            return true;
+        };
+        let keys = self
+            .anchor_keys
+            .get_or_init(|| restricted_keys(content, minds_attest::NS_ANCHOR));
+        minds_attest::signature_public_key(signature).is_some_and(|key| keys.contains(&key))
+    }
+
+    /// Ob `signature` die Gegenzeichnung `text` unter `minds-anchor` trägt
+    /// — `None` ohne vertrauenswürdige Signer. Dieselbe Regel wie für
+    /// Replay-Records ([`anchor_only`]).
+    pub(crate) fn anchor_check(&self, text: &str, signature: &str) -> Option<bool> {
+        if !self.keygen {
+            return None;
+        }
+        let key = {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(&(text.len() as u64).to_le_bytes());
+            hasher.update(text.as_bytes());
+            hasher.update(signature.as_bytes());
+            *hasher.finalize().as_bytes()
+        };
+        if let Some(verdict) = self.anchor_verdicts.borrow().get(&key) {
+            return Some(*verdict);
+        }
+        // Ein gescheiterter Prozess ist kein Urteil: nicht geprüft (der
+        // Fehler steht in `anchor_error`), nie „ungültig".
+        let verdict = self.anchor_signed(text, signature)?;
+        self.anchor_verdicts.borrow_mut().insert(key, verdict);
+        Some(verdict)
     }
 
     /// Ob eine vertrauenswürdige Signer-Datei vorliegt und geprüft werden
@@ -189,35 +301,50 @@ impl<'a> WitnessTrust<'a> {
         if let Some(verdict) = self.replay_verdicts.borrow().get(&key) {
             return *verdict;
         }
-        let verdict = self.anchor_signed(text, signature);
+        let verdict = self.anchor_signed(text, signature).unwrap_or(false);
         self.replay_verdicts.borrow_mut().insert(key, verdict);
         verdict
     }
 
-    /// Ob `signature` die gespeicherten Bytes eines Replay-Records unter
-    /// `minds-anchor` trägt — von einem Principal, dessen **sämtliche**
-    /// Zeilen auf genau diesen Namespace beschränkt sind (dieselbe Regel
+    /// Ob `signature` die gespeicherten Bytes eines Replay-Records (oder den
+    /// Text einer Erstsicht-Gegenzeichnung) unter `minds-anchor` trägt —
+    /// von einem Principal, dessen **sämtliche** Zeilen auf genau diesen
+    /// Namespace beschränkt sind (dieselbe Regel
     /// wie für Witness und Intent). Ohne vertrauenswürdige Signer: nein.
-    fn anchor_signed(&self, text: &str, signature: &str) -> bool {
+    fn anchor_signed(&self, text: &str, signature: &str) -> Option<bool> {
         let (Some(path), Some(content), true) =
             (self.file.as_deref(), self.content.as_deref(), self.keygen)
         else {
-            return false;
+            return Some(false);
         };
-        let Ok(principals) = minds_attest::ssh_find_principals(signature, path) else {
-            return false;
+        let failed = |err: String| {
+            self.anchor_error.borrow_mut().get_or_insert(err);
+            None
         };
-        principals.iter().any(|principal| {
-            anchor_only(content, principal)
-                && minds_attest::ssh_verify_ns(
-                    text,
-                    signature,
-                    path,
-                    principal,
-                    minds_attest::NS_ANCHOR,
-                )
-                .unwrap_or(false)
-        })
+        let Some(program) = self.anchor_program.as_deref() else {
+            return failed(
+                "ssh-keygen was not found under an absolute PATH entry outside the checkout".into(),
+            );
+        };
+        let principals = match minds_attest::ssh_find_principals_with(program, signature, path) {
+            Ok(principals) => principals,
+            Err(err) => return failed(err.to_string()),
+        };
+        for principal in principals.iter().filter(|p| anchor_only(content, p)) {
+            match minds_attest::ssh_verify_ns_with(
+                program,
+                text,
+                signature,
+                path,
+                principal,
+                minds_attest::NS_ANCHOR,
+            ) {
+                Ok(true) => return Some(true),
+                Ok(false) => {}
+                Err(err) => return failed(err.to_string()),
+            }
+        }
+        Some(false)
     }
 
     fn check_intent(&self, anchor: &str, signature: &str) -> IntentSignature {
@@ -332,10 +459,49 @@ fn intent_only(allowed_signers: &str, principal: &str) -> bool {
     restricted_to(allowed_signers, principal, minds_attest::NS_INTENT)
 }
 
-/// Ob `principal` ein CI-Signer für Replay-Records ist — dieselbe Regel
-/// wie [`witness_only`], für `namespaces="minds-anchor"` (EA-18b).
+/// Ob `principal` ein CI-Signer für Replay-Records und Erstsicht-
+/// Gegenzeichnungen ist — dieselbe Regel wie [`witness_only`], für
+/// `namespaces="minds-anchor"` (EA-18b, EA-19).
 fn anchor_only(allowed_signers: &str, principal: &str) -> bool {
     restricted_to(allowed_signers, principal, minds_attest::NS_ANCHOR)
+}
+
+/// Die Schlüssel (SSH-Wire-Format) aller Zeilen, die auf genau
+/// `namespaces="<namespace>"` beschränkt sind — eine **Obermenge** dessen,
+/// was [`restricted_to`] gelten lässt. Sie sortiert ohne Prozess aus, was
+/// sicher von keinem solchen Schlüssel stammt; ob eine Signatur gilt,
+/// entscheidet weiter die volle Prüfung. `cert-authority`-Zeilen gelten
+/// für `minds-anchor` nicht ([`restricted_to`] lehnt sie ab) — ein
+/// CA-signierter Anker-Schlüssel wird nicht unterstützt.
+fn restricted_keys(allowed_signers: &str, namespace: &str) -> Vec<Vec<u8>> {
+    let only = format!("namespaces=\"{namespace}\"");
+    let mut keys = Vec::new();
+    for line in allowed_signers.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let tokens = tokens(line);
+        let (Some(options), rest) = (match tokens.get(1) {
+            Some(token) if !is_key_type(token) => (Some(token.as_str()), &tokens[2..]),
+            _ => (None, &tokens[1.min(tokens.len())..]),
+        }) else {
+            continue;
+        };
+        let restricted = options
+            .split(',')
+            .filter(|o| o.to_ascii_lowercase().starts_with("namespaces="))
+            .all(|o| o.eq_ignore_ascii_case(&only))
+            && options
+                .split(',')
+                .any(|o| o.to_ascii_lowercase().starts_with("namespaces="));
+        if let ([kind, blob, ..], true) = (rest, restricted)
+            && let Some(key) = minds_attest::public_key_blob(&format!("{kind} {blob}"))
+        {
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 /// Ob **jede** Zeile, die `principal` nennt oder einen seiner Schlüssel
@@ -823,6 +989,55 @@ mod tests {
                 .replay(id, Some(&session), Some(&commit))
                 .unwrap()
                 .signed
+        );
+    }
+
+    #[test]
+    fn only_keys_restricted_to_the_namespace_pass_the_prefilter() {
+        let key = |n: u8| {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&11u32.to_be_bytes());
+            blob.extend_from_slice(b"ssh-ed25519");
+            blob.extend_from_slice(&32u32.to_be_bytes());
+            blob.extend_from_slice(&[n; 32]);
+            blob
+        };
+        let line = |n: u8| {
+            let blob = key(n);
+            // Base64 von Hand: Die Tests haben keinen Encoder.
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in blob.chunks(3) {
+                let b = [
+                    chunk[0],
+                    *chunk.get(1).unwrap_or(&0),
+                    *chunk.get(2).unwrap_or(&0),
+                ];
+                let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+                for i in 0..4 {
+                    if i <= chunk.len() {
+                        out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
+                    } else {
+                        out.push('=');
+                    }
+                }
+            }
+            format!("ssh-ed25519 {out}")
+        };
+        let signers = format!(
+            "ci@x namespaces=\"minds-anchor\" {}\n\
+             dev@x {}\n\
+             w@x namespaces=\"minds-witness\" {}\n\
+             both@x namespaces=\"minds-anchor,minds\" {}\n",
+            line(1),
+            line(2),
+            line(3),
+            line(4)
+        );
+        assert_eq!(
+            restricted_keys(&signers, minds_attest::NS_ANCHOR),
+            vec![key(1)]
         );
     }
 

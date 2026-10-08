@@ -403,7 +403,7 @@ fn repo_relative(path: &str) -> bool {
 /// Ein GitLab-Projektpfad (`gruppe/untergruppe/projekt`): Segmente aus
 /// `[A-Za-z0-9._-]`, nicht leer, kein `.`/`..` — EA-16 baut daraus eine
 /// API-URL, ein `?`, `%` oder `..` hätte dort eine andere Bedeutung.
-fn project_path(project: &str) -> bool {
+pub(crate) fn project_path(project: &str) -> bool {
     !project.is_empty()
         && project.split('/').all(|segment| {
             !matches!(segment, "" | "." | "..")

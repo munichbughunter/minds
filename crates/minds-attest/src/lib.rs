@@ -98,6 +98,20 @@ pub fn ssh_sign_ns_with(
     sign_with(program, payload, key, namespace, false)
 }
 
+/// Wie [`ssh_sign_ns_with`], aber **nie über einen ssh-agent**:
+/// `SSH_AUTH_SOCK` fehlt dem Prozess. `ssh-keygen -Y sign` fragt sonst den
+/// Agenten, sobald neben der Schlüsseldatei eine `.pub` liegt, deren
+/// Schlüssel er hält — dann signierte womöglich ein anderer Schlüssel als
+/// die genannte Datei (CI: `minds anchor`).
+pub fn ssh_sign_ns_file_only(
+    program: &Path,
+    payload: &str,
+    key: &Path,
+    namespace: &str,
+) -> Result<String, AttestError> {
+    sign_inner(program, payload, key, namespace, false, true)
+}
+
 /// Wie [`ssh_sign_ns`], aber mit **geerbtem stderr**: Für einen FIDO-Schlüssel
 /// (`sk-…`) fordert `ssh-keygen` dort zur Berührung auf („Confirm user
 /// presence"). Eingesammelt sähe der Mensch die Aufforderung nie — der
@@ -121,6 +135,17 @@ fn sign_with(
     namespace: &str,
     inherit_stderr: bool,
 ) -> Result<String, AttestError> {
+    sign_inner(program, payload, key, namespace, inherit_stderr, false)
+}
+
+fn sign_inner(
+    program: &Path,
+    payload: &str,
+    key: &Path,
+    namespace: &str,
+    inherit_stderr: bool,
+    without_agent: bool,
+) -> Result<String, AttestError> {
     let dir = private_tempdir()?;
     let data = dir.path().join("payload");
     write_private(&data, payload.as_bytes())?;
@@ -134,6 +159,9 @@ fn sign_with(
         .arg(&data)
         .stdin(Stdio::null()) // ein passphrasegeschützter Schlüssel scheitert, statt zu hängen
         .stdout(Stdio::null());
+    if without_agent {
+        command.env_remove("SSH_AUTH_SOCK");
+    }
     let (status, stderr) = if inherit_stderr {
         let status = command.stderr(Stdio::inherit()).status()?;
         (status, "see the ssh-keygen output above".to_string())
@@ -216,21 +244,7 @@ pub struct SignatureKey {
 /// [`ssh_verify_ns`]. Es liest nur, was die (danach geprüfte) Signatur über
 /// ihren Schlüssel sagt. `None` für alles, was nicht so aussieht.
 pub fn signature_key(armored: &str) -> Option<SignatureKey> {
-    // Genau ein Block: BEGIN, Base64-Zeilen, END — nichts davor oder danach.
-    let lines: Vec<&str> = armored.trim_end_matches('\n').split('\n').collect();
-    let [first, body @ .., last] = lines.as_slice() else {
-        return None;
-    };
-    if *first != "-----BEGIN SSH SIGNATURE-----"
-        || *last != "-----END SSH SIGNATURE-----"
-        || body.is_empty()
-        || body
-            .iter()
-            .any(|line| line.is_empty() || line.starts_with('-'))
-    {
-        return None;
-    }
-    let blob = base64_decode(&body.concat())?;
+    let blob = armored_blob(armored)?;
     let rest = blob.strip_prefix(b"SSHSIG")?;
     if rest.get(..4)? != 1u32.to_be_bytes() {
         return None; // Version
@@ -271,6 +285,69 @@ pub fn signature_key(armored: &str) -> Option<SignatureKey> {
         key_type: kind.to_owned(),
         user_presence,
     })
+}
+
+/// Die Bytes hinter genau einem armierten Block: BEGIN, Base64-Zeilen, END —
+/// nichts davor oder danach.
+fn armored_blob(armored: &str) -> Option<Vec<u8>> {
+    let lines: Vec<&str> = armored.trim_end_matches('\n').split('\n').collect();
+    let [first, body @ .., last] = lines.as_slice() else {
+        return None;
+    };
+    if *first != "-----BEGIN SSH SIGNATURE-----"
+        || *last != "-----END SSH SIGNATURE-----"
+        || body.is_empty()
+        || body
+            .iter()
+            .any(|line| line.is_empty() || line.starts_with('-'))
+    {
+        return None;
+    }
+    base64_decode(&body.concat())
+}
+
+/// Der öffentliche Schlüssel (SSH-Wire-Format), den eine armierte
+/// `ssh-sig`-Signatur nennt — **ungeprüft**: Wer den Schlüssel nicht hat,
+/// kann ihn trotzdem hineinschreiben. Taugt nur, um eine Signatur
+/// auszusortieren, die sicher **nicht** von einem bestimmten Schlüssel
+/// stammt; ob sie gilt, entscheidet [`ssh_verify_ns`].
+pub fn signature_public_key(armored: &str) -> Option<Vec<u8>> {
+    let blob = armored_blob(armored)?;
+    let rest = blob.strip_prefix(b"SSHSIG")?;
+    if rest.get(..4)? != 1u32.to_be_bytes() {
+        return None;
+    }
+    let (public_key, _) = ssh_string(&rest[4..])?;
+    Some(public_key.to_vec())
+}
+
+/// Der Schlüssel einer `.pub`-Zeile (`<typ> <base64> [<kommentar>]`) im
+/// SSH-Wire-Format — nur, wenn sein erstes Feld der genannte Typ ist.
+pub fn public_key_blob(line: &str) -> Option<Vec<u8>> {
+    let mut words = line.split_whitespace();
+    let kind = words.next()?;
+    let blob = base64_decode(words.next()?)?;
+    let (inner, _) = ssh_string(&blob)?;
+    (inner == kind.as_bytes()).then_some(blob)
+}
+
+/// Der öffentliche Schlüssel zu einer privaten Schlüsseldatei
+/// (`ssh-keygen -y`) — mit genau dem Programm `program`. stdin bleibt zu:
+/// Eine Passphrase-Abfrage scheitert, statt zu hängen.
+pub fn ssh_public_key_with(program: &Path, key: &Path) -> Result<String, AttestError> {
+    let output = Command::new(program)
+        .arg("-y")
+        .arg("-f")
+        .arg(key)
+        .stdin(Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        return Err(AttestError::Keygen {
+            operation: "public key",
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Der Schlüsseltyp einer armierten `ssh-sig`-Signatur — siehe
@@ -340,12 +417,32 @@ pub fn ssh_verify_ns(
     identity: &str,
     namespace: &str,
 ) -> Result<bool, AttestError> {
+    ssh_verify_ns_with(
+        Path::new("ssh-keygen"),
+        payload,
+        signature,
+        signers,
+        identity,
+        namespace,
+    )
+}
+
+/// Wie [`ssh_verify_ns`], aber mit genau dem Programm `program` — für CI,
+/// wo `ssh-keygen` aufgelöst wird, bevor etwas aus dem Checkout läuft.
+pub fn ssh_verify_ns_with(
+    program: &Path,
+    payload: &str,
+    signature: &str,
+    signers: &Path,
+    identity: &str,
+    namespace: &str,
+) -> Result<bool, AttestError> {
     // A missing/unreadable trust file is an operational error, not tampering.
     std::fs::File::open(signers)?;
     let dir = private_tempdir()?;
     let sig = dir.path().join("attest.sig");
     write_private(&sig, signature.as_bytes())?;
-    let mut child = Command::new("ssh-keygen")
+    let mut child = Command::new(program)
         .args(["-Y", "verify", "-n", namespace, "-I", identity, "-f"])
         .arg(signers)
         .arg("-s")
@@ -376,6 +473,15 @@ pub fn ssh_verify_ns(
 /// payload or namespace: each candidate must still pass [`ssh_verify_ns`].
 /// An invalid signature or an untrusted key yields an empty list.
 pub fn ssh_find_principals(signature: &str, signers: &Path) -> Result<Vec<String>, AttestError> {
+    ssh_find_principals_with(Path::new("ssh-keygen"), signature, signers)
+}
+
+/// Wie [`ssh_find_principals`], aber mit genau dem Programm `program`.
+pub fn ssh_find_principals_with(
+    program: &Path,
+    signature: &str,
+    signers: &Path,
+) -> Result<Vec<String>, AttestError> {
     let allowed = std::fs::read_to_string(signers)?;
     let dir = private_tempdir()?;
     let sig = dir.path().join("attest.sig");
@@ -391,7 +497,7 @@ pub fn ssh_find_principals(signature: &str, signers: &Path) -> Result<Vec<String
         }
         let record = dir.path().join(format!("signers-{index}"));
         write_private(&record, format!("{line}\n").as_bytes())?;
-        let output = Command::new("ssh-keygen")
+        let output = Command::new(program)
             .args(["-Y", "find-principals", "-f"])
             .arg(record)
             .arg("-s")
@@ -747,6 +853,45 @@ mod tests {
             ssh_sign_ns_presence("payload", &key, NS_INTENT).unwrap(),
             signature
         );
+    }
+
+    /// EA-19: Der Schlüssel in der Signatur ist genau der, den `ssh-keygen
+    /// -y` aus der privaten Datei ableitet — ein anderer Schlüssel nicht.
+    #[test]
+    fn a_signature_names_the_public_key_that_made_it() {
+        assert!(ssh_keygen_available());
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let key = dir.path().join(name);
+            assert!(
+                Command::new("ssh-keygen")
+                    .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                    .arg(&key)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            key
+        };
+        let (own, other) = (make("own"), make("other"));
+        let line = ssh_public_key_with(Path::new("ssh-keygen"), &own).unwrap();
+        assert_eq!(
+            line.split_whitespace().take(2).collect::<Vec<_>>(),
+            std::fs::read_to_string(own.with_extension("pub"))
+                .unwrap()
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+        );
+        let blob = public_key_blob(&line).unwrap();
+        let signature = ssh_sign_ns("payload\n", &own, NS_ANCHOR).unwrap();
+        assert_eq!(signature_public_key(&signature), Some(blob.clone()));
+        let foreign = ssh_sign_ns("payload\n", &other, NS_ANCHOR).unwrap();
+        assert_ne!(signature_public_key(&foreign), Some(blob));
+        assert_eq!(signature_public_key("free text"), None);
+        // Ein Typ, der nicht zum Blob passt, ist keine Schlüsselzeile.
+        let lied = line.replacen("ssh-ed25519", "ssh-rsa", 1);
+        assert_eq!(public_key_blob(&lied), None);
     }
 
     #[test]

@@ -60,6 +60,47 @@ impl Repo {
         }))
     }
 
+    /// Die Commits, die von `tip` aus erreichbar sind, von `base` aus aber
+    /// nicht (`base..tip`) — ohne `base` nur `tip` selbst. Höchstens `limit`
+    /// Commits; ein größerer Bereich ist ein Fehler, nie still gekürzt.
+    ///
+    /// # Fehler
+    ///
+    /// [`GitError::Revwalk`], wenn ein Startpunkt fehlt oder der Lauf
+    /// scheitert; [`GitError::RangeTooLarge`], wenn der Bereich mehr als
+    /// `limit` Commits hat. Ist `base` kein Vorfahr von `tip` (Force-Push),
+    /// ist der Bereich alles, was von `tip` aus erreichbar ist und von `base`
+    /// aus nicht — das kann die Grenze sprengen.
+    pub fn commits_since(
+        &self,
+        tip: CommitId,
+        base: Option<CommitId>,
+        limit: usize,
+    ) -> Result<Vec<CommitId>> {
+        let Some(base) = base else {
+            return Ok(vec![tip]);
+        };
+        let gix = self.gix();
+        for start in [tip, base] {
+            gix.find_commit(start.to_gix())
+                .map_err(|err| GitError::revwalk(start, err))?;
+        }
+        let walk = gix
+            .rev_walk(Some(tip.to_gix()))
+            .with_hidden(Some(base.to_gix()))
+            .all()
+            .map_err(|err| GitError::revwalk(tip, err))?;
+        let mut out = Vec::new();
+        for step in walk {
+            let info = step.map_err(|err| GitError::revwalk(tip, err))?;
+            if out.len() == limit {
+                return Err(GitError::RangeTooLarge { tip, limit });
+            }
+            out.push(CommitId::from_gix(info.id));
+        }
+        Ok(out)
+    }
+
     /// Ob `ancestor` von `descendant` aus erreichbar ist — ob ein Ref-Update von
     /// `ancestor` auf `descendant` also ein **Fast-Forward** wäre.
     ///
@@ -94,6 +135,29 @@ mod tests {
     /// Sammelt den ganzen Walk und bricht beim ersten Defekt ab.
     fn walk(repo: &Repo, tip: CommitId) -> Result<Vec<CommitId>> {
         repo.revwalk(tip)?.collect()
+    }
+
+    /// EA-19: `base..tip`, begrenzt — ein zu großer Bereich ist ein Fehler.
+    #[test]
+    fn commits_since_a_base_are_the_range_only() {
+        let fixture = TempRepo::init();
+        let c1 = fixture.commit("c1");
+        let c2 = fixture.commit("c2");
+        let c3 = fixture.commit("c3");
+        let repo = Repo::open(fixture.path()).unwrap();
+
+        let range: HashSet<CommitId> = repo
+            .commits_since(c3, Some(c1), 10)
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(range, HashSet::from([c2, c3]));
+        assert_eq!(repo.commits_since(c3, None, 10).unwrap(), vec![c3]);
+        assert!(repo.commits_since(c3, Some(c3), 10).unwrap().is_empty());
+        assert!(matches!(
+            repo.commits_since(c3, Some(c1), 1),
+            Err(GitError::RangeTooLarge { limit: 1, .. })
+        ));
     }
 
     #[test]

@@ -522,6 +522,39 @@ const MUST_SURVIVE: &[(&str, &str)] = &[
         "evidence-mark-object",
         r#"{"source":"observed","status":"unknown"}"#,
     ),
+    // --- EA-19: Erstsicht-Gegenzeichnungen ---------------------------------
+    // `minds anchor` signiert nur, was die Default-Redaction unverändert
+    // passiert — ein Fehlalarm hier verhinderte jede Gegenzeichnung.
+    (
+        "first-sight-anchor-text",
+        "minds-anchor-v1\nseal=b3-abababababababababababababababababababababababababababababababab\nproject=group/sub/repo\npipeline=4711\nat=2026-10-08T12:34:56Z\n",
+    ),
+    (
+        "first-sight-anchor-text-with-offset",
+        "minds-anchor-v1\nseal=b3-abababababababababababababababababababababababababababababababab\nproject=group/sub/repo\npipeline=4711\nat=2026-10-08T14:34:56.123+02:00\n",
+    ),
+    ("first-sight-note-marker", "<!-- minds:anchor:4711:1 -->"),
+    (
+        "first-sight-note-marker-part",
+        "<!-- minds:anchor:4711:2 -->",
+    ),
+    (
+        "first-sight-anchor-text-deep-group",
+        "minds-anchor-v1\nseal=b3-abababababababababababababababababababababababababababababababab\nproject=a/b/c/d/repo-name.x\npipeline=4711\nat=2026-10-08T12:34:56Z\n",
+    ),
+    // Ein gewöhnlicher Projektpfad mit Punkt, Unterstrich und Bindestrich —
+    // fiele er der Redaction zum Opfer, endete jeder Anker-Lauf mit 4.
+    ("first-sight-project-path", "group/sub-group/repo.name_1"),
+    (
+        "first-sight-ref-name",
+        "refs/minds/anchors/first-sight/abababababababababababababababababababababababababababababababab",
+    ),
+    // Eine armierte Signatur ist öffentliches Material (sie steht in der
+    // MR-Note) — Base64, kein Geheimnis.
+    (
+        "armored-ssh-signature",
+        "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAg\n-----END SSH SIGNATURE-----\n",
+    ),
     // --- EA-18a: Runner-Ergebnisse ------------------------------------------
     // Criterion-Bench-Namen (`group/function/parameter`) landen als
     // `outcome.benches[i].name` im Envelope — ein Fehlalarm hier machte jedes

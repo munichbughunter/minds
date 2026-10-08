@@ -33,6 +33,7 @@
 //! **gespeicherten Bytes**, nicht gegen das, was wir daraus wieder machen
 //! würden.
 
+use minds_core::first_sight::FirstSight;
 use minds_core::intent_anchor::IntentAnchor;
 use minds_core::observation::Observations;
 use minds_core::replay::ReplayRecord;
@@ -124,6 +125,24 @@ pub struct StoredIntent {
     /// Die abgelegten (redigierten) Snapshot-Bytes — **ungeprüft** gegen
     /// `content=`.
     pub snapshot: Vec<u8>,
+}
+
+/// Was unter dem Ref einer Erstsicht-Gegenzeichnung liegt
+/// ([`ContextStore::first_sight`]) — roh, ungeprüft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirstSightRef {
+    /// Kein Ref.
+    Absent,
+    /// Der Ref liegt. Was davon lesbar ist: der Text (UTF-8, höchstens
+    /// [`minds_core::first_sight::MAX_FIRST_SIGHT`] Bytes) und die Signatur
+    /// (nur in der Form einer armierten `ssh-sig`-Signatur). Fehlt eines,
+    /// ist der Ref belegt, aber keine gültige Gegenzeichnung.
+    Present {
+        /// Die Textform, ungeprüft.
+        text: Option<String>,
+        /// Die Signatur, nur der Form nach geprüft.
+        signature: Option<String>,
+    },
 }
 
 /// Was [`ContextStore::forget`] bewirkt hat.
@@ -579,6 +598,43 @@ pub trait ContextStore {
             reason: format!("{:?}", err.classify()).to_lowercase(),
         })?;
         Ok(Some((record, bytes)))
+    }
+
+    /// Legt eine Erstsicht-Gegenzeichnung ab (EA-19): ein elternloser Commit
+    /// unter `refs/minds/anchors/first-sight/<64 hex>` mit dem Baum `anchor`
+    /// (die Textform) und `anchor.sig` (`ssh-sig`, Namespace
+    /// `minds-anchor`) — in **einem** Schritt, nie ein Ref ohne Signatur.
+    ///
+    /// Die erste Sicht gewinnt: Liegt unter dem Ref schon etwas — gleich
+    /// was —, wird nichts geschrieben und `false` zurückgegeben; ebenso,
+    /// wenn ein paralleler Lauf ihn zwischen Prüfen und Schreiben belegt.
+    /// Überschrieben wird nie. Der Default lehnt ab, statt still zu
+    /// verlieren.
+    fn put_first_sight(&self, _anchor: &FirstSight, _signature: &str) -> Result<bool> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store first-sight anchors",
+        )))
+    }
+
+    /// Was unter dem Ref der Gegenzeichnung von `seal` liegt —
+    /// **ungeprüft**: Ob der Text parst, den Seal nennt und die Signatur
+    /// trägt, entscheidet der Leser.
+    ///
+    /// Der Default lehnt ab: Ein Backend, das „kein Ref" meldete, ohne
+    /// nachzusehen, machte aus jeder gespiegelten Note einen gelöschten Ref.
+    fn first_sight(&self, _seal: &ContentHash) -> Result<FirstSightRef> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not read first-sight anchors",
+        )))
+    }
+
+    /// Die Seals, für die ein Ref unter `refs/minds/anchors/first-sight/`
+    /// liegt. Der Default lehnt ab: „keine" hieße für `verify --online`
+    /// „nicht geholt".
+    fn list_first_sights(&self) -> Result<Vec<ContentHash>> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not list first-sight anchors",
+        )))
     }
 
     /// Holt die Session unter `id` — `None`, wenn sie hier nicht liegt.

@@ -225,6 +225,21 @@ const REPLAY_SIG_FILE: &str = "record.sig";
 /// Höchstgröße eines Records, geprüft am Objekt-Header vor dem Lesen.
 const REPLAY_MAX: u64 = minds_core::replay::MAX_RECORD as u64;
 
+/// Namensraum der Erstsicht-Gegenzeichnungen (EA-19): ein elternloser
+/// Commit je Seal, adressiert über die volle `seal_id` (wie die Seals unter
+/// `refs/minds/evidence/`). Die erste Sicht gewinnt — geschrieben wird nur,
+/// wo noch kein Ref liegt.
+const FIRST_SIGHT_REF_PREFIX: &str = "refs/minds/anchors/first-sight/";
+
+/// Die Textform (`minds-anchor-v1`) im Baum eines Erstsicht-Refs.
+const FIRST_SIGHT_FILE: &str = "anchor";
+
+/// Die `ssh-sig`-Signatur (`minds-anchor`) — nie im Text selbst.
+const FIRST_SIGHT_SIG_FILE: &str = "anchor.sig";
+
+/// Höchstgröße des Texts, geprüft am Objekt-Header vor dem Lesen.
+const FIRST_SIGHT_MAX: u64 = minds_core::first_sight::MAX_FIRST_SIGHT as u64;
+
 /// Rückverweise Session → Seals im Baum des Session-Refs, neben
 /// `session.json` und `links.json`. Veränderlich wie `links.json`, nie
 /// kanonisch; `forget` ersetzt nur `session.json`, die Rückverweise bleiben.
@@ -1012,6 +1027,18 @@ fn replay_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
     (id.hex() == hex).then_some(id)
 }
 
+/// Der Ref der Erstsicht-Gegenzeichnung eines Seals.
+fn first_sight_ref(seal: &minds_core::ContentHash) -> String {
+    format!("{FIRST_SIGHT_REF_PREFIX}{}", seal.hex())
+}
+
+/// Der Seal hinter einem Erstsicht-Ref — `None` für Fremdes.
+fn first_sight_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(FIRST_SIGHT_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
 impl GitStore {
     /// Eine Datei im Baum eines Replay-Refs, höchstens `max` Bytes groß —
     /// geprüft am Objekt-Header, bevor gelesen wird.
@@ -1690,6 +1717,100 @@ impl ContextStore for GitStore {
             Ok(text) if minds_core::intent_anchor::is_armored_signature(&text) => Ok(Some(text)),
             _ => Err(StoreError::ReplaySignatureMalformed { id: id.clone() }),
         }
+    }
+
+    fn put_first_sight(
+        &self,
+        anchor: &minds_core::first_sight::FirstSight,
+        signature: &str,
+    ) -> Result<bool> {
+        let text = anchor
+            .to_text()
+            .map_err(|err| StoreError::backend(std::io::Error::other(err)))?;
+        // Nur die Form einer `ssh-sig`-Signatur: Der Ref wird gesynct, und
+        // Freitext hat dort nichts verloren.
+        if !minds_core::intent_anchor::is_armored_signature(signature) {
+            return Err(StoreError::backend(std::io::Error::other(
+                "first-sight signature is not an armored ssh signature",
+            )));
+        }
+        let reference = first_sight_ref(&anchor.seal);
+        // Die erste Sicht gewinnt — auch über einen Ref, der nicht von uns
+        // stammt: Überschrieben wird nie, die Prüfung ist Sache des Lesers.
+        if self
+            .repo
+            .commit_at(&reference)
+            .map_err(StoreError::backend)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let write = || -> minds_git::Result<()> {
+            let text_blob = self.repo.write_blob(text.as_bytes())?;
+            let sig_blob = self.repo.write_blob(signature.as_bytes())?;
+            let tree = self.repo.write_tree(
+                None,
+                [
+                    (FIRST_SIGHT_FILE, text_blob),
+                    (FIRST_SIGHT_SIG_FILE, sig_blob),
+                ],
+            )?;
+            // `None` als erwarteter Stand: Der Ref entsteht nur, wenn es ihn
+            // noch nicht gibt — ein paralleler Lauf verliert, statt zu
+            // überschreiben.
+            self.repo.commit_tree_onto_expected(
+                &reference,
+                tree,
+                None,
+                &format!("minds: first sight of {}", anchor.seal),
+            )?;
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(true),
+            Err(GitError::RefRaced { .. }) => Ok(false),
+            Err(err) => Err(StoreError::backend(err)),
+        }
+    }
+
+    fn first_sight(&self, seal: &minds_core::ContentHash) -> Result<crate::FirstSightRef> {
+        let Some(commit) = self
+            .repo
+            .commit_at(&first_sight_ref(seal))
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(crate::FirstSightRef::Absent);
+        };
+        // Fehlt eine Datei oder ist sie kein UTF-8, ist der Ref belegt, aber
+        // ohne lesbaren Inhalt — ein Befund für den Leser. Scheitert das
+        // Lesen selbst (fehlendes Objekt im Partial Clone, zu groß, I/O), ist
+        // das ein Fehler: Der Leser darf ihn nie als „ersetzt" deuten.
+        // Ein übergroßer Blob hat jemand so abgelegt — der Ref ist belegt,
+        // aber ohne lesbaren Inhalt (der Leser urteilt), kein Lesefehler.
+        let read = |file: &str, max: u64| -> Result<Option<String>> {
+            match self.repo.read_blob_bounded(commit, file, max) {
+                Ok(found) => Ok(found.and_then(|(_, bytes)| String::from_utf8(bytes).ok())),
+                Err(GitError::TooLarge { .. }) => Ok(None),
+                Err(err) => Err(StoreError::backend(err)),
+            }
+        };
+        let text = read(FIRST_SIGHT_FILE, FIRST_SIGHT_MAX)?;
+        let signature = read(
+            FIRST_SIGHT_SIG_FILE,
+            minds_core::intent_anchor::MAX_SIGNATURE as u64,
+        )?
+        .filter(|text| minds_core::intent_anchor::is_armored_signature(text));
+        Ok(crate::FirstSightRef::Present { text, signature })
+    }
+
+    fn list_first_sights(&self) -> Result<Vec<minds_core::ContentHash>> {
+        Ok(self
+            .repo
+            .refs_under(FIRST_SIGHT_REF_PREFIX)
+            .map_err(StoreError::backend)?
+            .iter()
+            .filter_map(|(name, _)| first_sight_id_of_ref(name))
+            .collect())
     }
 
     fn put_intent(&self, intent: &minds_redact::RedactedIntent) -> Result<minds_core::ContentHash> {
@@ -3010,6 +3131,147 @@ mod tests {
             Err(StoreError::IntentSnapshotConflict { .. })
         ));
         assert_eq!(fixture.git(&["rev-parse", &intent_ref(&id)]), before);
+    }
+
+    fn sample_first_sight(byte: u8) -> minds_core::first_sight::FirstSight {
+        minds_core::first_sight::FirstSight {
+            seal: minds_core::ContentHash::from_bytes([byte; 32]),
+            project: "group/repo".into(),
+            pipeline: 7,
+            at: "2026-10-08T12:00:00Z".into(),
+        }
+    }
+
+    const FIRST_SIGHT_SIG: &str =
+        "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+
+    /// EA-19: ein Commit je Seal, Baum `anchor` + `anchor.sig`, in einem
+    /// Schritt — und die erste Sicht gewinnt: Ein späterer Lauf (andere
+    /// Pipeline, andere Zeit) schreibt nichts.
+    #[test]
+    fn the_first_sight_wins_and_fsck_stays_clean() {
+        use crate::FirstSightRef;
+        let (fixture, store) = fresh_store();
+        let first = sample_first_sight(0xab);
+        assert_eq!(
+            store.first_sight(&first.seal).unwrap(),
+            FirstSightRef::Absent
+        );
+        assert!(store.put_first_sight(&first, FIRST_SIGHT_SIG).unwrap());
+        let reference = first_sight_ref(&first.seal);
+        assert_eq!(
+            reference,
+            format!("refs/minds/anchors/first-sight/{}", first.seal.hex())
+        );
+        assert_eq!(
+            fixture.git(&["ls-tree", "--name-only", &reference]).trim(),
+            "anchor\nanchor.sig"
+        );
+        let later = minds_core::first_sight::FirstSight {
+            pipeline: 8,
+            at: "2026-10-09T12:00:00Z".into(),
+            ..first.clone()
+        };
+        assert!(!store.put_first_sight(&later, FIRST_SIGHT_SIG).unwrap());
+        assert!(!store.put_first_sight(&first, FIRST_SIGHT_SIG).unwrap());
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "1"
+        );
+        assert_eq!(
+            store.first_sight(&first.seal).unwrap(),
+            FirstSightRef::Present {
+                text: Some(first.to_text().unwrap()),
+                signature: Some(FIRST_SIGHT_SIG.into()),
+            }
+        );
+        assert_eq!(store.list_first_sights().unwrap(), vec![first.seal.clone()]);
+        fixture.git(&["fsck", "--strict", "--no-progress"]);
+    }
+
+    /// Ein Ref, den jemand anders belegt hat (leerer Baum, Freitext statt
+    /// Signatur), wird nie überschrieben; gelesen wird er als belegt, ohne
+    /// lesbaren Inhalt — das Urteil spricht der Leser.
+    #[test]
+    fn an_occupied_first_sight_ref_is_never_overwritten() {
+        use crate::FirstSightRef;
+        let (fixture, store) = fresh_store();
+        let anchor = sample_first_sight(0xcd);
+        let path = fixture.path().join("junk");
+        std::fs::write(&path, "not a signature").unwrap();
+        let blob = fixture.git(&["hash-object", "-w", path.to_str().unwrap()]);
+        let tree = fixture.git_with_stdin(
+            &["mktree"],
+            &format!("100644 blob {}\t{FIRST_SIGHT_SIG_FILE}\n", blob.trim()),
+        );
+        let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "squat"]);
+        fixture.git(&["update-ref", &first_sight_ref(&anchor.seal), commit.trim()]);
+
+        assert!(!store.put_first_sight(&anchor, FIRST_SIGHT_SIG).unwrap());
+        assert_eq!(
+            fixture
+                .git(&["rev-parse", &first_sight_ref(&anchor.seal)])
+                .trim(),
+            commit.trim()
+        );
+        assert_eq!(
+            store.first_sight(&anchor.seal).unwrap(),
+            FirstSightRef::Present {
+                text: None,
+                signature: None,
+            }
+        );
+    }
+
+    /// Security-Review EA-19: Ein übergroßer `anchor`-Blob ist belegt, aber
+    /// unlesbar — kein Lesefehler (der hieße im Abgleich „gescheitert" statt
+    /// „ersetzt").
+    #[test]
+    fn an_oversized_first_sight_blob_is_unreadable_not_an_error() {
+        use crate::FirstSightRef;
+        let (fixture, store) = fresh_store();
+        let anchor = sample_first_sight(0x42);
+        let path = fixture.path().join("huge");
+        std::fs::write(&path, "x".repeat(FIRST_SIGHT_MAX as usize + 1)).unwrap();
+        let blob = fixture.git(&["hash-object", "-w", path.to_str().unwrap()]);
+        let tree = fixture.git_with_stdin(
+            &["mktree"],
+            &format!("100644 blob {}\t{FIRST_SIGHT_FILE}\n", blob.trim()),
+        );
+        let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "huge"]);
+        fixture.git(&["update-ref", &first_sight_ref(&anchor.seal), commit.trim()]);
+        assert_eq!(
+            store.first_sight(&anchor.seal).unwrap(),
+            FirstSightRef::Present {
+                text: None,
+                signature: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_first_sight_needs_an_armored_signature() {
+        let (_fixture, store) = fresh_store();
+        let anchor = sample_first_sight(0xef);
+        assert!(store.put_first_sight(&anchor, "free text").is_err());
+        assert_eq!(
+            store.first_sight(&anchor.seal).unwrap(),
+            crate::FirstSightRef::Absent
+        );
+    }
+
+    #[test]
+    fn foreign_refs_in_the_first_sight_namespace_are_not_anchors() {
+        for name in [
+            "refs/minds/anchors/first-sight/x",
+            &format!("refs/minds/anchors/first-sight/{}", "A".repeat(64)),
+            &format!("refs/minds/anchors/first-sight/b3-{}", "a".repeat(64)),
+            &format!("refs/minds/anchors/replay/{}", "a".repeat(64)),
+        ] {
+            assert_eq!(first_sight_id_of_ref(name), None, "{name}");
+        }
+        let id = minds_core::ContentHash::from_bytes([1; 32]);
+        assert_eq!(first_sight_id_of_ref(&first_sight_ref(&id)), Some(id));
     }
 
     #[test]

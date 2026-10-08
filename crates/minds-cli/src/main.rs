@@ -36,6 +36,7 @@
 //! Tippfehler in `.minds/redact.json` die Erfassung dauerhaft und lautlos.
 
 mod agent_help;
+mod anchor_cmd;
 mod audit;
 mod blame;
 mod brief_cmd;
@@ -278,6 +279,19 @@ Usage:
         current, changed since binding (confirmed in, not found in or no
         description history) or version check unavailable. Never changes
         the assurance, the verdict or the exit code.
+        A seal countersigned by minds anchor shows \"anchored: pipeline
+        #N, <at>\" (counted for A3 only with a valid minds-anchor signature
+        from --signers or ~/.ssh/allowed_signers). With --online (project
+        from MINDS_GITLAB_PROJECT or CI_PROJECT_PATH) the notes of the
+        merge requests containing the commit are compared: a signed note
+        whose anchor ref or seal is missing is TAMPERED (\"anchor ref
+        missing, MR note present\") when the note is older than the CI job
+        (CI_JOB_STARTED_AT) or a valid local anchor is at least as new;
+        otherwise, an edited anchor note, unvalidated entries or a failed
+        check are exit 4. In GitLab CI only CI_SERVER_URL/CI_PROJECT_PATH
+        count, the token must be read_api (never api), and a check that
+        cannot run is exit 4. Fetch refs/minds/* explicitly first; next to
+        the anchor job use needs: [minds-anchor].
         Exit codes: 0 VERIFIED, 1 TAMPERED, 2 \"VERIFIED, INCOMPLETE\",
         3 NOT VERIFIABLE, 4 operational failure (priority: 4 > 1 > 3 > 2 > 0).
   minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
@@ -302,6 +316,31 @@ Usage:
         One key and principal per project; ephemeral, project-dedicated
         runners; pushes to the signing branch only by merge. Exit
         codes: 0 reproduced or skipped, 2 claim not reproduced,
+        4 operational failure.
+
+  minds anchor [--mirror]
+        GitLab CI only, in push pipelines of the protected default branch
+        (CI_COMMIT_REF_PROTECTED, CI_PIPELINE_SOURCE=push, CI_COMMIT_BRANCH
+        = CI_DEFAULT_BRANCH, HEAD equals CI_COMMIT_SHA; never in merge
+        request, trigger, API or tag pipelines). Countersigns the seals of
+        the sessions the pushed commits name (CI_COMMIT_BEFORE_SHA..HEAD;
+        needs GIT_DEPTH: 0): \"existed no later than pipeline #N\"
+        (CI_PROJECT_PATH, CI_PIPELINE_ID, the CI clock), signed (namespace
+        minds-anchor) with the private key file in MINDS_ANCHOR_KEY_FILE —
+        never a developer key or ssh-agent — under
+        refs/minds/anchors/first-sight/. An existing anchor is never
+        overwritten (first sight wins); one not validly made with this key
+        is reported and ends the run with exit 4. One key per project,
+        scoped to the anchor job on protected runners. Fetch refs/minds/*
+        before, push it after (git push --atomic); then --mirror posts the
+        push's countersignatures made with this key (only those not yet in
+        an own note) to the merge requests merged into the default branch,
+        with its own bot token MINDS_ANCHOR_GITLAB_TOKEN (never the
+        MINDS_GITLAB_TOKEN of verify; instance only CI_SERVER_URL). Missing
+        CI variables: exit 4, nothing written. Run the job in a
+        resource_group (oldest first), not interruptible, and push even
+        when anchor exits 4. Never prints the key path or a token.
+        Exit codes: 0 anchored, mirrored or nothing new,
         4 operational failure.
 
   minds review <subject> --approve|--reject|--needs-work [--summary <text>]
@@ -476,6 +515,7 @@ const SPECS: &[Spec] = &[
     ),
     spec("seals", &["--session", "--limit"], &[], 0),
     spec("replay", &["--commit"], &["--unsigned"], 0),
+    spec("anchor", &[], &["--mirror"], 0),
     spec(
         "verify",
         &[
@@ -925,6 +965,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "seals" => seals_cmd::run(parsed.value("--session"), parsed.value("--limit")),
 
         "replay" => replay_cmd::run(parsed.value("--commit"), parsed.has("--unsigned")),
+
+        "anchor" => anchor_cmd::run(parsed.has("--mirror")),
 
         "verify" => verify_cmd::run(
             parsed.positional(0),

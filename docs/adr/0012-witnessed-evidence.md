@@ -364,7 +364,7 @@ unambiguous. minds proves *which* intent was in force and *who* approved it.
 
 The CI job countersigns every seal id it has not seen before (`minds anchor`), with the CI
 key from a protected variable, and stores the countersignature under
-`refs/minds/anchors/<seal_id>`; `minds-gitlab` mirrors it as an MR note. This proves "this
+`refs/minds/anchors/first-sight/<64 hex>` (EA-19); `minds-gitlab` mirrors it as an MR note. This proves "this
 seal existed no later than pipeline #N" — backdating after that point is detectable. It is
 not a transparency log and needs no network beyond the self-managed GitLab
 (ADR-0011's rejection of global logs stands).

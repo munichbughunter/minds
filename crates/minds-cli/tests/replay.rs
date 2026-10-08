@@ -364,6 +364,18 @@ fn operational_failures_exit_4_before_anything_runs() {
     assert_eq!(code, 4, "{out}");
     assert!(out.contains("invalid replay policy"), "{out}");
     assert!(broken.records().is_empty());
+
+    // Security-Review EA-19: Unsigniert läuft unreviewter Code — nie neben
+    // dem Anker-Schlüssel in der Umgebung.
+    let (code, out) = fixture.replay(&["--unsigned"], Some(Path::new("/nonexistent/anchor")));
+    assert_eq!(code, 4, "{out}");
+    assert!(
+        out.contains("refusing an unsigned replay while MINDS_ANCHOR_KEY_FILE is set"),
+        "{out}"
+    );
+    assert!(!out.contains("/nonexistent/anchor"), "{out}");
+    assert!(fixture.records().is_empty());
+    assert!(!fixture.root().join("target").exists(), "cargo ran");
 }
 
 #[test]
