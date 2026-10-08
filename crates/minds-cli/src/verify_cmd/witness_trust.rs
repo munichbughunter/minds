@@ -20,12 +20,12 @@
 //!
 //! Fehlt eines davon, gilt keine Beobachtung — fail-closed.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use minds_core::ContentHash;
-use minds_reader::assurance::{IntentSignature, SealSignature, SignerKind};
+use minds_core::{ContentHash, Session, SessionId};
+use minds_reader::assurance::{IntentSignature, ReplaySummary, SealSignature, SignerKind};
 use minds_store::ContextStore;
 
 /// Höchstgröße der Signer-Datei, die gelesen wird.
@@ -57,6 +57,12 @@ pub(crate) struct WitnessTrust<'a> {
     /// Intent-Urteile je (Ankertext, Signatur) — eine Prüfung startet
     /// mehrere `ssh-keygen`-Prozesse, und viele Sessions teilen einen Anker.
     intents: RefCell<HashMap<[u8; 32], IntentSignature>>,
+    /// Die Replay-Records (EA-18b), einmal je Lauf gelesen
+    /// ([`minds_reader::replay::ReplayIndex`]).
+    replays: OnceCell<minds_reader::replay::ReplayIndex>,
+    /// Signatur-Urteile je (Record-Id, Signatur) — jede Prüfung startet
+    /// `ssh-keygen`.
+    replay_verdicts: RefCell<HashMap<(ContentHash, String), bool>>,
 }
 
 impl<'a> WitnessTrust<'a> {
@@ -77,6 +83,8 @@ impl<'a> WitnessTrust<'a> {
             keygen,
             verdicts: RefCell::new(HashMap::new()),
             intents: RefCell::new(HashMap::new()),
+            replays: OnceCell::new(),
+            replay_verdicts: RefCell::new(HashMap::new()),
         }
     }
 
@@ -147,6 +155,69 @@ impl<'a> WitnessTrust<'a> {
         let verdict = self.check_intent(anchor, signature);
         self.intents.borrow_mut().insert(key, verdict);
         verdict
+    }
+
+    /// Das Replay-Ergebnis der Session (EA-18b) für genau `commit` — die
+    /// Regeln (Bindung an den Commit, Vorrang der signierten, der
+    /// schwächste gilt, Vergiftung bei ungültiger Signatur oder verändertem
+    /// Namensraum) stehen in [`minds_reader::replay::ReplayIndex::summary`]
+    /// (W5); hier kommt nur die Signaturprüfung unter `minds-anchor` dazu.
+    /// Ohne Commit-Kontext (eine Session-Id als Ziel, `audit`) kein Replay.
+    pub(crate) fn replay(
+        &self,
+        id: SessionId,
+        session: Option<&Session>,
+        commit: Option<&str>,
+    ) -> Option<ReplaySummary> {
+        let (session, commit) = (session?, commit?);
+        let index = self
+            .replays
+            .get_or_init(|| minds_reader::replay::ReplayIndex::load(self.store));
+        index.summary(
+            self.store,
+            id,
+            session,
+            commit,
+            &|record, text, signature| self.replay_signed(record, text, signature),
+        )
+    }
+
+    /// [`anchor_signed`](Self::anchor_signed), einmal je Record und
+    /// Signatur.
+    fn replay_signed(&self, record: &ContentHash, text: &str, signature: &str) -> bool {
+        let key = (record.clone(), signature.to_owned());
+        if let Some(verdict) = self.replay_verdicts.borrow().get(&key) {
+            return *verdict;
+        }
+        let verdict = self.anchor_signed(text, signature);
+        self.replay_verdicts.borrow_mut().insert(key, verdict);
+        verdict
+    }
+
+    /// Ob `signature` die gespeicherten Bytes eines Replay-Records unter
+    /// `minds-anchor` trägt — von einem Principal, dessen **sämtliche**
+    /// Zeilen auf genau diesen Namespace beschränkt sind (dieselbe Regel
+    /// wie für Witness und Intent). Ohne vertrauenswürdige Signer: nein.
+    fn anchor_signed(&self, text: &str, signature: &str) -> bool {
+        let (Some(path), Some(content), true) =
+            (self.file.as_deref(), self.content.as_deref(), self.keygen)
+        else {
+            return false;
+        };
+        let Ok(principals) = minds_attest::ssh_find_principals(signature, path) else {
+            return false;
+        };
+        principals.iter().any(|principal| {
+            anchor_only(content, principal)
+                && minds_attest::ssh_verify_ns(
+                    text,
+                    signature,
+                    path,
+                    principal,
+                    minds_attest::NS_ANCHOR,
+                )
+                .unwrap_or(false)
+        })
     }
 
     fn check_intent(&self, anchor: &str, signature: &str) -> IntentSignature {
@@ -259,6 +330,12 @@ fn witness_only(allowed_signers: &str, principal: &str) -> bool {
 /// ein Agent mitbenutzen kann) gibt so keinen Intent frei.
 fn intent_only(allowed_signers: &str, principal: &str) -> bool {
     restricted_to(allowed_signers, principal, minds_attest::NS_INTENT)
+}
+
+/// Ob `principal` ein CI-Signer für Replay-Records ist — dieselbe Regel
+/// wie [`witness_only`], für `namespaces="minds-anchor"` (EA-18b).
+fn anchor_only(allowed_signers: &str, principal: &str) -> bool {
+    restricted_to(allowed_signers, principal, minds_attest::NS_ANCHOR)
 }
 
 /// Ob **jede** Zeile, die `principal` nennt oder einen seiner Schlüssel
@@ -481,5 +558,285 @@ mod tests {
             trusted_signers_file(Some("/explicit")),
             Some(PathBuf::from("/explicit"))
         );
+    }
+
+    /// Ein Record, wie ihn die Pipeline zum Ablegen freigibt.
+    fn scanned(record: &minds_core::replay::ReplayRecord) -> minds_redact::ScannedReplayRecord {
+        minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .scan_replay(record.clone())
+            .unwrap()
+    }
+
+    /// EA-18b: Replay-Records zählen nur unter `minds-anchor`, von einem
+    /// darauf beschränkten Principal, und nur gegen die eigenen
+    /// entscheidenden Befehle der Session.
+    #[test]
+    fn replay_records_count_only_when_signed_by_an_anchor_principal() {
+        use minds_core::replay::{REPLAY_SCHEMA, ReplayRecord, ReplayResult, ReplayVerdict};
+
+        assert!(minds_attest::ssh_keygen_available());
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            std::process::Command::new("git")
+                .current_dir(root)
+                .args(["init", "-q", "--template="])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let store = minds_store::InRepoStore::open(root).unwrap();
+        let mut session = minds_core::Session::new(
+            minds_core::Agent {
+                name: "claude-code".into(),
+                version: "1".into(),
+            },
+            minds_core::Model {
+                provider: "t".into(),
+                id: "t".into(),
+            },
+            minds_core::Intent::default(),
+        );
+        session.turns.push(minds_core::Turn {
+            role: minds_core::Role::Assistant,
+            text: String::new(),
+            tool_calls: vec![minds_core::ToolCall {
+                name: "Bash".into(),
+                arguments: r#"{"command":"cargo test"}"#.into(),
+                capture: None,
+                effect: None,
+                outcome: Some(minds_core::ExecOutcome {
+                    class: minds_core::ExecClass::Test,
+                    runner: "cargo-test".into(),
+                    command: vec!["cargo".into(), "test".into()],
+                    cwd: Some(".".into()),
+                    exit_code: None,
+                    tests: Some(minds_core::TestCounts {
+                        passed: 12,
+                        failed: 0,
+                        ignored: 0,
+                    }),
+                    benches: Vec::new(),
+                }),
+            }],
+            parent: None,
+            at: None,
+        });
+        let redacted = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_session(session)
+            .unwrap();
+        let id = store.put(&redacted).unwrap().id();
+        let session = store.get(id).unwrap().unwrap();
+        let decisive = minds_reader::replay::decisive(&session);
+        let record = ReplayRecord {
+            kind: minds_core::replay::REPLAY_KIND.into(),
+            policy: None,
+            project: None,
+            schema: REPLAY_SCHEMA,
+            commit: "ab".repeat(20),
+            session: id.to_string(),
+            interpretation_version: minds_reader::replay::INTERPRETATION_VERSION,
+            results: vec![ReplayResult {
+                turn: decisive[0].turn,
+                call: decisive[0].call,
+                argv: decisive[0].outcome.command.clone(),
+                expected: minds_reader::replay::expected(decisive[0].outcome),
+                observed: None,
+                verdict: ReplayVerdict::Reproduced,
+                reason: None,
+            }],
+            environment: Default::default(),
+        };
+        let commit = "ab".repeat(20);
+        let record_id = store.put_replay(&scanned(&record)).unwrap();
+
+        let key = root.join("ci");
+        assert!(
+            std::process::Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&key)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        let signers_for = |namespace: &str| {
+            let path = root.join(format!("signers-{namespace}"));
+            std::fs::write(
+                &path,
+                format!("ci@pipeline namespaces=\"{namespace}\" {}", public.trim()),
+            )
+            .unwrap();
+            path.to_str().unwrap().to_owned()
+        };
+        let anchor = signers_for("minds-anchor");
+        let witness = signers_for("minds-witness");
+
+        // Unsigniert: gezeigt, aber nicht gezählt.
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        let summary = trust.replay(id, Some(&session), Some(&commit)).unwrap();
+        assert!(!summary.signed);
+        assert_eq!((summary.decisive, summary.reproduced), (1, 1));
+
+        // Unter `minds-anchor` signiert, von einem Anchor-Principal: zählt.
+        let text = String::from_utf8(record.canonical_bytes().unwrap()).unwrap();
+        let signature = minds_attest::ssh_sign_ns(&text, &key, minds_attest::NS_ANCHOR).unwrap();
+        store.put_replay_signature(&record_id, &signature).unwrap();
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        assert!(
+            trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+
+        // Derselbe Schlüssel als Witness-Principal: kein CI-Signer.
+        let trust = WitnessTrust::new(&store, Some(&witness));
+        assert!(
+            !trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+
+        // Gebunden an den Commit: Für einen anderen Commit gibt es keinen
+        // Replay, ohne Commit-Kontext ebenso wenig.
+        assert_eq!(
+            trust.replay(id, Some(&session), Some(&"cd".repeat(20))),
+            None
+        );
+        assert_eq!(trust.replay(id, Some(&session), None), None);
+
+        // Unter fremdem Namespace signiert: zählt nicht.
+        let wrong = minds_attest::ssh_sign_ns(&text, &key, minds_attest::NS_WITNESS).unwrap();
+        store.put_replay_signature(&record_id, &wrong).unwrap();
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        assert!(
+            !trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+
+        // Ein zweiter, gültig signierter Record desselben Commits hebt das
+        // nicht auf: Eine ungültige Signatur macht alle unsigniert.
+        let mut again = record.clone();
+        again.environment.pipeline = Some("2".into());
+        let again_id = store.put_replay(&scanned(&again)).unwrap();
+        let text = String::from_utf8(again.canonical_bytes().unwrap()).unwrap();
+        let good = minds_attest::ssh_sign_ns(&text, &key, minds_attest::NS_ANCHOR).unwrap();
+        store.put_replay_signature(&again_id, &good).unwrap();
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        assert!(
+            !trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+
+        // Eine fremde Session hat keinen Replay.
+        let other: SessionId = format!("b3-{}", "00".repeat(32)).parse().unwrap();
+        assert_eq!(trust.replay(other, Some(&session), Some(&commit)), None);
+
+        // Beide Signaturen gültig: signiert.
+        let first = String::from_utf8(record.canonical_bytes().unwrap()).unwrap();
+        let first = minds_attest::ssh_sign_ns(&first, &key, minds_attest::NS_ANCHOR).unwrap();
+        store.put_replay_signature(&record_id, &first).unwrap();
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        assert!(
+            trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+
+        // Wird der `record`-Blob eines der beiden ersetzt, zählt der andere
+        // nicht mehr als signiert: Ein signierter Fehlschlag ließe sich sonst
+        // still entfernen.
+        let run = |args: &[&str], input: Option<&str>| -> String {
+            use std::io::Write as _;
+            let mut child = std::process::Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.invalid")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.invalid")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            if let Some(input) = input {
+                stdin.write_all(input.as_bytes()).unwrap();
+            }
+            drop(stdin);
+            let out = child.wait_with_output().unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        let forged = String::from_utf8(again.canonical_bytes().unwrap())
+            .unwrap()
+            .replace("\"turn\"", "\"turn_\"");
+        let blob = run(&["hash-object", "-w", "--stdin"], Some(&forged));
+        let tree = run(&["mktree"], Some(&format!("100644 blob {blob}\trecord\n")));
+        let replaced = run(&["commit-tree", &tree, "-m", "replaced"], None);
+        run(
+            &[
+                "update-ref",
+                &format!("refs/minds/anchors/replay/{}", again_id.hex()),
+                &replaced,
+            ],
+            None,
+        );
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        assert!(
+            !trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+        // Ebenso unlesbare Bytes unter einem anderen Record-Namen.
+        let blob = run(&["hash-object", "-w", "--stdin"], Some("garbage"));
+        let tree = run(&["mktree"], Some(&format!("100644 blob {blob}\trecord\n")));
+        let replaced = run(&["commit-tree", &tree, "-m", "garbage"], None);
+        run(
+            &[
+                "update-ref",
+                &format!("refs/minds/anchors/replay/{}", "ef".repeat(32)),
+                &replaced,
+            ],
+            None,
+        );
+        let trust = WitnessTrust::new(&store, Some(&anchor));
+        assert!(
+            !trust
+                .replay(id, Some(&session), Some(&commit))
+                .unwrap()
+                .signed
+        );
+    }
+
+    #[test]
+    fn only_principals_restricted_to_the_anchor_namespace_sign_replays() {
+        let anchor = format!("ci@x namespaces=\"minds-anchor\" {KEY}\n");
+        assert!(anchor_only(&anchor, "ci@x"));
+        let witness = format!("ci@x namespaces=\"minds-witness\" {KEY}\n");
+        assert!(!anchor_only(&witness, "ci@x"));
+        let open = format!("ci@x {KEY}\n");
+        assert!(!anchor_only(&open, "ci@x"));
+        // Derselbe Schlüssel zusätzlich unbeschränkt: kein CI-Signer.
+        let mixed =
+            format!("ci@x namespaces=\"minds-anchor\" {KEY}\nother {OTHER}\nother2 {KEY}\n");
+        assert!(!anchor_only(&mixed, "ci@x"));
     }
 }

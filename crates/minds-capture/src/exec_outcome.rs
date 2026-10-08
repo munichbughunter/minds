@@ -547,6 +547,8 @@ pub fn interpret(runner: Runner, argv: Vec<String>, report: &ExecReport) -> Opti
         class: runner.class(),
         runner: runner.as_str().to_string(),
         command: argv,
+        // Das Arbeitsverzeichnis kennt nur der Checkpoint (Repo-Wurzel).
+        cwd: None,
         exit_code: report.exit_code,
         tests,
         benches,

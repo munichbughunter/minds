@@ -206,6 +206,41 @@ pub enum StoreError {
         reason: String,
     },
 
+    /// Die unter einer Replay-Id abgelegten Bytes hashen nicht auf diese Id
+    /// — der Record wurde nachträglich verändert (EA-18b).
+    #[error("replay record at {requested} hashes to {actual} — it has been altered")]
+    ReplayMismatch {
+        /// Die angefragte Id.
+        requested: ContentHash,
+        /// Die Id der abgelegten Bytes.
+        actual: ContentHash,
+    },
+
+    /// Die Bytes hashen korrekt, sind aber kein lesbarer Replay-Record.
+    #[error("replay record at {id} is not readable: {reason}")]
+    MalformedReplay {
+        /// Die Id.
+        id: ContentHash,
+        /// Die Fehlerkategorie des Parsers (`syntax`, `data`, `eof`) — nie
+        /// sein Text, der Werte zitieren könnte.
+        reason: String,
+    },
+
+    /// Unter der Id liegt kein (lesbarer) Replay-Record — nichts zu
+    /// signieren.
+    #[error("replay record {id} is not in the store")]
+    ReplayNotStored {
+        /// Die Record-Id.
+        id: ContentHash,
+    },
+
+    /// Eine Signatur hat nicht die Form einer armierten `ssh-sig`-Signatur.
+    #[error("replay signature for {id} is not an armored ssh signature")]
+    ReplaySignatureMalformed {
+        /// Die Record-Id.
+        id: ContentHash,
+    },
+
     /// Der unter einer Anker-Id abgelegte Text hasht nicht auf diese Id —
     /// der Anker wurde nachträglich verändert (EA-14).
     #[error("intent anchor at {requested} hashes to {actual} — it has been altered")]

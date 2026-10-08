@@ -474,6 +474,8 @@ fn session_level(
         root,
         id,
         Some(minds_core::EvidenceSource::Observed),
+        // Ohne Commit-Kontext zählt kein Replay-Record (EA-18b).
+        None,
     ) {
         Ok(report) => (
             report.overall,

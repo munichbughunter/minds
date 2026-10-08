@@ -1368,6 +1368,16 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
                 ),
                 // Und der Bench-Name aus der Programmausgabe.
                 runner_call(vec!["cargo".into(), "bench".into()], &case.text),
+                // EA-18b: das repo-relative Arbeitsverzeichnis.
+                ToolCall {
+                    outcome: runner_call(vec!["cargo".into(), "bench".into()], "ns-bench")
+                        .outcome
+                        .map(|outcome| ExecOutcome {
+                            cwd: Some(case.text.clone()),
+                            ..outcome
+                        }),
+                    ..runner_call(vec!["cargo".into(), "bench".into()], "ns-bench")
+                },
             ],
             parent: None,
             at: None,
@@ -1386,6 +1396,7 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
             if let Some(outcome) = &call.outcome {
                 haystack.extend(outcome.command.iter().map(String::as_str));
                 haystack.extend(outcome.benches.iter().map(|b| b.name.as_str()));
+                haystack.extend(outcome.cwd.as_deref());
             }
         }
     }
@@ -1405,10 +1416,10 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
         redacted.session().redaction.counts,
         redacted.audit().counts()
     );
-    // Vier Felder je Fixture müssen Funde tragen: Turn-Text, Tool-Argument,
+    // Fünf Felder je Fixture müssen Funde tragen: Turn-Text, Tool-Argument,
     // das Tool-Argument des Runner-Aufrufs (der argv-Fund wird dort
-    // verbucht und ersetzt es) und der Bench-Name.
-    assert!(redacted.audit().fields_changed() >= cases.len() * 4);
+    // verbucht und ersetzt es), der Bench-Name und das `cwd`.
+    assert!(redacted.audit().fields_changed() >= cases.len() * 5);
     // Und ein Fund im argv verwirft das ganze Ergebnis — nie ein halb
     // geschwärztes argv im Envelope.
     for turn in &redacted.session().turns {
@@ -1416,6 +1427,12 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
             turn.tool_calls[1].outcome.is_none(),
             "argv mit Fund überlebte: {:?}",
             turn.tool_calls[1].outcome
+        );
+        // Ebenso ein `cwd` mit Fund (EA-18b).
+        assert!(
+            turn.tool_calls[3].outcome.is_none(),
+            "cwd mit Fund überlebte: {:?}",
+            turn.tool_calls[3].outcome
         );
     }
 }
@@ -2032,6 +2049,7 @@ fn runner_call(command: Vec<String>, bench: &str) -> ToolCall {
             class: ExecClass::Bench,
             runner: "cargo-bench-criterion".into(),
             command,
+            cwd: None,
             exit_code: None,
             tests: None,
             benches: vec![BenchValue {

@@ -199,6 +199,8 @@ fn check_require_assurance(
                 root,
                 id,
                 Some(minds_core::EvidenceSource::Observed),
+                // Der neueste Commit mit dem Trailer der Session.
+                Some(&commit.to_string()),
             )?;
             if report.overall < required {
                 let why = crate::verify_cmd::assurance::first_reason(&report)

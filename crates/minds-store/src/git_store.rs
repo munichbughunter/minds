@@ -211,6 +211,20 @@ const INTENT_SIG_FILE: &str = "anchor.sig";
 const INTENT_ANCHOR_MAX: u64 = minds_core::intent_anchor::MAX_ANCHOR as u64;
 const INTENT_SNAPSHOT_MAX: u64 = minds_core::intent_anchor::MAX_SNAPSHOT as u64;
 
+/// Namensraum der Replay-Records (EA-18b): ein elternloser Commit je
+/// Record, adressiert über die volle Id. Unter `anchors/`, neben den
+/// künftigen Gegenzeichnungen (EA-19) — beides schreibt CI, nie der Agent.
+const REPLAY_REF_PREFIX: &str = "refs/minds/anchors/replay/";
+
+/// Der kanonische Record im Baum seines Refs.
+const REPLAY_FILE: &str = "record";
+
+/// Die `ssh-sig`-Signatur (`minds-anchor`) — nie im Record selbst.
+const REPLAY_SIG_FILE: &str = "record.sig";
+
+/// Höchstgröße eines Records, geprüft am Objekt-Header vor dem Lesen.
+const REPLAY_MAX: u64 = minds_core::replay::MAX_RECORD as u64;
+
 /// Rückverweise Session → Seals im Baum des Session-Refs, neben
 /// `session.json` und `links.json`. Veränderlich wie `links.json`, nie
 /// kanonisch; `forget` ersetzt nur `session.json`, die Rückverweise bleiben.
@@ -986,6 +1000,42 @@ fn intent_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
     (id.hex() == hex).then_some(id)
 }
 
+/// Der Ref eines Replay-Records.
+fn replay_ref(id: &minds_core::ContentHash) -> String {
+    format!("{REPLAY_REF_PREFIX}{}", id.hex())
+}
+
+/// Die Id hinter einem Replay-Ref — `None` für Fremdes.
+fn replay_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(REPLAY_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
+impl GitStore {
+    /// Eine Datei im Baum eines Replay-Refs, höchstens `max` Bytes groß —
+    /// geprüft am Objekt-Header, bevor gelesen wird.
+    fn replay_file(
+        &self,
+        id: &minds_core::ContentHash,
+        file: &str,
+        max: u64,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(commit) = self
+            .repo
+            .commit_at(&replay_ref(id))
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .repo
+            .read_blob_bounded(commit, file, max)
+            .map_err(StoreError::backend)?
+            .map(|(_, bytes)| bytes))
+    }
+}
+
 /// Die Form der `evidence.json`: ein Objekt, damit spätere Nachbarn (etwa
 /// Signatur-Verweise) additiv Platz finden.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -1498,6 +1548,148 @@ impl ContextStore for GitStore {
             .iter()
             .filter_map(|(name, _)| observations_id_of_ref(name))
             .collect())
+    }
+
+    fn put_replay(
+        &self,
+        record: &minds_redact::ScannedReplayRecord,
+    ) -> Result<minds_core::ContentHash> {
+        use minds_core::replay::ReplayRecord;
+
+        let bytes = record
+            .record()
+            .canonical_bytes()
+            .map_err(|err| StoreError::backend(std::io::Error::other(err)))?;
+        // Nicht größer, als `get_replay` zurückliest — sonst wäre die Id für
+        // immer gesperrt.
+        if bytes.len() as u64 > REPLAY_MAX {
+            return Err(StoreError::backend(std::io::Error::other(
+                "replay record is larger than the store reads back",
+            )));
+        }
+        let id = ReplayRecord::id_of_bytes(&bytes);
+        let reference = replay_ref(&id);
+        // Content-adressiert: Liegt etwas unter dem Ref, muss es genau dieser
+        // Record sein — ein fremd vorbelegter Ref fällt als Mismatch auf.
+        if self.get_replay(&id)?.is_some() {
+            return Ok(id);
+        }
+        if self
+            .repo
+            .commit_at(&reference)
+            .map_err(StoreError::backend)?
+            .is_some()
+        {
+            // Ein Ref ohne lesbaren Record (leerer Baum, nur `record.sig`) ist
+            // vorbelegt — darauf wird nicht aufgebaut.
+            return Err(StoreError::backend(std::io::Error::other(
+                "the replay ref is occupied without a readable replay record",
+            )));
+        }
+        let write = || -> minds_git::Result<()> {
+            let blob = self.repo.write_blob(&bytes)?;
+            let tree = self.repo.write_tree(None, [(REPLAY_FILE, blob)])?;
+            self.repo.commit_tree_onto_expected(
+                &reference,
+                tree,
+                None,
+                &format!("minds: replay {id}"),
+            )?;
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(id),
+            Err(GitError::RefRaced { .. }) => match self.get_replay(&id)? {
+                Some(_) => Ok(id),
+                None => Err(StoreError::backend(std::io::Error::other(
+                    "the replay ref moved but carries no replay record",
+                ))),
+            },
+            Err(err) => Err(StoreError::backend(err)),
+        }
+    }
+
+    fn replay_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.replay_file(id, REPLAY_FILE, REPLAY_MAX)
+    }
+
+    fn list_replays(&self) -> Result<Vec<minds_core::ContentHash>> {
+        Ok(self
+            .repo
+            .refs_under(REPLAY_REF_PREFIX)
+            .map_err(StoreError::backend)?
+            .iter()
+            .filter_map(|(name, _)| replay_id_of_ref(name))
+            .collect())
+    }
+
+    fn put_replay_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
+        // Nur die Form einer `ssh-sig`-Signatur: Der Ref wird gesynct, und
+        // Freitext hat dort nichts verloren.
+        if !minds_core::intent_anchor::is_armored_signature(signature) {
+            return Err(StoreError::ReplaySignatureMalformed { id: id.clone() });
+        }
+        let reference = replay_ref(id);
+        let message = format!("minds: signature for replay {id}");
+        let max = minds_core::intent_anchor::MAX_SIGNATURE as u64;
+        let mut attempts_left = PUT_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            // Geprüft und geschrieben wird gegen **denselben** Commit, wie
+            // bei der Intent-Signatur.
+            let Some(commit) = self
+                .repo
+                .commit_at(&reference)
+                .map_err(StoreError::backend)?
+            else {
+                return Err(StoreError::ReplayNotStored { id: id.clone() });
+            };
+            let stored = self
+                .repo
+                .read_blob_bounded(commit, REPLAY_FILE, REPLAY_MAX)
+                .map_err(StoreError::backend)?;
+            if !stored.is_some_and(|(_, bytes)| {
+                minds_core::replay::ReplayRecord::id_of_bytes(&bytes) == *id
+            }) {
+                return Err(StoreError::ReplayNotStored { id: id.clone() });
+            }
+            let current = self
+                .repo
+                .read_blob_bounded(commit, REPLAY_SIG_FILE, max)
+                .ok()
+                .flatten();
+            if current.is_some_and(|(_, bytes)| bytes == signature.as_bytes()) {
+                return Ok(()); // schon signiert, idempotent
+            }
+            let write = || -> minds_git::Result<()> {
+                let blob = self.repo.write_blob(signature.as_bytes())?;
+                let base = self.repo.tree_of(commit)?;
+                let tree = self
+                    .repo
+                    .write_tree(Some(base), [(REPLAY_SIG_FILE, blob)])?;
+                self.repo
+                    .commit_tree_onto_expected(&reference, tree, Some(commit), &message)?;
+                Ok(())
+            };
+            match write() {
+                Ok(()) => return Ok(()),
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
+    }
+
+    fn replay_signature(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        let max = minds_core::intent_anchor::MAX_SIGNATURE as u64;
+        let Some(bytes) = self.replay_file(id, REPLAY_SIG_FILE, max)? else {
+            return Ok(None);
+        };
+        // Dieselbe Formprüfung wie beim Schreiben: Was keine armierte
+        // Signatur ist, geht nicht an den Prüfer.
+        match String::from_utf8(bytes) {
+            Ok(text) if minds_core::intent_anchor::is_armored_signature(&text) => Ok(Some(text)),
+            _ => Err(StoreError::ReplaySignatureMalformed { id: id.clone() }),
+        }
     }
 
     fn put_intent(&self, intent: &minds_redact::RedactedIntent) -> Result<minds_core::ContentHash> {
@@ -2525,6 +2717,143 @@ mod tests {
                 .is_err()
         );
         assert!(store.put_intent_signature(&id, "free text").is_err());
+    }
+
+    /// Ein Record, wie ihn die Pipeline zum Ablegen freigibt.
+    fn scanned(record: &minds_core::replay::ReplayRecord) -> minds_redact::ScannedReplayRecord {
+        minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .scan_replay(record.clone())
+            .unwrap()
+    }
+
+    fn sample_replay() -> minds_core::replay::ReplayRecord {
+        use minds_core::replay::{
+            Expected, Observed, REPLAY_SCHEMA, ReplayEnvironment, ReplayRecord, ReplayResult,
+            ReplayVerdict,
+        };
+        let counts = minds_core::TestCounts {
+            passed: 12,
+            failed: 0,
+            ignored: 0,
+        };
+        ReplayRecord {
+            kind: minds_core::replay::REPLAY_KIND.into(),
+            policy: None,
+            project: None,
+            schema: REPLAY_SCHEMA,
+            commit: "ab".repeat(20),
+            session: format!("b3-{}", "cd".repeat(32)),
+            interpretation_version: 1,
+            results: vec![ReplayResult {
+                turn: 1,
+                call: 0,
+                argv: vec!["cargo".into(), "test".into()],
+                expected: Expected {
+                    class: minds_core::ExecClass::Test,
+                    runner: "cargo-test".into(),
+                    exit_code: None,
+                    tests: Some(counts),
+                    benches: Vec::new(),
+                },
+                observed: Some(Observed {
+                    exit_code: Some(0),
+                    tests: Some(counts),
+                    ..Observed::default()
+                }),
+                verdict: ReplayVerdict::Reproduced,
+                reason: None,
+            }],
+            environment: ReplayEnvironment::default(),
+        }
+    }
+
+    #[test]
+    fn a_replay_record_roundtrips_idempotently_and_fsck_stays_clean() {
+        let (fixture, store) = fresh_store();
+        let record = sample_replay();
+        let id = store.put_replay(&scanned(&record)).unwrap();
+        assert_eq!(id, record.id().unwrap());
+        let (back, bytes) = store.get_replay(&id).unwrap().unwrap();
+        assert_eq!(back, record);
+        assert_eq!(bytes, record.canonical_bytes().unwrap());
+        assert_eq!(store.list_replays().unwrap(), vec![id.clone()]);
+        // Idempotent je Id: kein zweiter Commit.
+        assert_eq!(store.put_replay(&scanned(&record)).unwrap(), id);
+        let reference = replay_ref(&id);
+        assert_eq!(reference, format!("refs/minds/anchors/replay/{}", id.hex()));
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "1"
+        );
+        assert_eq!(store.replay_signature(&id).unwrap(), None);
+        let signature = "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+        store.put_replay_signature(&id, signature).unwrap();
+        assert_eq!(
+            store.replay_signature(&id).unwrap().as_deref(),
+            Some(signature)
+        );
+        // Idempotent, und der Record bleibt unverändert.
+        store.put_replay_signature(&id, signature).unwrap();
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "2"
+        );
+        assert_eq!(store.get_replay(&id).unwrap().unwrap().0, record);
+        fixture.git(&["fsck", "--strict", "--no-progress"]);
+
+        let absent = minds_core::ContentHash::from_bytes([0; 32]);
+        assert!(store.get_replay(&absent).unwrap().is_none());
+        assert!(matches!(
+            store.put_replay_signature(&absent, signature),
+            Err(StoreError::ReplayNotStored { .. })
+        ));
+        assert!(matches!(
+            store.put_replay_signature(&id, "free text"),
+            Err(StoreError::ReplaySignatureMalformed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_tampered_replay_record_is_caught_on_read() {
+        let (fixture, store) = fresh_store();
+        let record = sample_replay();
+        let id = store.put_replay(&scanned(&record)).unwrap();
+        // Ein Record, der 13 statt 12 bestandene Tests nennt, unter der alten
+        // Id: Die Bytes hashen nicht mehr auf sie.
+        let forged = String::from_utf8(record.canonical_bytes().unwrap())
+            .unwrap()
+            .replace("\"passed\":12", "\"passed\":13");
+        let path = fixture.path().join("forged-record");
+        std::fs::write(&path, forged).unwrap();
+        let blob = fixture.git(&["hash-object", "-w", path.to_str().unwrap()]);
+        let tree = fixture.git_with_stdin(
+            &["mktree"],
+            &format!("100644 blob {}\t{REPLAY_FILE}\n", blob.trim()),
+        );
+        let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "forged"]);
+        fixture.git(&["update-ref", &replay_ref(&id), commit.trim()]);
+        assert!(matches!(
+            store.get_replay(&id),
+            Err(StoreError::ReplayMismatch { .. })
+        ));
+        assert!(store.put_replay(&scanned(&record)).is_err());
+    }
+
+    #[test]
+    fn foreign_refs_in_the_replay_namespace_are_not_records() {
+        let (fixture, store) = fresh_store();
+        let id = store.put_replay(&scanned(&sample_replay())).unwrap();
+        let commit = fixture.git(&["rev-parse", &replay_ref(&id)]);
+        for foreign in [
+            "refs/minds/anchors/replay/kaputt".to_owned(),
+            format!("refs/minds/anchors/replay/{}", "AB".repeat(32)),
+            format!("refs/minds/anchors/other/{}", "ab".repeat(32)),
+        ] {
+            fixture.git(&["update-ref", &foreign, commit.trim()]);
+        }
+        assert_eq!(store.list_replays().unwrap(), vec![id]);
     }
 
     #[test]

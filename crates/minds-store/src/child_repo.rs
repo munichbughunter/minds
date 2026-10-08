@@ -179,6 +179,29 @@ impl ContextStore for ChildRepoStore {
         self.0.list_observations()
     }
 
+    fn put_replay(
+        &self,
+        record: &minds_redact::ScannedReplayRecord,
+    ) -> Result<minds_core::ContentHash> {
+        self.0.put_replay(record)
+    }
+
+    fn replay_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.replay_bytes(id)
+    }
+
+    fn list_replays(&self) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.list_replays()
+    }
+
+    fn put_replay_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
+        self.0.put_replay_signature(id, signature)
+    }
+
+    fn replay_signature(&self, id: &minds_core::ContentHash) -> Result<Option<String>> {
+        self.0.replay_signature(id)
+    }
+
     fn put_intent(&self, intent: &minds_redact::RedactedIntent) -> Result<minds_core::ContentHash> {
         self.0.put_intent(intent)
     }
