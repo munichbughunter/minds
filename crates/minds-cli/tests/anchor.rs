@@ -419,6 +419,14 @@ impl Fixture {
             "MINDS_GITLAB_URL",
             "MINDS_GITLAB_TOKEN",
             "MINDS_GITLAB_PROJECT",
+            // Auch die Lage einer GitHub-Actions-CI: Ein `pull_request`
+            // färbte sonst jeden Anker-Lauf als Review-Pipeline.
+            "GITHUB_ACTIONS",
+            "GITHUB_EVENT_NAME",
+            "GITHUB_REF_PROTECTED",
+            "GITHUB_SHA",
+            "GITHUB_SERVER_URL",
+            "GITHUB_REPOSITORY",
         ] {
             command.env_remove(name);
         }
