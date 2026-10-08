@@ -79,6 +79,21 @@ calls, and re-run `minds enable` after moving the binary.
   (`minds verify`), gaps are recorded as gaps, and `minds audit --export`
   produces a bundle that is verifiable without this tool — see the
   [verification guide](docs/verification-guide.md).
+- **Assurance levels: who stands behind the record.** By default the agent's
+  own hooks write the record (**A1 observed**). It is sealed (and signed, if a signing key is configured), but the
+  agent could have reached it before the seal. An optional **witness**
+  (`minds enable --witness <profile>`) runs outside the agent's trust domain
+  (in the `container` and `user` profiles; under your own account it does
+  not). It chains
+  the events live, watches the worktree (paths and hashes, never content), and
+  seals under its own key. If the witness also saw the whole session without
+  gaps, runs in a proven isolated profile, and the session worked against a
+  signed intent, that makes it **A2 witnessed**. **A3 reproduced** adds CI: it re-runs the decisive
+  commands and countersigns every seal. `minds verify` computes the level each time from the material and a
+  trust file you supply, and states what that level does **not** prove.
+  Today a witnessed session still stops at A1, because the witness does not
+  yet sign its isolation profile — see the
+  [verification guide](docs/verification-guide.md#witnessed-evidence).
 - **No service, no telemetry.** Nothing leaves your machine that you don't push
   yourself. Fully functional offline and air-gapped.
 
@@ -104,9 +119,14 @@ Bridges to other platforms are not currently planned.
 ## Build from source
 
 ```sh
-cargo build --release --bin minds     # Rust 1.85+
+cargo build --release --bin minds
 cargo test --workspace
 ```
+
+The toolchain is pinned in `rust-toolchain.toml`; rustup installs it on the
+first build. `cargo xtask proof-table` prints the assurance table for the
+verification guide, generated from the code; a test fails when the guide's
+copy differs.
 
 ## Further reading
 
@@ -117,7 +137,12 @@ cargo test --workspace
 - [GitLab operating model](docs/gitlab-operating-model.md) — Git is the source,
   GitLab is the projection
 - [Verification guide](docs/verification-guide.md) — what an audit bundle
-  proves, and what it doesn't
+  and each assurance level prove, and what they don't; checking witnessed
+  evidence with only `git`, `b3sum` and `ssh-keygen`
+- [Privacy overview](docs/privacy-overview.md) — what is captured, where it
+  lives, what leaves the machine, what can be deleted
+- [Witness and works council](docs/betrvg-note.md) (German) — what the
+  witness observes and what it doesn't, for a works-council agreement
 - [Architecture decision records](docs/adr/) — why hooks instead of transcript
   parsing, why one ref per session, why reviews as Git objects
 - [CHANGELOG](CHANGELOG.md)

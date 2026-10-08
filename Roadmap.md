@@ -121,18 +121,34 @@ has long since closed the v0.1 chain — as of v0.3.0 it covers:
   evidence report), `minds render` (a stateless HTML page), `minds metrics`
   (Prometheus/OpenMetrics for the customer's Grafana).
 - **Releases** for macOS (Apple Silicon and Intel), Linux (x86_64/ARM64,
-  static musl) and, since v0.3.0, native Windows (x86_64).
+  static musl) and, since v0.3.0, native Windows (x86_64). Since v0.4.0 the
+  CLI and TUI speak English.
+- **Assurance levels** ([ADR-0012](docs/adr/0012-witnessed-evidence.md),
+  unreleased): `minds verify` now also says *who observed* a session, per
+  sealed range, computed at read time and never stored. **A0 claimed** means
+  no sound seal. **A1 observed** means the agent's own hooks sealed it, which
+  is today's default. **A2 witnessed** means a witness outside the agent's
+  trust domain chained the events live, observed the worktree (paths and
+  hashes only) and signed under its own key, against a signed intent.
+  **A3 reproduced** adds CI: it replays the decisive commands and
+  countersigns every seal on first sight. Each level states exactly the
+  promises and limits that hold for it, from one vocabulary
+  ([verification guide](docs/verification-guide.md#witnessed-evidence),
+  [privacy](docs/privacy-overview.md),
+  [works council](docs/betrvg-note.md)). The witness, file observer, intents,
+  replay and first-sight anchors are built. A2 is not reachable from real
+  material yet, because the witness does not sign its isolation profile.
 
-**Known gaps:** tool-call *interpretation* is still Claude-Code-only (other
-agents capture raw evidence via the generic fallback); the reader shows
-sessions and history but no overview tiles or charts yet, although
-`minds metrics` already supplies the numbers; the CLI output is
-German today — English output is on the list.
-Capture still shares the agent's trust domain: the append→seal window and key control
-remain gaps addressed by [Track EA](docs/specs/track-ea/README.md) and the accepted
-[ADR-0012](docs/adr/0012-witnessed-evidence.md); `managed` stays A1, Linux container
-qualification is pending, and macOS container recording remains disabled pending the
-required watcher and host-socket measurements.
+**Known gaps:** tool calls are fully interpreted for Claude Code. Codex
+`apply_patch`/shell calls are interpreted too. Other agents capture raw
+evidence via the generic fallback. The reader shows sessions and history
+but no overview tiles or charts yet, although `minds metrics` already
+supplies the numbers. Until A2 is reachable, capture still shares the
+agent's trust domain: the append→seal window and key control remain the
+gaps that the accepted [ADR-0012](docs/adr/0012-witnessed-evidence.md)
+addresses. `managed` stays A1, Linux container qualification is pending,
+and macOS container recording remains disabled pending the required watcher
+and host-socket measurements.
 
 ## 6. The roadmap in layers
 

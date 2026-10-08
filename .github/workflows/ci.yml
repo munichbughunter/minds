@@ -46,6 +46,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # Die Prüf-Rezepte der Verification-Guide laufen in
+      # `crates/minds-cli/tests/doc_recipes.rs` mit echtem `b3sum`; in CI ist
+      # es Pflicht, damit der Test nie still entfällt (EA-21). Billig bleibt
+      # der Schritt nur, weil `Swatinem/rust-cache` `~/.cargo/bin` mitcacht.
+      - name: b3sum
+        run: cargo install b3sum --version 1.8.7 --locked
+
       - name: cargo test
         run: cargo test --workspace --locked
 

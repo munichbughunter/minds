@@ -5,8 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
+minds-core = { path = "../crates/minds-core" }
 
 [package.metadata.dist]
 dist = false
