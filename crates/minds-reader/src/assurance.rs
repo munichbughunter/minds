@@ -836,7 +836,7 @@ impl Reason {
                 format!("replay covers {covered} of {decisive} decisive command(s)")
             }
             Self::DecisiveSkipped(skipped) => {
-                format!("{skipped} decisive command(s) skipped (not allowlisted)")
+                format!("{skipped} decisive command(s) skipped, not replayed")
             }
             Self::NotAnchored => "seal not anchored — no minds-anchor countersignature".into(),
         }
@@ -2057,7 +2057,7 @@ mod tests {
                     replay.skipped = 3;
                 },
                 Assurance::A2Witnessed,
-                &["3 decisive command(s) skipped (not allowlisted)"],
+                &["3 decisive command(s) skipped, not replayed"],
             ),
             (
                 "one skipped beside reproduced ones",
@@ -2067,7 +2067,7 @@ mod tests {
                     replay.skipped = 1;
                 },
                 Assurance::A2Witnessed,
-                &["1 decisive command(s) skipped (not allowlisted)"],
+                &["1 decisive command(s) skipped, not replayed"],
             ),
             (
                 "the record silently omits a decisive command",
@@ -2842,9 +2842,13 @@ mod tests {
     /// hängen nicht am Reader, und der Reader hat kein serde.
     ///
     /// W2 nennt auch `reproduced`: Das CI-signierte Replay-Record aus EA-18b
-    /// (`"verdict":"reproduced"` je Befehl) muss diesen Konflikt mit W2
-    /// ausdrücklich auflösen, bevor sein Typ in einem hier gescannten Crate
-    /// landet.
+    /// trägt je Befehl `"verdict":"reproduced"` (die Form legt EA-18b fest).
+    /// Aufgelöst über [`REPLAY_VERDICTS`]: Nur die Datei des Record-Typs darf
+    /// genau diese beiden Urteils-Wörter tragen — sie sind die Beobachtung
+    /// des CI-Laufs je argv, keine Stufe; `A3 reproduced` und `claim not
+    /// reproduced` rechnet der Reader (`replay::summarize`) gegen die
+    /// entscheidenden Befehle der Session selbst, nur unter gültiger
+    /// `minds-anchor`-Signatur. Jedes andere Muster bleibt dort verboten.
     const STORED_CLAIMS: &[&str] = &[
         "\"assurance",
         "\"level\"",
@@ -2998,10 +3002,19 @@ mod tests {
         }
 
         for (path, text) in &files {
-            if let Err(finding) = scan(text) {
+            let (record, words) = REPLAY_VERDICTS;
+            let allowed = if path.ends_with(record) { words } else { &[] };
+            if let Err(finding) = scan_allowing(text, allowed) {
                 panic!("{}:{finding}", path.display());
             }
         }
+        assert!(
+            files
+                .iter()
+                .any(|(path, _)| path.ends_with(REPLAY_VERDICTS.0)),
+            "stale exemption {}",
+            REPLAY_VERDICTS.0
+        );
 
         // Wer serde im Reader braucht, entscheidet W2 neu — und passt
         // diesen Test an.
@@ -3109,6 +3122,18 @@ mod tests {
     /// - Mehrzeilige `use minds_reader::{…}`-Gruppen werden als Ganzes
     ///   betrachtet; ein Glob-Import des Readers ist ein Fund.
     fn scan(text: &str) -> Result<(), String> {
+        scan_allowing(text, &[])
+    }
+
+    /// Die eine Ausnahme von [`STORED_CLAIMS`] (EA-18b): der Record-Typ und
+    /// die beiden Urteils-Wörter, die seine Form verlangt.
+    const REPLAY_VERDICTS: (&str, &[&str]) = (
+        "minds-core/src/replay.rs",
+        &["\"reproduced\"", "\"not_reproduced\""],
+    );
+
+    /// Wie [`scan`], aber die Muster in `allowed` gelten nicht.
+    fn scan_allowing(text: &str, allowed: &[&str]) -> Result<(), String> {
         let lines: Vec<&str> = text.lines().collect();
         let mut reader_group = false;
         for (number, line) in lines.iter().enumerate() {
@@ -3155,11 +3180,29 @@ mod tests {
             if lower.contains("minds_reader::*") {
                 return finding("minds_reader::*");
             }
-            if let Some(claim) = stored_claim(code) {
+            if let Some(claim) = stored_claim_except(code, allowed) {
                 return finding(claim);
             }
         }
         Ok(())
+    }
+
+    /// Die Ausnahme ist eng: nur diese Datei, nur diese zwei Wörter.
+    #[test]
+    fn the_replay_verdict_exemption_is_narrow() {
+        let (_, words) = REPLAY_VERDICTS;
+        let verdict = r#"            Self::Reproduced => "reproduced","#;
+        assert!(scan(verdict).is_err(), "elsewhere still a finding");
+        assert!(scan_allowing(verdict, words).is_ok());
+        assert!(scan_allowing(r#"    let x = "not_reproduced";"#, words).is_ok());
+        for still in [
+            r#"    #[serde(rename = "level")]"#,
+            r#"    let level = "a3";"#,
+            r#"    json!({"assurance": 3})"#,
+            "    pub reproduced: bool,",
+        ] {
+            assert!(scan_allowing(still, words).is_err(), "{still}");
+        }
     }
 
     /// Ob eine Zeile ein Element auf oberster Ebene beginnt (Spalte 0).
@@ -3224,16 +3267,21 @@ mod tests {
     /// nur an einer Bezeichner-Grenze: `pub explained: bool` ist ein Fund,
     /// das Gate-Flag `require_explained:` (EA-02, EA-12) nicht.
     fn stored_claim(line: &str) -> Option<&'static str> {
+        stored_claim_except(line, &[])
+    }
+
+    fn stored_claim_except(line: &str, allowed: &[&str]) -> Option<&'static str> {
         let code = line.to_lowercase();
         if code.contains("minds_reader") && code.contains("assurance") {
             return Some("minds_reader::…assurance");
         }
         let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
         STORED_CLAIMS.iter().copied().find(|claim| {
-            code.match_indices(claim).any(|(at, _)| {
-                !claim.starts_with(|c: char| c.is_ascii_alphabetic())
-                    || !code[..at].ends_with(identifier)
-            })
+            !allowed.contains(claim)
+                && code.match_indices(claim).any(|(at, _)| {
+                    !claim.starts_with(|c: char| c.is_ascii_alphabetic())
+                        || !code[..at].ends_with(identifier)
+                })
         })
     }
 }

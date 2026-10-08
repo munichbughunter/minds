@@ -195,7 +195,14 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
     let (mut session, call_events) = build_indexed(key, events);
 
     written_hashes(&mut session, events, &call_events, key.agent(), ctx);
-    exec_outcomes(&mut session, events, &call_events, key.agent());
+    exec_outcomes(
+        &mut session,
+        events,
+        &call_events,
+        key.agent(),
+        ctx.root,
+        Resolve::OnHost,
+    );
     hash_artifacts(&mut session, ctx, &[]);
 
     session.edges.extend(edges::subagent(key.agent(), events));
@@ -232,7 +239,17 @@ pub fn checkpoint_witness(
         key.agent(),
         &written_ctx,
     );
-    exec_outcomes(&mut session, events, &call_events, key.agent());
+    // Das `cwd` der Events steht im Namensraum des Agenten — wie die
+    // Effekt-Pfade, also gegen dieselbe Wurzel, und nur lexikalisch: Auf
+    // dem Host aufgelöst, zeigte ein Agenten-Pfad womöglich woandershin.
+    exec_outcomes(
+        &mut session,
+        events,
+        &call_events,
+        key.agent(),
+        agent_root,
+        Resolve::Lexical,
+    );
     hash_artifacts(&mut session, ctx, path_map);
     session.edges.extend(edges::subagent(key.agent(), events));
     if let Some(commit) = ctx.commit {
@@ -516,6 +533,10 @@ impl<'e> PostIndex<'e> {
 ///    werden nur Zahlen und Bench-Namen. Die Bench-Namen und das argv
 ///    scannt die Redaction danach wie jedes Textfeld.
 ///
+/// 6. **Arbeitsverzeichnis** ([`outcome_cwd`]): das `cwd` des Pre-Events,
+///    relativ zur Repo-Wurzel (EA-18b) — damit ein Replay in CI im selben
+///    Unterverzeichnis seines Checkouts laufen kann.
+///
 /// Eine Ableitung im Sinne der Invariante? Nein — eine **Deutung** des
 /// Adapters, versioniert über [`Capture::adapter_version`](minds_core::Capture),
 /// wie `effect` und `written`. Sie kann nur hier entstehen: Der Payload liegt
@@ -526,11 +547,18 @@ fn exec_outcomes(
     events: &[JournalEvent],
     call_events: &[usize],
     agent: &str,
+    root: Option<&Path>,
+    resolve: Resolve,
 ) {
     let Some(adapter) = normalize::adapter_for(agent).filter(|a| a.exec_outcomes()) else {
         return;
     };
     let posts = PostIndex::new(adapter, events);
+    let canonical_root = match resolve {
+        Resolve::OnHost => root.and_then(|r| fs::canonicalize(r).ok()),
+        Resolve::Lexical => None,
+    };
+    let roots: Vec<&Path> = root.into_iter().chain(canonical_root.as_deref()).collect();
 
     let calls = session.turns.iter_mut().flat_map(|t| &mut t.tool_calls);
     for (call, &pre_index) in calls.zip(call_events) {
@@ -562,10 +590,15 @@ fn exec_outcomes(
             }
             continue;
         };
+        let pre = events.get(pre_index);
         call.outcome = posts
-            .post_for(events.get(pre_index))
+            .post_for(pre)
             .and_then(|post| adapter.exec_report(post, &command))
-            .and_then(|report| exec_outcome::interpret(runner, argv, &report));
+            .and_then(|report| exec_outcome::interpret(runner, argv, &report))
+            .map(|mut outcome| {
+                outcome.cwd = outcome_cwd(pre.and_then(|e| e.cwd.as_deref()), &roots, resolve);
+                outcome
+            });
         // Erkannt, aber ohne Zusammenfassung — kein Ergebnis, oder nur ein
         // Exit-Code (Build-Fehler, unlesbare Zusammenfassung): Das steht
         // dabei, damit „kein `outcome`" nicht als „nicht versucht" und ein
@@ -578,6 +611,53 @@ fn exec_outcomes(
             capture.note = Some(CaptureNote::ResultNotCaptured);
         }
     }
+}
+
+/// Ob Pfade aus den Events auf diesem Dateisystem aufgelöst werden dürfen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolve {
+    /// Lokaler Checkpoint: Agent und Checkpoint teilen das Dateisystem.
+    OnHost,
+    /// Witness: Die Pfade stehen im Namensraum des Agenten — nur
+    /// lexikalisch vergleichen.
+    Lexical,
+}
+
+/// Das Arbeitsverzeichnis eines Aufrufs relativ zur Repo-Wurzel (EA-18b):
+/// `.` für die Wurzel selbst, sonst die `/`-getrennten Komponenten darunter.
+///
+/// Rein lexikalisch gegen jede Schreibweise der Wurzel (roh und kanonisch);
+/// erst wenn das nicht trifft, wird das `cwd` selbst aufgelöst (macOS
+/// `/var` → `/private/var`, verlinktes Home) — wie
+/// [`inside_repo_resolved`], aber nur bei [`Resolve::OnHost`]. `None` für alles andere: kein `cwd`, ein
+/// relatives, eines mit `..`/Shell-Expansion, eines außerhalb der Wurzel
+/// oder mit Komponenten, die kein UTF-8 sind. Ein absoluter Pfad wird nie
+/// gespeichert — er wäre in CI wertlos und trüge den Benutzernamen.
+fn outcome_cwd(cwd: Option<&str>, roots: &[&Path], resolve: Resolve) -> Option<String> {
+    let cwd = cwd?;
+    if !Path::new(cwd).is_absolute() || !lexically_plain(cwd) {
+        return None;
+    }
+    let relative = |path: &Path| -> Option<String> {
+        let rest = roots.iter().find_map(|root| path.strip_prefix(root).ok())?;
+        let mut parts = Vec::new();
+        for component in rest.components() {
+            match component {
+                Component::Normal(part) => parts.push(part.to_str()?),
+                Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        Some(if parts.is_empty() {
+            ".".to_owned()
+        } else {
+            parts.join("/")
+        })
+    };
+    relative(Path::new(cwd)).or_else(|| match resolve {
+        Resolve::OnHost => relative(&fs::canonicalize(cwd).ok()?),
+        Resolve::Lexical => None,
+    })
 }
 
 /// blake3 über `bytes` — nur, wenn die Redaction in `text` (denselben Bytes

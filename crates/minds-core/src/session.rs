@@ -266,6 +266,18 @@ pub struct ExecOutcome {
     /// `KEY=VALUE`-Präfixe gehören nicht dazu. Läuft durch die Redaction.
     pub command: Vec<String>,
 
+    /// Das Arbeitsverzeichnis des Aufrufs, **relativ zur Repo-Wurzel** zum
+    /// Zeitpunkt des Checkpoints: `.` für die Wurzel, sonst `/`-getrennt
+    /// ohne `.`/`..`-Komponenten (EA-18b). Ein Replay führt das Kommando im
+    /// selben Unterverzeichnis seines Checkouts aus — der absolute Pfad der
+    /// Entwicklungsmaschine wäre in CI wertlos (und PII).
+    ///
+    /// `None`, wenn das Hook-Event kein `cwd` trug oder es außerhalb der
+    /// Wurzel lag; ein Replay überspringt den Befehl dann. Läuft durch die
+    /// Redaction. Additiv: `None` wird nicht geschrieben.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+
     /// Der Exit-Code — nur, wenn der Payload ihn trägt. Claude Code nennt
     /// ihn nur bei einem gescheiterten Aufruf (`PostToolUseFailure`), bei
     /// Erfolg fehlt er im Payload und bleibt hier `None`.
@@ -656,6 +668,7 @@ mod tests {
             class: ExecClass::Bench,
             runner: "cargo-bench-criterion".into(),
             command: vec!["cargo".into(), "bench".into()],
+            cwd: None,
             exit_code: None,
             tests: None,
             benches: vec![BenchValue {

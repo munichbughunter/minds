@@ -339,6 +339,13 @@ pub enum Field {
         /// Index im argv.
         index: usize,
     },
+    /// `turns[t].tool_calls[c].outcome.cwd`
+    OutcomeCwd {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Tool-Calls im Zug.
+        call: usize,
+    },
     /// `turns[t].tool_calls[c].outcome.benches[i].name`
     OutcomeBenchName {
         /// Index des Zugs.
@@ -434,6 +441,9 @@ impl fmt::Display for Field {
                     f,
                     "turns[{turn}].tool_calls[{call}].outcome.command[{index}]"
                 )
+            }
+            Field::OutcomeCwd { turn, call } => {
+                write!(f, "turns[{turn}].tool_calls[{call}].outcome.cwd")
             }
             Field::OutcomeBenchName { turn, call, index } => {
                 write!(
@@ -1086,6 +1096,7 @@ impl RedactionPipeline {
             class,
             runner,
             command,
+            cwd,
             exit_code,
             tests,
             benches,
@@ -1147,6 +1158,12 @@ impl RedactionPipeline {
             return Ok(dropped(argv_hit));
         }
         let runner = self.redact_field(Field::OutcomeRunner { turn, call }, runner, audit)?;
+        // Das Arbeitsverzeichnis ist repo-relativ, kann aber einen
+        // Verzeichnisnamen tragen, der etwas verrät — gescannt wie jeder
+        // Text; ein Fund verwirft das Ergebnis (unten).
+        let cwd = cwd
+            .map(|cwd| self.redact_field(Field::OutcomeCwd { turn, call }, cwd, audit))
+            .transpose()?;
         let mut redacted_benches = Vec::with_capacity(benches.len());
         for (index, BenchValue { name, value, unit }) in benches.into_iter().enumerate() {
             redacted_benches.push(BenchValue {
@@ -1171,6 +1188,7 @@ impl RedactionPipeline {
                 class,
                 runner,
                 command,
+                cwd,
                 exit_code,
                 tests,
                 benches: redacted_benches,
@@ -1467,6 +1485,7 @@ mod tests {
                         // Ergebnis (eigener Test unten), und die Zählung hier
                         // bräuchte dann die verworfenen Felder.
                         command: vec!["cargo".into(), "bench".into()],
+                        cwd: None,
                         exit_code: Some(1),
                         tests: None,
                         benches: vec![BenchValue {
@@ -1962,6 +1981,7 @@ mod tests {
                 class: minds_core::ExecClass::Test,
                 runner: "pytest".into(),
                 command: argv.iter().map(|a| a.to_string()).collect(),
+                cwd: None,
                 exit_code: Some(1),
                 tests: Some(minds_core::TestCounts {
                     passed: 2,
@@ -2006,6 +2026,39 @@ mod tests {
         s.turns.push(turn);
         let out = pipeline().redact_session(s).unwrap();
         assert_eq!(out.session().turns[0].tool_calls[0].outcome, clean.outcome);
+    }
+
+    #[test]
+    fn pii_in_the_outcome_cwd_drops_the_outcome() {
+        // Das repo-relative `cwd` (EA-18b) ist Text wie jeder andere: Trägt
+        // ein Verzeichnisname eine Adresse, fällt das ganze Ergebnis weg —
+        // ein Replay braucht das unveränderte `cwd`, ein geschwärztes wäre
+        // ein falsches Arbeitsverzeichnis (fail-closed).
+        let mut s = session();
+        let mut turn = user_turn("teste");
+        let mut call = runner_call(&["pytest", "py"]);
+        call.outcome.as_mut().unwrap().cwd = Some("users/anna@example.com/py".into());
+        turn.tool_calls.push(call);
+        s.turns.push(turn);
+
+        let out = pipeline().redact_session(s).unwrap();
+        let canonical = minds_core::to_canonical_string(out.session()).unwrap();
+        assert!(!canonical.contains("anna@example.com"), "Leck: {canonical}");
+        assert_eq!(out.session().turns[0].tool_calls[0].outcome, None);
+
+        // Ein gewöhnliches Unterverzeichnis bleibt stehen.
+        let mut s = session();
+        let mut turn = user_turn("teste");
+        let mut clean = runner_call(&["pytest", "py"]);
+        clean.outcome.as_mut().unwrap().cwd = Some("crates/sort".into());
+        turn.tool_calls.push(clean.clone());
+        s.turns.push(turn);
+        let out = pipeline().redact_session(s).unwrap();
+        assert_eq!(out.session().turns[0].tool_calls[0].outcome, clean.outcome);
+        assert_eq!(
+            Field::OutcomeCwd { turn: 1, call: 2 }.to_string(),
+            "turns[1].tool_calls[2].outcome.cwd"
+        );
     }
 
     #[test]

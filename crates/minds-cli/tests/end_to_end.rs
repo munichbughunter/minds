@@ -3714,14 +3714,14 @@ fn reinterpret_is_read_only_and_deterministic() {
     assert!(out.status.success(), "{text}");
     // Interpretations-Protokoll: Evidenz-Adresse unverändert, gespeicherter
     // und aktueller Stand nebeneinander.
-    assert!(text.contains("Adapter   claude-code v3"), "{text}");
+    assert!(text.contains("Adapter   claude-code v4"), "{text}");
     assert!(text.contains("Evidence"), "{text}");
     assert!(
-        text.contains("stored        claude-code v3 → READ a.rs"),
+        text.contains("stored        claude-code v4 → READ a.rs"),
         "{text}"
     );
     assert!(
-        text.contains("current       claude-code v3 → READ a.rs (unchanged)"),
+        text.contains("current       claude-code v4 → READ a.rs (unchanged)"),
         "{text}"
     );
     assert!(text.contains("0 with a newer interpretation"), "{text}");
@@ -3785,7 +3785,7 @@ fn reinterpret_shows_the_write_time_hash_of_a_captured_write() {
         .lines()
         .find(|l| l.trim_start().starts_with("stored") && l.contains("EDIT"))
         .unwrap_or_else(|| panic!("keine gespeicherte Schreibung:\n{text}"));
-    assert!(stored.contains("claude-code v3"), "{text}");
+    assert!(stored.contains("claude-code v4"), "{text}");
     assert!(stored.ends_with(written), "{text}");
     let current = text
         .lines()

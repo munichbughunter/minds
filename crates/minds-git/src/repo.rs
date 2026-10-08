@@ -187,6 +187,13 @@ impl Repo {
         self.inner.common_dir()
     }
 
+    /// Der Arbeitsbaum mit den ausgecheckten Dateien — `None` bei einem
+    /// baren Repository. Im verlinkten Worktree dessen eigenes Verzeichnis,
+    /// nicht das Elternverzeichnis von [`git_dir`](Self::git_dir).
+    pub fn workdir(&self) -> Option<&Path> {
+        self.inner.workdir()
+    }
+
     /// Das gix-Handle. Crate-intern — siehe `error.rs` zur Fassade.
     pub(crate) fn gix(&self) -> &gix::Repository {
         &self.inner

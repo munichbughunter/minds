@@ -55,11 +55,17 @@ pub enum AttestError {
 /// (OpenSSH < 8.0) meldet stattdessen eine unbekannte Option und gilt als
 /// nicht verfügbar.
 pub fn ssh_keygen_available() -> bool {
-    let Ok(output) = Command::new("ssh-keygen")
-        .args(["-Y", "sign"])
-        .stdin(Stdio::null())
-        .output()
-    else {
+    ssh_keygen_available_at(Path::new("ssh-keygen"))
+}
+
+/// Wie [`ssh_keygen_available`], für genau das `ssh-keygen` unter
+/// `program` — mit leerer Umgebung, damit die Probe nichts erbt.
+pub fn ssh_keygen_available_at(program: &Path) -> bool {
+    let mut command = Command::new(program);
+    if program.is_absolute() {
+        command.env_clear();
+    }
+    let Ok(output) = command.args(["-Y", "sign"]).stdin(Stdio::null()).output() else {
         return false;
     };
     let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
@@ -75,7 +81,21 @@ pub fn ssh_sign(payload: &str, key: &Path) -> Result<String, AttestError> {
 /// Signiert `payload` im angegebenen SSH-Namespace. Der Namespace trennt
 /// Signaturen verschiedener Verwendungszwecke kryptographisch voneinander.
 pub fn ssh_sign_ns(payload: &str, key: &Path, namespace: &str) -> Result<String, AttestError> {
-    sign_with(payload, key, namespace, false)
+    sign_with(Path::new("ssh-keygen"), payload, key, namespace, false)
+}
+
+/// Wie [`ssh_sign_ns`], aber mit einem **vorab aufgelösten** `ssh-keygen`
+/// (absoluter Pfad). Für Aufrufer, die zwischen Auflösung und Signatur
+/// fremden Code ausführen (`minds replay`): Ein über `PATH` gefundenes
+/// Programm könnte dieser Code inzwischen untergeschoben haben — und es
+/// bekäme den Schlüssel.
+pub fn ssh_sign_ns_with(
+    program: &Path,
+    payload: &str,
+    key: &Path,
+    namespace: &str,
+) -> Result<String, AttestError> {
+    sign_with(program, payload, key, namespace, false)
 }
 
 /// Wie [`ssh_sign_ns`], aber mit **geerbtem stderr**: Für einen FIDO-Schlüssel
@@ -91,10 +111,11 @@ pub fn ssh_sign_ns_presence(
     key: &Path,
     namespace: &str,
 ) -> Result<String, AttestError> {
-    sign_with(payload, key, namespace, true)
+    sign_with(Path::new("ssh-keygen"), payload, key, namespace, true)
 }
 
 fn sign_with(
+    program: &Path,
     payload: &str,
     key: &Path,
     namespace: &str,
@@ -106,7 +127,7 @@ fn sign_with(
     // ssh-keygen hängt ".sig" an den Payload-Pfad an — die Signatur entsteht
     // im selben privaten Verzeichnis, das mit dem TempDir-Drop verschwindet.
     let sig = dir.path().join("payload.sig");
-    let mut command = Command::new("ssh-keygen");
+    let mut command = Command::new(program);
     command
         .args(["-Y", "sign", "-n", namespace, "-f"])
         .arg(key)

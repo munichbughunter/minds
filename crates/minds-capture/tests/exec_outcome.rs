@@ -38,12 +38,16 @@ fn feed(journal: &Journal, payload: &str, seq: u64) {
 }
 
 fn checkpoint(journal: &Journal) -> Session {
+    checkpoint_at(journal, None)
+}
+
+fn checkpoint_at(journal: &Journal, root: Option<&std::path::Path>) -> Session {
     let keys = journal.sessions().unwrap().keys;
     assert_eq!(keys.len(), 1, "genau eine Session erwartet");
     let events = journal.read(&keys[0]).unwrap().events;
     let policy = minds_redact::RedactionConfig::default().pipeline().unwrap();
     let ctx = Checkpoint {
-        root: None,
+        root,
         commit: None,
         tracked: None,
         redaction: Some(&policy),
@@ -101,6 +105,7 @@ fn outcome_cargo_test_pass() {
             class: ExecClass::Test,
             runner: "cargo-test".into(),
             command: argv(&["cargo", "test"]),
+            cwd: None,
             exit_code: None,
             tests: counts(2, 0, 1),
             benches: Vec::new(),
@@ -113,6 +118,7 @@ fn outcome_cargo_test_pass() {
             class: ExecClass::Test,
             runner: "cargo-nextest".into(),
             command: argv(&["cargo", "nextest", "run"]),
+            cwd: None,
             exit_code: None,
             tests: counts(2, 0, 1),
             benches: Vec::new(),
@@ -125,6 +131,7 @@ fn outcome_cargo_test_pass() {
             class: ExecClass::Test,
             runner: "cargo-test".into(),
             command: argv(&["cargo", "test"]),
+            cwd: None,
             exit_code: None,
             tests: counts(2, 0, 1),
             benches: Vec::new(),
@@ -141,6 +148,7 @@ fn outcome_cargo_test_fail() {
             class: ExecClass::Test,
             runner: "cargo-test".into(),
             command: argv(&["cargo", "test", "--features", "broken"]),
+            cwd: None,
             exit_code: Some(101),
             tests: counts(2, 1, 1),
             benches: Vec::new(),
@@ -162,6 +170,7 @@ fn outcome_cargo_test_fail() {
             class: ExecClass::Test,
             runner: "cargo-nextest".into(),
             command: argv(&["cargo", "nextest", "run", "--features", "broken"]),
+            cwd: None,
             exit_code: Some(100),
             tests: counts(2, 1, 1),
             benches: Vec::new(),
@@ -184,6 +193,7 @@ fn outcome_criterion_bench_ns() {
             class: ExecClass::Bench,
             runner: "cargo-bench-criterion".into(),
             command: argv(&["cargo", "bench", "--bench", "sort"]),
+            cwd: None,
             exit_code: None,
             tests: None,
             benches: vec![
@@ -203,6 +213,7 @@ fn outcome_pytest_summary() {
             class: ExecClass::Test,
             runner: "pytest".into(),
             command: argv(&["pytest", "py/test_calc.py"]),
+            cwd: None,
             exit_code: None,
             tests: counts(2, 0, 1),
             benches: Vec::new(),
@@ -214,6 +225,7 @@ fn outcome_pytest_summary() {
             class: ExecClass::Test,
             runner: "pytest".into(),
             command: argv(&["pytest", "py"]),
+            cwd: None,
             exit_code: Some(1),
             tests: counts(2, 1, 1),
             benches: Vec::new(),
@@ -237,7 +249,7 @@ fn outcome_compound_command_not_interpreted() {
         capture.note.unwrap().as_str(),
         "compound command not interpreted"
     );
-    assert_eq!(capture.adapter_version, 3);
+    assert_eq!(capture.adapter_version, 4);
 
     // Ein unbekanntes Kommando: kein Ergebnis, aber auch kein Hinweis.
     let call = single_call(fixture!("bash-unknown-command"));
@@ -544,7 +556,7 @@ fn a_count_beyond_the_canonical_range_never_blocks_the_session() {
 
 #[test]
 fn outcome_is_deterministic_per_adapter_version() {
-    assert_eq!(minds_capture::normalize::CLAUDE_ADAPTER_VERSION, 3);
+    assert_eq!(minds_capture::normalize::CLAUDE_ADAPTER_VERSION, 4);
     let pairs = [
         fixture!("bash-cargo-test-fail"),
         fixture!("bash-criterion-bench"),
@@ -552,4 +564,48 @@ fn outcome_is_deterministic_per_adapter_version() {
     let a = minds_core::to_canonical_string(&session_of(&pairs)).unwrap();
     let b = minds_core::to_canonical_string(&session_of(&pairs)).unwrap();
     assert_eq!(a, b);
+}
+
+/// Das Arbeitsverzeichnis des Ergebnisses für ein Paar, dessen Pre-Event
+/// `cwd` trägt, gegen die Wurzel `root` (EA-18b).
+fn recorded_cwd(cwd: &str, root: &str) -> Option<String> {
+    let (pre, post) = fixture!("bash-cargo-test-pass");
+    let pre = pre.replace(
+        r#""cwd":"/home/anna/scratch""#,
+        &format!(r#""cwd":"{cwd}""#),
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let journal = Journal::open(tmp.path());
+    feed(&journal, &pre, 0);
+    feed(&journal, post, 1);
+    let session = checkpoint_at(&journal, Some(std::path::Path::new(root)));
+    let call = calls(&session)[0].clone();
+    call.outcome
+        .expect("das Ergebnis bleibt, auch ohne cwd")
+        .cwd
+}
+
+#[test]
+fn outcome_records_the_cwd_relative_to_the_repo_root() {
+    // Die Wurzel selbst ist `.`, darunter der repo-relative Pfad — nie der
+    // absolute Pfad der Entwicklungsmaschine.
+    assert_eq!(
+        recorded_cwd("/home/anna/scratch", "/home/anna/scratch").as_deref(),
+        Some(".")
+    );
+    assert_eq!(
+        recorded_cwd("/home/anna/scratch/crates/sort", "/home/anna/scratch").as_deref(),
+        Some("crates/sort")
+    );
+    // Außerhalb der Wurzel, mit `..` oder relativ: kein cwd — ein Replay
+    // überspringt den Befehl dann, statt zu raten.
+    assert_eq!(recorded_cwd("/home/anna/other", "/home/anna/scratch"), None);
+    assert_eq!(
+        recorded_cwd("/home/anna/scratch/../other", "/home/anna/scratch"),
+        None
+    );
+    assert_eq!(recorded_cwd("scratch", "/home/anna/scratch"), None);
+    // Ohne Wurzel gibt es nichts, wogegen relativ gerechnet würde.
+    let session = session_of(&[fixture!("bash-cargo-test-pass")]);
+    assert_eq!(calls(&session)[0].outcome.as_ref().unwrap().cwd, None);
 }

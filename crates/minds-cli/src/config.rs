@@ -36,7 +36,7 @@ const KEY_BINARY: &str = "minds.binary";
 
 /// Optionale Redaction-Policy, relativ zur Repo-Wurzel. JSON, damit keine neue
 /// Format-Abhängigkeit nötig ist (das Envelope-Crate ist ohnehin serde-basiert).
-const REDACT_CONFIG: &str = ".minds/redact.json";
+pub(crate) const REDACT_CONFIG: &str = ".minds/redact.json";
 
 /// Wert von [`KEY_BACKEND`] für die beiden Backends.
 const BACKEND_IN_REPO: &str = "in-repo";
@@ -119,6 +119,12 @@ pub fn load_redaction(repo_root: &Path) -> Result<RedactionConfig, Box<dyn std::
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(RedactionConfig::default()),
         Err(err) => Err(format!("{}: cannot be read: {err}", path.display()).into()),
     }
+}
+
+/// Liest eine Redaction-Policy aus Bytes (etwa aus dem Baum eines Commits)
+/// — mit derselben wertfreien Fehlermeldung wie [`load_redaction`].
+pub(crate) fn parse_redaction(bytes: &[u8]) -> Result<RedactionConfig, Box<dyn std::error::Error>> {
+    serde_json::from_slice(bytes).map_err(|err| policy_error(Path::new(REDACT_CONFIG), &err).into())
 }
 
 /// Die Fehlermeldung zu einer kaputten Policy — **ohne den Wert, an dem sie

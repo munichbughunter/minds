@@ -64,6 +64,7 @@ mod recap;
 mod reinterpret_cmd;
 mod render;
 mod render_cmd;
+mod replay_cmd;
 mod review_cmd;
 mod seals_cmd;
 mod search;
@@ -285,6 +286,24 @@ Usage:
         The verdict of a single seal — even without a session
         (redaction block).
 
+  minds replay [--commit <rev>] [--unsigned]
+        Unix only. In CI, on a checkout of the commit (default HEAD): re-runs the
+        decisive test and benchmark commands of its sessions — without a
+        shell, with a cleared environment, only what .minds/replay.json in
+        the commit allowlists — and compares them with what the sessions
+        reported. Stores a replay record under refs/minds/anchors/replay/,
+        signed (namespace minds-anchor) with the key in
+        MINDS_ANCHOR_KEY_FILE; --unsigned stores it unsigned (never counts
+        for A3). The replayed code runs as the same user and could read
+        the key: signing is refused in merge/pull request pipelines — sign
+        only on protected branches. The key must only reach those: a
+        GitLab protected variable, or a GitHub environment secret with
+        deployment rules for protected refs (never a repository secret).
+        One key and principal per project; ephemeral, project-dedicated
+        runners; pushes to the signing branch only by merge. Exit
+        codes: 0 reproduced or skipped, 2 claim not reproduced,
+        4 operational failure.
+
   minds review <subject> --approve|--reject|--needs-work [--summary <text>]
                           [--sign] [--key <path>]
         Creates a review verdict as a Git object (refs/minds/reviews).
@@ -456,6 +475,7 @@ const SPECS: &[Spec] = &[
         2,
     ),
     spec("seals", &["--session", "--limit"], &[], 0),
+    spec("replay", &["--commit"], &["--unsigned"], 0),
     spec(
         "verify",
         &[
@@ -903,6 +923,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "intent" => intent_cmd::run(parsed),
 
         "seals" => seals_cmd::run(parsed.value("--session"), parsed.value("--limit")),
+
+        "replay" => replay_cmd::run(parsed.value("--commit"), parsed.has("--unsigned")),
 
         "verify" => verify_cmd::run(
             parsed.positional(0),

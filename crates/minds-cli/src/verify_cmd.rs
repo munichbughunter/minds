@@ -377,11 +377,25 @@ fn verify_target(
     };
     let mut levels = Vec::new();
     let mut scopes = Vec::new();
+    // Der Commit, gegen den Replay-Records zählen (EA-18b): derselbe wie
+    // für die Coverage — `--commit`, sonst die geprüfte Revision.
+    let replay_commit = match options.commit {
+        Some(rev) => match ctx.resolve_rev(rev) {
+            Some(commit) => Some(commit),
+            None => {
+                let err: Box<dyn std::error::Error> =
+                    format!("no such revision: {}", crate::text::sanitize(rev)).into();
+                return operational_failure(err.as_ref());
+            }
+        },
+        None => revision,
+    }
+    .map(|commit| commit.to_string());
     for (i, (id, link)) in links.into_iter().enumerate() {
         if i > 0 {
             println!();
         }
-        match verify_session(&ctx, id, &run, link, &artifact) {
+        match verify_session(&ctx, id, &run, link, &artifact, replay_commit.as_deref()) {
             Ok((verdict, level, scope)) => {
                 if verdict.severity() > worst.severity() {
                     worst = verdict;
@@ -563,7 +577,7 @@ fn trailer_commits(ctx: &Context, id: SessionId) -> Fallible<Vec<CommitId>> {
 /// `Heuristic`, und eine Vermutung hebt keine Stufe über A0). Beides kann
 /// auch der Agent schreiben; über den Commit sagt die Stufe deshalb nichts
 /// (das tut die Coverage-Achse, siehe `minds_reader::assurance`).
-fn sessions_of_revision(
+pub(crate) fn sessions_of_revision(
     ctx: &Context,
     rev: &str,
 ) -> Fallible<(CommitId, Vec<(SessionId, EvidenceSource)>)> {
@@ -674,6 +688,7 @@ fn verify_session(
     run: &RunOptions<'_>,
     link: Option<EvidenceSource>,
     artifact: &ArtifactState,
+    commit: Option<&str>,
 ) -> Fallible<(Verdict, Assurance, scope::ScopeState)> {
     println!("Session        {id}");
     let store = ctx.store.as_ref();
@@ -777,6 +792,7 @@ fn verify_session(
                 ledger: &run.ledger.check,
                 observations: &FsCoverage::Unavailable { cause: None },
                 intent: &intent,
+                commit,
             },
         );
         print_assurance(&report, run);
@@ -1025,6 +1041,7 @@ fn verify_session(
             ledger: &run.ledger.check,
             observations: &observations,
             intent: &intent,
+            commit,
         },
     );
     print_assurance(&report, run);
@@ -1537,6 +1554,7 @@ pub(crate) fn session_assurance(
     root: &Path,
     id: SessionId,
     link: Option<EvidenceSource>,
+    commit: Option<&str>,
 ) -> Fallible<minds_reader::assurance::AssuranceReport> {
     let mut tampered = false;
     let session = match store.get(id) {
@@ -1601,6 +1619,7 @@ pub(crate) fn session_assurance(
             ledger: &LedgerCheck::NotChecked,
             observations: &observations,
             intent: &intent,
+            commit,
         },
     ))
 }

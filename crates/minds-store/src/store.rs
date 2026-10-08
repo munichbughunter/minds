@@ -35,8 +35,9 @@
 
 use minds_core::intent_anchor::IntentAnchor;
 use minds_core::observation::Observations;
+use minds_core::replay::ReplayRecord;
 use minds_core::{ContentHash, EvidenceMark, Session, SessionId};
-use minds_redact::{RedactedIntent, RedactedObservations, RedactedSession};
+use minds_redact::{RedactedIntent, RedactedObservations, RedactedSession, ScannedReplayRecord};
 
 use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
@@ -512,6 +513,72 @@ pub trait ContextStore {
                 id: id.clone(),
                 reason: format!("{:?}", err.classify()).to_lowercase(),
             })
+    }
+
+    /// Legt einen Replay-Record ab (EA-18b) und gibt seine Id zurück:
+    /// `blake3` der kanonischen Bytes, ein elternloser Commit je Record unter
+    /// `refs/minds/anchors/replay/<64 hex>`, Baum `record`.
+    ///
+    /// Dass hier [`ScannedReplayRecord`] verlangt wird, ist dieselbe
+    /// fail-closed-Zusage in Typform wie bei [`put`](Self::put): Ein Record,
+    /// dessen Texte nicht die Redaction passiert haben, kann den Store nicht
+    /// erreichen (argv und Bench-Namen stammen aus einem Envelope, das auch
+    /// ungeprüft unter `refs/minds/*` liegen kann). Idempotent; der Default
+    /// lehnt ab, statt den Record still zu verlieren.
+    fn put_replay(&self, _record: &ScannedReplayRecord) -> Result<ContentHash> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store replay records",
+        )))
+    }
+
+    /// Die rohen Bytes eines Replay-Records — **ungeprüft**.
+    fn replay_bytes(&self, _id: &ContentHash) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Alle abgelegten Replay-Records.
+    fn list_replays(&self) -> Result<Vec<ContentHash>> {
+        Ok(Vec::new())
+    }
+
+    /// Legt die `ssh-sig`-Signatur (Namespace `minds-anchor`) neben den
+    /// Record (`record.sig`) — neben die signierten Bytes, nie hinein. Der
+    /// Record muss bereits liegen. Eine neue Signatur ersetzt die alte;
+    /// geprüft wird sie erst beim Lesen.
+    fn put_replay_signature(&self, _id: &ContentHash, _signature: &str) -> Result<()> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store replay signatures",
+        )))
+    }
+
+    /// Die Signatur zu einem Replay-Record — `None`, wenn er unsigniert ist.
+    fn replay_signature(&self, _id: &ContentHash) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Der Replay-Record unter `id` samt seiner gespeicherten Bytes —
+    /// `None`, wenn er hier nicht liegt.
+    ///
+    /// Geprüft wird gegen die **gespeicherten Bytes** (wie bei Sessions);
+    /// gelesen wird tolerant (unbekannte Felder brechen nicht). Die Bytes
+    /// gehen mit zurück: Signiert sind sie, nicht eine Neu-Serialisierung.
+    fn get_replay(&self, id: &ContentHash) -> Result<Option<(ReplayRecord, Vec<u8>)>> {
+        let Some(bytes) = self.replay_bytes(id)? else {
+            return Ok(None);
+        };
+        let actual = ReplayRecord::id_of_bytes(&bytes);
+        if actual != *id {
+            return Err(StoreError::ReplayMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        // Nur die Kategorie, nie der Parser-Text (wie bei Observations).
+        let record = serde_json::from_slice(&bytes).map_err(|err| StoreError::MalformedReplay {
+            id: id.clone(),
+            reason: format!("{:?}", err.classify()).to_lowercase(),
+        })?;
+        Ok(Some((record, bytes)))
     }
 
     /// Holt die Session unter `id` — `None`, wenn sie hier nicht liegt.

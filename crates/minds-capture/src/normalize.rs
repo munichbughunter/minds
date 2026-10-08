@@ -67,7 +67,10 @@ pub struct EventFacts {
 ///   ([`ToolCall::outcome`](minds_core::ToolCall::outcome)) und der Hinweis
 ///   `compound command not interpreted` (EA-18a). Sessions aus v1/v2 bleiben
 ///   ohne beides.
-pub const CLAUDE_ADAPTER_VERSION: u32 = 3;
+/// - v4: zusätzlich das repo-relative Arbeitsverzeichnis des Ergebnisses
+///   ([`ExecOutcome::cwd`](minds_core::ExecOutcome::cwd)) für den Replay
+///   (EA-18b). Ergebnisse aus v3 bleiben ohne; ein Replay überspringt sie.
+pub const CLAUDE_ADAPTER_VERSION: u32 = 4;
 
 /// Versionsstand des generischen Fallbacks für Agents ohne eigenen Adapter.
 pub const GENERIC_ADAPTER_VERSION: u32 = 1;
@@ -1511,7 +1514,7 @@ mod tests {
             .unwrap();
         assert_eq!(got.effect.written, None);
         assert_eq!(got.effect.written_unavailable, None);
-        assert_eq!(got.adapter_version, 3);
+        assert_eq!(got.adapter_version, CLAUDE_ADAPTER_VERSION);
     }
 
     #[test]

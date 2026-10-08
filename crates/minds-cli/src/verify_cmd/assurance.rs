@@ -14,10 +14,14 @@
 //!   Observation-Objekt trägt sie. Die Liste bleibt leer; A2 ist damit nicht
 //!   erreichbar (`witness profile unknown`), fail-closed. Erreichbar wird es,
 //!   sobald der Witness Profil und Trennung im signierten Material festhält.
-//! - **Replay** (EA-18b) und **Gegenzeichnungen** (EA-19) gibt es noch
-//!   nicht: keine, keine. Der **Intent** (EA-14/EA-15) wird gelesen
+//! - **Gegenzeichnungen** (EA-19) gibt es noch nicht: keine. Der
+//!   **Intent** (EA-14/EA-15) wird gelesen
 //!   ([`minds_reader::intent::intent_of`]); seine Signatur gilt nur unter
-//!   `minds-intent` gegen dieselbe vertrauenswürdige Signer-Datei.
+//!   `minds-intent` gegen dieselbe vertrauenswürdige Signer-Datei. Der
+//!   **Replay** (EA-18b) kommt aus den Records unter
+//!   `refs/minds/anchors/replay/` ([`WitnessTrust::replay`]); zählen kann er
+//!   nur unter `minds-anchor` gegen dieselbe Signer-Datei — ein
+//!   unsignierter Record steht als `replay record unsigned` da.
 //!
 //! # Das Ledger (`--witness-home`)
 //!
@@ -249,6 +253,9 @@ pub(crate) struct Facts<'a> {
     /// damit Coverage (Scope-Befunde, EA-17) und Stufe denselben Anker
     /// sehen.
     pub intent: &'a IntentState,
+    /// Der geprüfte Commit (volle Hex-Id) — nur Replay-Records genau dieses
+    /// Commits zählen (EA-18b); `None` ohne Commit-Kontext.
+    pub commit: Option<&'a str>,
 }
 
 /// Rechnet die Assurance der Session aus.
@@ -282,6 +289,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
     indexed.sort_by_key(|(index, _)| order[*index]);
     let ranges: Vec<RangeInput> = indexed.into_iter().map(|(_, range)| range).collect();
 
+    let replay = trust.replay(facts.id, facts.session, facts.commit);
     let integrity = if facts.tampered {
         EvidenceVerdict::Tampered
     } else if facts.complete {
@@ -303,7 +311,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
         observations: facts.observations,
         witness_starts: &[],
         intent: facts.intent,
-        replay: None,
+        replay: replay.as_ref(),
         anchors: None,
     })
 }

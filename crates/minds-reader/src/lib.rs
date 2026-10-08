@@ -57,6 +57,8 @@ pub mod intent;
 
 pub mod scope;
 
+pub mod replay;
+
 pub mod artifact;
 
 mod query;

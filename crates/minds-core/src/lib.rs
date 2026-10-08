@@ -32,6 +32,10 @@ pub mod observation;
 /// einer Session (EA-14).
 pub mod intent_anchor;
 
+/// Der Replay-Record: was CI beim Wiederholen der entscheidenden Test- und
+/// Benchmark-Befehle einer Session beobachtet hat (EA-18b).
+pub mod replay;
+
 mod attribution;
 pub use attribution::{Attribution, AttributionError};
 
