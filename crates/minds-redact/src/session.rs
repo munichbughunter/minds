@@ -138,8 +138,8 @@
 use std::fmt;
 
 use minds_core::{
-    Agent, Edge, Effect, Endpoint, Intent, Lineage, Model, Produced, Redaction, RedactionCounts,
-    Session, ToolCall, Turn,
+    Agent, BenchValue, Edge, Effect, Endpoint, ExecOutcome, Intent, Lineage, Model, Produced,
+    Redaction, RedactionCounts, Session, ToolCall, Turn,
 };
 
 use crate::pipeline::RedactionPipeline;
@@ -241,6 +241,20 @@ pub enum RedactionError {
     IntentAnchor(#[from] minds_core::intent_anchor::IntentAnchorError),
 }
 
+/// Was die Redaction mit dem Runner-Ergebnis eines Aufrufs gemacht hat.
+#[derive(Debug, Default)]
+struct OutcomeScan {
+    /// Das redigierte Ergebnis — `None`, wenn es keines gab oder es
+    /// verworfen wurde.
+    outcome: Option<ExecOutcome>,
+    /// Ein vorhandenes Ergebnis wurde verworfen (Fund darin, oder
+    /// `arguments` getroffen).
+    dropped: bool,
+    /// Die Funde im argv (Zeile und Elemente). Ungleich null, obwohl
+    /// `arguments` sauber war: `arguments` muss nachgezogen werden.
+    argv_hit: RedactionCounts,
+}
+
 // ---------------------------------------------------------------------------
 // Feld-Pfade
 // ---------------------------------------------------------------------------
@@ -300,6 +314,48 @@ pub enum Field {
         turn: usize,
         /// Index des Tool-Calls im Zug.
         call: usize,
+    },
+    /// `turns[t].tool_calls[c].outcome.runner`
+    OutcomeRunner {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Tool-Calls im Zug.
+        call: usize,
+    },
+    /// `turns[t].tool_calls[c].outcome.command` als ganze Zeile
+    /// (Elemente mit Leerzeichen verbunden) — für Kontext-Detektoren.
+    OutcomeCommandLine {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Tool-Calls im Zug.
+        call: usize,
+    },
+    /// `turns[t].tool_calls[c].outcome.command[i]`
+    OutcomeCommand {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Tool-Calls im Zug.
+        call: usize,
+        /// Index im argv.
+        index: usize,
+    },
+    /// `turns[t].tool_calls[c].outcome.benches[i].name`
+    OutcomeBenchName {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Tool-Calls im Zug.
+        call: usize,
+        /// Index des Benchmarks.
+        index: usize,
+    },
+    /// `turns[t].tool_calls[c].outcome.benches[i].unit`
+    OutcomeBenchUnit {
+        /// Index des Zugs.
+        turn: usize,
+        /// Index des Tool-Calls im Zug.
+        call: usize,
+        /// Index des Benchmarks.
+        index: usize,
     },
     /// `produced.commit_hint`
     ProducedCommitHint,
@@ -367,6 +423,30 @@ impl fmt::Display for Field {
             Field::EffectPath { turn, call } => {
                 write!(f, "turns[{turn}].tool_calls[{call}].effect.path")
             }
+            Field::OutcomeRunner { turn, call } => {
+                write!(f, "turns[{turn}].tool_calls[{call}].outcome.runner")
+            }
+            Field::OutcomeCommandLine { turn, call } => {
+                write!(f, "turns[{turn}].tool_calls[{call}].outcome.command")
+            }
+            Field::OutcomeCommand { turn, call, index } => {
+                write!(
+                    f,
+                    "turns[{turn}].tool_calls[{call}].outcome.command[{index}]"
+                )
+            }
+            Field::OutcomeBenchName { turn, call, index } => {
+                write!(
+                    f,
+                    "turns[{turn}].tool_calls[{call}].outcome.benches[{index}].name"
+                )
+            }
+            Field::OutcomeBenchUnit { turn, call, index } => {
+                write!(
+                    f,
+                    "turns[{turn}].tool_calls[{call}].outcome.benches[{index}].unit"
+                )
+            }
             Field::ProducedCommitHint => f.write_str("produced.commit_hint"),
             Field::ProducedFile(i) => write!(f, "produced.files[{i}]"),
             Field::LineageCwd => f.write_str("lineage.cwd"),
@@ -427,6 +507,37 @@ impl RedactionAudit {
         self.counts.secrets = self.counts.secrets.saturating_add(counts.secrets);
         self.counts.pii = self.counts.pii.saturating_add(counts.pii);
         self.sites.push(AuditSite { field, counts });
+    }
+
+    /// Nimmt die Fundstellen ab `from` zurück — samt ihren Zählern. Für
+    /// Felder, die gescannt, dann aber samt Inhalt verworfen wurden und
+    /// deren Fund an anderer Stelle verbucht wird.
+    fn rollback(&mut self, from: usize) {
+        for site in self.sites.drain(from..) {
+            self.counts.secrets = self.counts.secrets.saturating_sub(site.counts.secrets);
+            self.counts.pii = self.counts.pii.saturating_sub(site.counts.pii);
+        }
+    }
+
+    /// Verbucht `counts` an `field` — gibt es dort schon eine Fundstelle,
+    /// zählt je Kategorie das Maximum statt der Summe: Dasselbe Feld, derselbe
+    /// Inhalt, nicht zweimal gezählt.
+    fn merge(&mut self, field: Field, counts: RedactionCounts) {
+        let Some(site) = self.sites.iter_mut().find(|site| site.field == field) else {
+            self.record(field, counts);
+            return;
+        };
+        let merged = RedactionCounts {
+            secrets: site.counts.secrets.max(counts.secrets),
+            pii: site.counts.pii.max(counts.pii),
+        };
+        // `merged >= site.counts` je Kategorie: Die Differenz ist nie negativ.
+        self.counts.secrets = self
+            .counts
+            .secrets
+            .saturating_add(merged.secrets - site.counts.secrets);
+        self.counts.pii = self.counts.pii.saturating_add(merged.pii - site.counts.pii);
+        site.counts = merged;
     }
 
     /// Summe über alle Felder — genau das, was als Zähler in
@@ -642,6 +753,7 @@ impl RedactionPipeline {
                     arguments,
                     effect,
                     capture,
+                    outcome,
                 } = call;
                 // `arguments` zuerst: Ob die Redaction hier etwas entfernt
                 // hat, entscheidet gleich ueber den Schreibzeit-Hash des
@@ -656,6 +768,31 @@ impl RedactionPipeline {
                     &mut audit,
                 )?;
                 let arguments_redacted = audit.sites.len() > sites_before;
+                // Das Ergebnis vor dem Effekt: Zeigt sein argv ein
+                // Geheimnis, das `arguments` nicht gezeigt hat, wird
+                // `arguments` ganz ersetzt — und gilt danach für die
+                // Schreib-Hashes als getroffen.
+                let scan = self.redact_outcome(
+                    outcome,
+                    turn_index,
+                    call_index,
+                    arguments_redacted,
+                    &mut audit,
+                )?;
+                // Bei **jedem** Fund im argv — auch wenn `arguments` schon
+                // etwas anderes getroffen hat: Ein Fund dort heißt nicht, dass
+                // der Scan dasselbe Geheimnis gesehen hat (`--token=ghp_…
+                // '--password' hunter2` trifft nur das Token). Das argv ist
+                // dieselbe Kommandozeile, also kostet das nur Lesbarkeit; das
+                // Ergebnis ist dann ohnehin verworfen.
+                let (arguments, arguments_redacted) = if scan.argv_hit != RedactionCounts::default()
+                {
+                    let blank =
+                        self.blank_arguments(turn_index, call_index, scan.argv_hit, &mut audit);
+                    (blank, true)
+                } else {
+                    (arguments, arguments_redacted)
+                };
                 let effect = self.redact_effect(
                     effect,
                     turn_index,
@@ -672,6 +809,9 @@ impl RedactionPipeline {
                         status,
                         adapter,
                         adapter_version,
+                        // Geschlossenes Enum ohne Freitext — ungescannt
+                        // wegen seines Typs, wie `written_unavailable`.
+                        note,
                     }) => Some(minds_core::Capture {
                         status,
                         adapter: self.redact_field(
@@ -683,11 +823,19 @@ impl RedactionPipeline {
                             &mut audit,
                         )?,
                         adapter_version,
+                        // Von der Redaction verworfenes Ergebnis: Der Grund
+                        // steht dabei, „kein `outcome`" bleibt eindeutig.
+                        note: if scan.dropped {
+                            Some(minds_core::CaptureNote::ResultNotCaptured)
+                        } else {
+                            note
+                        },
                     }),
                 };
                 redacted_calls.push(ToolCall {
                     effect,
                     capture,
+                    outcome: scan.outcome,
                     // Der Tool-*Name* ist Vokabular des Agents und trägt
                     // normalerweise nichts Sensibles — normalerweise. Er kostet
                     // einen Scan über zehn Zeichen; die Ausnahme wäre teurer.
@@ -877,6 +1025,159 @@ impl RedactionPipeline {
             written,
             written_unavailable,
         }))
+    }
+
+    /// Ersetzt `arguments` als Ganzes durch den Platzhalter der getroffenen
+    /// Kategorie — für den Fall, dass die entquotete Sicht (das argv) ein
+    /// Geheimnis zeigt, das der Scan über `arguments` nicht gesehen hat
+    /// (`pytest '--password' hunter2`: Die Quotes brechen den Kontext des
+    /// Flag-Detektors, die Shell entfernt sie). Erkannt und trotzdem im
+    /// Klartext gespeichert wäre fail-open.
+    ///
+    /// **Zählregel:** `arguments` und argv sind zwei Sichten auf dieselbe
+    /// Kommandozeile; je Kategorie zählt die ergiebigere ([`RedactionAudit::merge`]),
+    /// nie die Summe — ein Geheimnis wird nicht doppelt gezählt. Bekannte
+    /// Untergrenze: Ein Fund in `arguments` **außerhalb** des Kommandos (etwa
+    /// in `description`) und ein anderer, nur im argv sichtbarer Fund zählen
+    /// zusammen als einer. Ersetzt wird trotzdem alles. Ein Env-Präfix kann
+    /// keinen erkennbaren Fund tragen: Seine Werte sind auf die Grammatik der
+    /// Variablen beschränkt (`env_value_ok` in `minds-capture`).
+    fn blank_arguments(
+        &self,
+        turn: usize,
+        call: usize,
+        hit: RedactionCounts,
+        audit: &mut RedactionAudit,
+    ) -> String {
+        audit.merge(Field::ToolCallArguments { turn, call }, hit);
+        let category = if hit.secrets > 0 {
+            crate::redactor::Category::Secret
+        } else {
+            crate::redactor::Category::Pii
+        };
+        category.placeholder().to_string()
+    }
+
+    /// Redigiert das gedeutete Ergebnis eines Laufs (EA-18a): `runner`, jedes
+    /// argv-Element und je Benchmark `name` und `unit`.
+    ///
+    /// Die Bench-Namen sind die einzige Stelle, an der Text aus stdout/stderr
+    /// ins Envelope gelangt — eine Programmausgabe, die der Agent steuert.
+    /// Das argv steht zwar auch in `arguments` (dort gescannt), wird hier
+    /// aber eigenständig gescannt: Kein Feld verlässt sich darauf, dass ein
+    /// anderes es schon entschärft hat (siehe Modul-Doku). Zahlen, Klasse und
+    /// Exit-Code sind Typen ohne Freitext.
+    ///
+    /// Jeder Fund im Ergebnis — argv, runner, Bench-Name, Einheit — verwirft
+    /// das **ganze** Ergebnis ([`OutcomeScan::dropped`]); ein teilweise
+    /// geschwärzter Bench-Name (`login/[redacted:pii]`) bliebe sonst neben
+    /// unverändertem Kontext stehen. Was das argv getroffen hat, meldet
+    /// [`OutcomeScan::argv_hit`] zurück: Der Aufrufer muss dann `arguments`
+    /// nachziehen.
+    fn redact_outcome(
+        &self,
+        outcome: Option<ExecOutcome>,
+        turn: usize,
+        call: usize,
+        arguments_redacted: bool,
+        audit: &mut RedactionAudit,
+    ) -> Result<OutcomeScan, RedactionError> {
+        let Some(ExecOutcome {
+            class,
+            runner,
+            command,
+            exit_code,
+            tests,
+            benches,
+        }) = outcome
+        else {
+            return Ok(OutcomeScan::default());
+        };
+        let dropped = |argv_hit| OutcomeScan {
+            outcome: None,
+            dropped: true,
+            argv_hit,
+        };
+        // Das argv zuerst, und zwar zweimal: als ganze Zeile und Element für
+        // Element. Kontext-Detektoren (`--password wert`, `KEY=wert`) sehen
+        // Schlüssel und Wert nur zusammen — Element für Element bliebe der
+        // Wert stehen. Ein Fund irgendwo im argv, oder in den `arguments`
+        // desselben Aufrufs (dort steht dasselbe Kommando), verwirft das
+        // **ganze** Ergebnis: Ein geschwärztes argv taugt für kein Replay,
+        // und ein halb geschwärztes wäre ein Leck. Fail-closed.
+        //
+        // Gezählt wird ein Fund im argv **einmal**: Die Fundstellen von Zeile
+        // und Elementen werden zurückgenommen und als Maximum an
+        // `arguments` verbucht (`blank_arguments`, `RedactionAudit::merge`).
+        let line = command.join(" ");
+        let sites_before = audit.sites.len();
+        self.redact_field(Field::OutcomeCommandLine { turn, call }, line, audit)?;
+        let sites_line = audit.sites.len();
+        let command = self.redact_list(
+            command,
+            |index| Field::OutcomeCommand { turn, call, index },
+            audit,
+        )?;
+        // Zeile und Elemente sind zwei Sichten auf dieselbe Kommandozeile:
+        // Ein Token in einem Element treffen beide. Je Kategorie zählt
+        // deshalb die ergiebigere Sicht, nicht die Summe.
+        let sum = |sites: &[AuditSite]| {
+            sites
+                .iter()
+                .fold(RedactionCounts::default(), |sum, site| RedactionCounts {
+                    secrets: sum.secrets.saturating_add(site.counts.secrets),
+                    pii: sum.pii.saturating_add(site.counts.pii),
+                })
+        };
+        let (line_hit, element_hit) = (
+            sum(&audit.sites[sites_before..sites_line]),
+            sum(&audit.sites[sites_line..]),
+        );
+        let argv_hit = RedactionCounts {
+            secrets: line_hit.secrets.max(element_hit.secrets),
+            pii: line_hit.pii.max(element_hit.pii),
+        };
+        if argv_hit != RedactionCounts::default() {
+            // Das argv wird samt Ergebnis verworfen; sein Fund wird an
+            // `arguments` verbucht (dieselbe Kommandozeile), nicht dreifach.
+            audit.rollback(sites_before);
+            return Ok(dropped(argv_hit));
+        }
+        if arguments_redacted {
+            return Ok(dropped(argv_hit));
+        }
+        let runner = self.redact_field(Field::OutcomeRunner { turn, call }, runner, audit)?;
+        let mut redacted_benches = Vec::with_capacity(benches.len());
+        for (index, BenchValue { name, value, unit }) in benches.into_iter().enumerate() {
+            redacted_benches.push(BenchValue {
+                name: self.redact_field(
+                    Field::OutcomeBenchName { turn, call, index },
+                    name,
+                    audit,
+                )?,
+                value,
+                unit: self.redact_field(
+                    Field::OutcomeBenchUnit { turn, call, index },
+                    unit,
+                    audit,
+                )?,
+            });
+        }
+        if audit.sites.len() > sites_before {
+            return Ok(dropped(RedactionCounts::default()));
+        }
+        Ok(OutcomeScan {
+            outcome: Some(ExecOutcome {
+                class,
+                runner,
+                command,
+                exit_code,
+                tests,
+                benches: redacted_benches,
+            }),
+            dropped: false,
+            argv_hit: RedactionCounts::default(),
+        })
     }
 
     /// Redigiert die gesamte Herkunft — Kennung, Zeitfenster und
@@ -1147,12 +1448,39 @@ mod tests {
         s.turns.push(Turn {
             role: Role::Assistant,
             text: TERM.into(),
-            tool_calls: vec![ToolCall {
-                capture: None,
-                name: TERM.into(),
-                arguments: TERM.into(),
-                effect: None,
-            }],
+            tool_calls: vec![
+                ToolCall {
+                    outcome: None,
+                    capture: None,
+                    name: TERM.into(),
+                    arguments: TERM.into(),
+                    effect: None,
+                },
+                // EA-18a: runner und Bench-Name/-Einheit sind Text. Eigener
+                // Aufruf mit sauberen `arguments` — ein Fund dort verwürfe das
+                // Ergebnis (siehe `a_secret_split_across_argv_elements_…`).
+                ToolCall {
+                    outcome: Some(ExecOutcome {
+                        class: minds_core::ExecClass::Bench,
+                        runner: TERM.into(),
+                        // Das argv bleibt sauber: Ein Fund dort verwirft das ganze
+                        // Ergebnis (eigener Test unten), und die Zählung hier
+                        // bräuchte dann die verworfenen Felder.
+                        command: vec!["cargo".into(), "bench".into()],
+                        exit_code: Some(1),
+                        tests: None,
+                        benches: vec![BenchValue {
+                            name: TERM.into(),
+                            value: 1,
+                            unit: TERM.into(),
+                        }],
+                    }),
+                    capture: None,
+                    name: "Bash".into(),
+                    arguments: r#"{"command":"cargo bench"}"#.into(),
+                    effect: None,
+                },
+            ],
             parent: None,
             at: Some(TERM.into()),
         });
@@ -1332,6 +1660,7 @@ mod tests {
             role: Role::Assistant,
             text: "deploye".into(),
             tool_calls: vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "bash".into(),
                 arguments: r#"{"cmd":"deploy --token=ghp_012345678901234567890123456789012345"}"#
@@ -1386,6 +1715,7 @@ mod tests {
             role: Role::User,
             text: "DB_PASSWORD=hunter2".into(),
             tool_calls: vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "bash".into(),
                 arguments: "psql postgres://admin:s3cr3t@db.internal/prod".into(),
@@ -1425,6 +1755,37 @@ mod tests {
             "turns[2].tool_calls[1].effect.path"
         );
         assert_eq!(Field::LineageCwd.to_string(), "lineage.cwd");
+        assert_eq!(
+            Field::OutcomeCommand {
+                turn: 1,
+                call: 0,
+                index: 2
+            }
+            .to_string(),
+            "turns[1].tool_calls[0].outcome.command[2]"
+        );
+        assert_eq!(
+            Field::OutcomeBenchName {
+                turn: 0,
+                call: 3,
+                index: 1
+            }
+            .to_string(),
+            "turns[0].tool_calls[3].outcome.benches[1].name"
+        );
+        assert_eq!(
+            Field::OutcomeRunner { turn: 0, call: 0 }.to_string(),
+            "turns[0].tool_calls[0].outcome.runner"
+        );
+        assert_eq!(
+            Field::OutcomeBenchUnit {
+                turn: 0,
+                call: 0,
+                index: 0
+            }
+            .to_string(),
+            "turns[0].tool_calls[0].outcome.benches[0].unit"
+        );
     }
 
     // --- M6: lineage.cwd und effect.path ------------------------------------
@@ -1481,6 +1842,7 @@ mod tests {
         let mut s = session();
         let mut turn = user_turn("schreib die Konfiguration");
         turn.tool_calls.push(ToolCall {
+            outcome: None,
             capture: None,
             name: "Write".into(),
             arguments: r#"{"file_path":"src/config.rs","content":"token = \"ghp_012345678901234567890123456789012345\"\n"}"#.into(),
@@ -1494,6 +1856,7 @@ mod tests {
         });
         // Derselbe Aufruf ohne Treffer: Der Hash bleibt.
         turn.tool_calls.push(ToolCall {
+            outcome: None,
             capture: None,
             name: "Write".into(),
             arguments: r#"{"file_path":"src/lib.rs","content":"fn main() {}\n"}"#.into(),
@@ -1558,6 +1921,7 @@ mod tests {
         let mut s = session();
         let mut turn = user_turn("schreib was");
         turn.tool_calls.push(ToolCall {
+            outcome: None,
             capture: None,
             name: "Write".into(),
             arguments: "{}".into(),
@@ -1588,6 +1952,201 @@ mod tests {
         );
         // Art und (hier fehlender) Hash bleiben unberührt.
         assert_eq!(effect.kind, EffectKind::Write);
+    }
+
+    /// Ein Bash-Aufruf mit Runner-Ergebnis, `command` als argv.
+    fn runner_call(argv: &[&str]) -> ToolCall {
+        let line = argv.join(" ");
+        ToolCall {
+            outcome: Some(ExecOutcome {
+                class: minds_core::ExecClass::Test,
+                runner: "pytest".into(),
+                command: argv.iter().map(|a| a.to_string()).collect(),
+                exit_code: Some(1),
+                tests: Some(minds_core::TestCounts {
+                    passed: 2,
+                    failed: 1,
+                    ignored: 0,
+                }),
+                benches: Vec::new(),
+            }),
+            capture: None,
+            name: "Bash".into(),
+            arguments: format!(r#"{{"command":"{line}"}}"#),
+            effect: None,
+        }
+    }
+
+    #[test]
+    fn a_secret_split_across_argv_elements_drops_the_outcome() {
+        // Kontext-Detektoren (`--password wert`) brauchen Flag und Wert in
+        // einem Text. Element für Element gescannt, stünde `hunter2` noch im
+        // argv — deshalb wird die ganze Kommandozeile gescannt, und bei einem
+        // Fund fällt das Ergebnis weg (fail-closed).
+        let mut s = session();
+        let mut turn = user_turn("teste");
+        turn.tool_calls
+            .push(runner_call(&["pytest", "--password", "hunter2"]));
+        s.turns.push(turn);
+
+        let out = pipeline().redact_session(s).unwrap();
+        let canonical = minds_core::to_canonical_string(out.session()).unwrap();
+        assert!(!canonical.contains("hunter2"), "Leck: {canonical}");
+        assert_eq!(out.session().turns[0].tool_calls[0].outcome, None);
+        // Ein Geheimnis, ein Fund — nicht je Sicht (arguments, argv-Zeile,
+        // argv-Element) einmal.
+        assert_eq!(out.session().redaction.counts.secrets, 1);
+        assert_eq!(out.audit().fields_changed(), 1);
+
+        // Ohne Fund bleibt das Ergebnis, wie es war.
+        let mut s = session();
+        let mut turn = user_turn("teste");
+        let clean = runner_call(&["pytest", "-p", "no:cacheprovider", "py"]);
+        turn.tool_calls.push(clean.clone());
+        s.turns.push(turn);
+        let out = pipeline().redact_session(s).unwrap();
+        assert_eq!(out.session().turns[0].tool_calls[0].outcome, clean.outcome);
+    }
+
+    #[test]
+    fn a_secret_only_the_argv_shows_blanks_the_arguments() {
+        // Die Shell-Quotes brechen den Kontext des Flag-Detektors in
+        // `arguments`; das entquotete argv zeigt das Geheimnis. Erkannt und
+        // trotzdem gespeichert wäre fail-open: `arguments` wird ganz ersetzt.
+        for raw in [
+            r#"{"command":"pytest '--password' hunter2"}"#,
+            r#"{"command":"pytest --pass''word hunter2"}"#,
+            r#"{"command":"pytest --password' 'hunter2"}"#,
+        ] {
+            let mut call = runner_call(&["pytest", "--password", "hunter2"]);
+            call.arguments = raw.into();
+            call.capture = Some(minds_core::Capture {
+                status: minds_core::CaptureStatus::Interpreted,
+                adapter: "claude-code".into(),
+                adapter_version: 3,
+                note: None,
+            });
+            let mut s = session();
+            let mut turn = user_turn("teste");
+            turn.tool_calls.push(call);
+            s.turns.push(turn);
+
+            let out = pipeline().redact_session(s).unwrap();
+            let canonical = minds_core::to_canonical_string(out.session()).unwrap();
+            assert!(!canonical.contains("hunter2"), "{raw}: {canonical}");
+            let call = &out.session().turns[0].tool_calls[0];
+            assert_eq!(call.arguments, "[redacted:secret]", "{raw}");
+            assert_eq!(call.outcome, None);
+            assert_eq!(
+                call.capture.as_ref().unwrap().note,
+                Some(minds_core::CaptureNote::ResultNotCaptured)
+            );
+            assert!(
+                out.audit()
+                    .sites()
+                    .iter()
+                    .any(|site| site.field == Field::ToolCallArguments { turn: 0, call: 0 }),
+                "{raw}: arguments nicht im Audit"
+            );
+        }
+    }
+
+    #[test]
+    fn another_finding_in_the_arguments_does_not_stop_the_blanking() {
+        // Ein Fund in `arguments` heißt nicht, dass der Scan dasselbe
+        // Geheimnis gesehen hat: Hier trifft er nur das Token bzw. die
+        // E-Mail-Adresse, `hunter2` hinter dem gequoteten Flag nicht.
+        for (other, raw) in [
+            (
+                "--token=ghp_012345678901234567890123456789012345",
+                r#"{"command":"pytest --token=ghp_012345678901234567890123456789012345 '--password' hunter2"}"#,
+            ),
+            (
+                "--email=anna.mueller@example.com",
+                r#"{"command":"pytest --email=anna.mueller@example.com '--password' hunter2"}"#,
+            ),
+        ] {
+            let mut call = runner_call(&["pytest", other, "--password", "hunter2"]);
+            call.arguments = raw.into();
+            let mut s = session();
+            let mut turn = user_turn("teste");
+            turn.tool_calls.push(call);
+            s.turns.push(turn);
+
+            let out = pipeline().redact_session(s).unwrap();
+            let canonical = minds_core::to_canonical_string(out.session()).unwrap();
+            assert!(!canonical.contains("hunter2"), "{raw}: {canonical}");
+            let call = &out.session().turns[0].tool_calls[0];
+            assert_eq!(call.arguments, "[redacted:secret]", "{raw}");
+            assert_eq!(call.outcome, None);
+        }
+    }
+
+    #[test]
+    fn a_secret_seen_by_line_and_element_counts_once() {
+        // Zeile und Element sind zwei Sichten auf dieselbe Kommandozeile;
+        // `arguments` die dritte. Gezählt wird je Geheimnis einmal.
+        const TOKEN: &str = "ghp_012345678901234567890123456789012345";
+        let flag = format!("--token={TOKEN}");
+        let email = "--email=anna.mueller@example.com";
+        for (argv, raw, secrets, pii) in [
+            // Ein Token in einem einzigen Element: Zeile und Element sehen es.
+            (
+                vec!["pytest", flag.as_str()],
+                format!(r#"{{"command":"pytest {flag}"}}"#),
+                1,
+                0,
+            ),
+            // Dazu ein Wert, den nur das entquotete argv zeigt.
+            (
+                vec!["pytest", flag.as_str(), "--password", "hunter2"],
+                format!(r#"{{"command":"pytest {flag} '--password' hunter2"}}"#),
+                2,
+                0,
+            ),
+            // PII statt Secret.
+            (
+                vec!["pytest", email],
+                format!(r#"{{"command":"pytest {email}"}}"#),
+                0,
+                1,
+            ),
+        ] {
+            let mut call = runner_call(&argv);
+            call.arguments = raw.clone();
+            let mut s = session();
+            let mut turn = user_turn("teste");
+            turn.tool_calls.push(call);
+            s.turns.push(turn);
+
+            let out = pipeline().redact_session(s).unwrap();
+            let counts = out.session().redaction.counts;
+            assert_eq!((counts.secrets, counts.pii), (secrets, pii), "{raw}");
+            assert_eq!(counts, out.audit().counts(), "{raw}");
+            assert_eq!(out.audit().fields_changed(), 1, "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_finding_in_a_bench_name_drops_the_outcome() {
+        // Ein teilweise geschwärzter Bench-Name bliebe neben unverändertem
+        // Kontext stehen — verworfen wird das ganze Ergebnis.
+        let mut call = runner_call(&["cargo", "bench"]);
+        call.outcome.as_mut().unwrap().benches = vec![BenchValue {
+            name: "login/ghp_012345678901234567890123456789012345".into(),
+            value: 1,
+            unit: "ns".into(),
+        }];
+        let mut s = session();
+        let mut turn = user_turn("bench");
+        turn.tool_calls.push(call);
+        s.turns.push(turn);
+
+        let out = pipeline().redact_session(s).unwrap();
+        let call = &out.session().turns[0].tool_calls[0];
+        assert_eq!(call.outcome, None);
+        // `arguments` war sauber und bleibt es.
+        assert_eq!(call.arguments, r#"{"command":"cargo bench"}"#);
     }
 
     #[test]

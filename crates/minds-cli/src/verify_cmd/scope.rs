@@ -329,6 +329,7 @@ mod tests {
             tool_calls: paths
                 .iter()
                 .map(|path| minds_core::ToolCall {
+                    outcome: None,
                     name: "Write".into(),
                     arguments: "{}".into(),
                     capture: None,

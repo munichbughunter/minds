@@ -445,11 +445,27 @@ fn assistant_blocks(content: Option<&serde_json::Value>) -> (String, Vec<ToolCal
                 } else {
                     minds_core::CaptureStatus::Uninterpreted
                 };
+                // Aus demselben Grund kein Runner-Ergebnis (EA-18a): Nennt
+                // das Kommando einen bekannten Runner, steht der Grund dabei —
+                // sonst läse sich die Import-Session als „v3 hat gedeutet und
+                // nichts gefunden". Immer `result-not-captured`, auch für ein
+                // zusammengesetztes Kommando (`cd x && cargo test`), das im
+                // Live-Pfad `compound-command-not-interpreted` trägt: Hier
+                // fehlt das Ergebnis schon, weil der Import keinen Payload
+                // sieht — das ist der vorrangige Grund.
+                let note = (effect.kind == EffectKind::Exec
+                    && effective
+                        .and_then(|input| input.get("command"))
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(crate::exec_outcome::names_runner))
+                .then_some(minds_core::CaptureNote::ResultNotCaptured);
                 tool_calls.push(ToolCall {
+                    outcome: None,
                     name,
                     arguments,
                     effect: Some(effect),
                     capture: Some(minds_core::Capture {
+                        note,
                         status,
                         adapter: "claude-code".into(),
                         adapter_version: normalize::CLAUDE_ADAPTER_VERSION,
@@ -534,6 +550,28 @@ mod tests {
         "\n",
         r#"{"type":"assistant","timestamp":"2026-07-23T09:00:20.000Z","sessionId":"s-1","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/home/anna/projekt/src/retry.rs"}},{"type":"text","text":"Fertig."}],"usage":{"input_tokens":950,"output_tokens":15}}}"#,
     );
+
+    #[test]
+    fn an_imported_runner_call_says_its_result_was_not_captured() {
+        // EA-18a: Der Import sieht nie den Post-Payload. Ein Runner-Aufruf
+        // trägt deshalb den Grund, ein anderes Kommando nicht.
+        let transcript = concat!(
+            r#"{"type":"user","timestamp":"2026-07-23T09:00:00.000Z","sessionId":"s-2","message":{"role":"user","content":"Tests"}}"#,
+            "\n",
+            r#"{"type":"assistant","timestamp":"2026-07-23T09:00:05.000Z","sessionId":"s-2","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"cargo test"}},{"type":"tool_use","name":"Bash","input":{"command":"ls src"}}]}}"#,
+        );
+        let sessions = parse_claude_code(transcript.as_bytes(), "fallback");
+        let calls: Vec<_> = sessions[0]
+            .turns
+            .iter()
+            .flat_map(|t| &t.tool_calls)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        let note = |i: usize| calls[i].capture.as_ref().unwrap().note;
+        assert_eq!(note(0), Some(minds_core::CaptureNote::ResultNotCaptured));
+        assert_eq!(note(1), None);
+        assert!(calls.iter().all(|c| c.outcome.is_none()));
+    }
 
     #[test]
     fn builds_a_full_session_from_a_transcript() {

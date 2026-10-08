@@ -38,6 +38,7 @@ use minds_core::{Capture, CaptureStatus, Effect, EffectKind, WrittenUnavailable}
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::exec_outcome::ExecReport;
 use crate::journal::{EventKind, JournalEvent};
 
 /// Die gedeuteten Fakten eines einzelnen Hook-Events.
@@ -62,7 +63,11 @@ pub struct EventFacts {
 /// - v1: Tool → Wirkung und Pfad.
 /// - v2: zusätzlich der Schreibzeit-Hash [`Effect::written`] aus dem
 ///   PostToolUse-Payload (EA-01a). Sessions aus v1 bleiben ohne ihn.
-pub const CLAUDE_ADAPTER_VERSION: u32 = 2;
+/// - v3: zusätzlich das Ergebnis bekannter Test-/Benchmark-Runner
+///   ([`ToolCall::outcome`](minds_core::ToolCall::outcome)) und der Hinweis
+///   `compound command not interpreted` (EA-18a). Sessions aus v1/v2 bleiben
+///   ohne beides.
+pub const CLAUDE_ADAPTER_VERSION: u32 = 3;
 
 /// Versionsstand des generischen Fallbacks für Agents ohne eigenen Adapter.
 pub const GENERIC_ADAPTER_VERSION: u32 = 1;
@@ -181,6 +186,27 @@ pub trait ToolAdapter: Sync {
     fn written_bytes(&self, _post: &JournalEvent, _path: &str) -> WrittenOutcome {
         Err(WrittenUnavailable::PayloadWithoutContent)
     }
+
+    /// Deutet dieser Adapter Shell-Aufrufe auf Runner-Ergebnisse
+    /// ([`ToolCall::outcome`](minds_core::ToolCall::outcome), EA-18a)? Nur
+    /// dann setzt der Checkpoint Ergebnis und Hinweis — ein Adapter, dessen
+    /// Payload-Form nicht aufgezeichnet ist, bleibt ohne beides. Der Default:
+    /// nein.
+    fn exec_outcomes(&self) -> bool {
+        false
+    }
+
+    /// Zieht aus dem Post-Event eines Shell-Aufrufs die sichtbare Ausgabe
+    /// und den Exit-Code (falls der Payload ihn trägt).
+    ///
+    /// `command` ist das Kommando aus dem Pre-Event; der Post-Payload muss
+    /// dasselbe nennen, sonst gehört er nicht zu diesem Aufruf (dieselbe
+    /// Gegenprobe wie beim Pfad in [`written_bytes`](Self::written_bytes)).
+    /// `None`, wenn die Ausgabe nicht vollständig vorliegt (abgebrochen,
+    /// gekürzt) — eine halbe Ausgabe ergäbe zu kleine Zähler.
+    fn exec_report(&self, _post: &JournalEvent, _command: &str) -> Option<ExecReport> {
+        None
+    }
 }
 
 /// Ergebnis der Schreibzeit-Deutung: die geschriebenen Bytes, oder warum es
@@ -256,6 +282,128 @@ impl ToolAdapter for ClaudeAdapter {
             return Err(PayloadWithoutContent);
         }
         claude_written(&name, tool.tool_response.as_ref())
+    }
+
+    fn exec_outcomes(&self) -> bool {
+        true
+    }
+
+    fn exec_report(&self, post: &JournalEvent, command: &str) -> Option<ExecReport> {
+        claude_exec_report(post, command)
+    }
+}
+
+/// Ab dieser Länge (Zeichen) gilt eine Ausgabe als möglicherweise gekürzt —
+/// knapp unter der beobachteten Kürzungsgrenze für `stdout` (29 761
+/// behaltene Zeichen, siehe Fixture-README). Gilt für den Fehlertext, dessen
+/// Kürzung nicht aufgezeichnet ist, und für `stdout` zusätzlich zu den
+/// `persisted*`-Markern: Eine andere Claude-Code-Version könnte ohne Marker
+/// kürzen, und libtest summiert über Binaries.
+const TRUNCATION_SUSPECT: usize = 29_000;
+
+/// Liegt `text` in der Nähe der Kürzungsgrenze? Gemessen in **Bytes**: Ob
+/// Claude Code nach Zeichen, UTF-16-Einheiten oder Bytes kürzt, ist nicht
+/// belegt — Bytes sind nie weniger als Zeichen oder UTF-16-Einheiten, die
+/// Schranke greift also in jedem Fall zuerst (fail-closed).
+fn suspect_truncated(text: &str) -> bool {
+    text.len() >= TRUNCATION_SUSPECT
+}
+
+/// Die Ausgabe eines `Bash`-Aufrufs aus Claude Codes Post-Payload — die
+/// Formen sind **aufgezeichnet** (Claude Code 2.1.292, siehe
+/// `tests/fixtures/claude-code/README.md`):
+///
+/// - `PostToolUse`: `tool_response.{stdout, stderr, interrupted, isImage,
+///   noOutputExpected}`. stderr ist in `stdout` eingemischt; einen Exit-Code
+///   trägt der Payload **nicht**. Ab etwa 30 000 Zeichen behält Claude Code
+///   nur den **Anfang** von `stdout` und legt die volle Ausgabe in einer
+///   Datei ab (`persistedOutputPath`) — die Zusammenfassung am Ende fehlt
+///   dann, und Teilsummen wären falsch: kein Ergebnis.
+/// - `PostToolUseFailure` (Exit-Code ≠ 0): `error` ist der Text
+///   `Exit code <n>` gefolgt von der Ausgabe; der Präfix `Error: ` (so steht
+///   er im Transkript) wird toleriert. `is_interrupt: true` (Abbruch durch
+///   den Nutzer) und Fehler ohne Exit-Code-Zeile (Timeout, Tool-Fehler):
+///   kein Ergebnis.
+///
+/// Die Datei hinter `persistedOutputPath` wird **nie** gelesen: Ihr Pfad
+/// stammt aus dem Payload, also vom Agenten.
+fn claude_exec_report(post: &JournalEvent, command: &str) -> Option<ExecReport> {
+    let tool = parse::<PostTool>(post)?;
+    if tool.tool_name.as_deref() != Some("Bash") {
+        return None;
+    }
+    let named = tool
+        .tool_input
+        .as_ref()
+        .and_then(|input| input.get("command"))
+        .and_then(serde_json::Value::as_str);
+    if named != Some(command) {
+        return None;
+    }
+    let flag = |value: Option<&serde_json::Value>, key: &str| {
+        value
+            .and_then(|v| v.get(key))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
+    match post.raw_kind.as_str() {
+        "PostToolUse" => {
+            let response = tool.tool_response.as_ref()?;
+            if flag(Some(response), "interrupted")
+                || flag(Some(response), "isImage")
+                || response.get("persistedOutputPath").is_some()
+                || response.get("persistedOutputSize").is_some()
+            {
+                return None;
+            }
+            let stdout = response.get("stdout")?.as_str()?;
+            if suspect_truncated(stdout) {
+                return None;
+            }
+            let stderr = response
+                .get("stderr")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            // Der Payload ist fremd: dieselbe Schranke auch für `stderr`.
+            if suspect_truncated(stderr) {
+                return None;
+            }
+            let output = if stderr.is_empty() {
+                stdout.to_owned()
+            } else {
+                format!("{stdout}\n{stderr}")
+            };
+            Some(ExecReport {
+                output,
+                exit_code: None,
+            })
+        }
+        "PostToolUseFailure" => {
+            let failure = parse::<PostToolFailure>(post)?;
+            if failure.is_interrupt.unwrap_or(false) {
+                return None;
+            }
+            let error = failure.error?;
+            // Ob und wie Claude Code einen langen Fehlertext kürzt, ist nicht
+            // aufgezeichnet — beim Erfolg geschieht es ab etwa 30 000
+            // Zeichen. Bis eine Aufnahme es zeigt: in der Nähe dieser Grenze
+            // kein Ergebnis statt möglicher Teilsummen.
+            if suspect_truncated(&error) {
+                return None;
+            }
+            let error = error.strip_prefix("Error: ").unwrap_or(&error);
+            let (first, output) = error.split_once('\n').unwrap_or((error, ""));
+            let code = first
+                .strip_prefix("Exit code ")?
+                .trim()
+                .parse::<i32>()
+                .ok()?;
+            Some(ExecReport {
+                output: output.to_owned(),
+                exit_code: Some(code),
+            })
+        }
+        _ => None,
     }
 }
 
@@ -365,6 +513,7 @@ fn generic_tool(event: &JournalEvent) -> ToolFacts {
         arguments,
         effect: None,
         capture: Capture {
+            note: None,
             status: CaptureStatus::Uninterpreted,
             adapter: "generic".into(),
             adapter_version: GENERIC_ADAPTER_VERSION,
@@ -425,6 +574,7 @@ fn claude_tool(t: Tool) -> Option<ToolFacts> {
 
     Some(ToolFacts {
         capture: Capture {
+            note: None,
             status,
             adapter: "claude-code".into(),
             adapter_version: CLAUDE_ADAPTER_VERSION,
@@ -496,6 +646,7 @@ fn codex_tool(t: Tool) -> Option<ToolFacts> {
     };
     Some(ToolFacts {
         capture: Capture {
+            note: None,
             status,
             adapter: "codex".into(),
             adapter_version: CODEX_ADAPTER_VERSION,
@@ -857,6 +1008,15 @@ struct PostTool {
     tool_name: Option<String>,
     tool_input: Option<serde_json::Value>,
     tool_response: Option<serde_json::Value>,
+}
+
+/// Claude Codes `PostToolUseFailure`-Payload, so weit die Ergebnis-Deutung
+/// ihn braucht: der Fehlertext (`Exit code <n>` + Ausgabe) und ob der Nutzer
+/// abgebrochen hat.
+#[derive(Debug, Deserialize)]
+struct PostToolFailure {
+    error: Option<String>,
+    is_interrupt: Option<bool>,
 }
 
 /// Die zwei Pfadfelder, die bei den datei-berührenden Tools vorkommen — eine
@@ -1351,7 +1511,7 @@ mod tests {
             .unwrap();
         assert_eq!(got.effect.written, None);
         assert_eq!(got.effect.written_unavailable, None);
-        assert_eq!(got.adapter_version, 2);
+        assert_eq!(got.adapter_version, 3);
     }
 
     #[test]

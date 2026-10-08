@@ -1405,6 +1405,7 @@ mod tests {
             text: "Ok".into(),
             tool_calls: vec![
                 ToolCall {
+                    outcome: None,
                     capture: None,
                     name: "Bash".into(),
                     arguments: r#"{"command":"cargo test"}"#.into(),
@@ -1417,6 +1418,7 @@ mod tests {
                     }),
                 },
                 ToolCall {
+                    outcome: None,
                     capture: None,
                     name: "Edit".into(),
                     arguments: "{}".into(),

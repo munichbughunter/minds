@@ -31,7 +31,9 @@
 //! (Zugangsdaten-Dateien, Schicht 1) und die Garantie dahinter
 //! (`redact_session`, Schicht 3) haben je einen eigenen Test am Ende.
 
-use minds_core::{Agent, Intent, Model, Role, Session, ToolCall, Turn};
+use minds_core::{
+    Agent, BenchValue, ExecClass, ExecOutcome, Intent, Model, Role, Session, ToolCall, Turn,
+};
 use minds_redact::{
     HighEntropyConfig, KnownTokenRedactor, RedactionConfig, RedactionPipeline, is_secret_file,
 };
@@ -520,6 +522,41 @@ const MUST_SURVIVE: &[(&str, &str)] = &[
         "evidence-mark-object",
         r#"{"source":"observed","status":"unknown"}"#,
     ),
+    // --- EA-18a: Runner-Ergebnisse ------------------------------------------
+    // Criterion-Bench-Namen (`group/function/parameter`) landen als
+    // `outcome.benches[i].name` im Envelope — ein Fehlalarm hier machte jedes
+    // Bench-Ergebnis für ein Replay unvergleichbar.
+    (
+        "criterion-bench-names",
+        "sort/1k sort/reverse_sorted_input/10000 serde_json/canonical/rfc8785 parse_large_input/1024 blake3/hash/65536",
+    ),
+    // Bench-Namen und Testfilter mit Wörtern, die auch Schlüsselnamen sind —
+    // ohne Wert dahinter kein Geheimnis.
+    (
+        "criterion-name-with-secretish-word",
+        "secret_scan/1k token_bucket/refill password_hash/argon2 cargo test -p minds-redact --test corpus -- --exact token_counts_survive",
+    ),
+    // Das eigene Vokabular des Runner-Ergebnisses: Ein Fehlalarm hier
+    // verwürfe jedes Ergebnis.
+    (
+        "runner-vocabulary",
+        "cargo-bench-criterion cargo-nextest cargo-test pytest ns",
+    ),
+    // Testfilter mit Schlüsselwörtern, aber ohne Wert.
+    (
+        "test-filter-with-keywords",
+        r#"cargo test -- --exact auth::password_reset_flow pytest -k "token_refresh and not slow""#,
+    ),
+    // Ein normalisiertes Runner-argv: Pakete, Filter, Toolchain.
+    (
+        "runner-argv",
+        "cargo +nightly test -p minds-capture --test exec_outcome -- --exact outcome_cargo_test_fail cargo nextest run --features broken pytest py/test_calc.py",
+    ),
+    // Das Ergebnis-Objekt selbst, in Prosa zitiert.
+    (
+        "outcome-object",
+        r#"{"class":"test","command":["cargo","test"],"exit_code":101,"runner":"cargo-test","tests":{"failed":1,"ignored":1,"passed":2}}"#,
+    ),
     // Der Capture-Stempel des generischen Fallbacks.
     (
         "capture-stamp",
@@ -800,6 +837,62 @@ const ACCEPTED_OVER_REDACTION: &[(&str, &str, &str)] = &[
 /// Wird ein Eintrag hier grün, weil jemand die Lücke geschlossen hat: Eintrag
 /// löschen und in [`MUST_REDACT`] aufnehmen.
 const DOCUMENTED_GAPS: &[(&str, &str, &str)] = &[
+    (
+        // EA-18a (Security-Review): Shell-Quotes brechen den Kontext des
+        // Flag-Detektors (`'--password' wert`); die Shell entfernt sie. Nur
+        // wenn für den Aufruf ein Runner-Ergebnis **gespeichert** wird,
+        // sieht die Session-Redaction das entquotete argv und ersetzt
+        // `arguments` ganz — für jedes andere Kommando (und Runner ohne
+        // Ergebnis: `-q`, gekürzt, abgebrochen, Import) bleibt nur dieser
+        // Text-Scan, und der sieht den Wert nicht.
+        "shell-quoted-cli-flag",
+        "deploy '--password' hunter2",
+        "hunter2",
+    ),
+    (
+        // EA-18a (Security-Review): Ein Tab zwischen Flag und Wert steht in
+        // `arguments` als JSON-Escape `\t` — zwei Zeichen, kein Leerraum für
+        // den Flag-Detektor. Abhilfe wäre ein Scan über die JSON-dekodierte
+        // Sicht.
+        "json-escaped-tab-cli-flag",
+        r#"{"command":"deploy --password\thunter2"}"#,
+        "hunter2",
+    ),
+    (
+        // EA-18a (Security-Review): Unsichtbare Füller, die keine Leerzeichen
+        // sind (Hangul-Füller U+3164, Braille-Leerfeld U+2800, CGJ U+034F,
+        // mongolischer Variation Selector U+180B), trennen Flag und Wert für
+        // das Auge, aber nicht für den Flag-Detektor. Im argv lehnt
+        // `minds-capture` sie ab (kein Runner-Ergebnis); im Text der
+        // `arguments` bleibt nur dieser Scan.
+        "invisible-filler-hangul",
+        "deploy --password\u{3164}hunter2",
+        "hunter2",
+    ),
+    (
+        "invisible-filler-braille",
+        "deploy --password\u{2800}hunter2",
+        "hunter2",
+    ),
+    (
+        "invisible-filler-cgj",
+        "deploy --password\u{034f}hunter2",
+        "hunter2",
+    ),
+    (
+        "invisible-filler-mongolian-vs",
+        "deploy --password\u{180b}hunter2",
+        "hunter2",
+    ),
+    (
+        // EA-18a (Security-Review): Bench-Namen kommen ohne Kontext ins
+        // Envelope. Ein mit echten Daten parametrierter Benchmark
+        // (`BenchmarkId::new("login", user)`) gibt dem Detektor nur
+        // `login/<wert>` — ohne Schlüssel, unter der Entropieschwelle.
+        "context-free-bench-name",
+        "login/hunter2",
+        "hunter2",
+    ),
     (
         // EA-16 (Security-Review): Im GitLab-Editor umbricht ein Wert gern auf
         // die nächste Zeile. Die Schlüssel-Wert-Regel endet am Zeilenende;
@@ -1257,12 +1350,25 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
         session.turns.push(Turn {
             role: Role::Assistant,
             text: case.text.clone(),
-            tool_calls: vec![ToolCall {
-                capture: None,
-                name: "bash".into(),
-                arguments: case.text.clone(),
-                effect: None,
-            }],
+            tool_calls: vec![
+                ToolCall {
+                    outcome: None,
+                    capture: None,
+                    name: "bash".into(),
+                    arguments: case.text.clone(),
+                    effect: None,
+                },
+                // EA-18a: das argv, wie ein Kommando es ergibt — an Leerraum
+                // zerlegt, damit Kontext-Detektoren (`--password wert`) über
+                // Elementgrenzen hinweg greifen müssen. Saubere `arguments`,
+                // damit nicht schon deren Fund das Ergebnis verwirft.
+                runner_call(
+                    case.text.split_whitespace().map(str::to_string).collect(),
+                    "ns-bench",
+                ),
+                // Und der Bench-Name aus der Programmausgabe.
+                runner_call(vec!["cargo".into(), "bench".into()], &case.text),
+            ],
             parent: None,
             at: None,
         });
@@ -1277,6 +1383,10 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
         haystack.push_str(&turn.text);
         for call in &turn.tool_calls {
             haystack.push_str(&call.arguments);
+            if let Some(outcome) = &call.outcome {
+                haystack.extend(outcome.command.iter().map(String::as_str));
+                haystack.extend(outcome.benches.iter().map(|b| b.name.as_str()));
+            }
         }
     }
 
@@ -1295,8 +1405,19 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
         redacted.session().redaction.counts,
         redacted.audit().counts()
     );
-    // Zwei Felder je Fixture (Turn-Text und Tool-Argument) müssen Funde tragen.
-    assert!(redacted.audit().fields_changed() >= cases.len() * 2);
+    // Vier Felder je Fixture müssen Funde tragen: Turn-Text, Tool-Argument,
+    // das Tool-Argument des Runner-Aufrufs (der argv-Fund wird dort
+    // verbucht und ersetzt es) und der Bench-Name.
+    assert!(redacted.audit().fields_changed() >= cases.len() * 4);
+    // Und ein Fund im argv verwirft das ganze Ergebnis — nie ein halb
+    // geschwärztes argv im Envelope.
+    for turn in &redacted.session().turns {
+        assert!(
+            turn.tool_calls[1].outcome.is_none(),
+            "argv mit Fund überlebte: {:?}",
+            turn.tool_calls[1].outcome
+        );
+    }
 }
 
 #[test]
@@ -1680,6 +1801,7 @@ fn a_secret_survives_json_serialization_as_a_tool_argument() {
             role: Role::Assistant,
             text: String::new(),
             tool_calls: vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "Bash".into(),
                 arguments: serde_json::json!({ "command": plaintext }).to_string(),
@@ -1900,5 +2022,27 @@ fn fuzz_an_injected_secret_never_survives() {
             "injiziertes Geheimnis überlebt:\n  ein: {input:?}\n  aus: {:?}",
             out.text
         );
+    }
+}
+
+/// Ein Bash-Aufruf mit Runner-Ergebnis und sauberen `arguments`.
+fn runner_call(command: Vec<String>, bench: &str) -> ToolCall {
+    ToolCall {
+        outcome: Some(ExecOutcome {
+            class: ExecClass::Bench,
+            runner: "cargo-bench-criterion".into(),
+            command,
+            exit_code: None,
+            tests: None,
+            benches: vec![BenchValue {
+                name: bench.into(),
+                value: 1,
+                unit: "ns".into(),
+            }],
+        }),
+        capture: None,
+        name: "Bash".into(),
+        arguments: r#"{"command":"cargo bench"}"#.into(),
+        effect: None,
     }
 }

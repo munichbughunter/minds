@@ -229,6 +229,91 @@ pub struct ToolCall {
     /// bevor irgendetwas gespeichert wird.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect: Option<Effect>,
+
+    /// Was ein bekannter Test- oder Benchmark-Runner laut Tool-Antwort
+    /// gemeldet hat — nur Zahlen und Bench-Namen, nie stdout/stderr (EA-18a).
+    ///
+    /// Eine **Deutung** des PostToolUse-Payloads beim Checkpoint, mit dem
+    /// Adapter-Stand in [`ToolCall::capture`] — derselbe Status wie
+    /// [`Effect::written`]: Der Payload liegt nach dem Checkpoint nicht mehr
+    /// vor, das gespeicherte Ergebnis ist damit Beweismittel des Checkpoints
+    /// und wird von `minds reinterpret` nicht neu gerechnet. Ob die Behauptung
+    /// stimmt, prüft erst ein Replay (EA-18b) — hier steht nur, was berichtet
+    /// wurde.
+    ///
+    /// Additiv: `None` wird nicht geschrieben — Sessions ohne Ergebnis
+    /// behalten Bytes und Id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ExecOutcome>,
+}
+
+/// Das gedeutete Ergebnis eines Test- oder Benchmark-Laufs (EA-18a).
+///
+/// Bewusst **ohne Fließkommazahlen** (Envelope-Invariante): Benchmark-Werte
+/// stehen als ganze Nanosekunden da, Zähler als `u64`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecOutcome {
+    /// Test oder Benchmark.
+    pub class: ExecClass,
+
+    /// Der erkannte Runner, kanonischer Name: `cargo-test`, `cargo-nextest`,
+    /// `cargo-bench-criterion`, `pytest`.
+    pub runner: String,
+
+    /// Das normalisierte argv des Aufrufs — nur aus einem **einfachen**
+    /// Kommando gebildet (kein `;`, `&&`, `|`, keine Umleitung, keine
+    /// Expansion), damit ein Replay es ohne Shell ausführen kann. Erlaubte
+    /// `KEY=VALUE`-Präfixe gehören nicht dazu. Läuft durch die Redaction.
+    pub command: Vec<String>,
+
+    /// Der Exit-Code — nur, wenn der Payload ihn trägt. Claude Code nennt
+    /// ihn nur bei einem gescheiterten Aufruf (`PostToolUseFailure`), bei
+    /// Erfolg fehlt er im Payload und bleibt hier `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+
+    /// Die Test-Zähler aus der Zusammenfassung des Runners.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<TestCounts>,
+
+    /// Die Benchmark-Werte, in der Reihenfolge ihres ersten Auftretens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benches: Vec<BenchValue>,
+}
+
+/// Art eines gedeuteten Laufs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecClass {
+    /// Ein Testlauf (`cargo test`, `cargo nextest run`, `pytest`).
+    Test,
+    /// Ein Benchmark-Lauf (`cargo bench` mit criterion).
+    Bench,
+}
+
+/// Test-Zähler, wie der Runner sie zusammenfasst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestCounts {
+    /// Bestandene Tests.
+    pub passed: u64,
+    /// Gescheiterte Tests (je nach Runner inklusive Timeouts/Errors).
+    pub failed: u64,
+    /// Ausgelassene Tests (`ignored`, `skipped`). Nur innerhalb desselben
+    /// Runners vergleichbar: nextests `skipped` enthält auch per Filter
+    /// ausgeschlossene Tests, libtests `filtered out` zählt hier nicht.
+    pub ignored: u64,
+}
+
+/// Ein Benchmark-Wert: der Median, in ganzen Nanosekunden.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BenchValue {
+    /// Der Name des Benchmarks, wie der Runner ihn ausgibt. Läuft durch die
+    /// Redaction — er stammt aus der Programmausgabe.
+    pub name: String,
+    /// Der Wert, gerundet auf ganze Einheiten.
+    pub value: u64,
+    /// Die Einheit; heute immer `ns`.
+    pub unit: String,
 }
 
 /// Ob und wie ein Tool-Aufruf gedeutet wurde — die Deutungsgrenze als
@@ -248,6 +333,48 @@ pub struct Capture {
 
     /// Versionsstand dieser Deutung; Bump bei jeder Deutungsänderung.
     pub adapter_version: u32,
+
+    /// Warum eine naheliegende Deutung bewusst unterblieb (EA-18a). Ein
+    /// geschlossenes Enum ohne Freitext — nichts, was die Redaction scannen
+    /// müsste.
+    ///
+    /// Additiv: `None` wird nicht geschrieben.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<CaptureNote>,
+}
+
+/// Ein Hinweis zur Deutungsgrenze eines Aufrufs.
+///
+/// Bewusst geschlossen wie [`WrittenUnavailable`](crate::WrittenUnavailable)
+/// und [`Role`]: Ein neuer Wert ist eine Schema-Änderung. Ein
+/// `#[serde(other)]`-Fallback hielte alte Binaries zwar lesefähig, schriebe
+/// den unbekannten Wert aber als Fallback zurück — und änderte damit Bytes
+/// und Id einer content-adressierten Session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptureNote {
+    /// Das Kommando ruft einen bekannten Runner auf, ist aber kein einfaches
+    /// Kommando (`;`, `&&`, `|`, Umleitung, Subshell, Expansion, nicht
+    /// erlaubte Umgebungsvariablen) — es wird nicht zerlegt, damit ein Replay
+    /// nie eine Shell braucht.
+    CompoundCommandNotInterpreted,
+
+    /// Ein bekannter Runner lief, aber sein Ergebnis lag nicht vollständig
+    /// vor: kein Post-Event, abgebrochen, gekürzte Ausgabe, keine lesbare
+    /// Zusammenfassung — oder der Pfad sieht den Payload gar nicht
+    /// (Transkript-Import). So ist „kein `outcome`" nie mehrdeutig zwischen
+    /// „nicht versucht" und „versucht, nichts gefunden".
+    ResultNotCaptured,
+}
+
+impl CaptureNote {
+    /// Die Textform für Menschen (CLI, Reader).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CompoundCommandNotInterpreted => "compound command not interpreted",
+            Self::ResultNotCaptured => "result not captured",
+        }
+    }
 }
 
 /// Der Deutungszustand eines beobachteten Tool-Aufrufs.
@@ -332,6 +459,7 @@ mod tests {
             role: Role::Assistant,
             text: "Ich schaue mir die Backoff-Logik an.".into(),
             tool_calls: vec![ToolCall {
+                outcome: None,
                 capture: None,
                 name: "read_file".into(),
                 arguments: r#"{"path":"src/retry.rs"}"#.into(),
@@ -486,6 +614,69 @@ mod tests {
             );
         }
         assert!(json.contains("\"effect\""));
+
+        // EA-18a: Ohne Ergebnis und ohne Hinweis kein neuer Schlüssel.
+        let mut with_capture = sample();
+        with_capture.turns[1].tool_calls[0].capture = Some(Capture {
+            status: CaptureStatus::Interpreted,
+            adapter: "claude-code".into(),
+            adapter_version: 3,
+            note: None,
+        });
+        let json = crate::to_canonical_string(&with_capture).unwrap();
+        for key in ["outcome", "note"] {
+            assert!(
+                !json.contains(&format!("\"{key}\"")),
+                "unbelegtes EA-18a-Feld {key:?} darf nicht serialisiert werden"
+            );
+        }
+    }
+
+    /// Eine Session, wie ein Binary **vor** EA-18a sie kanonisch schrieb —
+    /// mit Capture-Stempel und Effekt, aber ohne `outcome`/`note`.
+    const LEGACY_CANONICAL: &str = r#"{"agent":{"name":"claude-code","version":"2.1.282"},"intent":{"constraints":[],"discarded":[],"request":"Tests laufen lassen"},"model":{"id":"claude-opus-4","provider":"anthropic"},"produced":{"files":[]},"redaction":{"applied":true,"counts":{"pii":0,"secrets":0}},"schema_version":2,"turns":[{"role":"assistant","text":"","tool_calls":[{"arguments":"{\"command\":\"cargo test\"}","capture":{"adapter":"claude-code","adapter_version":2,"status":"interpreted"},"effect":{"kind":"exec"},"name":"Bash"}]}],"usage":{"input_tokens":0,"output_tokens":0}}"#;
+
+    #[test]
+    fn outcome_additive_serialization() {
+        // Alte Sessions lesen sich und schreiben sich byte-identisch zurück —
+        // ihre `SessionId` bleibt, jeder Trailer in der Historie trifft.
+        let legacy: Session = serde_json::from_str(LEGACY_CANONICAL).unwrap();
+        let call = &legacy.turns[0].tool_calls[0];
+        assert_eq!(call.outcome, None);
+        assert_eq!(call.capture.as_ref().unwrap().note, None);
+        assert_eq!(
+            crate::to_canonical_string(&legacy).unwrap(),
+            LEGACY_CANONICAL
+        );
+
+        // Belegt gehört das Ergebnis dagegen in die Identität — und die
+        // Rundreise ist verlustfrei.
+        let mut with_outcome = legacy.clone();
+        with_outcome.turns[0].tool_calls[0].outcome = Some(ExecOutcome {
+            class: ExecClass::Bench,
+            runner: "cargo-bench-criterion".into(),
+            command: vec!["cargo".into(), "bench".into()],
+            exit_code: None,
+            tests: None,
+            benches: vec![BenchValue {
+                name: "sort/1k".into(),
+                value: 298,
+                unit: "ns".into(),
+            }],
+        });
+        with_outcome.turns[0].tool_calls[0]
+            .capture
+            .as_mut()
+            .unwrap()
+            .note = Some(CaptureNote::CompoundCommandNotInterpreted);
+        let json = crate::to_canonical_string(&with_outcome).unwrap();
+        assert_ne!(json, LEGACY_CANONICAL);
+        assert!(json.contains(r#""note":"compound-command-not-interpreted""#));
+        assert!(json.contains(
+            r#""outcome":{"benches":[{"name":"sort/1k","unit":"ns","value":298}],"class":"bench","command":["cargo","bench"],"runner":"cargo-bench-criterion"}"#
+        ));
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, with_outcome);
     }
 
     #[test]

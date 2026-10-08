@@ -252,6 +252,7 @@ mod tests {
 
     fn effect_call(kind: EffectKind) -> ToolCall {
         ToolCall {
+            outcome: None,
             capture: None,
             name: "T".into(),
             arguments: "{}".into(),

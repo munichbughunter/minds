@@ -7,8 +7,9 @@
 
 mod session;
 pub use session::{
-    Agent, Capture, CaptureStatus, Intent, Model, Produced, Redaction, RedactionCounts, Role,
-    SCHEMA_VERSION, Session, ToolCall, Turn, Usage,
+    Agent, BenchValue, Capture, CaptureNote, CaptureStatus, ExecClass, ExecOutcome, Intent, Model,
+    Produced, Redaction, RedactionCounts, Role, SCHEMA_VERSION, Session, TestCounts, ToolCall,
+    Turn, Usage,
 };
 
 mod lineage;

@@ -507,7 +507,9 @@ fn written_is_deterministic_per_adapter_version() {
             minds_capture::normalize::CLAUDE_ADAPTER_VERSION
         );
     }
-    assert_eq!(minds_capture::normalize::CLAUDE_ADAPTER_VERSION, 2);
+    // `written` kennt die Deutung seit v2 (EA-01a); den aktuellen Stand
+    // pinnt `tests/exec_outcome.rs` (EA-18a: v3).
+    const { assert!(minds_capture::normalize::CLAUDE_ADAPTER_VERSION >= 2) };
 }
 
 #[test]

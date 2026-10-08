@@ -61,6 +61,9 @@ pub use normalize::{
     EventFacts, StoredInterpretation, ToolAdapter, ToolFacts, WrittenOutcome, adapter_for,
 };
 
+pub mod exec_outcome;
+pub use exec_outcome::ExecReport;
+
 pub mod secretwall;
 
 pub mod transcript;
