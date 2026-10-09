@@ -19,6 +19,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Live `minds inspect`.** The TUI reloads by itself when HEAD or a ref
+  under `refs/minds/` changes (checked about once a second, in the code
+  repository and in a child-repo store), and on `r`. Cursor, search and the
+  open graph, why or evidence view are kept; the footer shows when the view
+  was last updated, or that a reload failed and the previous state is shown.
+  `ContextStore::tips` is the new, read-only fingerprint of a store.
 - **Write-time content hash (EA-01a).** Every interpreted write effect of a
   Claude Code session now carries `effect.written`: the blake3 of the bytes
   the tool wrote according to the observed `PostToolUse` payload, taken at

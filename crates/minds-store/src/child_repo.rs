@@ -164,6 +164,10 @@ impl ContextStore for ChildRepoStore {
         self.0.list_seals()
     }
 
+    fn tips(&self) -> Result<Option<Vec<(String, String)>>> {
+        self.0.tips()
+    }
+
     fn put_observations(
         &self,
         observations: &minds_redact::RedactedObservations,
@@ -293,6 +297,22 @@ mod tests {
         let store = ChildRepoStore::open(child.path()).unwrap();
 
         (parent, child, store)
+    }
+
+    #[test]
+    fn tips_are_read_from_the_child_repository() {
+        // Die Hülle leitet weiter — fiele sie auf den Trait-Default zurück,
+        // sähe `inspect` Änderungen im Child nie.
+        let (_parent, _child, store) = parent_and_child();
+        let before = store.tips().unwrap().expect("Child kennt seine Refs");
+        store.put(&redacted("im Child")).unwrap();
+        let after = store.tips().unwrap().unwrap();
+        assert_ne!(before, after);
+        assert!(
+            after
+                .iter()
+                .all(|(name, _)| name.starts_with("refs/minds/"))
+        );
     }
 
     #[test]

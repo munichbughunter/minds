@@ -1508,3 +1508,699 @@ fn skipped_commits_are_not_shown_as_not_observed() {
     assert!(row.contains("· ARTIFACT"), "{row}");
     assert!(row.contains("2 commits · 2 not assessed"), "{row}");
 }
+
+// --- Live neu laden -------------------------------------------------------
+
+/// Ein Abdruck mit festem HEAD: `"2".into()` heißt „Refs anders, HEAD
+/// gleich" — ein Neuladen von selbst ohne HEAD-Bewegung.
+impl From<&str> for crate::Stamp {
+    fn from(refs: &str) -> Self {
+        Self {
+            head: "HEAD main 1111".into(),
+            refs: refs.into(),
+        }
+    }
+}
+
+/// Der Stand nach einer neuen, jüngeren Session `e` — sie steht danach oben.
+fn grown() -> Inspection {
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    sessions.insert(
+        sid('b'),
+        session("Add exponential backoff", "2026-07-25T13:41:00Z"),
+    );
+    sessions.insert(sid('e'), session("Live arrival", "2026-07-26T09:00:00Z"));
+    let (seal_id, seal) = clean_seal(sid('a'));
+    let index = Index::from_parts(sessions, BTreeMap::new())
+        .with_seals(sid('a'), vec![(seal_id, seal, false)]);
+    Inspection::from_index(index, Vec::new(), "payment-service")
+}
+
+/// Der Stand ohne Session `b` — etwa weil sie nicht mehr gelesen wird.
+fn without_b() -> Inspection {
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new()),
+        Vec::new(),
+        "payment-service",
+    )
+}
+
+fn now() -> std::time::SystemTime {
+    std::time::UNIX_EPOCH + std::time::Duration::from_secs(3723)
+}
+
+#[test]
+fn reload_keeps_the_cursor_on_the_same_session() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Down);
+    assert_eq!(app.selected().map(|c| c.id), Some(sid('b')));
+    app.reload(Ok(grown()), Some("2".into()), now());
+    // Die neue Session schiebt b eine Zeile tiefer — der Cursor folgt der
+    // Session, nicht der Zeilennummer.
+    assert_eq!(app.selected().map(|c| c.id), Some(sid('b')));
+    assert_eq!(app.cards.len(), 3);
+    assert_eq!(app.stamp.as_ref().map(|s| s.refs.as_str()), Some("2"));
+    assert_eq!(app.loaded_at, "01:02:03Z");
+    let out = render(&mut app);
+    assert!(out.contains("Live arrival"), "{out}");
+}
+
+#[test]
+fn reload_keeps_the_search() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, Some("backoff".into()));
+    assert_eq!(app.visible.len(), 1);
+    app.reload(Ok(grown()), None, now());
+    assert_eq!(app.query, "backoff");
+    assert_eq!(app.visible.len(), 1);
+    assert_eq!(app.visible_cards()[0].id, sid('b'));
+}
+
+#[test]
+fn reload_rebuilds_the_open_stack_from_its_origins() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Enter);
+    app.reduce(Action::Why);
+    assert_eq!(app.views.len(), 2);
+    app.reload(Ok(grown()), None, now());
+    assert_eq!(app.views.len(), 2);
+    assert!(matches!(&app.views[0], View::Graph { id, .. } if *id == sid('a')));
+    assert!(matches!(
+        &app.views[1],
+        View::Why { origin: crate::app::WhyOrigin::Session(id), .. } if *id == sid('a')
+    ));
+}
+
+#[test]
+fn reload_keeps_the_evidence_section_under_the_cursor() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Evidence);
+    app.reduce(Action::Down);
+    app.reduce(Action::Down);
+    app.reload(Ok(grown()), None, now());
+    assert!(matches!(
+        &app.views[..],
+        [View::Evidence { id, cursor: 2, .. }] if *id == sid('a')
+    ));
+}
+
+#[test]
+fn a_vanished_session_drops_its_view_and_everything_above() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Down);
+    app.reduce(Action::Enter);
+    app.reduce(Action::Evidence);
+    assert_eq!(app.views.len(), 2);
+    app.reload(Ok(without_b()), None, now());
+    assert!(app.views.is_empty());
+    assert_eq!(app.selected().map(|c| c.id), Some(sid('a')));
+    // Der Sprung bleibt nicht unerklärt.
+    let closed = app.closed.clone().expect("Grund vermerkt");
+    assert!(closed.contains("is gone"), "{closed}");
+    let out = render(&mut app);
+    assert!(out.contains("⚠ closed session b3-bbbbbbbb"), "{out}");
+
+    // Ein weiteres Neuladen ohne Taste nimmt den Hinweis nicht weg.
+    app.reload(Ok(without_b()), None, now());
+    assert!(app.closed.is_some());
+}
+
+#[test]
+fn a_failed_reload_keeps_the_old_state_and_says_so() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    let before = app.loaded_at.clone();
+    app.reduce(Action::Enter);
+    app.reload(
+        Err(minds_reader::ReaderError::UnbornHead),
+        Some("2".into()),
+        now(),
+    );
+    assert_eq!(app.cards.len(), filled().cards().len());
+    assert_eq!(app.views.len(), 1);
+    // Der Abdruck bleibt der alte: Die nächste Prüfung versucht es erneut.
+    assert_eq!(app.stamp.as_ref().map(|s| s.refs.as_str()), Some("1"));
+    assert_eq!(app.loaded_at, before);
+    let out = render(&mut app);
+    assert!(out.contains("⚠ reload failed, showing"), "{out}");
+    assert!(out.contains("HEAD has no commit yet"), "{out}");
+    // Der nächste Erfolg nimmt die Warnung zurück.
+    app.reload(Ok(filled()), Some("2".into()), now());
+    let out = render(&mut app);
+    assert!(!out.contains("reload failed"), "{out}");
+    assert!(out.contains("updated 01:02:03Z"), "{out}");
+}
+
+#[test]
+fn r_asks_for_a_reload_but_not_while_typing_a_search() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Reload);
+    assert!(app.reload_requested);
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::SearchStart);
+    let r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+    app.reduce(crate::input::map(r, app.searching));
+    assert!(!app.reload_requested);
+    assert_eq!(app.query, "r");
+}
+
+/// Eine Quelle, die mitzählt, wie oft geladen wurde — und auf Wunsch
+/// scheitert.
+struct Fake {
+    stamp: std::cell::RefCell<Option<String>>,
+    loads: std::cell::Cell<usize>,
+    fail: std::cell::Cell<bool>,
+}
+
+impl Fake {
+    fn at(stamp: &str) -> Self {
+        Self {
+            stamp: std::cell::RefCell::new(Some(stamp.into())),
+            loads: std::cell::Cell::new(0),
+            fail: std::cell::Cell::new(false),
+        }
+    }
+}
+
+impl crate::Source for Fake {
+    fn load(&self) -> minds_reader::Result<Inspection> {
+        self.loads.set(self.loads.get() + 1);
+        if self.fail.get() {
+            return Err(minds_reader::ReaderError::UnbornHead);
+        }
+        Ok(grown())
+    }
+
+    fn stamp(&self) -> Option<crate::Stamp> {
+        self.stamp.borrow().as_deref().map(crate::Stamp::from)
+    }
+}
+
+#[test]
+fn refresh_loads_only_when_the_stamp_changes_or_r_was_pressed() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    let source = Fake::at("1");
+    app.refresh(&source);
+    assert_eq!(source.loads.get(), 0, "gleicher Abdruck: nichts laden");
+
+    *source.stamp.borrow_mut() = Some("2".into());
+    app.refresh(&source);
+    assert_eq!(source.loads.get(), 1, "neuer Abdruck: laden");
+    assert_eq!(app.stamp.as_ref().map(|s| s.refs.as_str()), Some("2"));
+    assert_eq!(app.cards.len(), 3);
+
+    *source.stamp.borrow_mut() = None;
+    app.refresh(&source);
+    assert_eq!(
+        source.loads.get(),
+        1,
+        "unbestimmbar: nicht von selbst laden"
+    );
+
+    app.reduce(Action::Reload);
+    app.refresh(&source);
+    assert_eq!(source.loads.get(), 2, "r lädt immer");
+    assert!(!app.reload_requested);
+}
+
+/// Ein dauerhaft scheiterndes Laden darf die Schleife nicht jede Sekunde
+/// blockieren: Derselbe Abdruck wird nicht erneut versucht.
+#[test]
+fn a_failing_stamp_is_not_retried_in_a_hot_loop() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    let source = Fake::at("2");
+    source.fail.set(true);
+    for _ in 0..5 {
+        app.refresh(&source);
+    }
+    assert_eq!(source.loads.get(), 1, "einmal versucht, dann Ruhe");
+    assert!(app.reload_error.is_some());
+
+    // Eine neue Änderung versucht es wieder — erfolgreich.
+    source.fail.set(false);
+    *source.stamp.borrow_mut() = Some("3".into());
+    app.refresh(&source);
+    assert_eq!(source.loads.get(), 2);
+    assert!(app.reload_error.is_none());
+    assert_eq!(app.stamp.as_ref().map(|s| s.refs.as_str()), Some("3"));
+}
+
+#[test]
+fn r_retries_a_failed_stamp() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let source = Fake::at("2");
+    source.fail.set(true);
+    app.refresh(&source);
+    app.refresh(&source);
+    assert_eq!(source.loads.get(), 1);
+    app.reduce(Action::Reload);
+    app.refresh(&source);
+    assert_eq!(
+        source.loads.get(),
+        2,
+        "r lädt auch einen gescheiterten Abdruck"
+    );
+}
+
+/// Kehrt der Stand zum geladenen zurück, stimmt das Bild wieder — die
+/// Warnung darf nicht stehen bleiben.
+#[test]
+fn a_stale_failure_clears_when_the_state_returns() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    let source = Fake::at("2");
+    source.fail.set(true);
+    app.refresh(&source);
+    assert!(app.reload_error.is_some());
+    *source.stamp.borrow_mut() = Some("1".into());
+    app.refresh(&source);
+    assert!(app.reload_error.is_none());
+    assert_eq!(source.loads.get(), 1, "kein Laden nötig");
+}
+
+#[test]
+fn without_a_stamp_the_footer_says_live_is_off() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let source = Fake::at("1");
+    *source.stamp.borrow_mut() = None;
+    app.refresh(&source);
+    assert!(!app.live);
+    let out = render(&mut app);
+    assert!(out.contains("⚠ live off — r reloads"), "{out}");
+    *source.stamp.borrow_mut() = Some("1".into());
+    app.refresh(&source);
+    assert!(app.live);
+    let out = render(&mut app);
+    assert!(out.contains("· r reload"), "{out}");
+}
+
+/// Die Meldung kann Text aus dem Repository tragen: Bidi-, Zeilentrenner,
+/// Tag-Zeichen und ANSI erreichen das Terminal nicht roh.
+#[test]
+fn a_reload_error_is_sanitized_for_the_footer() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let nasty = "a\u{202E}b\u{2028}c\u{E0041}d\u{1b}[2J";
+    let err = minds_reader::ReaderError::Io {
+        op: "read",
+        path: nasty.into(),
+        source: std::io::Error::other("x"),
+    };
+    app.reload(Err(err), Some("2".into()), now());
+    let line = app.reload_error.clone().unwrap();
+    for raw in ['\u{202E}', '\u{2028}', '\u{E0041}', '\u{1b}'] {
+        assert!(!line.contains(raw), "{raw:?} roh in {line:?}");
+    }
+}
+
+/// Neu laden rechnet wirklich neu: Session b ist erst Legacy, nach dem
+/// Neuladen versiegelt — die offene Evidence-Ebene zeigt den neuen Stand.
+#[test]
+fn reload_recomputes_the_content_of_an_open_view() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Down);
+    app.reduce(Action::Evidence);
+    assert!(matches!(
+        &app.views[..],
+        [View::Evidence { report: None, .. }]
+    ));
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('b'),
+        session("Add exponential backoff", "2026-07-25T13:41:00Z"),
+    );
+    let (seal_id, seal) = clean_seal(sid('b'));
+    let sealed = Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new())
+            .with_seals(sid('b'), vec![(seal_id, seal, false)]),
+        Vec::new(),
+        "payment-service",
+    );
+    app.reload(Ok(sealed), None, now());
+    assert!(matches!(
+        &app.views[..],
+        [View::Evidence { id, report: Some(_), .. }] if *id == sid('b')
+    ));
+}
+
+#[test]
+fn reload_rebuilds_a_commit_chain_from_the_new_model() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let chain = app.inspection.why_commit(commit('1'));
+    app.views.push(View::Why {
+        origin: crate::app::WhyOrigin::Commit(commit('1')),
+        chain,
+        cursor: 0,
+        edge: 0,
+        inspector: None,
+    });
+    // In `grown` trägt Commit 1 keine Session mehr.
+    let next = grown();
+    let expected = format!("{:?}", next.why_commit(commit('1')));
+    app.reload(Ok(next), None, now());
+    match &app.views[..] {
+        [View::Why { origin, chain, .. }] => {
+            assert_eq!(*origin, crate::app::WhyOrigin::Commit(commit('1')));
+            assert_eq!(format!("{chain:?}"), expected);
+        }
+        other => panic!("{}", other.len()),
+    }
+}
+
+/// Lässt sich eine Zeilen-Kette nicht mehr rechnen (HEAD mitten in einem
+/// Checkout unlesbar), schließt sie — und die Fußzeile sagt, was und warum.
+#[test]
+fn a_line_chain_that_cannot_be_recomputed_closes_with_a_reason() {
+    let (dir, repo) = repo();
+    std::fs::write(dir.path().join(".git/HEAD"), "kein ref\n").unwrap();
+    let mut app = App::new(filled(), &repo, None);
+    app.views.push(View::Why {
+        origin: crate::app::WhyOrigin::Line {
+            path: "src/http/retry.rs".into(),
+            line: 3,
+        },
+        chain: app.inspection.why_commit(commit('1')),
+        cursor: 0,
+        edge: 0,
+        inspector: None,
+    });
+    app.reload(Ok(filled()), None, now());
+    assert!(app.views.is_empty());
+    let closed = app.closed.clone().expect("Grund vermerkt");
+    assert!(closed.contains("why src/http/retry.rs:3"), "{closed}");
+    let out = render(&mut app);
+    assert!(out.contains("⚠ closed why src/http/retry.rs:3"), "{out}");
+}
+
+#[test]
+fn the_footer_says_how_fresh_the_view_is_and_help_lists_r() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.loaded_at = crate::app::clock(now());
+    let out = render(&mut app);
+    assert!(out.contains("updated 01:02:03Z · r reload"), "{out}");
+    app.reduce(Action::Help);
+    let out = render(&mut app);
+    assert!(out.contains("reload now"), "{out}");
+}
+
+/// Die Warnung steht vor den Tasten: Auch auf 80 Spalten ist sie zu lesen,
+/// auf der Liste wie in einer Ebene und beim Tippen einer Suche.
+#[test]
+fn the_freshness_warning_survives_narrow_terminals() {
+    let (_dir, repo) = repo();
+    for width in [80, 120] {
+        let mut app = App::new(filled(), &repo, None);
+        app.reload(
+            Err(minds_reader::ReaderError::UnbornHead),
+            Some("2".into()),
+            now(),
+        );
+        assert!(
+            render_at(&mut app, width).contains("⚠ reload failed"),
+            "{width}"
+        );
+        app.reduce(Action::Enter);
+        assert!(
+            render_at(&mut app, width).contains("⚠ reload failed"),
+            "{width} Graph"
+        );
+        app.reduce(Action::Back);
+        app.reduce(Action::SearchStart);
+        assert!(
+            render_at(&mut app, width).contains("⚠ reload failed"),
+            "{width} Suche"
+        );
+
+        let mut app = App::new(filled(), &repo, None);
+        app.live = false;
+        assert!(render_at(&mut app, width).contains("⚠ live off"), "{width}");
+    }
+}
+
+/// Scheitert das Laden und fehlt danach auch der Abdruck, sagt die Fußzeile
+/// beides — sonst bliebe verborgen, dass nichts mehr von selbst lädt.
+#[test]
+fn a_failure_and_live_off_are_shown_together() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reload(
+        Err(minds_reader::ReaderError::UnbornHead),
+        Some("2".into()),
+        now(),
+    );
+    let source = Fake::at("2");
+    *source.stamp.borrow_mut() = None;
+    app.refresh(&source);
+    let out = render(&mut app);
+    assert!(out.contains("⚠ reload failed · live off"), "{out}");
+}
+
+#[test]
+fn the_closed_note_goes_away_with_the_next_key() {
+    let (dir, repo) = repo();
+    std::fs::write(dir.path().join(".git/HEAD"), "kein ref\n").unwrap();
+    let mut app = App::new(filled(), &repo, None);
+    app.views.push(View::Why {
+        origin: crate::app::WhyOrigin::Line {
+            path: "a.rs".into(),
+            line: 1,
+        },
+        chain: app.inspection.why_commit(commit('1')),
+        cursor: 0,
+        edge: 0,
+        inspector: None,
+    });
+    app.reload(Ok(filled()), None, now());
+    assert!(app.closed.is_some());
+    app.reduce(Action::Reload);
+    assert!(app.closed.is_some(), "r allein liest den Hinweis nicht");
+    app.reduce(Action::Down);
+    assert!(app.closed.is_none());
+    assert!(!render(&mut app).contains("closed"));
+}
+
+#[test]
+fn the_clock_is_utc_and_wraps_at_midnight() {
+    let at = |secs| crate::app::clock(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+    assert_eq!(at(0), "00:00:00Z");
+    assert_eq!(at(86_399), "23:59:59Z");
+    assert_eq!(at(86_400 + 61), "00:01:01Z");
+}
+
+/// Ein Platzhalter-Abgleich, den kein echtes Rechnen erzeugt — bleibt er
+/// nach dem Neuladen stehen, wurde nicht neu gerechnet (kein Unterprozess).
+fn marker() -> minds_reader::artifact::CommitArtifact {
+    minds_reader::artifact::CommitArtifact {
+        commit: commit('9'),
+        subject: None,
+        inferred: false,
+        claimants: 1,
+        state: minds_reader::artifact::ArtifactState::Unavailable("marker"),
+    }
+}
+
+fn evidence_with_marker(app: &mut App) {
+    let report = app.inspection.evidence_report(sid('a'));
+    app.views.push(View::Evidence {
+        id: sid('a'),
+        report,
+        uninterpreted: 0,
+        artifacts: vec![marker()],
+        cursor: 0,
+    });
+}
+
+fn has_marker(app: &App) -> bool {
+    matches!(&app.views[..], [View::Evidence { artifacts, .. }]
+        if artifacts.iter().any(|a| a.commit == commit('9')))
+}
+
+/// Schreibt jemand nur Refs (HEAD steht, Commits und Claimants gleich),
+/// rechnet ein Neuladen den Abgleich nicht neu — sonst bestimmte der
+/// Schreiber, wie oft auf dem Host Unterprozesse laufen.
+#[test]
+fn an_automatic_reload_keeps_the_assessment_while_its_inputs_stand() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    evidence_with_marker(&mut app);
+    app.reload(Ok(filled()), Some("2".into()), now());
+    assert!(has_marker(&app), "übernommen");
+}
+
+#[test]
+fn changed_inputs_or_r_recompute_the_assessment() {
+    let (_dir, repo) = repo();
+    // Andere Commits (wie nach einem Amend): neu gerechnet.
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    evidence_with_marker(&mut app);
+    app.reload(Ok(grown()), Some("2".into()), now());
+    assert!(!has_marker(&app), "Eingaben anders");
+
+    // `r` (setzt `full_next`, siehe `r_sets_a_full_reload`): alles neu,
+    // auch bei gleichen Eingaben.
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    evidence_with_marker(&mut app);
+    app.full_next = true;
+    app.reload(Ok(filled()), Some("1".into()), now());
+    assert!(!has_marker(&app), "r rechnet neu");
+
+    // HEAD bewegt: neu.
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    evidence_with_marker(&mut app);
+    let moved = crate::Stamp {
+        head: "HEAD main 2222".into(),
+        refs: "1".into(),
+    };
+    app.reload(Ok(filled()), Some(moved), now());
+    assert!(!has_marker(&app), "HEAD bewegt");
+}
+
+#[test]
+fn r_sets_a_full_reload() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let source = Fake::at("1");
+    app.stamp = Some("1".into());
+    app.reduce(Action::Reload);
+    app.refresh(&source);
+    assert_eq!(source.loads.get(), 1);
+    assert!(!app.full_next, "verbraucht");
+}
+
+/// Scheitert das von `r` verlangte Laden, rechnet das nächste gelungene
+/// trotzdem alles neu — das Versprechen von `r` geht nicht verloren.
+#[test]
+fn a_failed_r_keeps_the_full_reload_for_the_next_success() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    evidence_with_marker(&mut app);
+    app.full_next = true;
+    app.reload(
+        Err(minds_reader::ReaderError::UnbornHead),
+        Some("1".into()),
+        now(),
+    );
+    assert!(app.full_next);
+    app.reload(Ok(filled()), Some("2".into()), now());
+    assert!(!has_marker(&app), "voll neu gerechnet");
+}
+
+/// Ohne HEAD-Bewegung läuft für eine Zeilen-Kette kein Blame: Selbst ein
+/// gerade unlesbares HEAD schließt sie nicht.
+#[test]
+fn a_line_chain_is_not_blamed_again_while_head_stands() {
+    let (dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.stamp = Some("1".into());
+    let mut chain = app.inspection.why_commit(commit('1'));
+    chain.steps.insert(
+        0,
+        minds_reader::model::WhyStep::Line {
+            path: "src/http/retry.rs".into(),
+            line: 3,
+        },
+    );
+    app.views.push(View::Why {
+        origin: crate::app::WhyOrigin::Line {
+            path: "src/http/retry.rs".into(),
+            line: 3,
+        },
+        chain,
+        cursor: 0,
+        edge: 0,
+        inspector: None,
+    });
+    std::fs::write(dir.path().join(".git/HEAD"), "kein ref\n").unwrap();
+    app.reload(Ok(filled()), Some("2".into()), now());
+    assert!(app.closed.is_none(), "{:?}", app.closed);
+    assert!(matches!(&app.views[..], [View::Why { chain, .. }]
+        if matches!(chain.steps.first(), Some(minds_reader::model::WhyStep::Line { .. }))));
+    // `r` blamt neu — und scheitert jetzt sichtbar.
+    app.full_next = true;
+    app.reload(Ok(filled()), Some("2".into()), now());
+    assert!(app.views.is_empty());
+    assert!(app.closed.is_some());
+}
+
+#[test]
+fn a_vanished_selection_moves_to_its_neighbour() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(grown(), &repo, None);
+    // Reihenfolge: e (neu), a, b — Cursor auf b, die letzte Zeile.
+    app.reduce(Action::End);
+    assert_eq!(app.selected().map(|c| c.id), Some(sid('b')));
+    app.reload(Ok(without_b()), None, now());
+    assert_eq!(app.selected().map(|c| c.id), Some(sid('a')), "Nachbar");
+}
+
+#[test]
+fn r_works_while_the_help_is_open() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Help);
+    app.reduce(Action::Reload);
+    assert!(app.reload_requested);
+    assert!(app.help, "die Hilfe bleibt offen");
+}
+
+#[test]
+fn the_search_footer_does_not_promise_r() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::SearchStart);
+    let out = render(&mut app);
+    assert!(out.contains("updated"), "{out}");
+    assert!(!out.contains("r reload"), "{out}");
+    app.live = false;
+    let out = render(&mut app);
+    assert!(out.contains("⚠ live off"), "{out}");
+    assert!(!out.contains("r reloads"), "{out}");
+}
+
+#[test]
+fn a_degraded_session_closes_its_chain_with_the_right_reason() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.views.push(View::Why {
+        origin: crate::app::WhyOrigin::Session(sid('d')),
+        chain: app.inspection.why_commit(commit('1')),
+        cursor: 0,
+        edge: 0,
+        inspector: None,
+    });
+    app.reload(Ok(filled()), None, now());
+    assert!(app.views.is_empty());
+    let closed = app.closed.clone().unwrap_or_default();
+    assert!(closed.contains("has no why chain"), "{closed}");
+}

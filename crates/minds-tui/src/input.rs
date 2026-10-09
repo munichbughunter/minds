@@ -43,6 +43,8 @@ pub enum Action {
     SearchBackspace,
     /// Suche übernehmen.
     SearchCommit,
+    /// Neu laden — sofort, ohne auf den Fingerabdruck zu warten.
+    Reload,
     /// Hilfe ein/aus.
     Help,
     /// Beenden.
@@ -84,6 +86,7 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Char('1') => Action::Zoom(1),
         KeyCode::Char('2') => Action::Zoom(2),
         KeyCode::Char('3') => Action::Zoom(3),
+        KeyCode::Char('r') => Action::Reload,
         KeyCode::Char('/') => Action::SearchStart,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
@@ -121,6 +124,7 @@ mod tests {
             ('/', Action::SearchStart),
             ('?', Action::Help),
             ('q', Action::Quit),
+            ('r', Action::Reload),
             ('l', Action::Enter),
             ('h', Action::Back),
         ] {
