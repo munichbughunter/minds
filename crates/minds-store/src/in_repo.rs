@@ -130,6 +130,10 @@ impl ContextStore for InRepoStore {
         self.0.list_seals()
     }
 
+    fn tips(&self) -> Result<Option<Vec<(String, String)>>> {
+        self.0.tips()
+    }
+
     fn put_observations(
         &self,
         observations: &minds_redact::RedactedObservations,
@@ -273,6 +277,37 @@ mod tests {
             "der gemeinsame Index wurde doch angefasst"
         );
         assert_eq!(store.index().unwrap().links_of("deadbeef").len(), 1);
+    }
+
+    #[test]
+    fn tips_change_when_the_store_does_and_stay_in_the_minds_namespace() {
+        let fixture = TempRepo::init();
+        fixture.write_file("src/lib.rs", "fn main() {}\n");
+        fixture.commit("code");
+        let store = InRepoStore::open(fixture.path()).unwrap();
+
+        let empty = store
+            .tips()
+            .unwrap()
+            .expect("Git-Backends kennen ihre Refs");
+        assert!(empty.is_empty(), "{empty:?}");
+
+        store.put(&redacted("erste Session")).unwrap();
+        let first = store.tips().unwrap().unwrap();
+        assert!(!first.is_empty());
+        assert!(
+            first
+                .iter()
+                .all(|(name, _)| name.starts_with("refs/minds/"))
+        );
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "nach Namen sortiert");
+        // Ohne Schreiben derselbe Abdruck — sonst lüde `inspect` endlos.
+        assert_eq!(store.tips().unwrap().unwrap(), first);
+
+        store.put(&redacted("zweite Session")).unwrap();
+        assert_ne!(store.tips().unwrap().unwrap(), first);
     }
 
     #[test]

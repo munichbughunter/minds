@@ -18,6 +18,7 @@ w                  why — the provenance chain
 e                  evidence — verdict, coverage, epochs, signature, limits
 t                  graph ↔ timeline
 1 / 2 / 3          zoom: summary / normal / verbose
+r                  reload now (it also reloads by itself when the store changes)
 ?                  this help
 q / Ctrl-C         quit
 

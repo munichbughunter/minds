@@ -18,6 +18,10 @@
 //!   zurückgegeben.
 //! - **Pipe-tauglich.** Ist stdout kein Terminal, kommen die Zeilen
 //!   tab-separiert und ohne ANSI — dieselbe Liste, dieselbe Suche.
+//! - **Live.** Die Oberfläche hält keinen eingefrorenen Stand: Sie fragt ihre
+//!   [`Source`] regelmäßig nach einem Fingerabdruck und lädt neu, wenn er
+//!   sich ändert (oder auf `r`). Woraus der Fingerabdruck besteht, weiß die
+//!   Quelle — die Oberfläche fasst dafür kein Git an.
 
 use std::io::IsTerminal;
 
@@ -97,17 +101,52 @@ impl From<minds_reader::ReaderError> for TuiError {
     }
 }
 
+/// Ein Fingerabdruck des Stands, in zwei Teilen: HEAD für sich, weil nur
+/// eine Bewegung von HEAD die teuren, Git-gestützten Teile (Blame, Abgleich)
+/// neu rechnen muss — alles andere in `refs`, als Hash, damit der Abdruck bei
+/// vielen Refs klein bleibt. Er wird nur verglichen, nie gezeigt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    /// HEAD: Branch und Commit, wie die Quelle sie liest.
+    pub head: String,
+    /// Alles Übrige, das ein Neuladen auslöst.
+    pub refs: String,
+}
+
+/// Woher die Oberfläche ihren Stand bekommt — und woran sie merkt, dass er
+/// sich geändert hat.
+///
+/// Die CLI implementiert das über Repo und Store; die Oberfläche selbst
+/// bleibt beim Reader.
+pub trait Source {
+    /// Lädt das Lese-Modell frisch.
+    fn load(&self) -> Result<Inspection, minds_reader::ReaderError>;
+
+    /// Ein billiger Fingerabdruck des Stands, den [`load`](Self::load)
+    /// lesen würde. Ändert er sich, lädt die Oberfläche neu. `None` heißt:
+    /// gerade nicht bestimmbar — dann wird nicht von selbst neu geladen
+    /// (`r` lädt trotzdem).
+    fn stamp(&self) -> Option<Stamp>;
+}
+
 /// Startet die Oberfläche — oder, wenn stdout kein Terminal ist, schreibt die
 /// Zeilen und kehrt zurück.
-pub fn run(inspection: Inspection, repo: &Repo, opts: Options) -> Result<(), TuiError> {
+pub fn run(source: &dyn Source, repo: &Repo, opts: Options) -> Result<(), TuiError> {
+    // Der Fingerabdruck **vor** dem Laden: Ändert sich der Stand dazwischen,
+    // sieht die erste Prüfung einen neuen Abdruck und lädt nach — umgekehrt
+    // ginge die Änderung verloren.
     if !std::io::stdout().is_terminal() {
-        return print(inspection, repo, opts);
+        return print(source.load()?, repo, opts);
     }
+    let stamp = source.stamp();
+    let inspection = source.load()?;
     let mut app = app::App::new(inspection, repo, opts.query);
+    app.live = stamp.is_some();
+    app.stamp = stamp;
     if let Start::Why { path, line } = &opts.start {
         app.open_why_line(path, *line)?;
     }
-    app.run()?;
+    app.run(source)?;
     Ok(())
 }
 

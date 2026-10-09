@@ -171,8 +171,10 @@ Usage:
   minds inspect [<search> | <file>:<line>]
         How a change came to be, in the terminal: session list, a
         session's graph (intent → agent → effects → change → review) and
-        a line's why chain. Read-only. If stdout is not a console, the
-        lines come tab-separated (for grep/fzf).
+        a line's why chain. Read-only. Live: reloads by itself when
+        HEAD or a ref under refs/minds/ changes; r reloads at once.
+        If stdout is not a console, the lines come tab-separated (for
+        grep/fzf).
 
   minds agent-help
         Machine-readable command card (JSON) — for agents, not humans.

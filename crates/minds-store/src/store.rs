@@ -389,6 +389,24 @@ pub trait ContextStore {
         Ok(Vec::new())
     }
 
+    /// Die Spitzen aller Refs unter `refs/minds/` im Repository des Stores,
+    /// nach Namen sortiert — ein billiger Fingerabdruck seines Stands.
+    ///
+    /// Ändert sich nichts daran, hat sich nichts geändert, was ein Leser
+    /// sieht: Sessions, Index, Seals, Beobachtungen und Anker liegen alle
+    /// unter Refs dieses Namensraums. `minds inspect` vergleicht ihn, um zu
+    /// entscheiden, ob es neu laden muss. `None` heißt: Das Backend kann es
+    /// nicht billig sagen — der Aufrufer lädt dann nicht von selbst neu.
+    ///
+    /// Symbolische Refs im Namensraum werden auf ihr Ziel geschält: Der Name
+    /// bleibt unter `refs/minds/`, die Id kann die eines Ziels außerhalb sein.
+    /// Der Abdruck wird nur verglichen, nie gezeigt oder gespeichert.
+    /// Refs, die sich nicht schälen lassen, fehlen darin — ihre Änderung löst
+    /// kein Neuladen aus (`r` schon).
+    fn tips(&self) -> Result<Option<Vec<(String, String)>>> {
+        Ok(None)
+    }
+
     /// Legt die `ssh-sig`-Signatur zu einem Seal neben ihn (`seal.sig`) —
     /// dasselbe Muster wie bei Review-Signaturen: Die Signatur liegt **neben**
     /// den signierten Bytes, nie darin (das wäre zirkulär). Der Seal muss

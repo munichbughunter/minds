@@ -108,6 +108,7 @@ fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
             cursor,
             edge,
             inspector,
+            ..
         } => why::draw(frame, area, chain, *cursor, *edge, inspector.as_deref()),
         View::Evidence {
             id,
@@ -226,6 +227,8 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let keys = if app.searching {
         Line::from(vec![
+            freshness(app),
+            Span::raw("  "),
             Span::styled("/", theme::title()),
             Span::raw(app.query.clone()),
             Span::styled("▏", Style::default()),
@@ -259,6 +262,10 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             ));
             spans.push(Span::raw("  "));
         }
+        // Die Frische vor den Tasten: Auf einem schmalen Terminal werden die
+        // Tasten abgeschnitten, nie die Warnung, dass der Stand alt ist.
+        spans.push(freshness(app));
+        spans.push(Span::raw("  "));
         if !app.query.is_empty() {
             spans.push(Span::styled(
                 format!("[{}] ", app.query),
@@ -283,6 +290,34 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     };
     frame.render_widget(Paragraph::new(vec![status, keys]), area);
+}
+
+/// Wie frisch das Gezeigte ist — und, wenn es das nicht ist, warum (Glyph und
+/// Wort, nie nur Farbe). Vorrang: gescheitertes Laden (samt abgeschaltetem
+/// Live-Modus) vor abgeschaltetem Live-Modus vor einer geschlossenen Ebene;
+/// ein Hinweis, der später wieder vorn steht, bleibt bis zur nächsten Taste.
+/// Beim Tippen einer Suche fehlt der `r`-Hinweis — dort ist `r` ein Zeichen.
+fn freshness(app: &App) -> Span<'static> {
+    let warn = Style::default().fg(theme::REVIEW);
+    let at = &app.loaded_at;
+    let hint = !app.searching;
+    match (&app.reload_error, app.live, &app.closed) {
+        (Some(err), live, _) => Span::styled(
+            format!(
+                "⚠ reload failed{}, showing {at}: {}",
+                if live { "" } else { " · live off" },
+                clip(err, 40)
+            ),
+            warn,
+        ),
+        (None, false, _) if hint => Span::styled(format!("⚠ live off — r reloads · {at}"), warn),
+        (None, false, _) => Span::styled(format!("⚠ live off · {at}"), warn),
+        (None, true, Some(why)) => Span::styled(format!("⚠ closed {} · {at}", clip(why, 40)), warn),
+        (None, true, None) if hint => {
+            Span::styled(format!("updated {at} · r reload"), theme::dim())
+        }
+        (None, true, None) => Span::styled(format!("updated {at}"), theme::dim()),
+    }
 }
 
 /// `DD.MM. HH:MMZ` aus dem RFC-3339-Präfix; `—`, wenn keine Zeit erfasst ist.

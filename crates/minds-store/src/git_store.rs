@@ -1524,6 +1524,17 @@ impl ContextStore for GitStore {
             .collect())
     }
 
+    fn tips(&self) -> Result<Option<Vec<(String, String)>>> {
+        Ok(Some(
+            self.repo
+                .refs_under(MINDS_REF_NAMESPACE)
+                .map_err(StoreError::backend)?
+                .into_iter()
+                .map(|(name, id)| (name, id.to_string()))
+                .collect(),
+        ))
+    }
+
     fn put_observations(
         &self,
         observations: &minds_redact::RedactedObservations,
