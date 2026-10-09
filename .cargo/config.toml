@@ -1,0 +1,4 @@
+# `cargo xtask <aufgabe>` — Werkzeuge für das Repository selbst, nie Teil
+# des ausgelieferten Binaries.
+[alias]
+xtask = "run --quiet --package xtask --"

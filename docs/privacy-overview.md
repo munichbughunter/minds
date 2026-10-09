@@ -1,8 +1,10 @@
 # Minds — Privacy Overview
 
-*For the pilot partner's internal approval process. As of v0.1.3. Every claim
-in this document can be traced to the code; the known gaps are listed at the
-end — with issue numbers, not in a footnote.*
+*For the pilot partner's internal approval process. As of v0.1.3; the parts
+on the witness, observations, intents and CI anchors (ADR-0012) describe the
+unreleased state after v0.4.0. Every claim in this document can be traced to
+the code; the known gaps are listed at the end — with issue numbers, not in a
+footnote.*
 
 ---
 
@@ -35,7 +37,10 @@ e-mail address from the Git configuration.
 ## 2. Where does the data live?
 
 Everything stays **inside the repository and its `.git` directory** — there
-is no database, no service, no cloud component.
+is no database, no service, no cloud component. The one exception is the
+optional **witness** (ADR-0012, `minds enable --witness <profile>`). It keeps its working
+state in its own directory on the host, outside the agent's reach (last
+rows of the table).
 
 | Location | Content | Protection |
 |---|---|---|
@@ -46,6 +51,10 @@ is no database, no service, no cloud component.
 | `refs/minds/context` | index over the sessions | same as store |
 | `refs/minds/reviews` | review verdicts: decision, reviewer e-mail, free-text summary | **not redacted** — whatever the reviewer writes in `--summary` sits verbatim in the ref and in the mirrored MR note; responsibility lies with the reviewer |
 | commit trailers | `Minds-Session-Id` / `Minds-Change-Id` | hashes only, never content |
+| `refs/minds/observations/<hash>` | witness only: the file observer's record — repo-relative paths and blake3 hashes, never file content (section 5) | paths pass the same redaction pipeline, fail-closed; bound by a witness-signed seal |
+| `refs/minds/intents/<hash>` | the intent anchor plus the **redacted** requirement snapshot, and the approver's signature | snapshot redacted fail-closed before it is hashed (section 5) |
+| `refs/minds/anchors/…` | CI countersignatures and replay records: seal id, project path, pipeline id, CI timestamp; replay records add the decisive commands (argv from the already-redacted session) with exit codes, expected and observed test counts and benchmark values (only under names the session already carries), plus the CI environment (CI name, image, policy blob id) — never text from the replay's output | written by CI, signed under `minds-anchor`; `minds anchor --mirror` also posts the countersignature as a merge request note (section 4) |
+| witness home on the host (`--home`, else `MINDS_WITNESS_HOME`, else `$XDG_STATE_HOME/minds-witness/<repo-id>/`, else `~/.local/state/minds-witness/<repo-id>/`) | the witness journal: **raw hook events before redaction** (prompts, tool calls, tool results, and the event fields `cwd`/`transcript_path`, which are absolute host paths that usually contain the user name), unredacted `fs.observed` paths and `witness.start` facts; salts and epoch state, the witness key, the ledger of produced seals, `witness.json` (including the pinned redaction policy and therefore its `deny_pii`/`deny_secrets` terms), `log/witness.log` | directories 0700 with an owner check (0710 only for an explicit socket group), files and key 0600; the agent's domain sees only the socket — **if** the witness runs under its own account (`container`, `user` profile). A witness started as the developer's own user (`managed`, or by hand) shares the agent's UID, and the agent can read this directory. Only the credential-file wall applies before a raw event reaches the journal. The journal is deleted after a successful checkpoint, as on the agent side. If that deletion fails, it is reported and the raw data stays. A session the witness **defers** (`session(s) deferred` in its log) stays in the journal until a later checkpoint succeeds, so there is no fixed upper bound |
 
 Beyond that there are only **user-driven exports**: `minds render`,
 `minds distill --out`, and `minds audit --out` write only on explicit
@@ -82,7 +91,12 @@ path is built on that:
 ## 4. What leaves the machine? Nothing on its own.
 
 The binary contains **no HTTP stack, no telemetry, no update check**.
-Exactly two network paths exist, both triggered by the user:
+Exactly five network paths exist, all triggered by the user or the
+user's CI. The GitLab paths run through `curl`. Only `minds anchor
+--mirror` and the countersignature read-back of `minds verify --online`
+take it from the first absolute `PATH` entry outside the checkout. The
+other GitLab paths (2, 3 and the issue re-read in 5) use a plain `PATH`
+lookup (section 6):
 
 1. **`git push`** — the `pre-push` hook transfers `refs/minds/*` to exactly
    the remote the user is pushing to anyway. If there is nothing new, no
@@ -99,6 +113,23 @@ Exactly two network paths exist, both triggered by the user:
    summary verbatim and unredacted (see the table in section 2). The API
    token comes exclusively from an environment variable and appears neither
    in the process list nor on disk nor in error messages.
+3. **`minds intent bind --issue <group/project#iid>`**: only on explicit
+   invocation. It **reads** the issue's text from GitLab to bind it as an
+   intent (redacted before it is stored, section 5).
+4. **`minds anchor --mirror`** (in CI): looks up the merge requests of the
+   commit and posts the first-sight countersignature on them as a note.
+   That is the seal id, project, pipeline id, CI time and signature, with
+   no session content.
+5. **`minds verify --online`**: **reads** those notes back to detect a
+   deleted countersignature. For an intent bound to an issue, it also
+   re-reads the issue to check its version.
+
+The token for 3–5 comes from an environment variable, as for 2.
+
+Not Minds' own traffic, but worth knowing: **`minds replay`** (in CI)
+re-runs a session's decisive test and benchmark commands. Minds does not
+restrict their network access. Whatever those commands reach, they reach
+from the CI job.
 
 The `pre-push` hook transfers only Minds' own refs; the browsable session
 refs appear on the remote as regular branches `minds/session/<hex>` (see the
@@ -140,6 +171,35 @@ global excludes (`core.excludesFile`, `~/.config/git/ignore`) are **not**
 consulted by the witness. Keep private scratch files in `.gitignore` or
 `.git/info/exclude`.
 
+*Why observations are not erasable:* `forget` exists for the content of a
+session — prompts, responses and tool calls a person wrote or caused. An
+observation object carries no such content. It belongs to the witness's
+signed chain, not to a session: a `witness-fs/v1` seal names it by hash and
+the next epoch's seal names that seal. Deleting it would leave a
+witness-signed seal pointing at nothing. `minds verify` would then mark the
+observations as incomplete (scope not assessed), and the deleted
+observations would no longer corroborate or explain any line. If it was
+the first epoch of the chain, there would be no observation window at all,
+and the session could not reach A2. Verify cannot tell a privacy deletion
+from an agent removing an inconvenient observation.
+
+*No attribution to persons.* An observation has exactly these fields:
+sequence number, the witness's timestamp, repo-relative path, content hash or
+the reason for leaving it out (`secret_file`, `redacted_content`,
+`too_large`, `deleted`, `outside_repo`, `unscannable`). The object as a
+whole adds its schema and three witness timestamps (epoch start, first
+and last observation). There is no user
+name, uid, process, or keystroke. The observer watches the agent's worktree,
+not a person: it cannot tell a write by the agent from a write by a human in
+the same worktree, and it does not try. Two things around it do carry
+identity, and an approval decision should know them. First, like every ref
+under `refs/minds/`, each observation object is stored in a Git commit that
+records the Git identity configured for the repository and the commit
+time. Second, the timestamps of observed writes, read together with the
+session and commit they belong to, show *when* work happened in that
+worktree. Read [`betrvg-note.md`](betrvg-note.md) (German) before using
+this in a works-council setting.
+
 **Intent anchors are not subject to `forget` either.** A session can be
 bound to a requirement (ADR-0012, decision 5). The anchor and a
 **redacted** snapshot of the requirement text are stored under
@@ -158,10 +218,25 @@ requirement as written), and `minds forget <session>` does not remove it:
 the anchor belongs to the requirement, not to one session. Do not bind
 requirements whose text must later be erasable.
 
+**Replay records and countersignatures are not subject to `forget`
+either.** They live under `refs/minds/anchors/`. A replay record carries
+the session id, the commit and the argv of the session's decisive commands.
+The argv is taken from the already-redacted session, so it holds no text
+from the replay's output. Even after `minds forget <session>`, those
+command lines stay in the replay record. A countersignature carries only
+the seal id, project path, pipeline id and CI time.
+
 ## 6. Known gaps — as of v0.1.3
 
 The list an approval decision needs. None of this is hidden; all of it is
 public as issues:
+
+- **`curl` is not resolved the same way on every GitLab path.** `minds
+  gitlab mirror`, `minds intent bind --issue` and the issue re-read of
+  `minds verify --online` run the first `curl` in `PATH`, which can be a
+  relative entry or a program inside the checkout. Run them only with a
+  `PATH` you control. Only `minds anchor --mirror` and the countersignature
+  read-back resolve `curl` outside the checkout.
 
 - **The forge retains erased objects by its own rules.** Since
   [#102](https://github.com/munichbughunter/minds/issues/102), `sync`
@@ -175,6 +250,14 @@ public as issues:
   history has to be cleaned up by hand if needed. **Recommendation for the
   pilot:** `forget` before the first push is fully effective; after a push,
   the housekeeping question to the forge is part of the deletion process.
+- **With a witness, a second plain-text window opens on the host.** The
+  local `.git/minds/journal/` still catches what the witness cannot take
+  (witness unreachable, oversized or unparsable events). The
+  witness journal holds raw hook events (prompts, tool calls, tool results)
+  until its checkpoint. It lies outside the agent's reach (0700/0600, owner
+  check) as long as the witness runs under its own account, but it is readable by whoever controls the witness account on
+  that host, and `forget` does not reach it. Its retention follows the
+  same rule as the agent-side journal described next.
 - **The raw-data journal is the one plain-text window.** Between capture and
   checkpoint, the unredacted raw data — including tool results such as the
   output of `cat .env` — sits under `.git/minds/journal/` (files 0600, local
