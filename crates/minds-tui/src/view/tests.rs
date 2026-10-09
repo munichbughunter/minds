@@ -2326,19 +2326,22 @@ mod changes_tab {
         let (_dir, repo) = repo();
         let mut app = App::new(filled(), &repo, None);
         let out = render(&mut app);
-        assert!(out.contains("F1 Sessions"), "{out}");
-        assert!(out.contains("F2 Verify"), "{out}");
-        assert!(out.contains("F3 Changes"), "{out}");
+        assert!(out.contains("F1 Overview"), "{out}");
+        assert!(out.contains("F2 Sessions"), "{out}");
+        assert!(out.contains("F3 Verify"), "{out}");
+        assert!(out.contains("F4 Changes"), "{out}");
+        assert!(out.contains("F5 Intent"), "{out}");
         app.reduce(Action::CycleTab(true));
         assert_eq!(app.tab, Tab::Verify);
         // Ohne lesbaren Commit (leeres Repo) öffnet der Tab trotzdem — mit
         // einer ehrlichen Meldung statt eines Absturzes.
-        app.reduce(Action::TabTo(2));
+        app.reduce(Action::TabTo(3));
         assert_eq!(app.tab, Tab::Changes);
         assert!(render(&mut app).contains("Changes unavailable") || app.changes.is_some());
-        assert!(out.contains("F4 Intent"), "{out}");
-        app.reduce(Action::TabTo(0));
+        app.reduce(Action::TabTo(1));
         assert_eq!(app.tab, Tab::Sessions);
+        app.reduce(Action::CycleTab(false));
+        assert_eq!(app.tab, Tab::Overview);
         app.reduce(Action::CycleTab(false));
         assert_eq!(app.tab, Tab::Intent);
     }
@@ -2822,7 +2825,7 @@ mod verify_tab {
 
     fn app(repo: &Repo) -> App<'_> {
         let mut app = App::new(filled().with_head(Some(commit('1'))), repo, None);
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         app
     }
 
@@ -2919,7 +2922,7 @@ mod verify_tab {
             Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t")
                 .with_head(Some(commit('1')));
         let mut app = App::new(inspection, &repo, None);
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         let mut legacy = verdict(false, VerifyVerdict::NotVerifiable);
         legacy.sessions[0].session = sid('b');
         app.fill_verify(&signers(Some(legacy)));
@@ -2933,11 +2936,11 @@ mod verify_tab {
     fn a_hidden_tab_does_not_check() {
         let (_dir, repo) = repo();
         let mut app = app(&repo);
-        app.reduce(Action::TabTo(0));
+        app.reduce(Action::TabTo(1));
         let source = signers(Some(witnessed(false)));
         app.fill_verify(&source);
         assert_eq!(source.asked.get(), 0);
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         app.fill_verify(&source);
         assert_eq!(source.asked.get(), 1);
     }
@@ -3016,13 +3019,13 @@ mod verify_tab {
         assert_eq!(app.tab, Tab::Sessions);
         assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
         // Artefakt → der Diff des Commits.
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Changes);
         assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
         // Esc im Verify-Tab: zurück zu den Sessions.
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         app.reduce(Action::Back);
         assert_eq!(app.tab, Tab::Sessions);
     }
@@ -3199,7 +3202,7 @@ mod verify_tab {
         let mut app = app(&repo);
         let every = Duration::from_secs(5);
         app.fill_verify(&signers(Some(witnessed(false))));
-        app.reduce(Action::TabTo(0));
+        app.reduce(Action::TabTo(1));
         app.stamp = Some("1".into());
         app.reload(
             Ok(filled().with_head(Some(commit('1')))),
@@ -3207,7 +3210,7 @@ mod verify_tab {
             now(),
         );
         assert!(!app.verify.as_ref().unwrap().due(Duration::ZERO, every));
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         assert!(app.verify.as_ref().unwrap().due(Duration::ZERO, every));
     }
 
@@ -3358,7 +3361,7 @@ mod intent_tab {
 
     fn opened<'r>(repo: &'r Repo, source: &Anchors) -> App<'r> {
         let mut app = App::new(anchored(), repo, None);
-        app.reduce(Action::TabTo(3));
+        app.reduce(Action::TabTo(4));
         app.fill_intents(source);
         app
     }
@@ -3373,7 +3376,7 @@ mod intent_tab {
         assert_eq!(app.tab, Tab::Intent);
         assert_eq!(source.asked.get(), 1);
         let out = render(&mut app);
-        assert!(out.contains("F4 Intent"), "{out}");
+        assert!(out.contains("F5 Intent"), "{out}");
         assert!(out.contains("✓ b3-01010101010"), "{out}");
         assert!(out.contains("◉1"), "{out}");
         assert!(out.contains("(local file)"), "{out}");
@@ -3526,7 +3529,7 @@ mod intent_tab {
         let state = app.intent.as_ref().unwrap();
         assert_eq!(state.selected().map(|i| i.id.clone()), Some(anchor(2)));
         // Der Stapel bleibt: zurück im Sessions-Tab steht die Kette noch.
-        app.reduce(Action::TabTo(0));
+        app.reduce(Action::TabTo(1));
         assert!(matches!(app.top(), Some(View::Why { .. })));
         // Ein zweites Öffnen bei bestehendem Tab wählt sofort.
         app.open_intent(Some(anchor(1)));
@@ -3574,5 +3577,483 @@ mod intent_tab {
         app.reduce(Action::PageUp);
         let back = render_at(&mut app, 120);
         assert_ne!(out, back);
+    }
+}
+
+mod overview_tab {
+    use std::process::Command;
+
+    use minds_core::ContentHash;
+    use minds_core::intent_anchor::IntentEvent;
+    use minds_reader::model::WhyStep;
+
+    use super::*;
+    use crate::app::{Tab, View};
+    use crate::overview::{OverviewFocus, initials};
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=Patrick Döring",
+                "-c",
+                "user.email=pd@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// Drei Commits: der erste ohne Session, der zweite vom Agenten (Session
+    /// a, mit Intent-Anker), der dritte trägt zwei Sessions (a und c).
+    /// Session b hängt an keinem Commit (in Arbeit).
+    fn history() -> (tempfile::TempDir, Repo, Vec<CommitId>, Inspection) {
+        let (dir, _) = repo();
+        let mut commits = Vec::new();
+        for message in [
+            "init: empty",
+            "feat(sort): agent work",
+            "docs: two sessions",
+        ] {
+            git(
+                dir.path(),
+                &["commit", "-q", "--allow-empty", "-m", message],
+            );
+            commits.push(git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap());
+        }
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut a = session("Fix retry handling", "2026-07-25T14:10:00Z");
+        a.intent_events.push(IntentEvent {
+            seq: 1,
+            anchor_id: ContentHash::from_bytes([1; 32]),
+            opens_session: true,
+        });
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid('a'), a);
+        sessions.insert(
+            sid('b'),
+            session("Add exponential backoff", "2026-07-25T13:41:00Z"),
+        );
+        sessions.insert(sid('c'), session("Write the docs", "2026-07-25T15:00:00Z"));
+        let mut links = BTreeMap::new();
+        links.insert(commits[1], vec![sid('a')]);
+        links.insert(commits[2], vec![sid('a'), sid('c')]);
+        let inspection =
+            Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
+        (dir, repo, commits, inspection)
+    }
+
+    fn opened<'r>(repo: &'r Repo, inspection: Inspection) -> App<'r> {
+        let mut app = App::new(inspection, repo, None);
+        app.open_overview();
+        app
+    }
+
+    /// Der Graph: Badge, Ref-Pille, Pillen, Betreff, gedimmt der Auftrag —
+    /// oben die Session ohne Commit.
+    #[test]
+    fn the_overview_shows_commits_with_what_minds_knows() {
+        let (_dir, repo, _, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        assert_eq!(app.tab, Tab::Overview);
+        let out = render(&mut app);
+        assert!(out.contains("F1 Overview"), "{out}");
+        assert!(out.contains("OVERVIEW · 3 commits"), "{out}");
+        assert!(out.contains("open · no commit linked yet"), "{out}");
+        assert!(out.contains("Add exponential backoff"), "{out}");
+        assert!(out.contains(" ◆CC "), "agent badge: {out}");
+        assert!(out.contains(" PD "), "human badge: {out}");
+        assert!(out.contains("feat(sort): agent work"), "{out}");
+        assert!(out.contains("• Fix retry handling"), "{out}");
+        assert!(out.contains("⚑ intent"), "{out}");
+        assert!(out.contains("◉2"), "{out}");
+        assert!(out.contains("● HEAD"), "{out}");
+        // Kein Nerd Font: keine Private-Use-Glyphen.
+        assert!(!out.contains('\u{e0b6}'), "{out}");
+    }
+
+    /// Mit Nerd Font: runde Pillen.
+    #[test]
+    fn nerd_font_draws_round_pills() {
+        let (_dir, repo, _, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.nerd = true;
+        let out = render(&mut app);
+        assert!(out.contains('\u{e0b6}'), "{out}");
+        assert!(out.contains('\u{e0b4}'), "{out}");
+    }
+
+    /// Enter auf der Session in Arbeit: ihr Graph im Sessions-Tab.
+    #[test]
+    fn enter_on_a_session_in_progress_opens_its_graph() {
+        let (_dir, repo, _, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Sessions);
+        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('b')));
+    }
+
+    /// Zwei Sessions an einem Commit: Enter wählt rechts, Enter öffnet.
+    #[test]
+    fn a_commit_with_two_sessions_lets_you_choose() {
+        let (_dir, repo, _, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Down); // vom WIP auf den neuesten Commit
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Overview);
+        assert_eq!(
+            app.overview.as_ref().unwrap().focus,
+            OverviewFocus::Sessions
+        );
+        let out = render(&mut app);
+        assert!(out.contains("Sessions (2)"), "{out}");
+        assert!(out.contains("▸ "), "{out}");
+        app.reduce(Action::Down);
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Sessions);
+        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('c')));
+    }
+
+    /// Ein Commit mit einer Session: direkt deren Graph. Ohne Session: der
+    /// Diff.
+    #[test]
+    fn enter_follows_the_sessions_of_a_commit() {
+        let (_dir, repo, commits, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Down);
+        app.reduce(Action::Down);
+        app.reduce(Action::Enter);
+        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
+        app.reduce(Action::TabTo(0));
+        app.reduce(Action::End);
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Changes);
+        assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commits[0]));
+    }
+
+    /// `w`: die Why-Kette des Commits.
+    #[test]
+    fn w_opens_the_why_chain_of_the_commit() {
+        let (_dir, repo, commits, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Down);
+        app.reduce(Action::Why);
+        assert_eq!(app.tab, Tab::Sessions);
+        let Some(View::Why { chain, .. }) = app.top() else {
+            panic!("why chain");
+        };
+        assert!(
+            chain
+                .steps
+                .iter()
+                .any(|s| matches!(s, WhyStep::Commit { id: Some(id), .. } if *id == commits[2]))
+        );
+    }
+
+    /// Ein Neuladen behält den gewählten Commit — auch wenn eine neue
+    /// Session ohne Commit alle Zeilen um eins verschiebt.
+    #[test]
+    fn a_reload_keeps_the_selected_commit() {
+        let (_dir, repo, commits, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Down);
+        app.reduce(Action::Down);
+        let mut index = app.inspection.index().clone();
+        let mut more = BTreeMap::new();
+        for (id, session) in index.sessions() {
+            more.insert(*id, session.clone());
+        }
+        more.insert(sid('e'), session("A new idea", "2026-07-26T09:00:00Z"));
+        let mut links = BTreeMap::new();
+        links.insert(commits[1], vec![sid('a')]);
+        links.insert(commits[2], vec![sid('a'), sid('c')]);
+        index = Index::from_parts(more, links);
+        app.reload(
+            Ok(Inspection::from_index(index, Vec::new(), "demo")),
+            None,
+            now(),
+        );
+        let state = app.overview.as_ref().unwrap();
+        assert_eq!(state.cursor, 3, "moved down with the new row");
+        assert!(matches!(
+            state.selected(),
+            Some(crate::overview::Selected::Commit(row)) if row.id == commits[1]
+        ));
+    }
+
+    /// Ein Branch-Name kann keinen Status vortäuschen: Er trägt sein
+    /// Präfix und nie das Grün der Belege.
+    #[test]
+    fn a_branch_name_cannot_pose_as_a_status() {
+        let (dir, repo, commits, inspection) = history();
+        git(
+            dir.path(),
+            &["branch", "✓approved", &commits[0].to_string()],
+        );
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::End);
+        let out = render(&mut app);
+        assert!(out.contains("@✓approved"), "{out}");
+        let buffer = render_buffer(&mut app);
+        for cell in buffer.content() {
+            if cell.symbol() == "✓" {
+                assert_ne!(cell.bg, crate::theme::OK, "no evidence green behind a ref");
+            }
+        }
+    }
+
+    /// Steuerzeichen aus Betreff, Autor und Branch-Namen erreichen das
+    /// Terminal nicht.
+    #[test]
+    fn hostile_commit_text_is_sanitized() {
+        let (dir, _, _, inspection) = history();
+        git(
+            dir.path(),
+            &[
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "evil\u{1b}[2J\u{202e}txt",
+            ],
+        );
+        git(dir.path(), &["branch", "feat/\u{202e}x"]);
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut app = opened(&repo, inspection);
+        let out = render(&mut app);
+        for bad in ['\u{1b}', '\u{202e}', '\u{9b}'] {
+            assert!(!out.contains(bad), "{bad:?} in {out}");
+        }
+        assert!(out.contains("evil"), "{out}");
+    }
+
+    /// Ohne Commit sagt die Zeile nur, was bekannt ist: `ended_at` ist das
+    /// letzte Event, kein Ende — beendet ist nur, was `SessionEnd` sah.
+    #[test]
+    fn a_session_without_a_commit_says_only_what_is_known() {
+        let (_dir, repo, commits, _) = history();
+        let mut running = session("Still working", "2026-07-25T13:00:00Z");
+        if let Some(lineage) = running.lineage.as_mut() {
+            lineage.ended_at = Some("2026-07-25T13:05:00Z".into());
+        }
+        let mut done = session("Just a question", "2026-07-25T12:00:00Z");
+        if let Some(lineage) = done.lineage.as_mut() {
+            lineage.closed = true;
+        }
+        let mut legacy = session("Old capture", "2026-07-25T11:00:00Z");
+        legacy.lineage = None;
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid('d'), running);
+        sessions.insert(sid('e'), done);
+        sessions.insert(sid('f'), legacy);
+        let mut links = BTreeMap::new();
+        links.insert(commits[2], Vec::new());
+        let inspection =
+            Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
+        let mut app = opened(&repo, inspection);
+        let out = render(&mut app);
+        assert!(
+            out.contains("open · no commit linked yet  Still working"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ended · no commit linked  Just a question"),
+            "{out}"
+        );
+        assert!(!out.contains("in progress"), "{out}");
+        assert!(out.contains("SESSION WITHOUT A COMMIT"), "{out}");
+        assert!(out.contains("open — no SessionEnd seen"), "{out}");
+    }
+
+    /// Ein unsigniertes Seal ist nicht grün „sealed".
+    #[test]
+    fn an_unsigned_seal_is_not_green() {
+        let (_dir, repo, commits, _) = history();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            sid('a'),
+            session("Fix retry handling", "2026-07-25T14:10:00Z"),
+        );
+        let mut links = BTreeMap::new();
+        links.insert(commits[2], vec![sid('a')]);
+        let (seal_id, seal) = clean_seal(sid('a'));
+        let index =
+            Index::from_parts(sessions, links).with_seals(sid('a'), vec![(seal_id, seal, false)]);
+        let mut app = opened(&repo, Inspection::from_index(index, Vec::new(), "demo"));
+        let out = render(&mut app);
+        assert!(out.contains("◇ sealed · unsigned"), "{out}");
+        let row = out
+            .lines()
+            .find(|l| l.contains("docs: two sessions"))
+            .unwrap();
+        assert!(!row.contains("◈ sealed"), "{row}");
+    }
+
+    /// Neu geladen, während ein anderer Tab sichtbar war: Die Übersicht
+    /// wird beim Zeigen neu gelesen und behält ihren Commit.
+    #[test]
+    fn a_hidden_overview_is_rebuilt_when_shown() {
+        let (_dir, repo, commits, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Down);
+        app.reduce(Action::Down);
+        app.reduce(Action::TabTo(1));
+        let mut sessions = BTreeMap::new();
+        for (id, session) in app.inspection.index().sessions() {
+            sessions.insert(*id, session.clone());
+        }
+        sessions.insert(sid('e'), session("A new idea", "2026-07-26T09:00:00Z"));
+        let mut links = BTreeMap::new();
+        links.insert(commits[1], vec![sid('a')]);
+        links.insert(commits[2], vec![sid('a'), sid('c')]);
+        app.reload(
+            Ok(Inspection::from_index(
+                Index::from_parts(sessions, links),
+                Vec::new(),
+                "demo",
+            )),
+            None,
+            now(),
+        );
+        let state = app.overview.as_ref().unwrap();
+        assert!(state.stale);
+        assert_eq!(state.data.as_ref().unwrap().wip.len(), 1, "not yet rebuilt");
+        app.reduce(Action::TabTo(0));
+        let state = app.overview.as_ref().unwrap();
+        assert!(!state.stale);
+        assert_eq!(state.data.as_ref().unwrap().wip.len(), 2);
+        assert!(matches!(
+            state.selected(),
+            Some(crate::overview::Selected::Commit(row)) if row.id == commits[1]
+        ));
+    }
+
+    /// Ein Branch, der auf keinen Commit zeigt, legt die Übersicht nicht
+    /// lahm — er fehlt, und der Titel sagt es.
+    #[test]
+    fn a_ref_that_is_not_a_commit_is_skipped() {
+        let (dir, _, _, inspection) = history();
+        let tree = git(dir.path(), &["rev-parse", "HEAD^{tree}"]);
+        std::fs::write(
+            dir.path().join(".git/refs/heads/not-a-commit"),
+            format!("{tree}\n"),
+        )
+        .unwrap();
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut app = opened(&repo, inspection);
+        let out = render(&mut app);
+        assert!(out.contains("OVERVIEW · 3 commits"), "{out}");
+        assert!(out.contains("1 ref(s) not shown"), "{out}");
+    }
+
+    #[test]
+    fn initials_read_like_badges() {
+        assert_eq!(initials("claude-code"), "CC");
+        assert_eq!(initials("Patrick Döring"), "PD");
+        assert_eq!(initials("codex"), "CO");
+        assert_eq!(initials(""), "?");
+    }
+
+    /// Mehr Sessions, als das Detail listet: Der Cursor bleibt bei der
+    /// letzten sichtbaren stehen.
+    #[test]
+    fn the_session_cursor_stops_at_the_last_shown_session() {
+        let (_dir, repo, commits, _) = history();
+        let mut sessions = BTreeMap::new();
+        let ids: Vec<SessionId> = (0..25u8)
+            .map(|n| SessionId::of(&session(&format!("task {n}"), "2026-07-25T10:00:00Z")).unwrap())
+            .collect();
+        for (n, id) in ids.iter().enumerate() {
+            sessions.insert(*id, session(&format!("task {n}"), "2026-07-25T10:00:00Z"));
+        }
+        let mut links = BTreeMap::new();
+        links.insert(commits[2], ids.clone());
+        let inspection =
+            Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Enter);
+        for _ in 0..30 {
+            app.reduce(Action::Down);
+        }
+        let state = app.overview.as_ref().unwrap();
+        assert_eq!(state.session, crate::overview::MAX_SESSION_LINES - 1);
+        let out = render(&mut app);
+        // Die gewählte (zwanzigste) ist zu sehen, darüber ein Hinweis.
+        assert!(out.contains("▸ "), "{out}");
+        assert!(out.contains("above"), "{out}");
+        assert!(out.contains("… 5 more"), "{out}");
+    }
+
+    /// Lange Aufträge in einem schmalen Detail: Eine Session ist eine
+    /// Zeile, die gewählte bleibt sichtbar, der Rest wird gezählt.
+    #[test]
+    fn long_requests_keep_the_chosen_session_visible() {
+        let (_dir, repo, commits, _) = history();
+        let mut sessions = BTreeMap::new();
+        let ids: Vec<SessionId> = (0..25u8)
+            .map(|n| {
+                let s = session(
+                    &format!("task {n} {}", "word ".repeat(30)),
+                    "2026-07-25T10:00:00Z",
+                );
+                let id = SessionId::of(&s).unwrap();
+                sessions.insert(id, s);
+                id
+            })
+            .collect();
+        let mut links = BTreeMap::new();
+        links.insert(commits[2], ids);
+        let inspection =
+            Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
+        let mut app = opened(&repo, inspection);
+        app.reduce(Action::Enter);
+        for _ in 0..30 {
+            app.reduce(Action::Down);
+        }
+        let out = render_at(&mut app, 120);
+        assert!(out.contains("▸ "), "{out}");
+        assert!(out.contains("… 5 more"), "{out}");
+    }
+
+    /// `◈ sealed` nur, wenn jedes Seal eine Signatur trägt; eine
+    /// unsignierte daneben macht den ganzen Commit „unsigned".
+    #[test]
+    fn sealed_is_green_only_when_every_seal_is_signed() {
+        let (_dir, repo, commits, _) = history();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(
+            sid('a'),
+            session("Fix retry handling", "2026-07-25T14:10:00Z"),
+        );
+        sessions.insert(sid('c'), session("Write the docs", "2026-07-25T15:00:00Z"));
+        let mut links = BTreeMap::new();
+        links.insert(commits[2], vec![sid('a')]);
+        links.insert(commits[1], vec![sid('a'), sid('c')]);
+        let (seal_a, sealed_a) = clean_seal(sid('a'));
+        let (seal_c, sealed_c) = clean_seal(sid('c'));
+        let index = Index::from_parts(sessions, links)
+            .with_seals(sid('a'), vec![(seal_a, sealed_a, true)])
+            .with_seals(sid('c'), vec![(seal_c, sealed_c, false)]);
+        let mut app = opened(&repo, Inspection::from_index(index, Vec::new(), "demo"));
+        let out = render(&mut app);
+        let row = |needle: &str| {
+            out.lines()
+                .find(|l| l.contains(needle))
+                .unwrap()
+                .to_string()
+        };
+        assert!(row("docs: two sessions").contains("◈ sealed"), "{out}");
+        assert!(
+            row("feat(sort): agent work").contains("◇ sealed · unsigned"),
+            "{out}"
+        );
     }
 }

@@ -168,19 +168,23 @@ Usage:
   minds search <query>
         Searches intent, transcript and files of the captured sessions.
 
-  minds inspect [<search> | <file>:<line>]
+  minds inspect [<search> | <file>:<line>] [--nerd-font]
         How a change came to be, in the terminal: session list, a
         session's graph (intent → agent → effects → change → review) and
-        a line's why chain. Tabs (Tab, F1–F4): Sessions, Verify — the
-        verdict of minds verify at a glance (verdict, assurance, intent,
-        integrity, coverage, artifact bar, scope) — and Changes —
-        the diff of a commit as in git diff (unified, s for split) with
-        each added line's evidence class and, beside it, why the line
-        exists (session, step, what the agent said) — and Intent — the
-        intent anchors (source, scope, proof, signature as minds verify
-        checks it, snapshot) and the sessions naming them. Read-only. Live:
+        a line's why chain. Tabs (Tab, F1–F5): Overview (the history as a
+        commit graph with what Minds knows about each commit: agent or
+        human, branch and tag, seal, review, intent, sessions; Enter leads
+        to the commit's sessions), Sessions, Verify (the verdict of minds
+        verify at a glance: verdict, assurance, intent, integrity, coverage,
+        artifact bar, scope), Changes (the diff of a commit as in git diff,
+        unified, s for split, with each added line's evidence class and,
+        beside it, why the line exists) and Intent (the intent anchors:
+        source, scope, proof, signature as minds verify checks it, snapshot,
+        and the sessions naming them). Read-only. Live:
         reloads by itself when HEAD or a ref under refs/minds/ changes;
         r reloads at once.
+        --nerd-font (or MINDS_NERD_FONT=1) draws round pills and icons;
+        needs a Nerd Font in the terminal.
         If stdout is not a console, the lines come tab-separated (for
         grep/fzf).
 
@@ -496,7 +500,7 @@ const SPECS: &[Spec] = &[
     spec("distill", &["--path", "--out"], &[], 0),
     spec("brief", &[], &["--hook"], usize::MAX),
     spec("recap", &["--limit"], &["--all"], 0),
-    spec("inspect", &[], &[], 1),
+    spec("inspect", &[], &["--nerd-font"], 1),
     spec("search", &[], &[], 1),
     spec("agent-help", &[], &[], 0),
     spec("metrics", &["--format"], &[], 0),
@@ -881,7 +885,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "search" => search::run(parsed.positional(0)),
 
         #[cfg(feature = "tui")]
-        "inspect" => inspect::run(parsed.positional(0)),
+        "inspect" => inspect::run(parsed.positional(0), parsed.has("--nerd-font")),
         // Ohne Feature bleibt das Kommando in SPECS (agent-help und USAGE
         // bleiben eine Quelle), sagt aber ehrlich, warum es nichts tut.
         #[cfg(not(feature = "tui"))]

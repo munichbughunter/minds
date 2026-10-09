@@ -60,6 +60,7 @@ mod amend;
 mod blame;
 mod diff;
 mod error;
+mod graph;
 mod head;
 pub mod ignore;
 mod objects;
@@ -80,7 +81,14 @@ pub use diff::{
     line_alignment, removes_lines, unified_diff,
 };
 pub use error::{GitError, Result, Source};
+pub use graph::{
+    BoundedRepo, GRAPH_BUDGET, Graph, GraphCommit, MAX_COMMIT_OBJECT, MAX_DELTAS, MAX_LOOKUPS,
+    MAX_PARENTS, MAX_TIPS, READ_ALLOC_LIMIT, READ_DEADLINE,
+};
 pub use head::Head;
 pub use oid::{BlobId, CommitId, CommitIdParseError, TreeId};
-pub use refs::{DEFAULT_CONTEXT_REF, MINDS_REF_NAMESPACE, RefUpdate};
+pub use refs::{
+    BoundedHead, DEFAULT_CONTEXT_REF, MAX_TAG_DEPTH, MAX_TAG_OBJECT, MINDS_REF_NAMESPACE,
+    REFS_BUDGET, RefUpdate, RefsUnder,
+};
 pub use repo::Repo;

@@ -109,12 +109,14 @@ impl Repo {
                 // Eine Liste: `config_overrides` ersetzt, statt zu ergänzen.
                 // `refs/replace/*` tauschte Objekte still aus — ein Blob, den
                 // niemand im Review sah, stünde für den Witness an HEAD.
-                .config_overrides(
-                    LOCK_TIMEOUTS
-                        .iter()
-                        .copied()
-                        .chain(["gitoxide.objects.noReplace=true"]),
-                ),
+                // `gitoxide.objects.noReplace` liest gix 0.85 nicht; wirksam
+                // ist `core.useReplaceRefs=true` — gix liest es verkehrt
+                // (`true` schaltet die Ersatzobjekte ab). Ein Test mit beiden
+                // Repo-Einstellungen pinnt das.
+                .config_overrides(LOCK_TIMEOUTS.iter().copied().chain([
+                    "gitoxide.objects.noReplace=true",
+                    "core.useReplaceRefs=true",
+                ])),
         )
         .map(Self::from_gix)
         .map_err(|err| GitError::open(git_dir, err))
@@ -197,6 +199,46 @@ impl Repo {
     /// Das gix-Handle. Crate-intern — siehe `error.rs` zur Fassade.
     pub(crate) fn gix(&self) -> &gix::Repository {
         &self.inner
+    }
+
+    /// Ein zweiter Zugriff auf dieselbe Objektdatenbank für Ansichten, die
+    /// Objekte lesen, die ein Agent geschrieben haben kann: Jede Allokation
+    /// beim Lesen eines Objekts — auch beim Auflösen von Delta-Ketten in
+    /// Packs — ist auf `alloc_limit` Bytes begrenzt (eine zlib-Bombe wird
+    /// nie entpackt); Objekt-Caches sind aus (ihre Größe stünde sonst in der
+    /// vom Agenten beschreibbaren Konfiguration); Ersatzobjekte sind aus;
+    /// Includes der Konfiguration und Objekt-Umgebungsvariablen
+    /// (`GIT_ALLOC_LIMIT`) werden nicht gelesen. Die Overrides gewinnen über
+    /// die Repo-Konfiguration.
+    pub(crate) fn bounded(&self, alloc_limit: u64) -> Result<gix::Repository> {
+        let git_dir = self.git_dir();
+        let mut permissions = gix::open::Permissions::all();
+        permissions.config.includes = false;
+        // Kein `git`-Binary, um dessen Konfigurationsorte zu erfragen.
+        permissions.config.git_binary = false;
+        permissions.env.objects = gix::sec::Permission::Deny;
+        let overrides = [
+            format!("gitoxide.objects.allocLimit={alloc_limit}"),
+            "gitoxide.objects.cacheLimit=0".to_owned(),
+            "core.deltaBaseCacheLimit=0".to_owned(),
+            // gix 0.85 liest `core.useReplaceRefs` verkehrt: `true` schaltet
+            // die Ersatzobjekte **ab** (`gitoxide.objects.noReplace` liest es
+            // gar nicht). Ein Test pinnt das — und bricht, wenn gix es
+            // korrigiert.
+            "core.useReplaceRefs=true".to_owned(),
+        ];
+        let mut repo = gix::open_opts(
+            git_dir,
+            gix::open::Options::default()
+                .permissions(permissions)
+                .open_path_as_is(true)
+                .config_overrides(overrides),
+        )
+        .map_err(|err| GitError::open(git_dir, err))?;
+        // Ein fehlendes Objekt liest das Pack-Verzeichnis nicht jedes Mal neu
+        // ein (das könnte ein Agent aufblähen).
+        repo.objects.refresh_never();
+        Ok(repo)
     }
 
     /// Baut einen Fehler, der dieses Repository benennt. Spart in jedem
@@ -296,14 +338,21 @@ mod tests {
         git(&["replace", &original, &swapped]);
         assert_eq!(git(&["cat-file", "blob", "HEAD:policy.json"]), "swapped");
 
-        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
         let head: crate::oid::CommitId = git(&["rev-parse", "HEAD"]).parse().unwrap();
-        let (id, bytes) = repo
-            .read_blob_bounded(head, "policy.json", 1024)
-            .unwrap()
-            .unwrap();
-        assert_eq!(bytes, b"reviewed");
-        assert_eq!(id, original);
+        // Auch wenn die Repo-Konfiguration (vom Agenten beschreibbar) die
+        // Ersatzobjekte ausdrücklich einschaltet — gix 0.85 liest den
+        // Schlüssel verkehrt, `false` hieße dort „an".
+        for setting in ["true", "false"] {
+            git(&["config", "core.useReplaceRefs", setting]);
+            let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
+            let (id, bytes) = repo
+                .read_blob_bounded(head, "policy.json", 1024)
+                .unwrap()
+                .unwrap();
+            assert_eq!(bytes, b"reviewed", "{setting}");
+            assert_eq!(id, original, "{setting}");
+        }
+        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
         assert!(repo.read_blob_bounded(head, "policy.json", 3).is_err());
         assert_eq!(repo.read_blob_bounded(head, "missing", 1024).unwrap(), None);
 
