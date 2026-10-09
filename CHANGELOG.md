@@ -19,7 +19,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
-- **Intent tab in `minds inspect` (F4).** It lists the intent anchors of the
+- **Overview tab in `minds inspect` (F1, the new start view).** The history
+  as a commit graph in the style of GitKraken: colored lanes for branches
+  and merges, an agent or author badge per commit, pills for branch, tag,
+  seal, review, intent and the number of sessions, and the session's
+  request dimmed beside the subject. Sessions without a commit are listed
+  on top, open or ended as far as a SessionEnd was seen. `Enter` leads
+  from a commit to its session(s) in the Sessions tab (now F2), `w` to the
+  commit's why chain. Round pills and icons with `--nerd-font` or
+  `MINDS_NERD_FONT=1`, plain blocks otherwise. The history is read through
+  a bounded, replace-free reader (no `git` process).
+- **Intent tab in `minds inspect` (F5).** It lists the intent anchors of the
   store. For each one it shows source, content hash, declared scope, whether
   a `file:` blob is the version in HEAD, and the proof as
   `minds intent show` checks it. The signature is checked against the
@@ -61,8 +71,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   the diff. The verdict is the exit code of `minds verify <commit>`, run
   from the `minds` binary pinned at start — never rebuilt; if that is not
   possible (binary inside the checkout or replaced, timeout) the tab shows
-  `NOT CHECKED` with the reason. Tabs are now Sessions, Verify, Changes
-  (F1–F3).
+  `NOT CHECKED` with the reason. With the Overview and Intent tabs above,
+  the tabs are Overview, Sessions, Verify, Changes, Intent (F1–F5).
 - **Changes tab in `minds inspect`.** Tabs at the top (Tab/Shift-Tab, F1/F2):
   Sessions and Changes. Changes shows a commit (HEAD first, `[`/`]` to page
   in the file list) as a diff in the familiar form — unified with hunk

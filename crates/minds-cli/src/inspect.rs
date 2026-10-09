@@ -25,8 +25,11 @@ type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Führt `minds inspect` aus. Das Positional ist entweder `<datei>:<zeile>`
 /// (dann beginnt die Oberfläche bei der Why-Kette) oder ein Suchbegriff.
-pub fn run(target: Option<&str>) -> ExitCode {
-    match inspect(target) {
+pub fn run(target: Option<&str>, nerd_font: bool) -> ExitCode {
+    // `--nerd-font` oder `MINDS_NERD_FONT=1`: runde Pillen und Icons.
+    let nerd_font =
+        nerd_font || std::env::var("MINDS_NERD_FONT").is_ok_and(|v| !v.is_empty() && v != "0");
+    match inspect(target, nerd_font) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("minds inspect: {err}");
@@ -35,7 +38,7 @@ pub fn run(target: Option<&str>) -> ExitCode {
     }
 }
 
-fn inspect(target: Option<&str>) -> Fallible<()> {
+fn inspect(target: Option<&str>, nerd_font: bool) -> Fallible<()> {
     let ctx = Context::open()?;
     let reviews = ReviewStore::new(Repo::open(&ctx.root)?);
     let name = ctx
@@ -62,10 +65,12 @@ fn inspect(target: Option<&str>) -> Fallible<()> {
                 path: path.to_string(),
                 line,
             },
+            nerd_font,
         },
         None => Options {
             query: target.map(str::to_string),
             start: Start::Activity,
+            nerd_font,
         },
     };
     minds_tui::run(&live, &ctx.repo, opts)?;

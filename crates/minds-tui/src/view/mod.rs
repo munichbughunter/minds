@@ -25,6 +25,7 @@ pub mod evidence;
 pub mod graph;
 pub mod help;
 mod intent;
+mod overview;
 pub mod verify;
 pub mod why;
 
@@ -68,6 +69,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.tab == Tab::Verify {
         verify::draw(frame, app, body);
+        footer(frame, app, foot);
+        if app.help {
+            help::draw(frame, frame.area());
+        }
+        return;
+    }
+    if app.tab == Tab::Overview {
+        overview::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
             help::draw(frame, frame.area());
@@ -281,6 +290,33 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]);
         frame.render_widget(Paragraph::new(vec![status, keys]), area);
+        return;
+    }
+    if app.tab == Tab::Overview {
+        let status = Line::from(Span::styled(
+            "Each commit with what Minds knows: ◆CC = agent session, initials = author · @branch #tag · ◈ sealed (as recorded) · ⚑ intent · ◉ sessions",
+            theme::dim(),
+        ));
+        let focused = app
+            .overview
+            .as_ref()
+            .is_some_and(|o| o.focus == crate::overview::OverviewFocus::Sessions);
+        let mut keys = vec![
+            freshness(app),
+            Span::raw("  "),
+            Span::styled(
+                if focused {
+                    "↑↓ session  Enter its graph  Esc back to the history  ? help"
+                } else {
+                    "↑↓ commit  Enter sessions / graph  w why chain  Tab next tab  ? help"
+                },
+                theme::dim(),
+            ),
+        ];
+        if let Some(closed) = &app.closed {
+            keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
+        }
+        frame.render_widget(Paragraph::new(vec![status, Line::from(keys)]), area);
         return;
     }
     if app.tab == Tab::Intent {

@@ -27,6 +27,7 @@ use crate::filter;
 use crate::input::{self, Action};
 use crate::intent::{IntentTab, bound_sessions, named_anchors};
 use crate::layout::{self, Row, Zoom};
+use crate::overview::{OverviewFocus, OverviewState, Selected};
 use crate::term::Guard;
 use crate::verify::VerifyState;
 use crate::view;
@@ -123,6 +124,8 @@ pub const ARTIFACT_SECTION: usize = 2;
 /// Die Tabs der Oberfläche, in Anzeige-Reihenfolge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
+    /// Die Historie als Commit-Graph, an jedem Commit seine Sessions.
+    Overview,
     /// Die Sessions: Liste, Graph, Why, Evidence.
     Sessions,
     /// Das Urteil über einen Commit auf einen Blick.
@@ -135,11 +138,18 @@ pub enum Tab {
 
 impl Tab {
     /// Alle Tabs, in Reihenfolge.
-    pub const ALL: [Tab; 4] = [Tab::Sessions, Tab::Verify, Tab::Changes, Tab::Intent];
+    pub const ALL: [Tab; 5] = [
+        Tab::Overview,
+        Tab::Sessions,
+        Tab::Verify,
+        Tab::Changes,
+        Tab::Intent,
+    ];
 
     /// Der Name im Kopf.
     pub fn title(self) -> &'static str {
         match self {
+            Tab::Overview => "Overview",
             Tab::Sessions => "Sessions",
             Tab::Verify => "Verify",
             Tab::Changes => "Changes",
@@ -206,6 +216,10 @@ pub struct App<'a> {
     pub verify: Option<VerifyState>,
     /// Der Intent-Tab — erst beim ersten Öffnen gebaut.
     pub intent: Option<IntentTab>,
+    /// Der Overview-Tab — erst beim ersten Öffnen gebaut.
+    pub overview: Option<OverviewState>,
+    /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
+    pub nerd: bool,
 }
 
 impl<'a> App<'a> {
@@ -238,6 +252,8 @@ impl<'a> App<'a> {
             changes: None,
             verify: None,
             intent: None,
+            overview: None,
+            nerd: false,
         };
         app.refilter();
         app
@@ -317,6 +333,15 @@ impl<'a> App<'a> {
         if let Some(state) = self.intent.as_mut() {
             state.invalidate(full);
         }
+        // Die Historie neu: ein begrenzter Walk in-process, kein `git` —
+        // nur bei sichtbarem Tab, sonst beim nächsten Zeigen.
+        if let Some(state) = self.overview.as_mut() {
+            if self.tab == Tab::Overview {
+                state.rebuild(&self.inspection, self.repo);
+            } else {
+                state.stale = true;
+            }
+        }
         self.stamp = stamp;
         self.loaded_at = clock(now);
         self.reload_error = None;
@@ -368,6 +393,104 @@ impl<'a> App<'a> {
         };
         self.verify = Some(VerifyState::build(&self.inspection, self.repo, commits, at));
         self.tab = Tab::Verify;
+    }
+
+    /// Öffnet den Overview-Tab (beim ersten Mal gelesen).
+    pub fn open_overview(&mut self) {
+        match self.overview.as_mut() {
+            None => self.overview = Some(OverviewState::build(&self.inspection, self.repo)),
+            Some(state) if state.stale => state.rebuild(&self.inspection, self.repo),
+            Some(_) => {}
+        }
+        self.tab = Tab::Overview;
+    }
+
+    /// Springt zum Graphen der Session `id` im Sessions-Tab. Eine laufende
+    /// Suche wird geleert — sie filterte die Session sonst womöglich aus der
+    /// Liste.
+    fn goto_session(&mut self, id: SessionId) {
+        if self.inspection.graph(id).is_some() {
+            self.tab = Tab::Sessions;
+            self.query.clear();
+            self.refilter_keeping(Some(id));
+            self.views.clear();
+            self.push_graph(id);
+        } else {
+            self.closed = Some("that session is not readable".into());
+        }
+    }
+
+    /// Die Tasten im Overview-Tab.
+    fn reduce_overview(&mut self, action: Action) {
+        let Some(state) = self.overview.as_mut() else {
+            return;
+        };
+        let last = state.len().saturating_sub(1);
+        let page = self.page.max(1);
+        if state.focus == OverviewFocus::Sessions {
+            let sessions = state.sessions();
+            match action {
+                Action::Up => state.session = state.session.saturating_sub(1),
+                Action::Down => {
+                    let shown = sessions.len().min(crate::overview::MAX_SESSION_LINES);
+                    state.session = (state.session + 1).min(shown.saturating_sub(1));
+                }
+                Action::Back => state.focus = OverviewFocus::Graph,
+                Action::Enter => {
+                    if let Some(id) = state.chosen_session() {
+                        self.goto_session(id);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let at = state.cursor;
+        match action {
+            Action::Up => state.cursor = state.cursor.saturating_sub(1),
+            Action::Down => state.cursor = (state.cursor + 1).min(last),
+            Action::PageUp => state.cursor = state.cursor.saturating_sub(page),
+            Action::PageDown => state.cursor = (state.cursor + page).min(last),
+            Action::Home => state.cursor = 0,
+            Action::End => state.cursor = last,
+            Action::Enter => match state.selected() {
+                Some(Selected::Wip(wip)) => {
+                    let id = wip.id;
+                    self.goto_session(id);
+                    return;
+                }
+                Some(Selected::Commit(row)) => {
+                    let commit = row.id;
+                    match row.sessions.as_slice() {
+                        [] => self.open_changes(Some(commit)),
+                        [only] => {
+                            let only = *only;
+                            self.goto_session(only);
+                        }
+                        _ => {
+                            state.focus = OverviewFocus::Sessions;
+                            state.session = 0;
+                        }
+                    }
+                    return;
+                }
+                None => {}
+            },
+            Action::Why => {
+                if let Some(Selected::Commit(row)) = state.selected() {
+                    let commit = row.id;
+                    let chain = self.inspection.why_commit(commit);
+                    self.tab = Tab::Sessions;
+                    self.views.clear();
+                    self.push_why(WhyOrigin::Commit(commit), chain);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if state.cursor != at {
+            state.session = 0;
+        }
     }
 
     /// Öffnet den Intent-Tab — auf dem Anker `want`, wenn es ihn gibt.
@@ -577,6 +700,8 @@ impl<'a> App<'a> {
             self.open_verify(None);
         } else if tab == Tab::Intent {
             self.open_intent(None);
+        } else if tab == Tab::Overview {
+            self.open_overview();
         } else {
             // Zurück im Verify-Tab: Eine ausstehende Prüfung ist jetzt vom
             // Nutzer verlangt, nicht gedrosselt.
@@ -1108,6 +1233,10 @@ impl<'a> App<'a> {
         }
         if self.tab == Tab::Intent {
             self.reduce_intent(action);
+            return;
+        }
+        if self.tab == Tab::Overview {
+            self.reduce_overview(action);
             return;
         }
         let page = self.page.max(1);

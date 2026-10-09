@@ -34,6 +34,7 @@ mod filter;
 mod input;
 mod intent;
 mod layout;
+mod overview;
 mod pipe;
 mod term;
 mod theme;
@@ -63,6 +64,8 @@ pub struct Options {
     pub query: Option<String>,
     /// Womit begonnen wird.
     pub start: Start,
+    /// Nerd-Font-Glyphen zeichnen (runde Pillen, Icons) — sonst Blöcke.
+    pub nerd_font: bool,
 }
 
 /// Was schiefgehen kann.
@@ -257,11 +260,16 @@ pub fn run(source: &dyn Source, repo: &Repo, opts: Options) -> Result<(), TuiErr
     }
     let stamp = source.stamp();
     let inspection = source.load()?;
+    let start_overview = matches!(opts.start, Start::Activity) && opts.query.is_none();
     let mut app = app::App::new(inspection, repo, opts.query);
     app.live = stamp.is_some();
     app.stamp = stamp;
+    app.nerd = opts.nerd_font;
     if let Start::Why { path, line } = &opts.start {
         app.open_why_line(path, *line)?;
+    } else if start_overview {
+        // Ohne Suche beginnt die Oberfläche mit der Übersicht.
+        app.open_overview();
     }
     app.run(source)?;
     Ok(())

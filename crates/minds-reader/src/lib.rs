@@ -67,5 +67,7 @@ pub mod artifact;
 /// Die Änderungen eines Commits als Diff, mit Klasse und Herkunft je Zeile.
 pub mod changes;
 
+pub mod overview;
+
 mod query;
 pub use query::{Inspection, touches};

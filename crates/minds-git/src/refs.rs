@@ -94,6 +94,151 @@ impl RefUpdate {
     }
 }
 
+/// So viele Bytes (laut Header) liest [`crate::BoundedRepo::refs_under_max`]
+/// je Aufruf höchstens; darüber gelten die übrigen Refs als nicht angesehen.
+pub const REFS_BUDGET: u64 = 8 * 1024 * 1024;
+
+/// So groß darf ein Tag-Objekt höchstens sein (auch signierte sind wenige
+/// KiB).
+pub const MAX_TAG_OBJECT: u64 = 64 * 1024;
+
+/// So viele Stufen annotierter Tags schält [`crate::BoundedRepo::refs_under_max`].
+pub const MAX_TAG_DEPTH: usize = 8;
+
+impl crate::graph::BoundedRepo {
+    /// Wie [`Repo::refs_under`], aber für Ansichten, deren Namensraum ein
+    /// Agent beliebig füllen kann: höchstens `max` Refs angesehen und
+    /// höchstens [`REFS_BUDGET`] Bytes gelesen, jedes Objekt vor dem Lesen am
+    /// Header begrenzt (Größe, Delta-Tiefe), symbolische Refs gefolgt,
+    /// annotierte Tags von Hand geschält (höchstens [`MAX_TAG_DEPTH`] Stufen,
+    /// hash-geprüft), Commits nie gelesen. Nur Refs, die bei einem Commit
+    /// enden, kommen heraus.
+    pub fn refs_under_max(&self, prefix: &str, max: usize) -> Result<RefsUnder> {
+        let gix = self.gix();
+        let platform = gix
+            .references()
+            .map_err(|err| GitError::reference(prefix, err))?;
+        let iter = platform
+            .prefixed(prefix)
+            .map_err(|err| GitError::reference(prefix, err))?;
+        let mut out = RefsUnder::default();
+        let mut spent = 0u64;
+        for (seen, reference) in iter.enumerate() {
+            if seen == max || spent > REFS_BUDGET || self.exhausted() {
+                out.more = true;
+                break;
+            }
+            let Ok(mut reference) = reference else {
+                out.skipped += 1;
+                continue;
+            };
+            let name = reference.name().as_bstr().to_string();
+            // Symbolische Refs bis zum Objekt — ohne ein Objekt zu lesen.
+            let Ok(target) = reference.follow_to_object() else {
+                out.skipped += 1;
+                continue;
+            };
+            match peel_bounded(self, target.detach(), &mut spent) {
+                Some(commit) => out.refs.push((name, commit)),
+                None => out.skipped += 1,
+            }
+        }
+        out.refs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// HEAD über den begrenzten Zugriff: der Branch (ohne `refs/heads/`),
+    /// falls einer, der Commit, falls HEAD auf einem lesbaren endet — und ob
+    /// HEAD auf ein Objekt zeigte, das die Grenzen abwiesen (dann fehlt es
+    /// sichtbar, nicht still).
+    pub fn head(&self) -> BoundedHead {
+        let gix = self.gix();
+        let branch = gix
+            .head_name()
+            .ok()
+            .flatten()
+            .map(|name| name.shorten().to_string());
+        let target = gix
+            .find_reference("HEAD")
+            .ok()
+            .and_then(|mut head| head.follow_to_object().ok())
+            .map(|id| id.detach());
+        let commit = target.and_then(|id| peel_bounded(self, id, &mut 0));
+        BoundedHead {
+            branch,
+            commit,
+            refused: target.is_some() && commit.is_none(),
+        }
+    }
+}
+
+/// HEAD, wie [`crate::BoundedRepo::head`] es liest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedHead {
+    /// Der Branch (ohne `refs/heads/`), falls HEAD auf einem steht.
+    pub branch: Option<String>,
+    /// Der Commit, falls HEAD auf einem lesbaren endet.
+    pub commit: Option<CommitId>,
+    /// HEAD zeigte auf ein Objekt, das die Grenzen abwiesen.
+    pub refused: bool,
+}
+
+/// Das Ergebnis von [`crate::BoundedRepo::refs_under_max`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefsUnder {
+    /// Name und Commit, nach Name.
+    pub refs: Vec<(String, CommitId)>,
+    /// Ob es mehr als `max` Refs gab (nicht alle angesehen).
+    pub more: bool,
+    /// Wie viele angesehene Refs bei keinem lesbaren Commit endeten
+    /// (kaputt, zu groß, Baum oder Blob, zu tiefe Tag-Kette).
+    pub skipped: usize,
+}
+
+/// Schält `id` bis zum Commit — jede Stufe am Header begrenzt (Größe,
+/// Delta-Tiefe), nur Tags gelesen und hash-geprüft, Commits nie. `spent`
+/// zählt die gelesenen Bytes.
+fn peel_bounded(
+    reader: &crate::graph::BoundedRepo,
+    mut id: gix::ObjectId,
+    spent: &mut u64,
+) -> Option<CommitId> {
+    let gix = reader.gix();
+    for _ in 0..=MAX_TAG_DEPTH {
+        if !reader.permit() {
+            return None;
+        }
+        let header = gix.find_header(id).ok()?;
+        use crate::graph::{MAX_COMMIT_OBJECT, MAX_DELTAS, admissible};
+        match header.kind() {
+            gix::objs::Kind::Commit
+                if admissible(
+                    &header,
+                    gix::objs::Kind::Commit,
+                    MAX_COMMIT_OBJECT,
+                    MAX_DELTAS,
+                ) =>
+            {
+                return Some(CommitId::from_gix(id));
+            }
+            gix::objs::Kind::Tag
+                if admissible(&header, gix::objs::Kind::Tag, MAX_TAG_OBJECT, MAX_DELTAS) =>
+            {
+                *spent = spent.saturating_add(header.size());
+                let object = gix.find_object(id).ok()?;
+                if object.kind != gix::objs::Kind::Tag {
+                    return None;
+                }
+                crate::diff::verify_object(id, gix::objs::Kind::Tag, &object.data).ok()?;
+                let tag = gix::objs::TagRef::from_bytes(&object.data, id.kind()).ok()?;
+                id = tag.target();
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 impl Repo {
     /// Der Commit, auf den `reference` zeigt — `None`, wenn es den Ref nicht
     /// gibt.
@@ -150,6 +295,12 @@ impl Repo {
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(out)
+    }
+
+    /// [`crate::BoundedRepo::refs_under_max`] über einen eigens geöffneten
+    /// Zugriff.
+    pub fn refs_under_max(&self, prefix: &str, max: usize) -> Result<RefsUnder> {
+        self.bounded_reader()?.refs_under_max(prefix, max)
     }
 
     /// Schreibt `tree` als neuen Stand von `reference` und gibt zurück, was
@@ -1264,5 +1415,107 @@ mod tests {
             repo.commit_at(DEFAULT_CONTEXT_REF).unwrap(),
             Some(real.commit())
         );
+    }
+
+    /// Ein Commit-Objekt über der Grenze, roh geschrieben.
+    fn oversized_commit(fixture: &TempRepo) -> String {
+        let tree = fixture.git(&["rev-parse", "HEAD^{tree}"]);
+        let message = "x".repeat(crate::graph::MAX_COMMIT_OBJECT as usize + 1);
+        let raw = format!(
+            "tree {}\nauthor A <a@x> 0 +0000\ncommitter A <a@x> 0 +0000\n\n{message}\n",
+            tree.trim()
+        );
+        fixture
+            .write_raw_object("commit", raw.as_bytes())
+            .trim()
+            .to_string()
+    }
+
+    /// Ein Tag-Objekt auf `target` (Art `kind`), roh geschrieben.
+    fn tag_object(fixture: &TempRepo, target: &str, kind: &str, name: &str, pad: usize) -> String {
+        let raw = format!(
+            "object {target}\ntype {kind}\ntag {name}\ntagger A <a@x> 0 +0000\n\n{}\n",
+            "m".repeat(pad)
+        );
+        fixture
+            .write_raw_object("tag", raw.as_bytes())
+            .trim()
+            .to_string()
+    }
+
+    /// `refs_under_max` liest nie ein Objekt über der Grenze — weder ein
+    /// großes Tag, noch das Ziel einer Tag-Kette, noch ein Commit hinter
+    /// einem symbolischen Ref; ein gewöhnlicher Branch bleibt.
+    #[test]
+    fn bounded_refs_skip_oversized_objects_and_count_them() {
+        let fixture = TempRepo::init();
+        let ok = fixture.commit("ok");
+        let big = oversized_commit(&fixture);
+        let huge_tag = tag_object(
+            &fixture,
+            &ok.to_string(),
+            "commit",
+            "huge",
+            MAX_TAG_OBJECT as usize + 1,
+        );
+        let inner = tag_object(&fixture, &big, "commit", "inner", 0);
+        let outer = tag_object(&fixture, &inner, "tag", "outer", 0);
+        fixture.git(&["update-ref", "refs/tags/huge", &huge_tag]);
+        fixture.git(&["update-ref", "refs/tags/chain", &outer]);
+        fixture.git(&["update-ref", "refs/tags/fine", &ok.to_string()]);
+        fixture.git(&["update-ref", "refs/heads/big", &big]);
+        fixture.git(&["symbolic-ref", "refs/heads/alias", "refs/heads/big"]);
+        let repo = Repo::open(fixture.path()).unwrap();
+
+        let tags = repo.refs_under_max("refs/tags/", 100).unwrap();
+        assert_eq!(tags.refs, [("refs/tags/fine".to_string(), ok)]);
+        assert_eq!(tags.skipped, 2);
+        assert!(!tags.more);
+
+        let heads = repo.refs_under_max("refs/heads/", 100).unwrap();
+        assert!(heads.refs.iter().any(|(_, id)| *id == ok));
+        assert!(
+            heads
+                .refs
+                .iter()
+                .all(|(name, _)| !name.ends_with("big") && !name.ends_with("alias"))
+        );
+        assert_eq!(heads.skipped, 2);
+
+        // Gezählt werden Durchläufe: Bei `max` = 1 endet es nach einem Ref.
+        let capped = repo.refs_under_max("refs/tags/", 1).unwrap();
+        assert!(capped.more);
+
+        // `refs_under` bleibt, wie es war: ohne Bremse für andere Aufrufer.
+        assert!(repo.refs_under("refs/tags/").unwrap().len() >= 2);
+    }
+
+    /// Der begrenzte Zugriff lehnt ein Objekt über seiner Allokationsgrenze
+    /// ab — auch das, was ein Delta erst beim Auflösen verriete.
+    #[test]
+    fn the_bounded_handle_refuses_larger_objects() {
+        let fixture = TempRepo::init();
+        let blob = fixture.write_raw_object("blob", &[b'z'; 4096]);
+        let repo = Repo::open(fixture.path()).unwrap();
+        let id = gix::ObjectId::from_hex(blob.trim().as_bytes()).unwrap();
+        assert!(repo.bounded(1024).unwrap().find_object(id).is_err());
+        assert!(repo.bounded(1 << 20).unwrap().find_object(id).is_ok());
+    }
+
+    /// Auch ein Objekt im Pack, das erst beim Auflösen seiner Delta-Kette
+    /// groß wird, kommt über den begrenzten Zugriff nicht durch.
+    #[test]
+    fn the_bounded_handle_refuses_a_large_packed_delta() {
+        let fixture = TempRepo::init();
+        let base: Vec<u8> = (0..4096u32).map(|i| b'a' + (i % 23) as u8).collect();
+        let mut other = base.clone();
+        other.extend_from_slice(b"tail");
+        fixture.write_raw_object("blob", &base);
+        let target = fixture.write_raw_object("blob", &other);
+        fixture.git(&["repack", "-adq", "--depth=10", "--window=10"]);
+        let repo = Repo::open(fixture.path()).unwrap();
+        let id = gix::ObjectId::from_hex(target.trim().as_bytes()).unwrap();
+        assert!(repo.bounded(1024).unwrap().find_object(id).is_err());
+        assert!(repo.bounded(1 << 20).unwrap().find_object(id).is_ok());
     }
 }
