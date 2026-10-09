@@ -1437,6 +1437,7 @@ fn hostile_and_overlong_paths_are_sanitized_and_capped() {
             changed_lines: 0,
             removes: false,
             last_observed: None,
+            gap: None,
         })
         .collect();
     let artifacts = vec![CommitArtifact {
@@ -2257,6 +2258,7 @@ mod changes_tab {
                     added: 2,
                     removed: 1,
                     class: Some(ReconClass::ReportedOnly),
+                    gap: None,
                     note: None,
                     rows: vec![
                         row(DiffKind::Hunk, None, None, "@@ -1,3 +1,4 @@", None, None),
@@ -2294,6 +2296,7 @@ mod changes_tab {
                     added: 1,
                     removed: 0,
                     class: Some(ReconClass::Unexplained),
+                    gap: None,
                     note: None,
                     rows: vec![
                         row(DiffKind::Hunk, None, None, "@@ -0,0 +1 @@", None, None),
@@ -2474,12 +2477,60 @@ mod changes_tab {
         app.reduce(Action::Down);
         let out = render(&mut app);
         assert!(out.contains("NOT OBSERVED"), "{out}");
-        assert!(out.contains("No write of the sessions linked"), "{out}");
+        assert!(out.contains("No evidence of the sessions linked"), "{out}");
 
         app.reduce(Action::Why);
         assert!(
             !render(&mut app).contains("WHY THIS LINE?"),
             "w hides the column"
+        );
+    }
+
+    /// Eine unerklärte Zeile sagt, warum — und nennt den Shell-Aufruf, der
+    /// die Datei nennt.
+    #[test]
+    fn the_why_column_names_the_gap_of_an_unexplained_line() {
+        use minds_reader::reconcile::Gap;
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        let shell = LineSource {
+            session: sid('a'),
+            turn: 0,
+            call: 2,
+        };
+        let set_gap = |app: &mut App, gap| {
+            if let Ok(set) = &mut app.changes.as_mut().unwrap().set {
+                set.files[0].gap = Some(gap);
+            }
+        };
+        set_gap(&mut app, Gap::Shell(shell));
+        app.reduce(Action::Enter);
+        for _ in 0..3 {
+            app.reduce(Action::Down);
+        }
+        let out = render_at(&mut app, 260);
+        assert!(out.contains("NOT OBSERVED"), "{out}");
+        assert!(
+            out.contains("No tool claim for this file. A shell"),
+            "{out}"
+        );
+        assert!(out.contains("Shell    turn 1 · Bash (call 3)"), "{out}");
+        assert!(out.contains("Agent said (turn 1, unverified)"), "{out}");
+        assert!(out.contains("Session  b3-aaaaaaaaa"), "{out}");
+
+        set_gap(&mut app, Gap::AfterAgent { later_shell: None });
+        let out = render_at(&mut app, 260);
+        assert!(
+            out.contains("The last tool claim on this file (write or"),
+            "{out}"
+        );
+        assert!(!out.contains("Shell    turn"), "{out}");
+
+        set_gap(&mut app, Gap::Untouched { complete: true });
+        let out = render_at(&mut app, 260);
+        assert!(
+            out.contains("No tool claim or shell mention of this"),
+            "{out}"
         );
     }
 
@@ -2918,6 +2969,7 @@ mod verify_tab {
             changed_lines: changed,
             removes: false,
             last_observed: None,
+            gap: None,
         };
         let recon = Reconciliation {
             commit: commit('1'),
@@ -3156,5 +3208,30 @@ mod verify_tab {
         assert!(!app.verify.as_ref().unwrap().due(Duration::ZERO, every));
         app.reduce(Action::TabTo(1));
         assert!(app.verify.as_ref().unwrap().due(Duration::ZERO, every));
+    }
+
+    /// Warum nicht 100 %: die unerklärten Zeilen nach ihrem Grund.
+    #[test]
+    fn the_artifact_says_why_lines_are_unexplained() {
+        use minds_reader::reconcile::GapCounts;
+        let (_dir, repo) = repo();
+        let mut app = app(&repo);
+        app.verify.as_mut().unwrap().artifact = Ok(ClassCounts {
+            explained: 6,
+            unexplained: 4,
+            gaps: GapCounts {
+                after_agent: 1,
+                untouched: 3,
+                ..GapCounts::default()
+            },
+            ..ClassCounts::default()
+        });
+        let out = render_at(&mut app, 200);
+        assert!(
+            out.contains(
+                "◦ 1 whose last agent claim is another version or a deletion · 3 with no tool claim or shell mention found"
+            ),
+            "{out}"
+        );
     }
 }

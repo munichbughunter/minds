@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use minds_git::DiffKind;
 use minds_reader::changes::{DiffRow, FileDiff};
-use minds_reader::reconcile::ReconClass;
+use minds_reader::reconcile::{Gap, ReconClass};
 
 use crate::app::App;
 use crate::changes::{ChangesState, Focus};
@@ -424,12 +424,78 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                     )));
                     lines.push(Line::raw(""));
                     lines.push(Line::raw(
-                        "No write of the sessions linked to this commit produced this line.",
+                        "No evidence of the sessions linked to this commit backs this line.",
                     ));
-                    lines.push(Line::from(Span::styled(
-                        "Written by hand, by a shell command or a generator — Minds cannot attest it.",
-                        theme::dim(),
-                    )));
+                    // Warum — aus dem, was die Sessions über die Datei wissen;
+                    // nie, wer die Zeile schrieb.
+                    let (why, shell) = match file.gap {
+                        Some(Gap::AfterAgent { later_shell }) => (
+                            "The last tool claim on this file (write or delete) does not carry the version of this commit.",
+                            later_shell,
+                        ),
+                        Some(Gap::Unhashed) => (
+                            "A tool claim writes this file without a hash — whether it wrote this version is open.",
+                            None,
+                        ),
+                        Some(Gap::Unmapped) => (
+                            "A write or delete claim ends in this path but could not be mapped to this checkout — not counted.",
+                            None,
+                        ),
+                        Some(Gap::WitnessOpaque) => (
+                            "No tool claim for this file. The witness's latest observation of it is opaque (no hash).",
+                            None,
+                        ),
+                        Some(Gap::WitnessOther) => (
+                            "The witness's latest readable observation of this file shows another version.",
+                            None,
+                        ),
+                        Some(Gap::Shell(source)) => (
+                            "No tool claim for this file. A shell command mentions it (heuristic, not evidence).",
+                            Some(source),
+                        ),
+                        Some(Gap::Untouched { complete }) => (
+                            if complete {
+                                "No tool claim or shell mention of this file was found in the linked sessions."
+                            } else {
+                                "No tool claim or shell mention of this file was found in the linked sessions (search incomplete)."
+                            },
+                            None,
+                        ),
+                        None => ("Minds cannot attest this line.", None),
+                    };
+                    lines.push(Line::from(Span::styled(why, theme::dim())));
+                    if let Some(reason) = shell.and_then(|s| app.inspection.line_reason(s)) {
+                        let id = reason.session.to_string();
+                        lines.push(Line::raw(""));
+                        lines.push(Line::from(Span::styled(
+                            "Mentioned by a shell command (heuristic, not evidence):",
+                            theme::dim(),
+                        )));
+                        lines.push(Line::from(vec![
+                            label("Shell"),
+                            Span::raw(format!(
+                                "turn {} · {} (call {})",
+                                reason.turn + 1,
+                                reason.tool,
+                                reason.call + 1
+                            )),
+                        ]));
+                        lines.push(Line::from(vec![
+                            label("Session"),
+                            Span::raw(format!("{}… · {}", &id[..id.len().min(12)], reason.agent)),
+                        ]));
+                        if let Some(said) = reason.said {
+                            tail.push(Line::raw(""));
+                            tail.push(Line::from(Span::styled(
+                                format!(
+                                    "Agent said (turn {}, unverified)",
+                                    reason.said_turn.unwrap_or(reason.turn) + 1
+                                ),
+                                theme::title(),
+                            )));
+                            tail.push(Line::raw(said));
+                        }
+                    }
                 }
                 Some(class) => {
                     let (glyph, word, style) = theme::recon(class);

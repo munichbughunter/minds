@@ -49,6 +49,100 @@ pub struct FileRecon {
     /// Last observation matching the committed state, even if a later one
     /// contradicts it. Classification always uses the latest observation.
     pub last_observed: Option<ObservedAt>,
+    /// Warum die Datei unerklärt ist — `Some` genau bei
+    /// [`ReconClass::Unexplained`]. Gilt für alle ihre unerklärten Zeilen.
+    pub gap: Option<Gap>,
+}
+
+/// Warum geänderte Zeilen ohne Beleg sind — aus dem, was die Sessions über
+/// die Datei wissen. Eine Ableitung für die Anzeige; Klasse, Anteil und Gate
+/// hängen nie daran. Jede Variante sagt nur, was die gespeicherten Sessions
+/// hergeben — nie, wer die Zeile tatsächlich schrieb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gap {
+    /// Der letzte Claim auf die Datei trägt einen Hash, der nicht der
+    /// Commit-Fassung gleicht (oder ist eine Löschung). Über die zeitliche
+    /// Lage zum Commit sagt das nichts (eine Session kann mehrere Commits
+    /// tragen). `later_shell`: der erste Shell-Aufruf nach diesem Claim,
+    /// der die Datei erwähnt (Heuristik, kein Beleg).
+    AfterAgent { later_shell: Option<LineSource> },
+    /// Der letzte Claim schrieb die Datei ohne Hash (Import, redigierter
+    /// Inhalt, Patch ohne Nachher-Hash) — ob der Agent genau diese Fassung
+    /// schrieb, ist offen.
+    Unhashed,
+    /// Ein Write- oder Delete-Claim endet auf diesen Pfad, ließ sich aber
+    /// diesem Checkout nicht zuordnen ([`claim_path`]) — fail-closed nicht
+    /// gezählt. Warum, sagt der Reader nicht.
+    Unmapped,
+    /// Die letzte lesbare Witness-Beobachtung zeigt eine andere Fassung —
+    /// ohne Claim, oder obwohl der letzte Claim genau diese Fassung trägt.
+    WitnessOther,
+    /// Kein Claim; der Witness beobachtete die Datei, aber seine letzte
+    /// Beobachtung ist opak (ohne Hash) — sie bestätigt nichts.
+    WitnessOpaque,
+    /// Kein Claim, keine Beobachtung — ein Shell-Aufruf erwähnt die Datei
+    /// (Heuristik, kein Beleg).
+    Shell(LineSource),
+    /// Kein Claim, keine Beobachtung, keine Erwähnung in einem Shell-Aufruf
+    /// gefunden. `complete`: Die Heuristik sah alle Shell-Aufrufe (kein
+    /// Budget erschöpft).
+    Untouched { complete: bool },
+}
+
+/// Unerklärte Zeilen je [`Gap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GapCounts {
+    /// [`Gap::AfterAgent`].
+    pub after_agent: u64,
+    /// [`Gap::Unhashed`].
+    pub unhashed: u64,
+    /// [`Gap::Unmapped`].
+    pub unmapped: u64,
+    /// [`Gap::WitnessOther`].
+    pub witness_other: u64,
+    /// [`Gap::WitnessOpaque`].
+    pub witness_opaque: u64,
+    /// [`Gap::Shell`].
+    pub shell: u64,
+    /// [`Gap::Untouched`].
+    pub untouched: u64,
+    /// Mindestens eine [`Gap::Untouched`]-Zählung stammt aus einer Suche,
+    /// die ein Budget abbrach.
+    pub untouched_incomplete: bool,
+}
+
+impl GapCounts {
+    /// Die Zeilen von `gap` dazuzählen (sättigend).
+    pub fn add(&mut self, gap: Gap, lines: u64) {
+        let slot = match gap {
+            Gap::AfterAgent { .. } => &mut self.after_agent,
+            Gap::Unhashed => &mut self.unhashed,
+            Gap::Unmapped => &mut self.unmapped,
+            Gap::WitnessOther => &mut self.witness_other,
+            Gap::WitnessOpaque => &mut self.witness_opaque,
+            Gap::Shell(_) => &mut self.shell,
+            Gap::Untouched { complete } => {
+                self.untouched_incomplete |= !complete && lines > 0;
+                &mut self.untouched
+            }
+        };
+        *slot = slot.saturating_add(lines);
+    }
+
+    /// Alle gezählten Zeilen.
+    pub fn total(&self) -> u64 {
+        [
+            self.after_agent,
+            self.unhashed,
+            self.unmapped,
+            self.witness_other,
+            self.witness_opaque,
+            self.shell,
+            self.untouched,
+        ]
+        .into_iter()
+        .fold(0, u64::saturating_add)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +213,21 @@ impl Reconciliation {
     /// are backed by a tool claim, only not by a witness.
     pub fn unexplained_lines(&self) -> u64 {
         self.files.iter().map(FileRecon::unexplained_lines).sum()
+    }
+
+    /// Die unerklärten Zeilen, aufgeschlüsselt nach [`Gap`] — dieselbe
+    /// Zählung wie [`Reconciliation::unexplained_lines`].
+    pub fn unexplained_by_gap(&self) -> GapCounts {
+        let mut counts = GapCounts::default();
+        for file in &self.files {
+            // Unerklärte Zeilen gibt es nur in unerklärten Dateien (die
+            // Zeilen-Evidenz deckt eine belegte Datei ganz) — und die tragen
+            // aus dem Abgleich immer einen Grund; die Tests prüfen die Summe.
+            if let Some(gap) = file.gap {
+                counts.add(gap, file.unexplained_lines());
+            }
+        }
+        counts
     }
 }
 
@@ -311,6 +420,239 @@ struct Claim<'a> {
     call: &'a ToolCall,
     effect: &'a Effect,
     source: LineSource,
+    /// Position in der gemischten Turn-Reihenfolge (wie [`Mentions`]).
+    order: usize,
+}
+
+/// So viele Bytes eines Shell-Aufrufs werden nach Pfaden durchsucht.
+const MENTION_TEXT: usize = 64 * 1024;
+
+/// So viele Bytes aller Shell-Aufrufe zusammen.
+const MENTION_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Längere Wörter sind keine Pfade (`PATH_MAX`).
+const MENTION_TOKEN: usize = 4096;
+
+/// So viele Wörter merkt sich der Index höchstens. Ist eines der Budgets
+/// erschöpft, bleibt die Heuristik für den Rest stumm — still und abhängig
+/// von der Reihenfolge; dann eher [`Gap::Untouched`] als [`Gap::Shell`].
+const MENTION_ENTRIES: usize = 256 * 1024;
+
+/// So viele Wörter je Dateiname — begrenzt die Suche je unerklärter Datei
+/// (viele `mod.rs`).
+const MENTION_PER_NAME: usize = 4096;
+
+/// Ein Wort eines Shell-Aufrufs, geliehen aus der gespeicherten Session.
+#[derive(Clone, Copy)]
+struct Mention<'a> {
+    order: usize,
+    source: LineSource,
+    token: &'a str,
+}
+
+/// Pfadartige Wörter der Shell-Aufrufe (Exec) — für die Heuristik „ein
+/// Shell-Befehl erwähnt die Datei" — und die Dateinamen von Claims, deren
+/// Pfad sich nicht zuordnen ließ. Agent-neutral: reiner Text, kein Parsen
+/// der Argumente. Speicher linear in der Eingabe: Jedes Wort steht einmal
+/// unter seinem Dateinamen, geliehen, nie kopiert.
+#[derive(Default)]
+struct Mentions<'a> {
+    /// Je Dateiname die Wörter, in Aufruf-Reihenfolge.
+    by_name: BTreeMap<&'a str, Vec<Mention<'a>>>,
+    /// Die rohen Pfade nicht zuordenbarer Claims, je Dateiname.
+    unmapped: BTreeMap<&'a str, BTreeMap<&'a str, usize>>,
+    spent: usize,
+    entries: usize,
+    /// Ein Budget griff: Die Heuristik sah nicht alles.
+    truncated: bool,
+}
+
+/// Die Wörter eines Textes: getrennt an Leerraum, Anführungszeichen und
+/// Shell-Zeichen. Die Argumente sind JSON: Ein `\\` mit folgendem Zeichen
+/// (`\\n`, `\\"`) trennt und verschluckt das Zeichen; ein maskierter
+/// Backslash (`\\\\`, ein Windows-Pfad) bleibt im Wort — solche Wörter
+/// passen nie auf einen Repo-Pfad, statt als bloßer Dateiname überall.
+/// `\\uXXXX` verliert nur das `u`; `\\/` (von serde_json nie erzeugt)
+/// trennt. Beides ist Heuristik, nie Ausgabe.
+fn words<'t>(text: &'t str, mut each: impl FnMut(&'t str)) {
+    let mut start = None;
+    let mut chars = text.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        let split = if c == '\\' {
+            if chars.peek().is_some_and(|(_, next)| *next == '\\') {
+                chars.next();
+                start.get_or_insert(i);
+                continue;
+            }
+            chars.next();
+            true
+        } else {
+            c.is_whitespace() || "'\"`;|&()<>{}[],=:".contains(c)
+        };
+        match (split, start) {
+            (true, Some(from)) => {
+                each(&text[from..i]);
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(from) = start {
+        each(&text[from..]);
+    }
+}
+
+/// Ob der Claim-Pfad `long` den Repo-Pfad `path` an einer Komponentengrenze
+/// nennt: gleich, oder endet auf `/<path>` — `\\` zählt in `long` wie `/`
+/// (ein Windows-Claim `C:\\p\\src\\a.rs` endet auf `src/a.rs`). Byteweise:
+/// `/` und `\\` sind ASCII, ein Treffer liegt nie mitten in einem Zeichen.
+fn names_path(long: &str, path: &str) -> bool {
+    let slash = |b: u8| if b == b'\\' { b'/' } else { b };
+    let (long, path) = (long.as_bytes(), path.as_bytes());
+    let Some(start) = long.len().checked_sub(path.len()) else {
+        return false;
+    };
+    long[start..].iter().zip(path).all(|(a, b)| slash(*a) == *b)
+        && (start == 0 || slash(long[start - 1]) == b'/')
+}
+
+/// Der Dateiname eines Pfads (`/` oder `\\` als Trenner).
+fn file_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+impl<'a> Mentions<'a> {
+    fn add(&mut self, text: &'a str, order: usize, source: LineSource) {
+        if self.spent >= MENTION_BUDGET {
+            self.truncated = true;
+            return;
+        }
+        let mut end = text.len().min(MENTION_TEXT);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let cut = end < text.len();
+        self.truncated |= cut;
+        let mut text = &text[..end];
+        if cut {
+            // Das letzte Wort ist womöglich angeschnitten (`a.rs.bak` →
+            // `a.rs`): verwerfen.
+            text = text.rfind(char::is_whitespace).map_or("", |i| &text[..i]);
+        }
+        self.spent = self.spent.saturating_add(text.len());
+        let (by_name, entries, truncated) =
+            (&mut self.by_name, &mut self.entries, &mut self.truncated);
+        words(text, |token| {
+            let token = token.trim_start_matches("./");
+            if !(token.contains('.') || token.contains('/')) {
+                return;
+            }
+            if token.len() > MENTION_TOKEN {
+                // Ein pfadartiges Wort über `PATH_MAX`: übersprungen — die
+                // Suche sah also nicht alles.
+                *truncated = true;
+                return;
+            }
+            if *entries >= MENTION_ENTRIES {
+                *truncated = true;
+                return;
+            }
+            let name = file_name(token);
+            if name.is_empty() {
+                return;
+            }
+            let seen = by_name.entry(name).or_default();
+            if seen
+                .last()
+                .is_some_and(|m| m.order == order && m.token == token)
+            {
+                return;
+            }
+            if seen.len() >= MENTION_PER_NAME {
+                *truncated = true;
+                return;
+            }
+            seen.push(Mention {
+                order,
+                source,
+                token,
+            });
+            *entries += 1;
+        });
+    }
+
+    /// Die Aufrufe, die `path` erwähnen, in Aufruf-Reihenfolge: das Wort
+    /// ist der Pfad, endet auf `/<path>` (ein absoluter Pfad), oder es ist
+    /// der bloße Dateiname (relativ zum Arbeitsverzeichnis). `lib/mod.rs`
+    /// erwähnt also nicht `src/mod.rs`.
+    fn naming(&self, path: &str) -> impl Iterator<Item = &Mention<'a>> {
+        let name = file_name(path);
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            // Nur `/` als Grenze: Ein Windows-Pfad (`\\`) erwähnt keinen
+            // Repo-Pfad, auch keine Datei im Wurzelverzeichnis.
+            .filter(move |m| {
+                m.token == name
+                    || m.token == path
+                    || (m.token.len() > path.len()
+                        && m.token.ends_with(path)
+                        && m.token.as_bytes()[m.token.len() - path.len() - 1] == b'/')
+            })
+    }
+
+    /// Warum `path` unerklärt ist. `state`: die Commit-Fassung (`None`:
+    /// gelöscht); `contradicted`: Die letzte lesbare Beobachtung zeigt eine
+    /// andere Fassung; `observed`: Es gibt überhaupt eine Beobachtung.
+    fn gap(
+        &self,
+        path: &str,
+        claims: &[Claim<'_>],
+        state: Option<&ContentHash>,
+        contradicted: bool,
+        observed: bool,
+    ) -> Gap {
+        // Ein nicht zuordenbarer Claim auf diesen Pfad nach dem letzten
+        // zugeordneten (oder ohne einen): Das Letzte, was eine Session mit
+        // der Datei tat, ist unbekannt — nicht „danach geändert".
+        let after = claims.last().map_or(0, |last| last.order);
+        if self.unmapped.get(file_name(path)).is_some_and(|raws| {
+            raws.iter()
+                .any(|(raw, order)| *order > after && names_path(raw, path))
+        }) {
+            return Gap::Unmapped;
+        }
+        if let Some(last) = claims.last() {
+            // Der Claim trägt genau diese Fassung — unerklärt nur, weil der
+            // Witness zuletzt anderes sah.
+            if contradicted && claims_state(std::slice::from_ref(last), state) {
+                return Gap::WitnessOther;
+            }
+            if last.effect.kind == EffectKind::Write && last.effect.written.is_none() {
+                return Gap::Unhashed;
+            }
+            // Je Name in Aufruf-Reihenfolge: der erste Treffer danach.
+            let later_shell = self
+                .naming(path)
+                .find(|m| m.order > last.order)
+                .map(|m| m.source);
+            Gap::AfterAgent { later_shell }
+        } else if contradicted {
+            Gap::WitnessOther
+        } else if observed {
+            // Beobachtet, nicht widersprochen, trotzdem unerklärt: Die letzte
+            // Beobachtung ist opak.
+            Gap::WitnessOpaque
+        } else if let Some(first) = self.naming(path).next() {
+            Gap::Shell(first.source)
+        } else {
+            Gap::Untouched {
+                complete: !self.truncated,
+            }
+        }
+    }
 }
 
 /// The write and delete claims of a set of sessions, in merged turn order and
@@ -319,6 +661,8 @@ struct Claim<'a> {
 #[derive(Default)]
 pub struct Claims<'a> {
     by_path: BTreeMap<String, Vec<Claim<'a>>>,
+    /// Die Pfade, die Shell-Aufrufe nennen (für [`Gap`]).
+    mentions: Mentions<'a>,
     /// Ob je Zeile die Herkunft (`LineRecon::source`) gerechnet wird — nur
     /// auf Anfrage einer Anzeige, nie für `verify`: Es kostet einen Diff je
     /// abgespieltem Claim.
@@ -359,29 +703,54 @@ impl<'a> Claims<'a> {
         }
         turns.sort_by_key(|(time, id, index, _, _)| (*time, *id, *index));
         let mut by_path: BTreeMap<String, Vec<Claim<'a>>> = BTreeMap::new();
+        let mut mentions = Mentions::default();
+        let mut order = 0usize;
         for (_, id, turn_index, turn, session) in turns {
             let cwd = session.lineage.as_ref().and_then(|l| l.cwd.as_deref());
             for (call_index, call) in turn.tool_calls.iter().enumerate() {
+                order += 1;
+                let source = LineSource {
+                    session: id,
+                    turn: turn_index,
+                    call: call_index,
+                };
+                if let Some(effect) = &call.effect
+                    && effect.kind == EffectKind::Exec
+                {
+                    mentions.add(&call.arguments, order, source);
+                }
                 if let Some(effect) = &call.effect
                     && matches!(effect.kind, EffectKind::Write | EffectKind::Delete)
-                    && let Some(path) = effect.path.as_deref()
-                    && let Some(path) =
-                        claim_path(path, cwd, roots, known, effect.kind == EffectKind::Delete)
+                    && let Some(raw) = effect.path.as_deref()
                 {
-                    by_path.entry(path).or_default().push(Claim {
-                        call,
-                        effect,
-                        source: LineSource {
-                            session: id,
-                            turn: turn_index,
-                            call: call_index,
-                        },
-                    });
+                    match claim_path(raw, cwd, roots, known, effect.kind == EffectKind::Delete) {
+                        Some(path) => by_path.entry(path).or_default().push(Claim {
+                            call,
+                            effect,
+                            source,
+                            order,
+                        }),
+                        // Nicht zuordenbar: nicht gezählt (fail-closed), aber
+                        // „nichts nennt die Datei" wäre falsch.
+                        None => {
+                            let raws = mentions.unmapped.entry(file_name(raw)).or_default();
+                            // Je Name begrenzt, gleiche Pfade nur einmal (der
+                            // letzte zählt): Die Suche je Datei bleibt klein.
+                            if let Some(seen) = raws.get_mut(raw) {
+                                *seen = order;
+                            } else if raws.len() < MENTION_PER_NAME {
+                                raws.insert(raw, order);
+                            } else {
+                                mentions.truncated = true;
+                            }
+                        }
+                    }
                 }
             }
         }
         Self {
             by_path,
+            mentions,
             sources: false,
         }
     }
@@ -442,8 +811,24 @@ impl<'a> Claims<'a> {
                 .get(file.path)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let (recon, changed, explained) =
+            let (mut recon, changed, explained) =
                 reconcile_file(file, claims, observations, self.sources);
+            if recon.class == ReconClass::Unexplained {
+                // Wie `reconcile_file`: nur die letzte lesbare Beobachtung.
+                let state = (!recon.deleted).then_some(&recon.committed);
+                let contradicted = observations
+                    .iter()
+                    .rev()
+                    .find(|o| !o.opaque)
+                    .is_some_and(|o| o.observed.hash.as_ref() != state);
+                recon.gap = Some(self.mentions.gap(
+                    file.path,
+                    claims,
+                    state,
+                    contradicted,
+                    !observations.is_empty(),
+                ));
+            }
             result.total_changed_lines += changed;
             result.explained_lines += explained;
             result.files.push(recon);
@@ -551,6 +936,7 @@ fn reconcile_file(
             changed_lines: changed,
             removes,
             last_observed,
+            gap: None,
         },
         changed,
         explained,

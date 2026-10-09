@@ -208,6 +208,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         )),
     }
     lines.push(emphasis(Line::from(spans), row == state.cursor));
+    // Warum nicht 100 %: die unerklärten Zeilen nach ihrem Grund.
+    if let Ok(counts) = &state.artifact
+        && let Some(summary) = minds_reader::artifact::gap_summary(&counts.gaps)
+    {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            label(""),
+            Span::styled(format!("◦ {summary}"), theme::dim()),
+        ]));
+    }
 
     // Scope — wählbar: Enter öffnet die erste Datei außerhalb.
     let row = state.scope_row();

@@ -20,7 +20,7 @@ use minds_git::{CommitId, DiffKind, Repo};
 
 use crate::artifact::{ArtifactState, roots_of};
 use crate::model::ReviewState;
-use crate::reconcile::{FileRecon, LINE_LEVEL_LIMIT, LineLevel, LineSource, ReconClass};
+use crate::reconcile::{FileRecon, Gap, LINE_LEVEL_LIMIT, LineLevel, LineSource, ReconClass};
 use crate::text::{sanitize, sanitize_path};
 
 /// Kontextzeilen je Seite eines Hunks — wie `git diff`.
@@ -71,6 +71,8 @@ pub struct FileDiff {
     pub removed: usize,
     /// Die Klasse der Datei aus dem Abgleich.
     pub class: Option<ReconClass>,
+    /// Warum ihre unerklärten Zeilen unerklärt sind.
+    pub gap: Option<Gap>,
     /// Warum keine Zeilen da sind: Binärdatei, zu groß, Submodul, …
     pub note: Option<String>,
     /// Die Zeilen, in Diff-Reihenfolge.
@@ -216,6 +218,7 @@ impl crate::Inspection {
                 added: 0,
                 removed: 0,
                 class: recon.map(|r| r.class),
+                gap: recon.and_then(|r| r.gap),
                 note: None,
                 rows: Vec::new(),
             };

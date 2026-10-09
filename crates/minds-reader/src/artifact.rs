@@ -22,7 +22,8 @@ use minds_core::Session;
 use minds_git::{BlobId, CommitId, GitError, Repo};
 
 use crate::reconcile::{
-    ChangedFile, Claims, FileRecon, FsObservation, LineLevel, Reason, ReconClass, Reconciliation,
+    ChangedFile, Claims, FileRecon, FsObservation, Gap, GapCounts, LineLevel, Reason, ReconClass,
+    Reconciliation,
 };
 
 /// Der Legendentext einer unerklärten Stelle — nie ein Fehler, nur: In der
@@ -551,6 +552,78 @@ impl ReconClass {
     }
 }
 
+impl Gap {
+    /// Warum eine Stelle unerklärt ist — für eine Detailzeile. Sagt nur,
+    /// was die Sessions hergeben, nie, wer die Zeile schrieb.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::AfterAgent { later_shell: None } => {
+                "the agent's last write or delete of the file shows another version"
+            }
+            Self::AfterAgent {
+                later_shell: Some(_),
+            } => {
+                "the agent's last write or delete of the file shows another version; a later shell command mentions the file (heuristic)"
+            }
+            Self::Unhashed => "a tool claim writes the file without a hash",
+            Self::Unmapped => {
+                "a write or delete claim ends in this path but could not be mapped to this checkout (not counted)"
+            }
+            Self::WitnessOther => "the witness's latest readable observation shows another version",
+            Self::WitnessOpaque => {
+                "no tool claim; the witness's latest observation is opaque (no hash)"
+            }
+            Self::Shell(_) => "no tool claim; a shell command mentions the file (heuristic)",
+            Self::Untouched { complete: true } => "no tool claim or shell mention found",
+            Self::Untouched { complete: false } => {
+                "no tool claim or shell mention found (search incomplete)"
+            }
+        }
+    }
+}
+
+/// Die unerklärten Zeilen nach ihrem Grund, als eine Zeile — `None`, wenn
+/// keine unerklärte Zeile einen Grund trägt. Beantwortet „warum nicht
+/// 100 %?".
+pub fn gap_summary(counts: &GapCounts) -> Option<String> {
+    let parts: Vec<String> = [
+        (
+            counts.after_agent,
+            "whose last agent claim is another version or a deletion",
+        ),
+        (counts.unhashed, "claimed without a hash"),
+        (
+            counts.unmapped,
+            "with an unmapped claim ending in their path",
+        ),
+        (
+            counts.witness_other,
+            "in another version at the witness's latest readable observation",
+        ),
+        (
+            counts.witness_opaque,
+            "last observed opaquely by the witness",
+        ),
+        (
+            counts.shell,
+            "only mentioned by a shell command (heuristic)",
+        ),
+        (
+            counts.untouched,
+            if counts.untouched_incomplete {
+                "with no tool claim or shell mention found (search incomplete)"
+            } else {
+                "with no tool claim or shell mention found"
+            },
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 impl Reason {
     /// Warum die Zeilen-Ebene fehlt, als Wort.
     pub fn word(self) -> &'static str {
@@ -597,6 +670,7 @@ mod tests {
             changed_lines: 1,
             removes: false,
             last_observed: None,
+            gap: None,
         }
     }
 

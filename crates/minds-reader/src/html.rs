@@ -1790,6 +1790,7 @@ mod tests {
             changed_lines: lines.len() as u64,
             removes: false,
             last_observed: None,
+            gap: None,
         }
     }
 

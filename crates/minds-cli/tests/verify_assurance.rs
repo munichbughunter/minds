@@ -430,7 +430,8 @@ fn verify_assurance_golden_a1() {
         "\
 Integrity      intact
 Coverage       complete within the boundary (boundary: witness/v1 — activity outside it is not captured · 0 gaps · artifact 0/1 lines explained)
-  unexplained    generated.rs:1  not observed in the session
+  why            1 unexplained line(s): 1 with no tool claim or shell mention found
+  unexplained    generated.rs:1  no tool claim or shell mention found
 Interpretation complete
 Assurance      A1 observed    (range 1: witness signature not checked — no trusted allowed_signers)
 Intent         intent not bound
@@ -500,7 +501,8 @@ fn verify_assurance_golden_human_edit() {
         "\
 Integrity      intact
 Coverage       complete within the boundary (boundary: witness/v1 — activity outside it is not captured · 0 gaps · artifact 0/1 lines explained)
-  unexplained    generated.rs:1  not observed in the session
+  why            1 unexplained line(s): 1 with no tool claim or shell mention found
+  unexplained    generated.rs:1  no tool claim or shell mention found
 Interpretation complete
 Assurance      A1 observed    (range 1: no file-system observation window covering the session)
 Intent         intent not bound
@@ -536,7 +538,8 @@ fn verify_assurance_golden_missing_ledger_seal() {
         "\
 Integrity      VIOLATED  witnessed seal b3-<hash> missing from the repository
 Coverage       not assessable (boundary: witness/v1 — activity outside it is not captured · 0 gaps · artifact 0/1 lines explained)
-  unexplained    generated.rs:1  not observed in the session
+  why            1 unexplained line(s): 1 with no tool claim or shell mention found
+  unexplained    generated.rs:1  no tool claim or shell mention found
 Interpretation complete
 Assurance      A0 claimed     (witnessed seal(s) missing from the repository: b3-<hash>)
 Intent         intent not bound
