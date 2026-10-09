@@ -24,6 +24,7 @@ pub mod changes;
 pub mod evidence;
 pub mod graph;
 pub mod help;
+pub mod verify;
 pub mod why;
 
 #[cfg(test)]
@@ -58,6 +59,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     header(frame, app, head);
     if app.tab == Tab::Changes {
         changes::draw(frame, app, body);
+        footer(frame, app, foot);
+        if app.help {
+            help::draw(frame, frame.area());
+        }
+        return;
+    }
+    if app.tab == Tab::Verify {
+        verify::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
             help::draw(frame, frame.area());
@@ -247,6 +256,22 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn footer(frame: &mut Frame, app: &App, area: Rect) {
     if app.tab == Tab::Changes {
         changes_footer(frame, app, area);
+        return;
+    }
+    if app.tab == Tab::Verify {
+        let status = Line::from(Span::styled(
+            "The verdict of `minds verify` at a glance — signatures checked against the trusted signers, as verify does, once the check has run.",
+            theme::dim(),
+        ));
+        let keys = Line::from(vec![
+            freshness(app),
+            Span::raw("  "),
+            Span::styled(
+                "↑↓ row  Enter open  [ ] commit  Tab next tab  ? help",
+                theme::dim(),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(vec![status, keys]), area);
         return;
     }
     // Erste Zeile: was der Fokus bedeutet — der Evidenz-Satz zur gewählten

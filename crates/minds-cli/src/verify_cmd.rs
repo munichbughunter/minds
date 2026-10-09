@@ -69,9 +69,9 @@ use minds_store::{ContextStore, StoreError};
 use crate::context::Context;
 
 mod anchors;
-mod artifact;
+pub(crate) mod artifact;
 pub(crate) mod assurance;
-mod scope;
+pub(crate) mod scope;
 pub(crate) mod witness_trust;
 
 use artifact::Artifact;
@@ -463,7 +463,7 @@ fn verify_target(
 }
 
 /// Was über die Artefakt-Coverage eines Laufs sagbar ist.
-enum ArtifactState {
+pub(crate) enum ArtifactState {
     /// Der Commit ist abgeglichen.
     Assessed(Artifact),
     /// Kein Commit ist mit der Session verknüpft.
@@ -584,20 +584,13 @@ fn trailer_commits(ctx: &Context, id: SessionId) -> Fallible<Vec<CommitId>> {
     Ok(ctx.repo.commits_with_session(head, id)?)
 }
 
-/// Die Sessions der Revision, je mit der Herkunft ihrer Verknüpfung: aus
-/// dem Trailer (`Observed`) oder — ohne Trailer — die Quelle, die der
-/// Store-Index für die Kante festhält (ein Import steht dort als
-/// `Heuristic`, und eine Vermutung hebt keine Stufe über A0). Beides kann
-/// auch der Agent schreiben; über den Commit sagt die Stufe deshalb nichts
-/// (das tut die Coverage-Achse, siehe `minds_reader::assurance`).
-pub(crate) fn sessions_of_revision(
+/// Die Sessions eines Commits, wie `verify` sie wählt — der Kern von
+/// [`sessions_of_revision`], ohne Ausgabe (auch für den Verify-Tab von
+/// `minds inspect`, damit beide dieselben Sessions meinen).
+pub(crate) fn sessions_of_commit(
     ctx: &Context,
-    rev: &str,
-) -> Fallible<(CommitId, Vec<(SessionId, EvidenceSource)>)> {
-    // resolve_rev passes one argument after --end-of-options and peels to a commit.
-    let commit = ctx
-        .resolve_rev(rev)
-        .ok_or_else(|| format!("no such revision: {rev}"))?;
+    commit: CommitId,
+) -> Fallible<Vec<(SessionId, EvidenceSource)>> {
     let mut ids: Vec<(SessionId, EvidenceSource)> = ctx
         .repo
         .session_ids_of(commit)?
@@ -615,6 +608,24 @@ pub(crate) fn sessions_of_revision(
     }
     let mut seen = BTreeSet::new();
     ids.retain(|(id, _)| seen.insert(*id));
+    Ok(ids)
+}
+
+/// Die Sessions der Revision, je mit der Herkunft ihrer Verknüpfung: aus
+/// dem Trailer (`Observed`) oder — ohne Trailer — die Quelle, die der
+/// Store-Index für die Kante festhält (ein Import steht dort als
+/// `Heuristic`, und eine Vermutung hebt keine Stufe über A0). Beides kann
+/// auch der Agent schreiben; über den Commit sagt die Stufe deshalb nichts
+/// (das tut die Coverage-Achse, siehe `minds_reader::assurance`).
+pub(crate) fn sessions_of_revision(
+    ctx: &Context,
+    rev: &str,
+) -> Fallible<(CommitId, Vec<(SessionId, EvidenceSource)>)> {
+    // resolve_rev passes one argument after --end-of-options and peels to a commit.
+    let commit = ctx
+        .resolve_rev(rev)
+        .ok_or_else(|| format!("no such revision: {rev}"))?;
+    let ids = sessions_of_commit(ctx, commit)?;
     if ids.is_empty() {
         println!(
             "No session is linked to {} ({}).",

@@ -19,6 +19,19 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Verify tab in `minds inspect`.** The verdict of `minds verify` for a
+  commit at a glance instead of a wall of text: verdict, weakest assurance
+  level and intent first; then the linked sessions, Integrity, Coverage, the
+  Artifact as a bar with the count per evidence class, Scope (paths outside
+  the declared scope) and the short Not proven list. Repository-only facts
+  show at once; level, intent signature and scope are computed as
+  `minds verify` does (against `~/.ssh/allowed_signers`) and follow a moment
+  later. Enter on a session, the Artifact or the Scope jumps to the graph or
+  the diff. The verdict is the exit code of `minds verify <commit>`, run
+  from the `minds` binary pinned at start — never rebuilt; if that is not
+  possible (binary inside the checkout or replaced, timeout) the tab shows
+  `NOT CHECKED` with the reason. Tabs are now Sessions, Verify, Changes
+  (F1–F3).
 - **Changes tab in `minds inspect`.** Tabs at the top (Tab/Shift-Tab, F1/F2):
   Sessions and Changes. Changes shows a commit (HEAD first, `[`/`]` to page
   in the file list) as a diff in the familiar form — unified with hunk

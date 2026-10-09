@@ -36,7 +36,7 @@ use super::ArtifactState;
 use super::artifact::{DETAIL_CAP, KIND_WIDTH, shown_path};
 
 /// Was über den Bereich einer Session sagbar ist.
-pub(super) enum ScopeState {
+pub(crate) enum ScopeState {
     /// Ein Bereich ist erklärt; die Pfade außerhalb davon.
     Assessed(Vec<ScopeFinding>),
     /// Kein Bereich lesbar — warum.
@@ -47,7 +47,7 @@ pub(super) enum ScopeState {
 /// `intent`. `observations` sind schon auf das Fenster der Session und auf
 /// Witness-signierte Seals beschränkt; fehlt dabei ein bezeugtes Objekt,
 /// ist der Bereich nicht beurteilbar (fail-closed). Strikt lesend.
-pub(super) fn assess(
+pub(crate) fn assess(
     store: &dyn ContextStore,
     repo: &Repo,
     root: &Path,
