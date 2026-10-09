@@ -67,6 +67,21 @@ pub fn assess(
     sessions: &[&Session],
     observations: &[FsObservation],
 ) -> minds_git::Result<Result<Assessed, &'static str>> {
+    assess_detailed(repo, roots, commit, sessions, observations, false)
+}
+
+/// Wie [`assess`]; mit `sources` trägt jede Zeile zusätzlich den
+/// Schreibvorgang, der sie einführte ([`crate::reconcile::LineSource`]) —
+/// für Anzeigen. Kostet einen Diff je abgespieltem Claim (begrenzt durch
+/// [`crate::reconcile::SOURCE_BUDGET`]).
+pub fn assess_detailed(
+    repo: &Repo,
+    roots: &[&Path],
+    commit: CommitId,
+    sessions: &[&Session],
+    observations: &[FsObservation],
+    sources: bool,
+) -> minds_git::Result<Result<Assessed, &'static str>> {
     if let Some(parent) = repo.first_parent(commit)?
         && !repo.has_commit(parent)
     {
@@ -136,6 +151,11 @@ pub fn assess(
         found
     };
     let claims = Claims::collect(sessions, roots, &in_tree);
+    let claims = if sources {
+        claims.with_sources()
+    } else {
+        claims
+    };
     if let Some(err) = lookup_error.into_inner() {
         if partial {
             return Ok(Err(PARTIAL_TREE));
@@ -295,8 +315,19 @@ impl crate::Index {
     /// unterscheiden. Beobachtungen nutzt `minds verify`, das die
     /// Witness-Signatur prüft.
     pub fn artifact(&self, repo: &Repo, roots: &[&Path], commit: CommitId) -> CommitArtifact {
+        self.artifact_detailed(repo, roots, commit, false)
+    }
+
+    /// Wie [`Index::artifact`]; mit `sources` samt Herkunft je Zeile.
+    pub fn artifact_detailed(
+        &self,
+        repo: &Repo,
+        roots: &[&Path],
+        commit: CommitId,
+        sources: bool,
+    ) -> CommitArtifact {
         let (claimants, inferred) = self.claimants(commit);
-        let state = match assess(repo, roots, commit, &claimants, &[]) {
+        let state = match assess_detailed(repo, roots, commit, &claimants, &[], sources) {
             Ok(Ok(assessed)) => ArtifactState::Assessed(assessed),
             Ok(Err(why)) => ArtifactState::Unavailable(why),
             Err(err) => ArtifactState::Failed(crate::sanitize(&err.to_string())),
@@ -585,14 +616,17 @@ mod tests {
             LineRecon {
                 line: 2,
                 class: Unexplained,
+                source: None,
             },
             LineRecon {
                 line: 3,
                 class: Unexplained,
+                source: None,
             },
             LineRecon {
                 line: 5,
                 class: Unexplained,
+                source: None,
             },
         ]);
         let mut both = file(Unexplained, lines);

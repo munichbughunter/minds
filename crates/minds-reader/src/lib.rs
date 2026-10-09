@@ -64,5 +64,8 @@ pub mod first_sight;
 
 pub mod artifact;
 
+/// Die Änderungen eines Commits als Diff, mit Klasse und Herkunft je Zeile.
+pub mod changes;
+
 mod query;
 pub use query::{Inspection, touches};

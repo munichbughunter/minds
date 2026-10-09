@@ -43,6 +43,8 @@ pub struct Inspection {
     /// Reviews je Subjekt-Id.
     reviews: BTreeMap<String, Vec<Stored>>,
     branch: Option<String>,
+    /// Der Commit, auf den HEAD beim Laden zeigte — `None` ohne Commit.
+    head: Option<CommitId>,
     repo_name: String,
 }
 
@@ -56,7 +58,9 @@ impl Inspection {
         repo_name: &str,
     ) -> Result<Self> {
         let index = Index::build(repo, store)?;
-        let branch = match repo.head()? {
+        let head_state = repo.head()?;
+        let head = head_state.commit();
+        let branch = match head_state {
             Head::Branch { name, .. } | Head::Unborn { name } => Some(sanitize(&name)),
             Head::Detached { .. } => None,
         };
@@ -74,7 +78,7 @@ impl Inspection {
                     .push(Stored { review, signed });
             }
         }
-        Ok(Self::assemble(index, grouped, branch, repo_name))
+        Ok(Self::assemble(index, grouped, branch, repo_name).with_head(head))
     }
 
     /// Baut das Modell aus einem fertigen Index — für Tests und Aufrufer, die
@@ -116,6 +120,7 @@ impl Inspection {
             index,
             reviews,
             branch,
+            head: None,
             repo_name: sanitize(repo_name),
         }
     }
@@ -123,6 +128,18 @@ impl Inspection {
     /// Der Index dahinter.
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Setzt den HEAD-Commit — [`Inspection::load`] tut das selbst; für
+    /// Aufrufer von [`Inspection::from_index`].
+    pub fn with_head(mut self, head: Option<CommitId>) -> Self {
+        self.head = head;
+        self
+    }
+
+    /// Der Commit, auf den HEAD beim Laden zeigte.
+    pub fn head(&self) -> Option<CommitId> {
+        self.head
     }
 
     /// Die sessionlosen Block-Seals: zurückgehaltene Sessions, deren einziger

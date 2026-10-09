@@ -1265,3 +1265,192 @@ fn a_trailer_without_readable_sessions_says_so() {
         minds_reader::artifact::NO_CLAIMANT_NOTE
     );
 }
+
+/// Eine Zeile: (Zeile, Klasse, (Turn, Aufruf) der Herkunft).
+type Sourced = (u32, ReconClass, Option<(usize, usize)>);
+
+/// Je Zeile: Nummer, Klasse und Herkunft.
+fn sources(file: &FileRecon) -> Vec<Sourced> {
+    match &file.line_level {
+        LineLevel::Available(lines) => lines
+            .iter()
+            .map(|l| (l.line, l.class, l.source.as_ref().map(|s| (s.turn, s.call))))
+            .collect(),
+        other => panic!("expected lines, got {other:?}"),
+    }
+}
+
+/// Die Herkunft wandert mit: Ein Edit gibt nur den Zeilen, die er einführt,
+/// seinen Aufruf; was er stehen lässt, behält den Write davor. Eine Zeile,
+/// die kein Aufruf schrieb, hat keine Herkunft.
+#[test]
+fn every_backed_line_knows_the_call_that_introduced_it() {
+    let edit = call(
+        "Edit",
+        "f",
+        json!({"old_string": "b\n", "new_string": "B\nB2\n"}),
+        Some(b"a\nB\nB2\nc\n"),
+    );
+    let session = session(vec![write("f", "a\nb\nc\n"), edit]);
+    let id = SessionId::of(&session).unwrap();
+    let result = run_sourced(
+        &[file("f", None, Some(b"a\nB\nB2\nc\nhuman\n"))],
+        &[&session],
+        &[],
+    );
+    assert_eq!(
+        sources(&result.files[0]),
+        [
+            (1, ReportedOnly, Some((0, 0))),
+            (2, ReportedOnly, Some((0, 1))),
+            (3, ReportedOnly, Some((0, 1))),
+            (4, ReportedOnly, Some((0, 0))),
+            (5, Unexplained, None),
+        ]
+    );
+    let LineLevel::Available(lines) = &result.files[0].line_level else {
+        unreachable!()
+    };
+    assert!(
+        lines
+            .iter()
+            .flat_map(|l| l.source.as_deref())
+            .all(|s| s.session == id)
+    );
+}
+
+/// Mit Witness: dieselbe Herkunft für bestätigte Zeilen; ohne passenden
+/// Claim (nur im Dateisystem gesehen) keine.
+#[test]
+fn witnessed_lines_keep_their_source_and_fs_only_lines_have_none() {
+    let text = b"one\ntwo\n";
+    let session = session(vec![write("a", "one\ntwo\n")]);
+    let result = run_sourced(
+        &[file("a", None, Some(text)), file("b", None, Some(text))],
+        &[&session],
+        &[
+            observation("a", Some(text), 1),
+            observation("b", Some(text), 2),
+        ],
+    );
+    assert_eq!(
+        sources(&result.files[0]),
+        [(1, Explained, Some((0, 0))), (2, Explained, Some((0, 0)))]
+    );
+    assert_eq!(
+        sources(&result.files[1]),
+        [(1, ExplainedFsOnly, None), (2, ExplainedFsOnly, None)]
+    );
+}
+
+/// Wie [`run`], samt Herkunft je Zeile.
+fn run_sourced(
+    changed: &[ChangedFile<'_>],
+    sessions: &[&Session],
+    observations: &[FsObservation],
+) -> Reconciliation {
+    reconcile_with_sources(&ReconInput {
+        commit: commit(),
+        base: None,
+        changed,
+        sessions,
+        observations,
+        roots: &[],
+    })
+}
+
+/// Ohne Anfrage keine Herkunft — `verify` zahlt nicht für die Anzeige —, und
+/// die Klassen sind mit und ohne dieselben.
+#[test]
+fn sources_are_computed_only_on_request_and_never_change_the_classes() {
+    let session = session(vec![write("f", "a\nb\n")]);
+    let changed = [file("f", None, Some(b"a\nb\nc\n"))];
+    let plain = run(&changed, &[&session], &[]);
+    let sourced = run_sourced(&changed, &[&session], &[]);
+    assert!(sources(&plain.files[0]).iter().all(|(_, _, s)| s.is_none()));
+    assert!(
+        sources(&sourced.files[0])
+            .iter()
+            .any(|(_, _, s)| s.is_some())
+    );
+    assert_eq!(lines(&plain.files[0]), lines(&sourced.files[0]));
+    assert_eq!(
+        (plain.explained_lines, plain.total_changed_lines),
+        (sourced.explained_lines, sourced.total_changed_lines)
+    );
+}
+
+/// Ein Delete löscht die Herkunft: Was danach geschrieben wird, gehört ganz
+/// dem neuen Aufruf. Ebenso nach einer Wiedergabe, die nicht zum Hash passt.
+#[test]
+fn delete_and_failed_replays_restart_the_sources() {
+    let delete = call("Delete", "f", json!({}), None);
+    let deleted = session(vec![write("f", "a\nb\n"), delete, write("f", "a\nb\n")]);
+    let result = run_sourced(&[file("f", None, Some(b"a\nb\n"))], &[&deleted], &[]);
+    assert_eq!(
+        sources(&result.files[0]),
+        [
+            (1, ReportedOnly, Some((0, 2))),
+            (2, ReportedOnly, Some((0, 2)))
+        ]
+    );
+
+    let broken = call(
+        "Edit",
+        "f",
+        json!({"old_string": "missing", "new_string": "x"}),
+        Some(b"x\n"),
+    );
+    let failed = session(vec![write("f", "a\n"), broken, write("f", "a\nz\n")]);
+    let result = run_sourced(&[file("f", None, Some(b"a\nz\n"))], &[&failed], &[]);
+    assert_eq!(
+        sources(&result.files[0]),
+        [
+            (1, ReportedOnly, Some((0, 2))),
+            (2, ReportedOnly, Some((0, 2)))
+        ]
+    );
+}
+
+/// Eine Zeile aus der Basis, die ein Edit stehen lässt, ist keine geänderte
+/// Zeile — eine geänderte daneben trägt den Edit.
+#[test]
+fn an_edit_on_a_base_file_attributes_only_what_it_changed() {
+    let edit = call(
+        "Edit",
+        "f",
+        json!({"old_string": "old\n", "new_string": "new\n"}),
+        Some(b"keep\nnew\n"),
+    );
+    let session = session(vec![edit]);
+    let result = reconcile_with_sources(&ReconInput {
+        commit: commit(),
+        base: None,
+        changed: &[file("f", Some(b"keep\nold\n"), Some(b"keep\nnew\n"))],
+        sessions: &[&session],
+        observations: &[],
+        roots: &[],
+    });
+    assert_eq!(sources(&result.files[0]), [(2, ReportedOnly, Some((0, 0)))]);
+}
+
+/// Über dem Budget wird die Herkunft nicht weitergetragen — die Klasse
+/// bleibt, die Anzeige verliert nur die Quelle.
+#[test]
+fn sources_stop_beyond_the_budget_but_classes_stay() {
+    let line = "x".repeat(99) + "\n";
+    let text = line.repeat(1024 * 1024 * 3 / 2 / line.len());
+    let writes = (0..12).map(|_| write("f", &text)).collect();
+    let session = session(writes);
+    let result = run_sourced(&[file("f", None, Some(text.as_bytes()))], &[&session], &[]);
+    let lines = sources(&result.files[0]);
+    assert!(lines.iter().all(|(_, class, _)| *class == ReportedOnly));
+    assert!(lines.iter().all(|(_, _, source)| source.is_none()));
+}
+
+/// `verify` hält je geänderter Zeile ein `LineRecon` — die Herkunft (nur
+/// auf Anfrage) darf das nicht aufblähen.
+#[test]
+fn a_line_recon_stays_small() {
+    assert!(std::mem::size_of::<LineRecon>() <= 16);
+}

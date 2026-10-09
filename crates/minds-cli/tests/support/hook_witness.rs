@@ -20,8 +20,19 @@ pub fn minds() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_minds"));
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        // Ein leeres Home: `minds verify` liest ohne `--signers`
+        // `~/.ssh/allowed_signers` — die Datei des Entwicklers darf das
+        // Ergebnis eines Tests nicht bestimmen (in CI gibt es sie nie).
+        .env("HOME", isolated_home())
         .env_remove(SOCKET_ENV);
     cmd
+}
+
+/// Ein leeres, für alle Tests gemeinsames Home ohne `.ssh`.
+fn isolated_home() -> PathBuf {
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("isolated-home");
+    fs::create_dir_all(&home).unwrap();
+    home
 }
 
 pub struct Fixture {

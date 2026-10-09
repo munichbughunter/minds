@@ -312,7 +312,11 @@ mod tests {
     fn lines(spec: &[(u32, ReconClass)]) -> LineLevel {
         LineLevel::Available(
             spec.iter()
-                .map(|&(line, class)| LineRecon { line, class })
+                .map(|&(line, class)| LineRecon {
+                    line,
+                    class,
+                    source: None,
+                })
                 .collect(),
         )
     }

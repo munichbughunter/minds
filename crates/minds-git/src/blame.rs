@@ -203,10 +203,18 @@ impl<'repo> ShellBlame<'repo> {
     /// baren Repository funktionieren (Child-Repo-Backend, M4).
     fn run(&self, at: CommitId, path: &str, line: Option<u32>) -> Result<Vec<u8>> {
         let mut command = Command::new("git");
+        // Wie `commit_changes`: Nichts aus der (vom Agenten beschreibbaren)
+        // Konfiguration darf hier einen Befehl starten oder ins Netz gehen —
+        // kein Nachladen im Partial Clone, keine Ersatzobjekte, und kein
+        // `textconv`-Treiber aus `diff.<treiber>.textconv` samt Attributen.
         command
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .args(["-c", "protocol.allow=never"])
+            .arg("--no-replace-objects")
             .arg("--git-dir")
             .arg(self.repo.git_dir())
             .arg("blame")
+            .arg("--no-textconv")
             .arg("--porcelain");
 
         if let Some(line) = line {

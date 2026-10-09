@@ -29,6 +29,7 @@ use minds_git::Repo;
 use minds_reader::Inspection;
 
 mod app;
+mod changes;
 mod filter;
 mod input;
 mod layout;

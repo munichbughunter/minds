@@ -2204,3 +2204,485 @@ fn a_degraded_session_closes_its_chain_with_the_right_reason() {
     let closed = app.closed.clone().unwrap_or_default();
     assert!(closed.contains("has no why chain"), "{closed}");
 }
+
+// --- Changes-Tab ------------------------------------------------------------
+
+mod changes_tab {
+    use minds_git::DiffKind;
+    use minds_reader::changes::{ChangeSet, DiffRow, FileDiff};
+    use minds_reader::model::ReviewState;
+    use minds_reader::reconcile::{LineSource, ReconClass};
+
+    use super::*;
+    use crate::app::Tab;
+    use crate::changes::{ChangesState, Focus};
+
+    fn row(
+        kind: DiffKind,
+        old: Option<u32>,
+        new: Option<u32>,
+        text: &str,
+        class: Option<ReconClass>,
+        source: Option<LineSource>,
+    ) -> DiffRow {
+        DiffRow {
+            kind,
+            old,
+            new,
+            text: text.into(),
+            class,
+            source,
+        }
+    }
+
+    /// Ein Commit mit zwei Dateien: In `src/sort/mod.rs` schrieb die Session
+    /// `a` eine Zeile (Edit, Turn 0, Aufruf 1), eine stammt von niemandem;
+    /// `tests/t.rs` ist ganz unerklärt.
+    fn set() -> ChangeSet {
+        let source = LineSource {
+            session: sid('a'),
+            turn: 0,
+            call: 1,
+        };
+        ChangeSet {
+            commit: commit('1'),
+            subject: Some("feat(sort): chronologisch".into()),
+            change: None,
+            review: ReviewState::open(),
+            unassessed: None,
+            files: vec![
+                FileDiff {
+                    path: "src/sort/mod.rs".into(),
+                    identity: "src/sort/mod.rs".into(),
+                    added: 2,
+                    removed: 1,
+                    class: Some(ReconClass::ReportedOnly),
+                    note: None,
+                    rows: vec![
+                        row(DiffKind::Hunk, None, None, "@@ -1,3 +1,4 @@", None, None),
+                        row(
+                            DiffKind::Context,
+                            Some(1),
+                            Some(1),
+                            "fn order() {",
+                            None,
+                            None,
+                        ),
+                        row(DiffKind::Removed, Some(2), None, "    old();", None, None),
+                        row(
+                            DiffKind::Added,
+                            None,
+                            Some(2),
+                            "    sort_by_key();",
+                            Some(ReconClass::ReportedOnly),
+                            Some(source),
+                        ),
+                        row(
+                            DiffKind::Added,
+                            None,
+                            Some(3),
+                            "    // manuell nachgezogen",
+                            Some(ReconClass::Unexplained),
+                            None,
+                        ),
+                        row(DiffKind::Context, Some(3), Some(4), "}", None, None),
+                    ],
+                },
+                FileDiff {
+                    path: "tests/t.rs".into(),
+                    identity: "tests/t.rs".into(),
+                    added: 1,
+                    removed: 0,
+                    class: Some(ReconClass::Unexplained),
+                    note: None,
+                    rows: vec![
+                        row(DiffKind::Hunk, None, None, "@@ -0,0 +1 @@", None, None),
+                        row(
+                            DiffKind::Added,
+                            None,
+                            Some(1),
+                            "#[test] fn t() {}",
+                            Some(ReconClass::Unexplained),
+                            None,
+                        ),
+                    ],
+                },
+            ],
+        }
+    }
+
+    fn app_with_changes(repo: &Repo) -> App<'_> {
+        let mut app = App::new(filled(), repo, None);
+        app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(set())));
+        app.tab = Tab::Changes;
+        app
+    }
+
+    #[test]
+    fn the_header_shows_the_tabs_and_tab_switches() {
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled(), &repo, None);
+        let out = render(&mut app);
+        assert!(out.contains("F1 Sessions"), "{out}");
+        assert!(out.contains("F2 Changes"), "{out}");
+        // Ohne lesbaren Commit (leeres Repo) öffnet der Tab trotzdem — mit
+        // einer ehrlichen Meldung statt eines Absturzes.
+        app.reduce(Action::CycleTab(true));
+        assert_eq!(app.tab, Tab::Changes);
+        assert!(render(&mut app).contains("Changes unavailable") || app.changes.is_some());
+        app.reduce(Action::TabTo(0));
+        assert_eq!(app.tab, Tab::Sessions);
+        app.reduce(Action::CycleTab(false));
+        assert_eq!(app.tab, Tab::Changes);
+    }
+
+    #[test]
+    fn opening_starts_on_the_first_file_with_unexplained_lines() {
+        let state = ChangesState::new(vec![commit('1')], 0, Ok(set()));
+        assert_eq!(state.file, 0);
+        assert_eq!(state.focus, Focus::Files);
+    }
+
+    /// Wie `git diff`: Hunk-Kopf, alte und neue Nummer, `+`/`-` vor dem Text.
+    #[test]
+    fn the_unified_diff_reads_like_git_diff() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        let out = render(&mut app);
+        assert!(out.contains("@@ -1,3 +1,4 @@"), "{out}");
+        assert!(out.contains("1     1   fn order() {"), "{out}");
+        assert!(out.contains("2       -     old();"), "{out}");
+        assert!(out.contains("     2 +     sort_by_key();"), "{out}");
+        assert!(out.contains("FILES · 1111111 · 1/1"), "{out}");
+        assert!(out.contains("+2 −1"), "{out}");
+        assert!(
+            out.contains("◦1"),
+            "the file list counts unexplained lines: {out}"
+        );
+    }
+
+    /// Grün und Rot liegen als Hintergrund auf genau den `+`- und
+    /// `-`-Zeilen; die unerklärte Zeile ist fett und invertiert markiert.
+    #[test]
+    fn added_lines_are_green_removed_red_and_unexplained_bold() {
+        use ratatui::style::Modifier;
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        let mut terminal = Terminal::new(TestBackend::new(WIDE, 30)).unwrap();
+        terminal
+            .draw(|frame| super::super::draw(frame, &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let find = |needle: &str| {
+            (0..buffer.area.height)
+                .find_map(|y| {
+                    let line: String = (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect();
+                    line.find(needle).map(|byte| {
+                        let x = line[..byte].chars().count() as u16;
+                        (x, y)
+                    })
+                })
+                .unwrap_or_else(|| panic!("{needle} not drawn"))
+        };
+        let (x, y) = find("sort_by_key");
+        assert_eq!(buffer[(x, y)].bg, super::super::changes::ADD_BG);
+        let (x, y) = find("old();");
+        assert_eq!(buffer[(x, y)].bg, super::super::changes::DEL_BG);
+        let (x, y) = find("fn order");
+        assert_ne!(buffer[(x, y)].bg, super::super::changes::ADD_BG);
+        let (x, y) = find("// manuell");
+        // Der Rand-Glyph der Zeile: drei Zeichen vor den Zeilennummern.
+        let marker = (0..x)
+            .rev()
+            .find(|mx| buffer[(*mx, y)].symbol() == "◦")
+            .unwrap();
+        let cell = &buffer[(marker, y)];
+        assert!(cell.modifier.contains(Modifier::BOLD | Modifier::REVERSED));
+    }
+
+    #[test]
+    fn n_jumps_to_the_next_unexplained_line_across_files() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Unexplained(true));
+        let state = app.changes.as_ref().unwrap();
+        assert_eq!(state.focus, Focus::Diff);
+        assert_eq!((state.file, state.row), (0, 4));
+        app.reduce(Action::Unexplained(true));
+        let state = app.changes.as_ref().unwrap();
+        assert_eq!((state.file, state.row), (1, 1), "on into the next file");
+        app.reduce(Action::Unexplained(true));
+        let state = app.changes.as_ref().unwrap();
+        assert_eq!((state.file, state.row), (0, 4), "round the circle");
+        app.reduce(Action::Unexplained(false));
+        let state = app.changes.as_ref().unwrap();
+        assert_eq!((state.file, state.row), (1, 1), "and backwards");
+    }
+
+    #[test]
+    fn brackets_jump_hunks_in_the_diff() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        assert_eq!(
+            app.changes.as_ref().unwrap().row,
+            1,
+            "Enter lands on the first change"
+        );
+        app.reduce(Action::Bracket(false));
+        assert_eq!(
+            app.changes.as_ref().unwrap().row,
+            0,
+            "back to the hunk header"
+        );
+        app.reduce(Action::Bracket(true));
+        assert_eq!(
+            app.changes.as_ref().unwrap().row,
+            0,
+            "no further hunk: stays"
+        );
+        app.reduce(Action::Back);
+        assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
+        app.reduce(Action::Back);
+        assert_eq!(app.tab, Tab::Sessions);
+    }
+
+    /// „Warum diese Zeile?": was die Session zu genau diesem Schritt
+    /// festhielt — und für eine Zeile ohne Schreibvorgang der ehrliche Satz.
+    #[test]
+    fn the_why_column_explains_the_line_under_the_cursor() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        app.reduce(Action::Down);
+        app.reduce(Action::Down);
+        let out = render(&mut app);
+        assert!(out.contains("WHY THIS LINE?"), "{out}");
+        assert!(out.contains("REPORTED ONLY"), "{out}");
+        assert!(out.contains("turn 1 · Edit (call 2)"), "{out}");
+        assert!(out.contains("Ich lese und ändere."), "{out}");
+        assert!(out.contains("Fix retry handling"), "{out}");
+        assert!(out.contains("Review"), "{out}");
+
+        app.reduce(Action::Down);
+        let out = render(&mut app);
+        assert!(out.contains("NOT OBSERVED"), "{out}");
+        assert!(out.contains("No write of the sessions linked"), "{out}");
+
+        app.reduce(Action::Why);
+        assert!(
+            !render(&mut app).contains("WHY THIS LINE?"),
+            "w hides the column"
+        );
+    }
+
+    #[test]
+    fn split_shows_old_and_new_side_by_side_on_a_wide_terminal() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        app.reduce(Action::Split);
+        app.reduce(Action::Why);
+        let out = render_at(&mut app, 260);
+        let line = out
+            .lines()
+            .find(|l| l.contains("old();"))
+            .unwrap_or_else(|| panic!("{out}"));
+        assert!(
+            line.contains("sort_by_key"),
+            "removed and added side by side: {line}"
+        );
+        assert!(line.contains('│'), "{line}");
+        assert!(out.contains("[split]"), "{out}");
+        // Zu schmal: zurück zu Unified, ohne Fehler.
+        let narrow = render_at(&mut app, 120);
+        assert!(
+            !narrow
+                .lines()
+                .any(|l| l.contains("old();") && l.contains("sort_by_key")),
+            "{narrow}"
+        );
+    }
+
+    #[test]
+    fn split_pairs_put_removals_beside_additions() {
+        let pairs = ChangesState::split_pairs(&set().files[0].rows);
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(0), Some(0)),
+                (Some(1), Some(1)),
+                (Some(2), Some(3)),
+                (None, Some(4)),
+                (Some(5), Some(5)),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_footer_names_the_commit_and_the_keys_of_the_focus() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        let out = render(&mut app);
+        assert!(out.contains("1111111 feat(sort): chronologisch"), "{out}");
+        assert!(out.contains("Enter diff"), "{out}");
+        app.reduce(Action::Enter);
+        let out = render(&mut app);
+        assert!(out.contains("n N unexplained"), "{out}");
+    }
+
+    /// Von Evidence → ARTIFACT mit Enter in den Diff des Commits.
+    #[test]
+    fn enter_on_artifact_opens_the_changes_of_that_commit() {
+        use minds_reader::artifact::{ArtifactState, CommitArtifact};
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled(), &repo, None);
+        let report = app.inspection.evidence_report(sid('a'));
+        app.views.push(View::Evidence {
+            id: sid('a'),
+            report,
+            uninterpreted: 0,
+            artifacts: vec![CommitArtifact {
+                commit: commit('1'),
+                subject: None,
+                inferred: false,
+                claimants: 1,
+                state: ArtifactState::Unavailable("test"),
+            }],
+            cursor: crate::app::ARTIFACT_SECTION,
+        });
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Changes);
+        let state = app.changes.as_ref().unwrap();
+        assert_eq!(state.commit(), Some(commit('1')));
+        // Der Evidence-Report bleibt im Sessions-Tab liegen.
+        assert_eq!(app.views.len(), 1);
+    }
+
+    /// Neu laden hält Commit, Datei und Stelle — und liest den Commit nicht
+    /// neu, solange sich seine Eingaben nicht ändern.
+    #[test]
+    fn reload_keeps_the_place_in_the_changes_tab() {
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled().with_head(Some(commit('1'))), &repo, None);
+        app.stamp = Some("1".into());
+        app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(set())));
+        app.tab = Tab::Changes;
+        app.reduce(Action::Down);
+        app.reduce(Action::Enter);
+        app.reload(
+            Ok(filled().with_head(Some(commit('1')))),
+            Some("2".into()),
+            now(),
+        );
+        let state = app.changes.as_ref().unwrap();
+        assert_eq!(state.current().map(|f| f.path.as_str()), Some("tests/t.rs"));
+        assert_eq!(state.focus, Focus::Diff);
+        assert!(
+            state.set.is_ok(),
+            "carried over, not re-read from the empty repo"
+        );
+    }
+
+    /// Split ab 160 Spalten Terminal — auch mit eingeblendeter Begründung
+    /// (die rückt dann unter den Diff). Darunter sagt der Kopf ehrlich, dass
+    /// Unified gezeigt wird.
+    #[test]
+    fn split_appears_at_160_columns_with_the_why_column_on() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        app.reduce(Action::Split);
+        assert!(app.changes.as_ref().unwrap().why);
+        let out = render_at(&mut app, 160);
+        assert!(
+            out.lines()
+                .any(|l| l.contains("old();") && l.contains("sort_by_key")),
+            "{out}"
+        );
+        assert!(out.contains("WHY THIS LINE?"), "{out}");
+        let out = render_at(&mut app, 159);
+        assert!(out.contains("split needs ≥160 columns"), "{out}");
+    }
+
+    /// Im Split wandert der Cursor paarweise; er steht auf der neuen Seite,
+    /// damit Rand und Begründung dieselbe Zeile meinen.
+    #[test]
+    fn split_moves_pair_by_pair_on_the_new_side() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        app.reduce(Action::Enter);
+        app.reduce(Action::Split);
+        render_at(&mut app, 200);
+        assert_eq!(app.changes.as_ref().unwrap().row, 1);
+        app.reduce(Action::Down);
+        assert_eq!(
+            app.changes.as_ref().unwrap().row,
+            3,
+            "pair (old();, sort_by_key)"
+        );
+        app.reduce(Action::Down);
+        assert_eq!(app.changes.as_ref().unwrap().row, 4);
+        app.reduce(Action::Up);
+        assert_eq!(app.changes.as_ref().unwrap().row, 3);
+        let out = render_at(&mut app, 200);
+        assert!(
+            out.contains("REPORTED ONLY"),
+            "the why column means the new side: {out}"
+        );
+    }
+
+    /// Ein Commit außerhalb der HEAD-Historie (über ARTIFACT geöffnet) bleibt
+    /// nach dem Neuladen stehen.
+    #[test]
+    fn reload_keeps_a_commit_opened_from_outside_the_history() {
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled().with_head(Some(commit('2'))), &repo, None);
+        app.stamp = Some("1".into());
+        app.changes = Some(ChangesState::new(
+            vec![commit('2'), commit('9')],
+            1,
+            Ok(set()),
+        ));
+        app.tab = Tab::Changes;
+        app.reload(
+            Ok(filled().with_head(Some(commit('2')))),
+            Some("2".into()),
+            now(),
+        );
+        assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('9')));
+    }
+
+    /// Breite Zeichen zählen doppelt: Die neue Seite des Splits bleibt
+    /// sichtbar, auch wenn die alte aus Vollbreit-Zeichen besteht.
+    #[test]
+    fn wide_characters_do_not_push_the_new_side_out_of_view() {
+        let (_dir, repo) = repo();
+        let mut wide = set();
+        wide.files[0].rows[2].text = "ｗ".repeat(200);
+        let mut app = App::new(filled(), &repo, None);
+        app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(wide)));
+        app.tab = Tab::Changes;
+        app.reduce(Action::Enter);
+        app.reduce(Action::Split);
+        let out = render_at(&mut app, 200);
+        assert!(
+            out.lines()
+                .any(|l| l.contains('ｗ') && l.contains("sort_by_key")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn w_toggles_the_why_column_from_the_file_list_too() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
+        app.reduce(Action::Why);
+        assert!(!app.changes.as_ref().unwrap().why);
+    }
+}

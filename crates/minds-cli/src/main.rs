@@ -171,8 +171,12 @@ Usage:
   minds inspect [<search> | <file>:<line>]
         How a change came to be, in the terminal: session list, a
         session's graph (intent → agent → effects → change → review) and
-        a line's why chain. Read-only. Live: reloads by itself when
-        HEAD or a ref under refs/minds/ changes; r reloads at once.
+        a line's why chain. Tabs (Tab, F1/F2): Sessions and Changes —
+        the diff of a commit as in git diff (unified, s for split) with
+        each added line's evidence class and, beside it, why the line
+        exists (session, step, what the agent said). Read-only. Live:
+        reloads by itself when HEAD or a ref under refs/minds/ changes;
+        r reloads at once.
         If stdout is not a console, the lines come tab-separated (for
         grep/fzf).
 

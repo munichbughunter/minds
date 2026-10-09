@@ -15,10 +15,12 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use minds_reader::model::evidence_sentence;
 
-use crate::app::{App, View};
+use crate::app::{App, Tab, View};
+use crate::changes::Focus;
 use crate::theme;
 
 pub mod activity;
+pub mod changes;
 pub mod evidence;
 pub mod graph;
 pub mod help;
@@ -54,6 +56,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     .areas(frame.area());
 
     header(frame, app, head);
+    if app.tab == Tab::Changes {
+        changes::draw(frame, app, body);
+        footer(frame, app, foot);
+        if app.help {
+            help::draw(frame, frame.area());
+        }
+        return;
+    }
     // Eine Seite = sichtbare Zeilen: Die Liste verliert an Rahmen und
     // Kopfzeile drei Zeilen, die übrigen Ebenen zwei. Die Höhe teilt sich
     // nicht, nur die Breite — die Teilung ändert daran nichts.
@@ -151,12 +161,27 @@ fn preview(frame: &mut Frame, app: &App, area: Rect) {
 
 fn header(frame: &mut Frame, app: &App, area: Rect) {
     let h = app.inspection.header();
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled("MINDS ", theme::title().fg(theme::AGENT)),
         Span::styled(h.repo.clone(), theme::title()),
         Span::raw(" · "),
         Span::raw(h.branch.clone().unwrap_or_else(|| "(detached)".into())),
-    ]);
+        Span::raw("   "),
+    ];
+    // Die Tabs: der aktive invertiert, mit F-Taste — Tab/Shift-Tab wechselt.
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        let label = format!(" F{} {} ", i + 1, tab.title());
+        title.push(if *tab == app.tab {
+            Span::styled(
+                label,
+                theme::title().add_modifier(ratatui::style::Modifier::REVERSED),
+            )
+        } else {
+            Span::styled(label, theme::dim())
+        });
+        title.push(Span::raw(" "));
+    }
+    let title = Line::from(title);
     let mut stats = vec![
         Span::raw(format!("{} Sessions", h.sessions)),
         Span::raw(" · "),
@@ -177,7 +202,53 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(vec![title, Line::from(stats)]), area);
 }
 
+/// Die Fußzeile des Changes-Tabs: der Commit und die Tasten des Fokus.
+fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = &app.changes else {
+        return;
+    };
+    let status = match &state.set {
+        Ok(set) => {
+            let (glyph, word, style) = theme::verdict(set.review.verdict);
+            let mut spans = vec![
+                Span::styled(
+                    set.commit.to_string()[..7].to_string(),
+                    Style::default().fg(theme::CHANGE),
+                ),
+                Span::raw(format!(" {}  ", set.subject.clone().unwrap_or_default())),
+                Span::styled(format!("{glyph} {word}"), style),
+            ];
+            if let Some(why) = &set.unassessed {
+                spans.push(Span::styled(
+                    format!("  · not assessed: {why}"),
+                    theme::dim(),
+                ));
+            }
+            Line::from(spans)
+        }
+        Err(err) => Line::from(Span::styled(err.clone(), theme::dim())),
+    };
+    let keys = match state.focus {
+        Focus::Files => {
+            "↑↓ file  Enter diff  [ ] commit  n next unexplained  s split  Tab sessions  ? help"
+        }
+        Focus::Diff => {
+            "↑↓ line  ] [ hunk  n N unexplained  s split  w why  Enter why chain  Esc files  ? help"
+        }
+    };
+    let keys = Line::from(vec![
+        freshness(app),
+        Span::raw("  "),
+        Span::styled(keys, theme::dim()),
+    ]);
+    frame.render_widget(Paragraph::new(vec![status, keys]), area);
+}
+
 fn footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.tab == Tab::Changes {
+        changes_footer(frame, app, area);
+        return;
+    }
     // Erste Zeile: was der Fokus bedeutet — der Evidenz-Satz zur gewählten
     // Karte bzw. die Lücken der Kette. Zweite Zeile: die Tasten.
     let status = match app.top() {
