@@ -39,7 +39,7 @@ pub(super) const DETAIL_CAP: usize = 20;
 pub(super) const KIND_WIDTH: usize = 15;
 
 /// Die Reconciliation eines Commits, fertig zum Drucken.
-pub(super) struct Artifact {
+pub(crate) struct Artifact {
     recon: Reconciliation,
     /// Änderungen ohne Blob-Inhalt, die kein Claim erklären kann —
     /// Submodul-Zeiger und Modus-Wechsel, unentschärft.
@@ -68,7 +68,7 @@ struct Detail {
 /// offline). `Err(grund)`, wenn Objekte in diesem Klon fehlen — dann ist der
 /// Abgleich nicht bestimmbar, und das ist ein Zustand, kein operativer
 /// Fehler.
-pub(super) fn assess(
+pub(crate) fn assess(
     ctx: &Context,
     commit: CommitId,
     sessions: &[&Session],
@@ -312,7 +312,11 @@ mod tests {
     fn lines(spec: &[(u32, ReconClass)]) -> LineLevel {
         LineLevel::Available(
             spec.iter()
-                .map(|&(line, class)| LineRecon { line, class })
+                .map(|&(line, class)| LineRecon {
+                    line,
+                    class,
+                    source: None,
+                })
                 .collect(),
         )
     }

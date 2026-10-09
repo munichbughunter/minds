@@ -29,12 +29,14 @@ use minds_git::Repo;
 use minds_reader::Inspection;
 
 mod app;
+mod changes;
 mod filter;
 mod input;
 mod layout;
 mod pipe;
 mod term;
 mod theme;
+mod verify;
 mod view;
 
 pub use layout::Zoom;
@@ -127,6 +129,62 @@ pub trait Source {
     /// gerade nicht bestimmbar — dann wird nicht von selbst neu geladen
     /// (`r` lädt trotzdem).
     fn stamp(&self) -> Option<Stamp>;
+
+    /// Die signaturabhängigen Teile des Urteils über `commit` — Assurance
+    /// je Session, Intent-Lage, Scope —, wie `minds verify` sie rechnet
+    /// (gegen die vertrauenswürdigen Signer). `Err`: nicht bestimmbar, mit
+    /// Grund — der Verify-Tab sagt dann nie VERIFIED.
+    fn verify(&self, _commit: minds_git::CommitId) -> Result<CommitVerify, String> {
+        Err("not available".into())
+    }
+}
+
+/// Die Assurance einer Session, wie `minds verify` sie ausspricht.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionAssurance {
+    /// Die Session.
+    pub session: minds_core::SessionId,
+    /// Die erreichte Stufe.
+    pub level: minds_reader::assurance::Assurance,
+    /// Warum nicht höher — der erste Grund, entschärft.
+    pub reason: Option<String>,
+    /// Die Intent-Lage (gebunden, verkettet, Signatur).
+    pub intent: minds_reader::assurance::IntentState,
+    /// Das Seal-Material ist verändert (auch eine ungültige
+    /// Witness-Signatur).
+    pub tampered: bool,
+}
+
+/// Das Urteil von `minds verify` — sein Exit-Code, nicht nachgebaut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyVerdict {
+    /// Exit 0.
+    Verified,
+    /// Exit 2.
+    Incomplete,
+    /// Exit 1.
+    Tampered,
+    /// Exit 3.
+    NotVerifiable,
+}
+
+/// Was `minds verify` über einen Commit sagt, soweit es Signaturen und den
+/// Store braucht.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitVerify {
+    /// Das Urteil, von `minds verify` selbst — `Err` mit Grund, wenn es sich
+    /// nicht bestimmen ließ (Exit 4, kein Binary).
+    pub verdict: Result<VerifyVerdict, String>,
+    /// Je verknüpfter Session.
+    pub sessions: Vec<SessionAssurance>,
+    /// Die geänderten Pfade außerhalb des erklärten Bereichs, entschärft —
+    /// `None`, wenn kein Bereich geprüft werden konnte (siehe `scope_note`).
+    pub out_of_scope: Option<Vec<String>>,
+    /// Dieselben Pfade unentschärft — nur zum Navigieren (Datei im Diff
+    /// wählen), nie zur Anzeige.
+    pub out_of_scope_paths: Vec<String>,
+    /// Warum kein Bereich geprüft wurde (kein Intent gebunden, …).
+    pub scope_note: Option<String>,
 }
 
 /// Startet die Oberfläche — oder, wenn stdout kein Terminal ist, schreibt die

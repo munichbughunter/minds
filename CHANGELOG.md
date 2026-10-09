@@ -19,6 +19,34 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Verify tab in `minds inspect`.** The verdict of `minds verify` for a
+  commit at a glance instead of a wall of text: verdict, weakest assurance
+  level and intent first; then the linked sessions, Integrity, Coverage, the
+  Artifact as a bar with the count per evidence class, Scope (paths outside
+  the declared scope) and the short Not proven list. Repository-only facts
+  show at once; level, intent signature and scope are computed as
+  `minds verify` does (against `~/.ssh/allowed_signers`) and follow a moment
+  later. Enter on a session, the Artifact or the Scope jumps to the graph or
+  the diff. The verdict is the exit code of `minds verify <commit>`, run
+  from the `minds` binary pinned at start — never rebuilt; if that is not
+  possible (binary inside the checkout or replaced, timeout) the tab shows
+  `NOT CHECKED` with the reason. Tabs are now Sessions, Verify, Changes
+  (F1–F3).
+- **Changes tab in `minds inspect`.** Tabs at the top (Tab/Shift-Tab, F1/F2):
+  Sessions and Changes. Changes shows a commit (HEAD first, `[`/`]` to page
+  in the file list) as a diff in the familiar form — unified with hunk
+  headers, old and new line numbers, `+` on green and `-` on red, or side by
+  side with `s`. Every added line carries its evidence class in the margin
+  (● ◍ ◇, and a bold, inverted ◦ for a line no session wrote); `n`/`N` jump
+  between unexplained lines across files, `]`/`[` between hunks. Beside the
+  diff, "Why this line?" names the session, step and tool call that
+  introduced the line and what the agent said at that step; Enter opens the
+  line's why chain. Evidence → ARTIFACT → Enter opens the diff of that
+  commit. The diff is computed in-process with the same algorithm as the
+  reconciliation, so diff and classes always mean the same lines; the
+  reconciliation now records, per line, the tool call that introduced it
+  (`LineRecon::source`).
+
 - **Live `minds inspect`.** The TUI reloads by itself when HEAD or a ref
   under `refs/minds/` changes (checked about once a second, in the code
   repository and in a child-repo store), and on `r`. Cursor, search and the

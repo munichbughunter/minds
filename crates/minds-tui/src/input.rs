@@ -45,6 +45,17 @@ pub enum Action {
     SearchCommit,
     /// Neu laden — sofort, ohne auf den Fingerabdruck zu warten.
     Reload,
+    /// Zum nächsten Tab (`true`) oder vorigen.
+    CycleTab(bool),
+    /// Direkt zu einem Tab (F1, F2, …), nullbasiert.
+    TabTo(u8),
+    /// `]` (`true`) oder `[` — im Diff der nächste/vorige Hunk, in der
+    /// Dateiliste der nächste/vorige Commit.
+    Bracket(bool),
+    /// `n` (`true`) oder `N` — die nächste/vorige unerklärte Zeile.
+    Unexplained(bool),
+    /// `s` — Unified ↔ Split.
+    Split,
     /// Hilfe ein/aus.
     Help,
     /// Beenden.
@@ -87,6 +98,14 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Char('2') => Action::Zoom(2),
         KeyCode::Char('3') => Action::Zoom(3),
         KeyCode::Char('r') => Action::Reload,
+        KeyCode::Tab => Action::CycleTab(true),
+        KeyCode::BackTab => Action::CycleTab(false),
+        KeyCode::F(n @ 1..=9) => Action::TabTo(n - 1),
+        KeyCode::Char(']') => Action::Bracket(true),
+        KeyCode::Char('[') => Action::Bracket(false),
+        KeyCode::Char('n') => Action::Unexplained(true),
+        KeyCode::Char('N') => Action::Unexplained(false),
+        KeyCode::Char('s') => Action::Split,
         KeyCode::Char('/') => Action::SearchStart,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
@@ -125,6 +144,11 @@ mod tests {
             ('?', Action::Help),
             ('q', Action::Quit),
             ('r', Action::Reload),
+            (']', Action::Bracket(true)),
+            ('[', Action::Bracket(false)),
+            ('n', Action::Unexplained(true)),
+            ('N', Action::Unexplained(false)),
+            ('s', Action::Split),
             ('l', Action::Enter),
             ('h', Action::Back),
         ] {

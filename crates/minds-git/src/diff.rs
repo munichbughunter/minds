@@ -44,6 +44,161 @@ pub fn removes_lines(before: &[u8], after: &[u8]) -> bool {
         .any(|hunk| hunk.before.len() > hunk.after.len())
 }
 
+/// Ein Hunk: der betroffene Zeilenbereich vorher und nachher, nullbasiert.
+type Hunk = (std::ops::Range<u32>, std::ops::Range<u32>);
+
+/// Die Hunks zwischen `before` und `after` und die Zeilenzahlen beider
+/// Seiten — derselbe Algorithmus wie [`added_line_ranges`], damit
+/// Diff-Ansicht und Abgleich dieselben Zeilen meinen.
+fn hunks_of(before: &[u8], after: &[u8]) -> (Vec<Hunk>, u32, u32) {
+    use gix::diff::blob::{Algorithm, InternedInput, diff_with_slider_heuristics};
+    let input = InternedInput::new(before, after);
+    let hunks = diff_with_slider_heuristics(Algorithm::Myers, &input)
+        .hunks()
+        .map(|hunk| (hunk.before, hunk.after))
+        .collect();
+    (hunks, input.before.len() as u32, input.after.len() as u32)
+}
+
+/// Rein: je Zeile von `after` (nullbasiert) die Zeile von `before`, aus der
+/// sie unverändert stammt — `None` für hinzugefügte oder ersetzte Zeilen.
+/// Damit lässt sich eine Eigenschaft je Zeile (etwa: welcher Schreibvorgang
+/// sie einführte) über eine Änderung hinweg weitertragen.
+pub fn line_alignment(before: &[u8], after: &[u8]) -> Vec<Option<u32>> {
+    let (hunks, _, after_len) = hunks_of(before, after);
+    let mut out = Vec::with_capacity(after_len as usize);
+    let (mut b, mut a) = (0u32, 0u32);
+    for (hunk_before, hunk_after) in hunks {
+        while a < hunk_after.start {
+            out.push(Some(b));
+            a += 1;
+            b += 1;
+        }
+        out.extend(hunk_after.clone().map(|_| None));
+        a = hunk_after.end;
+        b = hunk_before.end;
+    }
+    while a < after_len {
+        out.push(Some(b));
+        a += 1;
+        b += 1;
+    }
+    out
+}
+
+/// Die Zeilen eines Blobs, wie der Diff sie zählt: getrennt nach `\n`, der
+/// Umbruch (und ein `\r` davor) gehört nicht zum Text; eine letzte Zeile
+/// ohne Umbruch zählt mit.
+fn text_lines(bytes: &[u8]) -> Vec<String> {
+    bytes
+        .split_inclusive(|b| *b == b'\n')
+        .map(|line| {
+            let line = line.strip_suffix(b"\n").unwrap_or(line);
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            String::from_utf8_lossy(line).into_owned()
+        })
+        .collect()
+}
+
+/// Rein, ohne Unterprozess: der Unified-Diff von `before` nach `after` mit
+/// `context` Kontextzeilen je Seite — dieselbe Form wie `git diff`
+/// (Hunk-Kopf `@@ -a,b +c,d @@`, Kontext, `-`, `+`), derselbe Algorithmus
+/// wie [`added_line_ranges`]. Liegen zwei Hunks höchstens `2 · context`
+/// Zeilen auseinander, verschmelzen sie wie bei Git. Zeilennummern sind
+/// einsbasiert. Texte sind roh (Identität, nicht Anzeige): Wer sie zeigt,
+/// entschärft sie. Aufrufer begrenzen die Größe der Blobs.
+pub fn unified_diff(before: &[u8], after: &[u8], context: u32) -> Vec<DiffLine> {
+    let (hunks, before_len, after_len) = hunks_of(before, after);
+    let old = text_lines(before);
+    let new = text_lines(after);
+    let text = |lines: &[String], i: u32| lines.get(i as usize).cloned().unwrap_or_default();
+    // Gruppen von Hunks, deren Kontexte sich berühren.
+    let mut groups: Vec<Vec<Hunk>> = Vec::new();
+    for hunk in hunks {
+        match groups.last_mut() {
+            Some(group)
+                if hunk
+                    .0
+                    .start
+                    .saturating_sub(group.last().map_or(0, |h| h.0.end))
+                    <= 2 * context =>
+            {
+                group.push(hunk)
+            }
+            _ => groups.push(vec![hunk]),
+        }
+    }
+    let mut out = Vec::new();
+    for group in groups {
+        let (first, last) = (&group[0], &group[group.len() - 1]);
+        let lead = first.0.start.min(context);
+        let (start_b, start_a) = (first.0.start - lead, first.1.start - lead);
+        let trail = (before_len - last.0.end)
+            .min(after_len - last.1.end)
+            .min(context);
+        let (end_b, end_a) = (last.0.end + trail, last.1.end + trail);
+        // Wie Git: Bei leerer Seite steht die Position davor, eine Länge von
+        // 1 entfällt.
+        let range = |start: u32, len: u32| match len {
+            0 => format!("{start},0"),
+            1 => format!("{}", start + 1),
+            _ => format!("{},{len}", start + 1),
+        };
+        out.push(DiffLine {
+            kind: DiffKind::Hunk,
+            old: None,
+            new: None,
+            text: format!(
+                "@@ -{} +{} @@",
+                range(start_b, end_b - start_b),
+                range(start_a, end_a - start_a)
+            ),
+        });
+        let (mut b, mut a) = (start_b, start_a);
+        for (hunk_before, hunk_after) in &group {
+            while b < hunk_before.start {
+                out.push(DiffLine {
+                    kind: DiffKind::Context,
+                    old: Some(b + 1),
+                    new: Some(a + 1),
+                    text: text(&old, b),
+                });
+                b += 1;
+                a += 1;
+            }
+            for i in hunk_before.clone() {
+                out.push(DiffLine {
+                    kind: DiffKind::Removed,
+                    old: Some(i + 1),
+                    new: None,
+                    text: text(&old, i),
+                });
+            }
+            for i in hunk_after.clone() {
+                out.push(DiffLine {
+                    kind: DiffKind::Added,
+                    old: None,
+                    new: Some(i + 1),
+                    text: text(&new, i),
+                });
+            }
+            b = hunk_before.end;
+            a = hunk_after.end;
+        }
+        while b < end_b {
+            out.push(DiffLine {
+                kind: DiffKind::Context,
+                old: Some(b + 1),
+                new: Some(a + 1),
+                text: text(&old, b),
+            });
+            b += 1;
+            a += 1;
+        }
+    }
+    out
+}
+
 /// Wie eine Diff-Zeile zu lesen ist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffKind {
@@ -906,6 +1061,188 @@ mod tests {
             "garbage\0".to_string(),
         ] {
             assert!(parse_raw(broken.as_bytes()).is_err(), "{broken:?}");
+        }
+    }
+
+    mod unified_tests {
+        use crate::diff::{DiffKind, DiffLine, line_alignment, unified_diff};
+        use crate::fixture::TempRepo;
+
+        /// Die Diff-Zeilen in Patch-Schreibweise — zum Vergleich mit `git diff`.
+        fn patch(lines: &[DiffLine]) -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| match l.kind {
+                    DiffKind::Hunk => l.text.clone(),
+                    DiffKind::Context => format!(" {}", l.text),
+                    DiffKind::Added => format!("+{}", l.text),
+                    DiffKind::Removed => format!("-{}", l.text),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn alignment_keeps_unchanged_lines_and_marks_new_ones() {
+            let before = b"a\nb\nc\nd\n";
+            let after = b"a\nX\nc\nd\ne\n";
+            assert_eq!(
+                line_alignment(before, after),
+                vec![Some(0), None, Some(2), Some(3), None]
+            );
+            assert_eq!(line_alignment(b"", b"x\ny\n"), vec![None, None]);
+            assert_eq!(line_alignment(b"x\n", b""), Vec::<Option<u32>>::new());
+        }
+
+        #[test]
+        fn an_addition_is_one_hunk_without_context() {
+            let lines = unified_diff(b"", b"one\ntwo\n", 3);
+            assert_eq!(patch(&lines), ["@@ -0,0 +1,2 @@", "+one", "+two"]);
+            assert_eq!((lines[1].old, lines[1].new), (None, Some(1)));
+            assert_eq!(lines[2].new, Some(2));
+        }
+
+        #[test]
+        fn identical_content_has_no_hunk() {
+            assert!(unified_diff(b"a\nb\n", b"a\nb\n", 3).is_empty());
+        }
+
+        /// Gegen das Original: dieselben Hunks, Köpfe, Kontexte und Zeilen wie
+        /// `git diff -U3` mit Myers und Einrückungs-Heuristik — zwei nahe
+        /// Änderungen verschmelzen zu einem Hunk, eine ferne bekommt einen
+        /// eigenen.
+        #[test]
+        fn the_patch_matches_git_diff() {
+            let before: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+            let mut after: Vec<String> = (1..=40).map(|i| format!("line {i}")).collect();
+            after[4] = "changed 5".into();
+            after[9] = "changed 10".into();
+            after.insert(30, "inserted".into());
+            after.remove(36);
+            let after: String = after.iter().map(|l| format!("{l}\n")).collect();
+
+            let fixture = TempRepo::init();
+            fixture.write_file("a.txt", &before);
+            fixture.commit("before");
+            fixture.write_file("a.txt", &after);
+            fixture.commit("after");
+            let git = fixture.git(&[
+                "diff",
+                "--no-color",
+                "-U3",
+                "--diff-algorithm=myers",
+                "--indent-heuristic",
+                "HEAD~1",
+                "HEAD",
+                "--",
+                "a.txt",
+            ]);
+            let expected: Vec<String> = git
+                .lines()
+                .skip_while(|l| !l.starts_with("@@"))
+                .map(|l| match l.find(" @@") {
+                    // Git hängt dem Kopf Funktionskontext an; der zählt nicht.
+                    Some(end) if l.starts_with("@@") => l[..end + 3].to_string(),
+                    _ => l.to_string(),
+                })
+                .collect();
+            assert_eq!(
+                patch(&unified_diff(before.as_bytes(), after.as_bytes(), 3)),
+                expected
+            );
+        }
+
+        /// `git diff -U3` zwischen zwei Fassungen einer Datei, ohne
+        /// Funktionskontext im Hunk-Kopf und ohne die Zeile
+        /// `\ No newline at end of file` (die Ansicht kennt sie nicht).
+        fn git_patch(before: &str, after: &str) -> Vec<String> {
+            let fixture = TempRepo::init();
+            fixture.write_file("a.txt", before);
+            fixture.commit("before");
+            fixture.write_file("a.txt", after);
+            fixture.commit("after");
+            fixture
+                .git(&[
+                    "diff",
+                    "--no-color",
+                    "-U3",
+                    "--diff-algorithm=myers",
+                    "--indent-heuristic",
+                    "HEAD~1",
+                    "HEAD",
+                    "--",
+                    "a.txt",
+                ])
+                .lines()
+                .skip_while(|l| !l.starts_with("@@"))
+                .filter(|l| !l.starts_with('\\'))
+                .map(|l| match l.find(" @@") {
+                    Some(end) if l.starts_with("@@") => l[..end + 3].to_string(),
+                    _ => l.to_string(),
+                })
+                .collect()
+        }
+
+        fn numbered(range: std::ops::RangeInclusive<u32>) -> Vec<String> {
+            range.map(|i| format!("line {i}")).collect()
+        }
+
+        fn joined(lines: &[String]) -> String {
+            lines.iter().map(|l| format!("{l}\n")).collect()
+        }
+
+        /// Die Ränder: Änderung in den ersten und letzten Zeilen (weniger
+        /// Kontext als 3), reine Löschung, geleerte Datei, Hunk-Abstand 6
+        /// (verschmilzt) gegen 7 (getrennt), fehlender Umbruch auf einer Seite.
+        #[test]
+        fn edge_cases_match_git_diff() {
+            let base = numbered(1..=30);
+            let mut cases: Vec<(String, String)> = Vec::new();
+            let mut first = base.clone();
+            first[0] = "changed 1".into();
+            let last_index = first.len() - 1;
+            first[last_index] = "changed 30".into();
+            cases.push((joined(&base), joined(&first)));
+            let mut removed = base.clone();
+            removed.drain(10..13);
+            cases.push((joined(&base), joined(&removed)));
+            cases.push((joined(&base), String::new()));
+            for gap in [6usize, 7] {
+                let mut near = base.clone();
+                near[5] = "changed A".into();
+                near[5 + gap + 1] = "changed B".into();
+                cases.push((joined(&base), joined(&near)));
+            }
+            cases.push(("a\nb\n".into(), "a\nb".into()));
+            cases.push(("a\nb".into(), "a\nc".into()));
+            for (before, after) in cases {
+                assert_eq!(
+                    patch(&unified_diff(before.as_bytes(), after.as_bytes(), 3)),
+                    git_patch(&before, &after),
+                    "before {before:?} after {after:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn line_numbers_follow_both_sides() {
+            let lines = unified_diff(b"a\nb\nc\n", b"a\nB\nc\n", 3);
+            let removed = lines.iter().find(|l| l.kind == DiffKind::Removed).unwrap();
+            let added = lines.iter().find(|l| l.kind == DiffKind::Added).unwrap();
+            assert_eq!((removed.old, removed.new), (Some(2), None));
+            assert_eq!((added.old, added.new), (None, Some(2)));
+            let last = lines.last().unwrap();
+            assert_eq!(
+                (last.kind, last.old, last.new),
+                (DiffKind::Context, Some(3), Some(3))
+            );
+        }
+
+        #[test]
+        fn crlf_and_a_missing_final_newline_do_not_leak_into_the_text() {
+            assert_eq!(
+                patch(&unified_diff(b"", b"a\r\nb", 3)),
+                ["@@ -0,0 +1,2 @@", "+a", "+b"]
+            );
         }
     }
 }

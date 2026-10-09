@@ -18,13 +18,16 @@ use minds_core::SessionId;
 use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::artifact::CommitArtifact;
+use minds_reader::changes::ChangeSet;
 use minds_reader::graph::{NodeKind, SessionGraph};
 use minds_reader::model::{EvidenceReport, LinkEvidence, SessionCard, WhyChain, WhyStep};
 
+use crate::changes::{ChangesState, Focus};
 use crate::filter;
 use crate::input::{self, Action};
 use crate::layout::{self, Row, Zoom};
 use crate::term::Guard;
+use crate::verify::VerifyState;
 use crate::view;
 use crate::{Source, Stamp};
 
@@ -34,6 +37,9 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// Wie oft die Quelle nach ihrem Fingerabdruck gefragt wird.
 const CHECK: Duration = Duration::from_secs(1);
+
+/// Wie oft der Verify-Tab nach einem Neuladen von selbst neu prüft.
+const VERIFY_EVERY: Duration = Duration::from_secs(5);
 
 /// Wie oft `r` höchstens lädt, auch wenn die Taste gehalten wird.
 const REPEAT: Duration = Duration::from_millis(250);
@@ -109,6 +115,35 @@ pub enum View {
 /// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge.
 pub const EVIDENCE_SECTIONS: usize = 7;
 
+/// Die Sektion ARTIFACT im Evidence-Report — Enter springt von dort in den
+/// Changes-Tab.
+pub const ARTIFACT_SECTION: usize = 2;
+
+/// Die Tabs der Oberfläche, in Anzeige-Reihenfolge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// Die Sessions: Liste, Graph, Why, Evidence.
+    Sessions,
+    /// Das Urteil über einen Commit auf einen Blick.
+    Verify,
+    /// Die Änderungen eines Commits als Diff.
+    Changes,
+}
+
+impl Tab {
+    /// Alle Tabs, in Reihenfolge.
+    pub const ALL: [Tab; 3] = [Tab::Sessions, Tab::Verify, Tab::Changes];
+
+    /// Der Name im Kopf.
+    pub fn title(self) -> &'static str {
+        match self {
+            Tab::Sessions => "Sessions",
+            Tab::Verify => "Verify",
+            Tab::Changes => "Changes",
+        }
+    }
+}
+
 /// Der Zustand.
 pub struct App<'a> {
     /// Das Lese-Modell.
@@ -135,6 +170,8 @@ pub struct App<'a> {
     pub quit: bool,
     /// Zeilen je Seite — setzt die Zeichenroutine.
     pub page: usize,
+    /// Die Breite des Terminals beim letzten Zeichnen — ob Split passt.
+    pub width: u16,
     /// Der Fingerabdruck des geladenen Stands, wie die Quelle ihn kennt.
     pub stamp: Option<Stamp>,
     /// Ob `r` ein Neuladen verlangt hat — `run` führt es aus.
@@ -157,6 +194,12 @@ pub struct App<'a> {
     /// Was beim letzten Neuladen geschlossen wurde und warum — etwa eine
     /// Zeilen-Kette, deren Datei gerade fehlt.
     pub closed: Option<String>,
+    /// Der sichtbare Tab.
+    pub tab: Tab,
+    /// Der Changes-Tab — erst beim ersten Öffnen geladen (er liest Blobs).
+    pub changes: Option<ChangesState>,
+    /// Der Verify-Tab — erst beim ersten Öffnen gebaut.
+    pub verify: Option<VerifyState>,
 }
 
 impl<'a> App<'a> {
@@ -176,6 +219,7 @@ impl<'a> App<'a> {
             help: false,
             quit: false,
             page: 20,
+            width: 0,
             stamp: None,
             reload_requested: false,
             full_next: false,
@@ -184,6 +228,9 @@ impl<'a> App<'a> {
             failed_stamp: None,
             live: true,
             closed: None,
+            tab: Tab::Sessions,
+            changes: None,
+            verify: None,
         };
         app.refilter();
         app
@@ -252,10 +299,377 @@ impl<'a> App<'a> {
                 }
             }
         }
+        if self.verify.is_some() {
+            self.refresh_verify(&before, full);
+        }
+        if self.changes.is_some() {
+            self.refresh_changes(&before, full);
+        }
         self.stamp = stamp;
         self.loaded_at = clock(now);
         self.reload_error = None;
         self.failed_stamp = None;
+    }
+
+    /// Die Änderungen von `commit`, fertig für den Tab — ein Lesefehler wird
+    /// zur Meldung (fail-soft).
+    fn load_changes(&self, commit: CommitId) -> Result<ChangeSet, String> {
+        self.inspection
+            .changes(self.repo, commit)
+            .map_err(|err| minds_reader::sanitize(&err.to_string()))
+    }
+
+    /// Öffnet den Changes-Tab — auf `commit`, sonst auf HEAD.
+    pub fn open_changes(&mut self, commit: Option<CommitId>) {
+        let mut commits = self.inspection.change_commits();
+        let at = match commit {
+            Some(commit) => commits
+                .iter()
+                .position(|c| *c == commit)
+                .unwrap_or_else(|| {
+                    commits.push(commit);
+                    commits.len() - 1
+                }),
+            None => 0,
+        };
+        let set = match commits.get(at) {
+            Some(commit) => self.load_changes(*commit),
+            None => Err("no commit yet".into()),
+        };
+        self.changes = Some(ChangesState::new(commits, at, set));
+        self.tab = Tab::Changes;
+    }
+
+    /// Öffnet den Verify-Tab — auf `commit`, sonst auf HEAD. Der Reader-Teil
+    /// steht sofort; den signaturabhängigen holt `run` über die Quelle.
+    pub fn open_verify(&mut self, commit: Option<CommitId>) {
+        let mut commits = self.inspection.change_commits();
+        let at = match commit {
+            Some(commit) => commits
+                .iter()
+                .position(|c| *c == commit)
+                .unwrap_or_else(|| {
+                    commits.push(commit);
+                    commits.len() - 1
+                }),
+            None => 0,
+        };
+        self.verify = Some(VerifyState::build(&self.inspection, self.repo, commits, at));
+        self.tab = Tab::Verify;
+    }
+
+    /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
+    /// der Quelle; `reduce` merkt sich nur den Bedarf.
+    /// Nur bei sichtbarem Tab: Ein verdeckter Tab startet kein ssh-keygen.
+    pub fn fill_verify(&mut self, source: &dyn Source) {
+        if self.tab != Tab::Verify {
+            return;
+        }
+        if let Some(state) = self.verify.as_mut()
+            && state.pending
+        {
+            state.pending = false;
+            state.cli = state.commit().map(|commit| source.verify(commit));
+        }
+    }
+
+    /// Der Verify-Tab nach dem Neuladen: derselbe Commit, dieselbe Zeile.
+    /// Der signaturabhängige Teil wird **immer** neu geprüft: Er hängt an
+    /// Material, das die Session-Ids nicht abbilden (eine ausgetauschte
+    /// `seal.sig`, neue Seals, der Intent-Anker) — ein übernommenes Urteil
+    /// könnte VERIFIED zeigen, wo `verify` TAMPERED sagt. Geprüft wird erst,
+    /// wenn der Tab sichtbar ist.
+    fn refresh_verify(&mut self, before: &Inspection, full: bool) {
+        let Some(state) = self.verify.take() else {
+            return;
+        };
+        let mut commits = self.inspection.change_commits();
+        let kept = state.commit().map(|commit| {
+            commits
+                .iter()
+                .position(|c| *c == commit)
+                .unwrap_or_else(|| {
+                    commits.push(commit);
+                    commits.len() - 1
+                })
+        });
+        // Der Abgleich (git diff-tree) nur neu, wenn sich Commit oder
+        // Claimants geändert haben oder das Neuladen voll ist — wie im
+        // Changes-Tab: Wer nur Refs schreibt, startet kein `git`.
+        let reuse = match state.commit() {
+            Some(commit)
+                if !full
+                    && commit_inputs(before, commit) == commit_inputs(&self.inspection, commit) =>
+            {
+                Some(state.artifact.clone())
+            }
+            _ => None,
+        };
+        let mut next = VerifyState::build_with(
+            &self.inspection,
+            self.repo,
+            commits,
+            kept.unwrap_or(0),
+            reuse,
+        );
+        // Von selbst gedrosselt (`VERIFY_EVERY`) — außer `r` oder eine noch
+        // ausstehende Prüfung, die der Nutzer verlangt hatte.
+        next.urgent = full || (state.pending && state.urgent);
+        next.cursor = state.cursor.min(next.rows().saturating_sub(1));
+        self.verify = Some(next);
+    }
+
+    /// Die Tasten im Verify-Tab.
+    fn reduce_verify(&mut self, action: Action) {
+        let Some(state) = self.verify.as_mut() else {
+            return;
+        };
+        let last = state.rows().saturating_sub(1);
+        match action {
+            Action::Up => state.cursor = state.cursor.saturating_sub(1),
+            Action::Down => state.cursor = (state.cursor + 1).min(last),
+            Action::Home | Action::PageUp => state.cursor = 0,
+            Action::End | Action::PageDown => state.cursor = last,
+            Action::Bracket(forward) => {
+                let at = if forward {
+                    (state.at + 1).min(state.commits.len().saturating_sub(1))
+                } else {
+                    state.at.saturating_sub(1)
+                };
+                if at != state.at {
+                    let commits = state.commits.clone();
+                    self.verify =
+                        Some(VerifyState::build(&self.inspection, self.repo, commits, at));
+                }
+            }
+            Action::Back => self.tab = Tab::Sessions,
+            Action::Enter => {
+                let cursor = state.cursor;
+                let commit = state.commit();
+                if cursor < state.sessions.len() {
+                    // Eine Session: ihr Graph im Sessions-Tab.
+                    let id = state.sessions[cursor].id;
+                    if self.inspection.graph(id).is_some() {
+                        self.tab = Tab::Sessions;
+                        self.query.clear();
+                        self.refilter_keeping(Some(id));
+                        self.push_graph(id);
+                    } else {
+                        // Nicht still in eine leere Liste springen.
+                        self.closed = Some("that session is not readable".into());
+                    }
+                } else if cursor == state.artifact_row() {
+                    self.open_changes(commit);
+                } else {
+                    // Scope: die erste Datei außerhalb des Bereichs im Diff.
+                    // Der rohe Pfad (nur zum Wählen) — der entschärfte träfe
+                    // eine Datei mit Steuerzeichen im Namen nicht.
+                    let paths: Vec<String> = state
+                        .checked()
+                        .map(|c| c.out_of_scope_paths.clone())
+                        .unwrap_or_default();
+                    self.open_changes(commit);
+                    // Bevorzugt eine Datei, die im Commit liegt — die Liste
+                    // nennt auch nur Geschriebenes (und wieder Gelöschtes).
+                    if let Some(changes) = self.changes.as_mut()
+                        && !paths.iter().any(|path| changes.select_path(path))
+                    {
+                        changes.file = 0;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Zeigt `tab`; Changes und Verify laden beim ersten Mal.
+    fn show_tab(&mut self, tab: Tab) {
+        if tab == Tab::Changes && self.changes.is_none() {
+            self.open_changes(None);
+        } else if tab == Tab::Verify && self.verify.is_none() {
+            self.open_verify(None);
+        } else {
+            // Zurück im Verify-Tab: Eine ausstehende Prüfung ist jetzt vom
+            // Nutzer verlangt, nicht gedrosselt.
+            if tab == Tab::Verify
+                && let Some(state) = self.verify.as_mut()
+                && state.pending
+            {
+                state.urgent = true;
+            }
+            self.tab = tab;
+        }
+    }
+
+    /// Der Changes-Tab nach dem Neuladen: derselbe Commit, dieselbe Datei,
+    /// dieselbe Stelle, wenn es sie noch gibt. Neu gelesen wird der Commit
+    /// nur, wenn sich seine Eingaben geändert haben (Sessions, Trailer) oder
+    /// das Neuladen voll ist — sonst bestimmte, wer Refs schreibt, wie oft
+    /// Blobs gelesen werden. Der Review-Stand wird immer aufgefrischt.
+    fn refresh_changes(&mut self, before: &Inspection, full: bool) {
+        let Some(state) = self.changes.take() else {
+            return;
+        };
+        let mut commits = self.inspection.change_commits();
+        // Ein Commit außerhalb der HEAD-Historie (über ARTIFACT geöffnet,
+        // etwa ein durch Amend ersetzter) bleibt, wie `open_changes` ihn
+        // angehängt hat — das Neuladen springt nicht still auf HEAD.
+        let kept = state.commit().map(|commit| {
+            commits
+                .iter()
+                .position(|c| *c == commit)
+                .unwrap_or_else(|| {
+                    commits.push(commit);
+                    commits.len() - 1
+                })
+        });
+        let at = kept.unwrap_or(0);
+        let commit = commits.get(at).copied();
+        // Ein früherer Lesefehler wird erneut versucht, nicht weitergereicht.
+        let unchanged = kept.is_some()
+            && !full
+            && state.set.is_ok()
+            && commit
+                .is_some_and(|c| commit_inputs(before, c) == commit_inputs(&self.inspection, c));
+        // Was nach dem Bau noch gebraucht wird — dann darf `set` umziehen,
+        // statt bis zu 200 000 Zeilen zu kopieren.
+        let path = state.current().map(|f| f.identity.clone());
+        let (split, why, focus, row) = (state.split, state.why, state.focus, state.row);
+        let set = match commit {
+            Some(c) if unchanged => state.set.map(|mut set| {
+                set.review = self.inspection.review_state_of_commit(c);
+                set
+            }),
+            Some(c) => self.load_changes(c),
+            None => Err("no commit yet".into()),
+        };
+        let mut next = ChangesState::new(commits, at, set);
+        next.split = split;
+        next.why = why;
+        // Stelle und Fokus nur, wenn es die Datei noch gibt — sonst gehörte
+        // die alte Zeile zu einer anderen Datei.
+        if kept.is_some()
+            && let Some(path) = path
+            && next.select_path(&path)
+        {
+            next.focus = focus;
+            next.row = row;
+            next.move_row(0);
+        }
+        self.changes = Some(next);
+    }
+
+    /// Ein Commit weiter (`forward`: älter) oder zurück.
+    fn step_commit(&mut self, forward: bool) {
+        let Some(state) = &self.changes else {
+            return;
+        };
+        let at = if forward {
+            (state.at + 1).min(state.commits.len().saturating_sub(1))
+        } else {
+            state.at.saturating_sub(1)
+        };
+        if at == state.at {
+            return;
+        }
+        let commit = state.commits[at];
+        let set = self.load_changes(commit);
+        let (split, why) = (state.split, state.why);
+        let mut next = ChangesState::new(state.commits.clone(), at, set);
+        next.split = split;
+        next.why = why;
+        self.changes = Some(next);
+    }
+
+    /// Die Tasten im Changes-Tab.
+    fn reduce_changes(&mut self, action: Action) {
+        let page = self.page.max(1) as isize;
+        let split_shown = self.width >= crate::view::changes::SPLIT_MIN;
+        let Some(state) = self.changes.as_mut() else {
+            return;
+        };
+        match (state.focus, action) {
+            (_, Action::Split) => state.split = !state.split,
+            (_, Action::Why) => state.why = !state.why,
+            (_, Action::Unexplained(forward)) => {
+                if state.jump_unexplained(forward) {
+                    state.focus = Focus::Diff;
+                }
+            }
+            (Focus::Files, Action::Up) => state.move_file(false),
+            (Focus::Files, Action::Down) => state.move_file(true),
+            (Focus::Files, Action::Home | Action::PageUp) => {
+                state.file = 0;
+                state.row = 0;
+            }
+            (Focus::Files, Action::End | Action::PageDown) => {
+                state.file = state.files().len().saturating_sub(1);
+                state.row = 0;
+            }
+            (Focus::Files, Action::Enter) => {
+                if let Some(file) = state.current().filter(|f| !f.rows.is_empty()) {
+                    // Gleich auf die erste Änderung, nicht auf den Kopf.
+                    state.row = file
+                        .rows
+                        .iter()
+                        .position(|r| r.kind != minds_git::DiffKind::Hunk)
+                        .unwrap_or(0);
+                    state.focus = Focus::Diff;
+                }
+            }
+            (Focus::Files, Action::Bracket(forward)) => self.step_commit(forward),
+            (Focus::Files, Action::Back) => self.tab = Tab::Sessions,
+            // Im gezeigten Split paarweise, wie gezeichnet.
+            (Focus::Diff, Action::Up) if state.split && split_shown => state.move_pair(-1),
+            (Focus::Diff, Action::Down) if state.split && split_shown => state.move_pair(1),
+            (Focus::Diff, Action::Up) => state.move_row(-1),
+            (Focus::Diff, Action::Down) => state.move_row(1),
+            (Focus::Diff, Action::PageUp) if state.split && split_shown => state.move_pair(-page),
+            (Focus::Diff, Action::PageDown) if state.split && split_shown => state.move_pair(page),
+            (Focus::Diff, Action::PageUp) => state.move_row(-page),
+            (Focus::Diff, Action::PageDown) => state.move_row(page),
+            (Focus::Diff, Action::Home) => state.row_to(false),
+            (Focus::Diff, Action::End) => state.row_to(true),
+            (Focus::Diff, Action::Bracket(forward)) => state.jump_hunk(forward),
+            (Focus::Diff, Action::Back) => state.focus = Focus::Files,
+            (Focus::Diff, Action::Enter) => self.why_of_row(),
+            _ => {}
+        }
+    }
+
+    /// Enter auf einer Diff-Zeile: die Herkunftskette dieser Zeile — im
+    /// Sessions-Tab, `Esc` führt zurück in die Liste. Auf HEAD die Kette der
+    /// Zeile (Blame), auf älteren Commits die des Commits.
+    fn why_of_row(&mut self) {
+        let Some(state) = &self.changes else {
+            return;
+        };
+        let Some(commit) = state.commit() else {
+            return;
+        };
+        let target = state
+            .current()
+            .and_then(|f| f.rows.get(state.row).map(|r| (f.identity.clone(), r.new)));
+        let Some((path, line)) = target else {
+            return;
+        };
+        match line {
+            Some(line) if self.inspection.head() == Some(commit) => {
+                match self.inspection.why_line(self.repo, &path, line) {
+                    Ok(chain) => self.push_why(WhyOrigin::Line { path, line }, chain),
+                    Err(err) => {
+                        self.closed =
+                            Some(minds_reader::sanitize(&format!("why {path}:{line}: {err}")));
+                        return;
+                    }
+                }
+            }
+            _ => {
+                let chain = self.inspection.why_commit(commit);
+                self.push_why(WhyOrigin::Commit(commit), chain);
+            }
+        }
+        self.tab = Tab::Sessions;
     }
 
     /// Rechnet eine Ebene gegen das aktuelle Modell neu. `Err(grund)`, wenn
@@ -574,6 +988,35 @@ impl<'a> App<'a> {
             self.help = true;
             return;
         }
+        match action {
+            Action::CycleTab(forward) => {
+                let n = Tab::ALL.len();
+                let i = Tab::ALL.iter().position(|t| *t == self.tab).unwrap_or(0);
+                self.show_tab(
+                    Tab::ALL[if forward {
+                        (i + 1) % n
+                    } else {
+                        (i + n - 1) % n
+                    }],
+                );
+                return;
+            }
+            Action::TabTo(i) => {
+                if let Some(tab) = Tab::ALL.get(usize::from(i)) {
+                    self.show_tab(*tab);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if self.tab == Tab::Changes {
+            self.reduce_changes(action);
+            return;
+        }
+        if self.tab == Tab::Verify {
+            self.reduce_verify(action);
+            return;
+        }
         let page = self.page.max(1);
         match self.views.pop() {
             None => self.reduce_activity(action, page),
@@ -807,12 +1250,17 @@ impl<'a> App<'a> {
                     0
                 };
                 let mut keep = true;
+                let mut jump = None;
                 match action {
                     Action::Up => cursor = cursor.saturating_sub(1),
                     Action::Down => cursor = (cursor + 1).min(last),
                     Action::Home | Action::PageUp => cursor = 0,
                     Action::End | Action::PageDown => cursor = last,
                     Action::Back => keep = false,
+                    // Enter auf ARTIFACT: der Diff des abgeglichenen Commits.
+                    Action::Enter if report.is_some() && cursor == ARTIFACT_SECTION => {
+                        jump = artifacts.first().map(|a| a.commit);
+                    }
                     _ => {}
                 }
                 if keep {
@@ -823,6 +1271,9 @@ impl<'a> App<'a> {
                         artifacts,
                         cursor,
                     });
+                }
+                if let Some(commit) = jump {
+                    self.open_changes(Some(commit));
                 }
             }
         }
@@ -904,8 +1355,25 @@ impl<'a> App<'a> {
     pub fn run(mut self, source: &dyn Source) -> std::io::Result<()> {
         let (_guard, mut terminal) = Guard::take()?;
         let mut checked = Instant::now();
+        let mut verified = Instant::now()
+            .checked_sub(VERIFY_EVERY)
+            .unwrap_or_else(Instant::now);
         while !self.quit {
             terminal.draw(|frame| view::draw(frame, &mut self))?;
+            // Steht eine Prüfung der Signer aus, ist „checking…" jetzt
+            // gezeichnet: erst dann prüfen (ssh-keygen je Seal) und sofort
+            // neu zeichnen.
+            // Vom Nutzer verlangt: sofort; nach einem Neuladen gedrosselt —
+            // jede Prüfung startet ssh-keygen je Seal und `minds verify`.
+            let due = self
+                .verify
+                .as_ref()
+                .is_some_and(|v| v.due(verified.elapsed(), VERIFY_EVERY));
+            if self.tab == Tab::Verify && due {
+                self.fill_verify(source);
+                verified = Instant::now();
+                continue;
+            }
             if event::poll(TICK)?
                 && let Event::Key(key) = event::read()?
                 && key.kind != event::KeyEventKind::Release
@@ -953,6 +1421,16 @@ fn artifact_inputs(inspection: &Inspection, id: SessionId) -> Vec<(CommitId, Vec
         .into_iter()
         .map(|commit| (commit, index.sessions_of(commit).to_vec()))
         .collect()
+}
+
+/// Was den Abgleich eines Commits bestimmt, ohne I/O: die Sessions, die ihn
+/// tragen, und die, die sein Trailer nennt (zusammen die Claimants).
+fn commit_inputs(inspection: &Inspection, commit: CommitId) -> (Vec<SessionId>, Vec<SessionId>) {
+    let index = inspection.index();
+    (
+        index.sessions_of(commit).to_vec(),
+        index.trailer_ids(commit).to_vec(),
+    )
 }
 
 /// Kopf und Blame-Ergebnis einer Zeilen-Kette — `None`, wenn sie nicht die

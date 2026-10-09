@@ -56,6 +56,24 @@ pub struct LineRecon {
     /// One-based line number in the committed file; only changed lines appear.
     pub line: u32,
     pub class: ReconClass,
+    /// Der Aufruf, der diese Zeile einführte — nur auf Anfrage gerechnet
+    /// ([`Claims::with_sources`]) und nur, wo ein Claim sich bis zu ihr
+    /// abspielen ließ. `None` bei unerklärten Zeilen, bei reiner
+    /// Dateisystem-Evidenz und über [`SOURCE_BUDGET`] hinaus.
+    pub source: Option<Box<LineSource>>,
+}
+
+/// Woher eine Zeile stammt: der Schreibvorgang, der sie einführte — beim
+/// Abspielen der Write-/Edit-Aufrufe von Aufruf zu Aufruf weitergetragen.
+/// Eine Ableitung aus gespeicherten Sessions, kein Beweismittel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LineSource {
+    /// Die Session des Aufrufs.
+    pub session: SessionId,
+    /// Index des Turns in [`Session::turns`].
+    pub turn: usize,
+    /// Index des Aufrufs in [`minds_core::Turn::tool_calls`].
+    pub call: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,6 +310,7 @@ pub fn repo_path(path: &str, roots: &[&Path]) -> Option<String> {
 struct Claim<'a> {
     call: &'a ToolCall,
     effect: &'a Effect,
+    source: LineSource,
 }
 
 /// The write and delete claims of a set of sessions, in merged turn order and
@@ -300,6 +319,10 @@ struct Claim<'a> {
 #[derive(Default)]
 pub struct Claims<'a> {
     by_path: BTreeMap<String, Vec<Claim<'a>>>,
+    /// Ob je Zeile die Herkunft (`LineRecon::source`) gerechnet wird — nur
+    /// auf Anfrage einer Anzeige, nie für `verify`: Es kostet einen Diff je
+    /// abgespieltem Claim.
+    sources: bool,
 }
 
 fn timestamp(at: Option<&str>) -> Option<jiff::Timestamp> {
@@ -336,23 +359,38 @@ impl<'a> Claims<'a> {
         }
         turns.sort_by_key(|(time, id, index, _, _)| (*time, *id, *index));
         let mut by_path: BTreeMap<String, Vec<Claim<'a>>> = BTreeMap::new();
-        for (_, _, _, turn, session) in turns {
+        for (_, id, turn_index, turn, session) in turns {
             let cwd = session.lineage.as_ref().and_then(|l| l.cwd.as_deref());
-            for call in &turn.tool_calls {
+            for (call_index, call) in turn.tool_calls.iter().enumerate() {
                 if let Some(effect) = &call.effect
                     && matches!(effect.kind, EffectKind::Write | EffectKind::Delete)
                     && let Some(path) = effect.path.as_deref()
                     && let Some(path) =
                         claim_path(path, cwd, roots, known, effect.kind == EffectKind::Delete)
                 {
-                    by_path
-                        .entry(path)
-                        .or_default()
-                        .push(Claim { call, effect });
+                    by_path.entry(path).or_default().push(Claim {
+                        call,
+                        effect,
+                        source: LineSource {
+                            session: id,
+                            turn: turn_index,
+                            call: call_index,
+                        },
+                    });
                 }
             }
         }
-        Self { by_path }
+        Self {
+            by_path,
+            sources: false,
+        }
+    }
+
+    /// Rechnet beim Abgleich je Zeile die Herkunft mit (`LineRecon::source`)
+    /// — für Anzeigen, die sie zeigen; `verify` braucht sie nicht.
+    pub fn with_sources(mut self) -> Self {
+        self.sources = true;
+        self
     }
 
     /// The repo-relative paths with at least one write or delete claim,
@@ -404,7 +442,8 @@ impl<'a> Claims<'a> {
                 .get(file.path)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let (recon, changed, explained) = reconcile_file(file, claims, observations);
+            let (recon, changed, explained) =
+                reconcile_file(file, claims, observations, self.sources);
             result.total_changed_lines += changed;
             result.explained_lines += explained;
             result.files.push(recon);
@@ -426,6 +465,15 @@ pub fn reconcile(input: &ReconInput<'_>) -> Reconciliation {
         input.changed,
         input.observations,
     )
+}
+
+/// Wie [`reconcile`], samt Herkunft je Zeile ([`LineRecon::source`]).
+pub fn reconcile_with_sources(input: &ReconInput<'_>) -> Reconciliation {
+    let changed: BTreeSet<&str> = input.changed.iter().map(|f| f.path).collect();
+    let known = |path: &str| changed.contains(path);
+    Claims::collect(input.sessions, input.roots, &known)
+        .with_sources()
+        .reconcile(input.commit, input.base, input.changed, input.observations)
 }
 
 fn hash(bytes: &[u8]) -> ContentHash {
@@ -468,6 +516,7 @@ fn reconcile_file(
     file: &ChangedFile<'_>,
     claims: &[Claim<'_>],
     observations: &[&FsObservation],
+    sources: bool,
 ) -> (FileRecon, u64, u64) {
     let committed = hash(file.committed.unwrap_or_default());
     let state = file.committed.map(|_| &committed);
@@ -491,7 +540,7 @@ fn reconcile_file(
         .find(|o| !o.opaque && o.observed.hash.as_ref() == state)
         .map(|o| o.observed.clone());
     let (line_level, changed, explained, removes) =
-        line_reconciliation(file, claims, observation, class);
+        line_reconciliation(file, claims, observation, class, sources);
     (
         FileRecon {
             path: file.path.into(),
@@ -517,6 +566,7 @@ fn line_reconciliation(
     claims: &[Claim<'_>],
     observation: Option<&FsObservation>,
     class: ReconClass,
+    sources: bool,
 ) -> (LineLevel, u64, u64, bool) {
     let Some(committed) = file.committed else {
         return (LineLevel::Available(Vec::new()), 0, 0, file.base.is_some());
@@ -552,8 +602,12 @@ fn line_reconciliation(
     let ranges = added_line_ranges(base, committed);
     let changed = lines_in(&ranges);
     let base_removes = removes_lines(base, committed);
-    let evidence = line_evidence(file, claims, observation, class);
-    let (content, evidence_class) = match evidence {
+    let evidence = line_evidence(file, claims, observation, class, sources);
+    let Evidence {
+        content,
+        origins,
+        class: evidence_class,
+    } = match evidence {
         Ok(evidence) => evidence,
         Err(reason) => {
             return (
@@ -569,20 +623,21 @@ fn line_reconciliation(
     let claim_removes = content
         .as_deref()
         .is_some_and(|content| removes_lines(content, committed));
-    let different = content
+    // Je Commit-Zeile die Zeile des belegten Inhalts, aus der sie unverändert
+    // stammt — derselbe Algorithmus wie `added_line_ranges`: Eine Zeile passt
+    // genau dann, wenn sie dort nicht als hinzugefügt gilt.
+    let alignment = content
         .as_deref()
-        .map(|content| added_line_ranges(content, committed));
-    let mut different = different.as_deref().unwrap_or_default().iter().peekable();
+        .map(|content| minds_git::line_alignment(content, committed));
     let mut explained = 0;
     let lines: Vec<LineRecon> = ranges
         .into_iter()
         .flatten()
         .map(|line| {
-            while different.peek().is_some_and(|r| r.end <= line) {
-                different.next();
-            }
-            let matches = content.is_some() && !different.peek().is_some_and(|r| r.contains(&line));
-            let class = if matches {
+            let from = alignment
+                .as_ref()
+                .and_then(|alignment| alignment.get(line as usize).copied().flatten());
+            let class = if from.is_some() {
                 evidence_class
             } else {
                 ReconClass::Unexplained
@@ -591,6 +646,9 @@ fn line_reconciliation(
             LineRecon {
                 line: line + 1,
                 class,
+                source: from
+                    .and_then(|from| origins.get(from as usize).copied().flatten())
+                    .map(Box::new),
             }
         })
         .collect();
@@ -603,12 +661,46 @@ fn line_reconciliation(
     (LineLevel::Available(lines), changed, explained, removes)
 }
 
+/// Was eine Datei zeilenweise belegt: der belegte Inhalt (`None`: nichts),
+/// die Herkunft je Zeile dieses Inhalts (leer, wo kein Claim abspielbar ist)
+/// und die Klasse, die eine passende Zeile erhält.
+struct Evidence {
+    content: Option<Vec<u8>>,
+    origins: Vec<Option<LineSource>>,
+    class: ReconClass,
+}
+
+impl Evidence {
+    fn none() -> Self {
+        Self {
+            content: None,
+            origins: Vec::new(),
+            class: ReconClass::Unexplained,
+        }
+    }
+}
+
+/// Die Herkunft je Zeile von `content`, wenn die Claims genau diese Fassung
+/// abspielen — sonst leer. Nur für die Anzeige; die Klasse hängt nie daran.
+fn origins_of(
+    file: &ChangedFile<'_>,
+    claims: &[Claim<'_>],
+    expected: &ContentHash,
+    content: &[u8],
+) -> Vec<Option<LineSource>> {
+    match reconstruct(file.base, claims, expected, true) {
+        Ok((bytes, origins)) if bytes == content => origins,
+        _ => Vec::new(),
+    }
+}
+
 fn line_evidence(
     file: &ChangedFile<'_>,
     claims: &[Claim<'_>],
     observation: Option<&FsObservation>,
     class: ReconClass,
-) -> Result<(Option<Vec<u8>>, ReconClass), Reason> {
+    sources: bool,
+) -> Result<Evidence, Reason> {
     if let Some(observation) = observation {
         let Some(expected) = observation
             .observed
@@ -616,9 +708,10 @@ fn line_evidence(
             .as_ref()
             .filter(|_| !observation.opaque)
         else {
-            return Ok((None, ReconClass::Unexplained));
+            return Ok(Evidence::none());
         };
-        let evidence_class = if claims_state(claims, Some(expected)) {
+        let claimed = claims_state(claims, Some(expected));
+        let evidence_class = if claimed {
             ReconClass::Explained
         } else {
             ReconClass::ExplainedFsOnly
@@ -626,7 +719,16 @@ fn line_evidence(
         // A matching witness hash authenticates these exact committed bytes;
         // no tool payload is needed for filesystem-only evidence.
         if class.explained() {
-            return Ok((file.committed.map(<[u8]>::to_vec), evidence_class));
+            let content = file.committed.map(<[u8]>::to_vec);
+            let origins = match (&content, claimed) {
+                (Some(content), true) if sources => origins_of(file, claims, expected, content),
+                _ => Vec::new(),
+            };
+            return Ok(Evidence {
+                content,
+                origins,
+                class: evidence_class,
+            });
         }
         if let Some(content) = &observation.content {
             if content.len() > LINE_LEVEL_LIMIT {
@@ -635,48 +737,120 @@ fn line_evidence(
             if hash(content) != *expected {
                 return Err(Reason::ReconstructionMismatch);
             }
-            return Ok((Some(content.clone()), evidence_class));
+            let origins = if claimed && sources {
+                origins_of(file, claims, expected, content)
+            } else {
+                Vec::new()
+            };
+            return Ok(Evidence {
+                content: Some(content.clone()),
+                origins,
+                class: evidence_class,
+            });
         }
-        if !claims_state(claims, Some(expected)) {
+        if !claimed {
             return Err(Reason::MissingContent);
         }
-        return reconstruct(file.base, claims, expected).map(|bytes| (Some(bytes), evidence_class));
+        return reconstruct(file.base, claims, expected, sources).map(|(bytes, origins)| {
+            Evidence {
+                content: Some(bytes),
+                origins,
+                class: evidence_class,
+            }
+        });
     }
     let Some(last) = claims.last().filter(|c| c.effect.kind == EffectKind::Write) else {
-        return Ok((None, ReconClass::Unexplained));
+        return Ok(Evidence::none());
     };
     let Some(expected) = last.effect.written.as_ref() else {
-        return Ok((None, ReconClass::Unexplained));
+        return Ok(Evidence::none());
     };
-    reconstruct(file.base, claims, expected).map(|bytes| (Some(bytes), ReconClass::ReportedOnly))
+    reconstruct(file.base, claims, expected, sources).map(|(bytes, origins)| Evidence {
+        content: Some(bytes),
+        origins,
+        class: ReconClass::ReportedOnly,
+    })
 }
 
+/// Die Herkunft je Zeile nach einem Schreibvorgang: Unverändert gebliebene
+/// Zeilen behalten ihre Herkunft, neue oder ersetzte bekommen `source`.
+fn carry(
+    before: Option<&[u8]>,
+    origins: &[Option<LineSource>],
+    after: &[u8],
+    source: LineSource,
+) -> Vec<Option<LineSource>> {
+    minds_git::line_alignment(before.unwrap_or_default(), after)
+        .into_iter()
+        .map(|kept| match kept {
+            Some(line) => origins.get(line as usize).copied().flatten(),
+            None => Some(source),
+        })
+        .collect()
+}
+
+/// So viele Bytes dürfen die Diffs für die Herkunft einer Datei insgesamt
+/// sehen. Die Herkunft ist reine Anzeige: Darüber hinaus wird sie nicht
+/// weitergetragen (dann `source: None`), die Klasse bleibt unberührt — eine
+/// lange Kette großer Schreibvorgänge kann die Anzeige nicht aufhalten.
+pub const SOURCE_BUDGET: usize = 16 * 1024 * 1024;
+
+/// Zeilen eines Blobs, wie der Diff sie zählt — ohne Diff.
+fn line_count(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|b| **b == b'\n').count()
+        + usize::from(bytes.last().is_some_and(|b| *b != b'\n'))
+}
+
+/// Spielt die Claims ab und liefert die Fassung mit dem Hash `expected` —
+/// mit `sources` samt der Herkunft je Zeile (Zeilen der Basis: `None`),
+/// solange [`SOURCE_BUDGET`] reicht; sonst ist die Herkunft leer.
 fn reconstruct(
     base: Option<&[u8]>,
     claims: &[Claim<'_>],
     expected: &ContentHash,
-) -> Result<Vec<u8>, Reason> {
+    sources: bool,
+) -> Result<(Vec<u8>, Vec<Option<LineSource>>), Reason> {
     let mut current = base.map(<[u8]>::to_vec);
+    let mut tracking = sources;
+    let mut spent = 0usize;
+    let mut origins: Vec<Option<LineSource>> = match base {
+        Some(base) if tracking => vec![None; line_count(base)],
+        _ => Vec::new(),
+    };
     let mut matching = None;
     let mut failure = Reason::ReconstructionMismatch;
     for claim in claims {
         if claim.effect.kind == EffectKind::Delete {
             current = None;
+            origins.clear();
             continue;
         }
         let candidate = replay(claim.call, current.as_deref());
         match candidate {
             Ok(bytes) if claim.effect.written.as_ref() == Some(&hash(&bytes)) => {
+                if tracking {
+                    spent = spent
+                        .saturating_add(current.as_deref().map_or(0, <[u8]>::len))
+                        .saturating_add(bytes.len());
+                    tracking = spent <= SOURCE_BUDGET;
+                }
+                let next = if tracking {
+                    carry(current.as_deref(), &origins, &bytes, claim.source)
+                } else {
+                    Vec::new()
+                };
                 if claim.effect.written.as_ref() == Some(expected) {
-                    matching = Some(bytes.clone());
+                    matching = Some((bytes.clone(), next.clone()));
                 }
                 current = Some(bytes);
+                origins = next;
             }
             result => {
                 if let Err(reason) = result {
                     failure = reason;
                 }
                 current = None;
+                origins.clear();
             }
         }
     }

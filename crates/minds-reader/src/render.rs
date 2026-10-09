@@ -322,10 +322,12 @@ mod tests {
                             LineRecon {
                                 line: 1,
                                 class: ReconClass::ReportedOnly,
+                                source: None,
                             },
                             LineRecon {
                                 line: 2,
                                 class: ReconClass::Unexplained,
+                                source: None,
                             },
                         ]),
                         committed: committed.clone(),

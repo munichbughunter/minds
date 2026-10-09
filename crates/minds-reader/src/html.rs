@@ -1778,7 +1778,11 @@ mod tests {
             line_level: LineLevel::Available(
                 lines
                     .iter()
-                    .map(|&(line, class)| LineRecon { line, class })
+                    .map(|&(line, class)| LineRecon {
+                        line,
+                        class,
+                        source: None,
+                    })
                     .collect(),
             ),
             committed: minds_core::ContentHash::from_bytes([0; 32]),

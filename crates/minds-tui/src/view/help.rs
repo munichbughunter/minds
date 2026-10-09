@@ -19,17 +19,22 @@ e                  evidence — verdict, coverage, epochs, signature, limits
 t                  graph ↔ timeline
 1 / 2 / 3          zoom: summary / normal / verbose
 r                  reload now (it also reloads by itself when the store changes)
+Tab / F1 F2 F3     switch tab: Sessions · Verify · Changes
 ?                  this help
 q / Ctrl-C         quit
 
 Evidence: ● observed   ◆ content   ◇ declared   ○ inferred   · unlinked
 Review:   ⚠ open   ✓ approved   ↻ needs work   ✕ rejected
-Effects:  ◇ READ   ✎ EDIT   ▶ EXEC   ✕ DELETE";
+Effects:  ◇ READ   ✎ EDIT   ▶ EXEC   ✕ DELETE
+
+Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next unexplained
+          s unified ↔ split · w why this line · Enter why chain · Esc back
+Lines:    ● observed  ◍ fs only  ◇ reported only  ◦ not observed (bold)";
 
 /// Zeichnet die Hilfe mittig.
 pub fn draw(frame: &mut Frame, area: Rect) {
     let width = 84.min(area.width);
-    let height = 20.min(area.height);
+    let height = 26.min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,

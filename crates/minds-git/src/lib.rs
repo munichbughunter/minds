@@ -77,7 +77,7 @@ pub use amend::TrailerUpdate;
 pub use blame::{AutoBlame, BlameLine, BlameProvider, GixBlame, ShellBlame};
 pub use diff::{
     ChangedEntry, CommitChanges, CommitDiff, DiffFile, DiffKind, DiffLine, added_line_ranges,
-    removes_lines,
+    line_alignment, removes_lines, unified_diff,
 };
 pub use error::{GitError, Result, Source};
 pub use head::Head;
