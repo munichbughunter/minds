@@ -171,12 +171,14 @@ Usage:
   minds inspect [<search> | <file>:<line>]
         How a change came to be, in the terminal: session list, a
         session's graph (intent → agent → effects → change → review) and
-        a line's why chain. Tabs (Tab, F1–F3): Sessions, Verify — the
+        a line's why chain. Tabs (Tab, F1–F4): Sessions, Verify — the
         verdict of minds verify at a glance (verdict, assurance, intent,
         integrity, coverage, artifact bar, scope) — and Changes —
         the diff of a commit as in git diff (unified, s for split) with
         each added line's evidence class and, beside it, why the line
-        exists (session, step, what the agent said). Read-only. Live:
+        exists (session, step, what the agent said) — and Intent — the
+        intent anchors (source, scope, proof, signature as minds verify
+        checks it, snapshot) and the sessions naming them. Read-only. Live:
         reloads by itself when HEAD or a ref under refs/minds/ changes;
         r reloads at once.
         If stdout is not a console, the lines come tab-separated (for

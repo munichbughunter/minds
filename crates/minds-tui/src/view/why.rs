@@ -227,6 +227,7 @@ fn enterable(step: &WhyStep) -> bool {
         WhyStep::Evidence { .. } => false,
         WhyStep::Sessions { cards } => !cards.is_empty(),
         WhyStep::Commit { id, .. } => id.is_some(),
+        WhyStep::Intent { anchor, .. } => anchor.is_some(),
         _ => false,
     }
 }
@@ -313,6 +314,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             request,
             constraints,
             discarded,
+            anchor,
         } => {
             // Das CLAIM-Label rendert `draw` gestylt VOR diesen Zeilen —
             // hier steht nur der Record-Text selbst.
@@ -322,6 +324,22 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             }
             if !discarded.is_empty() {
                 text.push(format!("Discarded: {}", discarded.len()));
+            }
+            // Der Anker als eigenes Glied der Kette: Enter öffnet ihn im
+            // Intent-Tab (Beleg, Signatur, Snapshot).
+            match anchor {
+                Some(anchor) => {
+                    let id = anchor.id.to_string();
+                    let how = match anchor.record {
+                        minds_reader::intent::AnchorRecord::WitnessEvent => "witness event",
+                        minds_reader::intent::AnchorRecord::LocalFile => "local file",
+                    };
+                    text.push(format!(
+                        "Anchor {}… ({how}, as recorded)",
+                        id.get(..14).unwrap_or(&id)
+                    ));
+                }
+                None => text.push("Anchor: none bound".into()),
             }
             ("●", "INTENT", Style::default().fg(theme::HUMAN), text)
         }

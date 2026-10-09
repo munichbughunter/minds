@@ -44,6 +44,44 @@ use crate::assurance::{IntentSignature, IntentState};
 /// So viele Epochen hält [`epoch_chain`] höchstens.
 pub const MAX_EPOCHS: usize = 4096;
 
+/// Wie die Bindung einer Session an einen Anker **aufgezeichnet** ist —
+/// ungeprüft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorRecord {
+    /// Ein `minds.intent`-Event in der Session (vom Witness geschrieben —
+    /// ob es über geprüfte Seals kam, sagt erst [`intent_of`]).
+    WitnessEvent,
+    /// Die lokale Datei-Bindung (`intent_anchor`, A1) — nie verkettet.
+    LocalFile,
+}
+
+/// Der Anker, an den eine gespeicherte Session sich gebunden nennt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundAnchor {
+    /// Die Anker-Id.
+    pub id: ContentHash,
+    /// Woher die Bindung stammt.
+    pub record: AnchorRecord,
+}
+
+/// Der Anker, den die gespeicherte Session nennt: ihr letztes
+/// `minds.intent`-Event, sonst die lokale Datei-Bindung. Ein Record, kein
+/// Beleg — ob die Events über geprüfte Seals kamen und die Signatur gilt,
+/// prüft nur [`intent_of`] mit Signern (`minds verify`). Betrachtet nur
+/// diese Session, nicht ihre Epochen-Kette.
+pub fn bound_anchor(session: &Session) -> Option<BoundAnchor> {
+    match session.intent_events.last() {
+        Some(event) => Some(BoundAnchor {
+            id: event.anchor_id.clone(),
+            record: AnchorRecord::WitnessEvent,
+        }),
+        None => session.intent_anchor.clone().map(|id| BoundAnchor {
+            id,
+            record: AnchorRecord::LocalFile,
+        }),
+    }
+}
+
 /// Die Sessions einer Epochen-Kette, älteste zuerst, die geprüfte zuletzt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochChain {

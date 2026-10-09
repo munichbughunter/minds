@@ -528,10 +528,14 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                         lines.push(Line::from(vec![label("At"), Span::raw(at)]));
                     }
                     if let Some(anchor) = reason.anchor {
-                        let anchor = anchor.to_string();
+                        let how = match anchor.record {
+                            minds_reader::intent::AnchorRecord::WitnessEvent => "witness event",
+                            minds_reader::intent::AnchorRecord::LocalFile => "local file",
+                        };
+                        let id = anchor.id.to_string();
                         lines.push(Line::from(vec![
                             label("Intent"),
-                            Span::raw(format!("anchor {}…", &anchor[..anchor.len().min(14)])),
+                            Span::raw(format!("anchor {}… ({how})", &id[..id.len().min(14)])),
                         ]));
                     }
                     // Prosa zuletzt (nach Commit und Review): Ein langer Text des

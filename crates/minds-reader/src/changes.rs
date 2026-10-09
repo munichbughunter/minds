@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use minds_core::{ChangeId, ContentHash, Role, SessionId};
+use minds_core::{ChangeId, Role, SessionId};
 use minds_git::{CommitId, DiffKind, Repo};
 
 use crate::artifact::{ArtifactState, roots_of};
@@ -130,8 +130,9 @@ pub struct LineReason {
     /// Aus welchem Turn `said` stammt — ein früherer als `turn`, wenn der
     /// Turn des Aufrufs selbst keinen Text trägt.
     pub said_turn: Option<usize>,
-    /// Der gebundene Intent-Anker der Session, falls einer galt.
-    pub anchor: Option<ContentHash>,
+    /// Der Anker, an den die Session sich gebunden nennt (Record,
+    /// ungeprüft) — Witness-Event vor lokaler Datei.
+    pub anchor: Option<crate::intent::BoundAnchor>,
 }
 
 /// Eine Zeile für die Anzeige: Tabs als vier Leerzeichen, dann entschärft.
@@ -325,7 +326,7 @@ impl crate::Inspection {
             at: turn.at.as_deref().map(|at| one_line(at, 40)),
             said,
             said_turn,
-            anchor: session.intent_anchor.clone(),
+            anchor: crate::intent::bound_anchor(session),
         })
     }
 }
