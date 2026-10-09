@@ -555,3 +555,34 @@ fn epoch_chain_never_invents_a_start() {
     );
     assert!(!chain.witnessed);
 }
+
+/// Der aufgezeichnete Anker einer Session: das letzte Witness-Event vor der
+/// lokalen Datei — ein Record, ungeprüft.
+#[test]
+fn bound_anchor_prefers_the_last_witness_event_over_the_local_file() {
+    use minds_reader::intent::{AnchorRecord, BoundAnchor, bound_anchor};
+    let (first, last, local) = (
+        ContentHash::from_bytes([1; 32]),
+        ContentHash::from_bytes([2; 32]),
+        ContentHash::from_bytes([3; 32]),
+    );
+    let mut s = session();
+    assert_eq!(bound_anchor(&s), None);
+    s.intent_anchor = Some(local.clone());
+    assert_eq!(
+        bound_anchor(&s),
+        Some(BoundAnchor {
+            id: local,
+            record: AnchorRecord::LocalFile
+        })
+    );
+    s.intent_events.push(event(1, &first, true));
+    s.intent_events.push(event(2, &last, false));
+    assert_eq!(
+        bound_anchor(&s),
+        Some(BoundAnchor {
+            id: last,
+            record: AnchorRecord::WitnessEvent
+        })
+    );
+}

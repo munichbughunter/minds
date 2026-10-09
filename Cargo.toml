@@ -23,7 +23,9 @@ regex = "1"
 tempfile = "3"
 # Ohne Default-Features: kein termwiz/termion/palette/serde — nur das
 # crossterm-Backend in genau der hier gepinnten crossterm-Version.
-ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache"] }
+# `unstable-rendered-line-info`: nur für `Paragraph::line_count` im Intent-Tab
+# (minds-tui/src/view/intent.rs) — außerhalb von SemVer, beim Anheben prüfen.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache", "unstable-rendered-line-info"] }
 crossterm = "0.29"
 terminal_size = "0.4"
 textwrap = "0.16"

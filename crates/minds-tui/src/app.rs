@@ -14,7 +14,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{self, Event};
-use minds_core::SessionId;
+use minds_core::{ContentHash, SessionId};
 use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::artifact::CommitArtifact;
@@ -25,6 +25,7 @@ use minds_reader::model::{EvidenceReport, LinkEvidence, SessionCard, WhyChain, W
 use crate::changes::{ChangesState, Focus};
 use crate::filter;
 use crate::input::{self, Action};
+use crate::intent::{IntentTab, bound_sessions, named_anchors};
 use crate::layout::{self, Row, Zoom};
 use crate::term::Guard;
 use crate::verify::VerifyState;
@@ -128,11 +129,13 @@ pub enum Tab {
     Verify,
     /// Die Änderungen eines Commits als Diff.
     Changes,
+    /// Die Intent-Anker und wer sich an sie gebunden nennt.
+    Intent,
 }
 
 impl Tab {
     /// Alle Tabs, in Reihenfolge.
-    pub const ALL: [Tab; 3] = [Tab::Sessions, Tab::Verify, Tab::Changes];
+    pub const ALL: [Tab; 4] = [Tab::Sessions, Tab::Verify, Tab::Changes, Tab::Intent];
 
     /// Der Name im Kopf.
     pub fn title(self) -> &'static str {
@@ -140,6 +143,7 @@ impl Tab {
             Tab::Sessions => "Sessions",
             Tab::Verify => "Verify",
             Tab::Changes => "Changes",
+            Tab::Intent => "Intent",
         }
     }
 }
@@ -200,6 +204,8 @@ pub struct App<'a> {
     pub changes: Option<ChangesState>,
     /// Der Verify-Tab — erst beim ersten Öffnen gebaut.
     pub verify: Option<VerifyState>,
+    /// Der Intent-Tab — erst beim ersten Öffnen gebaut.
+    pub intent: Option<IntentTab>,
 }
 
 impl<'a> App<'a> {
@@ -231,6 +237,7 @@ impl<'a> App<'a> {
             tab: Tab::Sessions,
             changes: None,
             verify: None,
+            intent: None,
         };
         app.refilter();
         app
@@ -305,6 +312,11 @@ impl<'a> App<'a> {
         if self.changes.is_some() {
             self.refresh_changes(&before, full);
         }
+        // Die Anker neu holen (Signatur, Beleg) — gedrosselt wie Verify,
+        // außer nach `r`.
+        if let Some(state) = self.intent.as_mut() {
+            state.invalidate(full);
+        }
         self.stamp = stamp;
         self.loaded_at = clock(now);
         self.reload_error = None;
@@ -356,6 +368,81 @@ impl<'a> App<'a> {
         };
         self.verify = Some(VerifyState::build(&self.inspection, self.repo, commits, at));
         self.tab = Tab::Verify;
+    }
+
+    /// Öffnet den Intent-Tab — auf dem Anker `want`, wenn es ihn gibt.
+    pub fn open_intent(&mut self, want: Option<ContentHash>) {
+        match self.intent.as_mut() {
+            Some(state) => {
+                if let Some(id) = &want {
+                    state.select(id);
+                }
+                if state.pending {
+                    state.urgent = true;
+                }
+            }
+            None => self.intent = Some(IntentTab::new(want)),
+        }
+        self.tab = Tab::Intent;
+    }
+
+    /// Holt die Anker, wenn sie ausstehen — nur bei sichtbarem Tab (die
+    /// Signaturprüfung startet ssh-keygen).
+    pub fn fill_intents(&mut self, source: &dyn Source) {
+        if self.tab != Tab::Intent {
+            return;
+        }
+        if let Some(state) = self.intent.as_mut()
+            && state.pending
+        {
+            let answer = source.intents(&named_anchors(&self.inspection));
+            state.fill(answer);
+        }
+    }
+
+    /// Die Tasten im Intent-Tab.
+    fn reduce_intent(&mut self, action: Action) {
+        let Some(state) = self.intent.as_mut() else {
+            return;
+        };
+        let last = state.list().len().saturating_sub(1);
+        let at = state.cursor;
+        match action {
+            Action::Up => state.cursor = state.cursor.saturating_sub(1),
+            Action::Down => state.cursor = (state.cursor + 1).min(last),
+            Action::Home => state.cursor = 0,
+            Action::End => state.cursor = last,
+            // Bild hoch/runter blättert im Detail (Snapshot).
+            Action::PageUp => {
+                state.scroll = state.scroll.min(state.max_scroll.get()).saturating_sub(10);
+            }
+            Action::PageDown => {
+                state.scroll = state.scroll.saturating_add(10).min(state.max_scroll.get());
+            }
+            Action::Back => self.tab = Tab::Sessions,
+            Action::Enter => {
+                // Eine Session, die sich an den Anker gebunden nennt (die
+                // kleinste Id): ihr Graph im Sessions-Tab.
+                let first = state
+                    .selected()
+                    .and_then(|info| bound_sessions(&self.inspection, &info.id).first().copied());
+                match first {
+                    Some((id, _)) if self.inspection.graph(id).is_some() => {
+                        self.tab = Tab::Sessions;
+                        self.query.clear();
+                        self.refilter_keeping(Some(id));
+                        self.push_graph(id);
+                    }
+                    Some(_) => self.closed = Some("that session is not readable".into()),
+                    None => self.closed = Some("no session names this anchor".into()),
+                }
+                return;
+            }
+            _ => {}
+        }
+        if state.cursor != at {
+            state.scroll = 0;
+        }
     }
 
     /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
@@ -488,6 +575,8 @@ impl<'a> App<'a> {
             self.open_changes(None);
         } else if tab == Tab::Verify && self.verify.is_none() {
             self.open_verify(None);
+        } else if tab == Tab::Intent {
+            self.open_intent(None);
         } else {
             // Zurück im Verify-Tab: Eine ausstehende Prüfung ist jetzt vom
             // Nutzer verlangt, nicht gedrosselt.
@@ -1017,6 +1106,10 @@ impl<'a> App<'a> {
             self.reduce_verify(action);
             return;
         }
+        if self.tab == Tab::Intent {
+            self.reduce_intent(action);
+            return;
+        }
         let page = self.page.max(1);
         match self.views.pop() {
             None => self.reduce_activity(action, page),
@@ -1193,6 +1286,23 @@ impl<'a> App<'a> {
                                 return;
                             }
                         }
+                        // Der Anker der Absicht: im Intent-Tab — der Stapel
+                        // bleibt, Tab führt zurück.
+                        Some(WhyStep::Intent {
+                            anchor: Some(anchor),
+                            ..
+                        }) => {
+                            let id = anchor.id.clone();
+                            self.views.push(View::Why {
+                                origin,
+                                chain,
+                                cursor,
+                                edge,
+                                inspector,
+                            });
+                            self.open_intent(Some(id));
+                            return;
+                        }
                         Some(WhyStep::Commit {
                             id: Some(commit), ..
                         }) => {
@@ -1358,6 +1468,7 @@ impl<'a> App<'a> {
         let mut verified = Instant::now()
             .checked_sub(VERIFY_EVERY)
             .unwrap_or_else(Instant::now);
+        let mut anchored = verified;
         while !self.quit {
             terminal.draw(|frame| view::draw(frame, &mut self))?;
             // Steht eine Prüfung der Signer aus, ist „checking…" jetzt
@@ -1372,6 +1483,15 @@ impl<'a> App<'a> {
             if self.tab == Tab::Verify && due {
                 self.fill_verify(source);
                 verified = Instant::now();
+                continue;
+            }
+            let due = self
+                .intent
+                .as_ref()
+                .is_some_and(|i| i.due(anchored.elapsed(), VERIFY_EVERY));
+            if self.tab == Tab::Intent && due {
+                self.fill_intents(source);
+                anchored = Instant::now();
                 continue;
             }
             if event::poll(TICK)?

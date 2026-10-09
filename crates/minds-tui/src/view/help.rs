@@ -19,7 +19,7 @@ e                  evidence — verdict, coverage, epochs, signature, limits
 t                  graph ↔ timeline
 1 / 2 / 3          zoom: summary / normal / verbose
 r                  reload now (it also reloads by itself when the store changes)
-Tab / F1 F2 F3     switch tab: Sessions · Verify · Changes
+Tab / F1 … F4      switch tab: Sessions · Verify · Changes · Intent
 ?                  this help
 q / Ctrl-C         quit
 
@@ -29,7 +29,9 @@ Effects:  ◇ READ   ✎ EDIT   ▶ EXEC   ✕ DELETE
 
 Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next unexplained
           s unified ↔ split · w why this line · Enter why chain · Esc back
-Lines:    ● observed  ◍ fs only  ◇ reported only  ◦ not observed (bold)";
+Lines:    ● observed  ◍ fs only  ◇ reported only  ◦ not observed (bold)
+Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it
+          in why: Enter on the anchor";
 
 /// Zeichnet die Hilfe mittig.
 pub fn draw(frame: &mut Frame, area: Rect) {

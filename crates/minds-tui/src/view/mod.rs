@@ -24,6 +24,7 @@ pub mod changes;
 pub mod evidence;
 pub mod graph;
 pub mod help;
+mod intent;
 pub mod verify;
 pub mod why;
 
@@ -67,6 +68,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if app.tab == Tab::Verify {
         verify::draw(frame, app, body);
+        footer(frame, app, foot);
+        if app.help {
+            help::draw(frame, frame.area());
+        }
+        return;
+    }
+    if app.tab == Tab::Intent {
+        intent::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
             help::draw(frame, frame.area());
@@ -272,6 +281,25 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             ),
         ]);
         frame.render_widget(Paragraph::new(vec![status, keys]), area);
+        return;
+    }
+    if app.tab == Tab::Intent {
+        let status = Line::from(Span::styled(
+            "Intent anchors under refs/minds/intents — proof as `minds intent show`, signature as `minds verify`, bindings as recorded.",
+            theme::dim(),
+        ));
+        let mut keys = vec![
+            freshness(app),
+            Span::raw("  "),
+            Span::styled(
+                "↑↓ anchor  Enter graph of a session naming it  Tab next tab  ? help",
+                theme::dim(),
+            ),
+        ];
+        if let Some(closed) = &app.closed {
+            keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
+        }
+        frame.render_widget(Paragraph::new(vec![status, Line::from(keys)]), area);
         return;
     }
     // Erste Zeile: was der Fokus bedeutet — der Evidenz-Satz zur gewählten

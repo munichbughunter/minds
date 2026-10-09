@@ -79,10 +79,53 @@ pub(crate) struct WitnessTrust<'a> {
     /// Der erste Fehler einer Anker-Prüfung (Prozess, Tempdatei) — ein
     /// gescheiterter Prozess ist kein „ungültig".
     anchor_error: RefCell<Option<String>>,
+    /// Das `ssh-keygen` für Intent-Signaturen: `None` (Standard, wie
+    /// `minds verify`) sucht im PATH; `Some(None)`: keins außerhalb des
+    /// Checkouts gefunden — dann prüft nichts, statt ein `ssh-keygen` aus
+    /// dem Checkout zu fragen; `Some(Some(p))`: genau dieses.
+    intent_program: Option<Option<PathBuf>>,
 }
 
 impl<'a> WitnessTrust<'a> {
     pub(crate) fn new(store: &'a dyn ContextStore, signers: Option<&str>) -> Self {
+        Self::build(store, signers, minds_attest::ssh_keygen_available)
+    }
+
+    /// Nur für Intent-Signaturen, mit genau diesem `ssh-keygen` (aufgelöst
+    /// außerhalb des Checkouts) — auch die Verfügbarkeitsprobe läuft nur
+    /// damit, nie über PATH. `None`: keins gefunden — jede Intent-Signatur
+    /// bleibt ungeprüft. Signer wie `minds verify` ohne `--signers`.
+    pub(crate) fn for_intents(store: &'a dyn ContextStore, program: Option<PathBuf>) -> Self {
+        Self::for_intents_with_signers(store, None, program)
+    }
+
+    /// [`for_intents`](Self::for_intents) mit ausdrücklicher Signer-Datei
+    /// (Tests).
+    fn for_intents_with_signers(
+        store: &'a dyn ContextStore,
+        signers: Option<&str>,
+        program: Option<PathBuf>,
+    ) -> Self {
+        let probe = program.clone();
+        Self::build(store, signers, move || {
+            probe
+                .as_deref()
+                .is_some_and(minds_attest::ssh_keygen_available_at)
+        })
+        .with_intent_program(program)
+    }
+
+    /// Ob Intent-Signaturen überhaupt geprüft werden können (Signer da,
+    /// Programm gefunden und lauffähig).
+    pub(crate) fn can_check_intents(&self) -> bool {
+        self.keygen
+    }
+
+    fn build(
+        store: &'a dyn ContextStore,
+        signers: Option<&str>,
+        probe: impl FnOnce() -> bool,
+    ) -> Self {
         let file = trusted_signers_file(signers);
         let content = file.as_deref().and_then(|path| {
             let meta = std::fs::metadata(path).ok()?;
@@ -91,7 +134,7 @@ impl<'a> WitnessTrust<'a> {
             }
             std::fs::read_to_string(path).ok()
         });
-        let keygen = content.is_some() && minds_attest::ssh_keygen_available();
+        let keygen = content.is_some() && probe();
         Self {
             store,
             file,
@@ -106,7 +149,16 @@ impl<'a> WitnessTrust<'a> {
             anchor_keys: OnceCell::new(),
             anchor_program: Some(PathBuf::from("ssh-keygen")),
             anchor_error: RefCell::new(None),
+            intent_program: None,
         }
+    }
+
+    /// Prüft Intent-Signaturen mit genau diesem `ssh-keygen` (aufgelöst
+    /// außerhalb des Checkouts); `None`: keins gefunden — dann bleibt jede
+    /// Intent-Signatur ungeprüft (`NotChecked`).
+    fn with_intent_program(mut self, program: Option<PathBuf>) -> Self {
+        self.intent_program = Some(program);
+        self
     }
 
     /// Prüft Anker mit genau diesem `ssh-keygen` (aufgelöst außerhalb des
@@ -265,7 +317,11 @@ impl<'a> WitnessTrust<'a> {
             return *verdict;
         }
         let verdict = self.check_intent(anchor, signature);
-        self.intents.borrow_mut().insert(key, verdict);
+        // „Nicht geprüft" kann ein vorübergehender Prozessfehler sein — es
+        // wird beim nächsten Mal wieder versucht, nicht festgeschrieben.
+        if verdict != IntentSignature::NotChecked {
+            self.intents.borrow_mut().insert(key, verdict);
+        }
         verdict
     }
 
@@ -348,17 +404,23 @@ impl<'a> WitnessTrust<'a> {
     }
 
     fn check_intent(&self, anchor: &str, signature: &str) -> IntentSignature {
-        let (Some(path), Some(content), true) =
-            (self.file.as_deref(), self.content.as_deref(), self.keygen)
-        else {
+        let program = match &self.intent_program {
+            _ if !self.keygen => return IntentSignature::NotChecked,
+            None => PathBuf::from("ssh-keygen"),
+            Some(Some(program)) => program.clone(),
+            Some(None) => return IntentSignature::NotChecked,
+        };
+        let (Some(path), Some(content)) = (self.file.as_deref(), self.content.as_deref()) else {
             return IntentSignature::NotChecked;
         };
-        let Ok(principals) = minds_attest::ssh_find_principals(signature, path) else {
+        let Ok(principals) = minds_attest::ssh_find_principals_with(&program, signature, path)
+        else {
             return IntentSignature::NotChecked;
         };
         let valid = principals.iter().any(|principal| {
             intent_only(content, principal)
-                && minds_attest::ssh_verify_ns(
+                && minds_attest::ssh_verify_ns_with(
+                    &program,
                     anchor,
                     signature,
                     path,
@@ -425,6 +487,51 @@ fn signer_kind(key: Option<&minds_attest::SignatureKey>) -> SignerKind {
         }
         _ => SignerKind::SoftwareKey,
     }
+}
+
+/// Ein Fingerabdruck der vertrauenswürdigen Signer (ohne `--signers`): Pfad
+/// und Inhalt, begrenzt gelesen wie in [`WitnessTrust::new`]. Ändert er
+/// sich, gelten frühere Signatur-Urteile nicht mehr.
+pub(crate) fn signers_fingerprint() -> [u8; 32] {
+    signers_fingerprint_at(trusted_signers_file(None).as_deref())
+}
+
+/// [`signers_fingerprint`] für genau diese Datei. Gelesen ohne zu
+/// blockieren (kein FIFO hält auf), nur eine reguläre Datei, höchstens
+/// [`MAX_SIGNERS_BYTES`] — ein Symlink (etwa in ein Dotfile-Repo) zählt.
+pub(crate) fn signers_fingerprint_at(path: Option<&Path>) -> [u8; 32] {
+    use std::io::Read;
+    let mut hasher = blake3::Hasher::new();
+    let Some(path) = path else {
+        hasher.update(b"minds-signers-v1\0absent");
+        return *hasher.finalize().as_bytes();
+    };
+    hasher.update(b"minds-signers-v1\0present\0");
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher.update(&[0]);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let content = options
+        .open(path)
+        .ok()
+        .filter(|file| file.metadata().is_ok_and(|meta| meta.is_file()))
+        .and_then(|file| {
+            let mut bytes = Vec::new();
+            file.take(MAX_SIGNERS_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            (bytes.len() as u64 <= MAX_SIGNERS_BYTES).then_some(bytes)
+        });
+    match content {
+        Some(bytes) => hasher.update(&bytes),
+        None => hasher.update(b"unreadable"),
+    };
+    *hasher.finalize().as_bytes()
 }
 
 /// `--signers`, sonst `~/.ssh/allowed_signers` — nie aus der Repo-Konfiguration.
@@ -1053,5 +1160,80 @@ mod tests {
         let mixed =
             format!("ci@x namespaces=\"minds-anchor\" {KEY}\nother {OTHER}\nother2 {KEY}\n");
         assert!(!anchor_only(&mixed, "ci@x"));
+    }
+
+    /// Der Intent-Tab ohne `ssh-keygen` außerhalb des Checkouts: nichts wird
+    /// geprüft, auch wenn eines im PATH läge — und keine Probe über PATH.
+    #[test]
+    fn intents_without_a_resolved_program_are_not_checked_even_with_signers() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let store = minds_store::InRepoStore::open(dir.path()).unwrap();
+        let signers = dir.path().join("allowed_signers");
+        std::fs::write(&signers, format!("a@x namespaces=\"minds-intent\" {KEY}\n")).unwrap();
+        let trust = WitnessTrust::for_intents_with_signers(&store, signers.to_str(), None);
+        assert!(trust.content.is_some(), "signers were read");
+        assert!(!trust.can_check_intents());
+        assert_eq!(
+            trust.intent_signature("anchor", "-----BEGIN SSH SIGNATURE-----"),
+            IntentSignature::NotChecked
+        );
+    }
+
+    #[test]
+    fn intents_without_a_resolved_program_are_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let store = minds_store::InRepoStore::open(dir.path()).unwrap();
+        let trust = WitnessTrust::for_intents(&store, None);
+        assert!(!trust.keygen);
+        assert_eq!(
+            trust.intent_signature("anchor", "-----BEGIN SSH SIGNATURE-----"),
+            IntentSignature::NotChecked
+        );
+    }
+
+    /// Ändern sich die Signer, ändert sich der Fingerabdruck — dann baut der
+    /// Intent-Tab die Prüfung neu, statt alte Urteile zu zeigen.
+    #[test]
+    fn the_signers_fingerprint_follows_the_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("allowed_signers");
+        std::fs::write(&path, "a@x namespaces=\"minds-intent\" ssh-ed25519 AAAA\n").unwrap();
+        let first = signers_fingerprint_at(Some(&path));
+        std::fs::write(&path, "b@x namespaces=\"minds-intent\" ssh-ed25519 BBBB\n").unwrap();
+        assert_ne!(first, signers_fingerprint_at(Some(&path)));
+        assert_ne!(first, signers_fingerprint_at(None));
+    }
+
+    /// Ein FIFO an Stelle der Signer hält nicht auf.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_signers_file_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("allowed_signers");
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(raw.as_ptr(), 0o600) }, 0);
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(signers_fingerprint_at(Some(&fifo)));
+        });
+        receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("returns without blocking");
     }
 }

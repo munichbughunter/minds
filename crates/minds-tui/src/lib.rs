@@ -32,6 +32,7 @@ mod app;
 mod changes;
 mod filter;
 mod input;
+mod intent;
 mod layout;
 mod pipe;
 mod term;
@@ -137,6 +138,64 @@ pub trait Source {
     fn verify(&self, _commit: minds_git::CommitId) -> Result<CommitVerify, String> {
         Err("not available".into())
     }
+
+    /// Die Intent-Anker des Stores, geprüft wie `minds intent show` (Beleg)
+    /// und `minds verify` (Signatur gegen die vertrauenswürdigen Signer).
+    /// `named`: Anker, die Sessions nennen — immer dabei (fehlen sie im
+    /// Store, mit genau diesem Grund). `Err`: nicht lesbar, mit Grund.
+    fn intents(&self, _named: &[minds_core::ContentHash]) -> Result<IntentList, String> {
+        Err("not available".into())
+    }
+}
+
+/// Die Anker eines Durchgangs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentList {
+    /// Die gelesenen Anker (die genannten zuerst).
+    pub entries: Vec<IntentInfo>,
+    /// Wie viele Anker es gibt — mehr als `entries`, wenn die Quelle
+    /// gekappt hat.
+    pub total: usize,
+    /// Wie viele der `entries` das Byte-Budget übersprang (nicht gelesen).
+    pub skipped: usize,
+}
+
+/// Ein Intent-Anker für den Intent-Tab. Alle Texte entschärft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentInfo {
+    /// Die Anker-Id.
+    pub id: minds_core::ContentHash,
+    /// Ob die lokale Datei-Bindung (A1) auf ihn zeigt.
+    pub active: bool,
+    /// Der gelesene Anker — `Err` mit Grund, wenn er nicht (lesbar) im
+    /// Store liegt.
+    pub detail: Result<IntentDetail, String>,
+}
+
+/// Was ein lesbarer Anker sagt — und was davon geprüft ist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentDetail {
+    /// Die Quelle: `file:<pfad>@<blob>`, `issue:<projekt>#<iid>@<zeit>`,
+    /// `prompt` — jedes Zeichen sichtbar (Nicht-ASCII als `\u{…}`).
+    pub source: String,
+    /// Der Inhalts-Hash des (redigierten) Snapshots.
+    pub content: minds_core::ContentHash,
+    /// Der erklärte Bereich; leer: keiner erklärt.
+    pub scope: Vec<String>,
+    /// Nur `file:`: ob der Blob die Fassung in HEAD ist.
+    pub version: Option<String>,
+    /// Der Beleg wie `minds intent show` (Snapshot passt, bereinigt, Blob
+    /// stimmt) — `Err` mit festem Grund.
+    pub proof: Result<(), String>,
+    /// Die Signatur wie `minds verify` sie prüft.
+    pub signature: minds_reader::assurance::IntentSignature,
+    /// Die Länge des abgelegten Snapshots in Bytes.
+    pub snapshot_len: usize,
+    /// Der Snapshot, Zeile für Zeile entschärft — nur bei belegtem Anker
+    /// (ein unbelegter könnte gepflanzter Klartext sein).
+    pub snapshot: Option<Vec<String>>,
+    /// Ob der gezeigte Snapshot gekürzt ist (Zeilen oder Zeichen).
+    pub snapshot_clipped: bool,
 }
 
 /// Die Assurance einer Session, wie `minds verify` sie ausspricht.

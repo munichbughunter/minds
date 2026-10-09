@@ -490,6 +490,9 @@ pub enum WhyStep {
         constraints: Vec<String>,
         /// Verworfene Wege, entschärft.
         discarded: Vec<String>,
+        /// Der Anker, an den die Session sich gebunden nennt — ein Record,
+        /// ungeprüft ([`crate::intent::bound_anchor`]).
+        anchor: Option<crate::intent::BoundAnchor>,
     },
     /// Womit die Kante belegt ist.
     Evidence {

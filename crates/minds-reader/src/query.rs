@@ -514,6 +514,7 @@ impl Inspection {
                     .iter()
                     .map(|c| sanitize(c))
                     .collect(),
+                anchor: crate::intent::bound_anchor(session),
             },
         ]
     }

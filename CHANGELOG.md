@@ -19,6 +19,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Intent tab in `minds inspect` (F4).** It lists the intent anchors of the
+  store. For each one it shows source, content hash, declared scope, whether
+  a `file:` blob is the version in HEAD, and the proof as
+  `minds intent show` checks it. The signature is checked against the
+  trusted signers, as `minds verify` does. The snapshot is shown only when
+  the anchor is proven. It also shows which sessions name the anchor (as
+  recorded). The why chain links its INTENT step to the anchor: `Enter`
+  opens it in the Intent tab. *Why this line?* now also names anchors bound
+  by a witness event, not only by the local file.
+- On Unix, an `ssh-keygen` resolved outside the checkout (anchor checks of
+  `minds verify` and the Intent tab) now runs with an empty environment,
+  like its availability probe. `valid-before`/`valid-after` without a
+  zone are then read in the system time zone, not `TZ`.
+
 - **Why lines are unexplained.** `minds verify` and `minds inspect` no
   longer just say `not observed in the session`. They break unexplained
   lines down by what the linked sessions hold:

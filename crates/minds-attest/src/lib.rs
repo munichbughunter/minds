@@ -427,6 +427,20 @@ pub fn ssh_verify_ns(
     )
 }
 
+/// Ein Aufruf von genau diesem `ssh-keygen`: Ist es ein aufgelöster,
+/// absoluter Pfad, mit leerer Umgebung wie die Verfügbarkeitsprobe — es
+/// erbt nichts (`-Y verify`/`find-principals` brauchen keine).
+fn keygen_command(program: &Path) -> Command {
+    let mut command = Command::new(program);
+    // Nur unter Unix geprüft (ssh-keygen liest den Nutzer über getpwuid);
+    // Win32-OpenSSH braucht womöglich `SystemRoot` — dort bleibt alles
+    // beim Alten.
+    if cfg!(unix) && program.is_absolute() {
+        command.env_clear();
+    }
+    command
+}
+
 /// Wie [`ssh_verify_ns`], aber mit genau dem Programm `program` — für CI,
 /// wo `ssh-keygen` aufgelöst wird, bevor etwas aus dem Checkout läuft.
 pub fn ssh_verify_ns_with(
@@ -442,7 +456,7 @@ pub fn ssh_verify_ns_with(
     let dir = private_tempdir()?;
     let sig = dir.path().join("attest.sig");
     write_private(&sig, signature.as_bytes())?;
-    let mut child = Command::new(program)
+    let mut child = keygen_command(program)
         .args(["-Y", "verify", "-n", namespace, "-I", identity, "-f"])
         .arg(signers)
         .arg("-s")
@@ -497,7 +511,7 @@ pub fn ssh_find_principals_with(
         }
         let record = dir.path().join(format!("signers-{index}"));
         write_private(&record, format!("{line}\n").as_bytes())?;
-        let output = Command::new(program)
+        let output = keygen_command(program)
             .args(["-Y", "find-principals", "-f"])
             .arg(record)
             .arg("-s")

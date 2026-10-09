@@ -264,7 +264,7 @@ fn bind_issue(
 /// **ungefilterten** Bytes (`git hash-object --no-filters`): Mit Clean-
 /// Filtern (`core.autocrlf`, LFS) weicht er auch für eine unveränderte
 /// Datei ab — dann heißt es „nicht in HEAD", die schwächere Aussage.
-fn in_head(repo: &minds_git::Repo, path: &str, blob: &str) -> bool {
+pub(crate) fn in_head(repo: &minds_git::Repo, path: &str, blob: &str) -> bool {
     repo.head()
         .ok()
         .and_then(|head| head.commit())
@@ -941,16 +941,16 @@ fn load(ctx: &Context, id: &ContentHash) -> Fallible<StoredIntent> {
 }
 
 /// Die Kurzform eines Ankers für die Ausgabe.
-struct Summary {
+pub(crate) struct Summary {
     /// `file:docs/req.md@3f9c1e2a`
-    source: String,
+    pub(crate) source: String,
     /// `file:docs/req.md@3f9c1e2a  content b3-7a41…`
     intent: String,
     /// `src/sort/**, tests/**` oder `none`
     scope: String,
 }
 
-fn summary(anchor: &minds_core::intent_anchor::IntentAnchor) -> Summary {
+pub(crate) fn summary(anchor: &minds_core::intent_anchor::IntentAnchor) -> Summary {
     let source = match &anchor.source {
         IntentSource::File { path, blob } => {
             format!("file:{}@{}", visible(path), blob.get(..8).unwrap_or(blob))
@@ -984,7 +984,7 @@ fn summary(anchor: &minds_core::intent_anchor::IntentAnchor) -> Summary {
 /// Fremder Text so, dass jedes Zeichen sichtbar ist: entschärft und
 /// Nicht-ASCII als `\u{…}` — ein kyrillisches `а` im Pfad sieht sonst aus
 /// wie ein lateinisches.
-fn visible(text: &str) -> String {
+pub(crate) fn visible(text: &str) -> String {
     crate::text::sanitize(text)
         .chars()
         .map(|c| {
@@ -1006,7 +1006,7 @@ fn labeled(label: &str, value: &str) -> String {
 /// Liest eine Id-Datei — tolerant (Leerraum, Groß-/Kleinschreibung),
 /// begrenzt, nur eine reguläre Datei, ohne Symlinks zu folgen. Was keine Id
 /// ist, ist keine.
-fn read_id_file(path: &Path) -> Option<ContentHash> {
+pub(crate) fn read_id_file(path: &Path) -> Option<ContentHash> {
     let file = open_regular(path).ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;

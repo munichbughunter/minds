@@ -2336,10 +2336,11 @@ mod changes_tab {
         app.reduce(Action::TabTo(2));
         assert_eq!(app.tab, Tab::Changes);
         assert!(render(&mut app).contains("Changes unavailable") || app.changes.is_some());
+        assert!(out.contains("F4 Intent"), "{out}");
         app.reduce(Action::TabTo(0));
         assert_eq!(app.tab, Tab::Sessions);
         app.reduce(Action::CycleTab(false));
-        assert_eq!(app.tab, Tab::Changes);
+        assert_eq!(app.tab, Tab::Intent);
     }
 
     #[test]
@@ -3233,5 +3234,345 @@ mod verify_tab {
             ),
             "{out}"
         );
+    }
+}
+
+mod intent_tab {
+    use std::cell::{Cell, RefCell};
+
+    use minds_core::ContentHash;
+    use minds_core::intent_anchor::IntentEvent;
+    use minds_reader::assurance::{IntentSignature, SignerKind};
+    use minds_reader::model::WhyStep;
+
+    use super::*;
+    use crate::app::{Tab, View};
+    use crate::{IntentDetail, IntentInfo, IntentList};
+
+    fn anchor(byte: u8) -> ContentHash {
+        ContentHash::from_bytes([byte; 32])
+    }
+
+    /// Session a nennt Anker `a_names` per Witness-Event, Session b Anker 3
+    /// per lokaler Datei — den der Store nicht hat.
+    fn anchored_to(a_names: u8) -> Inspection {
+        let mut a = session("Fix retry handling", "2026-07-25T14:10:00Z");
+        a.intent_events.push(IntentEvent {
+            seq: 1,
+            anchor_id: anchor(a_names),
+            opens_session: true,
+        });
+        let mut b = session("Add exponential backoff", "2026-07-25T13:41:00Z");
+        b.intent_anchor = Some(anchor(3));
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid('a'), a);
+        sessions.insert(sid('b'), b);
+        let mut commits = BTreeMap::new();
+        commits.insert(commit('1'), vec![sid('a')]);
+        Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t")
+    }
+
+    fn anchored() -> Inspection {
+        anchored_to(1)
+    }
+
+    fn proven(byte: u8) -> IntentInfo {
+        IntentInfo {
+            id: anchor(byte),
+            active: byte == 1,
+            detail: Ok(IntentDetail {
+                source: "file:docs/req.md@3f9c1e2a".into(),
+                content: anchor(9),
+                scope: vec!["src/sort/**".into(), "tests/**".into()],
+                version: Some("the version in HEAD".into()),
+                proof: Ok(()),
+                signature: IntentSignature::Valid(SignerKind::SoftwareKey),
+                snapshot_len: 20,
+                snapshot: Some(vec!["AC1: sort by date".into()]),
+                snapshot_clipped: true,
+            }),
+        }
+    }
+
+    fn unproven(byte: u8) -> IntentInfo {
+        IntentInfo {
+            id: anchor(byte),
+            active: false,
+            detail: Ok(IntentDetail {
+                source: "prompt".into(),
+                content: anchor(8),
+                scope: Vec::new(),
+                version: None,
+                proof: Err("intent snapshot does not match its anchor".into()),
+                signature: IntentSignature::Unsigned,
+                snapshot_len: 11,
+                // Eine Quelle, die die Regel bräche: Der View zeigt ihn trotzdem nicht.
+                snapshot: Some(vec!["PLANTED_SECRET".into()]),
+                snapshot_clipped: false,
+            }),
+        }
+    }
+
+    /// Wie die echte Quelle: die Anker des Stores, genannte, die fehlen,
+    /// mit Grund.
+    struct Anchors {
+        asked: Cell<usize>,
+        store: RefCell<Vec<IntentInfo>>,
+        total: usize,
+    }
+
+    impl crate::Source for Anchors {
+        fn load(&self) -> minds_reader::Result<Inspection> {
+            Ok(anchored())
+        }
+        fn stamp(&self) -> Option<crate::Stamp> {
+            None
+        }
+        fn intents(&self, named: &[ContentHash]) -> Result<IntentList, String> {
+            self.asked.set(self.asked.get() + 1);
+            let mut entries = self.store.borrow().clone();
+            for id in named {
+                if !entries.iter().any(|i| &i.id == id) {
+                    entries.push(IntentInfo {
+                        id: id.clone(),
+                        active: false,
+                        detail: Err("not in this store".into()),
+                    });
+                }
+            }
+            Ok(IntentList {
+                total: self.total.max(entries.len()),
+                entries,
+                skipped: 0,
+            })
+        }
+    }
+
+    fn source() -> Anchors {
+        Anchors {
+            asked: Cell::new(0),
+            store: RefCell::new(vec![proven(1), unproven(2)]),
+            total: 0,
+        }
+    }
+
+    fn opened<'r>(repo: &'r Repo, source: &Anchors) -> App<'r> {
+        let mut app = App::new(anchored(), repo, None);
+        app.reduce(Action::TabTo(3));
+        app.fill_intents(source);
+        app
+    }
+
+    /// Liste und Detail: geprüfte Signatur, Beleg, Bereich, Snapshot und
+    /// wer sich an den Anker gebunden nennt — als Record.
+    #[test]
+    fn the_tab_shows_the_anchor_and_what_is_checked() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = opened(&repo, &source);
+        assert_eq!(app.tab, Tab::Intent);
+        assert_eq!(source.asked.get(), 1);
+        let out = render(&mut app);
+        assert!(out.contains("F4 Intent"), "{out}");
+        assert!(out.contains("✓ b3-01010101010"), "{out}");
+        assert!(out.contains("◉1"), "{out}");
+        assert!(out.contains("(local file)"), "{out}");
+        assert!(out.contains("valid (software key)"), "{out}");
+        assert!(out.contains("src/sort/**, tests/**"), "{out}");
+        assert!(out.contains("the version in HEAD"), "{out}");
+        assert!(out.contains("proof     ok"), "{out}");
+        assert!(out.contains("Sessions naming this anchor (1)"), "{out}");
+        assert!(out.contains("(witness event)"), "{out}");
+        assert!(out.contains("AC1: sort by date"), "{out}");
+        assert!(out.contains("… cut here — minds intent show"), "{out}");
+        assert!(!out.contains("anchors read"), "nothing cut: {out}");
+        // Einmal geholt, nicht je Frame.
+        app.fill_intents(&source);
+        assert_eq!(source.asked.get(), 1);
+    }
+
+    /// Ein unbelegter Anker: kein Snapshot — auch wenn die Quelle einen
+    /// mitgäbe —, der Grund steht da.
+    #[test]
+    fn an_unproven_anchor_hides_its_snapshot() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = opened(&repo, &source);
+        app.reduce(Action::Down);
+        let out = render(&mut app);
+        assert!(
+            out.contains("NOT PROVEN — intent snapshot does not match its anchor"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Snapshot (11 bytes) not shown — the anchor is not proven"),
+            "{out}"
+        );
+        assert!(!out.contains("PLANTED_SECRET"), "{out}");
+        assert!(out.contains("scope     none declared"), "{out}");
+        assert!(out.contains("signature none"), "{out}");
+        assert!(out.contains("not the local file binding (A1)"), "{out}");
+    }
+
+    /// Ein Anker, den eine Session nennt, der Store aber nicht hat: gezeigt,
+    /// mit dem Grund der Quelle.
+    #[test]
+    fn an_anchor_missing_from_the_store_is_listed() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = opened(&repo, &source);
+        app.reduce(Action::End);
+        let out = render(&mut app);
+        assert!(out.contains("not in this store"), "{out}");
+        assert!(
+            out.contains("(local file)  Add exponential backoff"),
+            "{out}"
+        );
+    }
+
+    /// Gekappt: Der Tab sagt, wie viele er las.
+    #[test]
+    fn a_cut_list_says_so() {
+        let (_dir, repo) = repo();
+        let mut source = source();
+        source.total = 700;
+        let mut app = opened(&repo, &source);
+        let out = render(&mut app);
+        assert!(out.contains("3 of 700 anchors read"), "{out}");
+    }
+
+    /// Nach einem Neuladen gilt nichts mehr als geprüft, bis neu geholt ist.
+    #[test]
+    fn after_a_reload_nothing_is_shown_as_checked_until_rechecked() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = opened(&repo, &source);
+        app.stamp = Some(crate::Stamp {
+            head: "h".into(),
+            refs: "1".into(),
+        });
+        app.reload(
+            Ok(anchored()),
+            Some(crate::Stamp {
+                head: "h".into(),
+                refs: "2".into(),
+            }),
+            now(),
+        );
+        let out = render(&mut app);
+        assert!(!out.contains("valid (software key)"), "{out}");
+        assert!(!out.contains("AC1: sort by date"), "{out}");
+        assert!(!out.contains("the version in HEAD"), "{out}");
+        assert!(!out.contains("✓ b3-"), "{out}");
+        assert!(out.contains("rechecking…"), "{out}");
+        // Von selbst gedrosselt, dann wieder geprüft.
+        let state = app.intent.as_ref().unwrap();
+        let every = std::time::Duration::from_secs(5);
+        assert!(!state.due(std::time::Duration::from_secs(1), every));
+        assert!(state.due(every, every));
+        app.fill_intents(&source);
+        assert!(render(&mut app).contains("valid (software key)"));
+    }
+
+    /// Ein verdeckter Tab fragt die Quelle nicht.
+    #[test]
+    fn a_hidden_tab_does_not_ask() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = App::new(anchored(), &repo, None);
+        app.fill_intents(&source);
+        assert_eq!(source.asked.get(), 0);
+    }
+
+    /// Enter auf einem Anker: der Graph einer Session, die ihn nennt.
+    #[test]
+    fn enter_opens_the_graph_of_a_session_naming_the_anchor() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = opened(&repo, &source);
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Sessions);
+        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
+    }
+
+    /// In der Why-Kette ist der Anker ein Glied: Enter öffnet ihn im
+    /// Intent-Tab, auf genau diesem Anker — hier dem zweiten der Liste.
+    #[test]
+    fn the_why_chain_links_to_the_anchor() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = App::new(anchored_to(2), &repo, Some("Fix retry".into()));
+        app.reduce(Action::Why);
+        let out = render(&mut app);
+        assert!(out.contains("Anchor b3-02020202020"), "{out}");
+        assert!(out.contains("(witness event, as recorded)"), "{out}");
+        let at_intent = |app: &App| {
+            matches!(
+                app.top(),
+                Some(View::Why { chain, cursor, .. })
+                    if matches!(chain.steps.get(*cursor), Some(WhyStep::Intent { .. }))
+            )
+        };
+        for _ in 0..10 {
+            if at_intent(&app) {
+                break;
+            }
+            app.reduce(Action::Down);
+        }
+        assert!(at_intent(&app), "the cursor reaches the INTENT step");
+        app.reduce(Action::Enter);
+        assert_eq!(app.tab, Tab::Intent);
+        app.fill_intents(&source);
+        let state = app.intent.as_ref().unwrap();
+        assert_eq!(state.selected().map(|i| i.id.clone()), Some(anchor(2)));
+        // Der Stapel bleibt: zurück im Sessions-Tab steht die Kette noch.
+        app.reduce(Action::TabTo(0));
+        assert!(matches!(app.top(), Some(View::Why { .. })));
+        // Ein zweites Öffnen bei bestehendem Tab wählt sofort.
+        app.open_intent(Some(anchor(1)));
+        let state = app.intent.as_ref().unwrap();
+        assert_eq!(state.selected().map(|i| i.id.clone()), Some(anchor(1)));
+    }
+
+    /// Viele Anker: Das Fenster folgt dem Cursor, ▸ bleibt sichtbar.
+    #[test]
+    fn the_list_scrolls_with_the_cursor() {
+        let (_dir, repo) = repo();
+        let source = source();
+        source.store.replace((10..90).map(proven).collect());
+        let mut app = opened(&repo, &source);
+        app.reduce(Action::End);
+        let out = render(&mut app);
+        // Das Fenster folgt: der letzte Anker zu sehen, der erste nicht.
+        assert!(out.contains("b3-5959595959"), "{out}");
+        assert!(!out.contains("b3-0a0a0a0a0a"), "{out}");
+    }
+
+    /// Lange, umbrochene Snapshot-Zeilen: PgDn erreicht das Ende — die
+    /// Grenze zählt gerenderte Zeilen, nicht logische.
+    #[test]
+    fn the_detail_scrolls_to_the_end_of_wrapped_lines() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut long = proven(1);
+        if let Ok(detail) = &mut long.detail {
+            let mut lines: Vec<String> = (0..30)
+                .map(|i| format!("{i:02} {}", "word ".repeat(60)))
+                .collect();
+            lines.push("THE LAST LINE".into());
+            detail.snapshot = Some(lines);
+        }
+        source.store.replace(vec![long]);
+        let mut app = opened(&repo, &source);
+        render_at(&mut app, 120);
+        for _ in 0..200 {
+            app.reduce(Action::PageDown);
+        }
+        let out = render_at(&mut app, 120);
+        assert!(out.contains("… cut here"), "{out}");
+        // Eine Seite zurück bewegt sofort.
+        app.reduce(Action::PageUp);
+        let back = render_at(&mut app, 120);
+        assert_ne!(out, back);
     }
 }

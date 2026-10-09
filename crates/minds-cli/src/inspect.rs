@@ -53,6 +53,7 @@ fn inspect(target: Option<&str>) -> Fallible<()> {
                 let cwd = std::env::current_dir().map_err(|_| "no working directory")?;
                 pin_exe(&exe, &ctx.root, &cwd)
             }),
+        intents: IntentCache::default(),
     };
     let opts = match target.and_then(split) {
         Some((path, line)) => Options {
@@ -82,6 +83,8 @@ struct Live<'a> {
     /// im Verify-Tab. `Err` (Tests, Binary im Checkout): kein Urteil, der Tab
     /// sagt „not checked" mit diesem Grund.
     exe: Result<PinnedExe, &'static str>,
+    /// Was der Intent-Tab über Durchgänge hinweg behält.
+    intents: IntentCache<'a>,
 }
 
 impl Source for Live<'_> {
@@ -102,6 +105,298 @@ impl Source for Live<'_> {
         verify_commit(self.ctx, commit, self.exe.as_ref().map_err(|why| *why))
             .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
+
+    fn intents(&self, named: &[minds_core::ContentHash]) -> Result<minds_tui::IntentList, String> {
+        intent_infos(self.ctx, &self.intents, named)
+            .map_err(|err| minds_reader::sanitize(&err.to_string()))
+    }
+}
+
+/// So viele Anker liest der Intent-Tab höchstens — der Store gehört
+/// womöglich dem Agenten. Anker, die eine Session nennt, liest er immer.
+const MAX_INTENTS: usize = 500;
+
+/// So viele Bytes (Anker und Snapshot) liest ein Durchgang etwa höchstens
+/// — geprüft vor jedem Anker, der letzte kann es überschreiten; darüber
+/// stehen die übrigen als „nicht gelesen" da, nie als belegt oder gültig.
+const INTENT_BUDGET: usize = 64 * 1024 * 1024;
+
+/// So viele Snapshot-Zeilen zeigt der Tab höchstens.
+const SNAPSHOT_LINES: usize = 400;
+
+/// So viele Zeichen je Snapshot-Zeile (vor und nach dem Entschärfen).
+const SNAPSHOT_CHARS: usize = 400;
+
+/// Eine Signaturprüfung des Intent-Tabs: für welche Signer, seit wann.
+type BuiltTrust<'a> = (
+    [u8; 32],
+    std::time::Instant,
+    std::rc::Rc<crate::verify_cmd::witness_trust::WitnessTrust<'a>>,
+);
+
+/// Der Grund eines Ankers, den das Byte-Budget übersprang.
+const NOT_READ: &str = "not read — the byte budget of this pass is used up";
+
+/// So lange gelten Signatur-Urteile des Intent-Tabs höchstens.
+const TRUST_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// So groß darf die Redaction-Policy für den Intent-Tab höchstens sein.
+const MAX_POLICY: u64 = 1024 * 1024;
+
+/// Was der Intent-Tab über Durchgänge hinweg behält: das `ssh-keygen`
+/// (einmal außerhalb des Checkouts aufgelöst), die Signaturprüfung samt
+/// Urteils-Cache — neu gebaut, sobald sich die Signer ändern — und die
+/// Belege je (Policy, Anker-Fassung): Die Redaction läuft je Fassung einmal,
+/// eine geänderte Policy prüft neu.
+#[derive(Default)]
+struct IntentCache<'a> {
+    program: std::cell::OnceCell<Option<std::path::PathBuf>>,
+    trust: std::cell::RefCell<Option<BuiltTrust<'a>>>,
+    proofs: std::cell::RefCell<std::collections::HashMap<[u8; 32], Result<(), &'static str>>>,
+}
+
+/// Die Redaction-Policy des Repos für den Intent-Tab — wie
+/// [`crate::config::load_redaction`], aber nur eine reguläre Datei, ohne zu
+/// blockieren (kein FIFO hält die Oberfläche auf), höchstens
+/// [`MAX_POLICY`] Bytes. Dazu ihr Fingerabdruck.
+fn intent_policy(root: &std::path::Path) -> Fallible<(minds_redact::RedactionConfig, [u8; 32])> {
+    use std::io::Read;
+    let path = root.join(crate::config::REDACT_CONFIG);
+    let file = match crate::checkpoint::core::open_regular(&path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                minds_redact::RedactionConfig::default(),
+                *blake3::hash(b"minds-policy-v1\0absent").as_bytes(),
+            ));
+        }
+        Err(_) => return Err("the redaction policy is not a readable regular file".into()),
+    };
+    if !file.metadata()?.is_file() {
+        return Err("the redaction policy is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_POLICY + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_POLICY {
+        return Err("the redaction policy is too large".into());
+    }
+    let fingerprint = {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"minds-policy-v1\0present\0");
+        hasher.update(&bytes);
+        *hasher.finalize().as_bytes()
+    };
+    Ok((crate::config::parse_redaction(&bytes)?, fingerprint))
+}
+
+/// Die Anker des Stores für den Intent-Tab — geprüft wie `minds intent
+/// show` (Beleg, gegen die Redaction-Policy des Repos) und, für die
+/// Signatur, wie `minds verify` ohne `--signers` (gegen
+/// `~/.ssh/allowed_signers`, Namensraum `minds-intent`) — mit einem
+/// Unterschied: Geprüft wird nur mit einem `ssh-keygen` außerhalb des
+/// Checkouts; gibt es keins, bleibt die Signatur ungeprüft. Ein unbelegter
+/// Snapshot wird nicht mitgegeben. `named`: Anker, die Sessions nennen —
+/// immer gelistet, vor der Grenze [`MAX_INTENTS`]; das Byte-Budget gilt
+/// auch für sie (sie kommen zuerst dran). Strikt lesend.
+fn intent_infos<'a>(
+    ctx: &'a Context,
+    cache: &IntentCache<'a>,
+    named: &[minds_core::ContentHash],
+) -> Fallible<minds_tui::IntentList> {
+    intent_infos_with(ctx, cache, named, MAX_INTENTS, INTENT_BUDGET)
+}
+
+/// [`intent_infos`] mit ausdrücklichen Grenzen (Tests).
+fn intent_infos_with<'a>(
+    ctx: &'a Context,
+    cache: &IntentCache<'a>,
+    named: &[minds_core::ContentHash],
+    limit: usize,
+    budget: usize,
+) -> Fallible<minds_tui::IntentList> {
+    use std::collections::{BTreeSet, HashMap};
+
+    use minds_core::intent_anchor::IntentSource;
+    use minds_reader::assurance::IntentSignature;
+
+    let store = ctx.store.as_ref();
+    let (policy, policy_print) = intent_policy(&ctx.root)?;
+    let pipeline = policy.pipeline()?;
+    let program = cache
+        .program
+        .get_or_init(|| {
+            std::env::var("PATH")
+                .ok()
+                .and_then(|path| crate::replay_cmd::find_ssh_keygen(&path, &ctx.root))
+        })
+        .clone();
+    // Die Signer je Durchgang: geändert → neue Prüfung, alte Urteile weg.
+    // Spätestens nach `TRUST_TTL` ohnehin (ein `valid-before` läuft ab).
+    let signers = crate::verify_cmd::witness_trust::signers_fingerprint();
+    let trust = {
+        let mut slot = cache.trust.borrow_mut();
+        match slot.as_ref() {
+            Some((print, built, trust)) if *print == signers && built.elapsed() < TRUST_TTL => {
+                std::rc::Rc::clone(trust)
+            }
+            _ => {
+                let trust = std::rc::Rc::new(
+                    crate::verify_cmd::witness_trust::WitnessTrust::for_intents(store, program),
+                );
+                // Eine gescheiterte Probe wird nicht festgehalten: Der
+                // nächste Durchgang versucht es wieder.
+                *slot = trust.can_check_intents().then(|| {
+                    (
+                        signers,
+                        std::time::Instant::now(),
+                        std::rc::Rc::clone(&trust),
+                    )
+                });
+                trust
+            }
+        }
+    };
+    let active = crate::intent_cmd::read_id_file(
+        &ctx.repo
+            .git_dir()
+            .join(crate::checkpoint::core::ACTIVE_INTENT_FILE),
+    );
+    let listed = store.list_intents()?;
+    let in_store: BTreeSet<&minds_core::ContentHash> = listed.iter().collect();
+    // Erst die genannten (immer), dann der Rest bis zur Grenze.
+    let mut seen: BTreeSet<minds_core::ContentHash> = BTreeSet::new();
+    let mut ids: Vec<minds_core::ContentHash> = Vec::new();
+    for id in named {
+        if seen.insert(id.clone()) {
+            ids.push(id.clone());
+        }
+    }
+    let total = listed.len() + ids.iter().filter(|id| !in_store.contains(id)).count();
+    let cap = limit.max(ids.len());
+    for id in &listed {
+        if ids.len() >= cap {
+            break;
+        }
+        if seen.insert(id.clone()) {
+            ids.push(id.clone());
+        }
+    }
+    let mut spent = 0usize;
+    let mut used: HashMap<[u8; 32], Result<(), &'static str>> = HashMap::new();
+    let mut entries = Vec::new();
+    for id in ids {
+        let detail = if spent >= budget {
+            Err(NOT_READ.to_string())
+        } else {
+            match store.get_intent(&id) {
+                Ok(Some(stored)) => {
+                    spent = spent
+                        .saturating_add(stored.text.len())
+                        .saturating_add(stored.snapshot.len());
+                    let summary = crate::intent_cmd::summary(&stored.anchor);
+                    let version = match &stored.anchor.source {
+                        IntentSource::File { path, blob } => {
+                            // Zählt das HEAD-Blob mit, das `in_head` liest —
+                            // als Obergrenze die Snapshot-Länge.
+                            spent = spent.saturating_add(stored.snapshot.len());
+                            Some(
+                                if crate::intent_cmd::in_head(&ctx.repo, path, blob) {
+                                    "the version in HEAD"
+                                } else {
+                                    "a working-tree version, not the one in HEAD"
+                                }
+                                .to_string(),
+                            )
+                        }
+                        _ => None,
+                    };
+                    // Der Beleg je Policy und Fassung (Ankertext, Snapshot)
+                    // einmal — eine geänderte Policy prüft neu.
+                    let key = {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(&policy_print);
+                        hasher.update(&(stored.text.len() as u64).to_le_bytes());
+                        hasher.update(stored.text.as_bytes());
+                        hasher.update(&stored.snapshot);
+                        *hasher.finalize().as_bytes()
+                    };
+                    let proof = *cache.proofs.borrow_mut().entry(key).or_insert_with(|| {
+                        crate::intent_proof::proven_stored(&stored, &ctx.repo, &pipeline)
+                    });
+                    used.insert(key, proof);
+                    let signature = match store.intent_signature(&id) {
+                        Ok(None) => IntentSignature::Unsigned,
+                        Ok(Some(signature)) => trust.intent_signature(&stored.text, &signature),
+                        // Wie `verify`: eine unlesbare Signatur ist ungültig.
+                        Err(_) => IntentSignature::Invalid,
+                    };
+                    // Ein unbelegter Snapshot kann gepflanzter Klartext sein.
+                    let text = String::from_utf8_lossy(&stored.snapshot);
+                    let mut snapshot_clipped = text.lines().count() > SNAPSHOT_LINES;
+                    let snapshot = proof.is_ok().then(|| {
+                        text.lines()
+                            .take(SNAPSHOT_LINES)
+                            .map(|line| {
+                                // Tabs wie im Diff als Leerzeichen, dann
+                                // entschärft; gekürzt wird nach dem
+                                // Entschärfen (das verlängert) — und gesagt.
+                                let line: String = line.chars().take(SNAPSHOT_CHARS * 2).collect();
+                                let shown = minds_reader::sanitize(&line.replace('\t', "    "));
+                                if shown.chars().count() > SNAPSHOT_CHARS {
+                                    snapshot_clipped = true;
+                                    let cut: String =
+                                        shown.chars().take(SNAPSHOT_CHARS - 1).collect();
+                                    format!("{cut}…")
+                                } else {
+                                    shown
+                                }
+                            })
+                            .collect()
+                    });
+                    Ok(minds_tui::IntentDetail {
+                        source: summary.source,
+                        content: stored.anchor.content.clone(),
+                        scope: stored
+                            .anchor
+                            .scope
+                            .iter()
+                            .map(|glob| crate::intent_cmd::visible(glob))
+                            .collect(),
+                        version,
+                        proof: proof.map_err(str::to_string),
+                        signature,
+                        snapshot_len: stored.snapshot.len(),
+                        snapshot,
+                        snapshot_clipped,
+                    })
+                }
+                Ok(None) => Err("not in this store".to_string()),
+                Err(_) => Err("unreadable or altered in the store".to_string()),
+            }
+        };
+        entries.push(minds_tui::IntentInfo {
+            active: active.as_ref() == Some(&id),
+            id,
+            detail,
+        });
+    }
+    // Nur die Belege dieses Durchgangs bleiben — der Cache wächst nicht mit
+    // jeder Fassung, die der Agent schreibt.
+    *cache.proofs.borrow_mut() = used;
+    let skipped = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .detail
+                .as_ref()
+                .is_err_and(|why| why.as_str() == NOT_READ)
+        })
+        .count();
+    Ok(minds_tui::IntentList {
+        entries,
+        total,
+        skipped,
+    })
 }
 
 /// Das signaturabhängige Urteil über `commit` — dieselben Bausteine wie
@@ -618,6 +913,213 @@ mod tests {
         assert_ne!(stamp(&repo, &store).unwrap(), before);
     }
 
+    /// Der Intent-Tab gegen einen echten Store: ein belegter, unsignierter
+    /// Anker mit Bereich und Snapshot — geprüft wie `minds intent show`.
+    #[test]
+    fn intent_infos_read_and_prove_the_anchors() {
+        use minds_core::intent_anchor::IntentSource;
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        let intent = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_intent(
+                IntentSource::Prompt,
+                vec!["src/**".into()],
+                b"AC1: sort by date\n".to_vec(),
+            )
+            .unwrap();
+        let id = store.put_intent(&intent).unwrap();
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let cache = super::IntentCache::default();
+        let missing = minds_core::ContentHash::from_bytes([7; 32]);
+        let list = super::intent_infos(&ctx, &cache, std::slice::from_ref(&missing)).unwrap();
+        assert_eq!(list.total, 2);
+        // Der genannte, fehlende Anker zuerst — mit Grund.
+        assert_eq!(list.entries[0].id, missing);
+        assert_eq!(
+            list.entries[0].detail.as_ref().err().map(String::as_str),
+            Some("not in this store")
+        );
+        let infos = &list.entries[1..];
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, id);
+        assert!(!infos[0].active);
+        let detail = infos[0].detail.as_ref().unwrap();
+        assert_eq!(detail.source, "prompt");
+        assert_eq!(detail.scope, ["src/**"]);
+        assert_eq!(detail.proof, Ok(()));
+        assert_eq!(
+            detail.signature,
+            minds_reader::assurance::IntentSignature::Unsigned
+        );
+        assert_eq!(
+            detail.snapshot.as_deref(),
+            Some(&["AC1: sort by date".to_string()][..])
+        );
+    }
+
+    /// Das echte Gate: Ein `file:`-Anker, dessen Blob-Id nicht die
+    /// Snapshot-Bytes hasht, ist nicht belegt — sein Snapshot kommt nicht
+    /// mit.
+    #[test]
+    fn an_unproven_anchor_never_carries_its_snapshot() {
+        use minds_core::intent_anchor::IntentSource;
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        let intent = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_intent(
+                IntentSource::File {
+                    path: "docs/req.md".into(),
+                    blob: "0".repeat(40),
+                },
+                Vec::new(),
+                b"PLANTED\n".to_vec(),
+            )
+            .unwrap();
+        store.put_intent(&intent).unwrap();
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let list = super::intent_infos(&ctx, &super::IntentCache::default(), &[]).unwrap();
+        let detail = list.entries[0].detail.as_ref().unwrap();
+        assert!(detail.proof.is_err(), "{:?}", detail.proof);
+        assert!(detail.snapshot.is_none());
+        assert_eq!(
+            detail.version.as_deref(),
+            Some("a working-tree version, not the one in HEAD")
+        );
+    }
+
+    /// Ein belegter Prompt-Anker im Store des Test-Repos.
+    fn prompt_anchor(store: &InRepoStore, text: &[u8]) -> minds_core::ContentHash {
+        let intent = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_intent(
+                minds_core::intent_anchor::IntentSource::Prompt,
+                Vec::new(),
+                text.to_vec(),
+            )
+            .unwrap();
+        store.put_intent(&intent).unwrap()
+    }
+
+    /// Verschärft der Nutzer die Policy, gilt ein früherer Beleg nicht mehr:
+    /// derselbe Cache prüft neu — kein Snapshot.
+    #[test]
+    fn a_tightened_policy_rechecks_the_proof() {
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        prompt_anchor(&store, b"Ticket ZEBRA-42: sort by date\n");
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let cache = super::IntentCache::default();
+        let first = super::intent_infos(&ctx, &cache, &[]).unwrap();
+        assert_eq!(first.entries[0].detail.as_ref().unwrap().proof, Ok(()));
+        std::fs::create_dir_all(dir.path().join(".minds")).unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::REDACT_CONFIG),
+            r#"{"deny_secrets": ["ZEBRA-42"]}"#,
+        )
+        .unwrap();
+        let second = super::intent_infos(&ctx, &cache, &[]).unwrap();
+        let detail = second.entries[0].detail.as_ref().unwrap();
+        assert!(detail.proof.is_err(), "{:?}", detail.proof);
+        assert!(detail.snapshot.is_none());
+    }
+
+    /// Ein FIFO als Policy hält den Tab nicht auf: sofort ein Fehler.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_policy_does_not_block() {
+        let dir = code_repo();
+        std::fs::create_dir_all(dir.path().join(".minds")).unwrap();
+        let fifo = dir.path().join(crate::config::REDACT_CONFIG);
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let root = dir.path().to_path_buf();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = send.send(super::intent_policy(&root).is_err());
+        });
+        let failed = receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("returns without blocking");
+        assert!(failed);
+    }
+
+    /// Grenze und Budget: Ein genannter Anker wird immer gelesen, die
+    /// Gesamtzahl stimmt, über dem Budget steht „not read" — nie belegt.
+    #[test]
+    fn named_anchors_pass_the_limit_and_the_budget_marks_the_rest() {
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        let a = prompt_anchor(&store, b"first\n");
+        let b = prompt_anchor(&store, b"second\n");
+        let c = prompt_anchor(&store, b"third\n");
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let cache = super::IntentCache::default();
+        let named = [c.clone()];
+        let list = super::intent_infos_with(&ctx, &cache, &named, 1, usize::MAX).unwrap();
+        assert_eq!(list.total, 3);
+        assert_eq!(list.entries.len(), 1);
+        assert_eq!(list.entries[0].id, c);
+        assert!(list.entries.iter().all(|e| e.id != a && e.id != b));
+        let list = super::intent_infos_with(&ctx, &cache, &[], 10, 1).unwrap();
+        assert_eq!(list.entries.len(), 3);
+        assert!(list.entries[0].detail.is_ok());
+        for entry in &list.entries[1..] {
+            assert_eq!(
+                entry.detail.as_ref().err().map(String::as_str),
+                Some("not read — the byte budget of this pass is used up")
+            );
+        }
+        // Nur die Belege dieses Durchgangs bleiben im Cache.
+        assert_eq!(cache.proofs.borrow().len(), 1);
+    }
+
+    /// Gekürzt wird an der Quelle: höchstens 400 Zeilen, Tabs als Leerzeichen,
+    /// nach dem Entschärfen auf 400 Zeichen mit „…" — und gesagt.
+    #[test]
+    fn the_snapshot_is_clipped_at_the_source_and_says_so() {
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        let mut text = format!("{}\n", "\t".repeat(250));
+        for i in 0..410 {
+            text.push_str(&format!("line {i}\n"));
+        }
+        prompt_anchor(&store, text.as_bytes());
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let list = super::intent_infos(&ctx, &super::IntentCache::default(), &[]).unwrap();
+        let detail = list.entries[0].detail.as_ref().unwrap();
+        assert!(detail.snapshot_clipped);
+        let snapshot = detail.snapshot.as_ref().unwrap();
+        assert_eq!(snapshot.len(), 400);
+        assert_eq!(snapshot[0].chars().count(), 400);
+        assert!(snapshot[0].ends_with('…'));
+        assert!(!snapshot[0].contains('\t'));
+    }
+
     /// Der signaturabhängige Teil des Verify-Tabs gegen ein echtes Repo: Die
     /// Session am Trailer wird gefunden und bewertet; ohne gebundenen Intent
     /// sagt der Scope, warum er nicht geprüft wurde.
@@ -715,6 +1217,7 @@ mod tests {
             reviews: &reviews,
             name: "probe",
             exe: Err("not available"),
+            intents: super::IntentCache::default(),
         };
         let before = live.stamp();
         assert!(live.load().unwrap().cards().is_empty());
