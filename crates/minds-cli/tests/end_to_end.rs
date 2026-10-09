@@ -3925,8 +3925,9 @@ fn verify_lists_unexplained_ranges() {
         coverage_block(&text),
         format!(
             "Coverage       complete within the boundary ({BOUNDARY} · 0 gaps · artifact 4/7 lines explained)\n  \
-             unexplained    src/sort/merge.rs:2    not observed in the session\n  \
-             unexplained    src/sort/merge.rs:4-5  not observed in the session\n  \
+             why            3 unexplained line(s): 3 whose last agent claim is another version or a deletion\n  \
+             unexplained    src/sort/merge.rs:2    the agent's last write or delete of the file shows another version\n  \
+             unexplained    src/sort/merge.rs:4-5  the agent's last write or delete of the file shows another version\n  \
              file only      Cargo.lock             line level unavailable (binary)"
         )
     );
@@ -3956,26 +3957,31 @@ fn verify_detail_lines_are_capped() {
     let capped = stdout(&minds(dir, &["verify"], None));
     let block = coverage_block(&capped);
     let details: Vec<&str> = block.lines().skip(1).collect();
-    assert_eq!(details.len(), 21, "{block}");
+    // Die Aufschlüsselung zuerst, dann 20 Stellen und der Hinweis.
+    assert_eq!(details.len(), 22, "{block}");
     assert_eq!(
         details[0],
-        "  unexplained    big.rs:2   not observed in the session"
+        "  why            25 unexplained line(s): 25 whose last agent claim is another version or a deletion"
     );
     assert_eq!(
-        details[20],
+        details[1],
+        "  unexplained    big.rs:2   the agent's last write or delete of the file shows another version"
+    );
+    assert_eq!(
+        details[21],
         format!("  … 5 more (minds verify {} --all)", sha.trim())
     );
     // Der Hinweis wiederholt genau diesen Abgleich, ungekappt.
     let rerun = stdout(&minds(dir, &["verify", sha.trim(), "--all"], None));
-    assert_eq!(coverage_block(&rerun).lines().count(), 26);
+    assert_eq!(coverage_block(&rerun).lines().count(), 27);
     assert!(block.contains("artifact 25/50 lines explained"), "{block}");
 
     let all = stdout(&minds(dir, &["verify", "--all"], None));
     let block = coverage_block(&all);
     let details: Vec<&str> = block.lines().skip(1).collect();
-    assert_eq!(details.len(), 25, "{block}");
+    assert_eq!(details.len(), 26, "{block}");
     assert!(!block.contains("more ("), "{block}");
-    assert!(details[24].contains("big.rs:50"), "{block}");
+    assert!(details[25].contains("big.rs:50"), "{block}");
 }
 
 #[test]
@@ -4193,7 +4199,9 @@ fn verify_gate_resists_unverified_claims_and_weightless_changes() {
     assert!(
         text.lines()
             .any(|l| l.starts_with("  unexplained    big.txt ")
-                && l.ends_with("not observed in the session; line level unavailable (too large)")),
+                && l.ends_with(
+                    "no tool claim or shell mention found; line level unavailable (too large)"
+                )),
         "{text}"
     );
 }
@@ -4314,7 +4322,9 @@ fn verify_gate_sees_removals_submodules_modes_and_ambiguity() {
     let text = stdout(&out);
     assert_eq!(out.status.code(), Some(2), "{text}");
     assert!(
-        text.contains("  unexplained    auth.rs     removed lines not observed in the session\n"),
+        text.contains(
+            "  unexplained    auth.rs     removed lines — the agent's last write or delete of the file shows another version\n"
+        ),
         "{text}"
     );
 

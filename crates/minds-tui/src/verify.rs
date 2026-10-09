@@ -16,7 +16,7 @@ use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::artifact::{ArtifactState, roots_of};
 use minds_reader::model::{EvidenceReport, EvidenceVerdict, ReviewState};
-use minds_reader::reconcile::{LineLevel, ReconClass, Reconciliation};
+use minds_reader::reconcile::{GapCounts, LineLevel, ReconClass, Reconciliation};
 
 use crate::CommitVerify;
 
@@ -31,6 +31,8 @@ pub struct ClassCounts {
     pub reported: u64,
     /// ◦ ohne Beleg.
     pub unexplained: u64,
+    /// Die unerklärten Zeilen nach ihrem Grund.
+    pub gaps: GapCounts,
 }
 
 impl ClassCounts {
@@ -54,6 +56,7 @@ impl ClassCounts {
             ReconClass::ReportedOnly => counts.reported += n,
             ReconClass::Unexplained => counts.unexplained += n,
         };
+        counts.gaps = recon.unexplained_by_gap();
         for file in &recon.files {
             match &file.line_level {
                 LineLevel::Available(lines) => {

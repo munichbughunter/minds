@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 use minds_core::Session;
 use minds_git::CommitId;
-use minds_reader::artifact::{NOT_OBSERVED, Structural, range_text, ranges, root_spellings};
+use minds_reader::artifact::{
+    NOT_OBSERVED, Structural, gap_summary, range_text, ranges, root_spellings,
+};
 use minds_reader::reconcile::{FileRecon, LineLevel, ReconClass, Reconciliation};
 
 use crate::context::Context;
@@ -178,6 +180,17 @@ impl Artifact {
     /// Die Detailzeilen, gekappt auf [`DETAIL_CAP`] (außer mit `--all`).
     pub(super) fn detail_lines(&self) -> Vec<String> {
         let details = details(&self.recon.files, &self.structural);
+        // Zuerst, warum Zeilen fehlen — die Antwort auf „warum nicht 100 %?".
+        // Eigene Art `why`: Wer `^  unexplained` als Pfad liest, liest sie
+        // nicht falsch.
+        let gaps = self.recon.unexplained_by_gap();
+        let why = gap_summary(&gaps).map(|summary| {
+            format!(
+                "  {:<KIND_WIDTH$}{} unexplained line(s): {summary}",
+                "why",
+                gaps.total()
+            )
+        });
         let shown = if self.all {
             &details[..]
         } else {
@@ -188,14 +201,14 @@ impl Artifact {
             .map(|d| d.location.chars().count())
             .max()
             .unwrap_or(0);
-        let mut lines: Vec<String> = shown
-            .iter()
-            .map(|d| {
+        let mut lines: Vec<String> = why
+            .into_iter()
+            .chain(shown.iter().map(|d| {
                 format!(
                     "  {:<KIND_WIDTH$}{:<width$}  {}",
                     d.kind, d.location, d.reason
                 )
-            })
+            }))
             .collect();
         if shown.len() < details.len() {
             lines.push(format!(
@@ -216,6 +229,7 @@ fn details(files: &[FileRecon], structural: &[Structural]) -> Vec<Detail> {
     for file in files {
         let path = shown_path(&file.path);
         let before = unexplained.len();
+        let why = file.gap.map_or(NOT_OBSERVED, |gap| gap.word());
         if let LineLevel::Available(lines) = &file.line_level {
             let missing = lines
                 .iter()
@@ -225,7 +239,7 @@ fn details(files: &[FileRecon], structural: &[Structural]) -> Vec<Detail> {
                 unexplained.push(Detail {
                     kind: "unexplained",
                     location: format!("{path}:{}", range_text(range)),
-                    reason: NOT_OBSERVED.into(),
+                    reason: why.into(),
                 });
             }
         }
@@ -235,7 +249,7 @@ fn details(files: &[FileRecon], structural: &[Structural]) -> Vec<Detail> {
                 unexplained.push(Detail {
                     kind: "unexplained",
                     location: path,
-                    reason: format!("{NOT_OBSERVED}; line level unavailable ({})", reason.word()),
+                    reason: format!("{why}; line level unavailable ({})", reason.word()),
                 });
             }
             (LineLevel::Unavailable(reason), _) => file_only.push(Detail {
@@ -252,12 +266,14 @@ fn details(files: &[FileRecon], structural: &[Structural]) -> Vec<Detail> {
                 unexplained.push(Detail {
                     kind: "unexplained",
                     location: path,
-                    reason: if file.deleted {
-                        "deletion not observed in the session".into()
-                    } else if file.removes {
-                        "removed lines not observed in the session".into()
-                    } else {
-                        NOT_OBSERVED.into()
+                    // `None` nur bei handgebauten Abgleichen (Tests): Ein
+                    // unerklärter Abgleich trägt immer einen Grund.
+                    reason: match (file.gap, file.deleted, file.removes) {
+                        (None, true, _) => "deletion not observed in the session".into(),
+                        (None, false, true) => "removed lines not observed in the session".into(),
+                        (Some(_), true, _) => format!("deletion — {why}"),
+                        (Some(_), false, true) => format!("removed lines — {why}"),
+                        (_, false, false) => why.into(),
                     },
                 });
             }
@@ -306,6 +322,7 @@ mod tests {
             changed_lines: 0,
             removes: false,
             last_observed: None,
+            gap: None,
         }
     }
 
@@ -488,5 +505,38 @@ mod tests {
         assert_eq!(shown.chars().count(), PATH_CAP);
         assert!(shown.starts_with('…') && shown.ends_with("/x.rs"));
         assert_eq!(shown_path("a.rs"), "a.rs");
+    }
+
+    /// Mit Grund: zuerst die Aufschlüsselung (warum nicht 100 %), dann je
+    /// Stelle der Grund statt „not observed".
+    #[test]
+    fn details_name_why_lines_are_unexplained() {
+        use ReconClass::*;
+        use minds_reader::reconcile::Gap;
+        let mut human = file(
+            "src/a.rs",
+            Unexplained,
+            lines(&[(1, ReportedOnly), (2, Unexplained)]),
+        );
+        human.gap = Some(Gap::AfterAgent { later_shell: None });
+        let mut hand = file(
+            "hand.rs",
+            Unexplained,
+            lines(&[(1, Unexplained), (2, Unexplained)]),
+        );
+        hand.gap = Some(Gap::Untouched { complete: true });
+        let mut gone = file("gone.rs", Unexplained, lines(&[]));
+        gone.deleted = true;
+        gone.gap = Some(Gap::Untouched { complete: true });
+        let a = artifact(vec![gone, hand, human], 4, true);
+        assert_eq!(
+            a.detail_lines(),
+            [
+                "  why            3 unexplained line(s): 1 whose last agent claim is another version or a deletion · 2 with no tool claim or shell mention found",
+                "  unexplained    gone.rs      deletion — no tool claim or shell mention found",
+                "  unexplained    hand.rs:1-2  no tool claim or shell mention found",
+                "  unexplained    src/a.rs:2   the agent's last write or delete of the file shows another version",
+            ]
+        );
     }
 }

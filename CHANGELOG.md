@@ -19,6 +19,23 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Why lines are unexplained.** `minds verify` and `minds inspect` no
+  longer just say `not observed in the session`. They break unexplained
+  lines down by what the linked sessions hold:
+  - the agent's last write or delete of the file shows another version
+  - claimed without a hash
+  - with an unmapped claim ending in their path
+  - in another version at the witness's latest readable observation
+  - last observed opaquely by the witness
+  - only mentioned by a shell command (heuristic)
+  - no tool claim or shell mention found
+
+  `verify` prints a `why` line with the breakdown and the reason per place.
+  The Verify tab shows the breakdown below the Artifact bar, answering "why
+  not 100 %?". The Changes tab's *Why this line?* shows the reason for the
+  line under the cursor, plus the mentioning shell call. That call is marked
+  as unverified agent text. A derivation for display only: classes,
+  percentages and the gate are unchanged.
 - **Verify tab in `minds inspect`.** The verdict of `minds verify` for a
   commit at a glance instead of a wall of text: verdict, weakest assurance
   level and intent first; then the linked sessions, Integrity, Coverage, the

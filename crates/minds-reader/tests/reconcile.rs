@@ -1454,3 +1454,496 @@ fn sources_stop_beyond_the_budget_but_classes_stay() {
 fn a_line_recon_stays_small() {
     assert!(std::mem::size_of::<LineRecon>() <= 16);
 }
+
+fn exec(command: &str) -> ToolCall {
+    let mut call = call("Bash", "", json!({ "command": command }), None);
+    let effect = call.effect.as_mut().unwrap();
+    effect.kind = EffectKind::Exec;
+    effect.path = None;
+    call
+}
+
+fn gap_of(result: &Reconciliation, path: &str) -> Option<Gap> {
+    result.files.iter().find(|f| f.path == path).unwrap().gap
+}
+
+/// Je unerklärter Datei der Grund: nach dem Agenten geändert, vom Witness
+/// anders gesehen, nur von einem Shell-Befehl genannt, oder unberührt.
+#[test]
+fn every_unexplained_file_names_why() {
+    let agent = session(vec![
+        write("src/a.rs", "one\ntwo\n"),
+        write("src/fmt.rs", "x\n"),
+        exec("cargo fmt -- ./src/fmt.rs && echo done"),
+        exec(r#"python3 gen.py > "out/gen.txt""#),
+        write("ok.rs", "fine\n"),
+    ]);
+    let result = run(
+        &[
+            file("src/a.rs", None, Some(b"one\nHUMAN\n")),
+            file("src/fmt.rs", None, Some(b"y\n")),
+            file("out/gen.txt", None, Some(b"generated\n")),
+            file("seen.rs", None, Some(b"new\n")),
+            file("hand.rs", None, Some(b"a\nb\n")),
+            file("ok.rs", None, Some(b"fine\n")),
+        ],
+        &[&agent],
+        &[observation("seen.rs", Some(b"old\n"), 1)],
+    );
+    assert_eq!(
+        gap_of(&result, "src/a.rs"),
+        Some(Gap::AfterAgent { later_shell: None })
+    );
+    let Some(Gap::AfterAgent {
+        later_shell: Some(fmt),
+    }) = gap_of(&result, "src/fmt.rs")
+    else {
+        panic!("a later shell command names src/fmt.rs");
+    };
+    assert_eq!((fmt.turn, fmt.call), (0, 2));
+    let Some(Gap::Shell(generator)) = gap_of(&result, "out/gen.txt") else {
+        panic!("a shell command names out/gen.txt");
+    };
+    assert_eq!(generator.call, 3);
+    assert_eq!(gap_of(&result, "seen.rs"), Some(Gap::WitnessOther));
+    assert_eq!(
+        gap_of(&result, "hand.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+    assert_eq!(gap_of(&result, "ok.rs"), None, "only unexplained files");
+    // Dieselbe Zählung wie `unexplained_lines`, aufgeschlüsselt.
+    let counts = result.unexplained_by_gap();
+    assert_eq!(
+        counts,
+        GapCounts {
+            after_agent: 2,
+            witness_other: 1,
+            shell: 1,
+            untouched: 2,
+            ..GapCounts::default()
+        }
+    );
+    assert_eq!(counts.total(), result.unexplained_lines());
+}
+
+/// Die Heuristik nennt nur ganze Pfade oder Dateinamen — kein Präfix — und
+/// ein Shell-Befehl vor dem Schreibvorgang des Agenten zählt nicht als
+/// „danach".
+#[test]
+fn shell_mentions_match_whole_names_and_only_after_the_agent() {
+    let agent = session(vec![
+        exec("cat src/ab.rs src/a.rs.bak"),
+        exec("sed -i s/x/y/ src/late.rs"),
+        write("src/late.rs", "x\n"),
+    ]);
+    let result = run(
+        &[
+            file("src/a.rs", None, Some(b"a\n")),
+            file("src/late.rs", None, Some(b"y\n")),
+        ],
+        &[&agent],
+        &[],
+    );
+    assert_eq!(
+        gap_of(&result, "src/a.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+    assert_eq!(
+        gap_of(&result, "src/late.rs"),
+        Some(Gap::AfterAgent { later_shell: None })
+    );
+}
+
+/// Ein Schreibvorgang ohne Hash belegt nicht „danach geändert"; ein nicht
+/// zuordenbarer Claim-Pfad nicht „nichts nennt die Datei"; eine nur opake
+/// Beobachtung nicht „nie diese Fassung".
+#[test]
+fn gaps_claim_no_more_than_the_sessions_hold() {
+    let mut unhashed = write("u.rs", "u\n");
+    unhashed.effect.as_mut().unwrap().written = None;
+    let agent = session(vec![unhashed, write("/elsewhere/checkout/far.rs", "f\n")]);
+    let mut opaque = observation("dark.rs", None, 1);
+    opaque.opaque = true;
+    let result = run(
+        &[
+            file("u.rs", None, Some(b"u\n")),
+            file("far.rs", None, Some(b"f\n")),
+            file("dark.rs", None, Some(b"d\n")),
+        ],
+        &[&agent],
+        &[opaque],
+    );
+    assert_eq!(gap_of(&result, "u.rs"), Some(Gap::Unhashed));
+    assert_eq!(gap_of(&result, "far.rs"), Some(Gap::Unmapped));
+    assert_eq!(gap_of(&result, "dark.rs"), Some(Gap::WitnessOpaque));
+    assert_eq!(
+        result.unexplained_by_gap().total(),
+        result.unexplained_lines()
+    );
+}
+
+/// Ein Dateiname allein erwähnt eine Datei nur als bloßes Wort ohne `/`;
+/// JSON-Escapes (`\n`) trennen Wörter, statt sie zu verkleben.
+#[test]
+fn mentions_respect_directories_and_json_escapes() {
+    let agent = session(vec![
+        exec("cat lib/mod.rs"),
+        exec("cd src/b && cat util.rs"),
+        exec("echo start\nsed -i s/a/b/ src/n.rs"),
+    ]);
+    let result = run(
+        &[
+            file("src/mod.rs", None, Some(b"m\n")),
+            file("src/b/util.rs", None, Some(b"u\n")),
+            file("src/n.rs", None, Some(b"n\n")),
+        ],
+        &[&agent],
+        &[],
+    );
+    assert_eq!(
+        gap_of(&result, "src/mod.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+    assert!(matches!(gap_of(&result, "src/b/util.rs"), Some(Gap::Shell(s)) if s.call == 1));
+    assert!(matches!(gap_of(&result, "src/n.rs"), Some(Gap::Shell(s)) if s.call == 2));
+}
+
+/// Agent-gesteuerte Befehlstexte kosten linear: tief verschachtelte
+/// Riesenwörter, ein Multibyte-Zeichen an der Schnittgrenze, ein
+/// erschöpftes Wort-Budget — danach schweigt die Heuristik.
+#[test]
+fn mention_heuristic_is_bounded() {
+    // Tief verschachtelte Riesenwörter unter 64 KiB: Sie erreichen den
+    // Tokenizer und werden dort übersprungen (> 4096 Bytes).
+    let mut calls: Vec<ToolCall> = (0..64)
+        .map(|i| exec(&format!("cat {}{i}/late.rs", "a/".repeat(16 * 1024))))
+        .collect();
+    // Mehr verschiedene Wörter, als der Index aufnimmt (256 Ki), je Aufruf
+    // unter 64 KiB — nur das Wort-Budget greift.
+    for call in 0..50 {
+        let words: String = (0..6_000).map(|w| format!("{call}k{w}.i ")).collect();
+        assert!(words.len() < 60 * 1024);
+        calls.push(exec(&words));
+    }
+    calls.push(exec("touch late.rs"));
+    let agent = session(calls);
+    let started = std::time::Instant::now();
+    let result = run(&[file("late.rs", None, Some(b"l\n"))], &[&agent], &[]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    // Das Wort-Budget griff: „nichts gefunden" sagt dazu, dass es nicht
+    // alles sah.
+    assert_eq!(
+        gap_of(&result, "late.rs"),
+        Some(Gap::Untouched { complete: false })
+    );
+}
+
+/// „Danach" folgt der gemischten Turn-Reihenfolge über Sessions, nicht der
+/// Reihenfolge der Eingabe.
+#[test]
+fn later_shell_follows_merged_turn_time() {
+    let agent = session(vec![write("x.rs", "x\n")]);
+    let at = |time: &str| {
+        let mut other = session(vec![exec("rustfmt x.rs")]);
+        other.turns[0].at = Some(time.into());
+        other
+    };
+    let (before, after) = (at("2026-10-02T09:00:00Z"), at("2026-10-02T11:00:00Z"));
+    let gap = |other: &Session| {
+        gap_of(
+            &run(&[file("x.rs", None, Some(b"y\n"))], &[other, &agent], &[]),
+            "x.rs",
+        )
+    };
+    assert_eq!(gap(&before), Some(Gap::AfterAgent { later_shell: None }));
+    assert!(matches!(
+        gap(&after),
+        Some(Gap::AfterAgent {
+            later_shell: Some(_)
+        })
+    ));
+}
+
+/// Der letzte Claim trägt genau die Commit-Fassung, nur der Witness sah
+/// zuletzt anderes: nicht „danach geändert".
+#[test]
+fn a_matching_claim_against_the_witness_is_not_after_the_agent() {
+    let agent = session(vec![write("w.rs", "ok\n")]);
+    let result = run(
+        &[file("w.rs", None, Some(b"ok\n"))],
+        &[&agent],
+        &[observation("w.rs", Some(b"other\n"), 1)],
+    );
+    assert_eq!(result.files[0].class, Unexplained);
+    assert_eq!(gap_of(&result, "w.rs"), Some(Gap::WitnessOther));
+}
+
+/// Nur die letzte lesbare Beobachtung zählt: Sah sie die Commit-Fassung,
+/// ist es nicht „der Witness sah zuletzt anderes".
+#[test]
+fn only_the_latest_readable_observation_contradicts() {
+    let mut opaque = observation("o.rs", None, 3);
+    opaque.opaque = true;
+    let result = run(
+        &[file("o.rs", None, Some(b"new\n"))],
+        &[],
+        &[
+            observation("o.rs", Some(b"old\n"), 1),
+            observation("o.rs", Some(b"new\n"), 2),
+            opaque,
+        ],
+    );
+    // Der Witness sah zuletzt genau diese Fassung lesbar, danach nur opak:
+    // nicht „anderes gesehen", nicht „nichts gefunden".
+    assert_eq!(gap_of(&result, "o.rs"), Some(Gap::WitnessOpaque));
+}
+
+/// Ein nicht zuordenbarer Claim nennt nur seinen eigenen Pfad, nicht jede
+/// Datei gleichen Namens.
+#[test]
+fn unmapped_claims_match_paths_not_names() {
+    let agent = session(vec![
+        write("/tmp/far.rs", "f\n"),
+        write("/elsewhere/checkout/src/near.rs", "n\n"),
+    ]);
+    let result = run(
+        &[
+            file("src/far.rs", None, Some(b"f\n")),
+            file("src/near.rs", None, Some(b"n\n")),
+        ],
+        &[&agent],
+        &[],
+    );
+    assert_eq!(
+        gap_of(&result, "src/far.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+    assert_eq!(gap_of(&result, "src/near.rs"), Some(Gap::Unmapped));
+    // Keine Komponentengrenze: `/x/ba.rs` endet nicht auf den Pfad `a.rs`.
+    let agent = session(vec![write("/x/ba.rs", "a\n")]);
+    let result = run(&[file("a.rs", None, Some(b"a\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "a.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+}
+
+/// Die Reihenfolge der Claims zählt: Ein späterer Write mit Hash macht
+/// einen früheren ohne Hash bedeutungslos; eine Löschung als letzter Claim
+/// bei vorhandener Datei ist „danach geändert".
+#[test]
+fn the_last_claim_decides_hashed_or_not() {
+    let mut early = write("h.rs", "h\n");
+    early.effect.as_mut().unwrap().written = None;
+    let agent = session(vec![
+        early,
+        write("h.rs", "h2\n"),
+        write("d.rs", "d\n"),
+        call("Delete", "d.rs", json!({}), None),
+    ]);
+    let result = run(
+        &[
+            file("h.rs", None, Some(b"h3\n")),
+            file("d.rs", None, Some(b"back\n")),
+        ],
+        &[&agent],
+        &[],
+    );
+    assert_eq!(
+        gap_of(&result, "h.rs"),
+        Some(Gap::AfterAgent { later_shell: None })
+    );
+    assert_eq!(
+        gap_of(&result, "d.rs"),
+        Some(Gap::AfterAgent { later_shell: None })
+    );
+}
+
+/// Ein Windows-Pfad mit maskierten Backslashes wird nicht zum bloßen
+/// Dateinamen, der jede Datei des Namens trifft.
+#[test]
+fn escaped_windows_paths_do_not_match_as_bare_names() {
+    let agent = session(vec![exec(r"type C:\proj\src\bar.rs")]);
+    let result = run(&[file("lib/bar.rs", None, Some(b"b\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "lib/bar.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+}
+
+/// Ein Windows-Pfad erwähnt auch keine Datei im Wurzelverzeichnis.
+#[test]
+fn windows_paths_do_not_match_root_files() {
+    let agent = session(vec![exec(r"type C:\\proj\\src\\bar.rs")]);
+    let result = run(&[file("bar.rs", None, Some(b"b\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "bar.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+}
+
+/// Wird ein Aufruf bei 64 KiB abgeschnitten, zählt das angeschnittene
+/// letzte Wort nicht (`src/a.rs.bak` wäre sonst `src/a.rs`) — und „nichts
+/// gefunden" sagt, dass die Suche unvollständig war.
+#[test]
+fn a_cut_word_does_not_count() {
+    // `arguments` ist JSON: `{"command":"` (12 Bytes) davor. Der Schnitt
+    // fällt genau hinter `src/a.rs`.
+    let mut text = "x".repeat(64 * 1024 - 12 - 1 - "src/a.rs".len());
+    text.push(' ');
+    text.push_str("src/a.rs.bak");
+    let agent = session(vec![exec(&text)]);
+    let result = run(&[file("src/a.rs", None, Some(b"a\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "src/a.rs"),
+        Some(Gap::Untouched { complete: false })
+    );
+}
+
+/// Je Dateiname höchstens 4096 Wörter — danach schweigt die Heuristik für
+/// diesen Namen und sagt es.
+#[test]
+fn mentions_per_name_are_capped() {
+    let words: String = (0..5000).map(|i| format!("d{i}/mod.rs ")).collect();
+    let agent = session(vec![exec(&words), exec("cat src/mod.rs")]);
+    let result = run(&[file("src/mod.rs", None, Some(b"m\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "src/mod.rs"),
+        Some(Gap::Untouched { complete: false })
+    );
+}
+
+/// Die Zusammenfassung erbt „unvollständig" — und nennt Heuristik als
+/// Heuristik.
+#[test]
+fn the_summary_keeps_its_qualifiers() {
+    let mut counts = GapCounts::default();
+    counts.add(Gap::Untouched { complete: true }, 2);
+    counts.add(Gap::Untouched { complete: false }, 1);
+    counts.add(
+        Gap::Shell(LineSource {
+            session: SessionId::of(&session(vec![])).unwrap(),
+            turn: 0,
+            call: 0,
+        }),
+        1,
+    );
+    let summary = minds_reader::artifact::gap_summary(&counts).unwrap();
+    assert_eq!(
+        summary,
+        "1 only mentioned by a shell command (heuristic) · 3 with no tool claim or shell mention found (search incomplete)"
+    );
+}
+
+/// Ein nicht zuordenbarer Claim nach dem letzten zugeordneten: Was die
+/// Session zuletzt mit der Datei tat, ist offen — nicht „danach geändert".
+#[test]
+fn a_later_unmapped_claim_wins_over_an_earlier_mapped_one() {
+    let agent = session(vec![
+        write("a.rs", "one\n"),
+        write("/elsewhere/checkout/a.rs", "two\n"),
+    ]);
+    let result = run(&[file("a.rs", None, Some(b"two\n"))], &[&agent], &[]);
+    assert_eq!(result.files[0].class, Unexplained);
+    assert_eq!(gap_of(&result, "a.rs"), Some(Gap::Unmapped));
+    // Ein früherer nicht zuordenbarer Claim zählt nach einem zugeordneten
+    // nicht.
+    let agent = session(vec![
+        write("/elsewhere/checkout/b.rs", "two\n"),
+        write("b.rs", "one\n"),
+    ]);
+    let result = run(&[file("b.rs", None, Some(b"two\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "b.rs"),
+        Some(Gap::AfterAgent { later_shell: None })
+    );
+}
+
+/// Widerspricht der Witness und trägt der letzte Claim keinen Hash, ist es
+/// „ohne Hash", nicht „der Witness sah anderes".
+#[test]
+fn an_unhashed_claim_against_the_witness_stays_unhashed() {
+    let mut unhashed = write("u.rs", "u\n");
+    unhashed.effect.as_mut().unwrap().written = None;
+    let agent = session(vec![unhashed]);
+    let result = run(
+        &[file("u.rs", None, Some(b"u\n"))],
+        &[&agent],
+        &[observation("u.rs", Some(b"other\n"), 1)],
+    );
+    assert_eq!(gap_of(&result, "u.rs"), Some(Gap::Unhashed));
+}
+
+/// Nicht zuordenbare Claims: derselbe Pfad zählt einmal, mit seiner letzten
+/// Position; je Name höchstens 4096 — darüber „search incomplete".
+#[test]
+fn unmapped_claims_are_deduplicated_and_capped() {
+    let agent = session(vec![
+        write("/elsewhere/a.rs", "x\n"),
+        write("a.rs", "one\n"),
+        write("/elsewhere/a.rs", "two\n"),
+    ]);
+    let result = run(&[file("a.rs", None, Some(b"two\n"))], &[&agent], &[]);
+    assert_eq!(gap_of(&result, "a.rs"), Some(Gap::Unmapped));
+
+    let calls: Vec<ToolCall> = (0..4100)
+        .map(|i| write(&format!("/elsewhere/{i}/m.rs"), "m\n"))
+        .collect();
+    let agent = session(calls);
+    let result = run(&[file("hand.rs", None, Some(b"h\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "hand.rs"),
+        Some(Gap::Untouched { complete: false })
+    );
+}
+
+/// Ein Multibyte-Zeichen genau an der 64-KiB-Grenze: kein Panic, und der
+/// Schnitt gilt als unvollständig.
+#[test]
+fn a_cut_inside_a_multibyte_character_does_not_panic() {
+    let mut cut = "x".repeat(64 * 1024 - 1);
+    cut.push('ä');
+    let agent = session(vec![exec(&cut)]);
+    let result = run(&[file("z.rs", None, Some(b"z\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "z.rs"),
+        Some(Gap::Untouched { complete: false })
+    );
+}
+
+/// Auch ein nicht zuordenbarer Delete ist `Unmapped`; ein Windows-Claim
+/// endet auf den verschachtelten Repo-Pfad, nicht auf einen anderen.
+#[test]
+fn unmapped_deletes_and_windows_claims_match_their_path() {
+    let agent = session(vec![
+        call("Delete", "/elsewhere/checkout/d.rs", json!({}), None),
+        write(r"C:\p\src\a.rs", "a\n"),
+    ]);
+    let result = run(
+        &[
+            file("d.rs", Some(b"d\n"), None),
+            file("src/a.rs", None, Some(b"a\n")),
+            file("b/a.rs", None, Some(b"a\n")),
+        ],
+        &[&agent],
+        &[],
+    );
+    assert_eq!(gap_of(&result, "d.rs"), Some(Gap::Unmapped));
+    assert_eq!(gap_of(&result, "src/a.rs"), Some(Gap::Unmapped));
+    assert_eq!(
+        gap_of(&result, "b/a.rs"),
+        Some(Gap::Untouched { complete: true })
+    );
+}
+
+/// Ein pfadartiges Wort über 4096 Bytes wird übersprungen — und „nichts
+/// gefunden" sagt dann, dass die Suche unvollständig war.
+#[test]
+fn an_overlong_path_word_marks_the_search_incomplete() {
+    let agent = session(vec![exec(&format!("cat {}/src/a.rs", "d".repeat(5000)))]);
+    let result = run(&[file("src/a.rs", None, Some(b"a\n"))], &[&agent], &[]);
+    assert_eq!(
+        gap_of(&result, "src/a.rs"),
+        Some(Gap::Untouched { complete: false })
+    );
+}
