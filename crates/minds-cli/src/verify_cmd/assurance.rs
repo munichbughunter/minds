@@ -9,11 +9,12 @@
 //!
 //! # Was hier (noch) nicht gelesen wird
 //!
-//! - **Witness-Starts** (`witness.start`: Profil, Isolationsbeleg) liegen nur
-//!   im Journal des Witness, nicht im Repository — kein Seal und kein
-//!   Observation-Objekt trägt sie. Die Liste bleibt leer; A2 ist damit nicht
-//!   erreichbar (`witness profile unknown`), fail-closed. Erreichbar wird es,
-//!   sobald der Witness Profil und Trennung im signierten Material festhält.
+//! - **Witness-Starts** (Profil, Trennungsbefund): seit den Witness-Fakten hält der
+//!   Witness sie beim Versiegeln im Observation-Objekt jeder Epoche fest
+//!   ([`minds_reader::observations::witness_facts`]); gelesen werden genau
+//!   die Epochen, die das Fenster der Session tragen. Eine Epoche ohne
+//!   Fakten (älteres Schema, fehlendes Objekt) zählt als Start ohne Profil
+//!   (`witness profile unknown`), fail-closed.
 //! - **Gegenzeichnungen** (EA-19) kommen aus
 //!   `refs/minds/anchors/first-sight/` ([`WitnessTrust::first_sight`]);
 //!   zählen kann eine nur unter `minds-anchor` gegen dieselbe Signer-Datei.
@@ -251,6 +252,9 @@ pub(crate) struct Facts<'a> {
     pub ledger: &'a LedgerCheck,
     /// Die Abdeckung durch den Datei-Beobachter.
     pub observations: &'a FsCoverage,
+    /// Die Witness-Starts aus den Epochen der Fenster
+    /// ([`minds_reader::observations::witness_starts`]).
+    pub witness_starts: &'a [minds_reader::assurance::WitnessStart],
     /// Die Intent-Lage ([`intent_state`]) — einmal je Session gerechnet,
     /// damit Coverage (Scope-Befunde, EA-17) und Stufe denselben Anker
     /// sehen.
@@ -319,7 +323,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
         link: facts.link,
         trusted_signers: trust.trusted(),
         observations: facts.observations,
-        witness_starts: &[],
+        witness_starts: facts.witness_starts,
         intent: facts.intent,
         replay: replay.as_ref(),
         anchors: Some(&anchors),
@@ -345,7 +349,31 @@ pub(crate) fn intent_state(
         .iter()
         .map(|(id, seal, _)| (id.clone(), seal.clone()))
         .collect();
-    let witnessed = |seal_id: &ContentHash, _: &Seal| trust.witnessed(seal_id);
+    // Gelten alle Witness-Bereiche der Session unter einem getrennten
+    // Principal (A2 steht in Frage), zählt auch in der Kette davor nur ein
+    // solcher — ein Vorgänger unter einem Schlüssel, den der Agent lesen
+    // kann, belegte sonst den Anfang des Intents.
+    let separated = |seal_id: &ContentHash| {
+        trust
+            .store()
+            .seal_text(seal_id)
+            .ok()
+            .flatten()
+            .is_some_and(|text| trust.signature(seal_id, &text).is_separated_witness())
+    };
+    let mut witness_ranges = seals
+        .iter()
+        .filter(|(_, seal)| seal.scope == SCOPE_WITNESS_V1)
+        .peekable();
+    let all_separated =
+        witness_ranges.peek().is_some() && witness_ranges.all(|(seal_id, _)| separated(seal_id));
+    let witnessed = |seal_id: &ContentHash, _: &Seal| {
+        if all_separated {
+            separated(seal_id)
+        } else {
+            trust.witnessed(seal_id)
+        }
+    };
     let chain =
         minds_reader::intent::epoch_chain(trust.store(), id, session.clone(), &seals, &witnessed);
     let check = |anchor: &str, signature: &str| trust.intent_signature(anchor, signature);
@@ -408,6 +436,39 @@ pub(crate) fn fs_coverage(store: &dyn ContextStore, windows: &[Window]) -> FsCov
     } else {
         FsCoverage::Complete
     }
+}
+
+/// Die Witness-Starts der Fenster: die Fakten ihrer Epochen
+/// ([`minds_reader::observations::witness_facts`]), „getrennt" nur, wenn der
+/// Seal der Epoche unter einem Principal gilt, den ein Mensch als getrennten
+/// Witness eingetragen hat
+/// ([`minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL`]).
+pub(crate) fn witness_starts(
+    trust: &WitnessTrust<'_>,
+    store: &dyn ContextStore,
+    windows: &[Window],
+) -> Vec<minds_reader::assurance::WitnessStart> {
+    let separated = |seal_id: &ContentHash| {
+        store
+            .seal_text(seal_id)
+            .ok()
+            .flatten()
+            .is_some_and(|text| trust.signature(seal_id, &text).is_separated_witness())
+    };
+    let mut starts = minds_reader::observations::witness_starts(
+        &minds_reader::observations::witness_facts(store, windows),
+        &separated,
+    );
+    // Ein Fenster ohne benannte Epochen trägt keine Fakten — für seinen
+    // Zeitraum ist das Profil unbekannt (fail-closed).
+    if windows.iter().any(|window| window.epochs.is_none()) {
+        starts.push(minds_reader::assurance::WitnessStart {
+            profile: None,
+            isolated: false,
+            key: None,
+        });
+    }
+    starts
 }
 
 /// Die Schreib-Claims der Session, die der Witness nicht bestätigt — als
@@ -517,7 +578,7 @@ pub(crate) fn first_reason(report: &AssuranceReport) -> Option<String> {
     })
 }
 
-/// `minds-witness@build-07, profile container; intent signed, sk key`.
+/// `minds-witness-user@build-07, profile user; intent signed, sk key`.
 fn witness_detail(report: &AssuranceReport) -> Option<String> {
     let facts = report.witness.as_ref()?;
     // Der Reader entschärft die Principals schon; die zweite Schicht an der
@@ -655,7 +716,7 @@ mod tests {
 
     fn witness() -> SealSignature {
         SealSignature::Witness {
-            principal: "minds-witness@build-07".into(),
+            principal: "minds-witness-user@build-07".into(),
         }
     }
 
@@ -700,7 +761,7 @@ mod tests {
         lines.extend(not_proven_lines(report.overall, false));
         assert_eq!(
             lines.join("\n"),
-            "Assurance      A2 witnessed   (minds-witness@build-07, profile user; intent signed, sk key)\n\
+            "Assurance      A2 witnessed   (minds-witness-user@build-07, profile user; intent signed, sk key)\n\
              Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)"
         );
     }

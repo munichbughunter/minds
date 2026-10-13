@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome};
-use minds_core::observation::{Observation, Observations};
+use minds_core::observation::{Isolation, Observation, Observations, WitnessFacts};
 use minds_core::{ContentHash, SessionId};
 use minds_store::{ContextStore, InRepoStore};
 
@@ -257,9 +257,32 @@ impl Fixture {
     /// Der Witness lief schon vor der Session (Anker-Epoche) und sah in der
     /// Epoche des Checkpoints `generated.rs` mit `bytes` — signiert.
     fn observe(&self, bytes: &[u8]) -> ContentHash {
+        self.observe_as(bytes, None)
+    }
+
+    /// Wie [`Self::observe`], beide Epochen mit den Fakten `witness`.
+    fn observe_as(&self, bytes: &[u8], witness: Option<WitnessFacts>) -> ContentHash {
+        self.observe_split(bytes, witness.clone(), witness)
+    }
+
+    /// Wie [`Self::observe`]: die Anker-Epoche mit `first`, die Epoche mit
+    /// der Beobachtung mit `second`.
+    fn observe_split(
+        &self,
+        bytes: &[u8],
+        first: Option<WitnessFacts>,
+        second: Option<WitnessFacts>,
+    ) -> ContentHash {
+        let with = |object: Observations, witness: &Option<WitnessFacts>| match witness {
+            Some(facts) => object.with_witness(facts.clone()),
+            None => object,
+        };
         let pipeline = minds_redact::RedactionConfig::default().pipeline().unwrap();
         let empty = pipeline
-            .redact_observations(Observations::new("2026-10-02T08:59:00Z", Vec::new()))
+            .redact_observations(with(
+                Observations::new("2026-10-02T08:59:00Z", Vec::new()),
+                &first,
+            ))
             .unwrap();
         let anchor = self.put_epoch(
             self.store.put_observations(&empty).unwrap(),
@@ -267,15 +290,18 @@ impl Fixture {
             "2026-10-02T09:00:00Z",
         );
         let object = pipeline
-            .redact_observations(Observations::new(
-                "2026-10-02T09:00:00.001Z",
-                vec![Observation {
-                    seq: 1,
-                    at: "2026-10-02T10:00:05Z".into(),
-                    path: "generated.rs".into(),
-                    content: Some(hash(bytes)),
-                    reason: None,
-                }],
+            .redact_observations(with(
+                Observations::new(
+                    "2026-10-02T09:00:00.001Z",
+                    vec![Observation {
+                        seq: 1,
+                        at: "2026-10-02T10:00:05Z".into(),
+                        path: "generated.rs".into(),
+                        content: Some(hash(bytes)),
+                        reason: None,
+                    }],
+                ),
+                &second,
             ))
             .unwrap();
         self.put_epoch(
@@ -353,6 +379,17 @@ impl Fixture {
 
     fn signers(&self) -> &str {
         self.signers.to_str().unwrap()
+    }
+
+    /// Trägt den Witness-Schlüssel unter `principal` in die Signer-Datei
+    /// ein — etwa als getrennten Witness (`minds-witness-user@…`).
+    fn register_as(&self, principal: &str) {
+        let public = std::fs::read_to_string(self.key.with_extension("pub")).unwrap();
+        std::fs::write(
+            &self.signers,
+            format!("{principal} namespaces=\"minds-witness\" {}", public.trim()),
+        )
+        .unwrap();
     }
 
     /// Legt beliebige Bytes unter den Ref des Seals.
@@ -493,6 +530,249 @@ Not proven     model identity · correctness of the decision · actions outside 
 Overall        VERIFIED
 "
         )
+    );
+}
+
+/// Die Fakten, die ein Witness beim Versiegeln festhielt.
+fn witness_facts(profile: &str, witness_uid: u32) -> WitnessFacts {
+    WitnessFacts {
+        profile: profile.into(),
+        isolation: Isolation {
+            witness_uid,
+            agent_uids: vec![501],
+            home_private: true,
+            binary_protected: true,
+        },
+        spec: None,
+    }
+}
+
+/// Die Assurance-Zeile (mit ihrem ersten Grund).
+fn assurance_line(fixture: &Fixture) -> String {
+    let run = fixture.minds(&["verify", "HEAD", "--signers", fixture.signers()]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    run.stdout
+        .lines()
+        .find(|line| line.starts_with("Assurance"))
+        .unwrap_or_else(|| panic!("no assurance line: {}", run.all))
+        .to_owned()
+}
+
+/// Der Witness hält Profil und Trennung im signierten Objekt fest: Ein
+/// `local`-Witness (dieselbe Kennung wie der Agent) steht als nicht
+/// qualifiziert da — nicht mehr als „unbekannt".
+#[test]
+fn verify_reads_profile_and_isolation_from_the_witness_facts() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.observe_as(b"shell\n", Some(witness_facts("local", 501)));
+    let line = assurance_line(&fixture);
+    assert!(
+        line.contains("A1 observed") && line.contains("profile local not qualified for A2"),
+        "{line}"
+    );
+}
+
+/// Ein getrennter `user`-Witness, den die Signer-Datei als getrennt
+/// einträgt (`minds-witness-user@…`): Profil und Trennung tragen. Die Gründe
+/// stehen in fester Regel-Reihenfolge — Profil, Trennung, Sessionende,
+/// Intent —, die Zeile nennt den ersten: Steht dort einer nach der Trennung,
+/// sind Profil und Trennung erfüllt. Zu A2 fehlt hier nur noch das Ende und
+/// der gebundene Intent.
+#[test]
+fn verify_accepts_a_separated_user_witness() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.register_as("minds-witness-user@build-07");
+    fixture.observe_as(b"shell\n", Some(witness_facts("user", 498)));
+    let line = assurance_line(&fixture);
+    assert!(line.contains("A1 observed"), "{line}");
+    for unwanted in ["profile", "isolation"] {
+        assert!(!line.contains(unwanted), "{line}");
+    }
+    assert!(
+        line.contains("session end not witnessed") || line.contains("intent"),
+        "{line}"
+    );
+}
+
+/// Dieselben Fakten unter dem gewöhnlichen Witness-Principal: Was der
+/// Witness über sich schreibt, bezeugt allein sein Schlüssel — und den
+/// Schlüssel eines `local`-Witness kann der Agent lesen. Ohne Bürgschaft der
+/// Signer-Datei keine Trennung.
+#[test]
+fn verify_refuses_separation_without_the_separated_principal() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.observe_as(b"shell\n", Some(witness_facts("user", 498)));
+    let line = assurance_line(&fixture);
+    assert!(line.contains("witness isolation not proven"), "{line}");
+}
+
+/// Getrennte Beobachtungs-Epochen, aber die Hook-Bereiche der Session unter
+/// einem gewöhnlichen Witness-Principal — etwa dem Schlüssel eines
+/// `local`-Witness, den der Agent lesen kann und der noch in der Signer-Datei
+/// steht. Damit ließe sich eine Session fälschen: keine Trennung.
+#[test]
+fn verify_refuses_hook_ranges_under_an_ordinary_principal() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.observe_as(b"shell\n", Some(witness_facts("user", 498)));
+    let local = fixture.root().join("local_ed25519");
+    assert!(
+        Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&local)
+            .status()
+            .unwrap()
+            .success()
+    );
+    for seal in &fixture.seals {
+        let text = fixture.store.seal_text(seal).unwrap().unwrap();
+        let signature = minds_attest::ssh_sign_ns(&text, &local, minds_attest::NS_WITNESS).unwrap();
+        fixture.store.put_seal_signature(seal, &signature).unwrap();
+    }
+    let separated = std::fs::read_to_string(fixture.key.with_extension("pub")).unwrap();
+    let ordinary = std::fs::read_to_string(local.with_extension("pub")).unwrap();
+    std::fs::write(
+        &fixture.signers,
+        format!(
+            "minds-witness-user@build-07 namespaces=\"minds-witness\" {}\n\
+             minds-witness@build-07 namespaces=\"minds-witness\" {}\n",
+            separated.trim(),
+            ordinary.trim()
+        ),
+    )
+    .unwrap();
+    let line = assurance_line(&fixture);
+    assert!(line.contains("witness isolation not proven"), "{line}");
+}
+
+/// Ein `user`-Witness, der die Kennung mit dem Agenten teilt: Auch unter
+/// dem getrennten Principal trägt der Profilname allein nicht.
+#[test]
+fn verify_refuses_a_user_witness_without_separation() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.register_as("minds-witness-user@build-07");
+    fixture.observe_as(b"shell\n", Some(witness_facts("user", 501)));
+    let line = assurance_line(&fixture);
+    assert!(line.contains("witness isolation not proven"), "{line}");
+}
+
+/// Die Anker-Epoche vor dem Fenster zählt nicht: Ohne Fakten dort bleibt
+/// der getrennte Witness getrennt.
+#[test]
+fn verify_ignores_facts_of_the_epoch_before_the_window() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.register_as("minds-witness-user@build-07");
+    fixture.observe_split(b"shell\n", None, Some(witness_facts("user", 498)));
+    let line = assurance_line(&fixture);
+    for unwanted in ["profile", "isolation"] {
+        assert!(!line.contains(unwanted), "{line}");
+    }
+}
+
+/// Zwei Epochen im Fenster, eine davon ohne Fakten (ein älteres Objekt):
+/// Für einen Teil des Fensters ist das Profil unbekannt (fail-closed).
+#[test]
+fn verify_treats_an_epoch_without_facts_as_unknown() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    fixture.register_as("minds-witness-user@build-07");
+    let facts = witness_facts("user", 498);
+    let pipeline = minds_redact::RedactionConfig::default().pipeline().unwrap();
+    let put = |object: Observations, previous, last: &str| {
+        let redacted = pipeline.redact_observations(object).unwrap();
+        fixture.put_epoch(
+            fixture.store.put_observations(&redacted).unwrap(),
+            previous,
+            last,
+        )
+    };
+    let anchor = put(
+        Observations::new("2026-10-02T08:59:00Z", Vec::new()).with_witness(facts.clone()),
+        None,
+        "2026-10-02T09:00:00Z",
+    );
+    // Mitten im Fenster: keine Fakten.
+    let middle = put(
+        Observations::new("2026-10-02T09:00:00.001Z", Vec::new()),
+        Some(anchor),
+        "2026-10-02T10:00:10Z",
+    );
+    put(
+        Observations::new(
+            "2026-10-02T10:00:10.001Z",
+            vec![Observation {
+                seq: 1,
+                at: "2026-10-02T10:00:20Z".into(),
+                path: "generated.rs".into(),
+                content: Some(hash(b"shell\n")),
+                reason: None,
+            }],
+        )
+        .with_witness(facts),
+        Some(middle),
+        "2026-10-02T10:00:31Z",
+    );
+    let line = assurance_line(&fixture);
+    assert!(line.contains("witness profile unknown"), "{line}");
+}
+
+/// Der Witness sah ein Soll mit einem Umschlag, der heute nicht mehr im
+/// Store liegt: `verify` sagt es unter Conformance — als Auskunft, ohne
+/// Gate (die Umschläge hielt der Witness ungeprüft fest).
+#[test]
+fn verify_reports_spec_envelopes_the_witness_saw_but_the_store_lost() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"shell\n"));
+    let mut facts = witness_facts("user", 498);
+    facts.spec = Some(minds_core::observation::SpecSeen {
+        id: ContentHash::from_bytes([0x5a; 32]),
+        envelopes: vec![ContentHash::from_bytes([0x01; 32])],
+    });
+    fixture.observe_as(b"shell\n", Some(facts));
+    // Unter einem gewöhnlichen Witness-Principal (dessen Schlüssel der Agent
+    // lesen könnte) zählt die Auskunft nicht.
+    let ordinary = fixture.minds(&["verify", "HEAD", "--signers", fixture.signers()]);
+    assert!(
+        !ordinary.stdout.contains("witnessed spec"),
+        "{}",
+        ordinary.all
+    );
+    fixture.register_as("minds-witness-user@build-07");
+    let run = fixture.minds(&["verify", "HEAD", "--signers", fixture.signers()]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(
+        run.stdout.contains(
+            "witnessed spec b3-5a5a5a5a5a5a during the sessions (1 envelope(s) seen by the witness)"
+        ),
+        "{}",
+        run.all
+    );
+    assert!(
+        run.stdout.contains("none of them is in the store any more"),
+        "{}",
+        run.all
+    );
+    let gated = fixture.minds(&[
+        "verify",
+        "HEAD",
+        "--signers",
+        fixture.signers(),
+        "--conformance",
+    ]);
+    // Das Gate scheitert hier nur, weil der Commit kein Soll trägt.
+    assert!(
+        gated.stdout.contains("conformance not assessed (no spec"),
+        "{}",
+        gated.all
+    );
+    // Die Auskunft steht auch dort; sie ist kein Gate.
+    assert!(
+        gated.stdout.contains("witnessed spec b3-5a5a5a5a5a5a"),
+        "{}",
+        gated.all
+    );
+    assert_eq!(
+        gated.stdout.matches("Gate           conformance").count(),
+        1,
+        "{}",
+        gated.all
     );
 }
 

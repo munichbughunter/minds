@@ -7,15 +7,17 @@
 //! 3. Exhaustives Destructuring: Ein neues Feld bricht den Build hier.
 //!
 //! Gescannt wird jeder Text: Pfade (ein Dateiname kann ein Token oder einen
-//! Kundennamen tragen) und Zeitstempel (Doktrin aus #35 — die Ausnahmeliste
-//! bleibt leer). Ungescannt bleibt nur `content`: Der Typ
-//! [`ContentHash`](minds_core::ContentHash) erzwingt 64 Hex-Zeichen.
+//! Kundennamen tragen), Zeitstempel (Doktrin aus #35 — die Ausnahmeliste
+//! bleibt leer) und das Profilwort der Witness-Fakten. Ungescannt bleiben
+//! nur Hashes (`content`, Soll-Id und Umschläge: Der Typ
+//! [`ContentHash`](minds_core::ContentHash) erzwingt 64 Hex-Zeichen),
+//! Kennungen und Wahrheitswerte.
 //!
 //! Die Schreib-Regeln ([`Observations::check`]) gelten **vor und nach** der
 //! Bereinigung: Ein Platzhalter darf aus einem Pfad keinen absoluten oder
 //! leeren machen.
 
-use minds_core::observation::{Observation, Observations};
+use minds_core::observation::{Isolation, Observation, Observations, SpecSeen, WitnessFacts};
 
 use crate::pipeline::RedactionPipeline;
 use crate::session::{Field, RedactionAudit, RedactionError};
@@ -58,6 +60,7 @@ impl RedactionPipeline {
             first_at,
             last_at,
             observations,
+            witness,
         } = observations;
         let started_at = started_at
             .map(|at| self.redact_field(Field::ObservationsStartedAt, at, &mut audit))
@@ -85,12 +88,49 @@ impl RedactionPipeline {
                 reason,
             });
         }
+        let witness = witness
+            .map(|facts| {
+                let WitnessFacts {
+                    profile,
+                    isolation,
+                    spec,
+                } = facts;
+                let Isolation {
+                    witness_uid,
+                    agent_uids,
+                    home_private,
+                    binary_protected,
+                } = isolation;
+                // Exhaustiv, ohne Text: Soll-Id und Umschläge sind Hashes. Ein
+                // neues Feld muss hier entschieden werden.
+                if let Some(SpecSeen {
+                    id: _,
+                    envelopes: _,
+                }) = &spec
+                {}
+                Ok::<_, RedactionError>(WitnessFacts {
+                    profile: self.redact_field(
+                        Field::ObservationsWitnessProfile,
+                        profile,
+                        &mut audit,
+                    )?,
+                    isolation: Isolation {
+                        witness_uid,
+                        agent_uids,
+                        home_private,
+                        binary_protected,
+                    },
+                    spec,
+                })
+            })
+            .transpose()?;
         let observations = Observations {
             schema,
             started_at,
             first_at,
             last_at,
             observations: redacted,
+            witness,
         };
         observations.check()?;
         Ok(RedactedObservations {
@@ -106,6 +146,55 @@ mod tests {
     use crate::RedactionConfig;
     use minds_core::ContentHash;
     use minds_core::observation::{ObservationError, ObservationReason};
+
+    /// Die Fakten des Witness kommen unverändert durch; ihr Profilwort wird
+    /// gescannt, Hashes und Kennungen bleiben.
+    #[test]
+    fn witness_facts_survive_redaction() {
+        use minds_core::observation::{Isolation, SpecSeen, WitnessFacts};
+        let facts = WitnessFacts {
+            profile: "user".into(),
+            isolation: Isolation {
+                witness_uid: 498,
+                agent_uids: vec![20, 501],
+                home_private: true,
+                binary_protected: false,
+            },
+            spec: Some(SpecSeen {
+                id: ContentHash::from_bytes([7; 32]),
+                envelopes: vec![ContentHash::from_bytes([1; 32])],
+            }),
+        };
+        let pipeline = RedactionConfig::default().pipeline().unwrap();
+        let redacted = pipeline
+            .redact_observations(object(&["src/a.rs"]).with_witness(facts.clone()))
+            .unwrap();
+        assert_eq!(redacted.observations().witness, Some(facts));
+    }
+
+    /// Würde die Pipeline das Profilwort ersetzen, gibt es kein Objekt —
+    /// nie ein still verändertes Profil.
+    #[test]
+    fn a_redacted_profile_word_refuses_the_object() {
+        use minds_core::observation::{Isolation, WitnessFacts};
+        let facts = WitnessFacts {
+            profile: "user".into(),
+            isolation: Isolation {
+                witness_uid: 498,
+                agent_uids: vec![501],
+                home_private: true,
+                binary_protected: true,
+            },
+            spec: None,
+        };
+        let config: RedactionConfig = serde_json::from_str(r#"{"deny_pii":["user"]}"#).unwrap();
+        let pipeline = config.pipeline().unwrap();
+        assert!(
+            pipeline
+                .redact_observations(object(&["src/a.rs"]).with_witness(facts))
+                .is_err()
+        );
+    }
 
     fn object(paths: &[&str]) -> Observations {
         Observations::new(

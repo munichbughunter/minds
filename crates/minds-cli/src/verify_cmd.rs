@@ -456,10 +456,17 @@ fn verify_target(
     // über eine Session — und ändert den Exit-Code nur mit `--conformance`.
     let report = conformance_commit
         .and_then(|commit| conformance::report(&ctx, &run.trust, commit, signers));
+    let witnessed = conformance_commit
+        .map(|commit| conformance::witnessed(&ctx, &run.trust, commit))
+        .unwrap_or_default();
     if let Some(report) = &report {
         println!();
         conformance::print(report);
+    } else if !witnessed.seen.is_empty() {
+        println!();
+        println!("Conformance    no signed spec at this commit");
     }
+    conformance::print_witnessed(&witnessed, report.as_ref());
     // Das Assurance-Gate urteilt über die schwächste Session des Laufs.
     let assurance_failed = required_assurance.is_some_and(|required| {
         assurance::gate_failure(&levels, required)
@@ -859,6 +866,7 @@ fn verify_session(
                 link,
                 ledger: &run.ledger.check,
                 observations: &FsCoverage::Unavailable { cause: None },
+                witness_starts: &[],
                 intent: &intent,
                 commit,
             },
@@ -1140,6 +1148,7 @@ fn verify_session(
         }
     };
     let observations = assurance::fs_coverage(store, &windows);
+    let starts = assurance::witness_starts(&run.trust, store, &windows);
     let report = assurance::report(
         &run.trust,
         &assurance::Facts {
@@ -1155,6 +1164,7 @@ fn verify_session(
             link,
             ledger: &run.ledger.check,
             observations: &observations,
+            witness_starts: &starts,
             intent: &intent,
             commit,
         },
@@ -1724,6 +1734,7 @@ pub(crate) fn session_assurance(
         None => Vec::new(),
     };
     let observations = assurance::fs_coverage(store, &windows);
+    let starts = assurance::witness_starts(trust, store, &windows);
     let intent = assurance::intent_state(trust, id, session.as_ref(), &seals);
     Ok(assurance::report(
         trust,
@@ -1738,6 +1749,7 @@ pub(crate) fn session_assurance(
             link,
             ledger: &LedgerCheck::NotChecked,
             observations: &observations,
+            witness_starts: &starts,
             intent: &intent,
             commit,
         },

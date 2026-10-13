@@ -313,6 +313,15 @@ pub fn envelope_name(text: &str) -> String {
         .collect()
 }
 
+/// Die Identität eines Umschlags als Hash — dieselben Bytes wie
+/// [`envelope_name`], typisiert (etwa für die Fakten des Witness).
+pub fn envelope_id(text: &str) -> ContentHash {
+    ContentHash::from_bytes(blake3::derive_key(
+        "minds/spec/v1/envelope",
+        text.as_bytes(),
+    ))
+}
+
 /// Der Dateiname einer Signatur im Soll-Ref (`sigs/<name>`): 64 Hex-Zeichen
 /// über ihre Bytes — so verdrängt keine Signatur eine andere.
 pub fn signature_name(signature: &str) -> String {

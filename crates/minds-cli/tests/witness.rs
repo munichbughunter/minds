@@ -296,6 +296,43 @@ fn witness_keygen_is_safe() {
     assert_eq!(std::fs::read(&public).unwrap(), before_pub);
 }
 
+/// Den Principal eines getrennten Witness bekommt nur ein `user`-Witness, der
+/// hier wirklich getrennt läuft. Im Test läuft er unter der Kennung des
+/// Repo-Eigentümers: Er bekommt den gewöhnlichen — mit Hinweis.
+#[cfg(unix)]
+#[test]
+fn witness_keygen_names_a_separated_witness_by_its_principal() {
+    for (profile, note) in [("user", true), ("local", false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q", "--template="]);
+        let home = dir.path().join("home");
+        let init = command(&root)
+            .args(["witness", "init", "--repo"])
+            .arg(&root)
+            .args(["--profile", profile, "--home"])
+            .arg(&home)
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "{}", text(&init));
+        let keygen = command(&root)
+            .args(["witness", "keygen", "--home"])
+            .arg(&home)
+            .output()
+            .unwrap();
+        assert!(keygen.status.success(), "{}", text(&keygen));
+        let line = String::from_utf8_lossy(&keygen.stdout).into_owned();
+        assert!(line.starts_with("minds-witness@"), "{profile}: {line}");
+        assert_eq!(
+            String::from_utf8_lossy(&keygen.stderr).contains("does not run separated"),
+            note,
+            "{}",
+            text(&keygen)
+        );
+    }
+}
+
 #[test]
 fn witness_keygen_home_resolution_and_strict_arguments() {
     let dir = tempfile::tempdir().unwrap();

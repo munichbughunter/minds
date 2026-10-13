@@ -7,10 +7,28 @@
 //!
 //! ```text
 //! {"first_at":…,"last_at":…,"observations":[{"at":…,"content":"b3-…"|null,
-//!  "path":…,"reason":null|"…","seq":…}],"schema":2,"started_at":…}
+//!  "path":…,"reason":null|"…","seq":…}],"schema":2,"started_at":…,
+//!  "witness":{"isolation":{"agent_uids":[…],"binary_protected":…,
+//!  "home_private":…,"witness_uid":…},"profile":"…",
+//!  "spec":null|{"envelopes":["b3-…"],"id":"b3-…"}}}
 //! ```
 //!
 //! Alle Schlüssel stehen immer da, auch mit `null` — eine Form, ein Hash.
+//! Nur `started_at` (ab Schema 2) und `witness` (seit den Witness-Fakten)
+//! fehlen in älteren Objekten ganz — ein zusätzliches Feld hebt das Schema
+//! nicht (CHANGELOG); der Leser ist tolerant, die Id gilt den gespeicherten
+//! Bytes.
+//!
+//! # Was der Witness über sich festhält (`witness`)
+//!
+//! `witness` sind Fakten, die der Witness beim Versiegeln **selbst
+//! geprüft** hat ([`WitnessFacts`]): sein Profil, seine Trennung vom Agenten
+//! (eigene Kennung gegen die Eigentümer von Worktree und `.git`, privates
+//! Home, geschütztes Binary) und das Soll, das an HEAD galt, samt den
+//! Umschlägen, die er im Store sah. Wie `started_at` sind sie über die
+//! Objekt-Id im signierten Seal gebunden. Ob die Trennung als belegt gilt,
+//! leitet erst der Leser ab ([`Isolation::proven`]) — gespeichert wird der
+//! Befund, nicht das Urteil.
 //!
 //! # Beginn der Epoche (EA-08a)
 //!
@@ -74,6 +92,71 @@ pub struct Observations {
     pub last_at: Option<String>,
     /// Nach `seq` aufsteigend.
     pub observations: Vec<Observation>,
+    /// Was der Witness beim Versiegeln über sich festhielt; `None` in
+    /// älteren Objekten (und wo er nichts festhalten konnte).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub witness: Option<WitnessFacts>,
+}
+
+/// Was der Witness beim Versiegeln einer Epoche über sich prüfte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessFacts {
+    /// Sein Profil aus `witness.json` (`user`, `local`, …) — als Wort
+    /// gespeichert, damit ein künftiges Profil ein älteres Binary nicht am
+    /// Lesen hindert ([`crate::evidence::WitnessProfile::parse`] gibt dann
+    /// `None`).
+    pub profile: String,
+    /// Seine Trennung vom Agenten.
+    pub isolation: Isolation,
+    /// Das Soll an HEAD beim Versiegeln; `None` ohne (lesbares) Soll.
+    /// Fehlt der Schlüssel (tolerant gelesen), ebenso `None`.
+    #[serde(default)]
+    pub spec: Option<SpecSeen>,
+}
+
+/// Die Trennung des Witness vom Agenten, wie er sie beim Versiegeln vorfand.
+/// Der Agent läuft unter der Kennung, der Worktree und `.git` gehören.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Isolation {
+    /// Die effektive Kennung des Witness.
+    pub witness_uid: u32,
+    /// Die Eigentümer von Worktree-Wurzel und `.git` — aufsteigend, ohne
+    /// Doppelte.
+    pub agent_uids: Vec<u32>,
+    /// Home und Schlüssel gehören dem Witness, und niemand sonst kann sie
+    /// lesen oder schreiben (außer dem Durchqueren zum Socket).
+    pub home_private: bool,
+    /// Das laufende Binary und jedes Verzeichnis darüber gehören root oder
+    /// dem Witness und sind für niemanden sonst beschreibbar.
+    pub binary_protected: bool,
+}
+
+impl Isolation {
+    /// Ob die Trennung belegt ist: Die Kennung des Witness ist keine des
+    /// Agenten, der Agent ist nicht root (der läse jedes Home und ersetzte
+    /// jedes Binary), und Home wie Binary sind ihm entzogen.
+    ///
+    /// Das ist der Befund, nicht die Bürgschaft: Ob ihm zu trauen ist,
+    /// entscheidet der Principal, unter dem der Seal gilt
+    /// ([`crate::evidence::SEPARATED_WITNESS_PRINCIPAL`]).
+    pub fn proven(&self) -> bool {
+        !self.agent_uids.is_empty()
+            && !self.agent_uids.contains(&self.witness_uid)
+            && !self.agent_uids.contains(&0)
+            && self.home_private
+            && self.binary_protected
+    }
+}
+
+/// Das Soll, das der Witness an HEAD vorfand, und die Umschläge dazu im
+/// Store ([`crate::spec::envelope_id`]) — aufsteigend, ohne Doppelte.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecSeen {
+    /// Die Soll-Id (`derive_key("minds/spec/v1", kanonisch)`).
+    pub id: ContentHash,
+    /// Die Umschläge, die der Store unter dieser Id hielt — ungeprüft: Der
+    /// Witness kennt die vertrauenswürdigen Signer nicht.
+    pub envelopes: Vec<ContentHash>,
 }
 
 /// Eine beobachtete Änderung: `fs.observed { path, content, at }`.
@@ -148,6 +231,8 @@ pub enum ObservationError {
     Window,
     #[error("observation epoch start is missing, unreadable or after the first observation")]
     Start,
+    #[error("witness facts are not in canonical order or name an unknown profile")]
+    Witness,
 }
 
 impl Observations {
@@ -161,7 +246,15 @@ impl Observations {
             first_at: observations.first().map(|o| o.at.clone()),
             last_at: observations.last().map(|o| o.at.clone()),
             observations,
+            witness: None,
         }
+    }
+
+    /// Dasselbe Objekt mit den Fakten des Witness.
+    #[must_use]
+    pub fn with_witness(mut self, witness: WitnessFacts) -> Self {
+        self.witness = Some(witness);
+        self
     }
 
     /// Die Schreib-Regeln: Schema bekannt, Pfade schlicht repo-relativ,
@@ -197,6 +290,18 @@ impl Observations {
             let first: jiff::Timestamp = first.parse().map_err(|_| ObservationError::Window)?;
             if started > first {
                 return Err(ObservationError::Start);
+            }
+        }
+        if let Some(witness) = &self.witness {
+            let ascending = |values: &[u32]| values.windows(2).all(|pair| pair[0] < pair[1]);
+            let known = crate::evidence::WitnessProfile::parse(&witness.profile).is_some();
+            let envelopes = witness.spec.as_ref().is_none_or(|spec| {
+                spec.envelopes
+                    .windows(2)
+                    .all(|pair| pair[0].as_str() < pair[1].as_str())
+            });
+            if !known || !ascending(&witness.isolation.agent_uids) || !envelopes {
+                return Err(ObservationError::Witness);
             }
         }
         Ok(())
@@ -283,8 +388,107 @@ mod tests {
         r#""schema":1}"#
     );
 
+    /// Die Fakten eines getrennten `user`-Witness mit Soll.
+    fn facts() -> WitnessFacts {
+        WitnessFacts {
+            profile: "user".into(),
+            isolation: Isolation {
+                witness_uid: 498,
+                agent_uids: vec![501],
+                home_private: true,
+                binary_protected: true,
+            },
+            spec: Some(SpecSeen {
+                id: ContentHash::from_bytes([0x5a; 32]),
+                envelopes: vec![
+                    ContentHash::from_bytes([0x01; 32]),
+                    ContentHash::from_bytes([0x02; 32]),
+                ],
+            }),
+        }
+    }
+
     #[test]
-    fn observation_object_schema2_golden() {
+    fn observation_object_with_witness_facts_golden() {
+        let object = sample().with_witness(facts());
+        object.check().unwrap();
+        let text = String::from_utf8(object.canonical_bytes().unwrap()).unwrap();
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"first_at":"2026-10-05T10:00:00.250Z","last_at":"2026-10-05T10:00:02Z","#,
+                r#""observations":[{"at":"2026-10-05T10:00:00.250Z","#,
+                r#""content":"b3-77d93191302c0026c78d4347b6b5b6ecff6225060cb3128e487a849f474f0857","path":"src/sort/merge.rs","reason":null,"seq":1},"#,
+                r#"{"at":"2026-10-05T10:00:01Z","content":null,"path":".env","reason":"secret_file","seq":2},"#,
+                r#"{"at":"2026-10-05T10:00:02Z","content":null,"path":"old.txt","reason":"deleted","seq":4}],"#,
+                r#""schema":2,"started_at":"2026-10-05T09:59:58.125Z","#,
+                r#""witness":{"isolation":{"agent_uids":[501],"binary_protected":true,"#,
+                r#""home_private":true,"witness_uid":498},"profile":"user","#,
+                r#""spec":{"envelopes":["b3-0101010101010101010101010101010101010101010101010101010101010101","#,
+                r#""b3-0202020202020202020202020202020202020202020202020202020202020202"],"#,
+                r#""id":"b3-5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"}}}"#
+            )
+        );
+        let back: Observations = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, object);
+        assert_eq!(
+            object.id().unwrap().as_str(),
+            "b3-d0f51774c80f3ed56ba74b8adf0efaf9ad8e8463615d8f7c812dc4b7aab9fced"
+        );
+    }
+
+    /// Die Trennung gilt nur, wenn die Kennung des Witness keine des Agenten
+    /// ist und Home wie Binary ihm entzogen sind.
+    #[test]
+    fn isolation_is_proven_only_when_everything_holds() {
+        let proven = facts().isolation;
+        assert!(proven.proven());
+        for broken in [
+            Isolation {
+                agent_uids: vec![498, 501],
+                ..proven.clone()
+            },
+            Isolation {
+                agent_uids: vec![],
+                ..proven.clone()
+            },
+            Isolation {
+                agent_uids: vec![0],
+                ..proven.clone()
+            },
+            Isolation {
+                home_private: false,
+                ..proven.clone()
+            },
+            Isolation {
+                binary_protected: false,
+                ..proven.clone()
+            },
+        ] {
+            assert!(!broken.proven(), "{broken:?}");
+        }
+    }
+
+    /// Geschrieben werden nur Fakten in kanonischer Ordnung mit bekanntem
+    /// Profil.
+    #[test]
+    fn witness_facts_are_checked_before_writing() {
+        let mut unknown = facts();
+        unknown.profile = "sandbox".into();
+        let mut unsorted = facts();
+        unsorted.isolation.agent_uids = vec![501, 20];
+        let mut doubled = facts();
+        doubled.spec.as_mut().unwrap().envelopes.reverse();
+        for witness in [unknown, unsorted, doubled] {
+            assert_eq!(
+                sample().with_witness(witness).check(),
+                Err(ObservationError::Witness)
+            );
+        }
+    }
+
+    #[test]
+    fn observation_object_without_witness_facts_golden() {
         let object = sample();
         object.check().unwrap();
         let text = String::from_utf8(object.canonical_bytes().unwrap()).unwrap();
@@ -299,6 +503,8 @@ mod tests {
                 r#""schema":2,"started_at":"2026-10-05T09:59:58.125Z"}"#
             )
         );
+        // Ohne Fakten dieselben Bytes und Id wie vor ihnen — kein
+        // `witness: null`.
         assert_eq!(
             object.id().unwrap().as_str(),
             "b3-3d7c5cd8fbc5e3ff126d5bb75a218f6750e924da8ec2c2f0761e389d3586a26f"

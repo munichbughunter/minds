@@ -266,6 +266,9 @@ pub fn run_checkpoint_guarded(
 /// ablegen, versiegeln (Pflichtsignatur), erst dann verwerfen. Lehnt die
 /// Redaction das Objekt ab, entsteht ein Block-Seal desselben Scopes. Jeder
 /// Fehler vertagt nur diesen Stream.
+///
+/// `witness`: was der Witness bei diesem Checkpoint über sich prüfte — in
+/// jedem Objekt festgehalten (Feld `witness`).
 #[cfg(unix)]
 pub fn seal_observation_streams(
     env: &CheckpointEnv<'_>,
@@ -273,6 +276,7 @@ pub fn seal_observation_streams(
     signer: &SealSigner<'_>,
     guard: &dyn CheckpointGuard,
     streams: &[minds_capture::SessionKey],
+    witness: Option<&minds_core::observation::WitnessFacts>,
 ) -> Vec<SealSummary> {
     let mut sealed = Vec::new();
     for key in streams {
@@ -299,7 +303,10 @@ pub fn seal_observation_streams(
             continue;
         }
         let object = match observations_of(&read.events) {
-            Ok(object) => object,
+            Ok(object) => match witness {
+                Some(facts) => object.with_witness(facts.clone()),
+                None => object,
+            },
             Err(err) => {
                 guard.report(&format!("integrity error: {err}; witness stream deferred"));
                 continue;

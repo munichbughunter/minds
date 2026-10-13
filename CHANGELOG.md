@@ -19,6 +19,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Witness facts in signed material — A2 becomes reachable.** At every
+  checkpoint the witness records in the observation object what it checked
+  about itself: profile, its user ID against the owners of worktree and
+  `.git`, private home and key, protected binary, and the spec id at `HEAD`
+  with the envelopes it saw. `minds verify` reads them from the trusted epochs
+  of the session's window. The separation counts only under a signer
+  principal `minds-witness-user@…` (printed by `minds witness keygen` for the
+  `user` profile): a separated `user` witness no longer stops at `witness
+  profile unknown`, while a `local` key — readable by the agent — stays A1
+  whatever it signs. Under Conformance, `verify` names the spec the witness
+  saw (information, no gate). The observation schema stays 2 (additional
+  field).
 - **Witness by default.** `minds enable` without `--agent` sets up only the
   agents that look installed (their directory in the repository or in
   `$HOME`, or their program on `PATH`; none found: all as before). Without

@@ -439,6 +439,22 @@ must be private and owned by the current user. No repository is needed when
 the home is explicit. See the [verification guide](verification-guide.md)
 for trust-file distribution and independent signature verification.
 
+The principal says what the key may vouch for: a witness of the `user` profile
+(its own user ID) gets `minds-witness-user@<host>`, every other profile
+`minds-witness@<host>`. Only a witness range whose seal verifies under a
+`minds-witness-user@` principal can count as separated from the agent (A2) —
+list a key under that principal only if its witness really runs under its own
+user. A key of a witness under your own user ID (`local`) is readable by the
+agent; whatever it signs stays A1 — and so does every session whose hook ranges
+it signed, even next to a separated witness. `keygen` prints the separated
+principal only if the witness passes the separation checks right then (own user
+ID, not an owner of the repository, private home, root- or witness-owned binary),
+otherwise the ordinary one with a note; a home whose public key claims the
+separated principal without passing them is refused. List each key under exactly
+one principal. A key created by an older `minds`
+keeps `minds-witness@`; list a separated witness's key again under
+`minds-witness-user@<host>`.
+
 ### minds verify
 
 Witness-scoped seals require a signature in `minds-witness` by a principal
@@ -586,6 +602,19 @@ head. A branch based before a newer signature is checked against the spec of its
 own history. Graph facts are at the level of the sessions: at A1 the agent can write
 sessions itself; intents count with a valid `minds-intent` signature from the same
 signers (`--signers`).
+
+**What the witness saw.** At every checkpoint the witness records, in the signed
+observation object, the spec id of the checked commit and the envelopes it found
+under `refs/minds/specs/<id>`. Below the rows, `verify` shows one line per spec the
+witness saw during the commit's sessions (only sessions linked by trailer or
+witness, only trusted witness epochs that carry a session window) — `witnessed
+spec b3-… during the sessions (n envelope(s) seen by the witness)`, plus `this
+commit is judged against b3-…` if that differs from the spec the rows use. If none
+of those envelopes is in the store any more, a `note` line says so. This is
+information, not a gate: the witness does not know the trusted signers, so it
+records envelopes unchecked, and a new signature legitimately replaces envelopes
+without a trusted one. Which spec applies is still decided by history and
+signatures alone.
 
 Conformance is a derivation: it never changes the verdict or the exit code.
 `--conformance` (for CI) fails with exit 2 on any DRIFT or UNKNOWN, or when there

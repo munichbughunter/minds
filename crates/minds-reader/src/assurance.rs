@@ -199,7 +199,9 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use minds_core::evidence::{SCOPE_AGENT_HOOKS_V1, SCOPE_WITNESS_V1, WitnessProfile};
+use minds_core::evidence::{
+    SCOPE_AGENT_HOOKS_V1, SCOPE_WITNESS_V1, SEPARATED_WITNESS_PRINCIPAL, WitnessProfile,
+};
 use minds_core::{ContentHash, EvidenceSource};
 
 use crate::model::EvidenceVerdict;
@@ -380,6 +382,16 @@ pub enum SealSignature {
     /// zusätzlich als [`EvidenceVerdict::Tampered`] meldet; ohne Signer ist
     /// die Prüfung keine — A1.
     NotWitness,
+}
+
+impl SealSignature {
+    /// Ob der Seal unter einem Principal gilt, den ein Mensch als
+    /// **getrennten** Witness eingetragen hat
+    /// ([`SEPARATED_WITNESS_PRINCIPAL`]) — die eine Stelle für diese Regel.
+    pub fn is_separated_witness(&self) -> bool {
+        matches!(self, Self::Witness { principal }
+            if principal.starts_with(SEPARATED_WITNESS_PRINCIPAL))
+    }
 }
 
 /// Ein versiegelter Bereich der Session, wie der Aufrufer ihn gelesen hat.
@@ -811,7 +823,7 @@ impl Reason {
             Self::ProfileNotQualified(profile) => {
                 format!("profile {} not qualified for A2", profile.name())
             }
-            Self::IsolationNotProven => "witness isolation not proven — profile name only".into(),
+            Self::IsolationNotProven => "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent".into(),
             Self::SessionEndNotWitnessed => {
                 "session end not witnessed — a later range could be missing".into()
             }
@@ -1061,8 +1073,16 @@ impl SessionFacts {
                 .map(Reason::ProfileNotQualified),
         );
         // Der Profilname allein gewährt nie A2: Jeder Lauf muss seine
-        // Trennung vom Agenten belegt haben.
-        if starts.iter().any(|start| !start.isolated) {
+        // Trennung vom Agenten belegt haben — und jeder Witness-Bereich der
+        // Session muss unter einem Principal gelten, den ein Mensch als
+        // getrennten Witness eingetragen hat. Sonst signierte ein Schlüssel,
+        // den der Agent lesen kann (`local`), die Hook-Evidence, während ein
+        // getrennter Witness nur die Beobachtungs-Epochen beisteuert.
+        let unvouched = ranges.iter().any(|range| {
+            matches!(range.signature, SealSignature::Witness { .. })
+                && !range.signature.is_separated_witness()
+        });
+        if unvouched || starts.iter().any(|start| !start.isolated) {
             witnessed.push(Reason::IsolationNotProven);
         }
         // Das Ende muss bezeugt sein: Der letzte Bereich (Ketten-
@@ -1378,7 +1398,7 @@ mod tests {
 
     use super::*;
 
-    const PRINCIPAL: &str = "minds-witness@build-07";
+    const PRINCIPAL: &str = "minds-witness-user@build-07";
 
     /// Ein vom Witness verketteter, von Anfang an gültiger Anker mit
     /// passendem Snapshot — nur die Signaturlage variiert.
@@ -1830,6 +1850,21 @@ mod tests {
                 Assurance::A1Observed,
                 &["profile managed not qualified for A2"],
             ),
+            // Die Hook-Evidence unter einem gewöhnlichen Witness-Principal
+            // (etwa dem Schlüssel eines `local`-Witness, den der Agent lesen
+            // kann) — auch wenn die Beobachtungs-Epochen getrennt sind.
+            (
+                "a witness range not under a separated principal",
+                |f| {
+                    f.ranges[0].signature = SealSignature::Witness {
+                        principal: "minds-witness@build-07".into(),
+                    }
+                },
+                Assurance::A1Observed,
+                &[
+                    "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent",
+                ],
+            ),
             // `local` (derselbe Nutzer wie der Agent) nie — auch nicht mit
             // einem Start, der Isolation behauptet.
             (
@@ -1882,7 +1917,9 @@ mod tests {
                 "a profile name without proven isolation",
                 |f| f.witness_starts[0].isolated = false,
                 Assurance::A1Observed,
-                &["witness isolation not proven — profile name only"],
+                &[
+                    "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent",
+                ],
             ),
             (
                 "one of several runs without proven isolation",
@@ -1894,7 +1931,9 @@ mod tests {
                     })
                 },
                 Assurance::A1Observed,
-                &["witness isolation not proven — profile name only"],
+                &[
+                    "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent",
+                ],
             ),
             (
                 "intent signature not checked",

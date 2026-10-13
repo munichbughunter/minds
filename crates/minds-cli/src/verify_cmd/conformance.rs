@@ -135,6 +135,113 @@ pub(crate) fn report(
     )
 }
 
+/// Was der Witness während der Sessions des Commits über das Soll sah:
+/// je Soll-Id die Umschläge, die er im Store vorfand — und welche Solls
+/// davon heute **keinen** dieser Umschläge mehr im Store haben.
+///
+/// Gelesen werden nur die Fakten aus Epochen eines **getrennten** Witness
+/// (Principal `minds-witness-user@…`), die ein Fenster der Sessions tragen
+/// ([`minds_reader::observations::witness_facts`]) — den Schlüssel eines
+/// Witness unter der Kennung des Agenten kann der Agent lesen. Sessions, die
+/// nur heuristisch mit dem Commit verknüpft sind, zählen nicht.
+///
+/// Eine **Auskunft**, kein Urteil und kein Gate: Der Witness hält die
+/// Umschläge ungeprüft fest (er kennt die vertrauenswürdigen Signer nicht).
+/// Ein untergeschobener Umschlag kann so „noch da" heißen, und ein
+/// Mensch, der neu signiert, verdrängt rechtmäßig Umschläge ohne
+/// vertrauenswürdige Signatur. Welches Soll gilt, entscheiden weiter
+/// Historie und Signaturen (ADR-0013, Entscheidung 2).
+#[derive(Debug, Default)]
+pub(crate) struct Witnessed {
+    pub seen: std::collections::BTreeMap<
+        minds_core::ContentHash,
+        std::collections::BTreeSet<minds_core::ContentHash>,
+    >,
+    pub lost: Vec<minds_core::ContentHash>,
+}
+
+/// [`Witnessed`] für `commit` — leer ohne Sessions oder ohne bezeugte
+/// Epochen.
+pub(crate) fn witnessed(ctx: &Context, trust: &WitnessTrust<'_>, commit: CommitId) -> Witnessed {
+    let mut witnessed = Witnessed::default();
+    let Ok(ids) = super::sessions_of_commit(ctx, commit) else {
+        return witnessed;
+    };
+    let trusted = |seal_id: &minds_core::ContentHash, text: &str| {
+        trust.signature(seal_id, text).is_separated_witness()
+    };
+    let store = ctx.store.as_ref();
+    for (id, source) in ids {
+        if source == minds_core::EvidenceSource::Heuristic {
+            continue;
+        }
+        let Ok(Some(session)) = store.get(id) else {
+            continue;
+        };
+        let windows =
+            minds_reader::observations::witness_windows(store, &[(id, &session)], &trusted);
+        for (_, facts) in minds_reader::observations::witness_facts(store, &windows) {
+            // Dieselbe Definition wie bei den Starts: bekanntes Profil und
+            // belegte Trennung — sonst zählt die Epoche nicht.
+            let separated = |facts: &minds_core::observation::WitnessFacts| {
+                facts.isolation.proven()
+                    && minds_core::evidence::WitnessProfile::parse(&facts.profile).is_some()
+            };
+            if let Some(spec) = facts.filter(separated).and_then(|facts| facts.spec) {
+                witnessed
+                    .seen
+                    .entry(spec.id)
+                    .or_default()
+                    .extend(spec.envelopes);
+            }
+        }
+    }
+    for (spec, envelopes) in &witnessed.seen {
+        if envelopes.is_empty() {
+            continue;
+        }
+        let present: std::collections::BTreeSet<minds_core::ContentHash> = store
+            .get_spec(spec)
+            .ok()
+            .flatten()
+            .map(|stored| {
+                stored
+                    .envelopes
+                    .iter()
+                    .map(|envelope| minds_core::spec::envelope_id(envelope.signed.text()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if envelopes.is_disjoint(&present) {
+            witnessed.lost.push(spec.clone());
+        }
+    }
+    witnessed
+}
+
+/// Die Zeilen zu [`Witnessed`] — unter dem Bericht, ohne ihn zu ändern.
+pub(crate) fn print_witnessed(witnessed: &Witnessed, report: Option<&Report>) {
+    let short = |id: &minds_core::ContentHash| format!("b3-{}", &id.hex()[..12]);
+    for (spec, envelopes) in &witnessed.seen {
+        let judged = match report.and_then(|r| r.active.as_ref()) {
+            Some((active, _)) if active != spec => {
+                format!(" — this commit is judged against {}", short(active))
+            }
+            _ => String::new(),
+        };
+        println!(
+            "               witnessed spec {} during the sessions ({} envelope(s) seen by the witness){judged}",
+            short(spec),
+            envelopes.len()
+        );
+        if witnessed.lost.contains(spec) {
+            println!(
+                "               note      none of them is in the store any more (unchecked when seen; a new signature replaces envelopes without a trusted one)"
+            );
+        }
+    }
+}
+
 /// Die Zeilen des Berichts: eine Kopfzeile, dann je Regel
 /// *result · id · expected → observed*. Alle Texte sind schon entschärft
 /// (der Reader liefert nur Einzeiler).

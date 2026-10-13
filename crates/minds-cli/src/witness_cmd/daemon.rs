@@ -22,6 +22,21 @@ use crate::checkpoint::core::{
     CheckpointEnv, CheckpointGuard, EvidenceSource, SealSigner, run_checkpoint_guarded,
 };
 
+mod facts;
+
+/// Ob der Witness in `home` getrennt läuft ([`facts::separated_here`]).
+pub(crate) fn separated_here(home: &Path, with_key: bool) -> bool {
+    load(home).is_ok_and(|config| {
+        // Dieselben Pfade wie in den Fakten: auch das gemeinsame
+        // Git-Verzeichnis (verknüpfte Worktrees).
+        let git_dir = config.git_dir();
+        let common_dir = minds_git::Repo::open_pinned(&git_dir)
+            .map(|repo| repo.common_dir().to_path_buf())
+            .unwrap_or_else(|_| git_dir.clone());
+        config.profile == WitnessProfile::User
+            && facts::separated_here(home, &config.repo_root, &git_dir, &common_dir, with_key)
+    })
+}
 mod intent;
 mod limits;
 mod observer;
@@ -1989,6 +2004,16 @@ impl Writer {
             epochs: &self.epochs,
             scope: minds_core::evidence::SCOPE_WITNESS_FS_V1,
         };
+        // Was der Witness über sich festhält (Feld `witness`): einmal je
+        // Checkpoint geprüft, in jedem Objekt dieses Laufs.
+        let facts = facts::witness_facts(
+            self.config.profile,
+            &self.home,
+            root,
+            &repo,
+            store.as_ref(),
+            commit.and_then(|commit| commit.parse().ok()),
+        );
         let fs_sealed = crate::checkpoint::core::seal_observation_streams(
             &env,
             &fs_source,
@@ -1998,6 +2023,7 @@ impl Writer {
             },
             self,
             &streams,
+            Some(&facts),
         );
         // Ob die Epoche geschlossen ist, wertet `finish_checkpoint` im
         // Witness aus — auch nach einem Lauf im Worker.
