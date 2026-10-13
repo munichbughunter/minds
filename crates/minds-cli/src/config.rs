@@ -156,7 +156,7 @@ fn policy_error(path: &Path, err: &serde_json::Error) -> String {
     )
 }
 
-fn set(repo_root: &Path, key: &str, value: &str) -> std::io::Result<()> {
+pub(crate) fn set(repo_root: &Path, key: &str, value: &str) -> std::io::Result<()> {
     let status = Command::new("git")
         .arg("-C")
         .arg(repo_root)

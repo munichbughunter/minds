@@ -321,7 +321,12 @@ fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<()> {
 /// Wie `enable` mit dem Standard-Witness umgeht (`MINDS_WITNESS`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LocalMode {
-    /// Einrichten und starten (Standard).
+    /// Standard: auf einem Terminal einmal fragen, ob geschützt
+    /// ([`crate::enable_protected`]); sonst wie [`LocalMode::On`].
+    Ask,
+    /// Geschützt einrichten, ohne zu fragen (`MINDS_WITNESS=protected`).
+    Protected,
+    /// Ungeschützt einrichten und starten, ohne zu fragen.
     On,
     /// Einrichten, den Start nur drucken.
     Print,
@@ -330,22 +335,24 @@ pub(crate) enum LocalMode {
 }
 
 impl LocalMode {
-    /// Aus `MINDS_WITNESS` — fehlend oder leer: `On`. Alles andere,
+    /// Aus `MINDS_WITNESS` — fehlend oder leer: `Ask`. Alles andere,
     /// auch ein Wert, der kein UTF-8 ist, ist ein Fehler.
     pub(crate) fn from_env() -> std::io::Result<Self> {
         match std::env::var("MINDS_WITNESS") {
-            Err(std::env::VarError::NotPresent) => Ok(Self::On),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Ask),
             Ok(value) => match value.as_str() {
-                "" | "on" => Ok(Self::On),
+                "" => Ok(Self::Ask),
+                "protected" => Ok(Self::Protected),
+                "on" | "local" => Ok(Self::On),
                 "print" => Ok(Self::Print),
                 "off" => Ok(Self::Off),
                 other => Err(std::io::Error::other(format!(
-                    "MINDS_WITNESS must be on, print or off, not {:?}",
+                    "MINDS_WITNESS must be protected, local, on, print or off, not {:?}",
                     crate::text::sanitize(other)
                 ))),
             },
             Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
-                "MINDS_WITNESS must be on, print or off",
+                "MINDS_WITNESS must be protected, local, on, print or off",
             )),
         }
     }
@@ -361,6 +368,154 @@ enum LocalOutcome {
     /// Ein anderes Profil ist eingerichtet (etwa `container`) und bleibt,
     /// wie es ist — `enable` startet es nicht.
     Kept(&'static str),
+}
+
+/// Der Witness ohne `--witness`: ein schon laufender geschützter bleibt;
+/// sonst — auf Nachfrage oder mit `MINDS_WITNESS=protected` — der geschützte
+/// ([`crate::enable_protected`]), und wo der nicht gewählt wird oder
+/// scheitert, der ungeschützte ([`local`]).
+pub(crate) fn default(
+    root: &Path,
+    store: &minds_store::StoreConfig,
+    mode: LocalMode,
+    verbose: bool,
+) {
+    if mode == LocalMode::Off {
+        return;
+    }
+    #[cfg(unix)]
+    if crate::hook::witness::socket_path().is_none() && mode != LocalMode::Print {
+        let canonical = root.canonicalize().ok();
+        let found = canonical
+            .as_deref()
+            .and_then(crate::enable_protected::discover);
+        match &found {
+            // Läuft er, bleibt er — außer `MINDS_WITNESS=protected` verlangt
+            // ausdrücklich, ihn neu einzurichten (etwa nach einem Update).
+            Some((socket, _))
+                if mode != LocalMode::Protected && crate::witness_cmd::ping(socket) =>
+            {
+                eprintln!(
+                    "minds: protected witness running for this repository (user {}, socket {})",
+                    crate::enable_protected::WITNESS_USER,
+                    quoted_display(socket)
+                );
+                if let Some(root) = &canonical {
+                    crate::enable_protected::stop_local_service(root);
+                }
+                if crate::enable_protected::binary_differs() {
+                    crate::text::warn(&format!(
+                        "the protected witness runs another minds binary ({}) than this one — \
+                         rerun `MINDS_WITNESS=protected minds enable` to update it",
+                        crate::enable_protected::BINARY
+                    ));
+                }
+                return;
+            }
+            // Eingerichtet, aber stumm: Die Hooks fänden ihn zuerst und
+            // schrieben dann ins lokale Journal — das soll man sehen.
+            Some((socket, _)) if mode != LocalMode::Protected => crate::text::warn(&format!(
+                "a protected witness is installed for this repository but does not answer \
+                 (socket {}) — hooks record into the local journal; check its service or \
+                 rerun `MINDS_WITNESS=protected minds enable`",
+                quoted_display(socket)
+            )),
+            _ => {}
+        }
+        let protected = match mode {
+            LocalMode::Protected => true,
+            LocalMode::Ask => {
+                crate::enable_protected::interactive() && crate::enable_protected::ask()
+            }
+            _ => false,
+        };
+        if protected {
+            match crate::enable_protected::install(root, store, verbose) {
+                Ok(installed) => {
+                    report_protected(&installed);
+                    return;
+                }
+                Err(err) => crate::text::warn(&format!(
+                    "protected witness not set up: {} — setting up the unprotected witness \
+                     instead",
+                    crate::text::sanitize(&err.to_string())
+                )),
+            }
+        }
+    }
+    let mode = match mode {
+        LocalMode::Ask | LocalMode::Protected => LocalMode::On,
+        mode => mode,
+    };
+    local(root, store, mode, verbose);
+}
+
+/// Was nach der geschützten Einrichtung zu sagen ist: wo er läuft, die
+/// Signer-Zeile (und ob sie für die Trennung bürgen kann), die Managed
+/// Settings.
+#[cfg(unix)]
+fn report_protected(installed: &crate::enable_protected::Installed) {
+    if installed.answering {
+        eprintln!(
+            "minds: protected witness running for this repository (user {}, socket {})",
+            crate::enable_protected::WITNESS_USER,
+            quoted_display(&installed.socket)
+        );
+    } else {
+        // Eingerichtet, aber noch keine Antwort: kein Rückfall auf den
+        // ungeschützten — sonst liefen bald zwei.
+        // Unter Linux gilt die neue Gruppe erst nach dem nächsten Anmelden —
+        // vorher kann dieser Prozess den Socket nicht erreichen.
+        crate::text::warn(&if installed.notes.is_empty() {
+            format!(
+                "the protected witness is installed but does not answer yet (socket {}) — \
+                 hooks record into the local journal until it does; rerun `minds enable` to \
+                 check",
+                quoted_display(&installed.socket)
+            )
+        } else {
+            format!(
+                "the protected witness is installed (socket {}); it is reachable after your \
+                 next login — run `minds enable` again then",
+                quoted_display(&installed.socket)
+            )
+        });
+    }
+    for note in &installed.notes {
+        eprintln!("minds: {note}");
+    }
+    match &installed.signers {
+        Some(line) if line.starts_with(minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL) => {
+            eprintln!(
+                "Add this line to the allowed_signers file you pass to `minds verify --signers` \
+                 (keep it outside the repository) — it vouches that this witness runs \
+                 separated:\n  {line}"
+            );
+        }
+        Some(line) => crate::text::warn(&format!(
+            "the protected witness did not pass its separation checks — its key carries the \
+             ordinary principal and its ranges stay A1:\n  {line}"
+        )),
+        None => crate::text::warn(
+            "the setup printed no signers line — run `minds witness signers` as the witness \
+             user",
+        ),
+    }
+    if let Some(managed) = installed.managed.as_deref() {
+        if let Some(path) = managed.strip_prefix("installed ") {
+            eprintln!(
+                "minds: Claude Code managed settings installed ({path}) — deny rules for the \
+                 witness only"
+            );
+        } else if let Some(path) = managed.strip_prefix("unchanged ") {
+            eprintln!("minds: Claude Code managed settings unchanged ({path})");
+        } else if let Some(path) = managed.strip_prefix("proposed ") {
+            crate::text::warn(&format!(
+                "a Claude Code managed-settings.json already exists — the deny rules are \
+                 proposed in {path}; merge them yourself"
+            ));
+        }
+    }
 }
 
 /// Richtet den Standard-Witness ein (Profil `local`) und startet ihn — nach
@@ -555,7 +710,7 @@ fn local_unix(
             Ok(LocalOutcome::Printed(crate::text::sanitize(&printed)))
         }
         LocalMode::Off => unreachable!("vorher geprüft"),
-        LocalMode::On => {
+        LocalMode::On | LocalMode::Ask | LocalMode::Protected => {
             start_service(&service_target, &id)?;
             // Bis zu drei Sekunden auf einen Witness, der antwortet — eine
             // Socket-Datei allein kann von einem toten Lauf übrig sein.
@@ -668,6 +823,9 @@ fn start_service(target: &ServiceTarget, id: &str) -> std::io::Result<()> {
             }
         }
         let plist = utf8(&target.path)?;
+        // Ein früher abgeschalteter Job (der geschützte Witness hat ihn
+        // abgelöst) lädt erst wieder, wenn er eingeschaltet ist.
+        let _ = run(launchctl, &["enable", &service])?;
         // Auch danach meldet `bootstrap` gelegentlich noch „5: Input/output
         // error" — einige Versuche, dann der Fehler mit seiner Meldung.
         let mut attempt = 0;
@@ -754,7 +912,7 @@ fn start_service(target: &ServiceTarget, id: &str) -> std::io::Result<()> {
 /// im beobachteten Repo liegt (etwa `target/release/minds` beim Dogfooding):
 /// Das Repo ist in den Container gemountet, der Agent könnte es ersetzen.
 #[cfg(unix)]
-fn service_binary(root: &Path) -> std::io::Result<PathBuf> {
+pub(crate) fn service_binary(root: &Path) -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?.canonicalize()?;
     if exe.starts_with(root) {
         return Err(other(format!(

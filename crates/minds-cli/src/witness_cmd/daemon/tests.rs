@@ -4,6 +4,37 @@ use minds_store::ContextStore;
 mod intent_tests;
 mod observer_tests;
 
+/// Ein Verzeichnis in `.git`, das der Witness betreten, aber nicht auflisten
+/// darf, könnte einen Symlink verbergen, den er beim Öffnen eines bekannten
+/// Namens fände: nicht schlicht. Eines, das er gar nicht betreten darf (das
+/// lokale Journal eines anderen Nutzers), lenkt nichts um und bleibt außen
+/// vor.
+#[test]
+fn a_directory_that_can_be_entered_but_not_listed_is_not_plain() {
+    use std::os::unix::fs::PermissionsExt;
+    // Als root greift die Rechteprüfung nicht — dann sagt der Test nichts.
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let dot_git = dir.path().join(".git");
+    let hidden = dot_git.join("logs/hidden");
+    fs::create_dir_all(dot_git.join("objects")).unwrap();
+    fs::create_dir_all(&hidden).unwrap();
+    let mode = |mode| fs::set_permissions(&hidden, fs::Permissions::from_mode(mode)).unwrap();
+    assert!(plain_git_dir_within(&dot_git, 1000).is_ok());
+    // Betretbar, nicht auflistbar.
+    mode(0o300);
+    let refused = plain_git_dir_within(&dot_git, 1000);
+    // Weder betret- noch auflistbar: übergangen.
+    mode(0o000);
+    let skipped = plain_git_dir_within(&dot_git, 1000);
+    mode(0o700);
+    assert!(refused.is_err(), "searchable but unlistable");
+    assert!(skipped.is_ok(), "{skipped:?}");
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     home: PathBuf,

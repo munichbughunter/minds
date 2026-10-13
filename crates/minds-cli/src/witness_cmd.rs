@@ -38,7 +38,7 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
     let result = (|| {
         let command = parsed
             .positional(0)
-            .ok_or("expected: witness init, run, keygen or status")?;
+            .ok_or("expected: witness init, run, keygen, signers or status")?;
         if command != "init"
             && [
                 "--repo",
@@ -84,7 +84,12 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
                 Ok(String::new())
             }
             "status" => daemon::status(&home),
-            _ => Err("expected: witness init, run, keygen or status".into()),
+            // Die Signer-Zeile eines vorhandenen Schlüssels — für die
+            // geschützte Einrichtung, die das Home nur als Witness-Nutzer
+            // lesen kann.
+            "signers" => existing_signers_line(&home)?
+                .ok_or_else(|| "no witness key — run minds witness keygen".into()),
+            _ => Err("expected: witness init, run, keygen, signers or status".into()),
         }
     })();
     match result {

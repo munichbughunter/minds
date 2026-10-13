@@ -162,7 +162,7 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
 
     let unreachable = match witness {
         Some((found, raw)) => {
-            let same_user = found.same_user();
+            let peer = found.peer;
             let socket = found.socket;
             // Hat die Mauer gegriffen, gehen nicht die Rohbytes über den
             // Socket, sondern ihr gewallter Neubau — der passt auch dann in
@@ -187,9 +187,9 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
             } else {
                 raw
             };
-            match stdin.and_then(|stdin| {
-                witness::forward(&socket, same_user, agent, event_override, stdin)
-            }) {
+            match stdin
+                .and_then(|stdin| witness::forward(&socket, peer, agent, event_override, stdin))
+            {
                 Ok(()) => return Ok(()),
                 Err(kind) => Some(kind),
             }

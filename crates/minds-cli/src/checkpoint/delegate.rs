@@ -89,7 +89,7 @@ pub(super) fn delegate(repo: &Repo, commit: Option<&str>) {
     let Some(found) = witness::discovered_socket(&here) else {
         return;
     };
-    let same_user = found.same_user();
+    let peer = found.peer;
     let socket = found.socket;
 
     // Der Witness bekommt immer einen konkreten Commit, nie „HEAD": Er prüft
@@ -114,7 +114,7 @@ pub(super) fn delegate(repo: &Repo, commit: Option<&str>) {
         request_id: request_id(),
     };
 
-    match witness::request(&socket, same_user, &request, Instant::now() + timeout()) {
+    match witness::request(&socket, peer, &request, Instant::now() + timeout()) {
         Ok(Frame::Ack { status, .. }) => {
             for line in status.split(LINE_SEPARATOR).filter(|l| !l.is_empty()) {
                 // Fremder Text auf das Terminal des Nutzers: Das Protokoll hat

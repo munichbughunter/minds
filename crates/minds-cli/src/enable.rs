@@ -208,11 +208,24 @@ pub fn run(
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
             // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
             None => {
-                crate::enable_witness::local(&paths.root, store, local_mode, verbose);
+                crate::enable_witness::default(&paths.root, store, local_mode, verbose);
                 Ok(())
             }
         }
     });
+    // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
+    // soll rückwirkend Kontext bekommen, ohne auf das Lesen (womöglich großer)
+    // Transkripte zu warten. Seine Fehler landen im Log der Hook-Pfade, nicht
+    // im Terminal des Nutzers — und `fsck` verweist darauf. Er startet erst
+    // nach dem Witness: Ist das Repo dann für einen geschützten geteilt,
+    // schreibt er schon so, dass dessen Gruppe weiterschreiben kann.
+    if enabled.is_ok() {
+        spawn_background_import();
+        vln(
+            verbose,
+            "  backfill running in the background (errors → .git/minds/hook.log)",
+        );
+    }
     match enabled {
         // Im Regelfall still — den Nutzer interessiert das Setup nicht. `-v`
         // zeigt jeden Schritt; nur echte Fehler kommen immer durch.
@@ -550,16 +563,9 @@ fn enable_agents(
     config::write(&paths.root, store)?;
     vln(verbose, "  .git/config: minds.backend/contextRef set");
 
-    // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
-    // soll rückwirkend Kontext bekommen, ohne auf das Lesen (womöglich großer)
-    // Transkripte zu warten. Seine Fehler landen im Log der Hook-Pfade, nicht
-    // im Terminal des Nutzers — und `fsck` verweist darauf.
+    // Das Log eines früheren Backfills räumen; den Backfill selbst startet
+    // `run`, nach dem Witness.
     remove_legacy_import_log(&paths.git_dir);
-    spawn_background_import();
-    vln(
-        verbose,
-        "  backfill running in the background (errors → .git/minds/hook.log)",
-    );
 
     Ok(())
 }
