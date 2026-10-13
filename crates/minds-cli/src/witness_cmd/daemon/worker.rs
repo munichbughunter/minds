@@ -119,13 +119,22 @@ fn run_within(
     })
     .map_err(|_| Failure::Aborted("worker request not encodable"))?;
     let mut command = Command::new(exe);
+    // Der Startpfad des Witness für seine Fakten — der Worker selbst startet
+    // über das aufgelöste Binary. Nur ein absoluter (der Dienst startet so).
+    let started_as = std::env::args_os()
+        .next()
+        .filter(|path| Path::new(path).is_absolute());
     command
         .args(["witness", crate::witness_cmd::WORKER_COMMAND, "--home"])
         .arg(home)
         .env_remove("MINDS_WITNESS_SOCKET")
+        .env_remove(super::facts::STARTED_AS)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    if let Some(path) = &started_as {
+        command.env(super::facts::STARTED_AS, path);
+    }
     // SAFETY: zwischen fork und exec laufen nur async-signal-sichere
     // Systemaufrufe ohne Allokation.
     unsafe {

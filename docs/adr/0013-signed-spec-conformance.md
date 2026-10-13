@@ -121,8 +121,12 @@ only names — is no rule.
 - Signature checks are bounded per run (envelopes in the history first, at most 64
   `ssh-keygen` checks); beyond that the result is UNKNOWN.
 - Graph facts (sessions, intents) are at the assurance level of the sessions: at A1 the agent
-  can write sessions itself. The witness does not yet attest the active spec at observation
-  time; that is follow-up work (witness by default).
+  can write sessions itself. The witness records, at every checkpoint and signed, the spec id
+  of the checked commit and the envelopes it found in the store (ADR-0012, addendum
+  "Witness facts"); `verify` names them and whether they are still in the store. That is
+  information, not a gate: the witness records envelopes unchecked, and a new signature
+  legitimately replaces untrusted ones. Which envelope applies stays with history and
+  signatures (decision 2).
 - On Windows, `ssh-keygen` ownership is not checked (the first one outside the checkout is
   used).
 - A fresh clone without `refs/minds/specs/*` reports the spec as unsigned ("fetch

@@ -1305,6 +1305,31 @@ fn enable_skips_the_local_witness_when_another_is_named() {
     assert!(!f.path("state").join("minds-witness").exists());
 }
 
+/// Im Home eines `local`-Witness kann der Agent den Kommentar des
+/// öffentlichen Schlüssels umschreiben. Behauptet er den Principal eines
+/// getrennten Witness, druckt `enable` diese Zeile nicht — wer sie übernähme,
+/// bürgte ahnungslos für eine Trennung.
+#[test]
+fn enable_refuses_a_separated_principal_in_a_local_home() {
+    let f = Fixture::new();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let public = f.home().join("key/witness_ed25519.pub");
+    let line = fs::read_to_string(&public).unwrap();
+    let forged = line.replace("minds-witness@", "minds-witness-user@");
+    assert_ne!(forged, line);
+    fs::write(&public, forged).unwrap();
+
+    let out = f.enable_default_with("print", &[]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("claims the principal of a separated witness"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("witness set up"), "{stderr}");
+}
+
 /// Ein schon eingerichteter Witness (hier `container`) bleibt, wie er ist.
 #[test]
 fn enable_keeps_an_existing_witness_profile() {

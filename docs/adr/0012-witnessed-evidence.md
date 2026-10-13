@@ -441,3 +441,68 @@ demonstrate agent exclusion and working managed hooks for the pinned OS/harness
 versions. This is a conservative qualification decision, not a proof that all
 managed configurations are incapable of isolation. EA-04 accepts this ADR with the A1
 cap intact. No production behavior changes in EA-S1.
+
+## Addendum: Witness facts
+
+2026-10-13 — **The witness records what it checked about itself; the reader decides.**
+Until now the profile was only in `witness.start`, which stays in the witness journal, so
+`verify` never had a profile and A2 was unreachable. From now on the checkpoint worker
+(the witness's own user ID and binary) adds a field `witness` to every observation object
+it seals (`refs/minds/observations/<hash>`, bound by the signed `witness-fs/v1` seal):
+
+- `profile`: the word from `witness.json`;
+- `isolation`: its effective user ID, the owners of the worktree root and `.git` (the
+  agent's user ID), `home_private` (home owned by it, no access for others, the group
+  may only traverse; key 0600) and `binary_protected` (the running binary and every
+  directory above it belong to root or the witness and are writable by no one else);
+- `spec`: the spec id at `HEAD` and the envelope hashes under `refs/minds/specs/<id>`.
+
+The field is additional: the object schema stays 2, older objects simply lack it.
+
+The facts are self-reported: whoever holds the witness key can sign any of them, and the
+key of a witness under the developer's user ID (`local`, the `minds enable` default) is
+readable by the agent. So the **trust anchor** vouches for the separation, as decision 2
+demands: a human lists the key of a separated witness under a principal starting with
+`minds-witness-user@` (which `minds witness keygen` prints for the `user` profile). The
+reader derives `isolated` only if the facts show it ("witness user ID is none of the
+agent's, the agent is not root, home private, binary protected"), the profile is known,
+**and** the epoch's seal verifies under such a principal. It feeds one start per trusted
+epoch of the session's window into the assessment. The same holds for the evidence the
+facts are meant to back: A2 also requires every witness-signed range of the session
+(`witness/v1`) to verify under a `minds-witness-user@` principal, and then the intent's
+epoch chain counts only such seals too — otherwise a still-trusted `local` key could sign
+fabricated hook ranges while a separated witness supplies clean observation epochs.
+`minds witness keygen` and `minds enable` print the separated principal only for a home of
+profile `user` that passes the same checks as the facts at that moment (own user ID, not
+an owner of worktree or `.git`, private home, protected binary); otherwise `keygen` prints
+the ordinary principal with a note, and a home whose public key claims the separated one is
+refused (the agent could have rewritten the comment). List each key under exactly one
+principal: which line `ssh-keygen` reports for a key listed twice depends on file order. A key created before this change keeps `minds-witness@`: list a
+separated witness's key again under `minds-witness-user@<host>`. An epoch without facts is a start without profile (`witness profile unknown`),
+so old material and missing objects stay fail-closed. A profile name alone still never
+grants A2: `local` never qualifies, and `user` qualifies only with the separation proven.
+
+"Private" and "protected" mean: owned by root or the witness, not writable by group or
+others (the home not even readable), along the whole directory chain, for the binary
+also along the path it was started from, and without ACLs (macOS extended ACLs, Linux
+POSIX and NFSv4 ACLs); anything that cannot be checked counts as not protected. On macOS
+the home directories under `/Users` carry a deny-only ACL (`group:everyone deny delete`),
+so a witness home or binary below `/Users` never counts as protected — the protected setup
+places both outside it.
+
+The spec part (`spec`) is information: the witness records the envelopes unchecked (it
+does not know the trusted signers), and `minds spec sign` legitimately drops envelopes
+without a trusted signature. `verify` names what the witness saw and whether those
+envelopes are still in the store; it gates nothing — ADR-0013 decision 2 stands.
+
+Limits: the agent is identified by file ownership — a repository owned by a third
+account is judged by the same rule, and other members of a group that can write the
+repository are not seen (the human vouches for that through the principal). `keygen`
+checks the binary it runs as; the service must start that same binary. A pinned
+redaction policy whose `deny_pii` matches a profile word (`user`, `local`, …) refuses
+every observation object (block seals, A1) — fail-closed, but visible only as gaps. The witness signs with an `ssh-keygen` found through
+its `PATH`; the facts do not cover it (the system service's `PATH` is the system's). The
+spec information under Conformance comes only from epochs under a separated principal. The facts are what the witness found at the
+checkpoint, not a continuous guarantee between checkpoints. Group access to the socket is
+not part of the finding (any group member can still send frames, decision 2). Numeric
+user IDs land in the synced refs (privacy overview).

@@ -50,8 +50,12 @@ them, then run them as an administrator (Linux with systemd):
         /usr/local/bin/minds witness init --repo {{ROOT}} --profile user --socket-group minds-agents
    sudo -u minds-witness env MINDS_WITNESS_HOME=/var/lib/minds-witness/{{REPO_ID}} \
         /usr/local/bin/minds witness keygen
-   keygen prints the allowed_signers line. Distribute it out of band, in a
-   location outside the repository that the team trusts.
+   keygen prints the allowed_signers line with the principal
+   minds-witness-user@<host>: listing it vouches that this witness runs under
+   its own user (only then can its ranges reach A2). keygen checks the binary
+   it runs as — the service must start exactly that binary
+   (/usr/local/bin/minds in step 5). Distribute it out of
+   band, in a location outside the repository that the team trusts.
 
 5. Service unit
    sudo tee /etc/systemd/system/minds-witness-{{REPO_ID}}.service >/dev/null <<'EOF'

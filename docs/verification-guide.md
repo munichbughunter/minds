@@ -349,15 +349,28 @@ replays the decisive commands (`minds-anchor`). The **assurance level** says whi
 observers stand behind a sealed range. `minds verify` computes it each time
 it reads the evidence. No stored object claims a level.
 
-**State of the implementation — read this before relying on a level.** The
-witness does not yet record its isolation profile and evidence in signed
-material (the `witness.start` facts stay in the witness's own journal).
-`minds verify` therefore never grants A2 from real material today: a
-fully witnessed range stops at A1, at the latest with the reason
-`witness profile unknown`. A3 requires A2. The levels, gates and sentences
-below are implemented and tested, and witness seals, intents and
-countersignatures are already checked. The recipes in this section work on
-real material today. The top two levels are not yet reachable.
+**State of the implementation — read this before relying on a level.** At
+every checkpoint the witness records what it checked about itself in the
+signed observation object (field `witness`): its profile, its user ID against
+the owners of the worktree and `.git`, whether its home and key are private and
+whether its binary and every directory above it belong to root or the witness
+and are writable by no one else (no ACLs). `minds verify` reads these facts from
+exactly the trusted epochs that carry the session's window and derives whether
+the witness was separated from the agent. The facts are only as good as the key
+that signed them, so the separation counts only for epochs whose seal verifies
+under a `minds-witness-user@` principal: by listing a key under that principal
+you vouch that its witness runs under its own user (`minds witness keygen`
+prints that principal for the `user` profile). Every witness-signed range of the
+session must verify under such a principal too — a session whose hook ranges carry
+an ordinary `minds-witness@` key stays at A1. A range reaches A2 only with a
+qualified profile (`user`) **and** that separation, besides the other conditions
+below.
+Material from before these facts — or a witness under the developer's own
+account (`local`, the default of `minds enable`) — stops at A1 with
+`witness profile unknown`, `profile local not qualified for A2` or `witness
+isolation not proven`. Setting up a separated witness still takes the
+administrator steps of the `user` profile (`minds enable --witness user`); an
+automated protected setup follows. A3 requires A2.
 
 ### Reading the `Assurance` line
 

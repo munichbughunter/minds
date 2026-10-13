@@ -461,6 +461,15 @@ pub const SCOPE_AGENT_HOOKS_V1: &str = "agent-hooks/v1";
 /// Vom unabhängigen Witness beobachtete Hook-Evidence.
 pub const SCOPE_WITNESS_V1: &str = "witness/v1";
 
+/// Der Principal-Präfix, unter dem ein Mensch in der Signer-Datei einen
+/// **getrennten** Witness einträgt (Profil `user`, eigene Kennung):
+/// `minds-witness-user@<host>`. Nur ein Seal, der unter einem solchen
+/// Principal gültig ist, kann die Fakten „Profil `user`, getrennt" tragen —
+/// was der Witness über sich schreibt, bezeugt allein sein Schlüssel, und den
+/// Schlüssel eines Witness unter der Kennung des Agenten (`minds-witness@…`)
+/// kann der Agent lesen.
+pub const SEPARATED_WITNESS_PRINCIPAL: &str = "minds-witness-user@";
+
 /// Vom Witness selbst beobachtete Datei-Änderungen im Worktree (EA-08):
 /// der eigene Stream des Witness mit `fs.observed`-Events.
 pub const SCOPE_WITNESS_FS_V1: &str = "witness-fs/v1";

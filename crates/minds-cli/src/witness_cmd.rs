@@ -196,9 +196,16 @@ pub(crate) fn keygen(home: &Path) -> Fallible<String> {
     let home: PathBuf = home.components().collect();
     // Im `user`-Profil steht das Home der Socket-Gruppe zum Durchqueren
     // offen (0710) — das sagt die schon eingerichtete Konfiguration.
-    let shared_gid = daemon::load(&home)
-        .ok()
-        .and_then(|config| config.socket_group());
+    let config = daemon::load(&home).ok();
+    let shared_gid = config.as_ref().and_then(|config| config.socket_group());
+    // Ein Witness unter eigener Kennung (`user`) bekommt den Principal, unter
+    // dem ein Mensch ihn als getrennt einträgt — aber nur, wenn er hier
+    // wirklich getrennt läuft (eigene Kennung, privates Home, geschütztes
+    // Binary); sonst den gewöhnlichen: Wer die Zeile übernimmt, bürgt.
+    let user_profile = config
+        .as_ref()
+        .is_some_and(|config| config.profile() == minds_core::evidence::WitnessProfile::User);
+    let separated = user_profile && daemon::separated_here(&home, false);
     private_directory_shared(&home, shared_gid)?;
     let key_dir = home.join("key");
     private_directory(&key_dir)?;
@@ -210,6 +217,13 @@ pub(crate) fn keygen(home: &Path) -> Fallible<String> {
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
+    }
+    if user_profile && !separated {
+        eprintln!(
+            "minds witness keygen: this witness does not run separated from the repository \
+             owner (own user ID, private home, root-owned binary) — printing the ordinary \
+             principal; its ranges stay A1"
+        );
     }
     let host = Command::new("hostname").stdin(Stdio::null()).output()?;
     if !host.status.success() {
@@ -225,7 +239,14 @@ pub(crate) fn keygen(home: &Path) -> Fallible<String> {
     {
         return Err("hostname is not a valid witness principal".into());
     }
-    let principal = format!("minds-witness@{host}");
+    let principal = if separated {
+        format!(
+            "{}{host}",
+            minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL
+        )
+    } else {
+        format!("minds-witness@{host}")
+    };
     // Generate in a private, random directory. Publish with hard_link's atomic
     // no-clobber semantics: concurrent keygens and dangling symlinks cannot
     // make ssh-keygen overwrite an existing private or public key.
@@ -313,7 +334,21 @@ pub(crate) fn existing_signers_line(home: &Path) -> Fallible<Option<String>> {
     if !token(algorithm) || !token(material) {
         return Err("witness public key is malformed".into());
     }
-    if !principal.starts_with("minds-witness@")
+    // Den Principal eines getrennten Witness druckt nur ein Home des
+    // Profils `user` — im Home eines Witness unter der Kennung des Agenten
+    // könnte der Agent den Kommentar umschreiben, und wer die Zeile übernimmt,
+    // bürgte ahnungslos für eine Trennung.
+    let separated = principal.starts_with(minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL);
+    if separated && !daemon::separated_here(home, true) {
+        return Err(format!(
+            "witness public key claims the principal of a separated witness ({}…), but this \
+             witness does not run separated (user profile, own user ID, private home, \
+             root-owned binary) — remove key/witness_ed25519* and rerun",
+            minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL
+        )
+        .into());
+    }
+    if !(principal.starts_with("minds-witness@") || separated)
         || !principal
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"@.-_".contains(&b))

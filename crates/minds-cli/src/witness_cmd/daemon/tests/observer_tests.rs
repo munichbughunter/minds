@@ -683,6 +683,17 @@ fn witness_checkpoint_seals_both_streams() {
         object.observations[0].content.as_ref().unwrap().to_string(),
         b3(b"fn merge() {}\n")
     );
+    // Was der Witness beim Versiegeln über sich prüfte — hier
+    // dieselbe Kennung wie der Agent (der Test), also nicht getrennt.
+    assert_eq!(object.schema, 2);
+    let facts = object.witness.as_ref().expect("witness facts");
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    assert_eq!(facts.profile, writer.config.profile.name());
+    assert_eq!(facts.isolation.witness_uid, euid);
+    assert!(facts.isolation.agent_uids.contains(&euid));
+    assert!(!facts.isolation.proven());
+    assert_eq!(facts.spec, None, "kein Soll im Repo");
     // Die Epoche ist verworfen; die nächste setzt die Kette fort.
     assert!(writer.journal.read(&stream()).unwrap().events.is_empty());
     assert!(!writer.fs_dirty);

@@ -463,6 +463,72 @@ fn began_by(store: &dyn ContextStore, object: &str, from: Timestamp) -> bool {
     object.schema == 2 && object.started_at().is_some_and(|start| start <= from)
 }
 
+/// Was der Witness in den Epochen der Fenster über sich festhielt — je
+/// genannter Epoche (doppelte einmal) ihre Seal-Id und die Fakten, `None`,
+/// wo das Objekt fehlt, nicht lesbar ist oder keine Fakten trägt (ältere
+/// Objekte).
+///
+/// Die Fenster stammen aus [`witness_windows`]: Ihre Epochen sind schon
+/// vertrauenswürdige `witness-fs/v1`-Seals. Ein Fenster ohne benannte
+/// Epochen trägt nichts bei — der Aufrufer behandelt eine leere Liste als
+/// „Profil unbekannt" (fail-closed).
+pub fn witness_facts(
+    store: &dyn ContextStore,
+    windows: &[Window],
+) -> Vec<(ContentHash, Option<minds_core::observation::WitnessFacts>)> {
+    let epochs: std::collections::BTreeSet<&ContentHash> = windows
+        .iter()
+        .flat_map(|window| window.epochs.iter().flatten())
+        .collect();
+    epochs
+        .into_iter()
+        .map(|epoch| {
+            let facts = (|| {
+                let text = store.seal_text(epoch).ok().flatten()?;
+                let seal = Seal::parse(&text).ok()?;
+                let SealOutcome::ObservationsStored { observations } = &seal.outcome else {
+                    return None;
+                };
+                let id = observations.parse::<ContentHash>().ok()?;
+                store.get_observations(&id).ok().flatten()?.witness
+            })();
+            (epoch.clone(), facts)
+        })
+        .collect()
+}
+
+/// Die Witness-Starts für die Assurance ([`crate::assurance::WitnessStart`])
+/// aus [`witness_facts`]: das Profil als Wort gelesen (unbekannt ⇒ `None`).
+/// Eine Epoche ohne Fakten wird ein Start ohne Profil — nie übergangen.
+///
+/// **Getrennt** ist ein Lauf nur, wenn sein Befund die Trennung zeigt
+/// ([`minds_core::observation::Isolation::proven`]), das Profil bekannt ist
+/// **und** `separated(epoch)` gilt: Der Seal der Epoche ist unter einem
+/// Principal gültig, den ein Mensch als getrennten Witness eingetragen hat
+/// ([`minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL`]). Die Fakten
+/// schreibt der Witness selbst — ohne diese Bürgschaft könnte der Schlüssel
+/// eines Witness unter der Kennung des Agenten sie behaupten.
+pub fn witness_starts(
+    facts: &[(ContentHash, Option<minds_core::observation::WitnessFacts>)],
+    separated: &dyn Fn(&ContentHash) -> bool,
+) -> Vec<crate::assurance::WitnessStart> {
+    facts
+        .iter()
+        .map(|(epoch, facts)| {
+            let profile = facts
+                .as_ref()
+                .and_then(|f| minds_core::evidence::WitnessProfile::parse(&f.profile));
+            crate::assurance::WitnessStart {
+                profile,
+                isolated: profile.is_some()
+                    && facts.as_ref().is_some_and(|f| f.isolation.proven())
+                    && separated(epoch),
+                key: None,
+            }
+        })
+        .collect()
+}
+
 /// Die vom Witness bezeugten unter den `sessions`, je mit dem Ende ihres
 /// versiegelten Bereichs: Sessions, die ein vertrauenswürdiger
 /// `witness/v1`-Seal mit `outcome=stored` **namentlich** nennt, und der
@@ -643,6 +709,49 @@ pub fn corroborations(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fakten werden Starts: Profil als Wort (unbekannt ⇒ `None`), Trennung
+    /// nur mit Befund, bekanntem Profil und Bürgschaft des Principals; eine
+    /// Epoche ohne Fakten bleibt ein Start ohne Profil.
+    #[test]
+    fn witness_facts_become_starts() {
+        use minds_core::evidence::WitnessProfile;
+        use minds_core::observation::{Isolation, WitnessFacts};
+        let facts = |profile: &str, witness_uid: u32| WitnessFacts {
+            profile: profile.into(),
+            isolation: Isolation {
+                witness_uid,
+                agent_uids: vec![501],
+                home_private: true,
+                binary_protected: true,
+            },
+            spec: None,
+        };
+        let epoch = |n: u8| ContentHash::from_bytes([n; 32]);
+        let facts = [
+            (epoch(1), Some(facts("user", 498))),
+            (epoch(2), Some(facts("local", 501))),
+            (epoch(3), Some(facts("sandbox", 498))),
+            (epoch(4), None),
+            (epoch(5), Some(facts("user", 498))),
+        ];
+        // Epoche 5 gilt nur unter einem gewöhnlichen Witness-Principal.
+        let separated = |seal: &ContentHash| *seal != epoch(5);
+        let pairs: Vec<(Option<WitnessProfile>, bool)> = witness_starts(&facts, &separated)
+            .iter()
+            .map(|s| (s.profile, s.isolated))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (Some(WitnessProfile::User), true),
+                (Some(WitnessProfile::Local), false),
+                (None, false),
+                (None, false),
+                (Some(WitnessProfile::User), false),
+            ]
+        );
+    }
 
     fn h(byte: u8) -> ContentHash {
         ContentHash::from_bytes([byte; 32])
