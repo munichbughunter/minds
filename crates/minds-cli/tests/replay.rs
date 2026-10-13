@@ -173,7 +173,14 @@ impl Fixture {
     }
 
     fn replay(&self, args: &[&str], key: Option<&Path>) -> (i32, String) {
-        let mut command = Command::new(MINDS);
+        let mut command = {
+            let mut minds = Command::new(MINDS);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        };
         command
             .current_dir(self.root())
             .arg("replay")

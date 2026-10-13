@@ -174,7 +174,7 @@ pub(crate) fn ping(path: &Path) -> bool {
 
 /// Die UID der Gegenstelle einer Unix-Socket-Verbindung — `None`, wo das
 /// System sie nicht nennt.
-pub(super) fn peer_uid(stream: &UnixStream) -> Option<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let mut cred = libc::ucred {

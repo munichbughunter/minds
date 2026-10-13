@@ -392,7 +392,14 @@ impl Fixture {
     }
 
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(MINDS);
+        let mut command = {
+            let mut minds = Command::new(MINDS);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        };
         command
             .current_dir(self.root())
             .args(args)

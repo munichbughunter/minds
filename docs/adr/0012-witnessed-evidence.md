@@ -117,6 +117,7 @@ principal), not a claim in the seal. A profile name alone never grants A2.
 | `container` (intended default for regulated teams once qualified) | in a dev container, worktree bind-mounted | on the host | the container boundary; only the socket directory is mounted from witness state |
 | `user` | as the developer's UID | as a dedicated OS user `minds-witness` | file ownership; socket is write-only for the developer group |
 | `managed` (Claude Code; A1 only) | natively | as the developer's UID | candidate system-managed policy and sandbox/file-tool denials; exclusion has not been demonstrated |
+| `local` (default of `minds enable`; never A2) | natively | as the developer's UID, as a user service | nothing — it witnesses but does not separate; the agent could stop it or read its key |
 
 **Container qualification (EA-S2).** The [container spike](../spikes/ea-s2-container-profile.md)
 provides reusable templates and a repeatable experiment, not successful isolation or

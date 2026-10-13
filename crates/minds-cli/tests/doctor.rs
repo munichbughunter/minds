@@ -76,7 +76,14 @@ impl Fixture {
     }
 
     fn command(&self, env: &[(&str, &Path)]) -> Command {
-        let mut command = Command::new(MINDS);
+        let mut command = {
+            let mut minds = Command::new(MINDS);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        };
         command
             .current_dir(&self.root)
             .env("HOME", self.dir.path().join("user-home"))
@@ -291,6 +298,24 @@ fn doctor_reports_the_host_side() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{}", text(&out));
     assert!(line(&stdout, "witness").starts_with("ok "), "{stdout}");
+}
+
+/// Ein Witness-Home, das ein anderes Repo pinnt (etwa ein global gesetztes
+/// `MINDS_WITNESS_HOME`), bezeugt dieses nicht: fail.
+#[test]
+fn doctor_fails_on_a_witness_home_of_another_repository() {
+    let a = Fixture::new();
+    let b = Fixture::new();
+    let out = b.minds(&["doctor"], &[("MINDS_WITNESS_HOME", a.home.as_path())]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    let pinned = line(&stdout, "witness repository");
+    assert!(pinned.starts_with("fail"), "{stdout}");
+    assert!(pinned.contains("not this repository"), "{stdout}");
+
+    let out = a.minds(&["doctor"], &[("MINDS_WITNESS_HOME", a.home.as_path())]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!stdout.contains("witness repository"), "{stdout}");
 }
 
 /// Ohne Witness: ein Hinweis, kein Fehler.

@@ -92,9 +92,18 @@ Usage:
         Sets the repo up for Minds: registers the hooks with the agent
         and in the repo and writes the store config to .git/config.
         Runs quietly; -v/--verbose shows every single step.
-        Without --agent: all known agents. Idempotent, leaves foreign
+        Without --agent: the agents that look installed (their
+        directory in the repo or in $HOME, or their program on PATH);
+        none found: all known agents. Idempotent, leaves foreign
         entries alone. Agents: claude-code, codex, cursor, gemini,
         opencode, all.
+        Without --witness it always sets up a witness for the repo
+        (profile local: same user ID, witness home + key, a user
+        service started via launchctl/systemctl --user) and warns that
+        it runs unprotected (assurance stays A1). Hooks find it at its
+        default socket. MINDS_WITNESS=off skips it, MINDS_WITNESS=print
+        sets it up and prints the start command instead. A failure is
+        a warning, never a failed enable.
         --child-repo puts the context into a separate repo instead of
         in-repo; it is created (bare) or cloned from --child-remote.
         --recall (Claude Code): SessionStart hook that puts the context

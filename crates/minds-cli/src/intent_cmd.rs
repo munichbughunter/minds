@@ -784,7 +784,7 @@ fn activate_at_witness(socket: &Path, anchor: &str, signature: &str) -> Result<(
         request_id: request_id(),
     };
     let deadline = std::time::Instant::now() + ACTIVATE_TIMEOUT;
-    match crate::hook::witness::request(socket, &frame, deadline) {
+    match crate::hook::witness::request(socket, false, &frame, deadline) {
         Ok(Frame::Ack { .. }) => Ok(()),
         // Der Grund kommt vom Witness, aber über einen Socket: entschärft.
         Ok(Frame::Nack { reason, .. }) => Err(Refusal::Refused(crate::text::sanitize(&reason))),

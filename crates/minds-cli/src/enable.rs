@@ -123,15 +123,37 @@ pub fn run(
         }
     };
 
-    let which = agent.unwrap_or("all");
-    let agents: &[Which] = match which {
-        "claude-code" => &[Which::ClaudeCode],
-        "codex" => &[Which::Codex],
-        "cursor" => &[Which::Cursor],
-        "gemini" => &[Which::Gemini],
-        "opencode" => &[Which::OpenCode],
-        "all" => Which::ALL,
-        other => {
+    // Ohne `--agent`: die Agents, die hier installiert aussehen — findet
+    // sich keiner, alle (wie bisher; die Registrierungen schaden nicht).
+    let detected;
+    // Was erkannt wurde, gesagt erst, wenn die Hooks stehen.
+    let mut note = None;
+    let agents: &[Which] = match agent {
+        None => {
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let path = std::env::var("PATH").unwrap_or_default();
+            detected = Which::installed(&paths.root, home.as_deref(), &path);
+            if detected.is_empty() {
+                note = Some(
+                    "minds: no installed agent found — hooks set up for all known agents"
+                        .to_owned(),
+                );
+                Which::ALL
+            } else {
+                // Immer gesagt: Ein später installierter Agent bekommt keine
+                // Hooks, bis `enable` noch einmal läuft.
+                let names: Vec<&str> = detected.iter().map(|w| w.name()).collect();
+                note = Some(format!("minds: hooks set up for {}", names.join(", ")));
+                &detected
+            }
+        }
+        Some("claude-code") => &[Which::ClaudeCode],
+        Some("codex") => &[Which::Codex],
+        Some("cursor") => &[Which::Cursor],
+        Some("gemini") => &[Which::Gemini],
+        Some("opencode") => &[Which::OpenCode],
+        Some("all") => Which::ALL,
+        Some(other) => {
             eprintln!(
                 "minds enable: unknown agent {other:?}\n\
                  known: claude-code, codex, cursor, gemini, opencode, all"
@@ -141,7 +163,16 @@ pub fn run(
     };
 
     // Das Profil vor jedem Schreibzugriff prüfen: Ein Tippfehler soll kein
-    // halb eingerichtetes Repo hinterlassen.
+    // halb eingerichtetes Repo hinterlassen. Ebenso `MINDS_WITNESS`.
+    let local_mode = match witness.map_or_else(crate::enable_witness::LocalMode::from_env, |_| {
+        Ok(crate::enable_witness::LocalMode::Off)
+    }) {
+        Ok(mode) => mode,
+        Err(err) => {
+            eprintln!("minds enable: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let profile = match witness
         .map(crate::enable_witness::Profile::parse)
         .transpose()
@@ -168,9 +199,19 @@ pub fn run(
     )
     // Die bezeugte Konfiguration setzt auf die gewöhnliche auf (EA-10):
     // Hooks und Git-Hooks wie immer, dann Witness, Container und Dienst.
-    .and_then(|()| match profile {
-        Some(profile) => crate::enable_witness::run(&paths.root, profile, store),
-        None => Ok(()),
+    .and_then(|()| {
+        if let Some(note) = &note {
+            eprintln!("{note}");
+        }
+        match profile {
+            Some(profile) => crate::enable_witness::run(&paths.root, profile, store),
+            // Ohne `--witness`: immer der Standard-Witness (`local`) —
+            // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
+            None => {
+                crate::enable_witness::local(&paths.root, store, local_mode, verbose);
+                Ok(())
+            }
+        }
     });
     match enabled {
         // Im Regelfall still — den Nutzer interessiert das Setup nicht. `-v`
@@ -212,6 +253,11 @@ struct AgentSpec {
     /// Schickt der Agent den Eventnamen im Payload mit? Wenn nicht, muss er in
     /// der Registrierung stehen (`--event`, siehe `hook_event::parse`).
     event_in_payload: bool,
+    /// Woran man sieht, dass der Agent installiert ist: Verzeichnisse
+    /// relativ zum Home des Nutzers …
+    home_dirs: &'static [&'static str],
+    /// … oder Programme unter einem absoluten `PATH`-Eintrag.
+    binaries: &'static [&'static str],
 }
 
 /// **Die** Liste der Agents: `enable` schreibt daraus, `fsck` prüft dagegen.
@@ -232,6 +278,8 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             name: "claude-code",
             // Claude Code schickt `hook_event_name` mit.
             event_in_payload: true,
+            home_dirs: &[".claude"],
+            binaries: &["claude"],
         },
     ),
     (
@@ -240,6 +288,8 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             file: ".codex/hooks.json",
             name: "codex",
             event_in_payload: false,
+            home_dirs: &[".codex"],
+            binaries: &["codex"],
         },
     ),
     (
@@ -248,6 +298,8 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             file: ".cursor/hooks.json",
             name: "cursor",
             event_in_payload: false,
+            home_dirs: &[".cursor"],
+            binaries: &["cursor-agent", "cursor"],
         },
     ),
     (
@@ -256,6 +308,8 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             file: ".gemini/settings.json",
             name: "gemini",
             event_in_payload: false,
+            home_dirs: &[".gemini"],
+            binaries: &["gemini"],
         },
     ),
     (
@@ -267,6 +321,8 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             file: ".opencode/plugin/minds.ts",
             name: "opencode",
             event_in_payload: true,
+            home_dirs: &[".config/opencode", ".opencode"],
+            binaries: &["opencode"],
         },
     ),
 ];
@@ -297,6 +353,55 @@ impl Which {
     /// Der Name für `--agent`.
     pub(crate) fn name(self) -> &'static str {
         self.spec().name
+    }
+
+    /// Die Agents, die hier installiert aussehen: ihr Verzeichnis im Repo
+    /// (`.claude/`, `.codex/`, …) oder im Home des Nutzers, oder ihr
+    /// Programm unter einem absoluten `PATH`-Eintrag. Nur Dateisystem — kein
+    /// Programm wird gestartet.
+    pub(crate) fn installed(root: &Path, home: Option<&Path>, path: &str) -> Vec<Which> {
+        let on_path = |binary: &str| {
+            std::env::split_paths(path)
+                .filter(|dir| dir.is_absolute())
+                .any(|dir| {
+                    let candidate = dir.join(binary);
+                    executable(&candidate)
+                        || cfg!(windows) && dir.join(format!("{binary}.exe")).is_file()
+                })
+        };
+        Which::ALL
+            .iter()
+            .copied()
+            .filter(|which| {
+                let spec = which.spec();
+                let repo_dir = Path::new(spec.file)
+                    .components()
+                    .next()
+                    .map(|first| root.join(first))
+                    .is_some_and(|dir| dir.is_dir());
+                repo_dir
+                    || home.is_some_and(|home| {
+                        spec.home_dirs.iter().any(|dir| home.join(dir).is_dir())
+                    })
+                    || spec.binaries.iter().any(|binary| on_path(binary))
+            })
+            .collect()
+    }
+}
+
+/// Eine ausführbare Datei (unter Unix mit gesetztem x-Bit).
+fn executable(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        meta.is_file()
     }
 }
 
@@ -3067,6 +3172,60 @@ pub(crate) fn create_parent(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Installiert ist, was ein Verzeichnis im Repo oder im Home hat oder
+    /// ein ausführbares Programm unter einem absoluten `PATH`-Eintrag.
+    #[cfg(unix)]
+    #[test]
+    fn installed_agents_are_detected() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        let home = dir.path().join("home");
+        let bin = dir.path().join("bin");
+        for d in [&root, &home, &bin] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let exe = |path: &Path| {
+            std::fs::write(path, "").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let path = bin.display().to_string();
+        assert!(Which::installed(&root, Some(&home), &path).is_empty());
+        assert!(Which::installed(&root, None, &path).is_empty());
+        // Nicht ausführbar zählt nicht.
+        std::fs::write(bin.join("gemini"), "").unwrap();
+        assert!(Which::installed(&root, None, &path).is_empty());
+        std::fs::create_dir_all(root.join(".cursor")).unwrap();
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        exe(&bin.join("claude"));
+        assert_eq!(
+            Which::installed(&root, Some(&home), &path),
+            vec![
+                Which::ClaudeCode,
+                Which::Codex,
+                Which::Cursor,
+                Which::OpenCode
+            ]
+        );
+        // `cursor-agent` allein genügt für Cursor; ohne Home zählen nur Repo
+        // und PATH.
+        std::fs::remove_dir_all(root.join(".cursor")).unwrap();
+        exe(&bin.join("cursor-agent"));
+        assert_eq!(
+            Which::installed(&root, None, &path),
+            vec![Which::ClaudeCode, Which::Cursor]
+        );
+        // Ein relativer PATH-Eintrag zählt nicht — auch wenn er vom
+        // Arbeitsverzeichnis aus auf ein ausführbares `gemini` zeigt.
+        exe(&bin.join("gemini"));
+        let cwd = std::env::current_dir().unwrap();
+        let up = "../".repeat(cwd.components().count().saturating_sub(1));
+        let relative = format!("{up}{}", bin.display().to_string().trim_start_matches('/'));
+        assert!(Path::new(&relative).join("gemini").is_file(), "{relative}");
+        assert!(!Which::installed(&root, None, &relative).contains(&Which::Gemini));
+    }
 
     fn tmp() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()

@@ -17,7 +17,14 @@ use minds_capture::{Journal, JournalEvent, SessionKey};
 pub const SOCKET_ENV: &str = "MINDS_WITNESS_SOCKET";
 
 pub fn minds() -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_minds"));
+    let mut cmd = {
+        let mut minds = Command::new(env!("CARGO_BIN_EXE_minds"));
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         // Ein leeres Home: `minds verify` liest ohne `--signers`
@@ -72,13 +79,42 @@ impl Fixture {
         Self { dir, home, root }
     }
 
-    /// Repo plus initialisiertes Witness-Home mit Schlüssel.
+    /// Repo plus initialisiertes Witness-Home mit Schlüssel (Profil `user`).
     pub fn new() -> Self {
         let f = Self::repo_only();
-        for args in [
-            vec!["witness", "init", "--repo", f.root.to_str().unwrap()],
-            vec!["witness", "keygen"],
-        ] {
+        f.init(&[]);
+        f
+    }
+
+    /// Wie [`Self::new`], mit Profil `profile`.
+    pub fn with_profile(profile: &str) -> Self {
+        let f = Self::repo_only();
+        f.init(&["--profile", profile]);
+        f
+    }
+
+    /// Ein `local`-Witness am Standardpfad, wie `minds enable` ihn anlegt:
+    /// `$XDG_STATE_HOME/minds-witness/<repo-id>` mit `XDG_STATE_HOME` =
+    /// [`Self::xdg_state`].
+    pub fn local_default() -> Self {
+        let mut f = Self::repo_only();
+        let canonical = f.root.canonicalize().unwrap();
+        let id = blake3::hash(canonical.as_os_str().as_encoded_bytes()).to_hex()[..16].to_owned();
+        f.home = f.xdg_state().join("minds-witness").join(id);
+        f.init(&["--profile", "local"]);
+        f
+    }
+
+    /// `XDG_STATE_HOME` für [`Self::local_default`].
+    pub fn xdg_state(&self) -> PathBuf {
+        self.dir.path().join("xdg")
+    }
+
+    fn init(&self, extra: &[&str]) {
+        let mut init = vec!["witness", "init", "--repo", self.root.to_str().unwrap()];
+        init.extend_from_slice(extra);
+        let f = self;
+        for args in [init, vec!["witness", "keygen"]] {
             let out = minds()
                 .args(&args)
                 .arg("--home")
@@ -91,7 +127,6 @@ impl Fixture {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        f
     }
 
     pub fn socket(&self) -> PathBuf {

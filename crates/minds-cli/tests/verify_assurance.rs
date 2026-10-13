@@ -329,14 +329,21 @@ impl Fixture {
 
     fn minds(&self, args: &[&str]) -> Run {
         let root = self.root();
-        let out = Command::new(MINDS)
-            .current_dir(root)
-            .env("HOME", root.join("user-home"))
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .args(args)
-            .output()
-            .unwrap();
+        let out = {
+            let mut minds = Command::new(MINDS);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        }
+        .current_dir(root)
+        .env("HOME", root.join("user-home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .args(args)
+        .output()
+        .unwrap();
         Run {
             code: out.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1215,22 +1222,29 @@ fn a_planted_ssh_keygen_does_not_approve_a_spec() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let out = Command::new(MINDS)
-        .current_dir(root)
-        .env("HOME", root.join("user-home"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("PATH", path)
-        .args([
-            "verify",
-            "HEAD~1",
-            "--commit",
-            "HEAD",
-            "--signers",
-            fixture.signers(),
-        ])
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(root)
+    .env("HOME", root.join("user-home"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env("PATH", path)
+    .args([
+        "verify",
+        "HEAD~1",
+        "--commit",
+        "HEAD",
+        "--signers",
+        fixture.signers(),
+    ])
+    .output()
+    .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("PASS     spec [signature]"), "{stdout}");
     assert!(stdout.contains("DRIFT    spec [signature]"), "{stdout}");

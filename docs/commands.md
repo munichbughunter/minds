@@ -10,11 +10,50 @@
 minds enable [--agent <name>] [--child-repo <path>] [--child-remote <url>] [-v] [--ref <name>] [--recall] [--global-hooks]
 ```
 
-Prepares the repository for Minds: registers the hooks with the agent and the repo, and writes the store config to `.git/config`. Runs silently; `-v`/`--verbose` shows each step. Without `--agent` it configures all known agents (`claude-code`, `codex`, `cursor`, `gemini`, `opencode`, `all`); the command is idempotent and leaves third-party hooks untouched. `--child-repo` places the context in a separate repository instead of in-repo (created bare, or cloned from `--child-remote`); `--recall` (Claude Code) adds an opt-in SessionStart hook that prepends the context brief from previous sessions to a new session (costs tokens); `--global-hooks` confirms a hooks directory outside the repo (e.g. a globally set `core.hooksPath`) — without the flag, enable asks or aborts.
+Prepares the repository for Minds: registers the hooks with the agent and the repo, and writes the store config to `.git/config`. Runs silently; `-v`/`--verbose` shows each step. Without `--agent` it configures the agents that look installed — their directory in the repository or in `$HOME` (`.claude`, `.codex`, `.cursor`, `.gemini`, `.config/opencode`) or their executable under an absolute `PATH` entry (`claude`, `codex`, `cursor-agent`/`cursor`, `gemini`, `opencode`), and says which (`minds: hooks set up for …`); when none is found, all known agents (`claude-code`, `codex`, `cursor`, `gemini`, `opencode`, `all`); the command is idempotent and leaves third-party hooks untouched. `--child-repo` places the context in a separate repository instead of in-repo (created bare, or cloned from `--child-remote`); `--recall` (Claude Code) adds an opt-in SessionStart hook that prepends the context brief from previous sessions to a new session (costs tokens); `--global-hooks` confirms a hooks directory outside the repo (e.g. a globally set `core.hooksPath`) — without the flag, enable asks or aborts.
 
 ```
 minds enable --agent claude-code -v
 ```
+
+**The witness, by default.** Without `--witness`, `enable` always sets up a witness for
+this repository (profile `local`): `minds witness init --profile local` and a key in the
+witness home (`MINDS_WITNESS_HOME`, otherwise `$XDG_STATE_HOME/minds-witness/<repo-id>`),
+the user service (`~/Library/LaunchAgents/dev.minds.witness.<repo-id>.plist`, or
+`$XDG_CONFIG_HOME/systemd/user/minds-witness-<repo-id>.service`), started with
+`/bin/launchctl` (an already loaded job of that name is unloaded and loaded from this file)
+or `systemctl --user` (refused when the unit has drop-ins or comes from another file) —
+absolute paths, never a privileged command. `enable` reports success only after the
+witness answers on its socket. Hooks and the commit checkpoint find it at
+`run/witness.sock` in that home when `MINDS_WITNESS_SOCKET` is not set
+(`MINDS_WITNESS_HOME` counts only when it is absolute) — only a home whose `witness.json`
+pins this repository with profile `local`, owned by you and writable by no one else, only
+when the witness answering on the socket runs under your user ID, and only for events whose
+working directory lies in this repository; a witness of another profile is reached only
+through an explicit `MINDS_WITNESS_SOCKET`. Each `enable` pins the redaction policy of the
+`local` witness anew from `.minds/redact.json` at HEAD, so a later committed policy applies
+after the next `enable`.
+
+It runs under **your** user ID: it witnesses, but an agent with a shell could stop it or
+read its key — `enable` prints a yellow `warning:` saying so, `minds doctor` reports the
+profile as a warning, and the assurance stays at A1 (`observed`); only a witness under its
+own user (or a qualified container) reaches A2. Its key is not a protected witness key —
+do not add its `allowed_signers` line for A2. Raw hook events live in the witness home
+(outside the repository) until they are sealed into the store.
+
+A witness home that pins another repository (e.g. a globally exported
+`MINDS_WITNESS_HOME`) is refused with a warning (`minds doctor` reports it as a failure); an
+existing setup with another profile (e.g. `--witness container`) is left as it is and not
+started — except a home owned by your user ID that claims profile `user` (such a witness
+runs under its own user), which `enable` warns about. A `minds` binary inside the
+repository or in a build directory (`target/debug`, `target/release`) is refused — another
+checkout rewrites it. `MINDS_WITNESS=off` skips the witness (the test suites use it),
+`MINDS_WITNESS=print` sets it up and prints the start command instead of running it. With
+`MINDS_WITNESS_SOCKET` set (e.g. inside a dev container), no local witness is set up; a
+relative `MINDS_WITNESS_HOME` and running as root are refused with a warning. If
+anything fails (binary, no service manager, a differing service file, a witness that does
+not answer), `enable` warns with the cause and still succeeds; hooks then record into the
+local journal. Each linked worktree has its own repository id, hence its own witness.
 
 ### minds enable --witness
 

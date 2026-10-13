@@ -231,6 +231,20 @@ fn without_query_credentials(text: &str) -> String {
     out
 }
 
+/// Eine Warnung auf stderr: `warning: …`, gelb, wenn stderr ein Terminal ist
+/// und `NO_COLOR` nicht gesetzt — die Farbe trägt nie allein, das Wort
+/// `warning` steht immer da. `text` muss schon entschärft sein.
+pub(crate) fn warn(text: &str) {
+    use std::io::IsTerminal;
+    let color = std::io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    if color {
+        eprintln!("\x1b[33mwarning: {text}\x1b[0m");
+    } else {
+        eprintln!("warning: {text}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

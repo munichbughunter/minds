@@ -40,6 +40,141 @@ fn hook_forwards_to_witness() {
     assert_eq!(f.hook_log(), None, "eine gelungene Weitergabe loggt nichts");
 }
 
+/// Ohne `MINDS_WITNESS_SOCKET` findet der Hook den Witness dieses Repos an
+/// seinem Standardpfad (`run/witness.sock` im Witness-Home) — so, wie
+/// `minds enable` ihn einrichtet.
+#[test]
+fn hook_finds_the_witness_without_the_variable() {
+    let f = Fixture::with_profile("local");
+    let _daemon = f.start();
+    let stdin = f.payload("found", "UserPromptSubmit", r#","prompt":"ohne Variable""#);
+
+    let mut cmd = minds();
+    cmd.current_dir(&f.root)
+        .args(["hook", "--agent", "claude-code"])
+        .env("MINDS_WITNESS_HOME", &f.home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert_silent_success(&out);
+    let events = wait_for_events(&f.witness_journal(), "found", 1);
+    assert_eq!(events.len(), 1);
+    assert!(!f.local_journal_dir().exists(), "kein lokales Journal");
+}
+
+/// Über den Standardpfad gefunden, aber das Event gehört zu einem anderen
+/// Repo (das `cwd` im Payload): Es geht nicht an diesen Witness, sondern ins
+/// Journal seines Repos.
+#[test]
+fn hook_keeps_events_of_another_repository_away_from_the_witness() {
+    let f = Fixture::with_profile("local");
+    let _daemon = f.start();
+    let other = Fixture::repo_only();
+    let stdin = other.payload(
+        "elsewhere",
+        "UserPromptSubmit",
+        r#","prompt":"anderes Repo""#,
+    );
+
+    let mut cmd = minds();
+    cmd.current_dir(&f.root)
+        .args(["hook", "--agent", "claude-code"])
+        .env("MINDS_WITNESS_HOME", &f.home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+
+    assert_silent_success(&out);
+    assert_eq!(events(&other.local_journal(), "elsewhere").len(), 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(events(&f.witness_journal(), "elsewhere").is_empty());
+}
+
+/// Am echten Standardpfad (`$XDG_STATE_HOME/minds-witness/<repo-id>`), ganz
+/// ohne Variable — so, wie `minds enable` ihn einrichtet.
+#[test]
+fn hook_finds_the_witness_at_the_default_path() {
+    let f = Fixture::local_default();
+    let _daemon = f.start();
+    let stdin = f.payload("default", "UserPromptSubmit", r#","prompt":"Standardpfad""#);
+
+    let out = run_hook(&f, &stdin, &[("XDG_STATE_HOME", f.xdg_state().as_os_str())]);
+
+    assert_silent_success(&out);
+    assert_eq!(wait_for_events(&f.witness_journal(), "default", 1).len(), 1);
+    assert!(!f.local_journal_dir().exists(), "kein lokales Journal");
+}
+
+/// Ein Witness eines anderen Profils (hier `user`) bezeugt eine Trennung —
+/// ein Hook außerhalb davon findet ihn nicht über den Standardpfad, nur über
+/// die ausdrückliche `MINDS_WITNESS_SOCKET`. Ebenso ein Home, das ein
+/// anderes Repo pinnt.
+#[test]
+fn hook_discovers_only_a_local_witness_of_this_repository() {
+    let f = Fixture::new();
+    let _daemon = f.start();
+    let stdin = f.payload("separated", "UserPromptSubmit", r#","prompt":"getrennt""#);
+    let out = run_hook(&f, &stdin, &[("MINDS_WITNESS_HOME", f.home.as_os_str())]);
+    assert_silent_success(&out);
+    assert_eq!(events(&f.local_journal(), "separated").len(), 1);
+
+    let other = Fixture::with_profile("local");
+    let _other_daemon = other.start();
+    let stdin = f.payload("foreign", "UserPromptSubmit", r#","prompt":"fremdes Home""#);
+    let out = run_hook(
+        &f,
+        &stdin,
+        &[("MINDS_WITNESS_HOME", other.home.as_os_str())],
+    );
+    assert_silent_success(&out);
+    assert_eq!(events(&f.local_journal(), "foreign").len(), 1);
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(events(&f.witness_journal(), "separated").is_empty());
+    assert!(events(&other.witness_journal(), "foreign").is_empty());
+}
+
+/// Ein Home, das andere beschreiben können (hier `witness.json` mit 0666),
+/// könnte ein anderer Nutzer angelegt haben: keine Entdeckung, lokales
+/// Journal.
+#[test]
+fn hook_ignores_a_witness_home_others_can_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::with_profile("local");
+    let _daemon = f.start();
+    let config = f.home.join("witness.json");
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+    let stdin = f.payload("writable", "UserPromptSubmit", r#","prompt":"offen""#);
+    let out = run_hook(&f, &stdin, &[("MINDS_WITNESS_HOME", f.home.as_os_str())]);
+    assert_silent_success(&out);
+    assert_eq!(events(&f.local_journal(), "writable").len(), 1);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(events(&f.witness_journal(), "writable").is_empty());
+}
+
+/// `minds hook` im Repo von `f`, mit `stdin` und weiteren Variablen.
+fn run_hook(f: &Fixture, stdin: &str, vars: &[(&str, &std::ffi::OsStr)]) -> std::process::Output {
+    let mut cmd = minds();
+    cmd.current_dir(&f.root)
+        .args(["hook", "--agent", "claude-code"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in vars {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), stdin.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn hook_unset_env_is_unchanged() {
     let f = Fixture::repo_only();

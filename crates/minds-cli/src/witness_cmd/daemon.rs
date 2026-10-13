@@ -31,7 +31,7 @@ mod tests;
 mod witness_clock;
 mod worker;
 pub use socket::run;
-pub(crate) use socket::{CONTROL_SOCKET, ping};
+pub(crate) use socket::{CONTROL_SOCKET, peer_uid, ping};
 pub(crate) use worker::worker;
 
 /// Das Isolationsprofil (00-conventions, ADR-0012) — ein Typ für Witness-
@@ -117,6 +117,11 @@ impl Config {
         self.socket_group
     }
 
+    /// Die Repo-Wurzel, für die dieser Witness eingerichtet ist.
+    pub(crate) fn repo_root(&self) -> &Path {
+        &self.repo_root
+    }
+
     /// Ob `git_dir`, Store und Policy in der Datei stehen (Schema 2).
     pub(crate) fn pinned(&self) -> bool {
         self.git_dir.is_some() && self.store.is_some() && self.redaction.is_some()
@@ -165,7 +170,8 @@ pub(crate) enum Initialized {
     /// sehen, was gilt.
     Unchanged(Pins),
     /// Dieselbe Konfiguration stand da, aber ohne Pins (Schema 1); sie sind
-    /// jetzt ergänzt.
+    /// jetzt ergänzt — oder (Profil `local`) die Policy aus HEAD neu
+    /// festgehalten.
     Pinned(Pins),
 }
 
@@ -291,9 +297,8 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
         Vec::new()
     };
     let profile = match request.profile {
-        Some(name) => {
-            WitnessProfile::parse(name).ok_or("profile must be container, user or managed")?
-        }
+        Some(name) => WitnessProfile::parse(name)
+            .ok_or("profile must be container, user, managed or local")?,
         None if path_map.is_empty() => WitnessProfile::User,
         None => WitnessProfile::Container,
     };
@@ -301,7 +306,7 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
         (WitnessProfile::Container, true) => {
             return Err("the container profile requires --path-map".into());
         }
-        (WitnessProfile::User | WitnessProfile::Managed, false) => {
+        (WitnessProfile::User | WitnessProfile::Managed | WitnessProfile::Local, false) => {
             return Err("--path-map is only valid for the container profile".into());
         }
         _ => {}
@@ -357,6 +362,38 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
                 differs.join(", ")
             )
             .into());
+        }
+        // `local` bezeugt nur A1, und HEAD schreibt ohnehin der Agent: Ein
+        // eingefrorener Stand schützte nichts, verlöre aber jede spätere
+        // Verschärfung der Policy. Also bei jedem `init` ohne ausdrückliche
+        // Revision die Policy aus HEAD — der Dienst startet danach neu.
+        if existing.pinned()
+            && existing.profile == WitnessProfile::Local
+            && request.policy_rev.is_none()
+        {
+            let (wanted, source) = pinned_policy(&existing.git_dir(), None)?;
+            if Some(&wanted)
+                != existing
+                    .redaction
+                    .clone()
+                    .map(|p| p.floored_at_default())
+                    .as_ref()
+            {
+                // Ohne Lock: Den hält ein laufender Witness sein Leben lang.
+                // Der Daemon liest `witness.json` beim Start, jeder
+                // Checkpoint-Worker bei jedem Lauf — bis zum Neustart (den
+                // `enable` danach auslöst) redigiert der Observer noch mit
+                // der alten Policy, der Checkpoint schon mit der neuen; beide
+                // nie unter dem Standard. Der atomare Tausch lässt keinen
+                // halben Stand sehen.
+                existing.redaction = Some(wanted);
+                existing.policy_source = Some(source.clone());
+                atomic(
+                    &home.join("witness.json"),
+                    &serde_json::to_vec_pretty(&existing)?,
+                )?;
+                return Ok(Initialized::Pinned(Pins::of(&existing, &source)));
+            }
         }
         if existing.pinned() {
             // Die gespeicherte Quelle (volle Commit- und Blob-Id), damit auch

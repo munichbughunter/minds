@@ -23,7 +23,14 @@ impl Drop for Daemon {
     }
 }
 fn minds() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_minds"))
+    {
+        let mut minds = Command::new(env!("CARGO_BIN_EXE_minds"));
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
 }
 fn git(root: &Path, args: &[&str]) {
     assert!(

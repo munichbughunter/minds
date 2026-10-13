@@ -51,7 +51,14 @@ fn git(dir: &Path, args: &[&str]) -> Output {
 
 fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     use std::io::Write;
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir).args(args);
     without_user_config(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
