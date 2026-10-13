@@ -96,15 +96,11 @@ pub(crate) struct Discovered {
     /// `None`: aus `MINDS_WITNESS_SOCKET` (ausdrücklich gesetzt, ohne
     /// Repo-Bezug, etwa der gemountete Socket im Container).
     pub(crate) root: Option<PathBuf>,
-}
-
-impl Discovered {
-    /// Ob die Gegenstelle dieser Nutzer sein muss: am Standardpfad nur ein
-    /// `local`-Witness, also derselbe Nutzer. Die ausdrückliche Variable
-    /// zeigt legitim auf einen Witness unter anderem Nutzer.
-    pub(crate) fn same_user(&self) -> bool {
-        self.root.is_some()
-    }
+    /// Die Kennung, die die Gegenstelle haben muss: dieser Nutzer für einen
+    /// `local`-Witness, der Witness-Nutzer für den geschützten. `None` nur
+    /// für die ausdrückliche Variable — sie zeigt legitim auf einen Witness
+    /// unter anderem Nutzer.
+    pub(crate) peer: Option<u32>,
 }
 
 /// Der Socket für Hook und Checkpoint: die Variable, sonst der Standardpfad
@@ -112,7 +108,11 @@ impl Discovered {
 /// `start` ist ein Pfad im Repo (das Arbeitsverzeichnis).
 pub(crate) fn discovered_socket(start: &Path) -> Option<Discovered> {
     match socket_path() {
-        Some(socket) => Some(Discovered { socket, root: None }),
+        Some(socket) => Some(Discovered {
+            socket,
+            root: None,
+            peer: None,
+        }),
         None => default_socket(start),
     }
 }
@@ -135,6 +135,15 @@ pub(crate) fn repo_root(start: &Path) -> Option<PathBuf> {
 fn default_socket(start: &Path) -> Option<Discovered> {
     use std::os::unix::fs::FileTypeExt;
     let root = repo_root(start)?;
+    // Zuerst der geschützte Witness am festen, root-eigenen Ort — die
+    // Gegenstelle muss dann sein Nutzer sein.
+    if let Some((socket, witness)) = crate::enable_protected::discover(&root) {
+        return Some(Discovered {
+            socket,
+            root: Some(root),
+            peer: Some(witness),
+        });
+    }
     // `MINDS_WITNESS_HOME` gilt nur, wenn es absolut ist; jedes Home nur,
     // wenn es **dieses** Repo pinnt (ein global gesetztes Home gehört
     // womöglich einem anderen) und das Profil `local` trägt. Ein Witness
@@ -156,6 +165,8 @@ fn default_socket(start: &Path) -> Option<Discovered> {
         .map(|_| Discovered {
             socket,
             root: Some(root),
+            // SAFETY: geteuid hat keine Vorbedingungen.
+            peer: Some(unsafe { libc::geteuid() }),
         })
 }
 
@@ -251,7 +262,7 @@ pub(super) fn admissible(
 /// Socket-Pfad.
 pub(super) fn forward(
     socket: &Path,
-    same_user: bool,
+    peer: Option<u32>,
     agent: &str,
     event_override: Option<&str>,
     stdin: Vec<u8>,
@@ -266,7 +277,7 @@ pub(super) fn forward(
         ProtoError::TooLarge(_) => "frame too large",
         _ => "invalid frame",
     })?;
-    send(socket, same_user, &frame).map_err(|err| kind(&err))
+    send(socket, peer, &frame).map_err(|err| kind(&err))
 }
 
 /// Obergrenze für eine Antwort des Witness: Kopf plus `request_id` plus eine
@@ -285,7 +296,7 @@ const MAX_RESPONSE: usize = 8 * 1024;
 /// Bezeichnung, nie fremder Text.
 pub(crate) fn request(
     socket: &Path,
-    same_user: bool,
+    peer: Option<u32>,
     frame: &Frame,
     deadline: std::time::Instant,
 ) -> Result<Frame, &'static str> {
@@ -296,7 +307,7 @@ pub(crate) fn request(
         _ => return Err("invalid frame"),
     };
     let bytes = witness_proto::encode(frame).map_err(|_| "invalid frame")?;
-    let response = exchange(socket, same_user, &bytes, deadline).map_err(|err| {
+    let response = exchange(socket, peer, &bytes, deadline).map_err(|err| {
         // Nur hier gibt es eine Antwort, die unpassend sein kann.
         if err.kind() == std::io::ErrorKind::InvalidData {
             "unexpected response"
@@ -317,7 +328,7 @@ pub(crate) fn request(
 }
 
 #[cfg(not(unix))]
-fn exchange(_: &Path, _: bool, _: &[u8], _: std::time::Instant) -> std::io::Result<Vec<u8>> {
+fn exchange(_: &Path, _: Option<u32>, _: &[u8], _: std::time::Instant) -> std::io::Result<Vec<u8>> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
@@ -326,7 +337,7 @@ fn exchange(_: &Path, _: bool, _: &[u8], _: std::time::Instant) -> std::io::Resu
 #[cfg(unix)]
 fn exchange(
     socket: &Path,
-    same_user: bool,
+    peer: Option<u32>,
     request: &[u8],
     deadline: std::time::Instant,
 ) -> std::io::Result<Vec<u8>> {
@@ -348,7 +359,7 @@ fn exchange(
         Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
         other => other,
     };
-    let mut stream = connect(socket, same_user, deadline)?;
+    let mut stream = connect(socket, peer, deadline)?;
     let mut rest = request;
     while !rest.is_empty() {
         tolerate_closed_peer(stream.set_write_timeout(Some(remaining()?)))?;
@@ -413,16 +424,16 @@ fn kind(err: &std::io::Error) -> &'static str {
 }
 
 #[cfg(not(unix))]
-fn send(_: &Path, _: bool, _: &[u8]) -> std::io::Result<()> {
+fn send(_: &Path, _: Option<u32>, _: &[u8]) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(unix)]
-fn send(socket: &Path, same_user: bool, frame: &[u8]) -> std::io::Result<()> {
+fn send(socket: &Path, peer: Option<u32>, frame: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::time::Instant;
 
-    let mut stream = connect(socket, same_user, Instant::now() + CONNECT_TIMEOUT)?;
+    let mut stream = connect(socket, peer, Instant::now() + CONNECT_TIMEOUT)?;
     let deadline = Instant::now() + WRITE_TIMEOUT;
     let mut rest = frame;
     while !rest.is_empty() {
@@ -456,12 +467,12 @@ fn send(socket: &Path, same_user: bool, frame: &[u8]) -> std::io::Result<()> {
 /// Log deshalb als `connection refused`, obwohl der Witness lebt — der
 /// Rückfall ist trotzdem richtig, nur die Diagnose ist unscharf.
 ///
-/// `same_user`: Die Gegenstelle muss dieser Nutzer sein (ein am Standardpfad
-/// gefundener `local`-Witness) — sonst kein Byte dorthin.
+/// `peer`: die Kennung, die die Gegenstelle haben muss (ein am Standardpfad
+/// gefundener Witness) — sonst kein Byte dorthin.
 #[cfg(unix)]
 fn connect(
     path: &Path,
-    same_user: bool,
+    peer: Option<u32>,
     deadline: std::time::Instant,
 ) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::io::{Error, ErrorKind};
@@ -537,8 +548,7 @@ fn connect(
 
     let stream = std::os::unix::net::UnixStream::from(fd);
     // Fail-closed: Eine UID, die das System nicht nennt, ist nicht die eigene.
-    // SAFETY: geteuid hat keine Vorbedingungen.
-    if same_user && crate::witness_cmd::peer_uid(&stream) != Some(unsafe { libc::geteuid() }) {
+    if peer.is_some_and(|expected| crate::witness_cmd::peer_uid(&stream) != Some(expected)) {
         return Err(Error::other(ForeignPeer));
     }
     stream.set_nonblocking(false)?;
@@ -696,9 +706,10 @@ mod tests {
 
         // Wie am Standardpfad: Die Gegenstelle muss dieser Nutzer sein —
         // hier ist sie es.
+        // SAFETY: geteuid hat keine Vorbedingungen.
         forward(
             &path,
-            true,
+            Some(unsafe { libc::geteuid() }),
             "claude-code",
             Some("Stop"),
             b"{\"a\":1}".to_vec(),
@@ -723,7 +734,7 @@ mod tests {
         let dir = short_dir();
         let missing = dir.path().join("missing.sock");
         assert_eq!(
-            forward(&missing, false, "a", None, vec![]),
+            forward(&missing, None, "a", None, vec![]),
             Err("socket missing")
         );
 
@@ -735,7 +746,7 @@ mod tests {
         // ist, zählt die Antwort.
         let deadline = Instant::now() + Duration::from_secs(5);
         let stale_result = loop {
-            let result = forward(&stale, false, "a", None, vec![]);
+            let result = forward(&stale, None, "a", None, vec![]);
             if result.is_err() || Instant::now() >= deadline {
                 break result;
             }
@@ -745,27 +756,27 @@ mod tests {
 
         let long = Path::new("/tmp").join("x".repeat(200));
         assert_eq!(
-            forward(&long, false, "a", None, vec![]),
+            forward(&long, None, "a", None, vec![]),
             Err("invalid socket path")
         );
 
         assert_eq!(
-            forward(&stale, false, "../a", None, vec![]),
+            forward(&stale, None, "../a", None, vec![]),
             Err("invalid frame")
         );
         let huge = vec![b' '; witness_proto::MAX_FRAME as usize];
         assert_eq!(
-            forward(&stale, false, "a", None, huge),
+            forward(&stale, None, "a", None, huge),
             Err("frame too large")
         );
         assert_eq!(
-            forward(&stale, false, "witness", None, vec![]),
+            forward(&stale, None, "witness", None, vec![]),
             Err("reserved agent")
         );
 
         let relative = Path::new("w.sock");
         assert_eq!(
-            forward(relative, false, "a", None, vec![]),
+            forward(relative, None, "a", None, vec![]),
             Err("invalid socket path")
         );
 
@@ -779,7 +790,7 @@ mod tests {
         let listener = UnixListener::bind(&planted).unwrap();
         listener.set_nonblocking(true).unwrap();
         assert_eq!(
-            forward(&planted, false, "a", None, vec![]),
+            forward(&planted, None, "a", None, vec![]),
             Err("untrusted socket dir")
         );
         assert!(listener.accept().is_err(), "keine Verbindung zum Fremden");
@@ -789,7 +800,7 @@ mod tests {
         let link = dir.path().join("link.sock");
         std::os::unix::fs::symlink(&planted, &link).unwrap();
         assert_eq!(
-            forward(&link, false, "a", None, vec![]),
+            forward(&link, None, "a", None, vec![]),
             Err("untrusted socket dir")
         );
         assert!(listener.accept().is_err(), "keine Verbindung über den Link");
@@ -838,7 +849,7 @@ mod tests {
         let witness = answering(&path, witness_proto::encode(&ack).unwrap());
 
         assert_eq!(
-            request(&path, false, &checkpoint_request(7), soon()),
+            request(&path, None, &checkpoint_request(7), soon()),
             Ok(ack)
         );
         assert_eq!(witness.join().unwrap(), checkpoint_request(7));
@@ -854,7 +865,7 @@ mod tests {
         };
         let witness = answering(&path, witness_proto::encode(&other).unwrap());
         assert_eq!(
-            request(&path, false, &checkpoint_request(2), soon()),
+            request(&path, None, &checkpoint_request(2), soon()),
             Err("unexpected response")
         );
         witness.join().unwrap();
@@ -866,14 +877,14 @@ mod tests {
         huge.extend(std::iter::repeat_n(0x81, 16 * 1024));
         let witness = answering(&path, huge);
         assert_eq!(
-            request(&path, false, &checkpoint_request(2), soon()),
+            request(&path, None, &checkpoint_request(2), soon()),
             Err("unexpected response")
         );
         witness.join().unwrap();
 
         // Nur Anfragen mit `request_id` erwarten eine Antwort.
         assert_eq!(
-            request(&path, false, &Frame::Ping, soon()),
+            request(&path, None, &Frame::Ping, soon()),
             Err("invalid frame")
         );
     }
@@ -892,7 +903,7 @@ mod tests {
         let deadline = started + Duration::from_millis(200);
 
         assert_eq!(
-            request(&path, false, &checkpoint_request(3), deadline),
+            request(&path, None, &checkpoint_request(3), deadline),
             Err("timeout")
         );
         let took = started.elapsed();
@@ -930,7 +941,7 @@ mod tests {
         // Backlog, der Frame füllt den Puffer, dann steht `write`.
         let _listener = UnixListener::bind(&path).unwrap();
         let started = Instant::now();
-        let result = forward(&path, false, "a", None, vec![b'x'; 4 * 1024 * 1024]);
+        let result = forward(&path, None, "a", None, vec![b'x'; 4 * 1024 * 1024]);
         let took = started.elapsed();
         assert_eq!(result, Err("timeout"));
         assert!(took < Duration::from_millis(500), "zu lange: {took:?}");

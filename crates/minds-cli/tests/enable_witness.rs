@@ -788,10 +788,11 @@ fn enable_witness_managed_writes_only_the_proposal() {
     assert_eq!(fs::read(&path).unwrap(), before);
 }
 
-/// AC: Kein Kommando dieser Spec ruft `sudo` auf. Die EA-10-Module nennen es
-/// nicht einmal; die gedruckten Schritte des `user`-Profils stehen als Text
-/// in einer Vorlage. Und nirgends im CLI-Quelltext wird `sudo` als Programm
-/// oder Argument übergeben.
+/// AC: Genau eine Stelle erhöht Rechte — die geschützte Einrichtung
+/// (`enable_protected.rs`), einmal, über das absolute `/usr/bin/sudo`, nach
+/// ausdrücklicher Zustimmung. Die EA-10-Module nennen `sudo` nicht einmal;
+/// die gedruckten Schritte des `user`-Profils stehen als Text in einer
+/// Vorlage. Sonst wird `sudo` nirgends als Programm oder Argument übergeben.
 #[test]
 fn no_sudo_in_enable_witness() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -812,6 +813,19 @@ fn no_sudo_in_enable_witness() {
                 stack.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = fs::read_to_string(&path).unwrap();
+                if path.ends_with("enable_protected.rs") {
+                    assert_eq!(
+                        source.matches("\"/usr/bin/sudo\"").count(),
+                        1,
+                        "one elevation, by absolute path"
+                    );
+                    continue;
+                }
+                assert!(
+                    !source.contains("/usr/bin/sudo"),
+                    "{} elevates",
+                    path.display()
+                );
                 assert!(
                     !source.contains("\"sudo\""),
                     "{} passes sudo to a process",
@@ -1095,7 +1109,7 @@ fn enable_without_witness_and_unknown_mode() {
     let f = Fixture::new();
     let bad = f.enable_default("sometimes");
     assert!(!bad.status.success(), "{}", text(&bad));
-    assert!(text(&bad).contains("MINDS_WITNESS must be on, print or off"));
+    assert!(text(&bad).contains("MINDS_WITNESS must be protected, local, on, print or off"));
     assert!(!f.root.join(".claude").exists(), "nichts geschrieben");
     assert!(!f.path("state").join("minds-witness").exists());
     let out = f.enable_default("off");
@@ -1328,6 +1342,137 @@ fn enable_refuses_a_separated_principal_in_a_local_home() {
         "{stderr}"
     );
     assert!(!stderr.contains("witness set up"), "{stderr}");
+}
+
+/// Ein Ersatz für `sudo` (`MINDS_SUDO_STUB`): legt jedes Argument in eine
+/// eigene Zeile von `<name>.args` (das Skript also ganz), gibt die Zeilen
+/// aus, an denen `enable` das Ergebnis erkennt, und endet mit `code`.
+fn elevation_stub(f: &Fixture, name: &str, code: i32) -> PathBuf {
+    let stub = f.path(name);
+    fs::write(
+        &stub,
+        format!(
+            "#!/bin/sh\n\
+             for arg in \"$@\"; do printf '%s\\n----\\n' \"$arg\" >> '{log}'; done\n\
+             echo 'MINDS-SIGNERS minds-witness-user@host namespaces=\"minds-witness\" ssh-ed25519 AAAA'\n\
+             echo 'MINDS-MANAGED installed /Library/Application Support/ClaudeCode/managed-settings.json'\n\
+             exit {code}\n",
+            log = f.path(&format!("{name}.args")).display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    stub
+}
+
+/// `MINDS_WITNESS=protected`: das Repo wird für die Gruppe geteilt (ohne
+/// Rechte), dann läuft genau **eine** Erhöhung — `/bin/sh -c <Skript>`, jeder
+/// Wert gequotet. Antwortet danach kein geschützter Witness (hier: der
+/// Ersatz richtet nichts ein), warnt `enable` und richtet den ungeschützten
+/// ein.
+#[test]
+fn enable_sets_up_the_protected_witness_with_one_elevation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let stub = elevation_stub(&f, "sudo.sh", 0);
+    let manager = f.manager_stub("manager.sh", "");
+    let base = f.path("protected");
+    let out = f.enable_default_with(
+        "protected",
+        &[
+            ("MINDS_SUDO_STUB", stub.to_str().unwrap()),
+            ("MINDS_SERVICE_MANAGER_STUB", manager.to_str().unwrap()),
+            ("MINDS_PROTECTED_BASE", base.to_str().unwrap()),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let args = fs::read_to_string(f.path("sudo.sh.args")).unwrap();
+    let args: Vec<&str> = args.split("\n----\n").filter(|a| !a.is_empty()).collect();
+    assert_eq!(args.len(), 4, "{args:?}");
+    assert_eq!(args[0], "/bin/sh");
+    assert_eq!(args[1], "-c");
+    assert_eq!(args[3], "minds-protected-setup");
+    let script = args[2];
+    let root = f.root.to_str().unwrap();
+    assert!(script.contains(&format!("ROOT='{root}'")), "{script}");
+    assert!(script.contains("--profile user --socket-group"), "{script}");
+    assert!(
+        script.contains("BIN='/usr/local/libexec/minds/minds'"),
+        "{script}"
+    );
+    // Ohne Rechte vorbereitet: das Repo für die Gruppe geteilt.
+    let shared = Command::new("git")
+        .arg("-C")
+        .arg(&f.root)
+        .args(["config", "--local", "core.sharedRepository"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&shared.stdout).trim(), "group");
+    // Vor dem Skript wird nichts gruppenschreibbar: Gruppe und Modi setzt
+    // erst das Skript, nach dem Wechsel zur Witness-Gruppe — bricht die
+    // Einrichtung ab (hier: der Ersatz tut nichts), bleibt alles, wie es war.
+    for entry in [".git", ".git/refs", ".git/objects"] {
+        let mode = fs::metadata(f.root.join(entry))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o1020, 0, "{entry}: {mode:o}");
+    }
+    assert!(f.root.join(".git/minds").is_dir());
+    assert!(f.root.join(".git/logs").is_dir());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Eingerichtet, aber (hier: nie) antwortend: kein Rückfall auf den
+    // ungeschützten — sonst liefen bald zwei.
+    assert!(
+        stderr.contains("the protected witness is installed but does not answer yet"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("setting up the unprotected witness instead"),
+        "{stderr}"
+    );
+}
+
+/// Scheitert die Erhöhung (falsches Passwort, abgebrochen), bleibt es beim
+/// ungeschützten Witness — mit Warnung.
+#[test]
+fn enable_falls_back_when_the_elevation_fails() {
+    let f = Fixture::new();
+    let stub = elevation_stub(&f, "sudo.sh", 1);
+    let manager = f.manager_stub("manager.sh", "");
+    let out = f.enable_default_with(
+        "protected",
+        &[
+            ("MINDS_SUDO_STUB", stub.to_str().unwrap()),
+            ("MINDS_SERVICE_MANAGER_STUB", manager.to_str().unwrap()),
+            (
+                "MINDS_PROTECTED_BASE",
+                f.path("protected").to_str().unwrap(),
+            ),
+        ],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("the protected setup stopped"), "{stderr}");
+    assert!(
+        stderr.contains("setting up the unprotected witness instead"),
+        "{stderr}"
+    );
+}
+
+/// Ohne `MINDS_WITNESS` und ohne Terminal wird nie gefragt und nie erhöht:
+/// der ungeschützte Witness, wie bisher.
+#[test]
+fn enable_never_elevates_without_a_terminal() {
+    let f = Fixture::new();
+    let stub = elevation_stub(&f, "sudo.sh", 0);
+    let out = f.enable_default_with("", &[("MINDS_SUDO_STUB", stub.to_str().unwrap())]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!f.path("sudo.sh.args").exists(), "no elevation");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("[Y/n]"), "{stderr}");
 }
 
 /// Ein schon eingerichteter Witness (hier `container`) bleibt, wie er ist.

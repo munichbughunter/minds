@@ -2187,6 +2187,17 @@ fn plain_repo_layout_within(root: &Path, max_entries: usize) -> Fallible<()> {
     plain_git_dir_within(&root.join(".git"), max_entries)
 }
 
+/// Ob dieser Prozess `dir` betreten darf (Suchrecht, mit effektiver Kennung
+/// und — unter macOS — ACLs).
+fn searchable(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return true;
+    };
+    // SAFETY: `path` ist NUL-terminiert; faccessat liest nur.
+    unsafe { libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS) == 0 }
+}
+
 /// [`plain_repo_layout`] für ein Git-Verzeichnis selbst — auch das eines
 /// baren Child-Repos, in das der Witness-Store schreibt (EA-10).
 fn plain_git_dir_within(dot_git: &Path, max_entries: usize) -> Fallible<()> {
@@ -2208,8 +2219,10 @@ fn plain_git_dir_within(dot_git: &Path, max_entries: usize) -> Fallible<()> {
     }
     let objects = dot_git.join("objects");
     // `hooks/` liest und startet der Witness nie (weder gix noch
-    // `git ls-files` rufen Hooks); dort sind Symlinks üblich.
+    // `git ls-files` rufen Hooks); dort sind Symlinks üblich. Das lokale
+    // Journal des Entwicklers (`minds/journal`, 0700) liest er ebenso nie.
     let hooks = dot_git.join("hooks");
+    let journal = dot_git.join("minds").join("journal");
     let mut seen = 0usize;
     let mut stack = vec![(dot_git.clone(), 0usize)];
     while let Some((dir, depth)) = stack.pop() {
@@ -2218,6 +2231,21 @@ fn plain_git_dir_within(dot_git: &Path, max_entries: usize) -> Fallible<()> {
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            // Ein Verzeichnis, das der Witness weder auflisten noch betreten
+            // darf (ein geschützter Witness unter eigener Kennung), kann
+            // seine Zugriffe nicht umlenken. Darf er es betreten, aber nicht
+            // auflisten, könnte darin ein Symlink liegen, den er beim
+            // Öffnen eines bekannten Namens fände — das ist nicht schlicht.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    && dir != dot_git
+                    && !searchable(&dir) =>
+            {
+                continue;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+                return refused("a directory that can be entered but not listed");
+            }
             Err(err) => return Err(err.into()),
         };
         for entry in entries {
@@ -2230,7 +2258,7 @@ fn plain_git_dir_within(dot_git: &Path, max_entries: usize) -> Fallible<()> {
             if seen > max_entries {
                 return refused("too many entries");
             }
-            if path == hooks {
+            if path == hooks || path == journal {
                 continue;
             }
             let meta = match fs::symlink_metadata(&path) {

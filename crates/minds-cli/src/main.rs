@@ -46,6 +46,8 @@ mod context;
 mod distill;
 mod doctor;
 mod enable;
+#[cfg(unix)]
+mod enable_protected;
 mod enable_witness;
 mod forget_cmd;
 mod fsck;
@@ -97,13 +99,18 @@ Usage:
         none found: all known agents. Idempotent, leaves foreign
         entries alone. Agents: claude-code, codex, cursor, gemini,
         opencode, all.
-        Without --witness it always sets up a witness for the repo
-        (profile local: same user ID, witness home + key, a user
-        service started via launchctl/systemctl --user) and warns that
-        it runs unprotected (assurance stays A1). Hooks find it at its
-        default socket. MINDS_WITNESS=off skips it, MINDS_WITNESS=print
-        sets it up and prints the start command instead. A failure is
-        a warning, never a failed enable.
+        Without --witness it always sets up a witness for the repo. On
+        a terminal it asks once whether to set it up protected
+        (administrator rights, once): its own user, a root-owned binary,
+        a system service, deny-only Claude Code managed settings (only
+        if none exist) — the only setup that can reach A2. Otherwise
+        (no, no terminal, or a failed setup) profile local: same user
+        ID, witness home + key, a user service, with a warning that it
+        runs unprotected (A1). Hooks find either at its default socket.
+        MINDS_WITNESS=protected sets up the protected one without
+        asking, =local (or on) the local one, =print prints its start
+        command, =off skips the witness. A failure is a warning, never
+        a failed enable.
         --child-repo puts the context into a separate repo instead of
         in-repo; it is created (bare) or cloned from --child-remote.
         --recall (Claude Code): SessionStart hook that puts the context
@@ -143,6 +150,8 @@ Usage:
         Creates a private Ed25519 witness key without overwriting an existing
         key. Prints its namespace-restricted allowed_signers line to stdout.
         Home: --home, MINDS_WITNESS_HOME, or the repository's XDG state path.
+  minds witness signers [--home <directory>]
+        Prints the allowed_signers line of the existing witness key.
 
   minds show [<commit>] [--full]
         Shows intent and attribution of the session(s) behind a commit
@@ -786,6 +795,44 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+
+    // Ein Repo, das mit einem geschützten Witness geteilt ist: Was minds
+    // dort anlegt, bleibt für dessen Gruppe schreibbar (gix folgt
+    // `core.sharedRepository` nicht).
+    // Nur Befehle, die in den Store unter `.git` schreiben (auch der Backfill
+    // von `enable` im Hintergrund) — `enable` selbst (Agent-Konfiguration im
+    // Worktree) und Exporte (`--out`) behalten die gewohnten Rechte.
+    #[cfg(unix)]
+    {
+        let background_import = args.first().is_some_and(|command| command == "enable")
+            && args.iter().any(|arg| arg == enable::BACKGROUND_IMPORT_FLAG);
+        if (background_import
+            || args.first().is_some_and(|command| {
+                [
+                    "hook",
+                    "checkpoint",
+                    "sync",
+                    "forget",
+                    "intent",
+                    "spec",
+                    "review",
+                    "sign",
+                    "anchor",
+                    "reinterpret",
+                    "comment",
+                    "gitlab",
+                    "prepare-commit-msg",
+                ]
+                .contains(&command.as_str())
+            }))
+            && std::env::current_dir().is_ok_and(|dir| enable_protected::shared_repository(&dir))
+        {
+            // SAFETY: umask hat keine Vorbedingungen.
+            unsafe {
+                libc::umask(0o002);
+            }
+        }
+    }
 
     let Some(command) = args.first().map(String::as_str) else {
         print!("{USAGE}");

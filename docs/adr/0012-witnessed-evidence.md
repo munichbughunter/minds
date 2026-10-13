@@ -506,3 +506,41 @@ spec information under Conformance comes only from epochs under a separated prin
 checkpoint, not a continuous guarantee between checkpoints. Group access to the socket is
 not part of the finding (any group member can still send frames, decision 2). Numeric
 user IDs land in the synced refs (privacy overview).
+
+## Addendum: Protected setup
+
+2026-10-13 — **`minds enable` sets up the `user` profile itself, with one elevation and the
+developer's consent.** The `user` profile used to be a list of administrator steps. Now
+`enable` asks once on a terminal; yes prepares the repository as the developer and runs a
+single generated script through `sudo`. This is the only place minds elevates; the no-sudo
+test pins it to that module and to the absolute `/usr/bin/sudo`.
+
+The witness amends commits and writes `refs/minds/*`, so it needs write access to `.git`.
+It gets it through a **dedicated group** (`_minds` / `minds-witness`) whose members are the
+witness user and the developer — not the developer's primary group (on macOS `staff`, every
+local account). Only `objects/`, `refs/` and `logs/` become group-writable; `.git` itself is
+group-writable with the sticky bit (lock files, no replacing the developer's files);
+`config`, `hooks/`, `info/` and the local journal stay the developer's. Everything inside
+the repository and the developer's home is done **as the developer** (`sudo -u` from the
+setup script, which by then has made the developer a member of the group): first the group,
+then the modes — a cancelled setup leaves nothing writable for the developer's former group.
+The witness reaches the worktree through ACL entries (search) on the developer's directories
+above it, not through group membership. Root only writes into system directories it has
+checked to be its own (owner, mode, no ACL), and the binary is read by the developer, so no
+file the developer cannot read is ever copied. macOS folders under TCC (Desktop, Documents,
+Downloads, Pictures, iCloud, `/Volumes`) are refused. Because gix does not honour
+`core.sharedRepository`, the commands that write into the store use umask 002 in a
+repository marked this way (the sticky bit on `.git`).
+
+Limits: the binary that gets copied is the one the developer runs `enable` with — whoever
+can replace it before the setup controls the witness (as with any install). Files other
+tools create in `.git` with a restrictive umask may stay unwritable for the witness; a
+detached `HEAD` cannot be amended by the witness (the sticky bit protects the developer's
+`HEAD`); files one side leaves in the `.git` root (a stale lock, a `packed-refs` the
+witness rewrote) cannot be replaced by the other without root. A setup that fails after the
+repository was handed to the witness group stays that way (sticky `.git`, group-writable
+`objects/refs/logs` for the witness group only) — there is no rollback, as there is no
+uninstall. The witness refuses a `.git` directory it may enter but not list (a symlink in
+it could redirect a reflog write into its own home). On Linux the developer's group membership takes effect after the next login. The
+witness user can read everything in the worktree that others may read. There is no
+uninstall yet.

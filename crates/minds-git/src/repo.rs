@@ -36,6 +36,14 @@ const LOCK_TIMEOUTS: [&str; 2] = [
     "core.packedRefsTimeout=2000",
 ];
 
+/// Die Identität, unter der ein Witness ohne eigene Git-Konfiguration
+/// schreibt ([`Repo::open_pinned`]) — etwa ein geschützter Witness unter
+/// eigenem Nutzer, dessen Home kein `~/.gitconfig` hat.
+pub const WITNESS_IDENTITY: [&str; 2] = [
+    "user.name=minds witness",
+    "user.email=witness@minds.invalid",
+];
+
 /// Ein geöffnetes Git-Repository.
 ///
 /// Das Handle ist billig zu halten, aber nicht `Sync` — gix cacht intern beim
@@ -97,8 +105,24 @@ impl Repo {
     /// seine Konfiguration um. Das Verzeichnis selbst ist in `witness.json`
     /// festgehalten; gesucht wird nichts. Die übrigen Quellen (System, Nutzer)
     /// bleiben, damit etwa die Committer-Identität des Hosts gilt.
+    ///
+    /// Findet sich so keine Identität (ein Witness unter eigenem Nutzer ohne
+    /// `~/.gitconfig`), schreibt er als [`WITNESS_IDENTITY`] — sonst
+    /// scheiterte jeder Schreibzugriff seines Stores.
     pub fn open_pinned(git_dir: impl AsRef<Path>) -> Result<Self> {
         let git_dir = git_dir.as_ref();
+        let repo = Self::open_pinned_with(git_dir, &[])?;
+        // Nur eine gültige Identität zählt — eine kaputte Angabe in der
+        // `.git/config` hielte sonst jeden Schreibzugriff an.
+        if matches!(repo.gix().committer(), Some(Ok(_)))
+            && matches!(repo.gix().author(), Some(Ok(_)))
+        {
+            return Ok(repo);
+        }
+        Self::open_pinned_with(git_dir, &WITNESS_IDENTITY)
+    }
+
+    fn open_pinned_with(git_dir: &Path, extra: &[&str]) -> Result<Self> {
         let mut permissions = gix::open::Permissions::all();
         permissions.config.includes = false;
         gix::open_opts(
@@ -113,10 +137,16 @@ impl Repo {
                 // ist `core.useReplaceRefs=true` — gix liest es verkehrt
                 // (`true` schaltet die Ersatzobjekte ab). Ein Test mit beiden
                 // Repo-Einstellungen pinnt das.
-                .config_overrides(LOCK_TIMEOUTS.iter().copied().chain([
-                    "gitoxide.objects.noReplace=true",
-                    "core.useReplaceRefs=true",
-                ])),
+                .config_overrides(
+                    LOCK_TIMEOUTS
+                        .iter()
+                        .copied()
+                        .chain([
+                            "gitoxide.objects.noReplace=true",
+                            "core.useReplaceRefs=true",
+                        ])
+                        .chain(extra.iter().copied()),
+                ),
         )
         .map(Self::from_gix)
         .map_err(|err| GitError::open(git_dir, err))
@@ -299,6 +329,27 @@ mod tests {
         let pinned = Repo::open_pinned(&git_dir).unwrap();
         assert!(!pinned.has_ref_namespace());
         assert!(pinned.git_dir().ends_with(".git"));
+    }
+
+    /// Eine vorhandene Identität bleibt; nur wo keine ist, schreibt der
+    /// Witness als [`WITNESS_IDENTITY`] — dessen Form gix annimmt.
+    #[test]
+    fn open_pinned_keeps_an_identity_and_falls_back_to_the_witness() {
+        let fixture = TempRepo::init();
+        let git_dir = fixture.path().join(".git");
+        let config = git_dir.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[user]\n\tname = Repo Person\n\temail = person@example.invalid\n");
+        std::fs::write(&config, text).unwrap();
+        let pinned = Repo::open_pinned(&git_dir).unwrap();
+        let committer = pinned.gix().committer().unwrap().unwrap();
+        assert_eq!(committer.name, "Repo Person");
+
+        let fallback = Repo::open_pinned_with(&git_dir, &WITNESS_IDENTITY).unwrap();
+        let committer = fallback.gix().committer().unwrap().unwrap();
+        assert_eq!(committer.name, "minds witness");
+        assert_eq!(committer.email, "witness@minds.invalid");
+        assert!(fallback.gix().author().is_some());
     }
 
     /// `refs/replace/*` tauscht für den festgehaltenen Zugriff nichts aus.

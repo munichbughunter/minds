@@ -19,6 +19,19 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Protected witness, with one sudo.** On a terminal `minds enable` asks once
+  whether to set the witness up protected. Yes shares the repository with
+  your group (as you), then runs one generated, fully quoted setup script
+  through `sudo`: a root-owned binary in `/usr/local/libexec/minds`, the
+  witness user `_minds`/`minds-witness` with a group of its own (the witness
+  and you) that may write only `objects/`, `refs/` and `logs/` of `.git`, its
+  home outside every user home, a system service under that user, and
+  deny-only Claude Code managed settings (only if none exist, otherwise a
+  proposal). Hooks find the
+  protected witness at its fixed root-owned place and accept only its user as
+  peer. `MINDS_WITNESS=protected|local` chooses without asking; no, no
+  terminal or a failed setup fall back to the local witness with a warning.
+  New: `minds witness signers`.
 - **Witness facts in signed material — A2 becomes reachable.** At every
   checkpoint the witness records in the observation object what it checked
   about itself: profile, its user ID against the owners of worktree and

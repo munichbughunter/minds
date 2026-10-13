@@ -285,6 +285,14 @@ fn witness_keygen_is_safe() {
         )
         .unwrap()
     );
+    // `signers` druckt dieselbe Zeile für den vorhandenen Schlüssel.
+    let signers = command(dir.path())
+        .args(["witness", "signers", "--home"])
+        .arg(&home)
+        .output()
+        .unwrap();
+    assert!(signers.status.success(), "{}", text(&signers));
+    assert_eq!(String::from_utf8_lossy(&signers.stdout), line);
     let second = generate();
     assert!(!second.status.success());
     assert!(text(&second).contains("refusing to overwrite"));
