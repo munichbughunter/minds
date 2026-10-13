@@ -57,6 +57,7 @@
 #![deny(missing_docs)]
 
 mod amend;
+pub mod ancestry;
 mod blame;
 mod diff;
 mod error;
@@ -86,6 +87,7 @@ pub use graph::{
     MAX_PARENTS, MAX_TIPS, READ_ALLOC_LIMIT, READ_DEADLINE,
 };
 pub use head::Head;
+pub use objects::{MAX_LISTED_PATH, VerifiedListing};
 pub use oid::{BlobId, CommitId, CommitIdParseError, TreeId};
 pub use refs::{
     BoundedHead, DEFAULT_CONTEXT_REF, MAX_TAG_DEPTH, MAX_TAG_OBJECT, MINDS_REF_NAMESPACE,

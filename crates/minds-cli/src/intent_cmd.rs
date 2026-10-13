@@ -571,7 +571,7 @@ fn sign(target: Option<&str>, key: Option<&str>, witness_home: Option<&str>) -> 
 /// Der öffentliche Schlüssel zu `key`: die Datei selbst, wenn sie auf
 /// `.pub` endet, sonst `<key>.pub`. Nur eine reguläre Datei (ein FIFO ließe
 /// `sign` hängen), höchstens 64 KiB.
-fn read_public_key(key: &str) -> Option<String> {
+pub(crate) fn read_public_key(key: &str) -> Option<String> {
     let path = if key.ends_with(".pub") {
         PathBuf::from(key)
     } else {
@@ -594,7 +594,7 @@ fn read_public_key(key: &str) -> Option<String> {
 /// Pfad. Passt die `.pub` nicht zum privaten Schlüssel (oder hat der Agent
 /// `user.signingkey` umgebogen), nennt er den Falschen — wer gilt,
 /// entscheidet erst `minds verify` gegen die vertrauenswürdige Signer-Datei.
-fn signer_line(key: &str, public: Option<&str>, signature: &str) -> String {
+pub(crate) fn signer_line(key: &str, public: Option<&str>, signature: &str) -> String {
     let who = public
         .and_then(minds_attest::public_key_comment)
         .map_or_else(|| crate::text::sanitize(key), crate::text::sanitize);

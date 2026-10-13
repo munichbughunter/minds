@@ -64,6 +64,7 @@ mod replay;
 mod secret;
 pub mod secretfile;
 mod session;
+mod spec;
 
 pub use assignment::{
     KeyValueRedactor, ShortFlagRedactor, Tier, UrlCredentialRedactor, has_credential_shape,
@@ -78,3 +79,4 @@ pub use replay::{ReplayScanError, ScannedReplayRecord};
 pub use secret::{DEFAULT_ENTROPY_BITS, DEFAULT_MIN_LEN, HighEntropyRedactor, KnownTokenRedactor};
 pub use secretfile::{SECRET_FILE_PLACEHOLDER, is_secret_file, secret_file_reason};
 pub use session::{AuditSite, Field, RedactedSession, RedactionAudit, RedactionError};
+pub use spec::RedactedSpec;

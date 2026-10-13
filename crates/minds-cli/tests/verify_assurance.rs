@@ -954,3 +954,284 @@ fn a_legacy_session_keeps_its_line_under_a_ledger_finding() {
         run.stdout
     );
 }
+
+/// Die Conformance neben einem VERIFIED-Urteil: gezeigt, ohne den Exit-Code
+/// zu ändern; erst `--conformance` macht DRIFT zum Gate (Exit 2). Das Soll
+/// signiert ein eigener Schlüssel, beschränkt auf `minds-spec`.
+#[test]
+fn verify_shows_conformance_and_gates_only_with_the_flag() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], None);
+    let root = fixture.root();
+    let spec_key = root.join("spec_id");
+    assert!(
+        Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "spec@human", "-f"])
+            .arg(&spec_key)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let public = std::fs::read_to_string(spec_key.with_extension("pub")).unwrap();
+    let mut signers = std::fs::read_to_string(&fixture.signers).unwrap();
+    signers.push_str(&format!(
+        "\nspec@human namespaces=\"minds-spec\" {}\n",
+        public.trim()
+    ));
+    std::fs::write(&fixture.signers, signers).unwrap();
+
+    std::fs::create_dir_all(root.join(".minds")).unwrap();
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::write(
+        root.join(".minds/spec.json"),
+        r#"{"version":"minds-spec-v1","rules":[
+            {"id":"config","kind":"json-schema","schema":"config.schema.json","files":"config/*.json"}
+        ]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("config.schema.json"),
+        r#"{"type":"object","required":["name"]}"#,
+    )
+    .unwrap();
+    std::fs::write(root.join("config/a.json"), r#"{"name":"a"}"#).unwrap();
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "spec"],
+    );
+    let signed = fixture.minds(&["spec", "sign", "--key", spec_key.to_str().unwrap()]);
+    assert_eq!(signed.code, 0, "{}", signed.all);
+    assert!(
+        signed.stdout.contains("signed  spec@human"),
+        "{}",
+        signed.all
+    );
+
+    // Die Session hängt am Commit davor; die Conformance gilt `--commit`.
+    let verify = |extra: &[&str]| {
+        let mut args = vec![
+            "verify",
+            "HEAD~1",
+            "--commit",
+            "HEAD",
+            "--signers",
+            fixture.signers(),
+        ];
+        args.extend_from_slice(extra);
+        fixture.minds(&args)
+    };
+    let run = verify(&[]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(
+        run.stdout
+            .contains("Conformance    PASS  2 pass · 0 drift · 0 unknown — spec b3-"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("signed by spec@human"),
+        "{}",
+        run.stdout
+    );
+    let run = verify(&["--conformance"]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(!run.stdout.contains("Gate"), "{}", run.stdout);
+
+    // Eine Datei bricht den Vertrag: gezeigt, Exit unverändert — außer mit
+    // `--conformance`.
+    std::fs::write(root.join("config/b.json"), r#"{"other":1}"#).unwrap();
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "broken"],
+    );
+    let verify = |extra: &[&str]| {
+        let mut args = vec![
+            "verify",
+            "HEAD~2",
+            "--commit",
+            "HEAD",
+            "--signers",
+            fixture.signers(),
+        ];
+        args.extend_from_slice(extra);
+        fixture.minds(&args)
+    };
+    let run = verify(&[]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(
+        run.stdout.contains("DRIFT    config [json-schema]"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout
+            .contains("observed  config/b.json: /name violates `required`"),
+        "{}",
+        run.stdout
+    );
+    let run = verify(&["--conformance"]);
+    assert_eq!(run.code, 2, "{}", run.all);
+    assert!(
+        run.stdout
+            .ends_with("Gate           conformance: 1 drift, 0 unknown — required all PASS\n"),
+        "{}",
+        run.stdout
+    );
+
+    // Ohne vertrauenswürdige Signer ist das Soll UNKNOWN, nie PASS.
+    let run = fixture.minds(&["verify", "HEAD~2", "--commit", "HEAD~1", "--conformance"]);
+    assert!(
+        run.stdout.contains("UNKNOWN  spec [signature]"),
+        "{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.contains("Gate           conformance:"),
+        "{}",
+        run.stdout
+    );
+
+    // Nur im Verdikt-Modus.
+    let seal = fixture.seals[0].to_string();
+    let run = fixture.minds(&["verify", "--evidence", &seal, "--conformance"]);
+    assert_eq!(run.code, 4, "{}", run.all);
+}
+
+/// Ein unbeschränkter Schlüssel gibt kein Soll frei (wie bei Intents): Ein
+/// Entwickler-Schlüssel im ssh-agent könnte auch der Agent benutzen.
+#[test]
+fn an_unrestricted_key_does_not_approve_a_spec() {
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], None);
+    let root = fixture.root();
+    let spec_key = root.join("spec_id");
+    assert!(
+        Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "dev", "-f"])
+            .arg(&spec_key)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let public = std::fs::read_to_string(spec_key.with_extension("pub")).unwrap();
+    let mut signers = std::fs::read_to_string(&fixture.signers).unwrap();
+    signers.push_str(&format!("\ndev {}\n", public.trim()));
+    std::fs::write(&fixture.signers, signers).unwrap();
+    std::fs::create_dir_all(root.join(".minds")).unwrap();
+    std::fs::write(
+        root.join(".minds/spec.json"),
+        r#"{"version":"minds-spec-v1","rules":[{"id":"s","kind":"graph","expect":"session"}]}"#,
+    )
+    .unwrap();
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "spec"],
+    );
+    let signed = fixture.minds(&["spec", "sign", "--key", spec_key.to_str().unwrap()]);
+    assert_eq!(signed.code, 0, "{}", signed.all);
+    let run = fixture.minds(&["spec", "show", "--signers", fixture.signers()]);
+    assert!(
+        run.stdout
+            .contains("state   no valid signature of a trusted minds-spec signer"),
+        "{}",
+        run.all
+    );
+    let run = fixture.minds(&[
+        "verify",
+        "HEAD~1",
+        "--commit",
+        "HEAD",
+        "--signers",
+        fixture.signers(),
+    ]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(
+        run.stdout.contains("DRIFT    spec [signature]"),
+        "{}",
+        run.stdout
+    );
+}
+
+/// Ein `ssh-keygen`, das der Agent in den Checkout auf `PATH` legt, prüft
+/// keine Soll-Signatur: Es wird übergangen, die gepflanzte Signatur fällt
+/// beim echten durch.
+#[cfg(unix)]
+#[test]
+fn a_planted_ssh_keygen_does_not_approve_a_spec() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], None);
+    let root = fixture.root();
+    std::fs::create_dir_all(root.join(".minds")).unwrap();
+    let text =
+        r#"{"version":"minds-spec-v1","rules":[{"id":"s","kind":"graph","expect":"session"}]}"#;
+    std::fs::write(root.join(".minds/spec.json"), text).unwrap();
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &["-c", "commit.gpgsign=false", "commit", "-qm", "spec"],
+    );
+    let head = git_out(root, &["rev-parse", "HEAD"], None);
+    // Der Agent: ein Umschlag mit wertloser Signatur im Store ...
+    let spec = minds_core::spec::Spec::parse(text.as_bytes()).unwrap();
+    let signed = minds_core::spec::SignedSpec::new(spec, Default::default(), head.trim()).unwrap();
+    let redacted = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_spec(signed)
+        .unwrap();
+    fixture
+        .store
+        .put_spec(
+            &redacted,
+            "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n",
+            &|_| true,
+        )
+        .unwrap();
+    // ... und ein `ssh-keygen`, das alles gutheißt, vorn auf PATH.
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("ssh-keygen");
+    std::fs::write(&fake, "#!/bin/sh\necho spec@human\nexit 0\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let key = root.join("spec_id");
+    assert!(
+        Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "spec@human", "-f"])
+            .arg(&key)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    let mut signers = std::fs::read_to_string(&fixture.signers).unwrap();
+    signers.push_str(&format!(
+        "\nspec@human namespaces=\"minds-spec\" {}\n",
+        public.trim()
+    ));
+    std::fs::write(&fixture.signers, signers).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(MINDS)
+        .current_dir(root)
+        .env("HOME", root.join("user-home"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("PATH", path)
+        .args([
+            "verify",
+            "HEAD~1",
+            "--commit",
+            "HEAD",
+            "--signers",
+            fixture.signers(),
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("PASS     spec [signature]"), "{stdout}");
+    assert!(stdout.contains("DRIFT    spec [signature]"), "{stdout}");
+}

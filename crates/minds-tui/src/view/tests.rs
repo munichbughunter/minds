@@ -185,6 +185,47 @@ const SPLIT: u16 = 124;
 /// Eine Fläche nach der anderen, wie vor der Teilung.
 const NARROW: u16 = 100;
 
+/// Ein Conformance-Bericht: Soll signiert, eine Regel weicht ab.
+fn sample_conformance(commit: CommitId) -> minds_reader::conformance::Report {
+    use minds_reader::conformance::{Outcome, Report, RuleResult};
+    let row = |id: &str, kind: &str, expected: &str, observed: &str, outcome| RuleResult {
+        id: id.into(),
+        kind: kind.into(),
+        expected: expected.into(),
+        observed: observed.into(),
+        outcome,
+    };
+    Report {
+        commit,
+        here: Some(minds_core::ContentHash::from_bytes([9u8; 32])),
+        active: Some((minds_core::ContentHash::from_bytes([9u8; 32]), commit)),
+        signer: Some("human@example".into()),
+        spec: row(
+            "spec",
+            "signature",
+            "signed spec",
+            "signed by human@example",
+            Outcome::Pass,
+        ),
+        rules: vec![
+            row(
+                "app-not-db",
+                "no-dependency",
+                "app does not depend on db",
+                "app → core → db",
+                Outcome::Drift,
+            ),
+            row(
+                "config",
+                "json-schema",
+                "config/*.json match schema/config.json",
+                "1 file(s) valid",
+                Outcome::Pass,
+            ),
+        ],
+    }
+}
+
 fn render(app: &mut App) -> String {
     render_at(app, WIDE)
 }
@@ -2813,6 +2854,7 @@ mod verify_tab {
             out_of_scope: Some(vec!["Cargo.lock".into()]),
             out_of_scope_paths: vec!["Cargo.lock".into()],
             scope_note: None,
+            conformance: None,
         }
     }
 
@@ -3064,6 +3106,38 @@ mod verify_tab {
         let out = render(&mut app);
         assert!(out.contains("! VERIFIED, INCOMPLETE"), "{out}");
         assert!(out.contains("Coverage    ! incomplete"), "{out}");
+    }
+
+    /// Die Conformance steht je Regel neben dem Urteil — und ändert es nicht
+    /// (wie `verify` ohne `--conformance`).
+    #[test]
+    fn conformance_lists_each_rule_beside_the_verdict() {
+        let (_dir, repo) = repo();
+        let mut app = app(&repo);
+        let mut cli = verdict(false, VerifyVerdict::Verified);
+        cli.conformance = Some(sample_conformance(commit('1')));
+        app.fill_verify(&signers(Some(cli)));
+        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Verified);
+        let out = render(&mut app);
+        assert!(out.contains("Conformance ✗ DRIFT"), "{out}");
+        assert!(out.contains("2 pass · 1 drift · 0 unknown"), "{out}");
+        assert!(out.contains("signed by human@example"), "{out}");
+        assert!(
+            out.contains("✗ DRIFT   app-not-db  app → core → db"),
+            "{out}"
+        );
+        assert!(out.contains("expected app does not depend on db"), "{out}");
+        assert!(out.contains("✓ PASS    config"), "{out}");
+    }
+
+    /// Ohne Soll sagt der Tab das — kein leerer Platz, kein PASS.
+    #[test]
+    fn without_a_spec_the_verify_tab_says_so() {
+        let (_dir, repo) = repo();
+        let mut app = app(&repo);
+        app.fill_verify(&signers(Some(verdict(false, VerifyVerdict::Verified))));
+        let out = render(&mut app);
+        assert!(out.contains("Conformance · no spec"), "{out}");
     }
 
     /// Ohne geprüftes Urteil nie VERIFIED und nie INCOMPLETE — beides
@@ -3678,6 +3752,55 @@ mod overview_tab {
         assert!(out.contains("● HEAD"), "{out}");
         // Kein Nerd Font: keine Private-Use-Glyphen.
         assert!(!out.contains('\u{e0b6}'), "{out}");
+    }
+
+    /// Eine Quelle, die nur die Conformance kennt — und zählt, wonach
+    /// gefragt wurde.
+    struct Conforming {
+        asked: std::cell::RefCell<Vec<CommitId>>,
+    }
+
+    impl crate::Source for Conforming {
+        fn load(&self) -> minds_reader::Result<Inspection> {
+            unreachable!("this test never reloads")
+        }
+        fn stamp(&self) -> Option<crate::Stamp> {
+            None
+        }
+        fn conformance(&self, commit: CommitId) -> Option<minds_reader::conformance::Report> {
+            self.asked.borrow_mut().push(commit);
+            Some(sample_conformance(commit))
+        }
+    }
+
+    /// Die Conformance-Pille: im Leerlauf gerechnet — erst HEAD, dann der
+    /// gewählte Commit, jeder nur einmal.
+    #[test]
+    fn the_overview_shows_a_conformance_pill() {
+        let (_dir, repo, commits, inspection) = history();
+        let mut app = opened(&repo, inspection);
+        let source = Conforming {
+            asked: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(!render(&mut app).contains("drift"));
+        // Der Cursor steht auf der Session ohne Commit: zuerst HEAD.
+        assert!(app.fill_conformance(&source));
+        assert!(!app.fill_conformance(&source));
+        let out = render(&mut app);
+        assert!(out.contains("✗ drift 1"), "{out}");
+        // Ein anderer Commit gewählt: dessen Pille, HEAD nicht noch einmal.
+        app.reduce(Action::Down);
+        app.reduce(Action::Down);
+        assert!(app.fill_conformance(&source));
+        assert!(!app.fill_conformance(&source));
+        let asked = source.asked.borrow();
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(commits.contains(&asked[1]));
+        assert_ne!(asked[0], asked[1]);
+        // Nur im Overview-Tab.
+        drop(asked);
+        app.reduce(Action::TabTo(2));
+        assert!(!app.fill_conformance(&source));
     }
 
     /// Mit Nerd Font: runde Pillen.

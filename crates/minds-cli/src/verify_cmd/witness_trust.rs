@@ -58,6 +58,19 @@ pub(crate) struct WitnessTrust<'a> {
     /// Intent-Urteile je (Ankertext, Signatur) — eine Prüfung startet
     /// mehrere `ssh-keygen`-Prozesse, und viele Sessions teilen einen Anker.
     intents: RefCell<HashMap<[u8; 32], IntentSignature>>,
+    /// Die Signaturen je Umschlag-Text, aus [`WitnessTrust::envelope_candidates`].
+    envelope_signatures: RefCell<HashMap<String, Vec<String>>>,
+    /// Wie viele Soll-Signaturen dieser Lauf schon geprüft hat.
+    spec_checks: std::cell::Cell<usize>,
+    /// Soll-Urteile je (Umschlag, Signatur).
+    specs: RefCell<HashMap<[u8; 32], SpecVerdict>>,
+    /// Die Schlüssel der auf `minds-spec` beschränkten Zeilen.
+    spec_keys: OnceCell<Vec<Vec<u8>>>,
+    /// Das `ssh-keygen` für Soll-Signaturen: `None` (Standard) und
+    /// `Some(None)` prüfen nicht; `Some(Some(p))`: genau dieses.
+    spec_program: Option<Option<PathBuf>>,
+    /// Ob `spec_program` lauffähig ist — einmal je Lauf geprobt.
+    spec_probe: OnceCell<bool>,
     /// Die Replay-Records (EA-18b), einmal je Lauf gelesen
     /// ([`minds_reader::replay::ReplayIndex`]).
     replays: OnceCell<minds_reader::replay::ReplayIndex>,
@@ -91,6 +104,36 @@ impl<'a> WitnessTrust<'a> {
         Self::build(store, signers, minds_attest::ssh_keygen_available)
     }
 
+    /// Nur für Soll-Signaturen, mit genau diesem `ssh-keygen`
+    /// (`conformance::spec_program`, root-eigen) — auch die
+    /// Verfügbarkeitsprobe läuft nur damit, nie über `PATH`.
+    pub(crate) fn for_specs(
+        store: &'a dyn ContextStore,
+        signers: Option<&str>,
+        program: Option<PathBuf>,
+    ) -> Self {
+        let probe = program.clone();
+        Self::build(store, signers, move || {
+            probe
+                .as_deref()
+                .is_some_and(minds_attest::ssh_keygen_available_at)
+        })
+        .with_spec_program(program)
+    }
+
+    /// Ob die Signer-Datei lesbar ist **und** mindestens einen Schlüssel
+    /// auf einer `minds-spec`-Zeile trägt — nur dann taugt sie als Filter
+    /// für vorhandene Signaturen (eine Datei nur für Commit-Signaturen
+    /// kennt keinen Soll-Signer).
+    pub(crate) fn has_spec_signers(&self) -> bool {
+        self.content.as_deref().is_some_and(|content| {
+            !self
+                .spec_keys
+                .get_or_init(|| restricted_keys(content, minds_attest::NS_SPEC))
+                .is_empty()
+        })
+    }
+
     /// Nur für Intent-Signaturen, mit genau diesem `ssh-keygen` (aufgelöst
     /// außerhalb des Checkouts) — auch die Verfügbarkeitsprobe läuft nur
     /// damit, nie über PATH. `None`: keins gefunden — jede Intent-Signatur
@@ -100,8 +143,8 @@ impl<'a> WitnessTrust<'a> {
     }
 
     /// [`for_intents`](Self::for_intents) mit ausdrücklicher Signer-Datei
-    /// (Tests).
-    fn for_intents_with_signers(
+    /// (`--signers`; die Conformance und Tests).
+    pub(crate) fn for_intents_with_signers(
         store: &'a dyn ContextStore,
         signers: Option<&str>,
         program: Option<PathBuf>,
@@ -142,6 +185,12 @@ impl<'a> WitnessTrust<'a> {
             keygen,
             verdicts: RefCell::new(HashMap::new()),
             intents: RefCell::new(HashMap::new()),
+            specs: RefCell::new(HashMap::new()),
+            envelope_signatures: RefCell::new(HashMap::new()),
+            spec_checks: std::cell::Cell::new(0),
+            spec_keys: OnceCell::new(),
+            spec_program: None,
+            spec_probe: OnceCell::new(),
             replays: OnceCell::new(),
             replay_verdicts: RefCell::new(HashMap::new()),
             first_sights: RefCell::new(HashMap::new()),
@@ -323,6 +372,212 @@ impl<'a> WitnessTrust<'a> {
             self.intents.borrow_mut().insert(key, verdict);
         }
         verdict
+    }
+
+    /// Prüft Soll-Signaturen mit genau diesem `ssh-keygen`
+    /// (`conformance::spec_program`: root-eigen, außerhalb des Checkouts);
+    /// `None`: keins gefunden — dann bleibt jedes Soll ungeprüft. Ohne diesen Aufruf prüft
+    /// nichts: Ein `ssh-keygen` aus `PATH` könnte der Agent abgelegt haben.
+    pub(crate) fn with_spec_program(mut self, program: Option<PathBuf>) -> Self {
+        self.spec_program = Some(program);
+        self
+    }
+
+    /// Alle Umschläge des Stores, **ungeprüft** — für die Conformance
+    /// ([`minds_reader::conformance::Inputs`]), die erst verortet und dann
+    /// nur die nötigen prüft ([`WitnessTrust::verify_envelope`]). Ein
+    /// verändertes oder vorbelegtes Soll im Store zählt nicht. Höchstens
+    /// [`MAX_SPECS`] Solls und [`MAX_ENVELOPES`] Umschläge — darüber ist
+    /// nichts entschieden.
+    pub(crate) fn envelope_candidates(&self) -> Result<Vec<minds_core::spec::SignedSpec>, String> {
+        let ids = self
+            .store
+            .list_specs()
+            .map_err(|_| "the spec refs cannot be listed".to_owned())?;
+        if ids.len() > MAX_SPECS {
+            return Err(format!("more than {MAX_SPECS} specs in the store"));
+        }
+        let mut signatures = self.envelope_signatures.borrow_mut();
+        signatures.clear();
+        let mut out = Vec::new();
+        for id in ids {
+            let Ok(Some(stored)) = self.store.get_spec(&id) else {
+                continue;
+            };
+            for envelope in stored.envelopes {
+                if out.len() == MAX_ENVELOPES {
+                    return Err(format!("more than {MAX_ENVELOPES} envelopes in the store"));
+                }
+                signatures
+                    .entry(envelope.signed.text().to_owned())
+                    .or_default()
+                    .extend(envelope.signatures);
+                out.push(envelope.signed);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Wer einen Umschlag aus [`WitnessTrust::envelope_candidates`] gültig
+    /// signiert hat — `Ok(None)`: niemand; `Err`: nicht prüfbar.
+    pub(crate) fn verify_envelope(
+        &self,
+        signed: &minds_core::spec::SignedSpec,
+    ) -> Result<Option<String>, String> {
+        let signatures = self
+            .envelope_signatures
+            .borrow()
+            .get(signed.text())
+            .cloned()
+            .unwrap_or_default();
+        self.envelope_signer(&minds_store::StoredEnvelope {
+            signed: signed.clone(),
+            signatures,
+        })
+    }
+
+    /// Wer einen Umschlag gültig signiert hat — `None`: niemand; `Err`:
+    /// nicht prüfbar.
+    fn envelope_signer(
+        &self,
+        envelope: &minds_store::StoredEnvelope,
+    ) -> Result<Option<String>, String> {
+        let mut unchecked = None;
+        for signature in &envelope.signatures {
+            let key = {
+                let mut hasher = blake3::Hasher::new();
+                let text = envelope.signed.text();
+                hasher.update(&(text.len() as u64).to_le_bytes());
+                hasher.update(text.as_bytes());
+                hasher.update(signature.as_bytes());
+                *hasher.finalize().as_bytes()
+            };
+            let cached = self.specs.borrow().get(&key).cloned();
+            let verdict = match cached {
+                Some(verdict) => verdict,
+                None => {
+                    // Ein Deckel auf die Prüfungen je Lauf: Untergeschobene
+                    // Signaturen mit kopiertem Schlüssel kosten je einen
+                    // `ssh-keygen`-Lauf. Gezählt wird erst nach dem
+                    // Vorfilter — was er verwirft, startet keinen Prozess.
+                    if self.content.is_some() && self.spec_key_trusted(signature) {
+                        let used = self.spec_checks.get();
+                        if used >= MAX_SPEC_CHECKS {
+                            return Err(format!(
+                                "more than {MAX_SPEC_CHECKS} spec signatures to check"
+                            ));
+                        }
+                        self.spec_checks.set(used + 1);
+                    }
+                    let verdict = self.check_spec(envelope.signed.text(), signature);
+                    if !matches!(verdict, SpecVerdict::NotChecked(_)) {
+                        self.specs.borrow_mut().insert(key, verdict.clone());
+                    }
+                    verdict
+                }
+            };
+            match verdict {
+                SpecVerdict::Valid(signer) => return Ok(Some(signer)),
+                SpecVerdict::NotChecked(reason) => unchecked = Some(reason),
+                SpecVerdict::Invalid => {}
+            }
+        }
+        match unchecked {
+            Some(reason) => Err(reason),
+            None => Ok(None),
+        }
+    }
+
+    /// Ob eine Signatur von einem Schlüssel stammt, den eine
+    /// `minds-spec`-Zeile der Signer trägt — ohne `ssh-keygen`. Für den
+    /// Store: Nur solche Signaturen werden beim Neu-Signieren behalten.
+    pub(crate) fn spec_key_trusted(&self, signature: &str) -> bool {
+        let Some(content) = self.content.as_deref() else {
+            return false;
+        };
+        let keys = self
+            .spec_keys
+            .get_or_init(|| restricted_keys(content, minds_attest::NS_SPEC));
+        minds_attest::signature_public_key(signature).is_some_and(|key| keys.contains(&key))
+    }
+
+    /// Die Signaturlage eines Solls (für `minds spec show`): gültig, wenn
+    /// einer seiner Umschläge gültig signiert ist. Ob der Umschlag für einen
+    /// Commit gilt, sagt erst die Conformance.
+    pub(crate) fn spec_signature(
+        &self,
+        spec: &minds_core::spec::Spec,
+    ) -> minds_reader::conformance::SpecTrust {
+        use minds_reader::conformance::SpecTrust;
+        let stored = match self.store.get_spec(spec.id()) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => return SpecTrust::Unsigned,
+            Err(_) => return SpecTrust::Invalid,
+        };
+        if stored.envelopes.iter().all(|e| e.signatures.is_empty()) {
+            return SpecTrust::Unsigned;
+        }
+        let mut verdict = SpecTrust::Invalid;
+        for envelope in &stored.envelopes {
+            match self.envelope_signer(envelope) {
+                Ok(Some(signer)) => {
+                    return SpecTrust::Valid {
+                        signer,
+                        signed: envelope.signed.clone(),
+                    };
+                }
+                Ok(None) => {}
+                Err(reason) => verdict = SpecTrust::NotChecked(reason),
+            }
+        }
+        verdict
+    }
+
+    fn check_spec(&self, text: &str, signature: &str) -> SpecVerdict {
+        let (Some(path), Some(content)) = (self.file.as_deref(), self.content.as_deref()) else {
+            return SpecVerdict::NotChecked(
+                "no trusted signers (--signers or ~/.ssh/allowed_signers)".into(),
+            );
+        };
+        // Vorfilter ohne Prozess: Nur ein Schlüssel mit einer
+        // `minds-spec`-Zeile kann gelten.
+        if !self.spec_key_trusted(signature) {
+            return SpecVerdict::Invalid;
+        }
+        let program = match &self.spec_program {
+            Some(Some(program)) => program.clone(),
+            _ => {
+                return SpecVerdict::NotChecked(
+                    "no root-owned ssh-keygen found outside the checkout".into(),
+                );
+            }
+        };
+        if !*self
+            .spec_probe
+            .get_or_init(|| minds_attest::ssh_keygen_available_at(&program))
+        {
+            return SpecVerdict::NotChecked("ssh-keygen is not usable".into());
+        }
+        // Ein Prozessfehler ist kein „ungültig" — nichts ist entschieden.
+        let principals = match minds_attest::ssh_find_principals_with(&program, signature, path) {
+            Ok(principals) => principals,
+            Err(_) => return SpecVerdict::NotChecked("ssh-keygen failed".into()),
+        };
+        for principal in principals.into_iter().filter(|p| spec_only(content, p)) {
+            match minds_attest::ssh_verify_ns_with(
+                &program,
+                text,
+                signature,
+                path,
+                &principal,
+                minds_attest::NS_SPEC,
+            ) {
+                Ok(true) => return SpecVerdict::Valid(principal),
+                Ok(false) => {}
+                Err(_) => return SpecVerdict::NotChecked("ssh-keygen failed".into()),
+            }
+        }
+        SpecVerdict::Invalid
     }
 
     /// Das Replay-Ergebnis der Session (EA-18b) für genau `commit` — die
@@ -564,6 +819,30 @@ fn witness_only(allowed_signers: &str, principal: &str) -> bool {
 /// ein Agent mitbenutzen kann) gibt so keinen Intent frei.
 fn intent_only(allowed_signers: &str, principal: &str) -> bool {
     restricted_to(allowed_signers, principal, minds_attest::NS_INTENT)
+}
+
+/// Höchstzahl der Solls, die eine Prüfung liest.
+const MAX_SPECS: usize = 256;
+
+/// Höchstzahl der Umschläge, die eine Prüfung liest.
+const MAX_ENVELOPES: usize = 1024;
+
+/// Höchstzahl der Signaturprüfungen (je ein `ssh-keygen`-Lauf je
+/// Signer-Zeile) eines Laufs.
+const MAX_SPEC_CHECKS: usize = 64;
+
+/// Das Urteil über eine Soll-Signatur.
+#[derive(Debug, Clone)]
+enum SpecVerdict {
+    Valid(String),
+    Invalid,
+    NotChecked(String),
+}
+
+/// Ob `principal` ein Soll-Signer ist — dieselbe Regel wie
+/// [`witness_only`], für `namespaces="minds-spec"`.
+fn spec_only(allowed_signers: &str, principal: &str) -> bool {
+    restricted_to(allowed_signers, principal, minds_attest::NS_SPEC)
 }
 
 /// Ob `principal` ein CI-Signer für Replay-Records und Erstsicht-

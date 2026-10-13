@@ -401,8 +401,16 @@ impl Glob {
     /// Trifft der Glob `path` (repo-relativ, `/`-getrennt)?
     /// Erschöpft der Abgleich [`MATCH_BUDGET`], trifft der Glob nicht.
     pub fn matches(&self, path: &str) -> bool {
+        self.matches_checked(path).unwrap_or(false)
+    }
+
+    /// Wie [`matches`](Self::matches), aber `None`, wenn der Abgleich
+    /// [`MATCH_BUDGET`] erschöpft — für Aufrufer, bei denen „trifft nicht"
+    /// ein Durchlassen wäre (Conformance: nicht geprüft ist nicht bestanden).
+    pub fn matches_checked(&self, path: &str) -> Option<bool> {
         let budget = Cell::new(MATCH_BUDGET);
-        self.matches_parts(&split(path), &budget) && budget.get() > 0
+        let hit = self.matches_parts(&split(path), &budget);
+        (budget.get() > 0).then_some(hit)
     }
 
     fn matches_parts(&self, parts: &[Vec<char>], budget: &Cell<u64>) -> bool {

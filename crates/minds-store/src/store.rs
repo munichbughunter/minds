@@ -38,7 +38,9 @@ use minds_core::intent_anchor::IntentAnchor;
 use minds_core::observation::Observations;
 use minds_core::replay::ReplayRecord;
 use minds_core::{ContentHash, EvidenceMark, Session, SessionId};
-use minds_redact::{RedactedIntent, RedactedObservations, RedactedSession, ScannedReplayRecord};
+use minds_redact::{
+    RedactedIntent, RedactedObservations, RedactedSession, RedactedSpec, ScannedReplayRecord,
+};
 
 use crate::bytes::SessionBytes;
 use crate::error::{Result, StoreError};
@@ -125,6 +127,26 @@ pub struct StoredIntent {
     /// Die abgelegten (redigierten) Snapshot-Bytes — **ungeprüft** gegen
     /// `content=`.
     pub snapshot: Vec<u8>,
+}
+
+/// Ein abgelegtes Soll, wie [`ContextStore::get_spec`] es liest: alle
+/// Umschläge dieses Solls (je Signier-Commit und Pins einer), jeder gegen
+/// die Id geprüft, die Signaturen nur der Form nach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredSpec {
+    /// Die Umschläge.
+    pub envelopes: Vec<StoredEnvelope>,
+}
+
+/// Ein Umschlag samt Signaturen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEnvelope {
+    /// Der signierte Umschlag (Soll, Pins, `at`).
+    pub signed: minds_core::spec::SignedSpec,
+    /// Die armierten `ssh-sig`-Signaturen (`minds-spec`) über ihn —
+    /// **ungeprüft**. Jeder Signierende fügt hinzu, keiner verdrängt einen
+    /// anderen.
+    pub signatures: Vec<String>,
 }
 
 /// Was unter dem Ref einer Erstsicht-Gegenzeichnung liegt
@@ -525,6 +547,40 @@ pub trait ContextStore {
             anchor,
             snapshot,
         }))
+    }
+
+    /// Legt einen Umschlag samt Signatur ab: `refs/minds/specs/<64 hex>`,
+    /// Baum `envelopes/<hash>/spec` und `envelopes/<hash>/sigs/<hash>`.
+    /// Verlangt [`RedactedSpec`] — dieselbe fail-closed-Zusage in Typform wie
+    /// bei [`put_intent`](Self::put_intent). Idempotent; Umschläge und
+    /// Signaturen kommen **hinzu** (Kind-Commit), keiner verdrängt einen
+    /// anderen — ein älterer Umschlag bleibt für ältere Commits gültig.
+    /// Behalten werden nur vorhandene Signaturen, die `retain` gutheißt
+    /// (etwa: Schlüssel eines vertrauten Signers; ohne Signer-Urteil alle);
+    /// ein Umschlag ohne verbleibende Signatur fällt weg — untergeschobene
+    /// belegen so keinen Platz. Der Default lehnt ab.
+    fn put_spec(
+        &self,
+        _spec: &RedactedSpec,
+        _signature: &str,
+        _retain: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store specs",
+        )))
+    }
+
+    /// Das Soll unter `id` — `None`, wenn es hier nicht liegt. Prüft die
+    /// kanonische Form jedes Umschlags, seinen Namen und `id` gegen das Soll
+    /// darin ([`StoreError::SpecMismatch`]); die Signaturen prüft der Leser.
+    /// Was unter `sigs/` keine armierte Signatur ist, wird übergangen.
+    fn get_spec(&self, _id: &ContentHash) -> Result<Option<StoredSpec>> {
+        Ok(None)
+    }
+
+    /// Alle abgelegten Solls.
+    fn list_specs(&self) -> Result<Vec<ContentHash>> {
+        Ok(Vec::new())
     }
 
     /// Das Observation-Objekt unter `id` — `None`, wenn es hier nicht liegt.

@@ -57,6 +57,8 @@ pub mod intent;
 
 pub mod scope;
 
+pub mod conformance;
+
 pub mod replay;
 
 /// Erstsicht-Gegenzeichnungen zur Lesezeit (EA-19).

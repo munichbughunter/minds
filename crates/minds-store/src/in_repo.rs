@@ -216,6 +216,23 @@ impl ContextStore for InRepoStore {
         self.0.get_intent(id)
     }
 
+    fn put_spec(
+        &self,
+        spec: &minds_redact::RedactedSpec,
+        signature: &str,
+        retain: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        self.0.put_spec(spec, signature, retain)
+    }
+
+    fn get_spec(&self, id: &minds_core::ContentHash) -> Result<Option<crate::StoredSpec>> {
+        self.0.get_spec(id)
+    }
+
+    fn list_specs(&self) -> Result<Vec<minds_core::ContentHash>> {
+        self.0.list_specs()
+    }
+
     fn put_seal_signature(&self, id: &minds_core::ContentHash, signature: &str) -> Result<()> {
         self.0.put_seal_signature(id, signature)
     }
