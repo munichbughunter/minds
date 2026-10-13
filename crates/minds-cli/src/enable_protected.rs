@@ -774,10 +774,18 @@ mod tests {
     #[test]
     fn the_script_quotes_every_value_and_parses() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("it's $HOME `id`; repo");
+        // macOS: ein Pfad mit Anführungszeichen und Leerzeichen; Linux: einer,
+        // den die systemd-Unit erlaubt (Leerzeichen und Anführungszeichen
+        // lehnt sie ab — siehe unten).
+        let (name, quoted) = if cfg!(target_os = "macos") {
+            ("it's $HOME `id`; repo", r"'\''s $HOME `id`; repo'")
+        } else {
+            ("it$HOME`id`;repo", "it$HOME`id`;repo'")
+        };
+        let root = dir.path().join(name);
         std::fs::create_dir(&root).unwrap();
         let script = script(&values(&root, Path::new("/opt/minds/bin/minds"))).unwrap();
-        assert!(script.contains(r"'\''s $HOME `id`; repo'"), "{script}");
+        assert!(script.contains(quoted), "{script}");
         assert!(!script.contains("{{"), "{script}");
         assert!(script.contains("DEVUID='501'"), "{script}");
         assert!(script.contains("--profile user --socket-group \"$WUSER\""));
@@ -794,6 +802,12 @@ mod tests {
         let mut bad = values(&root, Path::new("/opt/minds"));
         bad.user = "dev; rm -rf /";
         assert!(super::script(&bad).is_err());
+        // Unter Linux lehnt die Unit Pfade ab, die systemd zerlegen würde.
+        if !cfg!(target_os = "macos") {
+            let spaced = dir.path().join("it's a repo");
+            std::fs::create_dir(&spaced).unwrap();
+            assert!(super::script(&values(&spaced, Path::new("/opt/minds"))).is_err());
+        }
     }
 
     /// Beide Vorlagen nennen nur Platzhalter, die `script` kennt — auch die
@@ -834,7 +848,7 @@ mod tests {
     #[test]
     fn a_value_that_looks_like_a_placeholder_stays_quoted() {
         let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("repo `touch pwn` $HOME");
+        let root = dir.path().join("repo`touch`$HOME");
         std::fs::create_dir(&root).unwrap();
         let source = Path::new("/opt/{{ROOT}}/minds");
         let script = script(&values(&root, source)).unwrap();
