@@ -336,15 +336,23 @@ impl Repo {
     /// diesem Klon **vorhanden** ist (Shallow Clone), sagt erst
     /// [`Repo::has_commit`].
     pub fn first_parent(&self, commit: CommitId) -> Result<Option<CommitId>> {
-        let object = self
-            .gix()
-            .find_commit(commit.to_gix())
+        Ok(self.parents(commit)?.into_iter().next())
+    }
+
+    /// Alle Elternteile eines Commits, in ihrer Reihenfolge.
+    ///
+    /// Das Commit-Objekt wird erst am Header begrenzt (ein Commit mit
+    /// gigabytegroßer Nachricht, als zlib-Bombe winzig, füllte sonst den
+    /// Speicher), dann gelesen und neu gehasht.
+    pub fn parents(&self, commit: CommitId) -> Result<Vec<CommitId>> {
+        let data = self.verified_object(
+            commit.to_gix(),
+            gix::objs::Kind::Commit,
+            crate::objects::MAX_VERIFIED_OBJECT,
+        )?;
+        let parsed = gix::objs::CommitRef::from_bytes(&data, self.gix().object_hash())
             .map_err(|err| GitError::read_object(commit, err))?;
-        verify_object(commit.to_gix(), gix::objs::Kind::Commit, &object.data)?;
-        Ok(object
-            .parent_ids()
-            .next()
-            .map(|id| CommitId::from_gix(id.detach())))
+        Ok(parsed.parents().map(CommitId::from_gix).collect())
     }
 
     /// Ob das Commit-Objekt in diesem Repository liegt — `false` etwa für

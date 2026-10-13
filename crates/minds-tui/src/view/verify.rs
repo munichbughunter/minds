@@ -256,6 +256,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.push(emphasis(Line::from(spans), row == state.cursor));
 
+    conformance_lines(state, &mut lines);
+
     // Grenzen: dieselbe Kurzliste wie `minds verify`.
     if let Some((level, _)) = state.weakest() {
         let shown: Vec<&str> = minds_core::evidence::limits_at(level.level())
@@ -287,6 +289,88 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         ),
         area,
     );
+}
+
+/// Die Conformance gegen das signierte Soll — je Regel *result · id ·
+/// observed*, darunter gedimmt *expected*. Eine Anzeige neben dem Urteil:
+/// Die Kopfzeile bleibt die von `verify` (dessen Exit-Code sie nicht ändert).
+fn conformance_lines(state: &VerifyState, lines: &mut Vec<Line<'static>>) {
+    use minds_reader::conformance::Outcome;
+    let label = Span::styled(format!("{:<12}", "Conformance"), theme::dim());
+    let report = match &state.cli {
+        _ if state.pending => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                label,
+                Span::styled("… checking", theme::dim()),
+            ]));
+            return;
+        }
+        Some(Ok(cli)) => cli.conformance.as_ref(),
+        Some(Err(err)) => {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                label,
+                Span::styled(format!("· not checked ({err})"), theme::dim()),
+            ]));
+            return;
+        }
+        None => None,
+    };
+    let Some(report) = report else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            label,
+            Span::styled(
+                "· no spec (.minds/spec.json, signed with minds spec sign)",
+                theme::dim(),
+            ),
+        ]));
+        return;
+    };
+    let style = |outcome: Outcome| match outcome {
+        Outcome::Pass => ("✓", Style::default().fg(theme::OK)),
+        Outcome::Drift => ("✗", Style::default().fg(theme::DELETE)),
+        Outcome::Unknown => ("?", Style::default().fg(theme::REVIEW)),
+    };
+    let (pass, drift, unknown) = report.counts();
+    let (glyph, head) = style(report.outcome());
+    let source = match (&report.active, &report.signer) {
+        (Some((id, _)), Some(signer)) => format!(
+            "spec b3-{} signed by {}",
+            &id.hex()[..12],
+            minds_reader::sanitize(signer)
+        ),
+        (Some((id, _)), None) => format!("spec b3-{} (not signed)", &id.hex()[..12]),
+        (None, _) => "no signed spec".to_owned(),
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        label,
+        Span::styled(
+            format!("{glyph} {}", report.outcome().label()),
+            head.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(format!(
+            "  {pass} pass · {drift} drift · {unknown} unknown  "
+        )),
+        Span::styled(source, theme::dim()),
+    ]));
+    for row in report.rows() {
+        let (glyph, style) = style(row.outcome);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(format!("{:<12}", "")),
+            Span::styled(format!("{glyph} {:<8}", row.outcome.label()), style),
+            Span::raw(format!("{}  ", row.id)),
+            Span::raw(row.observed.clone()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::raw(format!("{:<23}", "")),
+            Span::styled(format!("expected {}", row.expected), theme::dim()),
+        ]));
+    }
 }
 
 fn emphasis(line: Line<'static>, on: bool) -> Line<'static> {

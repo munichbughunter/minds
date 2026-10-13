@@ -413,7 +413,7 @@ minds verify [<session|rev>] [--signers <file>] [--identity <id>]
              [--commit <rev>] [--require-explained <percent>] [--all]
              [--require-in-scope] [--witness-home <dir>]
              [--require-assurance <A0|A1|A2|A3>] [--limits]
-             [--online [--gitlab-url <url>]]
+             [--online [--gitlab-url <url>]] [--conformance]
 minds verify <session> --sig <file> [--signers <file>] [--identity <id>]
 minds verify --evidence <seal-id>
 ```
@@ -508,6 +508,52 @@ minds verify b3a1f0e --commit HEAD~2 --all
 minds verify --signers ~/trusted/allowed_signers --require-assurance A2
 minds verify --witness-home "$MINDS_WITNESS_HOME" --limits
 ```
+
+#### Conformance
+
+With a spec, `verify` adds a `Conformance` block after the session blocks: per rule
+*expected → observed → PASS / DRIFT / UNKNOWN*. The first row is the spec itself.
+
+An envelope counts for a commit only if it is **fresh**: its `at` lies in the
+commit's history, every descendant of `at` there (the commit included) carries exactly
+the signed state (the spec and every pinned schema), and side branches forked before
+`at` carry that state or one that existed before `at`. This depends on the history
+only, not on the store (which the agent can also write, rewind or empty) — any change
+after a signature, even a reverted one, needs a new signature:
+
+- the spec in the commit has a fresh envelope: PASS;
+- otherwise DRIFT — a spec changed, removed or broken without a signature, a return
+  to an older signed spec (through any number of commits, a removal or a merge), a
+  changed schema, a rewound `refs/minds/specs/*`, or a spec signed outside this
+  history (after a squash or rebase). To return to an older spec, or after a squash,
+  sign again; two differently signed branches that are merged need a signature on
+  the result. The rules then come from the newest valid envelope in the history (by
+  generation), never from the commit's spec; without one, no rule is evaluated;
+- signatures cannot be checked (no signer file, no root-owned `ssh-keygen`, a
+  process error) or the history cannot be walked (budget, **shallow clone** — use the
+  full history, e.g. `fetch-depth: 0`): UNKNOWN; the commit's rules are shown, marked
+  "(unverified spec)".
+
+Without a spec in the commit and without a valid envelope in its history, there is
+no report.
+
+The commit is read only through hash-verified, bounded object reads (no `git`
+process): entries, path and tree bytes, commit size, parents per commit, file bytes
+and schema steps are capped, tree entry names follow `git fsck`, and a symlink or
+submodule under a rule's glob is UNKNOWN — a limit or an unreadable object is
+UNKNOWN, never PASS. A `graph` rule judges the evaluated commit only (its diff
+against the first parent): CI must check every commit of a change, not only its
+head. A branch based before a newer signature is checked against the spec of its
+own history. Graph facts are at the level of the sessions: at A1 the agent can write
+sessions itself; intents count with a valid `minds-intent` signature from the same
+signers (`--signers`).
+
+Conformance is a derivation: it never changes the verdict or the exit code.
+`--conformance` (for CI) fails with exit 2 on any DRIFT or UNKNOWN, or when there
+is no spec; like every gate it never masks 1/3/4. The commit is `--commit`,
+otherwise the revision checked. `minds inspect` shows the same rows in the Verify
+tab and a pill per commit in the Overview (computed while idle, for the selected
+commit and HEAD).
 
 ### minds sign
 
@@ -633,6 +679,54 @@ snapshot (not shown when the anchor is not proven); `list` lists
 all anchors. The default "last bound" lives in `<git-dir>/minds/intent/last-bound`
 — a convenience the agent can write, which is why `sign` shows the anchor before
 the touch. `minds verify` checks the signature (see `Intent` above).
+
+### minds spec
+
+```
+minds spec sign [--key <path>] [--signers <file>]
+minds spec show [<rev>] [--signers <file>]
+```
+
+The spec (`.minds/spec.json`, `minds-spec-v1`) is the target state a commit is
+checked against — written and signed by a human, never by the agent. Rules:
+
+| Kind | Checks | Example |
+|---|---|---|
+| `no-dependency` | no crate depends on a forbidden one, also transitively through workspace crates and through renames (`package = …`, `[workspace.dependencies]`); `[dependencies]`, `[build-dependencies]`, `target` forms, not `[dev-dependencies]` | `{"id":"core-is-leaf","kind":"no-dependency","crate":"minds-core","on":["minds-cli"]}` |
+| `no-import` | no file under `paths` names a forbidden Rust path: `use` trees across lines and nested groups, a leading `::`, renamed crates; `#[path]`, `include!` and a glob import of a prefix are UNKNOWN | `{"id":"capture","kind":"no-import","paths":"crates/minds-capture/src/**","import":"minds_reader"}` |
+| `json-schema` | every file under `files` matches the JSON Schema **in the version that was signed** (a Draft 2020-12 subset; any other keyword is UNKNOWN) | `{"id":"policy","kind":"json-schema","schema":"schemas/replay.json","files":".minds/replay.json"}` |
+| `graph` | every commit changing `paths` (default: every commit) carries a minds session (`"expect":"session"`), or binds each of its sessions to an intent with a valid `minds-intent` signature (`"expect":"intent"`; a commit without sessions passes — combine with `session`) | `{"id":"agents","kind":"graph","expect":"intent","paths":"crates/**"}` |
+
+The document is read tolerantly and identified by its canonical form (RFC 8785):
+reformatting keeps the id, any change to a rule does not. A rule of an unknown
+kind is kept and evaluates to UNKNOWN.
+
+`sign` signs an envelope (`minds-spec-signed-v1`) of the spec in `HEAD` (not the
+working tree), the hash of every schema it names (in `HEAD`) and `at` — the `HEAD`
+commit — under the ssh-sig namespace `minds-spec`, after printing every rule and pin
+on stderr. A FIDO key (`sk-…`) asks for a touch. On Unix only an `ssh-keygen` whose
+file and every directory above it are owned by root and writable by no one else is
+used (from `PATH` outside the checkout, else `/usr/bin`) — one in `~/.local/bin`,
+`~/.cargo/bin` or a user-owned Homebrew prefix could have been planted. Where no
+such `ssh-keygen` exists (e.g. only in a group-writable `/nix/store`), signing is
+refused and verification is UNKNOWN. The key's
+`.pub` file is required: before storing, the signature must come from that key and
+cover exactly the envelope under `minds-spec` (`ssh-keygen -Y check-novalidate`).
+The policy (`.minds/redact.json`) is read from `HEAD` and never weaker than the
+default; a spec it would change is refused. Envelopes are stored under
+`refs/minds/specs/<id>` (`envelopes/<hash>/spec`, one file per signature): envelopes
+and signatures are added, never replaced (at most 64 envelopes per spec, 32
+signatures each — beyond, a changed spec starts anew). Envelopes are never dropped;
+of the existing signatures only those from keys on a `minds-spec` line of
+`--signers` (default `~/.ssh/allowed_signers`) are kept — without such a line
+nothing is dropped. `put` only builds on a ref history that is itself a spec
+history. `minds sync` pushes it; fetch it with
+`git fetch origin '+refs/minds/*:refs/minds/*'`. `show` prints the id, rules and
+whether a stored signature is valid.
+
+`minds verify` accepts a signature only from a principal whose every
+`allowed_signers` line is restricted to `namespaces="minds-spec"` — a developer
+key in an ssh-agent that the agent can also use does not approve one.
 
 ### minds fsck
 

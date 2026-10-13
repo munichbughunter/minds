@@ -115,6 +115,18 @@ impl Source for Live<'_> {
         intent_infos(self.ctx, &self.intents, named)
             .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
+
+    fn conformance(&self, commit: CommitId) -> Option<minds_reader::conformance::Report> {
+        // Dieselben Signer wie der Verify-Tab (`~/.ssh/allowed_signers`) —
+        // die Pille sagt nie mehr als `verify`. Je Aufruf frisch gelesen: Ein
+        // widerrufener Schlüssel gilt ab der nächsten Pille nicht mehr.
+        let trust = crate::verify_cmd::witness_trust::WitnessTrust::for_specs(
+            self.ctx.store.as_ref(),
+            None,
+            crate::verify_cmd::conformance::spec_program(&self.ctx.root),
+        );
+        crate::verify_cmd::conformance::report(self.ctx, &trust, commit, None)
+    }
 }
 
 /// So viele Anker liest der Intent-Tab höchstens — der Store gehört
@@ -423,7 +435,8 @@ fn verify_commit(
             std::env::var("PATH")
                 .ok()
                 .and_then(|path| crate::replay_cmd::find_ssh_keygen(&path, &ctx.root)),
-        );
+        )
+        .with_spec_program(crate::verify_cmd::conformance::spec_program(&ctx.root));
     let hex = commit.to_string();
     let mut sessions = Vec::new();
     // Je Session: ohne Seal (wie `verify`: keine Evidence-Kette, kein Scope).
@@ -543,12 +556,16 @@ fn verify_commit(
             Some(minds_reader::sanitize(&err.to_string())),
         ),
     };
+    // Die Conformance mit derselben Prüfung der Signer — eine Anzeige neben
+    // dem Urteil (`verdict_of` ruft `verify` ohne `--conformance`).
+    let conformance = crate::verify_cmd::conformance::report(ctx, &trust, commit, None);
     Ok(CommitVerify {
         verdict: verdict_of(commit, exe),
         sessions,
         out_of_scope,
         out_of_scope_paths,
         scope_note,
+        conformance,
     })
 }
 

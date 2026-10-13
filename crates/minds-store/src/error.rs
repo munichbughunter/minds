@@ -286,6 +286,46 @@ pub enum StoreError {
         reason: &'static str,
     },
 
+    /// Unter einer Soll-Id liegt ein Text, der nicht auf sie hasht — das
+    /// Soll wurde nachträglich verändert.
+    #[error("spec at {requested} hashes to {actual} — it has been altered")]
+    SpecMismatch {
+        /// Die angefragte Id.
+        requested: ContentHash,
+        /// Die Id des abgelegten Texts.
+        actual: ContentHash,
+    },
+
+    /// Das Soll hasht korrekt, ist aber nicht lesbar.
+    #[error("spec at {id} is not readable: {reason}")]
+    MalformedSpec {
+        /// Die Id.
+        id: ContentHash,
+        /// Eine feste Kategorie — nie Bytes aus dem Ref.
+        reason: &'static str,
+    },
+
+    /// Das Soll trägt schon die Höchstzahl an Umschlägen oder ein Umschlag
+    /// die an Signaturen — ein geändertes Soll (neue Id) beginnt neu.
+    #[error(
+        "spec {id} already carries {envelopes} envelopes or a full envelope ({signatures} signatures) — change the spec to start a new one"
+    )]
+    SpecFull {
+        /// Die Soll-Id.
+        id: ContentHash,
+        /// Höchstzahl der Umschläge.
+        envelopes: usize,
+        /// Höchstzahl der Signaturen je Umschlag.
+        signatures: usize,
+    },
+
+    /// Eine Signatur hat nicht die Form einer armierten `ssh-sig`-Signatur.
+    #[error("spec signature for {id} is not an armored ssh signature")]
+    SpecSignatureMalformed {
+        /// Die Soll-Id.
+        id: ContentHash,
+    },
+
     /// Das Backend konnte nicht lesen oder schreiben.
     ///
     /// Die Fassade: Was darunter liegt (gix, Dateisystem, Rechte), erreicht den

@@ -50,7 +50,7 @@ use crate::oid::{BlobId, CommitId, TreeId};
 use crate::repo::Repo;
 
 /// Größter Commit oder Baum, den [`Repo::read_blob_bounded`] nachprüft.
-const MAX_VERIFIED_OBJECT: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_VERIFIED_OBJECT: u64 = 16 * 1024 * 1024;
 
 impl Repo {
     /// Der Baum, auf den `reference` zeigt — `None`, wenn es den Ref nicht gibt.
@@ -138,44 +138,8 @@ impl Repo {
         validate_path(path)?;
         let repo = self.gix();
         let hash_kind = repo.object_hash();
-        // Jedes Objekt erst am Header begrenzen, dann lesen — auch Commit und
-        // Bäume: Ein Commit mit gigabytegroßer Nachricht (als zlib-Bombe nur
-        // wenige MB) füllte sonst den Speicher des Menschen, der `init`
-        // ausführt.
-        let verified = |id: gix::ObjectId, kind: gix::objs::Kind, limit: u64| -> Result<Vec<u8>> {
-            let size = repo
-                .find_header(id)
-                .map_err(|err| GitError::read_object(id, err))?
-                .size();
-            if size > limit {
-                return Err(GitError::TooLarge {
-                    id: id.to_string(),
-                    size,
-                    limit,
-                });
-            }
-            let object = repo
-                .find_object(id)
-                .map_err(|err| GitError::read_object(id, err))?
-                .detach();
-            if object.data.len() as u64 > limit {
-                return Err(GitError::read_object(id, "object grew beyond the limit"));
-            }
-            if object.kind != kind {
-                return Err(GitError::read_object(
-                    id,
-                    format!("expected a {kind}, found a {}", object.kind),
-                ));
-            }
-            let actual = gix::objs::compute_hash(hash_kind, kind, &object.data)
-                .map_err(|err| GitError::read_object(id, err))?;
-            if actual != id {
-                return Err(GitError::read_object(
-                    id,
-                    "object content does not match its id",
-                ));
-            }
-            Ok(object.data)
+        let verified = |id: gix::ObjectId, kind: gix::objs::Kind, limit: u64| {
+            self.verified_object(id, kind, limit)
         };
         let commit_data = verified(
             commit.to_gix(),
@@ -190,22 +154,8 @@ impl Repo {
             let tree_data = verified(tree, gix::objs::Kind::Tree, MAX_VERIFIED_OBJECT)?;
             let parsed = gix::objs::TreeRef::from_bytes(&tree_data, hash_kind)
                 .map_err(|err| GitError::read_object(tree, err))?;
-            // Wie `git fsck`: streng sortiert nach Gits Regel (Verzeichnisse
-            // mit nachgestelltem `/`), ohne Duplikate. Sonst fänden git und
-            // gix in demselben Baum verschiedene Einträge — der Mensch sähe
-            // mit `git` einen anderen als den festgehaltenen.
-            let sort_key = |entry: &gix::objs::tree::EntryRef<'_>| {
-                let mut key = entry.filename.to_vec();
-                if entry.mode.is_tree() {
-                    key.push(b'/');
-                }
-                key
-            };
-            if parsed
-                .entries
-                .windows(2)
-                .any(|pair| sort_key(&pair[0]) >= sort_key(&pair[1]))
-            {
+            // Sortierung wie `git fsck` (siehe `strictly_sorted`).
+            if !strictly_sorted(&parsed) {
                 return Err(GitError::read_object(
                     tree,
                     "tree is not sorted or has duplicate entries",
@@ -233,6 +183,166 @@ impl Repo {
             return Ok(Some((id.to_string(), data)));
         }
         Ok(None)
+    }
+
+    /// Ein Objekt, erst am Header begrenzt, dann gelesen und neu gehasht —
+    /// es muss seine Id tragen und die erwartete Art haben.
+    ///
+    /// Jedes Objekt erst am Header begrenzen, dann lesen — auch Commit und
+    /// Bäume: Ein Commit mit gigabytegroßer Nachricht (als zlib-Bombe nur
+    /// wenige MB) füllte sonst den Speicher des Menschen, der `init`
+    /// ausführt.
+    pub(crate) fn verified_object(
+        &self,
+        id: gix::ObjectId,
+        kind: gix::objs::Kind,
+        limit: u64,
+    ) -> Result<Vec<u8>> {
+        let repo = self.gix();
+        let hash_kind = repo.object_hash();
+        let size = repo
+            .find_header(id)
+            .map_err(|err| GitError::read_object(id, err))?
+            .size();
+        if size > limit {
+            return Err(GitError::TooLarge {
+                id: id.to_string(),
+                size,
+                limit,
+            });
+        }
+        let object = repo
+            .find_object(id)
+            .map_err(|err| GitError::read_object(id, err))?
+            .detach();
+        if object.data.len() as u64 > limit {
+            return Err(GitError::read_object(id, "object grew beyond the limit"));
+        }
+        if object.kind != kind {
+            return Err(GitError::read_object(
+                id,
+                format!("expected a {kind}, found a {}", object.kind),
+            ));
+        }
+        let actual = gix::objs::compute_hash(hash_kind, kind, &object.data)
+            .map_err(|err| GitError::read_object(id, err))?;
+        if actual != id {
+            return Err(GitError::read_object(
+                id,
+                "object content does not match its id",
+            ));
+        }
+        Ok(object.data)
+    }
+
+    /// Alle Blob-Pfade eines Commits samt Blob-Id — wie [`Repo::list_blobs`],
+    /// aber jeder Commit und jeder Baum am Header begrenzt, neu gehasht und
+    /// auf Gits Sortierung geprüft (wie [`Repo::read_blob_bounded`]). Für
+    /// Aussagen über den Inhalt eines Commits, dessen Objektdatenbank dem
+    /// beobachteten Agenten gehören kann: Eine ungeprüfte Liste ließe ihn
+    /// Dateien verstecken.
+    ///
+    /// Höchstens `max_entries` Blobs und `max_tree_bytes` gelesene
+    /// Baum-Bytes; darüber [`GitError::TooLarge`]. Symlinks und Submodule
+    /// werden übergangen. Sortiert nach Pfad.
+    pub fn list_blobs_verified(
+        &self,
+        commit: CommitId,
+        max_entries: usize,
+        max_tree_bytes: u64,
+    ) -> Result<VerifiedListing> {
+        let hash_kind = self.gix().object_hash();
+        let commit_data = self.verified_object(
+            commit.to_gix(),
+            gix::objs::Kind::Commit,
+            MAX_VERIFIED_OBJECT,
+        )?;
+        let root = gix::objs::CommitRef::from_bytes(&commit_data, hash_kind)
+            .map_err(|err| GitError::read_object(commit, err))?
+            .tree();
+        let too_large = |size: u64, limit: u64| GitError::TooLarge {
+            id: commit.to_string(),
+            size,
+            limit,
+        };
+        // Gelesene Baum-Bytes und gebaute Pfad-Bytes je gegen
+        // `max_tree_bytes`: Ein tiefer Baum mit langen Namen bleibt in den
+        // Objekten klein, seine Pfade nicht.
+        let mut spent: u64 = 0;
+        let mut path_bytes: u64 = 0;
+        let mut entries: usize = 0;
+        let mut listing = VerifiedListing::default();
+        let mut pending = vec![(String::new(), root)];
+        while let Some((prefix, tree)) = pending.pop() {
+            let left = max_tree_bytes.saturating_sub(spent);
+            let data = self
+                .verified_object(tree, gix::objs::Kind::Tree, left.min(MAX_VERIFIED_OBJECT))
+                .map_err(|err| match err {
+                    GitError::TooLarge { .. } => too_large(spent, max_tree_bytes),
+                    other => other,
+                })?;
+            spent = spent.saturating_add(data.len() as u64);
+            let parsed = gix::objs::TreeRef::from_bytes(&data, hash_kind)
+                .map_err(|err| GitError::read_object(tree, err))?;
+            if !strictly_sorted(&parsed) {
+                return Err(GitError::read_object(
+                    tree,
+                    "tree is not sorted or has duplicate entries",
+                ));
+            }
+            for entry in &parsed.entries {
+                // Wie `git fsck`: kein leerer Name, kein `.`/`..`/`.git`,
+                // kein `/` oder NUL — sonst entstünden doppelte oder
+                // fremde Pfade.
+                let Ok(name) = std::str::from_utf8(entry.filename) else {
+                    return Err(GitError::read_object(tree, "a path is not UTF-8"));
+                };
+                if name.is_empty()
+                    || matches!(name, "." | "..")
+                    || name.eq_ignore_ascii_case(".git")
+                    || name.contains(['/', '\0'])
+                {
+                    return Err(GitError::read_object(
+                        tree,
+                        "a tree entry has an invalid name",
+                    ));
+                }
+                entries += 1;
+                if entries > max_entries {
+                    return Err(too_large(entries as u64, max_entries as u64));
+                }
+                let length = prefix.len() + 1 + name.len();
+                path_bytes = path_bytes.saturating_add(length as u64);
+                if length > MAX_LISTED_PATH || path_bytes > max_tree_bytes {
+                    return Err(too_large(path_bytes, max_tree_bytes));
+                }
+                let path = if prefix.is_empty() {
+                    name.to_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                if entry.mode.is_tree() {
+                    pending.push((path, entry.oid.to_owned()));
+                } else if entry.mode.is_blob() {
+                    listing
+                        .blobs
+                        .push((path, BlobId::from_gix(entry.oid.to_owned())));
+                } else {
+                    // Symlink oder Gitlink: Inhalt, den die Liste nicht
+                    // zeigt — der Aufrufer entscheidet, ob er zählt.
+                    listing.links.push(path);
+                }
+            }
+        }
+        listing.blobs.sort_by(|a, b| a.0.cmp(&b.0));
+        listing.links.sort();
+        Ok(listing)
+    }
+
+    /// Ein Blob über seine Id, höchstens `max_bytes` groß (am Header geprüft)
+    /// und neu gehasht.
+    pub fn read_blob_verified(&self, blob: BlobId, max_bytes: u64) -> Result<Vec<u8>> {
+        self.verified_object(blob.to_gix(), gix::objs::Kind::Blob, max_bytes)
     }
 
     /// Alle Blob-Pfade in `tree`, rekursiv und sortiert.
@@ -414,6 +524,45 @@ pub(crate) fn validate_path(path: &str) -> Result<()> {
     }
 }
 
+/// Höchstlänge eines Pfads in [`Repo::list_blobs_verified`].
+pub const MAX_LISTED_PATH: usize = 4096;
+
+/// Was [`Repo::list_blobs_verified`] in einem Commit findet.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VerifiedListing {
+    /// Reguläre Dateien samt Blob-Id, nach Pfad sortiert.
+    pub blobs: Vec<(String, BlobId)>,
+    /// Symlinks und Gitlinks (Submodule) — Inhalt, den die Liste nicht
+    /// zeigt. Sortiert.
+    pub links: Vec<String>,
+}
+
+/// Wie `git fsck`: streng sortiert nach Gits Regel (Verzeichnisse mit
+/// nachgestelltem `/`), ohne Duplikate. Sonst fänden git und gix in
+/// demselben Baum verschiedene Einträge — der Mensch sähe mit `git` einen
+/// anderen als den festgehaltenen.
+pub(crate) fn strictly_sorted(tree: &gix::objs::TreeRef<'_>) -> bool {
+    let sort_key = |entry: &gix::objs::tree::EntryRef<'_>| {
+        let mut key = entry.filename.to_vec();
+        if entry.mode.is_tree() {
+            key.push(b'/');
+        }
+        key
+    };
+    let sorted = !tree
+        .entries
+        .windows(2)
+        .any(|pair| sort_key(&pair[0]) >= sort_key(&pair[1]));
+    // Auch ein Blob `a` neben einem Baum `a` (verschiedene Sortierschlüssel,
+    // derselbe Name) ist für `git fsck` ein Duplikat.
+    let mut names = std::collections::HashSet::new();
+    sorted
+        && tree
+            .entries
+            .iter()
+            .all(|entry| names.insert(entry.filename))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +618,134 @@ mod tests {
         let (_fixture, repo) = repo_with_context();
         let tree = repo.tree_at("refs/heads/main").unwrap().unwrap();
         assert_eq!(repo.read_blob(tree, "sessions/b3").unwrap(), None);
+    }
+
+    /// Die geprüfte Liste trifft die ungeprüfte, samt lesbaren Blob-Ids —
+    /// und hält ihre Deckel.
+    #[test]
+    fn list_blobs_verified_matches_and_is_bounded() {
+        let (fixture, repo) = repo_with_context();
+        let head: CommitId = fixture.hash("HEAD").parse().unwrap();
+        let listed = repo.list_blobs_verified(head, 10, 1 << 20).unwrap().blobs;
+        let paths: Vec<&str> = listed.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["index.json", "sessions/b3/aa.json", "sessions/b3/bb.json"]
+        );
+        assert_eq!(
+            repo.read_blob_verified(listed[1].1, 1024).unwrap(),
+            b"{\"session\":\"aa\"}"
+        );
+        assert!(matches!(
+            repo.read_blob_verified(listed[1].1, 4),
+            Err(GitError::TooLarge { .. })
+        ));
+        // Bäume zählen mit: 3 Dateien und 2 Verzeichnisse.
+        assert!(repo.list_blobs_verified(head, 5, 1 << 20).is_ok());
+        assert!(matches!(
+            repo.list_blobs_verified(head, 4, 1 << 20),
+            Err(GitError::TooLarge { .. })
+        ));
+        assert!(matches!(
+            repo.list_blobs_verified(head, 10, 16),
+            Err(GitError::TooLarge { .. })
+        ));
+    }
+
+    /// Ein roher Baum aus `(mode, name, oid-hex)`.
+    fn raw_tree(fixture: &TempRepo, entries: &[(&str, &[u8], &str)]) -> String {
+        let mut bytes = Vec::new();
+        for (mode, name, oid) in entries {
+            bytes.extend_from_slice(mode.as_bytes());
+            bytes.push(b' ');
+            bytes.extend_from_slice(name);
+            bytes.push(0);
+            let oid: Vec<u8> = (0..oid.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&oid[i..i + 2], 16).unwrap())
+                .collect();
+            bytes.extend_from_slice(&oid);
+        }
+        fixture.write_raw_object("tree", &bytes)
+    }
+
+    fn raw_commit(fixture: &TempRepo, tree: &str) -> CommitId {
+        let commit =
+            format!("tree {tree}\nauthor A <a@x> 1 +0000\ncommitter A <a@x> 1 +0000\n\nraw\n");
+        fixture
+            .write_raw_object("commit", commit.as_bytes())
+            .parse()
+            .unwrap()
+    }
+
+    /// Namen, die `git fsck` ablehnt, ergeben keinen Pfad — kein doppelter
+    /// oder fremder Eintrag in der Liste.
+    #[test]
+    fn list_blobs_verified_refuses_names_git_refuses() {
+        let fixture = TempRepo::init();
+        let blob = fixture.write_raw_object("blob", b"x");
+        let repo = Repo::open(fixture.path()).unwrap();
+        for name in [&b"a/b"[..], b"..", b".", b".git", b".GIT"] {
+            let tree = raw_tree(&fixture, &[("100644", name, &blob)]);
+            let commit = raw_commit(&fixture, &tree);
+            assert!(
+                repo.list_blobs_verified(commit, 10, 1 << 20).is_err(),
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    /// Symlinks und Gitlinks stehen in der Liste — nie still übergangen.
+    #[test]
+    fn list_blobs_verified_reports_links() {
+        let fixture = TempRepo::init();
+        let blob = fixture.write_raw_object("blob", b"target");
+        let commit_id = fixture.commit("leer").to_string();
+        let tree = raw_tree(
+            &fixture,
+            &[
+                ("100644", b"a.rs", &blob),
+                ("120000", b"link.rs", &blob),
+                ("160000", b"sub", &commit_id),
+            ],
+        );
+        let repo = Repo::open(fixture.path()).unwrap();
+        let listing = repo
+            .list_blobs_verified(raw_commit(&fixture, &tree), 10, 1 << 20)
+            .unwrap();
+        assert_eq!(listing.blobs.len(), 1);
+        assert_eq!(listing.links, ["link.rs", "sub"]);
+    }
+
+    /// Lange Namen über viele Ebenen: Die Pfade sind gedeckelt, nicht nur
+    /// die Baum-Bytes.
+    #[test]
+    fn list_blobs_verified_caps_path_length() {
+        let fixture = TempRepo::init();
+        let blob = fixture.write_raw_object("blob", b"x");
+        let name = vec![b'n'; 250];
+        let mut tree = raw_tree(&fixture, &[("100644", b"leaf", &blob)]);
+        for _ in 0..20 {
+            tree = raw_tree(&fixture, &[("40000", &name, &tree)]);
+        }
+        let repo = Repo::open(fixture.path()).unwrap();
+        assert!(matches!(
+            repo.list_blobs_verified(raw_commit(&fixture, &tree), 100, 1 << 20),
+            Err(GitError::TooLarge { .. })
+        ));
+    }
+
+    /// Elternteile werden geprüft gelesen.
+    #[test]
+    fn parents_and_bounded_ancestry() {
+        let fixture = TempRepo::init();
+        let c1 = fixture.commit("c1");
+        let c2 = fixture.commit("c2");
+        let c3 = fixture.commit("c3");
+        let repo = Repo::open(fixture.path()).unwrap();
+        assert_eq!(repo.parents(c3).unwrap(), vec![c2]);
+        assert_eq!(repo.first_parent(c1).unwrap(), None);
     }
 
     #[test]

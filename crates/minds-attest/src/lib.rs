@@ -28,6 +28,8 @@ pub const NS_WITNESS: &str = "minds-witness";
 pub const NS_INTENT: &str = "minds-intent";
 /// CI anchors and replay records.
 pub const NS_ANCHOR: &str = "minds-anchor";
+/// Human-signed specs (the target state for conformance).
+pub const NS_SPEC: &str = "minds-spec";
 /// Backwards-compatible name for the default namespace.
 pub const NAMESPACE: &str = NS_DEFAULT;
 
@@ -126,6 +128,19 @@ pub fn ssh_sign_ns_presence(
     namespace: &str,
 ) -> Result<String, AttestError> {
     sign_with(Path::new("ssh-keygen"), payload, key, namespace, true)
+}
+
+/// Wie [`ssh_sign_ns_presence`], mit einem **vorab aufgelösten**
+/// `ssh-keygen` (absoluter Pfad, außerhalb des Checkouts): Ein über `PATH`
+/// gefundenes Programm könnte der Agent abgelegt haben — es sähe die
+/// Berührung des Menschen und könnte einen anderen Text signieren lassen.
+pub fn ssh_sign_ns_presence_with(
+    program: &Path,
+    payload: &str,
+    key: &Path,
+    namespace: &str,
+) -> Result<String, AttestError> {
+    sign_with(program, payload, key, namespace, true)
 }
 
 fn sign_with(
@@ -441,6 +456,40 @@ fn keygen_command(program: &Path) -> Command {
     command
 }
 
+/// Ob `signature` die Bytes `payload` unter `namespace` trägt — ohne
+/// Signer-Datei (`ssh-keygen -Y check-novalidate`): Wer signiert hat,
+/// prüft der Aufrufer am Schlüssel der Signatur
+/// ([`signature_public_key`]). Für die Gegenprobe direkt nach dem Signieren.
+pub fn ssh_check_novalidate_with(
+    program: &Path,
+    payload: &str,
+    signature: &str,
+    namespace: &str,
+) -> Result<bool, AttestError> {
+    let dir = private_tempdir()?;
+    let sig = dir.path().join("attest.sig");
+    write_private(&sig, signature.as_bytes())?;
+    let mut child = keygen_command(program)
+        .args(["-Y", "check-novalidate", "-n", namespace, "-s"])
+        .arg(&sig)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("ssh-keygen: no stdin"))?;
+        if let Err(err) = stdin.write_all(payload.as_bytes()) {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(err.into());
+            }
+        }
+    }
+    Ok(child.wait()?.success())
+}
+
 /// Wie [`ssh_verify_ns`], aber mit genau dem Programm `program` — für CI,
 /// wo `ssh-keygen` aufgelöst wird, bevor etwas aus dem Checkout läuft.
 pub fn ssh_verify_ns_with(
@@ -614,7 +663,7 @@ mod tests {
             )
             .unwrap()
         );
-        for namespace in [NS_DEFAULT, NS_INTENT, NS_ANCHOR] {
+        for namespace in [NS_DEFAULT, NS_INTENT, NS_ANCHOR, NS_SPEC] {
             let signature = ssh_sign_ns(payload, &key, namespace).unwrap();
             assert!(
                 !ssh_verify_ns(

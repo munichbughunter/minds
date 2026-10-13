@@ -239,6 +239,15 @@ pub enum RedactionError {
     /// Die Felder ergeben keinen gültigen `minds-intent-v1`-Text.
     #[error("intent anchor refused: {0}")]
     IntentAnchor(#[from] minds_core::intent_anchor::IntentAnchorError),
+
+    /// Das Soll enthält etwas, das die Policy entfernt. Es wird signiert und
+    /// gesynct; ein Platzhalter darin wäre ein anderes Soll, der Klartext ein
+    /// Leck. Es gibt kein abgelegtes Soll — die Datei ist zu bereinigen.
+    #[error("spec refused: {field} contains content the redaction policy removes")]
+    SpecRedacted {
+        /// Wo im Soll.
+        field: Field,
+    },
 }
 
 /// Was die Redaction mit dem Runner-Ergebnis eines Aufrufs gemacht hat.
@@ -404,6 +413,10 @@ pub enum Field {
     IntentIssueTitle,
     /// Die Beschreibung eines Issues, vor dem Kanonisieren (EA-16).
     IntentIssueDescription,
+    /// Der i-te Schlüssel oder String-Wert des Solls.
+    SpecValue(usize),
+    /// Die ganze kanonische Form des Solls.
+    Spec,
 }
 
 impl fmt::Display for Field {
@@ -477,6 +490,8 @@ impl fmt::Display for Field {
             Field::IntentAnchor => f.write_str("intent.anchor"),
             Field::IntentIssueTitle => f.write_str("intent.issue.title"),
             Field::IntentIssueDescription => f.write_str("intent.issue.description"),
+            Field::SpecValue(i) => write!(f, "spec.value[{i}]"),
+            Field::Spec => f.write_str("spec"),
         }
     }
 }

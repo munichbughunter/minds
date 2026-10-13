@@ -71,6 +71,7 @@ mod seals_cmd;
 mod search;
 mod show;
 mod sign_cmd;
+mod spec_cmd;
 mod stack;
 mod sync;
 mod text;
@@ -252,6 +253,21 @@ Usage:
   minds intent list
         All stored intent anchors.
 
+  minds spec sign [--key <path>] [--signers <file>]
+        Signs the spec (.minds/spec.json, the target state for
+        conformance) in HEAD — with a hash of every schema it names and
+        the HEAD commit — under ssh-sig namespace minds-spec (root-owned
+        ssh-keygen only, the key's .pub required) and stores it
+        content-addressed in refs/minds/specs, keeping earlier signatures
+        from keys in --signers (default ~/.ssh/allowed_signers). Shows every rule before
+        signing; a FIDO key (sk-…) asks for a touch. Refused: a spec the
+        redaction policy would change. Rule kinds: no-dependency (crates),
+        no-import (modules), json-schema (data contracts), graph (expected
+        minds sessions and intents).
+  minds spec show [<rev>] [--signers <file>]
+        The spec in a revision (default HEAD), its id, rules and signature
+        state.
+
   minds seals [--session <id>] [--limit <n>]
         Lists Evidence-Chain seals — id, linked session (if any), event
         range, gap/signature status, timestamp. Most recent first.
@@ -262,7 +278,7 @@ Usage:
                [--commit <rev>] [--require-explained <percent>] [--all]
                [--require-in-scope] [--witness-home <dir>]
                [--require-assurance <A0|A1|A2|A3>] [--limits]
-               [--online [--gitlab-url <url>]]
+               [--online [--gitlab-url <url>]] [--conformance]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
         Multiple sessions print separate blocks; the worst verdict wins.
@@ -279,6 +295,17 @@ Usage:
         agent's own, and with --require-explained 100: the session link
         (trailer) decides whose scope applies, and only the explained gate
         shows that this session produced the commit.
+        With a spec (.minds/spec.json, minds spec sign) a Conformance
+        block follows the sessions: per rule expected → observed → PASS,
+        DRIFT or UNKNOWN. A signed spec counts only if fresh: its signing
+        commit lies in the history, and on every commit of the ancestry
+        path since (all parents) the spec and every pinned schema are
+        unchanged — a rollback, removal, merge or changed schema without a
+        new signature is DRIFT, and the rules then come from the newest
+        valid signature (--signers or ~/.ssh/allowed_signers). Needs the
+        full history (shallow: UNKNOWN). Shown without changing the exit
+        code; --conformance fails with exit 2 on any DRIFT or UNKNOWN, or
+        when there is no spec (never masks 1/3/4).
         Each block states the Assurance level (who observed, A0–A3), the
         Intent (minds intent: not bound / unsigned / signed under
         minds-intent, checked against --signers; never TAMPERED) and
@@ -527,6 +554,7 @@ const SPECS: &[Spec] = &[
         &["--allow-confidential"],
         2,
     ),
+    spec("spec", &["--key", "--signers"], &[], 2),
     spec("seals", &["--session", "--limit"], &[], 0),
     spec("replay", &["--commit"], &["--unsigned"], 0),
     spec("anchor", &[], &["--mirror"], 0),
@@ -543,7 +571,13 @@ const SPECS: &[Spec] = &[
             "--require-assurance",
             "--gitlab-url",
         ],
-        &["--all", "--limits", "--require-in-scope", "--online"],
+        &[
+            "--all",
+            "--limits",
+            "--require-in-scope",
+            "--online",
+            "--conformance",
+        ],
         1,
     ),
     spec(
@@ -976,6 +1010,8 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
 
         "intent" => intent_cmd::run(parsed),
 
+        "spec" => spec_cmd::run(parsed),
+
         "seals" => seals_cmd::run(parsed.value("--session"), parsed.value("--limit")),
 
         "replay" => replay_cmd::run(parsed.value("--commit"), parsed.has("--unsigned")),
@@ -993,6 +1029,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 require_explained: parsed.value("--require-explained"),
                 all: parsed.has("--all"),
                 require_in_scope: parsed.has("--require-in-scope"),
+                conformance: parsed.has("--conformance"),
             },
             verify_cmd::AssuranceOptions {
                 witness_home: parsed.value("--witness-home"),

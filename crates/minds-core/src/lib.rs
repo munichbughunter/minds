@@ -40,6 +40,9 @@ pub mod replay;
 /// einer bestimmten Pipeline existierte (EA-19).
 pub mod first_sight;
 
+/// Das Soll: ein vom Menschen signiertes Regelwerk für die Conformance.
+pub mod spec;
+
 mod attribution;
 pub use attribution::{Attribution, AttributionError};
 

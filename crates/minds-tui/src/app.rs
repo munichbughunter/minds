@@ -568,6 +568,25 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Rechnet die Conformance eines Commits der Übersicht, falls eine
+    /// fehlt — im Leerlauf, eine je Aufruf. `true`, wenn gerechnet wurde.
+    pub fn fill_conformance(&mut self, source: &dyn Source) -> bool {
+        if self.tab != Tab::Overview {
+            return false;
+        }
+        let Some(state) = self.overview.as_mut() else {
+            return false;
+        };
+        let Some(commit) = state.conformance_due() else {
+            return false;
+        };
+        let mark = source
+            .conformance(commit)
+            .map(|report| crate::overview::ConformanceMark::of(&report));
+        state.conformance.insert(commit, mark);
+        true
+    }
+
     /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
     /// der Quelle; `reduce` merkt sich nur den Bedarf.
     /// Nur bei sichtbarem Tab: Ein verdeckter Tab startet kein ssh-keygen.
@@ -1623,12 +1642,17 @@ impl<'a> App<'a> {
                 anchored = Instant::now();
                 continue;
             }
-            if event::poll(TICK)?
-                && let Event::Key(key) = event::read()?
-                && key.kind != event::KeyEventKind::Release
-            {
-                let action = input::map(key, self.searching);
-                self.reduce(action);
+            if event::poll(TICK)? {
+                if let Event::Key(key) = event::read()?
+                    && key.kind != event::KeyEventKind::Release
+                {
+                    let action = input::map(key, self.searching);
+                    self.reduce(action);
+                }
+            } else if self.fill_conformance(source) {
+                // Im Leerlauf, nie beim Scrollen: je Tick höchstens ein
+                // Commit, danach sofort neu zeichnen.
+                continue;
             }
             // `r` gehalten (Tastenwiederholung) lädt höchstens alle `REPEAT`
             // — jedes volle Laden kann Unterprozesse starten.

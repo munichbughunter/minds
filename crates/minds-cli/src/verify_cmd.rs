@@ -71,6 +71,7 @@ use crate::context::Context;
 mod anchors;
 pub(crate) mod artifact;
 pub(crate) mod assurance;
+pub(crate) mod conformance;
 pub(crate) mod scope;
 pub(crate) mod witness_trust;
 
@@ -136,6 +137,9 @@ pub struct ArtifactOptions<'a> {
     pub all: bool,
     /// `--require-in-scope`: das Scope-Gate (EA-17).
     pub require_in_scope: bool,
+    /// `--conformance`: DRIFT/UNKNOWN gegen das signierte Soll ist ein
+    /// verfehltes Gate (CI). Ohne das Flag wird die Conformance nur gezeigt.
+    pub conformance: bool,
 }
 
 impl ArtifactOptions<'_> {
@@ -144,6 +148,7 @@ impl ArtifactOptions<'_> {
             || self.require_explained.is_some()
             || self.all
             || self.require_in_scope
+            || self.conformance
     }
 }
 
@@ -217,7 +222,7 @@ pub fn run(
     // CI-Gate, das still wegfällt, wäre schlimmer als ein lauter Abbruch.
     if (options.any() || assurance_options.any()) && (evidence.is_some() || sig.is_some()) {
         eprintln!(
-            "minds verify: --commit, --require-explained, --require-in-scope, --all, --witness-home, --require-assurance, --limits, --online and --gitlab-url apply only to the evidence verdict (not with --evidence/--sig)"
+            "minds verify: --commit, --require-explained, --require-in-scope, --conformance, --all, --witness-home, --require-assurance, --limits, --online and --gitlab-url apply only to the evidence verdict (not with --evidence/--sig)"
         );
         return ExitCode::from(4);
     }
@@ -329,6 +334,12 @@ fn verify_target(
             }
         };
     let ids: Vec<SessionId> = links.iter().map(|(id, _)| *id).collect();
+    // Die Conformance gilt dem Commit: `--commit`, sonst der Commit der
+    // Revision; bei einer Session-Id als Ziel gibt es keinen.
+    let conformance_commit = match options.commit {
+        Some(rev) => ctx.resolve_rev(rev),
+        None => revision,
+    };
     if ids.is_empty() {
         // Ohne Session bleibt der Ledger-Befund trotzdem einer: Das
         // Repository hat bezeugte Seals verloren.
@@ -349,16 +360,35 @@ fn verify_target(
         if options.require_in_scope {
             println!("Gate           scope not assessed (no linked session) — required in scope");
         }
+        // Die Conformance braucht keine Session — ein Commit ohne Agent kann
+        // das Soll genauso verletzen.
+        let trust = witness_trust::WitnessTrust::for_specs(
+            ctx.store.as_ref(),
+            signers,
+            conformance::spec_program(&ctx.root),
+        );
+        let report = conformance_commit
+            .and_then(|commit| conformance::report(&ctx, &trust, commit, signers));
+        if let Some(report) = &report {
+            conformance::print(report);
+        }
+        if options.conformance
+            && let Some(line) = conformance::gate_failure(report.as_ref(), conformance_commit)
+        {
+            println!("{line}");
+        }
         return Verdict::Unverifiable.exit();
     }
     let run = RunOptions {
         signers,
         identity,
-        trust: witness_trust::WitnessTrust::new(ctx.store.as_ref(), signers).with_anchor_program(
-            std::env::var("PATH")
-                .ok()
-                .and_then(|path| crate::replay_cmd::find_ssh_keygen(&path, &ctx.root)),
-        ),
+        trust: witness_trust::WitnessTrust::new(ctx.store.as_ref(), signers)
+            .with_anchor_program(
+                std::env::var("PATH")
+                    .ok()
+                    .and_then(|path| crate::replay_cmd::find_ssh_keygen(&path, &ctx.root)),
+            )
+            .with_spec_program(conformance::spec_program(&ctx.root)),
         ledger,
         limits: assurance_options.limits,
         all: options.all,
@@ -422,6 +452,14 @@ fn verify_target(
             }
         }
     }
+    // Nach allen Blöcken: Die Conformance urteilt über den Commit, nicht
+    // über eine Session — und ändert den Exit-Code nur mit `--conformance`.
+    let report = conformance_commit
+        .and_then(|commit| conformance::report(&ctx, &run.trust, commit, signers));
+    if let Some(report) = &report {
+        println!();
+        conformance::print(report);
+    }
     // Das Assurance-Gate urteilt über die schwächste Session des Laufs.
     let assurance_failed = required_assurance.is_some_and(|required| {
         assurance::gate_failure(&levels, required)
@@ -452,9 +490,15 @@ fn verify_target(
         && scope::gate_failure(&scopes, &artifact)
             .map(|line| println!("{line}"))
             .is_some();
+    let conformance_failed = options.conformance
+        && conformance::gate_failure(report.as_ref(), conformance_commit)
+            .map(|line| println!("{line}"))
+            .is_some();
     if failed {
         ExitCode::from(4)
-    } else if (gate_failed || assurance_failed || scope_failed) && worst == Verdict::Verified {
+    } else if (gate_failed || assurance_failed || scope_failed || conformance_failed)
+        && worst == Verdict::Verified
+    {
         // Ein verfehltes Gate ist Exit 2 — es maskiert nie 1/3/4 (W6).
         Verdict::Incomplete.exit()
     } else {

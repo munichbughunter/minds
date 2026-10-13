@@ -17,7 +17,7 @@ use minds_reader::overview::{CommitRow, RefLabel, SealMark, WipSession, WipState
 use crate::overview::MAX_SESSION_LINES;
 
 use crate::app::App;
-use crate::overview::{OverviewFocus, Selected, initials};
+use crate::overview::{ConformanceMark, OverviewFocus, Selected, initials};
 use crate::theme;
 
 /// Die Farben der Lanes, reihum.
@@ -71,7 +71,12 @@ const BRANCH_REF: Color = Color::Indexed(24);
 const TAG_REF: Color = Color::Indexed(94);
 
 /// Die Pillen eines Commits: Refs, dann was Minds weiß.
-fn pills(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
+fn pills(
+    spans: &mut Vec<Span<'static>>,
+    row: &CommitRow,
+    conformance: Option<ConformanceMark>,
+    nerd: bool,
+) {
     // Refs tragen immer ein Präfix (Icon oder `@`/`#`), nie eine
     // Belegfarbe — sonst könnte ein Branch-Name einen Status vortäuschen.
     let (branch, tag) = if nerd {
@@ -96,6 +101,12 @@ fn pills(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
             spans.push(Span::styled(format!(" {text} "), body));
         }
         spans.push(Span::raw(" "));
+    }
+    // Die Conformance gilt jedem Commit, auch einem ohne Session — eine
+    // Pille, sobald sie gerechnet ist (gewählter Commit, HEAD). Farbe nie
+    // allein: Glyph und Wort tragen das Ergebnis.
+    if let Some(mark) = conformance {
+        pill(spans, conformance_pill(mark), conformance_color(mark), nerd);
     }
     // Was Minds weiß — nur an Commits, die Minds kennt (Session, Change-Id
     // oder ein Review), sonst bliebe jeder fremde Commit „open".
@@ -130,6 +141,25 @@ fn pills(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
             theme::AGENT,
             nerd,
         );
+    }
+}
+
+/// Der Text der Conformance-Pille.
+pub(crate) fn conformance_pill(mark: ConformanceMark) -> String {
+    use minds_reader::conformance::Outcome;
+    match mark.outcome {
+        Outcome::Pass => "✓ conform".to_owned(),
+        Outcome::Drift => format!("✗ drift {}", mark.drift),
+        Outcome::Unknown => format!("? conform unknown {}", mark.unknown),
+    }
+}
+
+fn conformance_color(mark: ConformanceMark) -> Color {
+    use minds_reader::conformance::Outcome;
+    match mark.outcome {
+        Outcome::Pass => theme::OK,
+        Outcome::Drift => theme::DELETE,
+        Outcome::Unknown => Color::Gray,
     }
 }
 
@@ -224,7 +254,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     Some(agent) => badge(&mut spans, agent, true, nerd),
                     None => badge(&mut spans, &row.author, false, nerd),
                 }
-                pills(&mut spans, row, nerd);
+                let mark = state.conformance.get(&row.id).copied().flatten();
+                pills(&mut spans, row, mark, nerd);
                 spans.push(Span::raw(row.subject.clone()));
                 if let Some(request) = &row.request {
                     spans.push(Span::styled(format!("  • {request}"), theme::dim()));

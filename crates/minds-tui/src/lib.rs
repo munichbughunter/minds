@@ -149,6 +149,16 @@ pub trait Source {
     fn intents(&self, _named: &[minds_core::ContentHash]) -> Result<IntentList, String> {
         Err("not available".into())
     }
+
+    /// Die Conformance von `commit` gegen das signierte Soll, wie
+    /// `minds verify` sie rechnet (Signaturen gegen die vertrauenswürdigen
+    /// Signer). `None`: kein Soll — oder nicht bestimmbar.
+    fn conformance(
+        &self,
+        _commit: minds_git::CommitId,
+    ) -> Option<minds_reader::conformance::Report> {
+        None
+    }
 }
 
 /// Die Anker eines Durchgangs.
@@ -247,6 +257,9 @@ pub struct CommitVerify {
     pub out_of_scope_paths: Vec<String>,
     /// Warum kein Bereich geprüft wurde (kein Intent gebunden, …).
     pub scope_note: Option<String>,
+    /// Die Conformance gegen das signierte Soll — `None` ohne Soll. Eine
+    /// Anzeige neben dem Urteil, nie ein Teil davon (wie in `verify`).
+    pub conformance: Option<minds_reader::conformance::Report>,
 }
 
 /// Startet die Oberfläche — oder, wenn stdout kein Terminal ist, schreibt die

@@ -2,9 +2,12 @@
 //! Sessions — und oben die Sessions, die noch an keinem Commit hängen. Von
 //! einem Commit aus geht es in die Sessions, die ihn tragen.
 
+use std::collections::HashMap;
+
 use minds_core::SessionId;
 use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
+use minds_reader::conformance::Outcome;
 use minds_reader::overview::{CommitRow, Overview, WipSession};
 
 /// So viele Sessions eines Commits listet das Detail höchstens — weiter
@@ -29,6 +32,30 @@ pub enum Selected<'a> {
     Commit(&'a CommitRow),
 }
 
+/// Die Conformance eines Commits als Pille: das schlechteste Ergebnis und
+/// wie viele Regeln abweichen bzw. offen sind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformanceMark {
+    /// DRIFT vor UNKNOWN vor PASS.
+    pub outcome: Outcome,
+    /// Regeln mit DRIFT.
+    pub drift: usize,
+    /// Regeln mit UNKNOWN.
+    pub unknown: usize,
+}
+
+impl ConformanceMark {
+    /// Aus einem Bericht.
+    pub fn of(report: &minds_reader::conformance::Report) -> Self {
+        let (_, drift, unknown) = report.counts();
+        Self {
+            outcome: report.outcome(),
+            drift,
+            unknown,
+        }
+    }
+}
+
 /// Der Zustand des Tabs.
 #[derive(Debug, Clone)]
 pub struct OverviewState {
@@ -42,6 +69,10 @@ pub struct OverviewState {
     pub session: usize,
     /// Neu geladen, während der Tab verdeckt war — beim Zeigen neu lesen.
     pub stale: bool,
+    /// Die schon gerechnete Conformance je Commit (`None`: kein Soll).
+    /// Gerechnet wird im Leerlauf, für den gewählten Commit und HEAD; ein
+    /// Neuladen beginnt leer (eine neue Signatur kann alles ändern).
+    pub conformance: HashMap<CommitId, Option<ConformanceMark>>,
 }
 
 impl OverviewState {
@@ -55,7 +86,35 @@ impl OverviewState {
             focus: OverviewFocus::Graph,
             session: 0,
             stale: false,
+            conformance: HashMap::new(),
         }
+    }
+
+    /// Der nächste Commit, dessen Conformance noch fehlt: der gewählte,
+    /// dann HEAD.
+    pub fn conformance_due(&self) -> Option<CommitId> {
+        let overview = self.data.as_ref().ok()?;
+        let selected = match self.selected() {
+            Some(Selected::Commit(row)) => Some(row.id),
+            _ => None,
+        };
+        let head = overview
+            .rows
+            .iter()
+            .find(|row| {
+                row.refs.iter().any(|label| {
+                    matches!(
+                        label,
+                        minds_reader::overview::RefLabel::Head(_)
+                            | minds_reader::overview::RefLabel::Detached
+                    )
+                })
+            })
+            .map(|row| row.id);
+        [selected, head]
+            .into_iter()
+            .flatten()
+            .find(|commit| !self.conformance.contains_key(commit))
     }
 
     /// Neu gelesen — dieselbe Zeile (Commit oder Session), wenn es sie noch

@@ -211,6 +211,30 @@ const INTENT_SIG_FILE: &str = "anchor.sig";
 const INTENT_ANCHOR_MAX: u64 = minds_core::intent_anchor::MAX_ANCHOR as u64;
 const INTENT_SNAPSHOT_MAX: u64 = minds_core::intent_anchor::MAX_SNAPSHOT as u64;
 
+/// Namensraum der Solls: ein Commit je Soll, adressiert über die volle Id.
+/// Gesynct wie alles unter `refs/minds/`.
+const SPEC_REF_PREFIX: &str = "refs/minds/specs/";
+
+/// Die kanonische Form (`minds-spec-v1`) im Baum eines Soll-Refs.
+const SPEC_FILE: &str = "spec";
+
+/// Die Umschläge eines Solls: `envelopes/<name>/spec` und je Signatur
+/// `envelopes/<name>/sigs/<name>` — nie im Soll selbst.
+const SPEC_ENVELOPES_DIR: &str = "envelopes";
+
+/// Höchstzahl der Umschläge je Soll.
+const SPEC_MAX_ENVELOPES: usize = 64;
+
+/// Höchstzahl der Signaturen je Umschlag.
+const SPEC_MAX_SIGS: usize = 32;
+
+/// Höchstzahl der Einträge eines Soll-Baums (Verzeichnisse mitgezählt).
+const SPEC_MAX_ENTRIES: usize = 1 + SPEC_MAX_ENVELOPES * (3 + SPEC_MAX_SIGS);
+
+/// So viele Commits darf die Historie eines Soll-Refs haben, auf die
+/// `put_spec` aufbaut — jede wird geprüft.
+const SPEC_MAX_CHAIN: usize = 1024;
+
 /// Namensraum der Replay-Records (EA-18b): ein elternloser Commit je
 /// Record, adressiert über die volle Id. Unter `anchors/`, neben den
 /// künftigen Gegenzeichnungen (EA-19) — beides schreibt CI, nie der Agent.
@@ -938,6 +962,109 @@ fn observations_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
 }
 
 impl GitStore {
+    /// Umschläge und Signaturen aus genau `commit`, alles geprüft gelesen.
+    /// `None`, wenn dort kein Umschlag liegt. Ein Baum mit anderen Einträgen
+    /// als `envelopes/<hex>/spec` und `envelopes/<hex>/sigs/<hex>` ist kein
+    /// Soll-Ref ([`StoreError::MalformedSpec`]); was unter `sigs/` keine
+    /// armierte Signatur ist, wird übergangen.
+    fn spec_at(
+        &self,
+        id: &minds_core::ContentHash,
+        commit: minds_git::CommitId,
+    ) -> Result<Option<crate::StoredSpec>> {
+        let malformed = |reason: &'static str| StoreError::MalformedSpec {
+            id: id.clone(),
+            reason,
+        };
+        let listing = self
+            .repo
+            .list_blobs_verified(commit, SPEC_MAX_ENTRIES, 1024 * 1024)
+            .map_err(|_| malformed("the spec ref tree is unreadable or too large"))?;
+        if !listing.links.is_empty() {
+            return Err(malformed("the spec ref tree carries links"));
+        }
+        let hex =
+            |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let mut texts: std::collections::BTreeMap<String, minds_git::BlobId> = Default::default();
+        let mut sigs: std::collections::BTreeMap<String, Vec<minds_git::BlobId>> =
+            Default::default();
+        for (path, blob) in &listing.blobs {
+            let parts: Vec<&str> = path.split('/').collect();
+            match parts.as_slice() {
+                [SPEC_ENVELOPES_DIR, name, SPEC_FILE] if hex(name) => {
+                    texts.insert((*name).to_owned(), *blob);
+                }
+                [SPEC_ENVELOPES_DIR, name, "sigs", sig] if hex(name) && hex(sig) => {
+                    sigs.entry((*name).to_owned()).or_default().push(*blob);
+                }
+                _ => return Err(malformed("the spec ref tree carries foreign entries")),
+            }
+        }
+        if texts.is_empty() {
+            return Ok(None);
+        }
+        if sigs.keys().any(|name| !texts.contains_key(name)) {
+            return Err(malformed(
+                "the spec ref tree carries signatures without an envelope",
+            ));
+        }
+        let max = minds_core::intent_anchor::MAX_SIGNATURE as u64;
+        let mut envelopes = Vec::new();
+        for (name, blob) in texts {
+            let bytes = self
+                .repo
+                .read_blob_verified(blob, 2 * minds_core::spec::MAX_SPEC as u64)
+                .map_err(StoreError::backend)?;
+            let text = String::from_utf8(bytes).map_err(|_| malformed("spec is not UTF-8"))?;
+            let signed = minds_core::spec::SignedSpec::parse(&text)
+                .map_err(|_| malformed("spec is not a canonical minds-spec-signed-v1 envelope"))?;
+            if signed.id() != id {
+                return Err(StoreError::SpecMismatch {
+                    requested: id.clone(),
+                    actual: signed.id().clone(),
+                });
+            }
+            if minds_core::spec::envelope_name(&text) != name {
+                return Err(malformed("an envelope is stored under a foreign name"));
+            }
+            let signatures = sigs
+                .remove(&name)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|blob| self.repo.read_blob_verified(blob, max).ok())
+                .filter_map(|bytes| String::from_utf8(bytes).ok())
+                .filter(|text| minds_core::intent_anchor::is_armored_signature(text))
+                .collect();
+            envelopes.push(crate::StoredEnvelope { signed, signatures });
+        }
+        Ok(Some(crate::StoredSpec { envelopes }))
+    }
+
+    /// Prüft die Historie eines Soll-Refs, bevor darauf aufgebaut wird: eine
+    /// Kette ohne Merges, höchstens [`SPEC_MAX_CHAIN`] Commits, jeder Baum
+    /// ein Soll-Baum. Was ein anderer mit Schreibrecht dort untergeschoben
+    /// hat, wird so nie vom Menschen fortgeschrieben.
+    fn spec_chain_ok(&self, id: &minds_core::ContentHash, tip: minds_git::CommitId) -> Result<()> {
+        let refused = |reason: &'static str| StoreError::MalformedSpec {
+            id: id.clone(),
+            reason,
+        };
+        let mut at = Some(tip);
+        for _ in 0..SPEC_MAX_CHAIN {
+            let Some(commit) = at else {
+                return Ok(());
+            };
+            self.spec_at(id, commit)?
+                .ok_or_else(|| refused("the spec ref history carries a commit without a spec"))?;
+            let parents = self.repo.parents(commit).map_err(StoreError::backend)?;
+            if parents.len() > 1 {
+                return Err(refused("the spec ref history contains a merge"));
+            }
+            at = parents.first().copied();
+        }
+        Err(refused("the spec ref history is too long"))
+    }
+
     /// Anker und Snapshot aus genau `commit` — dieselben Prüfungen wie
     /// [`ContextStore::get_intent`]: Id gegen den Ankertext, Textform,
     /// Snapshot vorhanden; beides begrenzt gelesen. `None`, wenn dort kein
@@ -1011,6 +1138,18 @@ fn intent_ref(id: &minds_core::ContentHash) -> String {
 /// Die Id hinter einem Intent-Ref — `None` für Fremdes.
 fn intent_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
     let hex = name.strip_prefix(INTENT_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
+/// Der Ref eines Solls.
+fn spec_ref(id: &minds_core::ContentHash) -> String {
+    format!("{SPEC_REF_PREFIX}{}", id.hex())
+}
+
+/// Die Id hinter einem Soll-Ref — `None` für Fremdes.
+fn spec_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(SPEC_REF_PREFIX)?;
     let id: minds_core::ContentHash = hex.parse().ok()?;
     (id.hex() == hex).then_some(id)
 }
@@ -1892,6 +2031,130 @@ impl ContextStore for GitStore {
 
     fn intent_anchor_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
         self.intent_file(id, INTENT_ANCHOR_FILE, INTENT_ANCHOR_MAX)
+    }
+
+    fn put_spec(
+        &self,
+        spec: &minds_redact::RedactedSpec,
+        signature: &str,
+        retain: &dyn Fn(&str) -> bool,
+    ) -> Result<()> {
+        let id = spec.id().clone();
+        // Nur die Form einer `ssh-sig`-Signatur: Der Ref wird gesynct, und
+        // Freitext hat dort nichts verloren.
+        if !minds_core::intent_anchor::is_armored_signature(signature) {
+            return Err(StoreError::SpecSignatureMalformed { id });
+        }
+        let reference = spec_ref(&id);
+        let message = format!("minds: spec {id}");
+        let mut attempts_left = PUT_ATTEMPTS;
+        loop {
+            attempts_left -= 1;
+            let parent = self
+                .repo
+                .commit_at(&reference)
+                .map_err(StoreError::backend)?;
+            // Geprüft und aufgebaut wird auf **demselben** Commit — und nur
+            // auf eine Historie, die selbst ein Soll-Ref ist.
+            let mut envelopes: Vec<crate::StoredEnvelope> = Vec::new();
+            if let Some(commit) = parent {
+                self.spec_chain_ok(&id, commit)?;
+                envelopes = self
+                    .spec_at(&id, commit)?
+                    .ok_or(StoreError::MalformedSpec {
+                        id: id.clone(),
+                        reason: "the spec ref carries no spec",
+                    })?
+                    .envelopes;
+            }
+            if envelopes.iter().any(|envelope| {
+                envelope.signed.text() == spec.text()
+                    && envelope.signatures.iter().any(|s| s == signature)
+            }) {
+                return Ok(()); // schon so abgelegt, idempotent
+            }
+            // Nur Signaturen, die der Aufrufer gutheißt. Umschläge bleiben
+            // immer — auch ohne gute Signatur: Ein älterer Umschlag trägt
+            // womöglich frühere Commits, und wer ihn gilt, entscheidet der
+            // Leser.
+            for envelope in &mut envelopes {
+                envelope.signatures.retain(|s| retain(s));
+            }
+            // Ein Umschlag ganz ohne Signatur (alle verworfen oder nie eine)
+            // kann nie gelten — er belegte nur Platz, bis das Soll nicht mehr
+            // signierbar wäre. Der gerade signierte bleibt.
+            envelopes.retain(|envelope| {
+                !envelope.signatures.is_empty() || envelope.signed.text() == spec.text()
+            });
+            match envelopes
+                .iter_mut()
+                .find(|envelope| envelope.signed.text() == spec.text())
+            {
+                Some(envelope) => envelope.signatures.push(signature.to_owned()),
+                None => envelopes.push(crate::StoredEnvelope {
+                    signed: spec.signed().clone(),
+                    signatures: vec![signature.to_owned()],
+                }),
+            }
+            if envelopes.len() > SPEC_MAX_ENVELOPES
+                || envelopes.iter().any(|e| e.signatures.len() > SPEC_MAX_SIGS)
+            {
+                return Err(StoreError::SpecFull {
+                    id,
+                    envelopes: SPEC_MAX_ENVELOPES,
+                    signatures: SPEC_MAX_SIGS,
+                });
+            }
+            let write = || -> minds_git::Result<()> {
+                let mut entries = Vec::new();
+                for envelope in &envelopes {
+                    let name = minds_core::spec::envelope_name(envelope.signed.text());
+                    entries.push((
+                        format!("{SPEC_ENVELOPES_DIR}/{name}/{SPEC_FILE}"),
+                        self.repo.write_blob(envelope.signed.text().as_bytes())?,
+                    ));
+                    for sig in &envelope.signatures {
+                        entries.push((
+                            format!(
+                                "{SPEC_ENVELOPES_DIR}/{name}/sigs/{}",
+                                minds_core::spec::signature_name(sig)
+                            ),
+                            self.repo.write_blob(sig.as_bytes())?,
+                        ));
+                    }
+                }
+                let tree = self.repo.write_tree(None, entries)?;
+                self.repo
+                    .commit_tree_onto_expected(&reference, tree, parent, &message)?;
+                Ok(())
+            };
+            match write() {
+                Ok(()) => return Ok(()),
+                Err(GitError::RefRaced { .. }) if attempts_left > 0 => {}
+                Err(err) => return Err(StoreError::backend(err)),
+            }
+        }
+    }
+
+    fn get_spec(&self, id: &minds_core::ContentHash) -> Result<Option<crate::StoredSpec>> {
+        match self
+            .repo
+            .commit_at(&spec_ref(id))
+            .map_err(StoreError::backend)?
+        {
+            Some(commit) => self.spec_at(id, commit),
+            None => Ok(None),
+        }
+    }
+
+    fn list_specs(&self) -> Result<Vec<minds_core::ContentHash>> {
+        Ok(self
+            .repo
+            .refs_under(SPEC_REF_PREFIX)
+            .map_err(StoreError::backend)?
+            .iter()
+            .filter_map(|(name, _)| spec_id_of_ref(name))
+            .collect())
     }
 
     fn intent_snapshot_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
@@ -3059,6 +3322,234 @@ mod tests {
             minds_core::intent_anchor::content_hash(&stored.snapshot)
         );
         assert!(store.put_intent(&intent).is_err());
+    }
+
+    fn sample_spec(rule: &str, at: &str) -> minds_redact::RedactedSpec {
+        let text = format!(
+            r#"{{"version":"minds-spec-v1","rules":[{{"id":"{rule}","kind":"graph","expect":"session"}}]}}"#
+        );
+        let spec = minds_core::spec::Spec::parse(text.as_bytes()).unwrap();
+        let signed = minds_core::spec::SignedSpec::new(spec, Default::default(), at).unwrap();
+        minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_spec(signed)
+            .unwrap()
+    }
+
+    const AT_1: &str = "1111111111111111111111111111111111111111";
+    const AT_2: &str = "2222222222222222222222222222222222222222";
+    const SPEC_SIG: &str = "-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+    const SPEC_SIG_2: &str = "-----BEGIN SSH SIGNATURE-----\nBBBB\n-----END SSH SIGNATURE-----\n";
+
+    fn keep_all(_: &str) -> bool {
+        true
+    }
+
+    fn signatures_of(stored: &crate::StoredSpec, at: &str) -> Vec<String> {
+        let mut sigs = stored
+            .envelopes
+            .iter()
+            .find(|e| e.signed.at() == at)
+            .unwrap()
+            .signatures
+            .clone();
+        sigs.sort();
+        sigs
+    }
+
+    /// Ablegen, Lesen, Idempotenz; Signaturen und Umschläge kommen hinzu,
+    /// keiner verdrängt einen anderen — nur unter `refs/minds/`, `fsck`
+    /// bleibt sauber.
+    #[test]
+    fn a_spec_roundtrips_with_its_envelopes_and_fsck_stays_clean() {
+        let (fixture, store) = fresh_store();
+        let spec = sample_spec("a", AT_1);
+        let id = spec.id().clone();
+        assert!(store.get_spec(&id).unwrap().is_none());
+        store.put_spec(&spec, SPEC_SIG, &keep_all).unwrap();
+        let stored = store.get_spec(&id).unwrap().unwrap();
+        assert_eq!(stored.envelopes.len(), 1);
+        assert_eq!(&stored.envelopes[0].signed, spec.signed());
+        assert_eq!(signatures_of(&stored, AT_1), vec![SPEC_SIG.to_owned()]);
+        assert_eq!(store.list_specs().unwrap(), vec![id.clone()]);
+        let reference = spec_ref(&id);
+        assert_eq!(reference, format!("refs/minds/specs/{}", id.hex()));
+        // Idempotent: kein zweiter Commit.
+        store.put_spec(&spec, SPEC_SIG, &keep_all).unwrap();
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "1"
+        );
+        // Eine zweite Signatur verdrängt die erste nicht.
+        store.put_spec(&spec, SPEC_SIG_2, &keep_all).unwrap();
+        let stored = store.get_spec(&id).unwrap().unwrap();
+        assert_eq!(
+            signatures_of(&stored, AT_1),
+            vec![SPEC_SIG.to_owned(), SPEC_SIG_2.to_owned()]
+        );
+        // Neu signiert (anderes `at`): ein zweiter Umschlag, der erste bleibt.
+        let again = sample_spec("a", AT_2);
+        assert_eq!(again.id(), &id);
+        store.put_spec(&again, SPEC_SIG, &keep_all).unwrap();
+        let stored = store.get_spec(&id).unwrap().unwrap();
+        assert_eq!(stored.envelopes.len(), 2);
+        assert_eq!(signatures_of(&stored, AT_2), vec![SPEC_SIG.to_owned()]);
+        assert_eq!(signatures_of(&stored, AT_1).len(), 2);
+        // Untergeschobene Signaturen hält der Filter draußen; Umschläge mit
+        // einer guten bleiben.
+        store
+            .put_spec(&sample_spec("a", AT_2), SPEC_SIG_2, &|s| {
+                s == SPEC_SIG_2 || s == SPEC_SIG
+            })
+            .unwrap();
+        let only_2 = |s: &str| s == SPEC_SIG_2;
+        store
+            .put_spec(&sample_spec("a", AT_2), SPEC_SIG_2, &only_2)
+            .unwrap();
+        let third = sample_spec("a", "3333333333333333333333333333333333333333");
+        store.put_spec(&third, SPEC_SIG_2, &only_2).unwrap();
+        let stored = store.get_spec(&id).unwrap().unwrap();
+        assert_eq!(stored.envelopes.len(), 3);
+        assert_eq!(signatures_of(&stored, AT_1), vec![SPEC_SIG_2.to_owned()]);
+        assert!(matches!(
+            store.put_spec(&spec, "free text", &keep_all),
+            Err(StoreError::SpecSignatureMalformed { .. })
+        ));
+        fixture.git(&["fsck", "--strict", "--no-progress"]);
+    }
+
+    /// Ein verändertes Soll unter derselben Id, ein Umschlag unter fremdem
+    /// Namen, fremde Einträge und eine untergeschobene Historie fallen auf;
+    /// Freitext unter `sigs/` wird übergangen; fremde Refs im Namensraum
+    /// sind keine Solls.
+    #[test]
+    fn a_tampered_spec_is_caught_on_read() {
+        let (fixture, store) = fresh_store();
+        let spec = sample_spec("a", AT_1);
+        let id = spec.id().clone();
+        store.put_spec(&spec, SPEC_SIG, &keep_all).unwrap();
+        let blob = |content: &str| {
+            let path = fixture.path().join("forged");
+            std::fs::write(&path, content).unwrap();
+            fixture
+                .git(&["hash-object", "-w", path.to_str().unwrap()])
+                .trim()
+                .to_owned()
+        };
+        // Baut einen Baum aus `(pfad, blob)` mit beliebiger Tiefe.
+        fn tree(fixture: &TempRepo, entries: &[(String, String)]) -> String {
+            let mut files = String::new();
+            let mut dirs: std::collections::BTreeMap<String, Vec<(String, String)>> =
+                Default::default();
+            for (path, oid) in entries {
+                match path.split_once('/') {
+                    Some((dir, rest)) => dirs
+                        .entry(dir.to_owned())
+                        .or_default()
+                        .push((rest.to_owned(), oid.clone())),
+                    None => files.push_str(&format!("100644 blob {oid}\t{path}\n")),
+                }
+            }
+            for (dir, inner) in dirs {
+                let sub = tree(fixture, &inner);
+                files.push_str(&format!("040000 tree {sub}\t{dir}\n"));
+            }
+            fixture
+                .git_with_stdin(&["mktree"], &files)
+                .trim()
+                .to_owned()
+        }
+        let forge = |entries: &[(String, String)], parent: Option<&str>| {
+            let tree = tree(&fixture, entries);
+            let mut args = vec!["commit-tree", tree.as_str(), "-m", "forged"];
+            if let Some(parent) = parent {
+                args.extend(["-p", parent]);
+            }
+            let commit = fixture.git(&args).trim().to_owned();
+            fixture.git(&["update-ref", &spec_ref(&id), &commit]);
+            commit
+        };
+        let envelope =
+            |text: &str| format!("envelopes/{}/spec", minds_core::spec::envelope_name(text));
+        // Ein anderes Soll unter derselben Id (unter seinem eigenen Namen).
+        let other = sample_spec("b", AT_1);
+        forge(&[(envelope(other.text()), blob(other.text()))], None);
+        assert!(matches!(
+            store.get_spec(&id),
+            Err(StoreError::SpecMismatch { .. })
+        ));
+        assert!(store.put_spec(&spec, SPEC_SIG, &keep_all).is_err());
+        // Der richtige Umschlag unter fremdem Namen.
+        forge(
+            &[(
+                format!("envelopes/{}/spec", "0".repeat(64)),
+                blob(spec.text()),
+            )],
+            None,
+        );
+        assert!(matches!(
+            store.get_spec(&id),
+            Err(StoreError::MalformedSpec { .. })
+        ));
+        // Ein fremder Eintrag daneben (Leck im gesyncten Ref).
+        forge(
+            &[
+                (envelope(spec.text()), blob(spec.text())),
+                ("leak.txt".to_owned(), blob("x")),
+            ],
+            None,
+        );
+        assert!(matches!(
+            store.get_spec(&id),
+            Err(StoreError::MalformedSpec { .. })
+        ));
+        // Freitext unter `sigs/` zählt nicht als Signatur.
+        let name = minds_core::spec::envelope_name(spec.text());
+        let clean = forge(
+            &[
+                (envelope(spec.text()), blob(spec.text())),
+                (
+                    format!("envelopes/{name}/sigs/{}", "0".repeat(64)),
+                    blob("free text\n"),
+                ),
+            ],
+            None,
+        );
+        assert!(
+            store.get_spec(&id).unwrap().unwrap().envelopes[0]
+                .signatures
+                .is_empty()
+        );
+        // Auf eine untergeschobene Historie wird nicht aufgebaut.
+        let leak_parent = {
+            let tree = fixture.git_with_stdin(
+                &["mktree"],
+                &format!("100644 blob {}\tleak.txt\n", blob("secret")),
+            );
+            fixture
+                .git(&["commit-tree", tree.trim(), "-m", "leak"])
+                .trim()
+                .to_owned()
+        };
+        forge(
+            &[(envelope(spec.text()), blob(spec.text()))],
+            Some(&leak_parent),
+        );
+        assert!(matches!(
+            store.put_spec(&spec, SPEC_SIG, &keep_all),
+            Err(StoreError::MalformedSpec { .. })
+        ));
+        // Eine saubere Historie wird fortgeschrieben.
+        fixture.git(&["update-ref", &spec_ref(&id), &clean]);
+        store.put_spec(&spec, SPEC_SIG, &keep_all).unwrap();
+        assert_eq!(
+            store.get_spec(&id).unwrap().unwrap().envelopes[0].signatures,
+            vec![SPEC_SIG.to_owned()]
+        );
+        let head = fixture.git(&["rev-parse", "HEAD"]);
+        fixture.git(&["update-ref", "refs/minds/specs/not-an-id", head.trim()]);
+        assert_eq!(store.list_specs().unwrap(), vec![id]);
     }
 
     /// Was unter einem gesyncten Intent-Ref liegt, kann jeder mit

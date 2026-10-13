@@ -19,6 +19,25 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Conformance against a human-signed spec (`minds spec`, ADR-0013).**
+  `.minds/spec.json` declares the target state: forbidden crate
+  dependencies (`no-dependency`, transitive through the workspace),
+  forbidden module imports (`no-import`), data contracts (`json-schema`)
+  and expected relations in the minds graph (`graph`: a session, an
+  intent). `minds spec sign` signs the version in `HEAD` — together with
+  the hash of every schema it names and the signing commit — under ssh-sig
+  namespace `minds-spec` and stores it content-addressed under
+  `refs/minds/specs/<id>`. `minds verify` always shows a Conformance block
+  when a spec exists — per rule expected, observed and PASS, DRIFT or
+  UNKNOWN against the newest validly signed spec in the history; a spec
+  or schema changed without a valid signature, a rollback to an older
+  signed spec and a spec signed for another history are DRIFT and never
+  replace the signed rules. The exit code stays unchanged;
+  `--conformance` makes DRIFT and UNKNOWN a CI gate (exit 2). The commit is
+  read through hash-verified, bounded object reads, signatures only with
+  an `ssh-keygen` outside the checkout — without a `git` process and
+  without a new dependency. `minds inspect` shows the rows in the Verify tab and a
+  conformance pill per commit in the Overview.
 - **Overview tab in `minds inspect` (F1, the new start view).** The history
   as a commit graph in the style of GitKraken: colored lanes for branches
   and merges, an agent or author badge per commit, pills for branch, tag,
