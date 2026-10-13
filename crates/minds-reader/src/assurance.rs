@@ -230,6 +230,8 @@ pub const fn profile_qualifies(profile: WitnessProfile) -> bool {
         WitnessProfile::User => true,
         WitnessProfile::Container => CONTAINER_PROFILE_QUALIFIES,
         WitnessProfile::Managed => MANAGED_PROFILE_QUALIFIES,
+        // Dieselbe Kennung wie der Agent: keine Trennung, nie A2.
+        WitnessProfile::Local => false,
     }
 }
 
@@ -1328,6 +1330,7 @@ fn witness_profiles(input: &AssuranceInput<'_>) -> Vec<WitnessProfile> {
         WitnessProfile::Container,
         WitnessProfile::User,
         WitnessProfile::Managed,
+        WitnessProfile::Local,
     ]
     .into_iter()
     .filter(|profile| starts.iter().any(|start| start.profile == Some(*profile)))
@@ -1826,6 +1829,14 @@ mod tests {
                 |f| f.witness_starts = vec![start(WitnessProfile::Managed)],
                 Assurance::A1Observed,
                 &["profile managed not qualified for A2"],
+            ),
+            // `local` (derselbe Nutzer wie der Agent) nie — auch nicht mit
+            // einem Start, der Isolation behauptet.
+            (
+                "profile local (never)",
+                |f| f.witness_starts = vec![start(WitnessProfile::Local)],
+                Assurance::A1Observed,
+                &["profile local not qualified for A2"],
             ),
             (
                 "profile container (until EA-S2)",

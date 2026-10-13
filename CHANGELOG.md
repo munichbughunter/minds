@@ -19,6 +19,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Witness by default.** `minds enable` without `--agent` sets up only the
+  agents that look installed (their directory in the repository or in
+  `$HOME`, or their program on `PATH`; none found: all as before). Without
+  `--witness` it always sets up and starts a witness for the repository —
+  new profile `local`: same user ID, witness home and key, a user service
+  started via `launchctl`/`systemctl --user` — and prints a yellow warning
+  that it runs unprotected (assurance stays A1). Hooks and the commit
+  checkpoint find it at its default socket without `MINDS_WITNESS_SOCKET`.
+  `MINDS_WITNESS=off` skips it, `MINDS_WITNESS=print` only prints the start.
 - **Conformance against a human-signed spec (`minds spec`, ADR-0013).**
   `.minds/spec.json` declares the target state: forbidden crate
   dependencies (`no-dependency`, transitive through the workspace),

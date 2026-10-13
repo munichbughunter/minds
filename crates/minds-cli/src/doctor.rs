@@ -184,7 +184,8 @@ fn witness_checks(root: Option<&Path>, probe_home: Option<&Path>, checks: &mut V
         checks.push(Check::new(
             Status::Warn,
             "witness",
-            "not configured — sessions are recorded as A1 (`minds enable --witness container`)",
+            "not configured — sessions are recorded as A1 (`minds enable` sets up a local \
+             witness)",
         ));
     }
 }
@@ -585,15 +586,38 @@ fn host_side(home: &Path, root: Option<&Path>, checks: &mut Vec<Check>) {
 
     match crate::witness_cmd::load(home) {
         Ok(config) => {
+            // `local` bezeugt, trennt aber nicht — das sagt die Zeile.
+            let local = config.profile() == minds_core::evidence::WitnessProfile::Local;
             checks.push(Check::new(
-                Status::Ok,
+                if local { Status::Warn } else { Status::Ok },
                 "witness profile",
                 format!(
-                    "{} (witness.json in \"{}\")",
+                    "{} (witness.json in \"{}\"){}",
                     config.profile().name(),
-                    home.display()
+                    home.display(),
+                    if local {
+                        " — same user ID as the agent: witnesses, but does not separate (A1)"
+                    } else {
+                        ""
+                    }
                 ),
             ));
+            // Ein Home, das ein anderes Repo pinnt (etwa ein global gesetztes
+            // `MINDS_WITNESS_HOME`), bezeugt dieses nicht.
+            if let Some(root) = root {
+                let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.into());
+                if canonical(config.repo_root()) != canonical(root) {
+                    checks.push(Check::new(
+                        Status::Fail,
+                        "witness repository",
+                        format!(
+                            "witness.json pins \"{}\", not this repository — unset \
+                             MINDS_WITNESS_HOME or rerun `minds enable`",
+                            crate::text::sanitize(&config.repo_root().display().to_string())
+                        ),
+                    ));
+                }
+            }
             if !config.pinned() {
                 checks.push(Check::new(
                     Status::Fail,
@@ -621,7 +645,7 @@ fn host_side(home: &Path, root: Option<&Path>, checks: &mut Vec<Check>) {
         Check::new(
             Status::Fail,
             "witness",
-            "not running — start its service (see `minds enable --witness`)",
+            "not running — rerun `minds enable` (or start its service)",
         )
     });
     let key = home.join("key/witness_ed25519");

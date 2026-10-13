@@ -4,9 +4,16 @@
 //! Witness statt ins lokale Journal. Die drei Regeln aus [`super`] gelten
 //! unverändert, und daraus folgt die Bauform:
 //!
-//! - **Entdeckung nur über die Umgebung.** Kein Repository, keine
-//!   Konfiguration: Die Agent-Seite kennt den Socket-Pfad und sonst nichts
-//!   (W1, W3).
+//! - **Entdeckung über die Umgebung, sonst über den festen Pfad.**
+//!   `MINDS_WITNESS_SOCKET` hat Vorrang (Container: der gemountete Socket).
+//!   Ohne Variable gilt der Standardpfad, den `minds enable` dem Witness
+//!   dieses Repos gibt: `run/witness.sock` im Witness-Home
+//!   (`MINDS_WITNESS_HOME`, sonst `$XDG_STATE_HOME/minds-witness/<repo-id>`)
+//!   — nur, wenn dort ein Socket liegt. Keine Repo-Konfiguration: Der Pfad
+//!   folgt aus der Repo-Wurzel, nicht aus Dateien, die der Agent schreibt
+//!   (W1, W3). Unter derselben Nutzerkennung könnte der Agent den Pfad
+//!   ohnehin belegen (oder die Variable setzen) — das ist der Grund, warum
+//!   dieses Profil (`local`) nie A2 trägt.
 //! - **Begrenzte Zeit.** Verbinden höchstens [`CONNECT_TIMEOUT`], Schreiben
 //!   höchstens [`WRITE_TIMEOUT`] insgesamt — nicht je Systemaufruf. Ein
 //!   hängender Witness kostet den Agenten damit eine feste Obergrenze.
@@ -82,6 +89,129 @@ pub(crate) fn socket_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Ein gefundener Witness: sein Socket und — wenn er über den Standardpfad
+/// gefunden wurde — die Repo-Wurzel, für die er gilt.
+pub(crate) struct Discovered {
+    pub(crate) socket: PathBuf,
+    /// `None`: aus `MINDS_WITNESS_SOCKET` (ausdrücklich gesetzt, ohne
+    /// Repo-Bezug, etwa der gemountete Socket im Container).
+    pub(crate) root: Option<PathBuf>,
+}
+
+impl Discovered {
+    /// Ob die Gegenstelle dieser Nutzer sein muss: am Standardpfad nur ein
+    /// `local`-Witness, also derselbe Nutzer. Die ausdrückliche Variable
+    /// zeigt legitim auf einen Witness unter anderem Nutzer.
+    pub(crate) fn same_user(&self) -> bool {
+        self.root.is_some()
+    }
+}
+
+/// Der Socket für Hook und Checkpoint: die Variable, sonst der Standardpfad
+/// des Witness dieses Repos (siehe Modul-Doku), sofern dort ein Socket liegt.
+/// `start` ist ein Pfad im Repo (das Arbeitsverzeichnis).
+pub(crate) fn discovered_socket(start: &Path) -> Option<Discovered> {
+    match socket_path() {
+        Some(socket) => Some(Discovered { socket, root: None }),
+        None => default_socket(start),
+    }
+}
+
+/// Die Repo-Wurzel über `start` (kanonisch) — für den Abgleich mit dem
+/// Repo des gefundenen Witness.
+pub(crate) fn repo_root(start: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        crate::witness_cmd::repo_root_of(&start.canonicalize().ok()?)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = start;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn default_socket(start: &Path) -> Option<Discovered> {
+    use std::os::unix::fs::FileTypeExt;
+    let root = repo_root(start)?;
+    // `MINDS_WITNESS_HOME` gilt nur, wenn es absolut ist; jedes Home nur,
+    // wenn es **dieses** Repo pinnt (ein global gesetztes Home gehört
+    // womöglich einem anderen) und das Profil `local` trägt. Ein Witness
+    // eines anderen Profils (etwa `container`) bezeugt eine Trennung — ein
+    // Agent außerhalb dieser Trennung darf ihm nichts liefern; dorthin führt
+    // nur die ausdrückliche `MINDS_WITNESS_SOCKET`.
+    let home = std::env::var_os("MINDS_WITNESS_HOME")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .or_else(|| crate::witness_cmd::home_for_root(&root).ok())?;
+    if !local_for(&home, &root) {
+        return None;
+    }
+    let socket = home.join("run").join("witness.sock");
+    std::fs::symlink_metadata(&socket)
+        .ok()
+        .filter(|meta| meta.file_type().is_socket())
+        .map(|_| Discovered {
+            socket,
+            root: Some(root),
+        })
+}
+
+/// Ob `witness.json` in `home` genau `root` pinnt und das Profil `local`
+/// trägt — begrenzt gelesen, ohne Symlink, nicht blockierend (ein FIFO
+/// hielte den Hook sonst auf), nur eine reguläre Datei, ohne die Prüfungen
+/// eines Witness-Starts (heißer Pfad).
+#[cfg(unix)]
+fn local_for(home: &Path, root: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Home, `run/` und `witness.json` gehören diesem Nutzer und sind für
+    // niemanden sonst beschreibbar — sonst legte in einem geteilten
+    // `XDG_STATE_HOME` ein anderer Nutzer Datei und Socket hin.
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    let private = |meta: &std::fs::Metadata| meta.uid() == euid && meta.mode() & 0o022 == 0;
+    if ![home.to_path_buf(), home.join("run")]
+        .iter()
+        .all(|dir| std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir() && private(&meta)))
+    {
+        return false;
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(home.join("witness.json"))
+    else {
+        return false;
+    };
+    if !file
+        .metadata()
+        .is_ok_and(|meta| meta.is_file() && private(&meta))
+    {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    if file.take(64 * 1024).read_to_end(&mut bytes).is_err() {
+        return false;
+    }
+    let Ok(config) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    config.get("profile").and_then(|p| p.as_str()) == Some("local")
+        && config
+            .get("repo_root")
+            .and_then(|r| r.as_str())
+            .is_some_and(|pinned| Path::new(pinned) == root)
+}
+
+#[cfg(not(unix))]
+fn default_socket(_start: &Path) -> Option<Discovered> {
+    None
+}
+
 /// Der Agent-Name, unter dem der Witness seinen eigenen Strom führt. Ein
 /// Hook-Frame mit diesem Namen verwirft er ("reserved agent rejected") — ohne
 /// dass der Hook davon erführe. Deshalb bleibt ein solches Event lokal.
@@ -121,6 +251,7 @@ pub(super) fn admissible(
 /// Socket-Pfad.
 pub(super) fn forward(
     socket: &Path,
+    same_user: bool,
     agent: &str,
     event_override: Option<&str>,
     stdin: Vec<u8>,
@@ -135,7 +266,7 @@ pub(super) fn forward(
         ProtoError::TooLarge(_) => "frame too large",
         _ => "invalid frame",
     })?;
-    send(socket, &frame).map_err(|err| kind(&err))
+    send(socket, same_user, &frame).map_err(|err| kind(&err))
 }
 
 /// Obergrenze für eine Antwort des Witness: Kopf plus `request_id` plus eine
@@ -154,6 +285,7 @@ const MAX_RESPONSE: usize = 8 * 1024;
 /// Bezeichnung, nie fremder Text.
 pub(crate) fn request(
     socket: &Path,
+    same_user: bool,
     frame: &Frame,
     deadline: std::time::Instant,
 ) -> Result<Frame, &'static str> {
@@ -164,7 +296,7 @@ pub(crate) fn request(
         _ => return Err("invalid frame"),
     };
     let bytes = witness_proto::encode(frame).map_err(|_| "invalid frame")?;
-    let response = exchange(socket, &bytes, deadline).map_err(|err| {
+    let response = exchange(socket, same_user, &bytes, deadline).map_err(|err| {
         // Nur hier gibt es eine Antwort, die unpassend sein kann.
         if err.kind() == std::io::ErrorKind::InvalidData {
             "unexpected response"
@@ -185,7 +317,7 @@ pub(crate) fn request(
 }
 
 #[cfg(not(unix))]
-fn exchange(_: &Path, _: &[u8], _: std::time::Instant) -> std::io::Result<Vec<u8>> {
+fn exchange(_: &Path, _: bool, _: &[u8], _: std::time::Instant) -> std::io::Result<Vec<u8>> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
@@ -194,6 +326,7 @@ fn exchange(_: &Path, _: &[u8], _: std::time::Instant) -> std::io::Result<Vec<u8
 #[cfg(unix)]
 fn exchange(
     socket: &Path,
+    same_user: bool,
     request: &[u8],
     deadline: std::time::Instant,
 ) -> std::io::Result<Vec<u8>> {
@@ -215,7 +348,7 @@ fn exchange(
         Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
         other => other,
     };
-    let mut stream = connect(socket, deadline)?;
+    let mut stream = connect(socket, same_user, deadline)?;
     let mut rest = request;
     while !rest.is_empty() {
         tolerate_closed_peer(stream.set_write_timeout(Some(remaining()?)))?;
@@ -260,6 +393,9 @@ fn kind(err: &std::io::Error) -> &'static str {
     {
         return "untrusted socket dir";
     }
+    if err.get_ref().is_some_and(|inner| inner.is::<ForeignPeer>()) {
+        return "witness of another user";
+    }
     match err.kind() {
         K::NotFound => "socket missing",
         K::ConnectionRefused => "connection refused",
@@ -277,16 +413,16 @@ fn kind(err: &std::io::Error) -> &'static str {
 }
 
 #[cfg(not(unix))]
-fn send(_: &Path, _: &[u8]) -> std::io::Result<()> {
+fn send(_: &Path, _: bool, _: &[u8]) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(unix)]
-fn send(socket: &Path, frame: &[u8]) -> std::io::Result<()> {
+fn send(socket: &Path, same_user: bool, frame: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::time::Instant;
 
-    let mut stream = connect(socket, Instant::now() + CONNECT_TIMEOUT)?;
+    let mut stream = connect(socket, same_user, Instant::now() + CONNECT_TIMEOUT)?;
     let deadline = Instant::now() + WRITE_TIMEOUT;
     let mut rest = frame;
     while !rest.is_empty() {
@@ -319,9 +455,13 @@ fn send(socket: &Path, frame: &[u8]) -> std::io::Result<()> {
 /// Schwall von mehr Hooks, als der Witness-Backlog fasst, erscheint dort im
 /// Log deshalb als `connection refused`, obwohl der Witness lebt — der
 /// Rückfall ist trotzdem richtig, nur die Diagnose ist unscharf.
+///
+/// `same_user`: Die Gegenstelle muss dieser Nutzer sein (ein am Standardpfad
+/// gefundener `local`-Witness) — sonst kein Byte dorthin.
 #[cfg(unix)]
 fn connect(
     path: &Path,
+    same_user: bool,
     deadline: std::time::Instant,
 ) -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::io::{Error, ErrorKind};
@@ -396,9 +536,26 @@ fn connect(
     }
 
     let stream = std::os::unix::net::UnixStream::from(fd);
+    // Fail-closed: Eine UID, die das System nicht nennt, ist nicht die eigene.
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    if same_user && crate::witness_cmd::peer_uid(&stream) != Some(unsafe { libc::geteuid() }) {
+        return Err(Error::other(ForeignPeer));
+    }
     stream.set_nonblocking(false)?;
     Ok(stream)
 }
+
+/// Markiert „die Gegenstelle ist ein anderer Nutzer" — für [`kind`].
+#[derive(Debug)]
+struct ForeignPeer;
+
+impl std::fmt::Display for ForeignPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("witness of another user")
+    }
+}
+
+impl std::error::Error for ForeignPeer {}
 
 /// Prüft den Ort des Sockets: Ist sein Verzeichnis für alle beschreibbar
 /// (`/tmp`, auch mit Sticky-Bit), könnte dort jeder lokale Nutzer einen
@@ -505,6 +662,15 @@ fn wait_writable(fd: &std::os::fd::OwnedFd, deadline: std::time::Instant) -> std
 mod tests {
     use super::*;
     use std::io::Read;
+
+    /// Eine Gegenstelle unter fremder UID hat ihre eigene Bezeichnung.
+    #[test]
+    fn a_foreign_peer_has_its_own_kind() {
+        assert_eq!(
+            kind(&std::io::Error::other(ForeignPeer)),
+            "witness of another user"
+        );
+    }
     use std::os::unix::net::UnixListener;
     use std::time::Instant;
 
@@ -528,7 +694,16 @@ mod tests {
             bytes
         });
 
-        forward(&path, "claude-code", Some("Stop"), b"{\"a\":1}".to_vec()).unwrap();
+        // Wie am Standardpfad: Die Gegenstelle muss dieser Nutzer sein —
+        // hier ist sie es.
+        forward(
+            &path,
+            true,
+            "claude-code",
+            Some("Stop"),
+            b"{\"a\":1}".to_vec(),
+        )
+        .unwrap();
 
         let bytes = reader.join().unwrap();
         let (frame, used) = witness_proto::decode(&bytes).unwrap();
@@ -547,7 +722,10 @@ mod tests {
     fn every_failure_has_a_fixed_kind() {
         let dir = short_dir();
         let missing = dir.path().join("missing.sock");
-        assert_eq!(forward(&missing, "a", None, vec![]), Err("socket missing"));
+        assert_eq!(
+            forward(&missing, false, "a", None, vec![]),
+            Err("socket missing")
+        );
 
         let stale = dir.path().join("stale.sock");
         drop(UnixListener::bind(&stale).unwrap());
@@ -557,7 +735,7 @@ mod tests {
         // ist, zählt die Antwort.
         let deadline = Instant::now() + Duration::from_secs(5);
         let stale_result = loop {
-            let result = forward(&stale, "a", None, vec![]);
+            let result = forward(&stale, false, "a", None, vec![]);
             if result.is_err() || Instant::now() >= deadline {
                 break result;
             }
@@ -567,21 +745,27 @@ mod tests {
 
         let long = Path::new("/tmp").join("x".repeat(200));
         assert_eq!(
-            forward(&long, "a", None, vec![]),
+            forward(&long, false, "a", None, vec![]),
             Err("invalid socket path")
         );
 
-        assert_eq!(forward(&stale, "../a", None, vec![]), Err("invalid frame"));
-        let huge = vec![b' '; witness_proto::MAX_FRAME as usize];
-        assert_eq!(forward(&stale, "a", None, huge), Err("frame too large"));
         assert_eq!(
-            forward(&stale, "witness", None, vec![]),
+            forward(&stale, false, "../a", None, vec![]),
+            Err("invalid frame")
+        );
+        let huge = vec![b' '; witness_proto::MAX_FRAME as usize];
+        assert_eq!(
+            forward(&stale, false, "a", None, huge),
+            Err("frame too large")
+        );
+        assert_eq!(
+            forward(&stale, false, "witness", None, vec![]),
             Err("reserved agent")
         );
 
         let relative = Path::new("w.sock");
         assert_eq!(
-            forward(relative, "a", None, vec![]),
+            forward(relative, false, "a", None, vec![]),
             Err("invalid socket path")
         );
 
@@ -595,7 +779,7 @@ mod tests {
         let listener = UnixListener::bind(&planted).unwrap();
         listener.set_nonblocking(true).unwrap();
         assert_eq!(
-            forward(&planted, "a", None, vec![]),
+            forward(&planted, false, "a", None, vec![]),
             Err("untrusted socket dir")
         );
         assert!(listener.accept().is_err(), "keine Verbindung zum Fremden");
@@ -605,7 +789,7 @@ mod tests {
         let link = dir.path().join("link.sock");
         std::os::unix::fs::symlink(&planted, &link).unwrap();
         assert_eq!(
-            forward(&link, "a", None, vec![]),
+            forward(&link, false, "a", None, vec![]),
             Err("untrusted socket dir")
         );
         assert!(listener.accept().is_err(), "keine Verbindung über den Link");
@@ -653,7 +837,10 @@ mod tests {
         };
         let witness = answering(&path, witness_proto::encode(&ack).unwrap());
 
-        assert_eq!(request(&path, &checkpoint_request(7), soon()), Ok(ack));
+        assert_eq!(
+            request(&path, false, &checkpoint_request(7), soon()),
+            Ok(ack)
+        );
         assert_eq!(witness.join().unwrap(), checkpoint_request(7));
     }
 
@@ -667,7 +854,7 @@ mod tests {
         };
         let witness = answering(&path, witness_proto::encode(&other).unwrap());
         assert_eq!(
-            request(&path, &checkpoint_request(2), soon()),
+            request(&path, false, &checkpoint_request(2), soon()),
             Err("unexpected response")
         );
         witness.join().unwrap();
@@ -679,13 +866,16 @@ mod tests {
         huge.extend(std::iter::repeat_n(0x81, 16 * 1024));
         let witness = answering(&path, huge);
         assert_eq!(
-            request(&path, &checkpoint_request(2), soon()),
+            request(&path, false, &checkpoint_request(2), soon()),
             Err("unexpected response")
         );
         witness.join().unwrap();
 
         // Nur Anfragen mit `request_id` erwarten eine Antwort.
-        assert_eq!(request(&path, &Frame::Ping, soon()), Err("invalid frame"));
+        assert_eq!(
+            request(&path, false, &Frame::Ping, soon()),
+            Err("invalid frame")
+        );
     }
 
     #[test]
@@ -702,7 +892,7 @@ mod tests {
         let deadline = started + Duration::from_millis(200);
 
         assert_eq!(
-            request(&path, &checkpoint_request(3), deadline),
+            request(&path, false, &checkpoint_request(3), deadline),
             Err("timeout")
         );
         let took = started.elapsed();
@@ -740,7 +930,7 @@ mod tests {
         // Backlog, der Frame füllt den Puffer, dann steht `write`.
         let _listener = UnixListener::bind(&path).unwrap();
         let started = Instant::now();
-        let result = forward(&path, "a", None, vec![b'x'; 4 * 1024 * 1024]);
+        let result = forward(&path, false, "a", None, vec![b'x'; 4 * 1024 * 1024]);
         let took = started.elapsed();
         assert_eq!(result, Err("timeout"));
         assert!(took < Duration::from_millis(500), "zu lange: {took:?}");

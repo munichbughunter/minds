@@ -478,6 +478,10 @@ pub enum WitnessProfile {
     User,
     /// Verwaltete Einstellungen des Harness trennen Agent und Witness.
     Managed,
+    /// Der Witness läuft unter **derselben** Benutzerkennung wie der Agent —
+    /// der Standard von `minds enable`. Er bezeugt, trennt aber nicht: Der
+    /// Agent könnte ihn beenden oder seinen Schlüssel lesen. Trägt nie A2.
+    Local,
 }
 
 impl WitnessProfile {
@@ -488,6 +492,7 @@ impl WitnessProfile {
             Self::Container => "container",
             Self::User => "user",
             Self::Managed => "managed",
+            Self::Local => "local",
         }
     }
 
@@ -497,6 +502,7 @@ impl WitnessProfile {
             "container" => Some(Self::Container),
             "user" => Some(Self::User),
             "managed" => Some(Self::Managed),
+            "local" => Some(Self::Local),
             _ => None,
         }
     }
@@ -1765,6 +1771,7 @@ mod tests {
             (WitnessProfile::Container, "container"),
             (WitnessProfile::User, "user"),
             (WitnessProfile::Managed, "managed"),
+            (WitnessProfile::Local, "local"),
         ] {
             assert_eq!(profile.name(), name);
             assert_eq!(WitnessProfile::parse(name), Some(profile));

@@ -58,7 +58,14 @@ fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
 /// der GitLab-Token ins Kommando kommt (nie als Argument).
 fn minds_with_env(dir: &Path, args: &[&str], stdin: Option<&str>, envs: &[(&str, &str)]) -> Output {
     use std::io::Write;
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir).args(args);
     without_user_config(&mut cmd);
     cmd.envs(envs.iter().copied());

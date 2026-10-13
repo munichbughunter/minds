@@ -126,13 +126,19 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
     }
 
     // Mit Witness braucht die Weitergabe die Rohbytes, `parse` verbraucht sie.
-    // Die Kopie entsteht nur dann — ohne Variable bleibt der Pfad wie bisher —
-    // und nur, wenn sie überhaupt in einen Frame passt: Ein Event über
-    // `MAX_FRAME` bliebe ohnehin lokal, und eine nutzlose Kopie von bis zu
-    // 32 MiB ist auf dem heißen Pfad ein OOM-Risiko, kein Detail.
-    let witness = witness::socket_path().map(|socket| {
+    // Die Kopie entsteht nur, wenn ein Witness da ist (Variable oder
+    // Standardpfad dieses Repos), und nur, wenn sie überhaupt in einen Frame
+    // passt: Ein Event über `MAX_FRAME` bliebe ohnehin lokal, und eine
+    // nutzlose Kopie von bis zu 32 MiB ist auf dem heißen Pfad ein
+    // OOM-Risiko, kein Detail.
+    //
+    // Gesucht wird ab dem Arbeitsverzeichnis des Hooks (vor `parse`); ob das
+    // Event zu genau diesem Repo gehört, prüft der Abgleich mit dem `cwd`
+    // des Payloads unten.
+    let here = std::env::current_dir().unwrap_or_default();
+    let witness = witness::discovered_socket(&here).map(|found| {
         let raw = witness::admissible(agent, event_override, bytes.len()).map(|()| bytes.clone());
-        (socket, raw)
+        (found, raw)
     });
 
     // Die Uhr liest der Prozess, nicht der Parser: So bleibt `parse` eine reine
@@ -144,8 +150,20 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
     // weggelassen, nicht aufgehoben.
     let walled = secretwall::guard(&mut parsed.event).is_some();
 
+    // Über den Standardpfad gefunden, aber das Event gehört zu einem anderen
+    // Repo (der Agent startet Hooks nicht zwingend im Projekt): Dann geht es
+    // nicht an diesen Witness, sondern wie bisher ins Journal seines Repos.
+    // Ein Event ohne `cwd` gehört — wie beim Journal — zum Arbeitsverzeichnis
+    // des Hooks.
+    let witness = witness.filter(|(found, _)| match (&found.root, &parsed.cwd) {
+        (Some(root), Some(cwd)) => witness::repo_root(cwd).as_ref() == Some(root),
+        _ => true,
+    });
+
     let unreachable = match witness {
-        Some((socket, raw)) => {
+        Some((found, raw)) => {
+            let same_user = found.same_user();
+            let socket = found.socket;
             // Hat die Mauer gegriffen, gehen nicht die Rohbytes über den
             // Socket, sondern ihr gewallter Neubau — der passt auch dann in
             // einen Frame, wenn der Rohpayload es nicht tat.
@@ -169,7 +187,9 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
             } else {
                 raw
             };
-            match stdin.and_then(|stdin| witness::forward(&socket, agent, event_override, stdin)) {
+            match stdin.and_then(|stdin| {
+                witness::forward(&socket, same_user, agent, event_override, stdin)
+            }) {
                 Ok(()) => return Ok(()),
                 Err(kind) => Some(kind),
             }

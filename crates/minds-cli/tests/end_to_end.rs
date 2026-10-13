@@ -87,7 +87,14 @@ fn path_with_minds() -> std::ffi::OsString {
 /// Ruft `minds` im Repo auf, optional mit stdin (für `hook`).
 fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     use std::io::Write;
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir).args(args).env("HOME", HOME.path());
     without_user_config(&mut cmd);
     cmd.stdin(std::process::Stdio::piped());
@@ -878,7 +885,14 @@ fn a_panic_in_the_hook_reaches_neither_stdout_nor_stderr() {
         r#"{{"session_id":"sess-panic","cwd":"{}","hook_event_name":"Stop"}}"#,
         dir.display()
     );
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .args(["hook", "--agent", "claude-code"])
         .env("MINDS_PANIC_FOR_TEST", "1")
@@ -1072,7 +1086,14 @@ fn a_panic_in_brief_hook_reaches_neither_channel_but_leaves_its_place() {
             .success()
     );
 
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .args(["brief", "--hook"])
         .env("MINDS_BRIEF_PANIC_FOR_TEST", "1")
@@ -1125,7 +1146,14 @@ fn a_panic_message_never_carries_the_payload_into_the_log() {
         r#"{{"session_id":"sess-x","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"Deploy mit {secret}"}}"#,
         dir.display()
     );
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .args(["hook", "--agent", "claude-code"])
         .env("MINDS_PANIC_FOR_TEST", "payload")
@@ -1170,7 +1198,14 @@ fn a_panic_before_the_guard_still_obeys_the_hook_rules() {
     // Ungültiges UTF-8 als Argument: `std::env::args()` panickt daran, noch
     // bevor irgendein minds-Code läuft.
     let ugly = std::ffi::OsStr::from_bytes(b"\xff\xfe-kaputt-\xff");
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .arg("hook")
         .arg("--agent")
@@ -1934,7 +1969,14 @@ fn fsck_points_at_the_log_but_does_not_quote_it() {
 /// Zuhause, in dem er nach Transkripten sucht; ein leeres Verzeichnis heißt:
 /// nichts zu importieren.
 fn background_import(dir: &Path, home: &Path) -> Output {
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .args(["enable", "--__background-import"])
         .env("HOME", home)
@@ -3068,7 +3110,14 @@ fn recall_prints_full_multiline_intent() {
     );
     let json = serde_json::to_string(&prompt).unwrap();
     record_session(dir, "multiline", &json[1..json.len() - 1], "intent.rs");
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .args(["recall", "intent.rs"])
         .env("COLUMNS", "40");

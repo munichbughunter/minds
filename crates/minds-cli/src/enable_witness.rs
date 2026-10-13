@@ -1,4 +1,19 @@
-//! `minds enable --witness <profile>` — die bezeugte Konfiguration (EA-10).
+//! `minds enable --witness <profile>` — die bezeugte Konfiguration (EA-10) —
+//! und der Witness, den `minds enable` ohne Flag immer einrichtet
+//! ([`local`]).
+//!
+//! # Der Standard: `local`
+//!
+//! Ohne `--witness` richtet `enable` einen Witness unter **derselben**
+//! Nutzerkennung ein und startet ihn: Witness-Home, Schlüssel, Nutzerdienst
+//! (launchd/systemd), Start über `launchctl`/`systemctl --user`. Er bezeugt,
+//! trennt aber nicht — der Agent könnte ihn beenden oder seinen Schlüssel
+//! lesen. Darum trägt das Profil nie A2, und `enable` sagt es mit einer
+//! gelben Warnung. `MINDS_WITNESS=off` lässt den Witness weg,
+//! `MINDS_WITNESS=print` richtet ihn ein und druckt den Start, statt ihn
+//! auszuführen.
+//!
+//! # Die Profile von `--witness`
 //!
 //! Ein Kommando richtet ein, was ein Witness braucht; `minds doctor` weist
 //! danach nach, dass die Trennung hält. Drei Profile (ADR-0012):
@@ -17,8 +32,10 @@
 //!   Prozess. Ein Test sucht den Quelltext danach ab.
 //! - **Kein Überschreiben.** Liegt eine Datei schon da und unterscheidet
 //!   sich, entsteht daneben `<name>.minds-proposed`, und der Bericht sagt es.
-//! - **Kein stiller Start.** Der Dienst wird geschrieben, nicht gestartet; der
-//!   Befehl dazu steht im Bericht.
+//! - **Kein stiller Start** (Profile von `--witness`). Der Dienst wird
+//!   geschrieben, nicht gestartet; der Befehl dazu steht im Bericht. Nur der
+//!   Standard ([`local`]) startet seinen Nutzerdienst — mit Bericht und
+//!   Warnung, nie mit Administratorrechten.
 
 // Außerhalb von Unix gibt es kein Witness-Profil; die Hilfen bleiben ungenutzt.
 #![cfg_attr(not(unix), allow(dead_code))]
@@ -252,7 +269,7 @@ fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<()> {
             shell_quote(utf8(&home)?)
         ),
     }
-    if let Some(note) = unstable_binary_note(&exe) {
+    if let Some(note) = unstable_binary_note(&exe, "minds enable --witness container") {
         println!();
         println!("{note}");
     }
@@ -301,6 +318,438 @@ fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Wie `enable` mit dem Standard-Witness umgeht (`MINDS_WITNESS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalMode {
+    /// Einrichten und starten (Standard).
+    On,
+    /// Einrichten, den Start nur drucken.
+    Print,
+    /// Gar nicht.
+    Off,
+}
+
+impl LocalMode {
+    /// Aus `MINDS_WITNESS` — fehlend oder leer: `On`. Alles andere,
+    /// auch ein Wert, der kein UTF-8 ist, ist ein Fehler.
+    pub(crate) fn from_env() -> std::io::Result<Self> {
+        match std::env::var("MINDS_WITNESS") {
+            Err(std::env::VarError::NotPresent) => Ok(Self::On),
+            Ok(value) => match value.as_str() {
+                "" | "on" => Ok(Self::On),
+                "print" => Ok(Self::Print),
+                "off" => Ok(Self::Off),
+                other => Err(std::io::Error::other(format!(
+                    "MINDS_WITNESS must be on, print or off, not {:?}",
+                    crate::text::sanitize(other)
+                ))),
+            },
+            Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
+                "MINDS_WITNESS must be on, print or off",
+            )),
+        }
+    }
+}
+
+/// Was der Standard-Witness ergab.
+#[cfg(unix)]
+enum LocalOutcome {
+    /// Läuft — der Ping am Socket kam zurück.
+    Running(PathBuf),
+    /// Eingerichtet; gestartet würde er so.
+    Printed(String),
+    /// Ein anderes Profil ist eingerichtet (etwa `container`) und bleibt,
+    /// wie es ist — `enable` startet es nicht.
+    Kept(&'static str),
+}
+
+/// Richtet den Standard-Witness ein (Profil `local`) und startet ihn — nach
+/// den gewöhnlichen `enable`-Schritten. Scheitert nie das ganze `enable`:
+/// Was nicht geht, steht als gelbe Warnung auf stderr, und die Hooks
+/// schreiben dann wie bisher ins lokale Journal.
+pub(crate) fn local(root: &Path, store: &minds_store::StoreConfig, mode: LocalMode, verbose: bool) {
+    if mode == LocalMode::Off {
+        return;
+    }
+    // Die Hooks nutzen ausdrücklich einen anderen Witness (etwa den in den
+    // Container gemounteten Socket) — hier keiner.
+    if crate::hook::witness::socket_path().is_some() {
+        eprintln!("minds: witness via MINDS_WITNESS_SOCKET — no local witness set up");
+        return;
+    }
+    #[cfg(unix)]
+    {
+        let child_repo = match store.backend() {
+            minds_store::Backend::ChildRepo { path } => Some(path.as_path()),
+            minds_store::Backend::InRepo => None,
+        };
+        match root
+            .canonicalize()
+            .and_then(|root| local_unix(&root, child_repo, mode, verbose))
+        {
+            Ok(LocalOutcome::Kept(profile)) => crate::text::warn(&format!(
+                "a witness with profile {profile} is set up for this repository — enable \
+                 leaves it as it is; hooks outside its isolation record into the local \
+                 journal (A1)"
+            )),
+            Ok(outcome) => {
+                match outcome {
+                    LocalOutcome::Running(socket) => eprintln!(
+                        "minds: witness running for this repository (profile local, socket {})",
+                        quoted_display(&socket)
+                    ),
+                    LocalOutcome::Printed(start) => {
+                        eprintln!("minds: witness set up (profile local) — start it with: {start}")
+                    }
+                    LocalOutcome::Kept(_) => unreachable!("oben behandelt"),
+                }
+                crate::text::warn(
+                    "the witness runs unprotected under your user ID — an agent with a shell \
+                     can stop it or read its key; assurance stays at A1 (observed). A \
+                     protected witness runs under its own user.",
+                );
+            }
+            Err(err) => crate::text::warn(&format!(
+                "witness not set up for this repository: {} — hooks record into the local \
+                 journal, or into a witness still running from before (A1)",
+                crate::text::sanitize(&err.to_string())
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, store, verbose);
+        crate::text::warn("no witness on this platform — hooks record into the local journal (A1)");
+    }
+}
+
+#[cfg(unix)]
+fn local_unix(
+    root: &Path,
+    child_repo: Option<&Path>,
+    mode: LocalMode,
+    verbose: bool,
+) -> std::io::Result<LocalOutcome> {
+    use crate::witness_cmd::InitRequest;
+
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(other(
+            "minds enable runs as root — the local witness belongs to your user; run it as \
+             your own user",
+        ));
+    }
+    // Wie der Hook: ein relatives Home gilt nicht (es hinge vom
+    // Arbeitsverzeichnis ab, und der Hook fände es nie).
+    if std::env::var_os("MINDS_WITNESS_HOME")
+        .is_some_and(|home| !home.is_empty() && !Path::new(&home).is_absolute())
+    {
+        return Err(other("MINDS_WITNESS_HOME must be an absolute path"));
+    }
+    let home = witness_home(root)?;
+    refuse_home_inside(root, &home)?;
+    // Ein schon eingerichteter Witness: Er muss **dieses** Repo pinnen (ein
+    // global gesetztes `MINDS_WITNESS_HOME` gehört womöglich einem anderen),
+    // und ein anderes Profil (etwa `container`) bleibt, wie es ist.
+    if home.join("witness.json").exists() {
+        let config = crate::witness_cmd::load(&home).map_err(other)?;
+        if config.repo_root() != root {
+            return Err(other(format!(
+                "the witness home {} belongs to another repository — unset \
+                 MINDS_WITNESS_HOME or give each repository its own",
+                quoted_display(&home)
+            )));
+        }
+        let profile = config.profile();
+        if profile != minds_core::evidence::WitnessProfile::Local {
+            // Ein Home, das dieser Nutzer besitzt, kann ein anderes Profil
+            // nur behaupten — der Agent könnte die Datei geschrieben haben.
+            use std::os::unix::fs::MetadataExt;
+            // SAFETY: geteuid hat keine Vorbedingungen.
+            let euid = unsafe { libc::geteuid() };
+            let owned = std::fs::metadata(&home).is_ok_and(|meta| meta.uid() == euid);
+            if owned && profile == minds_core::evidence::WitnessProfile::User {
+                return Err(other(format!(
+                    "the witness home {} claims profile user but belongs to your user ID — \
+                     a user-profile witness runs under its own user; enable leaves it alone",
+                    quoted_display(&home)
+                )));
+            }
+            return Ok(LocalOutcome::Kept(profile.name()));
+        }
+    }
+    let exe = service_binary(root)?;
+    refuse_build_output(&exe)?;
+    let service_target = service_path(root, &repo_id(root))?
+        .ok_or_else(|| other("no user service manager known on this platform"))?;
+    // Immer `init`: Es prüft die Pins gegen die vorhandene Datei (eine
+    // abweichende wird abgelehnt) und ergänzt fehlende.
+    let initialized = crate::witness_cmd::init_config(
+        &home,
+        &InitRequest {
+            repo: utf8(root)?,
+            mapping: None,
+            profile: Some("local"),
+            socket_group: None,
+            child_repo,
+            policy_rev: None,
+        },
+    )
+    .map_err(other)?;
+    // Neu festgehalten (etwa die Policy aus HEAD): Ein laufender Witness
+    // kennt den neuen Stand erst nach einem Neustart.
+    let repinned = matches!(initialized, crate::witness_cmd::Initialized::Pinned(_));
+    // Immer gesagt: Die Policy kann auch lockerer geworden sein.
+    if let crate::witness_cmd::Initialized::Pinned(pins) = &initialized {
+        eprintln!(
+            "minds: witness policy pinned anew — {}",
+            crate::text::sanitize(&pins.policy)
+        );
+    }
+    let home = home.canonicalize()?;
+    refuse_home_inside(root, &home)?;
+    let signers = match crate::witness_cmd::existing_signers_line(&home).map_err(other)? {
+        Some(line) => line,
+        None => crate::witness_cmd::keygen(&home).map_err(other)?,
+    };
+    if verbose {
+        eprintln!("  witness home   {}", quoted_display(&home));
+        eprintln!(
+            "  signers line   {signers}  (local profile: never A2 — do not trust it as a \
+             protected witness)"
+        );
+    }
+    if let Some(note) = unstable_binary_note(&exe, "minds enable") {
+        eprintln!("{}", crate::text::sanitize(&note));
+    }
+    let id = repo_id(root);
+    let (path, placed, start) = write_service(&service_target, &home, &exe, &id)?;
+    if let Placed::Proposed(proposal) = &placed {
+        return Err(other(format!(
+            "the existing service file {} differs — review {} and move it into place, then \
+             rerun minds enable",
+            quoted_display(&path),
+            quoted_display(proposal)
+        )));
+    }
+    let socket = home.join("run").join("witness.sock");
+    match mode {
+        LocalMode::Print => {
+            let mut printed = start.join(" && ");
+            if repinned {
+                printed.push_str(&format!(
+                    " (a witness already running keeps its old policy until restarted: {})",
+                    if service_target.launchd {
+                        format!(
+                            "launchctl bootout gui/$(id -u)/dev.minds.witness.{id} && {}",
+                            start.join(" && ")
+                        )
+                    } else {
+                        format!(
+                            "systemctl --user daemon-reload && systemctl --user restart \
+                             minds-witness-{id}.service"
+                        )
+                    }
+                ));
+            }
+            Ok(LocalOutcome::Printed(crate::text::sanitize(&printed)))
+        }
+        LocalMode::Off => unreachable!("vorher geprüft"),
+        LocalMode::On => {
+            start_service(&service_target, &id)?;
+            // Bis zu drei Sekunden auf einen Witness, der antwortet — eine
+            // Socket-Datei allein kann von einem toten Lauf übrig sein.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if crate::witness_cmd::ping(&socket) {
+                    return Ok(LocalOutcome::Running(socket));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(other(format!(
+                        "the witness service does not answer — see {}",
+                        quoted_display(&home.join("log").join("witness.log"))
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// Ein Binary aus einem Build-Verzeichnis (`target/debug`, `target/release`)
+/// läuft nicht als Dienst: Ein Agent, der in jenem Checkout arbeitet,
+/// schreibt es bei jedem Build neu — und der Dienst eines anderen Repos
+/// führte es aus.
+#[cfg(unix)]
+fn refuse_build_output(exe: &Path) -> std::io::Result<()> {
+    let parts: Vec<&std::ffi::OsStr> = exe.iter().collect();
+    let in_target = parts
+        .windows(2)
+        .any(|pair| pair[0] == "target" && (pair[1] == "debug" || pair[1] == "release"))
+        || parts
+            .windows(3)
+            .any(|w| w[0] == "target" && (w[2] == "debug" || w[2] == "release"));
+    if in_target {
+        return Err(other(format!(
+            "this minds binary lies in a build directory ({}) — another checkout rewrites it on \
+             every build; install minds and run enable from there",
+            crate::text::sanitize(&exe.display().to_string())
+        )));
+    }
+    Ok(())
+}
+
+/// Startet den Nutzerdienst aus genau unserer Dienstdatei — mit absoluten
+/// Pfaden der Dienstverwalter, nie über `PATH`. launchd: einen geladenen Job
+/// gleichen Namens erst entladen (er könnte aus einer anderen Datei
+/// stammen), dann laden. systemd: nie mit Drop-ins oder einer Unit aus einer
+/// anderen Datei; danach neu starten.
+#[cfg(unix)]
+fn start_service(target: &ServiceTarget, id: &str) -> std::io::Result<()> {
+    /// Was ein Aufruf des Dienstverwalters ergab.
+    struct Ran {
+        ok: bool,
+        stdout: String,
+        /// Die erste Zeile von stderr, entschärft.
+        cause: String,
+    }
+    // Nur in Debug-Builds (Tests): ein Ersatz für den Dienstverwalter. Er
+    // bekommt als erstes Argument den Namen des ersetzten Programms.
+    #[cfg(debug_assertions)]
+    let stub = std::env::var_os("MINDS_SERVICE_MANAGER_STUB").map(PathBuf::from);
+    #[cfg(not(debug_assertions))]
+    let stub: Option<PathBuf> = None;
+    let run = |program: &str, args: &[&str]| -> std::io::Result<Ran> {
+        let mut command = match &stub {
+            Some(stub) => {
+                let mut command = std::process::Command::new(stub);
+                command.arg(Path::new(program).file_name().unwrap_or_default());
+                command
+            }
+            None => std::process::Command::new(program),
+        };
+        let output = command
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Ok(Ran {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            cause: crate::text::sanitize(stderr.lines().next().unwrap_or_default()),
+        })
+    };
+    let check = |ran: Ran, what: &str| -> std::io::Result<Ran> {
+        if ran.ok {
+            Ok(ran)
+        } else {
+            Err(other(format!(
+                "{what} failed{} — start the witness service yourself",
+                if ran.cause.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", ran.cause)
+                }
+            )))
+        }
+    };
+    if target.launchd {
+        // SAFETY: getuid hat keine Vorbedingungen.
+        let uid = unsafe { libc::getuid() };
+        let domain = format!("gui/{uid}");
+        let service = format!("{domain}/dev.minds.witness.{id}");
+        let launchctl = "/bin/launchctl";
+        if run(launchctl, &["print", &service])?.ok {
+            check(run(launchctl, &["bootout", &service])?, "launchctl bootout")?;
+            // launchd entlädt asynchron: erst laden, wenn der Job weg ist.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while std::time::Instant::now() < deadline && run(launchctl, &["print", &service])?.ok {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let plist = utf8(&target.path)?;
+        // Auch danach meldet `bootstrap` gelegentlich noch „5: Input/output
+        // error" — einige Versuche, dann der Fehler mit seiner Meldung.
+        let mut attempt = 0;
+        loop {
+            let ran = run(launchctl, &["bootstrap", &domain, plist])?;
+            attempt += 1;
+            if ran.ok || attempt == 10 {
+                check(ran, "launchctl bootstrap")?;
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    } else {
+        let systemctl = if stub.is_some() {
+            "/usr/bin/systemctl"
+        } else {
+            [
+                "/usr/bin/systemctl",
+                "/bin/systemctl",
+                "/run/current-system/sw/bin/systemctl",
+            ]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .ok_or_else(|| other("systemctl not found"))?
+        };
+        let unit = format!("minds-witness-{id}.service");
+        check(
+            run(systemctl, &["--user", "daemon-reload"])?,
+            "systemctl --user daemon-reload",
+        )?;
+        // Drop-ins oder eine Unit aus einer anderen Datei änderten, was
+        // startet — dann nicht. Lässt sich das nicht feststellen, auch nicht.
+        let shown = check(
+            run(
+                systemctl,
+                &[
+                    "--user",
+                    "show",
+                    "-p",
+                    "DropInPaths",
+                    "-p",
+                    "FragmentPath",
+                    &unit,
+                ],
+            )?,
+            "systemctl --user show",
+        )?;
+        let field = |name: &str| {
+            shown
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .unwrap_or_default()
+                .trim()
+                .to_owned()
+        };
+        let fragment = field("FragmentPath=");
+        if fragment.is_empty() {
+            return Err(other(format!(
+                "systemd --user does not load {} — does the user manager use the same \
+                 XDG_CONFIG_HOME?",
+                quoted_display(&target.path)
+            )));
+        }
+        if !field("DropInPaths=").is_empty() || Path::new(&fragment) != target.path {
+            return Err(other(format!(
+                "the unit {unit} has drop-ins or comes from another file — review it; minds \
+                 does not start it"
+            )));
+        }
+        check(
+            run(systemctl, &["--user", "enable", &unit])?,
+            "systemctl --user enable",
+        )?;
+        check(
+            run(systemctl, &["--user", "restart", &unit])?,
+            "systemctl --user restart",
+        )?;
+        Ok(())
+    }
+}
+
 /// Das Binary für den Dienst: das laufende, kanonisch — aber nie eines, das
 /// im beobachteten Repo liegt (etwa `target/release/minds` beim Dogfooding):
 /// Das Repo ist in den Container gemountet, der Agent könnte es ersetzen.
@@ -342,7 +791,7 @@ fn service_binary(root: &Path) -> std::io::Result<PathBuf> {
 
 /// Ein Hinweis, wenn das Binary an einem Ort liegt, den ein Update oder eine
 /// Garbage-Collection entfernt — der Dienst fände es dann nicht mehr.
-fn unstable_binary_note(exe: &Path) -> Option<String> {
+fn unstable_binary_note(exe: &Path, rerun: &str) -> Option<String> {
     let text = exe.to_string_lossy();
     [
         "/Cellar/",
@@ -355,7 +804,7 @@ fn unstable_binary_note(exe: &Path) -> Option<String> {
     .then(|| {
         format!(
             "Note: the service runs {} — a version-specific path; after an upgrade, \
-                 rerun `minds enable --witness container` from the stable install",
+                 rerun `{rerun}` from the stable install",
             crate::text::sanitize(&text)
         )
     })
@@ -1003,9 +1452,13 @@ mod tests {
     #[test]
     fn version_specific_binaries_get_a_note() {
         assert!(
-            unstable_binary_note(Path::new("/opt/homebrew/Cellar/minds/0.3.0/bin/minds")).is_some()
+            unstable_binary_note(
+                Path::new("/opt/homebrew/Cellar/minds/0.3.0/bin/minds"),
+                "minds enable"
+            )
+            .is_some_and(|note| note.contains("rerun `minds enable` from"))
         );
-        assert!(unstable_binary_note(Path::new("/usr/local/bin/minds")).is_none());
+        assert!(unstable_binary_note(Path::new("/usr/local/bin/minds"), "minds enable").is_none());
     }
 
     #[cfg(unix)]

@@ -81,9 +81,16 @@ pub(crate) const LINE_SEPARATOR: &str = " | ";
 /// selbst — in beiden Reihenfolgen, auch wenn der Witness erst nach Ablauf
 /// der Frist fertig wird.
 pub(super) fn delegate(repo: &Repo, commit: Option<&str>) {
-    let Some(socket) = witness::socket_path() else {
+    // Der Witness aus der Variable, sonst am Standardpfad dieses Repos —
+    // gesucht wie im Hook ab dem Arbeitsverzeichnis (das Repo des Commits),
+    // nicht über `core.worktree` aus der `.git/config`, die der Agent
+    // schreiben kann.
+    let here = std::env::current_dir().unwrap_or_default();
+    let Some(found) = witness::discovered_socket(&here) else {
         return;
     };
+    let same_user = found.same_user();
+    let socket = found.socket;
 
     // Der Witness bekommt immer einen konkreten Commit, nie „HEAD": Er prüft
     // ihn gegen sein HEAD, **bevor** er versiegelt. Ohne Commit (ungültiges
@@ -107,7 +114,7 @@ pub(super) fn delegate(repo: &Repo, commit: Option<&str>) {
         request_id: request_id(),
     };
 
-    match witness::request(&socket, &request, Instant::now() + timeout()) {
+    match witness::request(&socket, same_user, &request, Instant::now() + timeout()) {
         Ok(Frame::Ack { status, .. }) => {
             for line in status.split(LINE_SEPARATOR).filter(|l| !l.is_empty()) {
                 // Fremder Text auf das Terminal des Nutzers: Das Protokoll hat

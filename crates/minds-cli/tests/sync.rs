@@ -70,7 +70,14 @@ fn without_user_config(cmd: &mut Command) -> &mut Command {
 }
 
 fn minds(dir: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir).args(args);
     without_user_config(&mut cmd).output().expect("minds läuft")
 }

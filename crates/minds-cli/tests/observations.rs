@@ -262,7 +262,14 @@ impl Fixture {
 
     fn verify(&self, signers: bool) -> String {
         let root = self.dir.path();
-        let mut cmd = Command::new(MINDS);
+        let mut cmd = {
+            let mut minds = Command::new(MINDS);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        };
         cmd.current_dir(root)
             .env("HOME", root.join("user-home"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")

@@ -48,7 +48,14 @@ fn path_with_minds() -> std::ffi::OsString {
 }
 
 fn minds(dir: &Path, args: &[&str]) -> Output {
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir).args(args);
     without_user_config(&mut cmd).output().expect("minds läuft")
 }
@@ -79,7 +86,14 @@ fn repo_with_session() -> Option<tempfile::TempDir> {
         r#"{{"session_id":"sess-audit","cwd":"{}","hook_event_name":"UserPromptSubmit","prompt":"Retry-Test reparieren"}}"#,
         dir.path().display()
     );
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir.path())
         .args(["hook", "--agent", "claude-code"]);
     let mut child = without_user_config(&mut cmd)
@@ -222,7 +236,14 @@ fn a_forgotten_session_stays_visible_in_the_chain() {
 
 /// Schickt ein Hook-Event über stdin — wie der Agent es täte.
 fn feed_hook(dir: &Path, payload: &str) {
-    let mut cmd = Command::new(MINDS);
+    let mut cmd = {
+        let mut minds = Command::new(MINDS);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    };
     cmd.current_dir(dir)
         .args(["hook", "--agent", "claude-code"]);
     let mut child = without_user_config(&mut cmd)

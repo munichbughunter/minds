@@ -88,16 +88,49 @@ impl Fixture {
     }
 
     fn minds(&self, args: &[&str]) -> Output {
-        Command::new(minds())
-            .current_dir(&self.root)
-            .args(args)
+        {
+            let mut minds = Command::new(minds());
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        }
+        .current_dir(&self.root)
+        .args(args)
+        .env("HOME", self.path("user-home"))
+        .env("XDG_STATE_HOME", self.path("state"))
+        .env("XDG_CONFIG_HOME", self.path("config"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env_remove("MINDS_WITNESS_HOME")
+        .env_remove("MINDS_WITNESS_SOCKET")
+        .output()
+        .unwrap()
+    }
+
+    /// `minds enable` ohne `--witness`, mit `MINDS_WITNESS=<mode>`.
+    fn enable_default(&self, mode: &str) -> Output {
+        self.enable_default_with(mode, &[])
+    }
+
+    /// Wie [`Self::enable_default`], mit weiteren Variablen.
+    fn enable_default_with(&self, mode: &str, vars: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(minds());
+        cmd.env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        for (key, value) in vars {
+            cmd.env(key, value);
+        }
+        cmd.current_dir(&self.root)
+            .args(["enable", "--agent", "claude-code"])
+            .env("MINDS_WITNESS", mode)
             .env("HOME", self.path("user-home"))
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env_remove("MINDS_WITNESS_HOME")
-            .env_remove("MINDS_WITNESS_SOCKET")
+            .env("NO_COLOR", "1")
             .output()
             .unwrap()
     }
@@ -137,6 +170,29 @@ impl Fixture {
                 .join("systemd/user")
                 .join(format!("minds-witness-{id}.service"))
         }
+    }
+
+    /// Ein Ersatz für den Dienstverwalter (`MINDS_SERVICE_MANAGER_STUB`):
+    /// protokolliert jeden Aufruf nach `<name>.log`, kennt keinen geladenen
+    /// launchd-Job und meldet für `systemctl show` unsere Dienstdatei mit
+    /// `drop_ins`.
+    fn manager_stub(&self, name: &str, drop_ins: &str) -> PathBuf {
+        let stub = self.path(name);
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 echo \"$*\" >> '{log}'\n\
+                 case \"$1 $2\" in 'launchctl print') exit 1;; esac\n\
+                 case \"$3\" in show) echo 'FragmentPath={unit}'; echo 'DropInPaths={drop_ins}';; esac\n\
+                 exit 0\n",
+                log = self.path(&format!("{name}.log")).display(),
+                unit = self.service().display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        stub
     }
 
     fn service_proposal(&self) -> PathBuf {
@@ -339,18 +395,25 @@ fn enable_witness_refuses_a_binary_inside_the_repository() {
     let inside = f.root.join("target/release/minds");
     fs::create_dir_all(inside.parent().unwrap()).unwrap();
     fs::copy(MINDS, &inside).unwrap();
-    let out = Command::new(&inside)
-        .current_dir(&f.root)
-        .args(["enable", "--agent", "claude-code", "--witness", "container"])
-        .env("HOME", f.path("user-home"))
-        .env("XDG_STATE_HOME", f.path("state"))
-        .env("XDG_CONFIG_HOME", f.path("config"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("MINDS_WITNESS_HOME")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(&inside);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["enable", "--agent", "claude-code", "--witness", "container"])
+    .env("HOME", f.path("user-home"))
+    .env("XDG_STATE_HOME", f.path("state"))
+    .env("XDG_CONFIG_HOME", f.path("config"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env_remove("MINDS_WITNESS_HOME")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("lies inside the repository"),
@@ -543,18 +606,25 @@ fn enable_witness_refuses_a_hard_linked_binary() {
     let copy = bin.join("minds");
     fs::copy(MINDS, &copy).unwrap();
     fs::hard_link(&copy, bin.join("other-name")).unwrap();
-    let out = Command::new(&copy)
-        .current_dir(&f.root)
-        .args(["enable", "--agent", "claude-code", "--witness", "container"])
-        .env("HOME", f.path("user-home"))
-        .env("XDG_STATE_HOME", f.path("state"))
-        .env("XDG_CONFIG_HOME", f.path("config"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("MINDS_WITNESS_HOME")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(&copy);
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["enable", "--agent", "claude-code", "--witness", "container"])
+    .env("HOME", f.path("user-home"))
+    .env("XDG_STATE_HOME", f.path("state"))
+    .env("XDG_CONFIG_HOME", f.path("config"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env_remove("MINDS_WITNESS_HOME")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("more than one hard link"),
@@ -592,15 +662,22 @@ fn doctor_fails_when_the_isolation_boundary_changes() {
 #[test]
 fn doctor_refuses_an_empty_probe_home() {
     let f = Fixture::new();
-    let out = Command::new(minds())
-        .current_dir(&f.root)
-        .args(["doctor", "--probe-home", ""])
-        .env("HOME", f.path("user-home"))
-        .env("XDG_STATE_HOME", f.path("state"))
-        .env_remove("MINDS_WITNESS_HOME")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(minds());
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["doctor", "--probe-home", ""])
+    .env("HOME", f.path("user-home"))
+    .env("XDG_STATE_HOME", f.path("state"))
+    .env_remove("MINDS_WITNESS_HOME")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(
         text(&out).contains("--probe-home is empty"),
@@ -624,17 +701,24 @@ fn enable_witness_refuses_a_symlinked_devcontainer_directory() {
 #[test]
 fn enable_witness_refuses_a_home_inside_the_repository() {
     let f = Fixture::new();
-    let out = Command::new(minds())
-        .current_dir(&f.root)
-        .args(["enable", "--agent", "claude-code", "--witness", "container"])
-        .env("HOME", f.path("user-home"))
-        .env("XDG_CONFIG_HOME", f.path("config"))
-        .env("MINDS_WITNESS_HOME", f.root.join("witness"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(minds());
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["enable", "--agent", "claude-code", "--witness", "container"])
+    .env("HOME", f.path("user-home"))
+    .env("XDG_CONFIG_HOME", f.path("config"))
+    .env("MINDS_WITNESS_HOME", f.root.join("witness"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("must lie outside the repository"),
@@ -791,18 +875,25 @@ fn enable_witness_refuses_a_service_file_inside_the_repository() {
     let f = Fixture::new();
     let inside = f.root.join("dotfiles");
     fs::create_dir_all(&inside).unwrap();
-    let out = Command::new(minds())
-        .current_dir(&f.root)
-        .args(["enable", "--agent", "claude-code", "--witness", "container"])
-        .env("HOME", &inside)
-        .env("XDG_CONFIG_HOME", inside.join(".config"))
-        .env("XDG_STATE_HOME", f.path("state"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("MINDS_WITNESS_HOME")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(minds());
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["enable", "--agent", "claude-code", "--witness", "container"])
+    .env("HOME", &inside)
+    .env("XDG_CONFIG_HOME", inside.join(".config"))
+    .env("XDG_STATE_HOME", f.path("state"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env_remove("MINDS_WITNESS_HOME")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("service file would lie inside the repository"),
@@ -825,18 +916,25 @@ fn enable_witness_refuses_an_equals_sign_in_the_directory_name() {
     fs::create_dir(&root).unwrap();
     git(&root, &["init", "-q", "--template="]);
     fs::create_dir(dir.path().join("state")).unwrap();
-    let out = Command::new(minds())
-        .current_dir(&root)
-        .args(["enable", "--agent", "claude-code", "--witness", "container"])
-        .env("HOME", dir.path())
-        .env("XDG_STATE_HOME", dir.path().join("state"))
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("MINDS_WITNESS_HOME")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(minds());
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&root)
+    .args(["enable", "--agent", "claude-code", "--witness", "container"])
+    .env("HOME", dir.path())
+    .env("XDG_STATE_HOME", dir.path().join("state"))
+    .env("XDG_CONFIG_HOME", dir.path().join("config"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env_remove("MINDS_WITNESS_HOME")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     assert!(text(&out).contains("contains '='"), "{}", text(&out));
     assert_eq!(fs::read_dir(dir.path().join("state")).unwrap().count(), 0);
@@ -864,16 +962,23 @@ fn enable_witness_refuses_an_incomplete_key_pair() {
 #[test]
 fn enable_witness_managed_refuses_unsafe_paths_and_prints_a_digest() {
     let f = Fixture::new();
-    let out = Command::new(minds())
-        .current_dir(&f.root)
-        .args(["enable", "--agent", "claude-code", "--witness", "managed"])
-        .env("HOME", f.path("user-home"))
-        .env("MINDS_WITNESS_HOME", f.root.join("witness"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env_remove("MINDS_WITNESS_SOCKET")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(minds());
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["enable", "--agent", "claude-code", "--witness", "managed"])
+    .env("HOME", f.path("user-home"))
+    .env("MINDS_WITNESS_HOME", f.root.join("witness"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .env_remove("MINDS_WITNESS_SOCKET")
+    .output()
+    .unwrap();
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("outside the repository"),
@@ -926,17 +1031,24 @@ fn doctor_probes_a_default_home_once() {
     let f = Fixture::new();
     assert!(f.enable("container").status.success());
     let home = f.home();
-    let out = Command::new(minds())
-        .current_dir(&f.root)
-        .args(["doctor"])
-        .env("HOME", f.path("user-home"))
-        .env("XDG_STATE_HOME", f.path("state"))
-        .env("MINDS_WITNESS_HOME", &home)
-        .env("MINDS_WITNESS_SOCKET", home.join("run/witness.sock"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .unwrap();
+    let out = {
+        let mut minds = Command::new(minds());
+        minds
+            .env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET");
+        minds
+    }
+    .current_dir(&f.root)
+    .args(["doctor"])
+    .env("HOME", f.path("user-home"))
+    .env("XDG_STATE_HOME", f.path("state"))
+    .env("MINDS_WITNESS_HOME", &home)
+    .env("MINDS_WITNESS_SOCKET", home.join("run/witness.sock"))
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+    .output()
+    .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(
         stdout
@@ -945,5 +1057,270 @@ fn doctor_probes_a_default_home_once() {
             .count(),
         1,
         "{stdout}"
+    );
+}
+
+/// Ohne `--witness` richtet `enable` immer einen Witness ein (Profil
+/// `local`): Home, Schlüssel, Nutzerdienst — und warnt, dass er ungeschützt
+/// läuft. `MINDS_WITNESS=print` startet ihn nicht, sondern druckt den Start.
+#[test]
+fn enable_sets_up_a_local_witness_by_default() {
+    let f = Fixture::new();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("witness set up (profile local)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("warning: the witness runs unprotected under your user ID"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains('\x1b'), "NO_COLOR: keine Farbe: {stderr}");
+    let home = f.home();
+    let config = fs::read_to_string(home.join("witness.json")).unwrap();
+    assert!(config.contains("\"local\""), "{config}");
+    assert!(home.join("key/witness_ed25519").exists());
+    assert!(f.service().exists(), "Dienstdatei geschrieben");
+    // Ein zweites `enable` ist idempotent.
+    let again = f.enable_default("print");
+    assert!(again.status.success(), "{}", text(&again));
+}
+
+/// `MINDS_WITNESS=off` lässt den Witness weg; ein unbekannter Wert ist ein
+/// Fehler, bevor irgendetwas geschrieben wird.
+#[test]
+fn enable_without_witness_and_unknown_mode() {
+    let f = Fixture::new();
+    let bad = f.enable_default("sometimes");
+    assert!(!bad.status.success(), "{}", text(&bad));
+    assert!(text(&bad).contains("MINDS_WITNESS must be on, print or off"));
+    assert!(!f.root.join(".claude").exists(), "nichts geschrieben");
+    assert!(!f.path("state").join("minds-witness").exists());
+    let out = f.enable_default("off");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!f.path("state").join("minds-witness").exists());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("warning"));
+}
+
+/// Ein Witness-Home, das ein anderes Repo pinnt (ein global gesetztes
+/// `MINDS_WITNESS_HOME`), wird nicht übernommen: Warnung, kein „running".
+#[test]
+fn enable_refuses_a_witness_home_of_another_repository() {
+    let a = Fixture::new();
+    let shared = a.path("shared-home");
+    let out = a.enable_default_with("print", &[("MINDS_WITNESS_HOME", shared.to_str().unwrap())]);
+    assert!(out.status.success(), "{}", text(&out));
+    let b = Fixture::new();
+    let out = b.enable_default_with("print", &[("MINDS_WITNESS_HOME", shared.to_str().unwrap())]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("belongs to another repository"), "{stderr}");
+    assert!(!stderr.contains("witness set up"), "{stderr}");
+}
+
+/// Scheitert der Dienstverwalter, warnt `enable` mit seiner Meldung und
+/// bleibt erfolgreich; antwortet danach kein Witness, ebenso.
+#[test]
+fn enable_warns_when_the_witness_cannot_be_started() {
+    let f = Fixture::new();
+    let stub = f.path("stub.sh");
+    fs::write(&stub, "#!/bin/sh\necho 'no session bus' >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = f.enable_default_with(
+        "on",
+        &[("MINDS_SERVICE_MANAGER_STUB", stub.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: witness not set up for this repository"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("no session bus"), "{stderr}");
+    assert!(!stderr.contains("witness running"), "{stderr}");
+
+    // Der Dienstverwalter gelingt (systemd: die Unit aus genau unserer Datei,
+    // ohne Drop-ins), aber kein Witness antwortet.
+    let ok = f.manager_stub("ok.sh", "");
+    let out = f.enable_default_with(
+        "on",
+        &[("MINDS_SERVICE_MANAGER_STUB", ok.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not answer"), "{stderr}");
+    // Der Ersatz bekam den Namen des Programms, das er ersetzt.
+    let calls = fs::read_to_string(f.path("ok.sh.log")).unwrap();
+    let manager = if cfg!(target_os = "macos") {
+        "launchctl bootstrap gui/"
+    } else {
+        "systemctl --user restart minds-witness-"
+    };
+    assert!(calls.contains(manager), "{calls}");
+}
+
+/// systemd: Eine Unit mit Drop-ins (oder aus einer anderen Datei) startet
+/// `enable` nicht — es warnt und bleibt erfolgreich.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn enable_refuses_a_unit_with_drop_ins() {
+    let f = Fixture::new();
+    let stub = f.manager_stub("dropin.sh", "/etc/systemd/user/x.service.d/evil.conf");
+    let out = f.enable_default_with(
+        "on",
+        &[("MINDS_SERVICE_MANAGER_STUB", stub.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("has drop-ins or comes from another file"),
+        "{stderr}"
+    );
+    let calls = fs::read_to_string(f.path("dropin.sh.log")).unwrap();
+    assert!(!calls.contains("restart"), "{calls}");
+}
+
+/// Ein Home unter der eigenen Nutzerkennung, das Profil `user` behauptet
+/// (ein `user`-Witness läuft unter eigenem Nutzer — der Agent könnte die
+/// Datei geschrieben haben): Warnung, nichts geändert, nichts gestartet.
+#[test]
+fn enable_warns_about_a_same_uid_home_claiming_profile_user() {
+    let f = Fixture::new();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let path = f.home().join("witness.json");
+    let config = fs::read_to_string(&path).unwrap();
+    let planted = config.replace("\"local\"", "\"user\"");
+    assert_ne!(planted, config);
+    fs::write(&path, &planted).unwrap();
+
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("claims profile user"), "{stderr}");
+    assert!(!stderr.contains("witness set up"), "{stderr}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), planted);
+}
+
+/// `local` hält die Policy bei jedem `enable` aus HEAD neu fest — eine
+/// später committete Verschärfung gilt, statt am ersten Stand zu hängen.
+#[test]
+fn enable_repins_the_policy_of_a_local_witness() {
+    let f = Fixture::new();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let path = f.home().join("witness.json");
+    assert!(!fs::read_to_string(&path).unwrap().contains("acme-internal"));
+
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"deny_pii":["acme-internal"]}"#,
+    )
+    .unwrap();
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "policy"]);
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let config = fs::read_to_string(&path).unwrap();
+    assert!(config.contains("acme-internal"), "{config}");
+}
+
+/// Auch neben einem laufenden Witness (er hält den Lock seines Homes) hält
+/// `enable` die neue Policy fest — und sagt, dass er neu starten muss.
+#[test]
+fn enable_repins_the_policy_next_to_a_running_witness() {
+    let f = Fixture::new();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let home = f.home();
+    let mut daemon = Command::new(minds())
+        .args(["witness", "run", "--home"])
+        .arg(&home)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let socket = home.join("run/witness.sock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "witness did not start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    fs::create_dir_all(f.root.join(".minds")).unwrap();
+    fs::write(
+        f.root.join(".minds/redact.json"),
+        r#"{"deny_pii":["acme-internal"]}"#,
+    )
+    .unwrap();
+    git(&f.root, &["add", ".minds/redact.json"]);
+    git(&f.root, &["commit", "-qm", "policy"]);
+    let out = f.enable_default("print");
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("keeps its old policy until restarted"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("not set up"), "{stderr}");
+    let config = fs::read_to_string(home.join("witness.json")).unwrap();
+    assert!(config.contains("acme-internal"), "{config}");
+}
+
+/// Ein relatives `MINDS_WITNESS_HOME` fände der Hook nie — `enable` warnt
+/// statt „running"; mit `MINDS_WITNESS_SOCKET` (der Container-Socket) richtet
+/// es gar keinen lokalen Witness ein.
+#[test]
+fn enable_skips_the_local_witness_when_another_is_named() {
+    let f = Fixture::new();
+    let out = f.enable_default_with("print", &[("MINDS_WITNESS_HOME", "relative-home")]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("MINDS_WITNESS_HOME must be an absolute path"),
+        "{stderr}"
+    );
+    assert!(!f.root.join("relative-home").exists());
+
+    let out = f.enable_default_with(
+        "print",
+        &[("MINDS_WITNESS_SOCKET", "/run/minds/witness.sock")],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("witness via MINDS_WITNESS_SOCKET"),
+        "{stderr}"
+    );
+    assert!(!f.path("state").join("minds-witness").exists());
+}
+
+/// Ein schon eingerichteter Witness (hier `container`) bleibt, wie er ist.
+#[test]
+fn enable_keeps_an_existing_witness_profile() {
+    let f = Fixture::new();
+    let out = f.enable("container");
+    assert!(out.status.success(), "{}", text(&out));
+    let config = fs::read_to_string(f.home().join("witness.json")).unwrap();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("a witness with profile container"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(
+        fs::read_to_string(f.home().join("witness.json")).unwrap(),
+        config
     );
 }
