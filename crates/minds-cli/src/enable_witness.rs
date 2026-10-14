@@ -194,6 +194,8 @@ fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<()> {
             socket_group: None,
             child_repo,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .map_err(other)?;
@@ -484,6 +486,9 @@ fn report_protected(installed: &crate::enable_protected::Installed) {
     for note in &installed.notes {
         eprintln!("minds: {note}");
     }
+    for key in &installed.intent_key {
+        eprintln!("minds: intent key at the witness: {key}");
+    }
     match &installed.signers {
         Some(line) if line.starts_with(minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL) => {
             eprintln!(
@@ -650,6 +655,8 @@ fn local_unix(
             socket_group: None,
             child_repo,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .map_err(other)?;

@@ -83,6 +83,8 @@ impl Fixture {
                 socket_group: None,
                 child_repo: None,
                 policy_rev: None,
+                intent_key: None,
+                replace_intent_key: false,
             },
         )
         .unwrap();
@@ -689,6 +691,8 @@ fn witness_processes_every_complete_frame_in_one_pass() {
         eof: false,
         pending: false,
         control: false,
+        challenge: None,
+        partial_since: None,
     };
     assert!(socket::step(&mut client, &mut writer).unwrap());
     assert!(client.bytes.is_empty());
@@ -717,6 +721,8 @@ fn witness_caps_frames_per_pass_without_dropping_any() {
         eof: false,
         pending: false,
         control: false,
+        challenge: None,
+        partial_since: None,
     };
     assert!(socket::step(&mut client, &mut writer).unwrap());
     assert!(client.pending);
@@ -1119,6 +1125,8 @@ fn witness_policy_is_pinned_at_init() {
             socket_group: None,
             child_repo: None,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap();
@@ -1209,6 +1217,8 @@ fn witness_init_is_idempotent_and_never_overwrites() {
         socket_group: None,
         child_repo: None,
         policy_rev: None,
+        intent_key: None,
+        replace_intent_key: false,
     };
     let before = fs::read(f.home.join("witness.json")).unwrap();
     // Auch „unverändert" nennt die Pins, die gelten.
@@ -1276,6 +1286,8 @@ fn witness_loads_a_schema_1_config_with_defaults() {
             socket_group: None,
             child_repo: None,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap();
@@ -1550,6 +1562,8 @@ fn witness_ignores_a_symlinked_policy_directory() {
             socket_group: None,
             child_repo: None,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap();
@@ -1581,6 +1595,8 @@ fn witness_init_refuses_an_unstable_policy() {
             socket_group: None,
             child_repo: None,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap_err();
@@ -1610,6 +1626,8 @@ fn witness_init_pins_a_child_repo_only_when_named() {
         socket_group: None,
         child_repo,
         policy_rev: None,
+        intent_key: None,
+        replace_intent_key: false,
     };
     let err = init_config(&f._dir.path().join("h1"), &request(None)).unwrap_err();
     assert!(err.to_string().contains("pass --child-repo"), "{err}");
@@ -1832,6 +1850,8 @@ fn witness_init_names_a_differing_store() {
             socket_group: None,
             child_repo: Some(&context),
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap_err();
@@ -1862,6 +1882,8 @@ fn witness_init_reads_the_policy_from_the_named_revision() {
         socket_group: None,
         child_repo: None,
         policy_rev,
+        intent_key: None,
+        replace_intent_key: false,
     };
 
     let Initialized::Created(pins) =
@@ -1967,6 +1989,8 @@ fn witness_init_unchanged_names_the_stored_policy_source() {
         socket_group: None,
         child_repo: None,
         policy_rev: None,
+        intent_key: None,
+        replace_intent_key: false,
     };
     assert!(matches!(
         init_config(&home, &request).unwrap(),
@@ -2006,6 +2030,8 @@ fn witness_init_refuses_replace_refs() {
             socket_group: None,
             child_repo: None,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap_err();
@@ -2028,6 +2054,8 @@ fn witness_init_on_an_unborn_head_pins_the_default() {
             socket_group: None,
             child_repo: None,
             policy_rev: None,
+            intent_key: None,
+            replace_intent_key: false,
         },
     )
     .unwrap() else {

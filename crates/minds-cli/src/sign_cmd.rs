@@ -87,14 +87,29 @@ fn sign(target: &str, key: Option<&str>) -> Fallible<()> {
 /// `git config user.signingkey`, falls gesetzt — der Weg, auf dem der
 /// Checkpoint entscheidet, ob er best-effort signiert.
 pub(crate) fn configured_key(root: &Path) -> Option<String> {
+    git_config_value(root, "user.signingkey")
+}
+
+/// Ein Wert aus der Git-Konfiguration des Repos (`git config <name>`).
+fn git_config_value(root: &Path, name: &str) -> Option<String> {
+    // Genau dieses Repo: Ein geerbtes `GIT_DIR` (etwa aus einem Git-Hook)
+    // ginge `-C` vor.
     let output = Command::new("git")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
         .arg("-C")
         .arg(root)
-        .args(["config", "user.signingkey"])
+        .args(["config", name])
         .output()
         .ok()?;
     let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (output.status.success() && !value.is_empty()).then_some(value)
+}
+
+/// Der eigene Freigabe-Schlüssel für Intents (`git config minds.intentKey`),
+/// falls gesetzt — siehe `minds enable` (geschützter Witness).
+pub(crate) fn intent_key_config(root: &Path) -> Option<String> {
+    git_config_value(root, "minds.intentKey")
 }
 
 /// Der Signaturschlüssel: `--key`, sonst `git config user.signingkey`.

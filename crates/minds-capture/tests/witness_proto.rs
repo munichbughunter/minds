@@ -104,6 +104,21 @@ fn examples() -> Vec<Frame> {
             request_id: ID,
             reason: String::new(),
         },
+        Frame::IntentChallenge { request_id: ID },
+        Frame::IntentActivateProven {
+            anchor: ANCHOR.into(),
+            signature: Some(SIGNATURE.into()),
+            nonce: "0a".repeat(32),
+            proof: SIGNATURE.into(),
+            request_id: ID,
+        },
+        Frame::IntentActivateProven {
+            anchor: "-".into(),
+            signature: None,
+            nonce: "f9".repeat(32),
+            proof: SIGNATURE.into(),
+            request_id: ID,
+        },
     ]
 }
 
@@ -154,8 +169,15 @@ fn frame_golden_vectors() {
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .collect();
-    assert_eq!(lines.len(), 6);
-    for (frame, line) in examples().into_iter().zip(lines) {
+    assert_eq!(lines.len(), 8);
+    // Die ersten sechs Beispiele, dann Nonce-Frage und Freigabe per
+    // Berührung (Anker, Signatur, Nonce `0a`×32, Freigabe = Signatur).
+    let all = examples();
+    let frames = all[..6]
+        .iter()
+        .chain([&all[all.len() - 3], &all[all.len() - 2]])
+        .cloned();
+    for (frame, line) in frames.zip(lines) {
         let (_, hex) = line.split_once(' ').unwrap();
         let expected: Vec<u8> = hex
             .as_bytes()
@@ -227,7 +249,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=4 | 0x81 | 0x82) {
+        if matches!(kind, 1..=6 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(
@@ -262,7 +284,11 @@ fn complete_payload_with_missing_fields_or_trailing_bytes_is_malformed() {
         }
         if matches!(
             frame,
-            Frame::Ping | Frame::CheckpointRequest { .. } | Frame::IntentActivate { .. }
+            Frame::Ping
+                | Frame::CheckpointRequest { .. }
+                | Frame::IntentActivate { .. }
+                | Frame::IntentChallenge { .. }
+                | Frame::IntentActivateProven { .. }
         ) {
             let mut extra = payload.to_vec();
             extra.push(0);
@@ -599,4 +625,45 @@ fn decode_never_panics() {
         mutated[index] = next() as u8;
         let _ = measured_decode(&mutated);
     }
+}
+
+#[test]
+fn proven_activation_requires_a_lowercase_hex_nonce_and_a_proof() {
+    let frame = |nonce: String, proof: &str| Frame::IntentActivateProven {
+        anchor: ANCHOR.into(),
+        signature: None,
+        nonce,
+        proof: proof.into(),
+        request_id: ID,
+    };
+    for nonce in [
+        "0A".repeat(32),
+        "0".repeat(63),
+        "0".repeat(65),
+        "g".repeat(64),
+        String::new(),
+    ] {
+        assert_eq!(
+            encode(&frame(nonce.clone(), SIGNATURE)),
+            Err(ProtoError::BadField("nonce")),
+            "{nonce}"
+        );
+    }
+    assert_eq!(
+        encode(&frame("0".repeat(64), "")),
+        Err(ProtoError::BadField("proof"))
+    );
+    assert_eq!(
+        encode(&frame("0".repeat(64), &"a".repeat(16 * 1024 + 1))),
+        Err(ProtoError::BadField("proof"))
+    );
+    // Dieselben Prüfungen beim Lesen: eine Großbuchstaben-Nonce von Hand.
+    let mut bytes = encode(&frame("0a".repeat(32), SIGNATURE)).unwrap();
+    let nonce = "0a".repeat(32);
+    let at = bytes
+        .windows(nonce.len())
+        .position(|window| window == nonce.as_bytes())
+        .unwrap();
+    bytes[at..at + nonce.len()].copy_from_slice("0A".repeat(32).as_bytes());
+    assert_eq!(measured_decode(&bytes), Err(ProtoError::BadField("nonce")));
 }

@@ -534,6 +534,8 @@ const SPECS: &[Spec] = &[
             "--socket-group",
             "--child-repo",
             "--policy-rev",
+            "--intent-key",
+            "--replace-intent-key",
         ],
         &["--follow"],
         1,

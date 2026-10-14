@@ -300,14 +300,56 @@ pub(crate) fn request(
     frame: &Frame,
     deadline: std::time::Instant,
 ) -> Result<Frame, &'static str> {
-    let request_id = match frame {
-        Frame::CheckpointRequest { request_id, .. } | Frame::IntentActivate { request_id, .. } => {
-            *request_id
-        }
-        _ => return Err("invalid frame"),
-    };
+    let request_id = request_id_of(frame)?;
     let bytes = witness_proto::encode(frame).map_err(|_| "invalid frame")?;
-    let response = exchange(socket, peer, &bytes, deadline).map_err(|err| {
+    answer(request_id, exchange(socket, peer, &bytes, deadline))
+}
+
+/// Die `request_id` einer Anfrage, die eine Antwort erwartet.
+fn request_id_of(frame: &Frame) -> Result<[u8; 16], &'static str> {
+    match frame {
+        Frame::CheckpointRequest { request_id, .. }
+        | Frame::IntentActivate { request_id, .. }
+        | Frame::IntentChallenge { request_id }
+        | Frame::IntentActivateProven { request_id, .. } => Ok(*request_id),
+        _ => Err("invalid frame"),
+    }
+}
+
+/// Mehrere Anfragen nacheinander auf **einer** Verbindung — die Nonce einer
+/// `IntentChallenge` gilt nur auf der Verbindung, die sie bekam.
+#[cfg(unix)]
+pub(crate) struct Conversation(std::os::unix::net::UnixStream);
+
+#[cfg(unix)]
+impl Conversation {
+    /// Verbindet wie [`request`] (Pfadprüfung, Gegenstelle `peer`).
+    pub(crate) fn open(
+        socket: &Path,
+        peer: Option<u32>,
+        deadline: std::time::Instant,
+    ) -> Result<Self, &'static str> {
+        connect(socket, peer, deadline)
+            .map(Self)
+            .map_err(|err| kind(&err))
+    }
+
+    /// Eine Anfrage, eine Antwort — wie [`request`].
+    pub(crate) fn request(
+        &mut self,
+        frame: &Frame,
+        deadline: std::time::Instant,
+    ) -> Result<Frame, &'static str> {
+        let request_id = request_id_of(frame)?;
+        let bytes = witness_proto::encode(frame).map_err(|_| "invalid frame")?;
+        answer(request_id, exchange_on(&mut self.0, &bytes, deadline))
+    }
+}
+
+/// Die Antwort auf die Anfrage `request_id`: genau ein `Ack` oder `Nack` mit
+/// derselben Id.
+fn answer(request_id: [u8; 16], response: std::io::Result<Vec<u8>>) -> Result<Frame, &'static str> {
+    let response = response.map_err(|err| {
         // Nur hier gibt es eine Antwort, die unpassend sein kann.
         if err.kind() == std::io::ErrorKind::InvalidData {
             "unexpected response"
@@ -341,6 +383,17 @@ fn exchange(
     request: &[u8],
     deadline: std::time::Instant,
 ) -> std::io::Result<Vec<u8>> {
+    let mut stream = connect(socket, peer, deadline)?;
+    exchange_on(&mut stream, request, deadline)
+}
+
+/// Wie [`exchange`], auf einer schon verbundenen Gegenstelle.
+#[cfg(unix)]
+fn exchange_on(
+    stream: &mut std::os::unix::net::UnixStream,
+    request: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<u8>> {
     use std::io::{ErrorKind, Read, Write};
     use std::time::Instant;
 
@@ -359,7 +412,6 @@ fn exchange(
         Err(err) if err.kind() == ErrorKind::InvalidInput => Ok(()),
         other => other,
     };
-    let mut stream = connect(socket, peer, deadline)?;
     let mut rest = request;
     while !rest.is_empty() {
         tolerate_closed_peer(stream.set_write_timeout(Some(remaining()?)))?;

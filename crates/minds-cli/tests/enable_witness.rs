@@ -1399,11 +1399,13 @@ fn enable_sets_up_the_protected_witness_with_one_elevation() {
     assert!(out.status.success(), "{}", text(&out));
     let args = fs::read_to_string(f.path("sudo.sh.args")).unwrap();
     let args: Vec<&str> = args.split("\n----\n").filter(|a| !a.is_empty()).collect();
-    assert_eq!(args.len(), 4, "{args:?}");
-    assert_eq!(args[0], "/bin/sh");
-    assert_eq!(args[1], "-c");
-    assert_eq!(args[3], "minds-protected-setup");
-    let script = args[2];
+    // `-k`: nie ein zwischengespeichertes Passwort, und keins für danach.
+    assert_eq!(args.len(), 5, "{args:?}");
+    assert_eq!(args[0], "-k");
+    assert_eq!(args[1], "/bin/sh");
+    assert_eq!(args[2], "-c");
+    assert_eq!(args[4], "minds-protected-setup");
+    let script = args[3];
     let root = f.root.to_str().unwrap();
     assert!(script.contains(&format!("ROOT='{root}'")), "{script}");
     assert!(script.contains("--profile user --socket-group"), "{script}");

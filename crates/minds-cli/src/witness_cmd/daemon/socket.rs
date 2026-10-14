@@ -243,6 +243,26 @@ pub(super) struct Client {
     /// Über den Steuer-Socket verbunden (Host-Seite), nicht über den der
     /// Agent-Seite.
     pub(super) control: bool,
+    /// Die Nonce, die diese Verbindung zuletzt bekam (`IntentChallenge`),
+    /// und wann — gültig für genau eine `IntentActivateProven` auf dieser
+    /// Verbindung, höchstens [`intent::CHALLENGE_TTL`] lang.
+    pub(super) challenge: Option<(String, Instant)>,
+    /// Seit wann ein unvollständiger Frame im Puffer liegt.
+    pub(super) partial_since: Option<Instant>,
+}
+
+impl Client {
+    /// Ob die Verbindung zu lange ohne vollständigen Frame war: Ein halb
+    /// gesendeter Frame bekommt die übliche Frist ab seinem ersten Byte;
+    /// still darf sie mit ausstehender Nonce so lange bleiben, wie eine
+    /// Berührung dauern darf, sonst die übliche Frist.
+    fn overdue(&self) -> bool {
+        match self.partial_since {
+            Some(at) if !self.bytes.is_empty() => at.elapsed() >= DEADLINE,
+            _ if self.challenge.is_some() => self.since.elapsed() >= intent::CHALLENGE_TTL,
+            _ => self.since.elapsed() >= DEADLINE,
+        }
+    }
 }
 
 pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
@@ -250,7 +270,12 @@ pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
     if !client.eof && !client.pending {
         match client.stream.read(&mut chunk) {
             Ok(0) => client.eof = true,
-            Ok(n) => client.bytes.extend_from_slice(&chunk[..n]),
+            Ok(n) => {
+                if client.bytes.is_empty() {
+                    client.partial_since = Some(Instant::now());
+                }
+                client.bytes.extend_from_slice(&chunk[..n]);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => return Ok(false),
         }
@@ -263,11 +288,20 @@ pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
             Ok((frame, used)) => {
                 client.bytes.drain(..used);
                 client.since = Instant::now();
+                client.partial_since = (!client.bytes.is_empty()).then(Instant::now);
                 if !dispatch(client, frame, writer)? {
                     return Ok(false);
                 }
+                // Die Frist für den nächsten Frame zählt ab der Antwort,
+                // nicht ab dem Eingang: Eine lange Prüfung (Store, fsync)
+                // schließt die Verbindung sonst, kaum dass sie geantwortet hat.
+                // Ebenso für einen schon halb angekommenen nächsten Frame.
+                client.since = Instant::now();
+                if !client.bytes.is_empty() {
+                    client.partial_since = Some(Instant::now());
+                }
             }
-            Err(ProtoError::Incomplete) if !client.eof && client.since.elapsed() < DEADLINE => {
+            Err(ProtoError::Incomplete) if !client.eof && !client.overdue() => {
                 return Ok(true);
             }
             Err(_) => {
@@ -354,7 +388,111 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
             } else if anchor == intent::CLEAR_INTENT {
                 writer.clear_intent().map(Ok)
             } else {
-                writer.activate_intent(&anchor, signature)
+                writer.activate_by_control(&anchor, signature)
+            };
+            let answer = match outcome? {
+                Ok(status) => Frame::Ack { request_id, status },
+                Err(reason) => Frame::Nack {
+                    request_id,
+                    reason: reason.into(),
+                },
+            };
+            let bytes = witness_proto::encode(&answer)?;
+            if client.stream.write_all(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        Frame::IntentChallenge { request_id } => {
+            // Nur mit festgehaltenem Schlüssel: Ohne ihn gäbe es keine
+            // Freigabe, die die Nonce verbrauchen könnte.
+            // Höchstens [`intent::MAX_OPEN_CHALLENGES`] Verbindungen halten
+            // zugleich eine Nonce (und dürfen dafür länger offen bleiben) —
+            // sonst belegte der Agent mit wenigen Nonces alle Plätze der
+            // Hooks. Wer schon eine hält, bekommt eine neue.
+            let full =
+                client.challenge.is_none() && writer.open_challenges >= intent::MAX_OPEN_CHALLENGES;
+            let pinned = if full {
+                Ok(None)
+            } else {
+                writer.pinned_intent_key()
+            };
+            let answer = if full {
+                Frame::Nack {
+                    request_id,
+                    reason: "too many open approvals at this witness".into(),
+                }
+            } else if matches!(pinned, Ok(None)) {
+                Frame::Nack {
+                    request_id,
+                    reason: crate::intent_proof::NO_INTENT_KEY.into(),
+                }
+            } else if pinned.is_err() {
+                Frame::Nack {
+                    request_id,
+                    reason: crate::intent_proof::NOT_CHECKABLE.into(),
+                }
+            } else {
+                match intent::new_nonce() {
+                    Ok(nonce) => {
+                        if client.challenge.is_none() {
+                            writer.open_challenges += 1;
+                        }
+                        client.challenge = Some((nonce.clone(), Instant::now()));
+                        Frame::Ack {
+                            request_id,
+                            status: format!("nonce {nonce}"),
+                        }
+                    }
+                    Err(_) => Frame::Nack {
+                        request_id,
+                        reason: "no randomness for a nonce".into(),
+                    },
+                }
+            };
+            let bytes = witness_proto::encode(&answer)?;
+            if client.stream.write_all(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        Frame::IntentActivateProven {
+            anchor,
+            signature,
+            nonce,
+            proof,
+            request_id,
+        } => {
+            // `ssh-keygen` läuft in der Eventloop: höchstens einmal je
+            // [`intent::VERIFY_INTERVAL`] — eine Flut erfundener Freigaben
+            // hält die Hooks nicht auf. Wer gebremst wird, behält seine
+            // Nonce und schickt dieselbe Freigabe noch einmal; sonst könnte
+            // der Agent die Freigabe des Menschen mit seiner Flut entwerten.
+            let throttled = client.challenge.is_some()
+                && writer
+                    .last_verify
+                    .is_some_and(|at| at.elapsed() < intent::VERIFY_INTERVAL);
+            // Sonst gilt die Nonce einmal: Sie ist verbraucht, wie auch immer
+            // die Prüfung ausgeht.
+            let issued = if throttled {
+                None
+            } else {
+                client.challenge.take()
+            };
+            if issued.is_some() {
+                writer.open_challenges = writer.open_challenges.saturating_sub(1);
+            }
+            let fresh = issued.is_some_and(|(issued, at)| {
+                issued == nonce && at.elapsed() < intent::CHALLENGE_TTL
+            });
+            // Aufheben bleibt dem Steuer-Socket: Eine Freigabe gilt einer
+            // Anforderung, nicht ihrem Fehlen.
+            let outcome = if throttled {
+                Ok(Err(crate::intent_proof::THROTTLED))
+            } else if !fresh {
+                Ok(Err("no fresh challenge on this connection"))
+            } else if anchor == intent::CLEAR_INTENT {
+                Ok(Err("clearing an intent needs the control socket"))
+            } else {
+                writer.activate_by_touch(&anchor, signature, &nonce, &proof)
             };
             let answer = match outcome? {
                 Ok(status) => Frame::Ack { request_id, status },
@@ -532,6 +670,7 @@ fn serve(listener: &UnixListener, control: &UnixListener, writer: &mut Writer) -
     let mut accept_logged = None;
     while !STOP.load(Ordering::Relaxed) {
         writer.next_step();
+        writer.open_challenges = clients.iter().filter(|c| c.challenge.is_some()).count();
         accept(control, true, &mut clients, writer, &mut accept_logged);
         accept(listener, false, &mut clients, writer, &mut accept_logged);
         let mut idx = 0;
@@ -595,6 +734,8 @@ pub(super) fn accept(
                     eof: false,
                     pending: false,
                     control,
+                    challenge: None,
+                    partial_since: None,
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -640,6 +781,8 @@ mod tests {
             eof: false,
             pending: false,
             control: false,
+            challenge: None,
+            partial_since: None,
         }
     }
 

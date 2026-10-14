@@ -14,7 +14,8 @@ mod daemon;
 
 #[cfg(unix)]
 pub(crate) use daemon::{
-    CONTROL_SOCKET, InitRequest, Initialized, UNPINNED, init_config, load, peer_uid, ping,
+    CONTROL_SOCKET, InitRequest, Initialized, UNPINNED, init_config, intent_key_line,
+    key_display_with, load, peer_uid, ping,
 };
 
 /// Das versteckte Unterkommando, unter dem der Witness seinen Checkpoint als
@@ -38,7 +39,7 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
     let result = (|| {
         let command = parsed
             .positional(0)
-            .ok_or("expected: witness init, run, keygen, signers or status")?;
+            .ok_or("expected: witness init, run, keygen, signers, status or activate")?;
         if command != "init"
             && [
                 "--repo",
@@ -47,12 +48,15 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
                 "--socket-group",
                 "--child-repo",
                 "--policy-rev",
+                "--intent-key",
+                "--replace-intent-key",
             ]
             .iter()
             .any(|flag| parsed.value(flag).is_some())
         {
             return Err(
-                "--repo, --path-map, --profile, --socket-group, --child-repo and --policy-rev require witness init"
+                "--repo, --path-map, --profile, --socket-group, --child-repo, --policy-rev, \
+                 --intent-key and --replace-intent-key require witness init"
                     .into(),
             );
         }
@@ -66,6 +70,10 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
             return daemon::worker(Path::new(home)).map(|()| String::new());
         }
         let home = resolve_home_for(parsed.value("--home"), parsed.value("--repo"))?;
+        if parsed.value("--intent-key").is_some() && parsed.value("--replace-intent-key").is_some()
+        {
+            return Err("--intent-key and --replace-intent-key exclude each other".into());
+        }
         match command {
             "keygen" => keygen(&home),
             "init" => daemon::init(
@@ -77,6 +85,10 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
                     socket_group: parsed.value("--socket-group"),
                     child_repo: parsed.value("--child-repo").map(Path::new),
                     policy_rev: parsed.value("--policy-rev"),
+                    intent_key: parsed
+                        .value("--intent-key")
+                        .or(parsed.value("--replace-intent-key")),
+                    replace_intent_key: parsed.value("--replace-intent-key").is_some(),
                 },
             ),
             "run" => {
@@ -89,7 +101,8 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
             // lesen kann.
             "signers" => existing_signers_line(&home)?
                 .ok_or_else(|| "no witness key — run minds witness keygen".into()),
-            _ => Err("expected: witness init, run, keygen, signers or status".into()),
+            "activate" => activate(&home),
+            _ => Err("expected: witness init, run, keygen, signers, status or activate".into()),
         }
     })();
     match result {
@@ -107,6 +120,71 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
             ExitCode::from(4)
         }
     }
+}
+
+/// Höchstens so viel liest `witness activate` von stdin.
+#[cfg(unix)]
+const MAX_ACTIVATE_REQUEST: u64 = 64 * 1024;
+
+/// `minds witness activate`: aktiviert einen Intent über den Steuer-Socket
+/// dieses Homes — als der Witness-Nutzer selbst, denn nur dessen
+/// Verbindungen nimmt der Steuer-Socket an. Beim geschützten Witness ruft
+/// `minds intent sign` das mit der einen Erhöhung auf (das Passwort des
+/// Menschen ist der Beleg). Anker und Signatur kommen als JSON über stdin
+/// (`{"anchor": …, "signature": …}`); der Anker `-` hebt die Aktivierung
+/// auf. Ausgegeben wird die Statuszeile des Witness.
+#[cfg(unix)]
+fn activate(home: &Path) -> Fallible<String> {
+    use minds_capture::witness_proto::Frame;
+    use std::io::Read;
+
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        anchor: String,
+        #[serde(default)]
+        signature: Option<String>,
+    }
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_ACTIVATE_REQUEST + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_ACTIVATE_REQUEST {
+        return Err("activation request too large".into());
+    }
+    let request: Request =
+        serde_json::from_slice(&bytes).map_err(|_| "activation request unreadable")?;
+    let socket = std::path::absolute(home)?.join(CONTROL_SOCKET);
+    let frame = Frame::IntentActivate {
+        anchor: request.anchor,
+        signature: request.signature,
+        request_id: crate::intent_cmd::request_id(),
+    };
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    match crate::hook::witness::request(&socket, Some(euid), &frame, deadline) {
+        Ok(Frame::Ack { status, .. }) => Ok(crate::text::sanitize(&status)),
+        Ok(Frame::Nack { reason, .. }) => {
+            Err(format!("the witness refused it: {}", crate::text::sanitize(&reason)).into())
+        }
+        Ok(_) => Err("witness control socket: unexpected response".into()),
+        Err(kind) => Err(format!("witness control socket not reachable ({kind})").into()),
+    }
+}
+
+/// Der Rechnername (`gethostname`).
+#[cfg(unix)]
+fn host_name() -> Fallible<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: Puffer und Länge passen zusammen; `gethostname` schreibt
+    // höchstens so viele Bytes.
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return Err("hostname failed".into());
+    }
+    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+    Ok(String::from_utf8(buffer[..end].to_vec())?)
 }
 
 #[cfg(unix)]
@@ -230,11 +308,8 @@ pub(crate) fn keygen(home: &Path) -> Fallible<String> {
              principal; its ranges stay A1"
         );
     }
-    let host = Command::new("hostname").stdin(Stdio::null()).output()?;
-    if !host.status.success() {
-        return Err("hostname failed".into());
-    }
-    let host = String::from_utf8(host.stdout)?;
+    // Im Prozess, nicht über ein `hostname` aus dem `PATH`.
+    let host = host_name()?;
     let host = host.trim();
     // Keep the principal a literal token in allowed_signers (no patterns or options).
     if host.is_empty()
@@ -257,7 +332,11 @@ pub(crate) fn keygen(home: &Path) -> Fallible<String> {
     // make ssh-keygen overwrite an existing private or public key.
     let temporary = tempfile::tempdir_in(&key_dir)?;
     let generated = temporary.path().join("witness_ed25519");
-    let output = Command::new("ssh-keygen")
+    // Dasselbe `ssh-keygen` wie der Dienst (fest, ohne geerbte Umgebung):
+    // `keygen` kann als Witness-Nutzer mit dem `PATH` des Entwicklers laufen.
+    let program = daemon::witness_keygen().ok_or("no root-owned ssh-keygen found")?;
+    let output = Command::new(&program)
+        .env_clear()
         .args(["-q", "-t", "ed25519", "-N", "", "-C", &principal, "-f"])
         .arg(&generated)
         .stdin(Stdio::null())

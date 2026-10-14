@@ -13,6 +13,12 @@
 //! to `None`. Request IDs are supplied by the caller. Intent anchors and signatures
 //! are opaque UTF-8 here: anchor semantics belong to EA-14 and signature verification
 //! belongs to the verifier, never to this capture-time codec.
+//!
+//! `IntentChallenge` and `IntentActivateProven` belong together on **one**
+//! connection: the witness answers the challenge with a one-time nonce that is
+//! valid only on that connection; the proof (an SSH signature by the human's
+//! pinned security key) covers anchor id and nonce. Whether it holds is the
+//! witness's decision, not this codec's.
 
 /// Protocol identity (first seven bytes) and version (last byte).
 pub const MAGIC: [u8; 8] = *b"MWIT\0\0\0\x01";
@@ -39,6 +45,19 @@ pub enum Frame {
     IntentActivate {
         anchor: String,
         signature: Option<String>,
+        request_id: [u8; 16],
+    },
+    /// Asks for a one-time nonce for [`Frame::IntentActivateProven`].
+    IntentChallenge {
+        request_id: [u8; 16],
+    },
+    /// An activation the human approved just now: `proof` signs anchor id and
+    /// `nonce` (64 lowercase hex digits).
+    IntentActivateProven {
+        anchor: String,
+        signature: Option<String>,
+        nonce: String,
+        proof: String,
         request_id: [u8; 16],
     },
     Ack {
@@ -99,6 +118,24 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             let signature = signature.as_deref().unwrap_or_default();
             out.extend_from_slice(&(signature.len() as u32).to_le_bytes());
             out.extend_from_slice(signature.as_bytes());
+            out.extend_from_slice(request_id);
+        }
+        Frame::IntentChallenge { request_id } => {
+            out.push(0x05);
+            out.extend_from_slice(request_id);
+        }
+        Frame::IntentActivateProven {
+            anchor,
+            signature,
+            nonce,
+            proof,
+            request_id,
+        } => {
+            out.push(0x06);
+            put_short(&mut out, anchor);
+            put_long(&mut out, signature.as_deref().unwrap_or_default());
+            put_short(&mut out, nonce);
+            put_long(&mut out, proof);
             out.extend_from_slice(request_id);
         }
         Frame::Ack { request_id, status } => {
@@ -182,6 +219,29 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
                 request_id,
             }
         }
+        0x05 => {
+            let request_id = cursor.request_id()?;
+            cursor.finish()?;
+            Frame::IntentChallenge { request_id }
+        }
+        0x06 => {
+            let anchor = cursor.short_text("anchor")?;
+            check_anchor(anchor)?;
+            let signature = cursor.long_text("signature")?;
+            let nonce = cursor.short_text("nonce")?;
+            check_nonce(nonce)?;
+            let proof = cursor.long_text("proof")?;
+            check_proof(proof)?;
+            let request_id = cursor.request_id()?;
+            cursor.finish()?;
+            Frame::IntentActivateProven {
+                anchor: anchor.to_owned(),
+                signature: optional(signature),
+                nonce: nonce.to_owned(),
+                proof: proof.to_owned(),
+                request_id,
+            }
+        }
         0x81 | 0x82 => {
             let request_id = cursor.request_id()?;
             let field = if kind == 0x81 { "status" } else { "reason" };
@@ -227,6 +287,20 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
         } => {
             check_anchor(anchor)?;
             (23 + anchor.len()).saturating_add(signature.as_ref().map_or(0, String::len))
+        }
+        Frame::IntentChallenge { .. } => 17,
+        Frame::IntentActivateProven {
+            anchor,
+            signature,
+            nonce,
+            proof,
+            ..
+        } => {
+            check_anchor(anchor)?;
+            check_nonce(nonce)?;
+            check_proof(proof)?;
+            (29 + anchor.len() + nonce.len() + proof.len())
+                .saturating_add(signature.as_ref().map_or(0, String::len))
         }
         Frame::Ack { status, .. } => {
             check_line(status, MAX_TEXT, "status")?;
@@ -275,6 +349,28 @@ fn check_anchor(value: &str) -> Result<(), ProtoError> {
     Ok(())
 }
 
+/// The nonce of a challenge: exactly 64 lowercase hex digits (32 bytes).
+pub const NONCE_HEX: usize = 64;
+
+fn check_nonce(value: &str) -> Result<(), ProtoError> {
+    if value.len() != NONCE_HEX
+        || !value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ProtoError::BadField("nonce"));
+    }
+    Ok(())
+}
+
+/// An armored SSH signature is a few hundred bytes; 16 KiB is generous.
+fn check_proof(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty() || value.len() > 16 * 1024 {
+        return Err(ProtoError::BadField("proof"));
+    }
+    Ok(())
+}
+
 fn text<'a>(bytes: &'a [u8], field: &'static str) -> Result<&'a str, ProtoError> {
     std::str::from_utf8(bytes).map_err(|_| ProtoError::BadField(field))
 }
@@ -286,6 +382,12 @@ fn optional(value: &str) -> Option<String> {
 fn put_short(out: &mut Vec<u8>, value: &str) {
     // All callers validated the byte length before allocating the output.
     out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn put_long(out: &mut Vec<u8>, value: &str) {
+    // The total frame length (≤ MAX_FRAME) was checked before.
+    out.extend_from_slice(&(value.len() as u32).to_le_bytes());
     out.extend_from_slice(value.as_bytes());
 }
 
@@ -302,6 +404,12 @@ impl<'a> Cursor<'a> {
     fn short_text(&mut self, field: &'static str) -> Result<&'a str, ProtoError> {
         let len = self.take(2, field)?;
         let len = u16::from_le_bytes(len.try_into().unwrap());
+        text(self.take(len as usize, field)?, field)
+    }
+
+    fn long_text(&mut self, field: &'static str) -> Result<&'a str, ProtoError> {
+        let len = self.take(4, field)?;
+        let len = u32::from_le_bytes(len.try_into().unwrap());
         text(self.take(len as usize, field)?, field)
     }
 

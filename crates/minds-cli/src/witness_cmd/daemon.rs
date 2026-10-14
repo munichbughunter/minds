@@ -38,6 +38,7 @@ pub(crate) fn separated_here(home: &Path, with_key: bool) -> bool {
     })
 }
 mod intent;
+pub(crate) use intent::witness_keygen;
 mod limits;
 mod observer;
 mod socket;
@@ -114,6 +115,13 @@ pub(crate) struct Config {
     /// späteres `init` sie nennen kann.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     policy_source: Option<String>,
+    /// Der Sicherheitsschlüssel (FIDO, `sk-…`) des Menschen, der Intents
+    /// freigibt — `<typ> <base64>`. Mit ihm signierte, frische Freigaben
+    /// nimmt der Witness auch auf dem Socket der Agent-Seite an
+    /// (`IntentActivateProven`): Die Berührung belegt den Menschen. Ohne ihn
+    /// aktiviert nur der Steuer-Socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    intent_key: Option<String>,
 }
 
 /// Die Schema-Version, die `init` schreibt. Gelesen wird auch 1 (ohne Pins).
@@ -130,6 +138,15 @@ impl Config {
 
     pub(crate) fn socket_group(&self) -> Option<u32> {
         self.socket_group
+    }
+
+    /// Der festgehaltene Freigabe-Schlüssel, nur wenn er die Form hat, die
+    /// `init` schreibt ([`intent_key_line`]) — eine von Hand verbogene Zeile
+    /// gilt nicht.
+    pub(crate) fn intent_key(&self) -> Option<&str> {
+        self.intent_key
+            .as_deref()
+            .filter(|line| intent_key_line(line).is_ok_and(|parsed| parsed == *line))
     }
 
     /// Die Repo-Wurzel, für die dieser Witness eingerichtet ist.
@@ -199,6 +216,14 @@ pub(crate) struct Pins {
     pub(crate) git_dir: PathBuf,
     pub(crate) store: String,
     pub(crate) policy: String,
+    /// Typ und Fingerabdruck des Freigabe-Schlüssels, falls einer
+    /// festgehalten ist.
+    pub(crate) intent_key: Option<String>,
+    /// Ein genannter anderer Schlüssel, der **nicht** festgehalten wurde
+    /// (es galt schon einer; ersetzt wird nur ausdrücklich).
+    pub(crate) intent_key_refused: Option<String>,
+    /// Ob `init` den Freigabe-Schlüssel eben (neu) festgehalten hat.
+    pub(crate) intent_key_new: bool,
 }
 
 impl Pins {
@@ -216,17 +241,83 @@ impl Pins {
             git_dir: config.git_dir(),
             store,
             policy: format!("{policy_source}, {terms} custom term(s), floored at the default"),
+            intent_key: config.intent_key().map(key_display),
+            intent_key_refused: None,
+            intent_key_new: false,
         }
     }
 
     /// Die Zeilen für den Bericht.
     pub(crate) fn lines(&self) -> Vec<String> {
-        vec![
+        let mut lines = vec![
             format!("pinned git dir: {}", self.git_dir.display()),
             format!("pinned store:   {}", self.store),
             format!("pinned policy:  {}", self.policy),
-        ]
+        ];
+        if let Some(key) = &self.intent_key {
+            if self.intent_key_new {
+                lines.push(format!(
+                    "intent key:     {key} (newly pinned — in effect at once)"
+                ));
+            } else {
+                lines.push(format!("intent key:     {key}"));
+            }
+        }
+        if let Some(key) = &self.intent_key_refused {
+            lines.push(format!(
+                "intent key:     {key} NOT pinned — another key is pinned; replace it with \
+                 witness init --replace-intent-key"
+            ));
+        }
+        lines
     }
+}
+
+/// `sk-ssh-ed25519 SHA256:<…>` — der volle Fingerabdruck, wie
+/// `ssh-keygen -l` ihn zeigt: Wer vergleicht, soll ihn mit dem seines
+/// Sicherheitsschlüssels vergleichen können (ein Ende der Base64-Zeile
+/// trüge nur wenige Bytes des Schlüssels).
+pub(crate) fn key_display(line: &str) -> String {
+    // Ein fester, absoluter Pfad (dann ohne geerbte Umgebung): `init` kann
+    // als Witness-Nutzer mit dem `PATH` des Entwicklers laufen — ein dort
+    // abgelegtes `ssh-keygen` liefe sonst als Witness-Nutzer.
+    match intent::witness_keygen() {
+        Some(program) => key_display_with(&program, line),
+        None => key_display_with(Path::new("/nonexistent/ssh-keygen"), line),
+    }
+}
+
+/// Wie [`key_display`], mit genau dem Programm `program`.
+pub(crate) fn key_display_with(program: &Path, line: &str) -> String {
+    let kind = line.split_whitespace().next().unwrap_or_default();
+    let kind = kind.strip_suffix("@openssh.com").unwrap_or(kind);
+    match minds_attest::ssh_fingerprint_with(program, line) {
+        Some(fingerprint) => format!("{kind} {fingerprint}"),
+        None => format!("{kind} (fingerprint unavailable)"),
+    }
+}
+
+/// Prüft eine `.pub`-Zeile als Freigabe-Schlüssel und bringt sie in die
+/// Form `<typ> <base64>` (ohne Kommentar). Nur ein Sicherheitsschlüssel
+/// (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`),
+/// kein Zertifikat: Nur seine Berührung belegt einen Menschen.
+pub(crate) fn intent_key_line(text: &str) -> Fallible<String> {
+    let mut words = text.split_whitespace();
+    let (Some(kind), Some(blob)) = (words.next(), words.next()) else {
+        return Err("--intent-key must be an SSH public key line".into());
+    };
+    if !minds_attest::is_security_key_type(kind) || kind.contains("-cert-") {
+        return Err(
+            "--intent-key must be a security key (sk-ssh-ed25519 or sk-ecdsa-sha2-nistp256): \
+             only its touch proves a human"
+                .into(),
+        );
+    }
+    let line = format!("{kind} {blob}");
+    if minds_attest::public_key_blob(&line).is_none() {
+        return Err("--intent-key is not a valid SSH public key".into());
+    }
+    Ok(line)
 }
 
 /// Die Wünsche an `init`, wie sie von der Kommandozeile oder aus
@@ -242,6 +333,15 @@ pub(crate) struct InitRequest<'a> {
     /// Aus welchem Commit die Policy gelesen wird (Standard: HEAD) — etwa der
     /// geprüfte Stand `origin/main`.
     pub(crate) policy_rev: Option<&'a str>,
+    /// Der Freigabe-Schlüssel des Menschen (`.pub`-Zeile eines
+    /// Sicherheitsschlüssels). Festgehalten wird er nur, wo noch keiner gilt
+    /// — oder mit `replace_intent_key`; ohne Nennung bleibt der
+    /// festgehaltene.
+    pub(crate) intent_key: Option<&'a str>,
+    /// Einen schon festgehaltenen Freigabe-Schlüssel ersetzen
+    /// (`--replace-intent-key`) — nie still: Die Einrichtung liest den
+    /// Schlüssel aus einer Konfiguration, die auch der Agent schreibt.
+    pub(crate) replace_intent_key: bool,
 }
 
 pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
@@ -256,6 +356,10 @@ pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
         }
         Initialized::Pinned(pins) => {
             lines.push("Witness configuration pinned (schema 2).".to_owned());
+            lines.extend(pins.lines());
+        }
+        Initialized::Unchanged(pins) if pins.intent_key_new => {
+            lines.push("Witness configuration unchanged; intent key pinned.".to_owned());
             lines.extend(pins.lines());
         }
         Initialized::Unchanged(pins) => {
@@ -290,6 +394,22 @@ pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
 ///   Policy, die ihre eigenen Platzhalter träfe (jede redigierte Session
 ///   würde instabil und vertagt), wird abgelehnt.
 pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<Initialized> {
+    let mut note = (None, false);
+    let mut initialized = init_config_noting(home, request, &mut note)?;
+    let (Initialized::Created(pins) | Initialized::Unchanged(pins) | Initialized::Pinned(pins)) =
+        &mut initialized;
+    pins.intent_key_refused = note.0;
+    pins.intent_key_new = note.1;
+    Ok(initialized)
+}
+
+/// [`init_config`]; `note` nennt einen genannten, aber nicht
+/// festgehaltenen Freigabe-Schlüssel und ob einer neu festgehalten wurde.
+fn init_config_noting(
+    home: &Path,
+    request: &InitRequest<'_>,
+    note: &mut (Option<String>, bool),
+) -> Fallible<Initialized> {
     let home: PathBuf = home.components().collect();
     // Die Wurzel über das Dateisystem, nicht über `git rev-parse`: Das
     // folgte `core.worktree` aus der `.git/config` des Agenten und hielte
@@ -330,6 +450,7 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
     if socket_group.is_some() && profile != WitnessProfile::User {
         return Err("--socket-group is only valid for the user profile".into());
     }
+    let intent_key = request.intent_key.map(intent_key_line).transpose()?;
 
     // Schon eingerichtet? Dann nur vergleichen — ohne Lock, damit ein
     // erneutes `enable --witness` auch neben einem laufenden Witness gelingt.
@@ -345,7 +466,11 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
         if existing.profile != profile {
             differs.push("profile");
         }
-        if existing.socket_group != socket_group {
+        // Wer nur den Freigabe-Schlüssel ersetzt, muss die Gruppe nicht
+        // erneut nennen.
+        if existing.socket_group != socket_group
+            && !(request.replace_intent_key && request.socket_group.is_none())
+        {
             differs.push("socket group");
         }
         // Ausdrücklich Genanntes, das nicht dem Festgehaltenen entspricht,
@@ -377,6 +502,25 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
                 differs.join(", ")
             )
             .into());
+        }
+        // Ein genannter Freigabe-Schlüssel wird festgehalten, wo noch keiner
+        // gilt; einen geltenden ersetzt nur `--replace-intent-key` — sonst
+        // könnte ein späteres `enable` still den Schlüssel aus einer
+        // Konfiguration übernehmen, die der Agent inzwischen umgebogen hat.
+        // Der andere wird genannt, nicht gespeichert. Ohne Lock wie unten;
+        // der laufende Dienst liest ihn bei der nächsten Prüfung (atomarer
+        // Tausch, kein halber Stand).
+        // „Keiner festgehalten" heißt: das Feld fehlt. Ein vorhandener, aber
+        // (heute) ungültiger Eintrag gilt zur Laufzeit nicht — ersetzt wird
+        // er trotzdem nur ausdrücklich. Geschrieben wird er erst, wenn
+        // nichts anderes mehr scheitern kann (unten, auf jedem Weg).
+        if let Some(key) = intent_key.filter(|key| existing.intent_key.as_ref() != Some(key)) {
+            if existing.intent_key.is_none() || request.replace_intent_key {
+                existing.intent_key = Some(key);
+                note.1 = true;
+            } else {
+                note.0 = Some(key_display(&key));
+            }
         }
         // `local` bezeugt nur A1, und HEAD schreibt ohnehin der Agent: Ein
         // eingefrorener Stand schützte nichts, verlöre aber jede spätere
@@ -419,6 +563,12 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
                 .as_deref()
                 .map(crate::text::sanitize)
                 .unwrap_or_else(|| "pinned earlier (source not recorded)".to_owned());
+            if note.1 {
+                atomic(
+                    &home.join("witness.json"),
+                    &serde_json::to_vec_pretty(&existing)?,
+                )?;
+            }
             return Ok(Initialized::Unchanged(Pins::of(&existing, &source)));
         }
         // Schema 1 ergänzen: dieselben Quellen wie bei einer neuen Einrichtung.
@@ -474,6 +624,7 @@ pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<In
         store: Some(pins.1),
         redaction: Some(pins.2),
         policy_source: Some(source.clone()),
+        intent_key,
     };
     let mut file = private_new(&home.join("witness.json"))?;
     file.write_all(&serde_json::to_vec_pretty(&config)?)?;
@@ -933,7 +1084,9 @@ fn lock(home: &Path) -> Fallible<File> {
 fn fingerprint(home: &Path) -> Fallible<String> {
     let key = home.join("key/witness_ed25519");
     validate_tree(&key)?;
-    let output = Command::new("ssh-keygen")
+    let program = intent::witness_keygen().ok_or("no root-owned ssh-keygen found")?;
+    let output = Command::new(&program)
+        .env_clear()
         .args(["-l", "-E", "sha256", "-f"])
         .arg(&key)
         .stdin(Stdio::null())
@@ -1139,7 +1292,23 @@ struct Writer {
     /// Je Session der zuletzt eingetragene Anker (Cache der Einträge in
     /// `evidence/folders/*.intent`, siehe `intent`).
     intent_seen: BTreeMap<SessionKey, Option<minds_core::ContentHash>>,
+    /// Prüft eine Freigabe per Berührung (Nachricht, Signatur,
+    /// Signer-Datei) — im Dienst `ssh-keygen -Y verify`; im Test ersetzbar,
+    /// weil eine echte FIDO-Signatur Hardware braucht.
+    verify_activation: fn(&str, &str, &Path, &str) -> Option<bool>,
+    /// Wann zuletzt eine Freigabe mit `ssh-keygen` geprüft wurde.
+    last_verify: Option<std::time::Instant>,
+    /// Der zuletzt aus `witness.json` gelesene Freigabe-Schlüssel und der
+    /// Stand der Datei, aus dem er stammt (Inode, Zeit, Größe).
+    pin_cache: Option<(FileStamp, Option<String>)>,
+    /// Wie viele Verbindungen gerade eine Nonce halten (je Durchlauf der
+    /// Eventloop gezählt).
+    open_challenges: usize,
 }
+
+/// Der Stand einer Datei: Gerät, Inode, Änderungszeit, Statuszeit (je
+/// Sekunden, Nanosekunden), Größe.
+pub(super) type FileStamp = (u64, u64, i64, i64, i64, i64, u64);
 
 /// Höchstzahl der `fs.observed`-Appends je Durchlauf der Eventloop.
 const FS_APPENDS_PER_STEP: usize = 64;
@@ -1180,6 +1349,10 @@ impl Writer {
             // eines Checkpoints braucht ihn nicht.
             intent: None,
             intent_seen: BTreeMap::new(),
+            verify_activation: intent::ssh_verify,
+            last_verify: None,
+            pin_cache: None,
+            open_challenges: 0,
         })
     }
 

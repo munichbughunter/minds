@@ -18,6 +18,7 @@ LABEL={{LABEL}}
 PLIST={{SERVICE_FILE}}
 MDIR={{MANAGED_DIR}}
 PREVIOUS={{MANAGED_PREVIOUS}}
+INTENT_KEY={{INTENT_KEY}}
 
 fail() { echo "minds: $*" >&2; exit 1; }
 owner_of() { /usr/bin/stat -f '%u' "$1"; }
@@ -141,7 +142,16 @@ as_witness() {
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$ROOT" \
     MINDS_WITNESS_HOME="$HOME_DIR" "$BIN" "$@"
 }
-as_witness witness init --repo "$ROOT" --profile user --socket-group "$WUSER" >/dev/null
+# Your intent key (if minds.intentKey names a security key) is pinned as the key that
+# approves intents: a fresh touch activates one over the witness socket. A key
+# pinned earlier is never replaced here (witness init --replace-intent-key).
+if [ -n "$INTENT_KEY" ]; then
+  out=$(as_witness witness init --repo "$ROOT" --profile user --socket-group "$WUSER" \
+    --intent-key "$INTENT_KEY")
+else
+  out=$(as_witness witness init --repo "$ROOT" --profile user --socket-group "$WUSER")
+fi
+printf '%s\n' "$out" | /usr/bin/sed -n 's/^intent key: */MINDS-INTENT-KEY /p'
 [ -e "$HOME_DIR/key/witness_ed25519" ] || as_witness witness keygen >/dev/null
 line=$(as_witness witness signers)
 [ -n "$line" ] || fail "the witness printed no signers line"
