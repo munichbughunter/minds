@@ -507,6 +507,8 @@ fn report_protected(installed: &crate::enable_protected::Installed) {
                 "minds: Claude Code managed settings installed ({path}) — deny rules for the \
                  witness only"
             );
+        } else if let Some(path) = managed.strip_prefix("updated ") {
+            eprintln!("minds: Claude Code managed settings updated ({path})");
         } else if let Some(path) = managed.strip_prefix("unchanged ") {
             eprintln!("minds: Claude Code managed settings unchanged ({path})");
         } else if let Some(path) = managed.strip_prefix("proposed ") {
@@ -1438,15 +1440,15 @@ fn managed_settings(root: &Path, home: &Path, exe: &Path) -> std::io::Result<Str
     let exe_text = utf8(exe)?;
     let rule = |verb: &str, path: &str| format!("{verb}(/{path}/**)");
     let mut deny = Vec::new();
-    for verb in ["Read", "Edit", "Write"] {
+    // Claude Code prüft Dateizugriffe nur gegen `Read(…)` und `Edit(…)` —
+    // `Edit` deckt jedes schreibende Werkzeug ab; `Write(…)` ignoriert es.
+    for verb in ["Read", "Edit"] {
         deny.push(rule(verb, home));
     }
-    for verb in ["Edit", "Write"] {
-        deny.push(rule(verb, &claude));
-        deny.push(rule(verb, "/Library/Application Support/ClaudeCode"));
-        deny.push(rule(verb, "/etc/claude-code"));
-        deny.push(format!("{verb}(/{exe_text})"));
-    }
+    deny.push(rule("Edit", &claude));
+    deny.push(rule("Edit", "/Library/Application Support/ClaudeCode"));
+    deny.push(rule("Edit", "/etc/claude-code"));
+    deny.push(format!("Edit(/{exe_text})"));
     let mut hooks = serde_json::Map::new();
     for registration in crate::enable::expected_entries(crate::enable::Which::ClaudeCode) {
         let arguments = registration
@@ -1635,7 +1637,8 @@ mod tests {
             deny.contains("Read(//state/minds-witness/abc/**)"),
             "{deny}"
         );
-        assert!(deny.contains("Write(//work/demo/.claude/**)"), "{deny}");
+        assert!(deny.contains("Edit(//work/demo/.claude/**)"), "{deny}");
+        assert!(!deny.contains("Write("), "{deny}");
         assert_eq!(
             value["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
             "'/usr/local/bin/minds' hook --agent claude-code"

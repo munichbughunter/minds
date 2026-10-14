@@ -87,7 +87,8 @@ pub(crate) struct Installed {
     pub(crate) answering: bool,
     /// Die `allowed_signers`-Zeile des Witness-Schlüssels.
     pub(crate) signers: Option<String>,
-    /// `installed <path>`, `unchanged <path>` oder `proposed <path>`.
+    /// `installed <path>`, `updated <path>`, `unchanged <path>` oder
+    /// `proposed <path>`.
     pub(crate) managed: Option<String>,
     /// Hinweise des Skripts (etwa: einmal neu anmelden).
     pub(crate) notes: Vec<String>,
@@ -279,6 +280,7 @@ pub(crate) fn install(
         root: &root,
         user: &user,
         uid: euid,
+        managed: existing_managed(),
     })?;
     if verbose {
         eprintln!("  setup script (run once as root):\n{script}");
@@ -339,6 +341,8 @@ struct Values<'a> {
     /// Der Entwickler: Name und Kennung.
     user: &'a str,
     uid: u32,
+    /// Die vorgefundene Managed-Settings-Datei ([`managed_plan`]).
+    managed: Option<String>,
 }
 
 /// Das Einrichtungsskript für diese Plattform — jeder Wert in einfachen
@@ -384,9 +388,12 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
             service,
         )
     };
-    let managed = managed_settings(values.root, &home)?;
+    let managed = managed_plan(
+        managed_rules(values.root, &home)?,
+        values.managed.as_deref(),
+    )?;
     let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
-    let pairs: [(&str, String); 13] = [
+    let pairs: [(&str, String); 14] = [
         ("SOURCE", quote(&text(values.source)?)),
         ("BINARY", quote(BINARY)),
         ("WUSER", quote(WITNESS_USER)),
@@ -399,7 +406,8 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         ("SERVICE_FILE", quote(&service_file)),
         ("SERVICE_CONTENT", quote(&service)),
         ("MANAGED_DIR", quote(MANAGED_DIR)),
-        ("MANAGED_CONTENT", quote(&managed)),
+        ("MANAGED_CONTENT", quote(&managed.content)),
+        ("MANAGED_PREVIOUS", quote(&managed.previous)),
     ];
     // Ein Durchgang über die Vorlage: Eingesetzte Werte werden nie erneut
     // nach Platzhaltern durchsucht.
@@ -505,10 +513,14 @@ fn system_unit(id: &str, home: &str, root: &str) -> std::io::Result<String> {
     ))
 }
 
-/// Die schlanken Managed Settings: nur Deny-Regeln — keine Sandbox, keine
-/// Einschränkung eigener Hooks oder Regeln (die Datei gilt für jede
-/// Claude-Code-Sitzung auf dem Rechner).
-fn managed_settings(root: &Path, home: &Path) -> std::io::Result<String> {
+/// Der `$comment`, an dem minds seine eigene Managed-Settings-Datei erkennt.
+const MANAGED_MARKER: &str =
+    "Installed by `minds enable` (protected witness): deny rules only. Remove this file to undo.";
+
+/// Die Deny-Regeln für dieses Repo und diesen Witness — nur Deny-Regeln,
+/// keine Sandbox, keine Einschränkung eigener Hooks oder Regeln (die Datei
+/// gilt für jede Claude-Code-Sitzung auf dem Rechner).
+fn managed_rules(root: &Path, home: &Path) -> std::io::Result<Vec<String>> {
     let text = |path: &Path| -> std::io::Result<String> {
         let text = path
             .to_str()
@@ -532,18 +544,101 @@ fn managed_settings(root: &Path, home: &Path) -> std::io::Result<String> {
         "Bash(minds witness:*)".to_owned(),
         format!("Bash({BINARY} witness:*)"),
     ];
-    for verb in ["Edit", "Write"] {
-        deny.push(format!("{verb}(/{refs}/**)"));
-    }
-    for verb in ["Read", "Edit", "Write"] {
+    // Claude Code prüft Dateizugriffe nur gegen `Read(…)` und `Edit(…)` —
+    // `Edit` deckt jedes schreibende Werkzeug ab; eine `Write(…)`-Regel
+    // ignoriert es mit einer Warnung bei jedem Start.
+    deny.push(format!("Edit(/{refs}/**)"));
+    for verb in ["Read", "Edit"] {
         deny.push(format!("{verb}(/{home}/**)"));
     }
+    Ok(deny)
+}
+
+fn render_managed(deny: &[String]) -> std::io::Result<String> {
     let settings = serde_json::json!({
-        "$comment": "Installed by `minds enable` (protected witness): deny rules only. \
-                     Remove this file to undo.",
+        "$comment": MANAGED_MARKER,
         "permissions": { "deny": deny },
     });
     serde_json::to_string_pretty(&settings).map_err(other)
+}
+
+/// Was die Einrichtung mit den Managed Settings tut: `content` schreiben,
+/// eine vorhandene Datei aber nur ersetzen, wenn sie noch genau `previous`
+/// ist (sonst ein Vorschlag daneben).
+#[derive(Debug, PartialEq, Eq)]
+struct ManagedPlan {
+    content: String,
+    /// Leer: keine eigene Datei vorgefunden — eine vorhandene bleibt.
+    previous: String,
+}
+
+/// Die Datei ist eine eigene minds-Datei, wenn sie als JSON **genau** unsere
+/// Form hat (`$comment` mit unserer Kennung, `permissions.deny` als Liste von
+/// Zeichenketten, sonst nichts) — dann wird sie zur Vereinigung ihrer
+/// Regeln (ohne die überholten `Write(…)`) mit den neuen. Die Datei gilt
+/// rechnerweit, die Regeln je Repo: So verliert ein zweites Repo die Regeln
+/// des ersten nicht. Alles andere (eine Datei des Administrators, eine
+/// mit weiteren Schlüsseln) bekommt nur einen Vorschlag.
+fn managed_plan(new_deny: Vec<String>, existing: Option<&str>) -> std::io::Result<ManagedPlan> {
+    // Eine eigene Datei über 32 KiB (sehr viele Repos) bekommt einen
+    // Vorschlag: Alte und neue Fassung stehen im Skript, und das ist unter
+    // Linux ein einziges Argument (höchstens 128 KiB).
+    let existing = existing.filter(|text| text.len() <= 32 * 1024);
+    let ours = existing.and_then(|text| {
+        let value: serde_json::Value = serde_json::from_str(text).ok()?;
+        let object = value.as_object()?;
+        let permissions = object.get("permissions")?.as_object()?;
+        if object.len() != 2
+            || object.get("$comment")?.as_str()? != MANAGED_MARKER
+            || permissions.len() != 1
+        {
+            return None;
+        }
+        permissions
+            .get("deny")?
+            .as_array()?
+            .iter()
+            .map(|rule| rule.as_str().map(str::to_owned))
+            .collect::<Option<Vec<String>>>()
+    });
+    match ours {
+        Some(old) => {
+            let mut deny: Vec<String> = old
+                .into_iter()
+                .filter(|rule| !rule.starts_with("Write("))
+                .collect();
+            for rule in new_deny {
+                if !deny.contains(&rule) {
+                    deny.push(rule);
+                }
+            }
+            Ok(ManagedPlan {
+                content: render_managed(&deny)?,
+                previous: existing.unwrap_or_default().to_owned(),
+            })
+        }
+        None => Ok(ManagedPlan {
+            content: render_managed(&new_deny)?,
+            previous: String::new(),
+        }),
+    }
+}
+
+/// Die vorhandene Managed-Settings-Datei, gelesen als Entwickler (sie ist
+/// für alle lesbar) — begrenzt, nur eine reguläre Datei.
+fn existing_managed() -> Option<String> {
+    use std::io::Read;
+    let path = Path::new(MANAGED_DIR).join("managed-settings.json");
+    if !std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(&path)
+        .ok()?
+        .take(1024 * 1024)
+        .read_to_string(&mut text)
+        .ok()?;
+    Some(text)
 }
 
 /// Der Login-Name des Entwicklers.
@@ -621,14 +716,75 @@ fn shared_with(start: &Path, group: impl FnOnce() -> Option<u32>) -> bool {
     meta.is_dir() && meta.mode() & 0o1000 != 0 && group() == Some(meta.gid())
 }
 
+/// Ob dieser Nutzer in der Witness-Gruppe eingetragen ist, die laufende
+/// Sitzung sie aber noch nicht hat — nur unter Linux, wo die Gruppe erst
+/// nach dem nächsten Anmelden gilt (macOS löst Mitgliedschaften zur Laufzeit
+/// auf; `getgroups` nennt dort höchstens 16 Gruppen und bewiese nichts).
+pub(crate) fn membership_pending() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let Some(gid) = witness_gid() else {
+        return false;
+    };
+    // SAFETY: getgroups mit 0 liefert die Anzahl; danach in einen Puffer
+    // dieser Größe.
+    let groups = unsafe {
+        let count = libc::getgroups(0, std::ptr::null_mut());
+        let Ok(len) = usize::try_from(count) else {
+            return false;
+        };
+        let mut groups = vec![0 as libc::gid_t; len];
+        if libc::getgroups(count, groups.as_mut_ptr()) < 0 {
+            return false;
+        }
+        groups
+    };
+    // SAFETY: getegid hat keine Vorbedingungen.
+    if groups.contains(&gid) || unsafe { libc::getegid() } == gid {
+        return false;
+    }
+    let Ok(user) = developer() else {
+        return false;
+    };
+    let Ok(name) = std::ffi::CString::new(WITNESS_USER) else {
+        return false;
+    };
+    // SAFETY: getgrnam liefert NULL oder eine statische Struktur, deren
+    // NULL-terminierte Mitgliederliste sofort gelesen wird. macOS legt die
+    // Liste nicht immer ausgerichtet ab — jeder Eintrag wird deshalb mit
+    // `read_unaligned` gelesen; höchstens 4096 Einträge.
+    unsafe {
+        let entry = libc::getgrnam(name.as_ptr());
+        if entry.is_null() {
+            return false;
+        }
+        let list = std::ptr::read_unaligned(&raw const (*entry).gr_mem);
+        if list.is_null() {
+            return false;
+        }
+        for index in 0..4096 {
+            let member = std::ptr::read_unaligned(list.add(index));
+            if member.is_null() {
+                break;
+            }
+            if std::ffi::CStr::from_ptr(member).to_bytes() == user.as_bytes() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Die Gruppe des Witness, falls es sie gibt.
 fn witness_gid() -> Option<u32> {
     let name = std::ffi::CString::new(WITNESS_USER).ok()?;
     // SAFETY: `name` ist NUL-terminiert; getgrnam liefert NULL oder einen
-    // Zeiger auf eine statische Struktur, aus der sofort kopiert wird.
+    // Zeiger auf eine statische Struktur, aus der sofort kopiert wird —
+    // ungerichtet gelesen wie die Mitgliederliste in `membership_pending`.
     unsafe {
         let entry = libc::getgrnam(name.as_ptr());
-        (!entry.is_null()).then(|| (*entry).gr_gid)
+        (!entry.is_null()).then(|| std::ptr::read_unaligned(&raw const (*entry).gr_gid))
     }
 }
 
@@ -765,6 +921,7 @@ mod tests {
             root,
             user: "dev",
             uid: 501,
+            managed: None,
         }
     }
 
@@ -814,7 +971,7 @@ mod tests {
     /// der anderen Plattform, die hier nie gerendert wird.
     #[test]
     fn both_templates_use_only_known_placeholders() {
-        const KNOWN: [&str; 13] = [
+        const KNOWN: [&str; 14] = [
             "SOURCE",
             "BINARY",
             "WUSER",
@@ -828,6 +985,7 @@ mod tests {
             "SERVICE_CONTENT",
             "MANAGED_DIR",
             "MANAGED_CONTENT",
+            "MANAGED_PREVIOUS",
         ];
         for template in [
             include_str!("../templates/witness/protected-macos.sh"),
@@ -907,9 +1065,12 @@ mod tests {
     /// diesen Witness — keine Sandbox, keine Einschränkung eigener Hooks.
     #[test]
     fn the_managed_settings_only_deny() {
-        let text = managed_settings(
-            Path::new("/Users/dev/repo"),
-            Path::new("/private/var/db/minds-witness/0123456789abcdef"),
+        let text = render_managed(
+            &managed_rules(
+                Path::new("/Users/dev/repo"),
+                Path::new("/private/var/db/minds-witness/0123456789abcdef"),
+            )
+            .unwrap(),
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -924,14 +1085,85 @@ mod tests {
         assert!(deny.iter().any(|r| r == "Bash(minds witness:*)"));
         assert!(
             deny.iter()
-                .any(|r| r == "Write(//Users/dev/repo/.git/refs/minds/**)")
+                .any(|r| r == "Edit(//Users/dev/repo/.git/refs/minds/**)")
         );
         assert!(
             deny.iter()
                 .any(|r| r == "Read(//private/var/db/minds-witness/0123456789abcdef/**)")
         );
         assert!(value["permissions"].get("allow").is_none());
-        assert!(managed_settings(Path::new("/Users/dev/re[p]o"), Path::new("/x")).is_err());
+        // Nur Regeln, die Claude Code für Dateien auswertet.
+        assert!(
+            deny.iter()
+                .all(|r| !r.as_str().unwrap().starts_with("Write(")),
+            "{deny:?}"
+        );
+        assert!(managed_rules(Path::new("/Users/dev/re[p]o"), Path::new("/x")).is_err());
+    }
+
+    /// Eine eigene Datei (genau unsere Form) wird zur Vereinigung — die Regeln
+    /// eines anderen Repos bleiben, überholte `Write(…)` fallen weg; alles
+    /// andere bleibt unberührt (Vorschlag).
+    #[test]
+    fn the_managed_settings_merge_only_into_our_own_file() {
+        let rules = |repo: &str| {
+            managed_rules(
+                Path::new(repo),
+                Path::new("/private/var/db/minds-witness/0123456789abcdef"),
+            )
+            .unwrap()
+        };
+        // Keine Datei: neu.
+        let fresh = managed_plan(rules("/Users/dev/a"), None).unwrap();
+        assert!(fresh.previous.is_empty());
+        // Eigene Datei von Repo A (noch mit `Write`) — Repo B kommt dazu.
+        let mut old = rules("/Users/dev/a");
+        old.push("Write(//Users/dev/a/.git/refs/minds/**)".into());
+        let existing = render_managed(&old).unwrap() + "\n";
+        let plan = managed_plan(rules("/Users/dev/b"), Some(&existing)).unwrap();
+        assert_eq!(plan.previous, existing);
+        assert!(
+            plan.content
+                .contains("Edit(//Users/dev/a/.git/refs/minds/**)")
+        );
+        assert!(
+            plan.content
+                .contains("Edit(//Users/dev/b/.git/refs/minds/**)")
+        );
+        assert!(!plan.content.contains("Write("), "{}", plan.content);
+        // Dieselbe Datei noch einmal: keine doppelten Regeln.
+        let again = managed_plan(rules("/Users/dev/a"), Some(&existing)).unwrap();
+        let deny: serde_json::Value = serde_json::from_str(&again.content).unwrap();
+        let deny = deny["permissions"]["deny"].as_array().unwrap();
+        let unique: std::collections::BTreeSet<&str> =
+            deny.iter().filter_map(serde_json::Value::as_str).collect();
+        assert_eq!(deny.len(), unique.len());
+        // Zu groß für ein Skript-Argument: ein Vorschlag.
+        let mut many = rules("/Users/dev/a");
+        many.extend((0..2000).map(|n| format!("Edit(//Users/dev/r{n}/.git/refs/minds/**)")));
+        let large = render_managed(&many).unwrap();
+        assert!(
+            managed_plan(rules("/Users/dev/b"), Some(&large))
+                .unwrap()
+                .previous
+                .is_empty()
+        );
+        // Fremd: weitere Schlüssel, anderer Kommentar, die Kennung nur im
+        // Text — nie ersetzen.
+        let marker = serde_json::to_string(MANAGED_MARKER).unwrap();
+        for foreign in [
+            format!(r#"{{"$comment":{marker},"permissions":{{"deny":[]}},"env":{{"X":"1"}}}}"#),
+            r#"{"$comment":"company policy","permissions":{"deny":[]}}"#.to_owned(),
+            format!(
+                r#"{{"$comment":"ours too: {}","permissions":{{"deny":[]}}}}"#,
+                MANAGED_MARKER
+            ),
+            format!(r#"{{"$comment":{marker},"permissions":{{"deny":[],"allow":["Bash"]}}}}"#),
+            "not json".to_owned(),
+        ] {
+            let plan = managed_plan(rules("/Users/dev/b"), Some(&foreign)).unwrap();
+            assert!(plan.previous.is_empty(), "{foreign}");
+        }
     }
 
     #[test]

@@ -117,8 +117,19 @@ impl Fixture {
     /// Wie [`Self::enable_default`], mit weiteren Variablen.
     fn enable_default_with(&self, mode: &str, vars: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(minds());
+        // Das `minds` im PATH ist dieses — sonst warnte `enable`, die
+        // Agent-Hooks liefen ein anderes Programm.
+        let path = std::env::join_paths(
+            std::iter::once(minds().parent().unwrap().to_path_buf()).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )),
+        )
+        .unwrap();
         cmd.env_remove("MINDS_WITNESS_HOME")
-            .env_remove("MINDS_WITNESS_SOCKET");
+            .env_remove("MINDS_WITNESS_SOCKET")
+            .env("PATH", path)
+            // Nie der echte Ort geschützter Witnesses auf diesem Rechner.
+            .env("MINDS_PROTECTED_BASE", self.path("protected-base"));
         for (key, value) in vars {
             cmd.env(key, value);
         }
@@ -1473,6 +1484,27 @@ fn enable_never_elevates_without_a_terminal() {
     assert!(!f.path("sudo.sh.args").exists(), "no elevation");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("[Y/n]"), "{stderr}");
+}
+
+/// Rufen die Agent-Hooks über `PATH` ein anderes `minds` als dieses,
+/// warnt `enable` — sonst liefe etwa ein älteres Programm, das den
+/// geschützten Witness nicht kennt, und schriebe still ins lokale Journal.
+#[test]
+fn enable_warns_when_the_hooks_run_another_minds() {
+    let f = Fixture::new();
+    let other = f.path("other-bin");
+    fs::create_dir_all(&other).unwrap();
+    let stale = other.join("minds");
+    fs::write(&stale, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&stale, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:/usr/bin:/bin", other.display());
+    let out = f.enable_default_with("off", &[("PATH", path.as_str())]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("the agent hooks run `minds` from PATH"),
+        "{stderr}"
+    );
 }
 
 /// Ein schon eingerichteter Witness (hier `container`) bleibt, wie er ist.

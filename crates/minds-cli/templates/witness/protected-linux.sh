@@ -17,6 +17,7 @@ ROOT={{ROOT}}
 UNIT={{LABEL}}
 UNIT_FILE={{SERVICE_FILE}}
 MDIR={{MANAGED_DIR}}
+PREVIOUS={{MANAGED_PREVIOUS}}
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
 
@@ -131,7 +132,8 @@ systemctl restart "$UNIT"
 echo "MINDS-NOTE log out and back in once — your membership in $WUSER takes effect with your next login"
 
 # 6. Managed settings for Claude Code: deny rules only, and only if none
-#    exist (an identical file counts as ours). Its directory was checked first.
+#    exist; our own file from an earlier run (also another repository's) is
+#    merged. Its directory was checked first.
 tmp=$(mktemp "$MDIR/.minds.XXXXXX")
 printf '%s\n' {{MANAGED_CONTENT}} > "$tmp"
 chmod 0644 "$tmp"
@@ -139,6 +141,11 @@ if [ -e "$MDIR/managed-settings.json" ] || [ -L "$MDIR/managed-settings.json" ];
   if cmp -s "$tmp" "$MDIR/managed-settings.json"; then
     rm -f "$tmp"
     echo "MINDS-MANAGED unchanged $MDIR/managed-settings.json"
+  elif [ -n "$PREVIOUS" ] && printf '%s' "$PREVIOUS" | cmp -s - "$MDIR/managed-settings.json"; then
+    # Our own file, exactly as minds read it: the union of its rules and the
+    # new ones replaces it. Anything else stays and gets a proposal.
+    mv -f "$tmp" "$MDIR/managed-settings.json"
+    echo "MINDS-MANAGED updated $MDIR/managed-settings.json"
   else
     mv -f "$tmp" "$MDIR/managed-settings.minds-proposed.json"
     echo "MINDS-MANAGED proposed $MDIR/managed-settings.minds-proposed.json"

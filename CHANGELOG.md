@@ -17,6 +17,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Managed settings without `Write(…)` rules.** Claude Code checks file
+  access only against `Read(…)`/`Edit(…)` and warned at every start about the
+  `Write(…)` rules of the protected setup (and of the `managed` proposal);
+  `Edit` already covers every file-writing tool. A file minds installed
+  earlier (exactly its own form) is now merged — the rules of other
+  repositories stay, `Write(…)` rules go — instead of proposed; any other
+  file still gets a proposal.
+- **`minds doctor` knows the protected witness**: whether it answers and
+  whether its home is closed to you — instead of "not configured".
+- **A different `minds` on `PATH`**: the agent hooks call `minds` through
+  `PATH`; `minds enable` and `minds doctor` now warn when that is another
+  program than the one you ran — an older one does not know the protected
+  witness and records into the local journal.
+
 ### Added
 
 - **Protected witness, with one sudo.** On a terminal `minds enable` asks once
