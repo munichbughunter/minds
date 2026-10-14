@@ -28,6 +28,58 @@ use minds_git::Repo;
 use minds_redact::RedactionPipeline;
 use minds_store::{ContextStore, StoredIntent};
 
+/// Der feste Grund, mit dem ein Witness eine Freigabe per Berührung
+/// bremst — die Nonce bleibt gültig, dieselbe Freigabe darf wiederkommen.
+#[cfg(unix)]
+pub(crate) const THROTTLED: &str = "too many activation attempts — send it again";
+
+/// Der feste Grund, mit dem ein Witness ohne festgehaltenen
+/// Freigabe-Schlüssel eine Freigabe per Berührung ablehnt — `intent sign`
+/// weicht dann auf das Passwort aus.
+#[cfg(unix)]
+pub(crate) const NO_INTENT_KEY: &str = "no intent key pinned at this witness";
+
+/// Die festen Gründe, mit denen ein Witness ablehnt, weil sein Zählerstand
+/// (`evidence/intent-counter`) sich nicht lesen oder festhalten lässt —
+/// dann scheitert auch der Weg über das Passwort für Signaturen des
+/// festgehaltenen Schlüssels; `intent sign` nennt die Datei.
+#[cfg(unix)]
+pub(crate) const COUNTER_UNREADABLE: &str = "intent counter unreadable";
+#[cfg(unix)]
+pub(crate) const NOT_RECORDABLE: &str = "approval not recordable";
+
+/// Der feste Grund, wenn der Witness eine Signatur gerade nicht prüfen kann
+/// (kein `ssh-keygen`, Frist, `witness.json` unlesbar) — kein Urteil über
+/// sie; nichts wird aktiviert.
+#[cfg(unix)]
+pub(crate) const NOT_CHECKABLE: &str = "approval not checkable right now — retry";
+
+/// Die festen Gründe für Signaturen eines anderen als des festgehaltenen
+/// Schlüssels — `intent sign` weicht dann auf das Passwort aus.
+#[cfg(unix)]
+pub(crate) const NOT_PINNED_PROOF: &str = "activation proof is not from the pinned intent key";
+#[cfg(unix)]
+pub(crate) const NOT_PINNED_SIGNATURE: &str = "intent signature is not from the pinned intent key";
+
+/// Der Text, den der Mensch mit seinem Sicherheitsschlüssel signiert, um am
+/// geschützten Witness einen Anker zu aktivieren — unter
+/// `minds-intent-activate`, über die Anker-Id, den Hash genau der
+/// Anker-Signatur, die mitgeht ([`signature_hash`]), und die Nonce, die der
+/// Witness eben für diese Verbindung ausgab. Beide Seiten bauen ihn hier,
+/// nie verschieden.
+#[cfg(unix)]
+pub(crate) fn activation_message(anchor_id: &str, signature: &str, nonce: &str) -> String {
+    let signature = signature_hash(signature);
+    format!("minds-intent-activate-v1\nanchor {anchor_id}\nsignature {signature}\nnonce {nonce}\n")
+}
+
+/// Der Hash einer Anker-Signatur (`b3-<hex>`) — in der Freigabe der
+/// Aktivierung: Sie gilt genau dieser Signatur.
+#[cfg(unix)]
+pub(crate) fn signature_hash(signature: &str) -> String {
+    format!("b3-{}", blake3::hash(signature.as_bytes()).to_hex())
+}
+
 /// Prüft den Beleg für `id`. Der Fehler ist ein fester Grund — nie ein
 /// Wert aus dem Store.
 pub(crate) fn proven(

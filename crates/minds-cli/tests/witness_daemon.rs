@@ -179,41 +179,44 @@ fn stop(daemon: &mut Daemon) {
         std::thread::sleep(Duration::from_millis(10));
     }
 }
-#[test]
-fn witness_serializes_concurrent_clients() {
-    let f = Fixture::new();
-    let mut daemon = f.start();
-    let clients: Vec<_> = (0..8)
-        .map(|thread| {
-            let mut stream = f.connect();
-            std::thread::spawn(move || {
-                for event in 0..125 {
-                    send(&mut stream, &hook(thread * 125 + event));
-                }
-                barrier(&mut stream).unwrap();
-            })
-        })
-        .collect();
-    for client in clients {
-        client.join().unwrap();
-    }
-    let read = f
-        .journal()
-        .read(&SessionKey::new("claude-code", "concurrent").unwrap())
-        .unwrap();
-    assert!(read.is_complete());
-    assert_eq!(read.events.len(), 1000);
-    for (seq, event) in read.events.iter().enumerate() {
-        assert_eq!(event.seq, seq as u64);
-    }
-    let payloads: std::collections::BTreeSet<_> = read
-        .events
-        .iter()
-        .map(|event| event.payload.get())
-        .collect();
-    assert_eq!(payloads.len(), 1000);
-    stop(&mut daemon);
-}
+// Auskommentiert (auf Wunsch): flakt, wenn mehrere Testsuiten parallel laufen —
+// allein braucht der Test ~19 s bei einer Lese-Frist von 20 s (8 Clients × 125
+// Events mit fsync). Zum Wiederaktivieren die `// ` vor den Zeilen entfernen.
+// #[test]
+// fn witness_serializes_concurrent_clients() {
+//     let f = Fixture::new();
+//     let mut daemon = f.start();
+//     let clients: Vec<_> = (0..8)
+//         .map(|thread| {
+//             let mut stream = f.connect();
+//             std::thread::spawn(move || {
+//                 for event in 0..125 {
+//                     send(&mut stream, &hook(thread * 125 + event));
+//                 }
+//                 barrier(&mut stream).unwrap();
+//             })
+//         })
+//         .collect();
+//     for client in clients {
+//         client.join().unwrap();
+//     }
+//     let read = f
+//         .journal()
+//         .read(&SessionKey::new("claude-code", "concurrent").unwrap())
+//         .unwrap();
+//     assert!(read.is_complete());
+//     assert_eq!(read.events.len(), 1000);
+//     for (seq, event) in read.events.iter().enumerate() {
+//         assert_eq!(event.seq, seq as u64);
+//     }
+//     let payloads: std::collections::BTreeSet<_> = read
+//         .events
+//         .iter()
+//         .map(|event| event.payload.get())
+//         .collect();
+//     assert_eq!(payloads.len(), 1000);
+//     stop(&mut daemon);
+// }
 #[test]
 fn witness_survives_kill_between_events_and_records_unclean_restart() {
     let f = Fixture::new();

@@ -101,7 +101,7 @@ fn witness_prepends_intent_to_new_session() {
     let mut writer = f.writer();
     let text = anchor(&f, "Retry exponentiell.\n");
     let status = writer
-        .activate_intent(&text, Some(SIGNATURE.into()))
+        .activate_by_control(&text, Some(SIGNATURE.into()))
         .unwrap()
         .unwrap();
     let id = IntentAnchor::id_of_text(&text);
@@ -170,13 +170,13 @@ fn witness_appends_intent_change_mid_session() {
     assert!(intent_payloads(&writer).is_empty());
 
     let first = anchor(&f, "Version 1\n");
-    writer.activate_intent(&first, None).unwrap().unwrap();
+    writer.activate_by_control(&first, None).unwrap().unwrap();
     hook_as(&mut writer, "Stop", 1);
     let second = anchor(&f, "Version 2\n");
-    writer.activate_intent(&second, None).unwrap().unwrap();
+    writer.activate_by_control(&second, None).unwrap().unwrap();
     // Dieselbe Aktivierung noch einmal: nichts Neues.
     assert_eq!(
-        writer.activate_intent(&second, None).unwrap().unwrap(),
+        writer.activate_by_control(&second, None).unwrap().unwrap(),
         format!("intent unchanged {}", IntentAnchor::id_of_text(&second))
     );
     hook_as(&mut writer, "UserPromptSubmit", 2);
@@ -216,7 +216,7 @@ fn a_change_reaches_a_session_only_with_its_next_event() {
     hook_as(&mut writer, "UserPromptSubmit", 0);
     hook_as(&mut writer, "SessionEnd", 1);
     writer
-        .activate_intent(&anchor(&f, "x\n"), None)
+        .activate_by_control(&anchor(&f, "x\n"), None)
         .unwrap()
         .unwrap();
     // Eine beendete (oder abgestürzte) Session bekommt nichts — keine
@@ -266,12 +266,14 @@ fn invalid_activations_are_refused_with_a_fixed_reason() {
     let mut writer = f.writer();
     let good = anchor(&f, "x\n");
     assert_eq!(
-        writer.activate_intent("minds-intent-v1\n", None).unwrap(),
+        writer
+            .activate_by_control("minds-intent-v1\n", None)
+            .unwrap(),
         Err("invalid intent anchor")
     );
     assert_eq!(
         writer
-            .activate_intent(&good.replace("src/**", "src/**\u{202E}"), None)
+            .activate_by_control(&good.replace("src/**", "src/**\u{202E}"), None)
             .unwrap(),
         Err("invalid intent anchor")
     );
@@ -284,7 +286,7 @@ fn invalid_activations_are_refused_with_a_fixed_reason() {
         ),
     ] {
         assert_eq!(
-            writer.activate_intent(&good, Some(signature)).unwrap(),
+            writer.activate_by_control(&good, Some(signature)).unwrap(),
             Err("invalid intent signature")
         );
     }
@@ -297,7 +299,7 @@ fn invalid_activations_are_refused_with_a_fixed_reason() {
     .to_text()
     .unwrap();
     assert_eq!(
-        writer.activate_intent(&leaky, None).unwrap(),
+        writer.activate_by_control(&leaky, None).unwrap(),
         Err("intent anchor refused by the redaction policy")
     );
     assert!(writer.intent.is_none());
@@ -343,7 +345,7 @@ fn the_active_intent_survives_a_restart() {
     let text = anchor(&f, "x\n");
     {
         let mut writer = f.writer();
-        writer.activate_intent(&text, None).unwrap().unwrap();
+        writer.activate_by_control(&text, None).unwrap().unwrap();
         hook_as(&mut writer, "SessionStart", 0);
     }
     let path = f.home.join("evidence/intent.json");
@@ -358,7 +360,7 @@ fn the_active_intent_survives_a_restart() {
     );
     // Ein Wechsel nach dem Neustart erreicht die laufende Session.
     writer
-        .activate_intent(&anchor(&f, "y\n"), None)
+        .activate_by_control(&anchor(&f, "y\n"), None)
         .unwrap()
         .unwrap();
     hook_as(&mut writer, "Stop", 1);
@@ -393,7 +395,7 @@ fn a_known_session_never_becomes_new_again() {
     let mut writer = f.writer();
     assert!(writer.epochs.last_seal(&key()).is_none());
     writer
-        .activate_intent(&anchor(&f, "x\n"), None)
+        .activate_by_control(&anchor(&f, "x\n"), None)
         .unwrap()
         .unwrap();
     hook_as(&mut writer, "Stop", 1);
@@ -442,6 +444,8 @@ fn connected(control: bool) -> (socket::Client, std::os::unix::net::UnixStream) 
         eof: false,
         pending: false,
         control,
+        challenge: None,
+        partial_since: None,
     };
     (client, theirs)
 }
@@ -463,6 +467,7 @@ fn ask(
     let mut chunk = [0u8; 4096];
     loop {
         let n = theirs.read(&mut chunk).unwrap();
+        assert!(n > 0, "the witness closed the connection without an answer");
         bytes.extend_from_slice(&chunk[..n]);
         if let Ok((frame, _)) = witness_proto::decode(&bytes) {
             return frame;
@@ -604,7 +609,7 @@ fn only_a_session_start_opens_a_session() {
     let f = Fixture::new();
     let mut writer = f.writer();
     writer
-        .activate_intent(&anchor(&f, "x\n"), None)
+        .activate_by_control(&anchor(&f, "x\n"), None)
         .unwrap()
         .unwrap();
     hook_as(&mut writer, "PostToolUse", 0);
@@ -626,7 +631,7 @@ fn a_crash_between_event_and_record_repeats_the_anchor_without_a_new_start() {
     let text = anchor(&f, "x\n");
     {
         let mut writer = f.writer();
-        writer.activate_intent(&text, None).unwrap().unwrap();
+        writer.activate_by_control(&text, None).unwrap().unwrap();
         hook_as(&mut writer, "SessionStart", 0);
     }
     fs::remove_file(folder_path(&f.home, &key()).with_extension("intent")).unwrap();
@@ -652,7 +657,7 @@ fn resume_or_compact_is_not_a_session_start() {
         let f = Fixture::new();
         let mut writer = f.writer();
         writer
-            .activate_intent(&anchor(&f, "x\n"), None)
+            .activate_by_control(&anchor(&f, "x\n"), None)
             .unwrap()
             .unwrap();
         hook_raw(
@@ -670,7 +675,7 @@ fn resume_or_compact_is_not_a_session_start() {
     let f = Fixture::new();
     let mut writer = f.writer();
     writer
-        .activate_intent(&anchor(&f, "x\n"), None)
+        .activate_by_control(&anchor(&f, "x\n"), None)
         .unwrap()
         .unwrap();
     hook_raw(
@@ -702,7 +707,7 @@ fn a_damaged_epoch_state_never_makes_a_sealed_session_new() {
     let mut writer = f.writer();
     assert!(writer.epochs.last_seal(&key()).is_none());
     writer
-        .activate_intent(&anchor(&f, "x\n"), None)
+        .activate_by_control(&anchor(&f, "x\n"), None)
         .unwrap()
         .unwrap();
     hook_as(&mut writer, "SessionStart", 1);
@@ -718,7 +723,10 @@ fn a_damaged_epoch_state_never_makes_a_sealed_session_new() {
 fn a_restart_reproves_the_active_intent() {
     let f = Fixture::new();
     let text = anchor(&f, "x\n");
-    f.writer().activate_intent(&text, None).unwrap().unwrap();
+    f.writer()
+        .activate_by_control(&text, None)
+        .unwrap()
+        .unwrap();
     assert!(f.writer().intent.is_some());
     let id = IntentAnchor::id_of_text(&text);
     git(
@@ -733,4 +741,877 @@ fn a_restart_reproves_the_active_intent() {
     assert!(writer.intent.is_none());
     hook_as(&mut writer, "SessionStart", 0);
     assert!(intent_payloads(&writer).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Freigabe per Berührung (geschützter Witness)
+// ---------------------------------------------------------------------------
+
+/// Ein ausgedachter FIDO-Schlüssel und eine Signatur „mit ihm" (Flags
+/// `flags`) — die Signaturbytes prüft im Test `verify_activation`.
+mod fido {
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let word = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |word, (i, b)| word | u32::from(*b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(ALPHABET[(word >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    fn string(bytes: &[u8]) -> Vec<u8> {
+        let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(bytes);
+        out
+    }
+
+    const SK: &str = "sk-ssh-ed25519@openssh.com";
+
+    fn blob() -> Vec<u8> {
+        [string(SK.as_bytes()), string(&[9; 32]), string(b"ssh:")].concat()
+    }
+
+    pub(super) fn key() -> String {
+        format!("{SK} {}", base64(&blob()))
+    }
+
+    /// Ein anderer ausgedachter Schlüssel.
+    pub(super) fn other_key() -> String {
+        let blob = [string(SK.as_bytes()), string(&[8; 32]), string(b"ssh:")].concat();
+        format!("{SK} {}", base64(&blob))
+    }
+
+    /// Die Freigabe der Aktivierung: die nächste Signatur nach
+    /// [`signature`] (Zähler 2).
+    pub(super) fn proof(flags: u8) -> String {
+        proof_at(flags, 2)
+    }
+
+    /// Die Freigabe des Ankers (Zähler 1, berührt).
+    pub(super) fn signature() -> String {
+        proof_at(1, 1)
+    }
+
+    pub(super) fn proof_at(flags: u8, counter: u32) -> String {
+        let mut signature = [string(SK.as_bytes()), string(&[7; 64])].concat();
+        signature.push(flags);
+        signature.extend_from_slice(&counter.to_be_bytes());
+        let body = base64(
+            &[
+                b"SSHSIG".to_vec(),
+                1u32.to_be_bytes().to_vec(),
+                string(&blob()),
+                string(minds_attest::NS_INTENT_ACTIVATE.as_bytes()),
+                string(b""),
+                string(b"sha512"),
+                string(&signature),
+            ]
+            .concat(),
+        );
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(70)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n",
+            lines.join("\n")
+        )
+    }
+}
+
+/// Schickt `frame` auf einer **bestehenden** Verbindung und liest die
+/// Antwort.
+fn ask_on(
+    writer: &mut Writer,
+    client: &mut socket::Client,
+    theirs: &mut std::os::unix::net::UnixStream,
+    frame: minds_capture::witness_proto::Frame,
+) -> minds_capture::witness_proto::Frame {
+    use minds_capture::witness_proto;
+    theirs
+        .write_all(&witness_proto::encode(&frame).unwrap())
+        .unwrap();
+    assert!(socket::step(client, writer).unwrap());
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = theirs.read(&mut chunk).unwrap();
+        assert!(n > 0, "the witness closed the connection without an answer");
+        bytes.extend_from_slice(&chunk[..n]);
+        if let Ok((frame, _)) = witness_proto::decode(&bytes) {
+            return frame;
+        }
+    }
+}
+
+fn challenge() -> minds_capture::witness_proto::Frame {
+    minds_capture::witness_proto::Frame::IntentChallenge {
+        request_id: [5; 16],
+    }
+}
+
+fn nonce_of(answer: minds_capture::witness_proto::Frame) -> String {
+    match answer {
+        minds_capture::witness_proto::Frame::Ack { status, .. } => {
+            status.strip_prefix("nonce ").unwrap().to_owned()
+        }
+        other => panic!("no nonce: {other:?}"),
+    }
+}
+
+fn proven(anchor: &str, nonce: &str, proof: String) -> minds_capture::witness_proto::Frame {
+    minds_capture::witness_proto::Frame::IntentActivateProven {
+        anchor: anchor.into(),
+        // Die Freigabe des Ankers: vom festgehaltenen Schlüssel, berührt.
+        signature: Some(fido::signature()),
+        nonce: nonce.into(),
+        proof,
+        request_id: [6; 16],
+    }
+}
+
+fn refused(reason: &str) -> minds_capture::witness_proto::Frame {
+    minds_capture::witness_proto::Frame::Nack {
+        request_id: [6; 16],
+        reason: reason.into(),
+    }
+}
+
+thread_local! {
+    /// Was der Prüfer (sonst `ssh-keygen`) in diesem Test sah: Text und
+    /// Namespace.
+    static SEEN: std::cell::RefCell<Vec<(String, String)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+fn accept_all(text: &str, _: &str, _: &Path, namespace: &str) -> Option<bool> {
+    SEEN.with(|seen| {
+        seen.borrow_mut()
+            .push((text.to_owned(), namespace.to_owned()))
+    });
+    Some(true)
+}
+
+/// Ohne festgehaltenen Schlüssel gibt es keine Nonce — und ohne Nonce
+/// keine Freigabe auf der Agent-Seite.
+#[test]
+fn without_a_pinned_key_the_agent_side_gets_no_challenge() {
+    use minds_capture::witness_proto::Frame;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    assert_eq!(
+        ask(&mut writer, false, challenge()),
+        Frame::Nack {
+            request_id: [5; 16],
+            reason: crate::intent_proof::NO_INTENT_KEY.into(),
+        }
+    );
+    let text = anchor(&f, "x\n");
+    assert_eq!(
+        ask(
+            &mut writer,
+            false,
+            proven(&text, &"0".repeat(64), fido::proof(1))
+        ),
+        refused("no fresh challenge on this connection")
+    );
+    assert!(writer.intent.is_none());
+}
+
+/// Mit festgehaltenem Schlüssel: Nonce holen, mit Berührung über Anker-Id
+/// und Nonce signieren, auf derselben Verbindung aktivieren — einmal. Die
+/// neue Session beginnt beim Anker.
+#[test]
+fn a_fresh_touch_of_the_pinned_key_activates_on_the_agent_side() {
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+    let id = IntentAnchor::id_of_text(&text);
+
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    assert_eq!(nonce.len(), 64);
+    // Ohne Berührung: abgewiesen — und die Nonce ist verbraucht.
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(0))
+        ),
+        refused("activation proof without a touch of the security key")
+    );
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused("no fresh challenge on this connection")
+    );
+    assert!(writer.intent.is_none());
+
+    // Eine neue Nonce, eine Freigabe mit Berührung: aktiv.
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        minds_capture::witness_proto::Frame::Ack {
+            request_id: [6; 16],
+            status: format!("intent active {id}"),
+        }
+    );
+    assert_eq!(
+        SEEN.with(|seen| seen.borrow().clone()),
+        [
+            (
+                crate::intent_proof::activation_message(id.as_str(), &fido::signature(), &nonce),
+                minds_attest::NS_INTENT_ACTIVATE.to_owned()
+            ),
+            (text.clone(), minds_attest::NS_INTENT.to_owned()),
+        ]
+    );
+    // Die folgenden Versuche sollen nicht gebremst werden.
+    writer.last_verify = None;
+    // Eine Freigabe des Ankers gilt einmal: Mit derselben Anker-Signatur
+    // und einer neuen Nonce (eine zweite, vielleicht erschlichene
+    // Berührung) bindet nichts erneut.
+    let again = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &again, fido::proof(1))
+        ),
+        refused("this intent approval was already used for an activation — sign again")
+    );
+    writer.last_verify = None;
+    hook_as(&mut writer, "SessionStart", 0);
+    assert_eq!(intent_payloads(&writer), vec![(0, text.clone(), true)]);
+
+    // Eine Nonce gilt nur auf ihrer Verbindung: Auf einer anderen ist
+    // dieselbe Freigabe wertlos (kein Wiedereinspielen).
+    let (mut other, mut other_theirs) = connected(false);
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut other,
+            &mut other_theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused("no fresh challenge on this connection")
+    );
+    // Eine falsche Nonce verbraucht die richtige.
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    let wrong = if nonce.starts_with('0') { "1" } else { "0" }.repeat(64);
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &wrong, fido::proof(1))
+        ),
+        refused("no fresh challenge on this connection")
+    );
+    // Aufheben bleibt dem Steuer-Socket.
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    let clear = minds_capture::witness_proto::Frame::IntentActivateProven {
+        anchor: "-".into(),
+        signature: None,
+        nonce,
+        proof: fido::proof(1),
+        request_id: [6; 16],
+    };
+    assert_eq!(
+        ask_on(&mut writer, &mut client, &mut theirs, clear),
+        refused("clearing an intent needs the control socket")
+    );
+    assert!(writer.intent.is_some());
+}
+
+/// Eine abgelaufene Nonce gilt nicht mehr, und solange eine aussteht,
+/// bleibt die Verbindung über die übliche Frist hinaus offen.
+#[test]
+fn a_challenge_expires_and_keeps_its_connection_open_until_then() {
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    // Still seit länger als die übliche Frist (5 s): Die Verbindung bleibt.
+    client.since = std::time::Instant::now() - std::time::Duration::from_secs(30);
+    assert!(socket::step(&mut client, &mut writer).unwrap());
+    // Nach Ablauf der Nonce: abgewiesen.
+    let issued = std::time::Instant::now() - intent::CHALLENGE_TTL;
+    client.challenge = Some((nonce.clone(), issued));
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused("no fresh challenge on this connection")
+    );
+    // Ohne ausstehende Nonce gilt wieder die übliche Frist.
+    client.since = std::time::Instant::now() - std::time::Duration::from_secs(30);
+    assert!(!socket::step(&mut client, &mut writer).unwrap());
+}
+
+/// Ein von Hand verbogener Schlüssel in `witness.json` gilt nicht: Nur die
+/// Form, die `init` schreibt, wird festgehalten — geprüft über die Datei,
+/// die der Witness bei jeder Prüfung liest.
+#[test]
+fn a_hand_edited_intent_key_does_not_count() {
+    use minds_capture::witness_proto::Frame;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    let edit = |line: &str| {
+        let path = f.home.join("witness.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        config["intent_key"] = serde_json::Value::String(line.to_owned());
+        atomic(&path, &serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    };
+    let no_key = Frame::Nack {
+        request_id: [5; 16],
+        reason: crate::intent_proof::NO_INTENT_KEY.into(),
+    };
+    for edited in [
+        format!("{} comment", fido::key()),
+        "ssh-ed25519 AAAA".to_owned(),
+    ] {
+        edit(&edited);
+        assert_eq!(ask(&mut writer, false, challenge()), no_key, "{edited}");
+    }
+    edit(&fido::key());
+    assert!(matches!(
+        ask(&mut writer, false, challenge()),
+        Frame::Ack { .. }
+    ));
+}
+
+/// Eine Nonce kostet das Lesen einer Datei, nicht einen Gang durch das
+/// ganze Home: Ein unlesbares Verzeichnis im Journal stört sie nicht.
+#[test]
+fn a_challenge_reads_only_the_witness_configuration() {
+    use std::os::unix::fs::PermissionsExt;
+    // Als root ließe sich das Verzeichnis trotzdem lesen.
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    let hidden = f.home.join("journal/unreadable");
+    fs::create_dir(&hidden).unwrap();
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(load(&f.home).is_err());
+    let answer = ask(&mut writer, false, challenge());
+    fs::set_permissions(&hidden, fs::Permissions::from_mode(0o700)).unwrap();
+    let _ = nonce_of(answer);
+}
+
+/// Gebremst wird, ohne die Nonce zu verbrauchen: Dieselbe Freigabe geht
+/// nach der Pause durch — eine Flut erfundener Freigaben entwertet die des
+/// Menschen nicht.
+#[test]
+fn a_throttled_approval_keeps_its_nonce() {
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    // Eben hat jemand anderes eine Prüfung ausgelöst.
+    writer.last_verify = Some(std::time::Instant::now());
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused(crate::intent_proof::THROTTLED)
+    );
+    let earlier = std::time::Instant::now() - intent::VERIFY_INTERVAL;
+    writer.last_verify = Some(earlier);
+    assert!(matches!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        minds_capture::witness_proto::Frame::Ack { .. }
+    ));
+    // Eine Prüfung, die `ssh-keygen` erreicht, setzt die Bremse.
+    assert!(writer.last_verify.unwrap() > earlier);
+}
+
+/// Ein Frame, der lange nach der Nonce in zwei Teilen kommt (größer als der
+/// Socket-Puffer), wird nicht verworfen: Die übliche Frist zählt ab seinem
+/// ersten Byte.
+#[test]
+fn a_split_approval_after_a_long_touch_is_read() {
+    use minds_capture::witness_proto;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    // Die Berührung dauerte 30 Sekunden.
+    client.since = std::time::Instant::now() - std::time::Duration::from_secs(30);
+    let bytes = witness_proto::encode(&proven(&text, &nonce, fido::proof(1))).unwrap();
+    let (first, second) = bytes.split_at(bytes.len() / 2);
+    theirs.write_all(first).unwrap();
+    assert!(socket::step(&mut client, &mut writer).unwrap());
+    assert!(!client.bytes.is_empty());
+    theirs.write_all(second).unwrap();
+    assert!(socket::step(&mut client, &mut writer).unwrap());
+    let mut answer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let frame = loop {
+        let n = theirs.read(&mut chunk).unwrap();
+        assert!(n > 0, "the witness closed the connection without an answer");
+        answer.extend_from_slice(&chunk[..n]);
+        if let Ok((frame, _)) = witness_proto::decode(&answer) {
+            break frame;
+        }
+    };
+    assert!(
+        matches!(frame, witness_proto::Frame::Ack { .. }),
+        "{frame:?}"
+    );
+    // Ein halber Frame, der länger als die übliche Frist liegt, schließt
+    // die Verbindung — auch mit ausstehender Nonce.
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    let bytes = witness_proto::encode(&proven(&text, &nonce, fido::proof(1))).unwrap();
+    theirs.write_all(&bytes[..10]).unwrap();
+    assert!(socket::step(&mut client, &mut writer).unwrap());
+    client.partial_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(6));
+    assert!(!socket::step(&mut client, &mut writer).unwrap());
+}
+
+/// `init` und der Freigabe-Schlüssel: Wer nur ihn ersetzt, muss die
+/// Socket-Gruppe nicht nennen; ein vorhandener, aber ungültiger Eintrag
+/// gilt als festgehalten — ersetzt wird er nur ausdrücklich.
+#[test]
+fn replacing_the_intent_key_needs_neither_the_group_nor_a_valid_old_entry() {
+    let f = Fixture::new();
+    let home = f._dir.path().join("grouped");
+    // SAFETY: getegid hat keine Vorbedingungen.
+    let gid = unsafe { libc::getegid() }.to_string();
+    let request = |socket_group, intent_key, replace_intent_key| InitRequest {
+        repo: f.root.to_str().unwrap(),
+        mapping: None,
+        profile: None,
+        socket_group,
+        child_repo: None,
+        policy_rev: None,
+        intent_key,
+        replace_intent_key,
+    };
+    let key = fido::key();
+    let other = fido::other_key();
+    init_config(
+        &home,
+        &request(Some(gid.as_str()), Some(key.as_str()), false),
+    )
+    .unwrap();
+    assert_eq!(load(&home).unwrap().intent_key(), Some(key.as_str()));
+    // Ohne Gruppe, ohne Ersetzen: eine abweichende Konfiguration.
+    let err = init_config(&home, &request(None, Some(other.as_str()), false)).unwrap_err();
+    assert!(err.to_string().contains("socket group"), "{err}");
+    // Ohne Gruppe, mit Ersetzen: ersetzt, die Gruppe bleibt.
+    let Initialized::Unchanged(pins) =
+        init_config(&home, &request(None, Some(other.as_str()), true)).unwrap()
+    else {
+        panic!("expected unchanged");
+    };
+    assert!(pins.intent_key_new);
+    let config = load(&home).unwrap();
+    assert_eq!(config.intent_key(), Some(other.as_str()));
+    assert!(config.socket_group().is_some());
+
+    // Ein ungültiger Eintrag: Er gilt zur Laufzeit nicht …
+    let path = home.join("witness.json");
+    let text = fs::read_to_string(&path)
+        .unwrap()
+        .replace(&other, "garbage");
+    atomic(&path, text.as_bytes()).unwrap();
+    assert!(load(&home).unwrap().intent_key().is_none());
+    // … wird aber nicht still durch einen genannten ersetzt.
+    let Initialized::Unchanged(pins) = init_config(
+        &home,
+        &request(Some(gid.as_str()), Some(key.as_str()), false),
+    )
+    .unwrap() else {
+        panic!("expected unchanged");
+    };
+    assert!(pins.intent_key_refused.is_some());
+    assert!(load(&home).unwrap().intent_key().is_none());
+    init_config(&home, &request(None, Some(key.as_str()), true)).unwrap();
+    assert_eq!(load(&home).unwrap().intent_key(), Some(key.as_str()));
+}
+
+/// Eine Freigabe gilt einmal — gemessen am Signaturzähler, der in den
+/// signierten Daten steht: Auch eine anders armierte Kopie trägt ihn. Der
+/// Weg über das Passwort (Steuer-Socket) hebt den Höchststand ebenso; die
+/// Freigabe der Aktivierung muss die nächste Signatur sein.
+#[test]
+fn an_approval_activates_once_on_any_route() {
+    use minds_capture::witness_proto::Frame;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+
+    // Über den Steuer-Socket aktiviert, mit Zähler 5: Höchststand 5.
+    let control = Frame::IntentActivate {
+        anchor: text.clone(),
+        signature: Some(fido::proof_at(1, 5)),
+        request_id: [7; 16],
+    };
+    assert!(matches!(ask(&mut writer, true, control), Frame::Ack { .. }));
+    assert_eq!(intent::counter_mark(&f.home, &fido::key()), Ok(5));
+
+    let (mut client, mut theirs) = connected(false);
+    let mut attempt = |writer: &mut Writer, signature: String, proof: String| {
+        let nonce = nonce_of(ask_on(writer, &mut client, &mut theirs, challenge()));
+        writer.last_verify = None;
+        ask_on(
+            writer,
+            &mut client,
+            &mut theirs,
+            Frame::IntentActivateProven {
+                anchor: text.clone(),
+                signature: Some(signature),
+                nonce,
+                proof,
+                request_id: [6; 16],
+            },
+        )
+    };
+    let used = refused("this intent approval was already used for an activation — sign again");
+    // Dieselbe Freigabe per Berührung: verbraucht.
+    assert_eq!(
+        attempt(&mut writer, fido::proof_at(1, 5), fido::proof_at(1, 6)),
+        used
+    );
+    // Neu armiert (andere Zeilen, angehängte Leerzeilen): derselbe Zähler.
+    let rewrapped = {
+        let original = fido::proof_at(1, 5);
+        let body: String = original
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect();
+        let lines: Vec<&str> = body
+            .as_bytes()
+            .chunks(7)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n\n\n",
+            lines.join("\n")
+        )
+    };
+    assert_ne!(rewrapped, fido::proof_at(1, 5));
+    assert_eq!(attempt(&mut writer, rewrapped, fido::proof_at(1, 6)), used);
+    // Eine neue Freigabe, aber eine Aktivierung, die nicht die nächste
+    // Signatur ist: abgewiesen.
+    assert_eq!(
+        attempt(&mut writer, fido::proof_at(1, 7), fido::proof_at(1, 9)),
+        refused("the activation touch does not directly follow the approval touch — sign again")
+    );
+    // Ohne Zähler (0): kein Weg per Berührung.
+    assert_eq!(
+        attempt(&mut writer, fido::proof_at(1, 0), fido::proof_at(1, 1)),
+        refused("the security key reports no signature counter — use the password route")
+    );
+    // Die richtige Folge: aktiv, Höchststand 8.
+    assert!(matches!(
+        attempt(&mut writer, fido::proof_at(1, 7), fido::proof_at(1, 8)),
+        Frame::Ack { .. }
+    ));
+    assert_eq!(intent::counter_mark(&f.home, &fido::key()), Ok(8));
+}
+
+/// Lässt sich der Höchststand nicht lesen oder festhalten, wird nicht
+/// aktiviert — und der Witness läuft weiter.
+#[test]
+fn an_unrecordable_counter_refuses_the_activation() {
+    use minds_capture::witness_proto::Frame;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+    // Ein Stand, der nicht so aussieht, wie der Witness ihn schreibt.
+    atomic(&f.home.join("evidence/intent-counter"), b"garbage\n").unwrap();
+    assert!(intent::counter_mark(&f.home, &fido::key()).is_err());
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused(crate::intent_proof::COUNTER_UNREADABLE)
+    );
+    let control = Frame::IntentActivate {
+        anchor: text.clone(),
+        signature: Some(fido::signature()),
+        request_id: [7; 16],
+    };
+    assert_eq!(
+        ask(&mut writer, true, control),
+        Frame::Nack {
+            request_id: [7; 16],
+            reason: crate::intent_proof::COUNTER_UNREADABLE.into(),
+        }
+    );
+    assert!(writer.intent.is_none());
+    assert!(!f.home.join("evidence/intent.json").exists());
+}
+
+/// Auf dem Weg über das Passwort hebt nur eine **gültige** Signatur des
+/// festgehaltenen Schlüssels den Höchststand: Eine erfundene mit hohem
+/// Zähler sperrt den Weg per Berührung nicht.
+#[test]
+fn only_a_valid_signature_raises_the_counter_on_the_control_route() {
+    use minds_capture::witness_proto::Frame;
+    fn reject(_: &str, _: &str, _: &Path, _: &str) -> Option<bool> {
+        Some(false)
+    }
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = reject;
+    let text = anchor(&f, "x\n");
+    let forged = Frame::IntentActivate {
+        anchor: text.clone(),
+        signature: Some(fido::proof_at(1, u32::MAX - 1)),
+        request_id: [7; 16],
+    };
+    // Eine Signatur, die den festgehaltenen Schlüssel nennt, aber nicht gilt:
+    // abgewiesen, nichts aktiviert, der Stand bleibt.
+    assert_eq!(
+        ask(&mut writer, true, forged),
+        Frame::Nack {
+            request_id: [7; 16],
+            reason: "intent signature invalid".into(),
+        }
+    );
+    assert!(writer.intent.is_none());
+    assert_eq!(intent::counter_mark(&f.home, &fido::key()), Ok(0));
+    writer.verify_activation = accept_all;
+    let real = Frame::IntentActivate {
+        anchor: text,
+        signature: Some(fido::proof_at(1, 9)),
+        request_id: [7; 16],
+    };
+    assert!(matches!(ask(&mut writer, true, real), Frame::Ack { .. }));
+    assert_eq!(intent::counter_mark(&f.home, &fido::key()), Ok(9));
+}
+
+/// Höchstens [`intent::MAX_OPEN_CHALLENGES`] Verbindungen halten eine
+/// Nonce; wer schon eine hält, bekommt eine neue.
+#[test]
+fn only_a_few_connections_hold_a_nonce() {
+    use minds_capture::witness_proto::Frame;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    let (mut client, mut theirs) = connected(false);
+    let _ = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    assert_eq!(writer.open_challenges, 1);
+    writer.open_challenges = intent::MAX_OPEN_CHALLENGES;
+    // Diese Verbindung hält schon eine: Sie bekommt eine neue.
+    let _ = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    // Eine weitere nicht.
+    assert_eq!(
+        ask(&mut writer, false, challenge()),
+        Frame::Nack {
+            request_id: [5; 16],
+            reason: "too many open approvals at this witness".into(),
+        }
+    );
+}
+
+/// Lässt sich der neue Höchststand nicht schreiben (das Verzeichnis ist
+/// schreibgeschützt), wird nicht aktiviert, der Stand bleibt, und der
+/// Witness arbeitet weiter.
+#[test]
+fn a_counter_that_cannot_be_written_refuses_the_activation() {
+    use minds_capture::witness_proto::Frame;
+    use std::os::unix::fs::PermissionsExt;
+    // Als root schreibt `atomic` auch in ein schreibgeschütztes Verzeichnis.
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = accept_all;
+    let text = anchor(&f, "x\n");
+    // Ein lesbarer Stand unter der Freigabe (Zähler 1).
+    intent::raise_counter_mark(&f.home, &fido::key(), 0).unwrap();
+    let evidence = f.home.join("evidence");
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o500)).unwrap();
+    let answer = ask_on(
+        &mut writer,
+        &mut client,
+        &mut theirs,
+        proven(&text, &nonce, fido::proof(1)),
+    );
+    fs::set_permissions(&evidence, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(answer, refused(crate::intent_proof::NOT_RECORDABLE));
+    assert!(writer.intent.is_none());
+    assert_eq!(intent::counter_mark(&f.home, &fido::key()), Ok(0));
+    // Der Witness arbeitet weiter.
+    assert!(matches!(
+        ask(&mut writer, false, Frame::Ping),
+        Frame::Ack { .. }
+    ));
+}
+
+/// Hält `key` als Freigabe-Schlüssel in `witness.json` fest — der Witness
+/// liest ihn bei jeder Prüfung von dort.
+fn pin(f: &Fixture, key: &str) {
+    init_config(
+        &f.home,
+        &InitRequest {
+            repo: f.root.to_str().unwrap(),
+            mapping: None,
+            profile: None,
+            socket_group: None,
+            child_repo: None,
+            policy_rev: None,
+            intent_key: Some(key),
+            replace_intent_key: true,
+        },
+    )
+    .unwrap();
+}
+
+/// Ist eine Signatur des festgehaltenen Schlüssels auf dem Weg über das
+/// Passwort nicht prüfbar (Frist, kein `ssh-keygen`), wird nicht
+/// aktiviert — sonst bliebe eine echte Freigabe unter dem Höchststand.
+#[test]
+fn an_uncheckable_signature_is_not_activated_on_the_control_route() {
+    use minds_capture::witness_proto::Frame;
+    fn unknown(_: &str, _: &str, _: &Path, _: &str) -> Option<bool> {
+        None
+    }
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    pin(&f, &fido::key());
+    writer.verify_activation = unknown;
+    let text = anchor(&f, "x\n");
+    let control = Frame::IntentActivate {
+        anchor: text,
+        signature: Some(fido::proof_at(1, 9)),
+        request_id: [7; 16],
+    };
+    assert_eq!(
+        ask(&mut writer, true, control),
+        Frame::Nack {
+            request_id: [7; 16],
+            reason: crate::intent_proof::NOT_CHECKABLE.into(),
+        }
+    );
+    assert!(writer.intent.is_none());
+    assert_eq!(intent::counter_mark(&f.home, &fido::key()), Ok(0));
+}
+
+/// Ein ersetzter Schlüssel gilt sofort — der alte nicht mehr, auch ohne
+/// Neustart des Witness.
+#[test]
+fn a_replaced_intent_key_applies_without_a_restart() {
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    writer.verify_activation = accept_all;
+    pin(&f, &fido::key());
+    let text = anchor(&f, "x\n");
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    pin(&f, &fido::other_key());
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused(crate::intent_proof::NOT_PINNED_PROOF)
+    );
+    assert!(writer.intent.is_none());
+}
+
+/// Auch ein Tausch an Ort und Stelle — gleiche Länge, die Änderungszeit
+/// zurückgesetzt — gilt sofort: Die Statuszeit verrät ihn.
+#[test]
+fn an_in_place_edit_of_the_pin_is_noticed() {
+    use std::io::Write;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    writer.verify_activation = accept_all;
+    pin(&f, &fido::key());
+    let text = anchor(&f, "x\n");
+    let (mut client, mut theirs) = connected(false);
+    let nonce = nonce_of(ask_on(&mut writer, &mut client, &mut theirs, challenge()));
+    let path = f.home.join("witness.json");
+    let before = fs::read_to_string(&path).unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    let after = before.replace(&fido::key(), &fido::other_key());
+    assert_eq!(after.len(), before.len());
+    {
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all(after.as_bytes()).unwrap();
+        file.set_modified(modified).unwrap();
+    }
+    assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+    assert_eq!(
+        ask_on(
+            &mut writer,
+            &mut client,
+            &mut theirs,
+            proven(&text, &nonce, fido::proof(1))
+        ),
+        refused(crate::intent_proof::NOT_PINNED_PROOF)
+    );
 }

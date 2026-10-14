@@ -63,6 +63,7 @@ const ELEVATE: &str = "/usr/bin/sudo";
 const SIGNERS_MARK: &str = "MINDS-SIGNERS ";
 const MANAGED_MARK: &str = "MINDS-MANAGED ";
 const NOTE_MARK: &str = "MINDS-NOTE ";
+const INTENT_KEY_MARK: &str = "MINDS-INTENT-KEY ";
 
 /// Wo die Homes geschützter Witnesses liegen (je Repo `<base>/<repo-id>`).
 /// Nur in Debug-Builds (Tests) über `MINDS_PROTECTED_BASE` verlegbar.
@@ -92,6 +93,9 @@ pub(crate) struct Installed {
     pub(crate) managed: Option<String>,
     /// Hinweise des Skripts (etwa: einmal neu anmelden).
     pub(crate) notes: Vec<String>,
+    /// Was der Witness über den Freigabe-Schlüssel sagt (festgehalten,
+    /// oder ein anderer nicht übernommen).
+    pub(crate) intent_key: Vec<String>,
 }
 
 /// Fragt genau einmal auf dem Terminal. Leere Antwort heißt ja; das Ende
@@ -135,7 +139,20 @@ fn witness_uid() -> Option<u32> {
 /// Socket und die Kennung, die die Gegenstelle haben muss. `None`, wenn
 /// keiner eingerichtet ist oder der Ort nicht vertrauenswürdig ist.
 pub(crate) fn discover(root: &Path) -> Option<(PathBuf, u32)> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::fs::FileTypeExt;
+    let (home, uid) = trusted_home(root)?;
+    let socket = home.join("run").join("witness.sock");
+    std::fs::symlink_metadata(&socket)
+        .ok()
+        .filter(|meta| meta.file_type().is_socket())
+        .map(|_| (socket, uid))
+}
+
+/// Das Home des geschützten Witness dieses Repos und die Kennung seines
+/// Nutzers — wenn der Ort vertrauenswürdig ist ([`Place`]), gleich ob sein
+/// Socket gerade da ist (ein angehaltener Dienst räumt ihn weg).
+pub(crate) fn trusted_home(root: &Path) -> Option<(PathBuf, u32)> {
+    use std::os::unix::fs::MetadataExt;
     let base = base();
     let home = base.join(crate::enable_witness::repo_id(root));
     let base_meta = std::fs::symlink_metadata(&base).ok()?;
@@ -153,11 +170,7 @@ pub(crate) fn discover(root: &Path) -> Option<(PathBuf, u32)> {
     if !place.trusted(euid, witness_uid()?) {
         return None;
     }
-    let socket = home.join("run").join("witness.sock");
-    std::fs::symlink_metadata(&socket)
-        .ok()
-        .filter(|meta| meta.file_type().is_socket())
-        .map(|_| (socket, home_meta.uid()))
+    Some((home, home_meta.uid()))
 }
 
 /// Was [`discover`] über den Ort prüft — ohne Dateisystem, testbar.
@@ -197,7 +210,10 @@ fn root_chain(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     path.ancestors().all(|node| {
         std::fs::symlink_metadata(node).is_ok_and(|meta| {
-            meta.uid() == 0 && (meta.file_type().is_symlink() || meta.mode() & 0o022 == 0)
+            meta.uid() == 0
+                && (meta.file_type().is_symlink()
+                    || (meta.mode() & 0o022 == 0
+                        && !crate::verify_cmd::conformance::carries_acl(node)))
         })
     })
 }
@@ -275,12 +291,14 @@ pub(crate) fn install(
     let source = crate::enable_witness::service_binary(&root)?;
     let user = developer()?;
     prepare_repo(&root, verbose)?;
+    let intent_key = intent_key(&root);
     let script = script(&Values {
         source: &source,
         root: &root,
         user: &user,
         uid: euid,
         managed: existing_managed(),
+        intent_key: intent_key.line(),
     })?;
     if verbose {
         eprintln!("  setup script (run once as root):\n{script}");
@@ -289,10 +307,36 @@ pub(crate) fn install(
         "minds: setting up the protected witness — it runs as {WITNESS_USER} from {BINARY}; \
          you are asked for your password once"
     );
+    // Der volle Fingerabdruck, mit einem `ssh-keygen` außerhalb von allem,
+    // was der Agent ablegen kann. Vergleichen mit dem des eigenen
+    // Sicherheitsschlüssels — nicht mit der `.pub` daneben: Die und
+    // `user.signingkey` kann der Agent geschrieben haben.
+    match &intent_key {
+        IntentKey::Key(key) => {
+            let shown = crate::verify_cmd::conformance::spec_program(&root)
+                .map(|program| crate::witness_cmd::key_display_with(&program, key))
+                .unwrap_or_else(|| "(fingerprint unavailable)".to_owned());
+            eprintln!(
+                "  intent key (from minds.intentKey): {} — once pinned, a touch of it activates \
+                 an intent at the witness. Compare this fingerprint with your security key's \
+                 before you enter your password; a key pinned earlier is kept",
+                crate::text::sanitize(&shown)
+            );
+        }
+        IntentKey::NotSet => {
+            eprintln!("  no minds.intentKey set — intents are activated with your password")
+        }
+        IntentKey::Unusable(path) => eprintln!(
+            "  minds.intentKey ({}) has no security key's .pub next to it — nothing pinned; \
+             intents are activated with your password",
+            crate::text::sanitize(path)
+        ),
+    }
     let output = elevate(&script)?;
     let mut signers = None;
     let mut managed = None;
     let mut notes = Vec::new();
+    let mut intent_keys = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Some(line) = line.strip_prefix(SIGNERS_MARK) {
             signers = Some(crate::text::sanitize(line.trim()));
@@ -300,6 +344,8 @@ pub(crate) fn install(
             managed = Some(crate::text::sanitize(line.trim()));
         } else if let Some(line) = line.strip_prefix(NOTE_MARK) {
             notes.push(crate::text::sanitize(line.trim()));
+        } else if let Some(line) = line.strip_prefix(INTENT_KEY_MARK) {
+            intent_keys.push(crate::text::sanitize(line.trim()));
         } else if !line.trim().is_empty() {
             eprintln!("  {}", crate::text::sanitize(line));
         }
@@ -331,6 +377,7 @@ pub(crate) fn install(
         signers,
         managed,
         notes,
+        intent_key: intent_keys,
     })
 }
 
@@ -343,6 +390,52 @@ struct Values<'a> {
     uid: u32,
     /// Die vorgefundene Managed-Settings-Datei ([`managed_plan`]).
     managed: Option<String>,
+    /// Der Freigabe-Schlüssel für Intents ([`intent_key`]), falls einer.
+    intent_key: Option<&'a str>,
+}
+
+/// Der Sicherheitsschlüssel aus `minds.intentKey` als Freigabe-Schlüssel
+/// (`<typ> <base64>`) — ein **eigener** Schlüssel für Freigaben, nicht
+/// `user.signingkey`: Mit dem signiert jeder Commit, und jede Berührung
+/// dafür wäre eine Freigabe, die der Agent auslösen kann. Ohne ihn (oder
+/// mit einem Software-Schlüssel) wird nichts festgehalten; dann aktiviert
+/// `intent sign` mit dem Passwort.
+///
+/// Nur ein **Vorschlag**, kein Vertrauensanker: Die Git-Konfiguration und
+/// die `.pub` kann der Agent geschrieben haben (auch einen
+/// Software-„Sicherheitsschlüssel"). Darum zeigt `enable` den vollen
+/// Fingerabdruck vor dem Passwort, und ein schon festgehaltener Schlüssel
+/// wird hier nie ersetzt.
+fn intent_key(root: &Path) -> IntentKey {
+    intent_key_from(crate::sign_cmd::intent_key_config(root))
+}
+
+/// [`intent_key`] für einen schon gelesenen Wert von `minds.intentKey`.
+fn intent_key_from(configured: Option<String>) -> IntentKey {
+    let Some(key) = configured else {
+        return IntentKey::NotSet;
+    };
+    crate::intent_cmd::read_public_key(&key)
+        .and_then(|line| crate::witness_cmd::intent_key_line(&line).ok())
+        .map_or(IntentKey::Unusable(key), IntentKey::Key)
+}
+
+/// Was `minds.intentKey` hergibt.
+enum IntentKey {
+    NotSet,
+    /// Gesetzt, aber keine `.pub` eines Sicherheitsschlüssels daneben.
+    Unusable(String),
+    /// Die Zeile, die festgehalten wird.
+    Key(String),
+}
+
+impl IntentKey {
+    fn line(&self) -> Option<&str> {
+        match self {
+            Self::Key(line) => Some(line),
+            Self::NotSet | Self::Unusable(_) => None,
+        }
+    }
 }
 
 /// Das Einrichtungsskript für diese Plattform — jeder Wert in einfachen
@@ -393,7 +486,7 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         values.managed.as_deref(),
     )?;
     let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
-    let pairs: [(&str, String); 14] = [
+    let pairs: [(&str, String); 15] = [
         ("SOURCE", quote(&text(values.source)?)),
         ("BINARY", quote(BINARY)),
         ("WUSER", quote(WITNESS_USER)),
@@ -408,6 +501,7 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         ("MANAGED_DIR", quote(MANAGED_DIR)),
         ("MANAGED_CONTENT", quote(&managed.content)),
         ("MANAGED_PREVIOUS", quote(&managed.previous)),
+        ("INTENT_KEY", quote(values.intent_key.unwrap_or_default())),
     ];
     // Ein Durchgang über die Vorlage: Eingesetzte Werte werden nie erneut
     // nach Platzhaltern durchsucht.
@@ -792,18 +886,98 @@ fn witness_gid() -> Option<u32> {
 /// ersetzt `MINDS_SUDO_STUB` das Programm; der Ersatz bekommt dieselben
 /// Argumente.
 fn elevate(script: &str) -> std::io::Result<std::process::Output> {
-    #[cfg(debug_assertions)]
-    let program = std::env::var_os("MINDS_SUDO_STUB")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(ELEVATE));
-    #[cfg(not(debug_assertions))]
-    let program = PathBuf::from(ELEVATE);
+    let program = elevation_program();
+    // `-k`: Ein zwischengespeichertes Passwort zählt nicht, und es entsteht
+    // keins — der Agent könnte es sonst in den nächsten Minuten nutzen.
     std::process::Command::new(program)
-        .args(["/bin/sh", "-c", script, "minds-protected-setup"])
+        .args(["-k", "/bin/sh", "-c", script, "minds-protected-setup"])
         .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
         .output()
+}
+
+/// Aktiviert einen Intent am geschützten Witness dieses Repos: als
+/// Witness-Nutzer `minds witness activate` aus dem root-eigenen Binary
+/// ([`BINARY`]), `request` (JSON mit Anker und Signatur) über stdin. Mit
+/// derselben einen Erhöhung wie die Einrichtung, immer mit Passwort (`-k`):
+/// Es ist der Beleg, dass der Mensch diese Aktivierung will — der Agent
+/// teilt seine Kennung, aber nicht sein Passwort. Die Ausgabe des Witness
+/// (stdout) wird eingesammelt, stderr und die Passwortabfrage gehen ans
+/// Terminal.
+pub(crate) fn activate_elevated(
+    root: &Path,
+    request: &[u8],
+) -> std::io::Result<std::process::Output> {
+    activate_elevated_with(&elevation_program(), &home_of(root), request)
+}
+
+/// [`activate_elevated`] mit genau dem Programm `program` (im Test ein
+/// Ersatz).
+fn activate_elevated_with(
+    program: &Path,
+    home: &Path,
+    request: &[u8],
+) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    let mut child = std::process::Command::new(program)
+        .args(activation_args(home))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| other("no stdin for the elevated activation"))?;
+        // Bricht die Erhöhung ab (falsches Passwort), liest niemand: Das
+        // Urteil fällt am Exit-Status, nicht am Schreiben.
+        if let Err(err) = stdin.write_all(request) {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(err);
+            }
+        }
+    }
+    child.wait_with_output()
+}
+
+/// Die Argumente der Erhöhung für [`activate_elevated`] — ohne Shell, jeder
+/// Wert ein eigenes Argument.
+fn activation_args(home: &Path) -> Vec<std::ffi::OsString> {
+    // `env -i` wie im Einrichtungsskript: Der Witness-Nutzer erbt weder
+    // `PATH` noch `HOME` des Entwicklers (die der Agent setzen kann).
+    let mut args: Vec<std::ffi::OsString> = [
+        "-k",
+        "-p",
+        "minds: your password approves activating this intent at the protected witness: ",
+        "-u",
+        WITNESS_USER,
+        "--",
+        "/usr/bin/env",
+        "-i",
+        "HOME=/var/empty",
+        "PATH=/usr/bin:/bin",
+        BINARY,
+        "witness",
+        "activate",
+        "--home",
+    ]
+    .iter()
+    .map(Into::into)
+    .collect();
+    args.push(home.as_os_str().to_owned());
+    args
+}
+
+/// Das Programm für die Erhöhung. Nur in Debug-Builds (Tests) ersetzt
+/// `MINDS_SUDO_STUB` es; der Ersatz bekommt dieselben Argumente.
+fn elevation_program() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(stub) = std::env::var_os("MINDS_SUDO_STUB") {
+        return PathBuf::from(stub);
+    }
+    PathBuf::from(ELEVATE)
 }
 
 /// Hält den ungeschützten Nutzerdienst dieses Repos an und schaltet ihn ab
@@ -922,6 +1096,7 @@ mod tests {
             user: "dev",
             uid: 501,
             managed: None,
+            intent_key: None,
         }
     }
 
@@ -971,7 +1146,7 @@ mod tests {
     /// der anderen Plattform, die hier nie gerendert wird.
     #[test]
     fn both_templates_use_only_known_placeholders() {
-        const KNOWN: [&str; 14] = [
+        const KNOWN: [&str; 15] = [
             "SOURCE",
             "BINARY",
             "WUSER",
@@ -986,6 +1161,7 @@ mod tests {
             "MANAGED_DIR",
             "MANAGED_CONTENT",
             "MANAGED_PREVIOUS",
+            "INTENT_KEY",
         ];
         for template in [
             include_str!("../templates/witness/protected-macos.sh"),
@@ -1173,6 +1349,168 @@ mod tests {
         }
         for bad in ["", "-x", "a b", "a;b", "a$b", "a'b"] {
             assert!(!word(bad), "{bad}");
+        }
+    }
+
+    /// Die Aktivierung mit Passwort: ohne Shell, `-k` (nie ein
+    /// zwischengespeichertes Passwort), als Witness-Nutzer, das root-eigene
+    /// Binary, das Home als eigenes Argument hinter `--`.
+    #[test]
+    fn the_elevated_activation_runs_the_installed_binary_as_the_witness() {
+        let home = Path::new("/var/lib/minds-witness/0123 it's");
+        let args: Vec<String> = activation_args(home)
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect();
+        assert_eq!(args[0], "-k");
+        assert_eq!(args[1], "-p");
+        assert!(!args[2].contains('%'), "{}", args[2]);
+        assert_eq!(
+            args[3..],
+            [
+                "-u",
+                WITNESS_USER,
+                "--",
+                "/usr/bin/env",
+                "-i",
+                "HOME=/var/empty",
+                "PATH=/usr/bin:/bin",
+                BINARY,
+                "witness",
+                "activate",
+                "--home",
+                "/var/lib/minds-witness/0123 it's",
+            ]
+        );
+    }
+
+    /// Ein Sicherheitsschlüssel aus `minds.intentKey` steht gequotet im
+    /// Skript und geht an `witness init --intent-key`; ohne bleibt der Wert
+    /// leer.
+    #[test]
+    fn the_script_pins_the_intent_key_only_when_there_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let source = Path::new("/opt/minds/bin/minds");
+        let script = script(&values(&root, source)).unwrap();
+        assert!(script.contains("INTENT_KEY=''"), "{script}");
+        let key = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29t";
+        let script = super::script(&Values {
+            intent_key: Some(key),
+            ..values(&root, source)
+        })
+        .unwrap();
+        assert!(script.contains(&format!("INTENT_KEY='{key}'")), "{script}");
+        assert!(script.contains("--intent-key \"$INTENT_KEY\""), "{script}");
+    }
+
+    /// Der Weg über das Passwort: Die Anfrage geht über stdin an das
+    /// Programm (im Test ein Ersatz, der sie ablegt); sein Exit-Status
+    /// entscheidet — auch wenn es stdin nie liest (falsches Passwort).
+    #[test]
+    fn the_elevated_activation_hands_the_request_over_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let seen = dir.path().join("seen");
+        let ok = stub(
+            "ok.sh",
+            &format!(
+                "printf '%s\\n' \"$@\" > '{0}.args'; cat > '{0}'; echo 'intent active b3-x'",
+                seen.display()
+            ),
+        );
+        let home = Path::new("/var/lib/minds-witness/abc");
+        let output = activate_elevated_with(&ok, home, br#"{"anchor":"a"}"#).unwrap();
+        assert!(output.status.success());
+        assert_eq!(std::fs::read(&seen).unwrap(), br#"{"anchor":"a"}"#);
+        let args = std::fs::read_to_string(format!("{}.args", seen.display())).unwrap();
+        assert!(
+            args.ends_with("activate\n--home\n/var/lib/minds-witness/abc\n"),
+            "{args}"
+        );
+        // Abgebrochen, bevor es stdin las: kein Fehler beim Schreiben,
+        // der Status entscheidet.
+        let refused = stub("refused.sh", "exit 1");
+        let big = vec![b' '; 1024 * 1024];
+        let output = activate_elevated_with(&refused, home, &big).unwrap();
+        assert_eq!(output.status.code(), Some(1));
+    }
+
+    /// `minds.intentKey`: nicht gesetzt, gesetzt ohne Sicherheitsschlüssel
+    /// daneben (Software-`.pub`, keine `.pub`), oder die Zeile ohne
+    /// Kommentar, die festgehalten wird.
+    #[test]
+    fn the_intent_key_is_a_security_keys_pub_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).to_str().unwrap().to_owned();
+        assert!(matches!(intent_key_from(None), IntentKey::NotSet));
+
+        std::fs::write(
+            dir.path().join("soft.pub"),
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl me\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            intent_key_from(Some(path("soft"))),
+            IntentKey::Unusable(_)
+        ));
+        assert!(matches!(
+            intent_key_from(Some(path("missing"))),
+            IntentKey::Unusable(_)
+        ));
+
+        // Ein (ausgedachter) Sicherheitsschlüssel: Typ und Base64, ohne
+        // Kommentar.
+        let blob = "AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIAkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJAAAABHNzaDo=";
+        std::fs::write(
+            dir.path().join("sk.pub"),
+            format!("sk-ssh-ed25519@openssh.com {blob} me@host\n"),
+        )
+        .unwrap();
+        match intent_key_from(Some(path("sk"))) {
+            IntentKey::Key(line) => {
+                assert_eq!(line, format!("sk-ssh-ed25519@openssh.com {blob}"));
+            }
+            _ => panic!("expected the key"),
+        }
+    }
+
+    /// Gelesen wird `minds.intentKey` des Repos.
+    #[test]
+    fn the_intent_key_comes_from_the_repository_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        let missing = root.join("missing");
+        git(&[
+            "config",
+            "--local",
+            "minds.intentKey",
+            missing.to_str().unwrap(),
+        ]);
+        match intent_key(root) {
+            IntentKey::Unusable(path) => assert_eq!(path, missing.to_str().unwrap()),
+            _ => panic!("expected the configured path"),
         }
     }
 }

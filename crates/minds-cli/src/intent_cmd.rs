@@ -41,6 +41,15 @@
 //!   (`control/control.sock`, nur host-seitig erreichbar, EA-14). Das Home
 //!   kommt aus `--witness-home`, sonst aus `MINDS_WITNESS_HOME` bzw. dem
 //!   XDG-Pfad dieses Repositorys, sofern dort ein Steuer-Socket liegt.
+//! - **Geschützter Witness** (`minds enable`, eigener Nutzer): Seinen
+//!   Steuer-Socket erreicht der Mensch nicht — sonst erreichte ihn auch der
+//!   Agent, der dieselbe Kennung hat. Aktiviert wird mit einem Beleg, dass
+//!   der Mensch es **jetzt** will: Signierte ein Sicherheitsschlüssel
+//!   (`sk-…`), holt `sign` eine Nonce vom Witness und signiert Anker-Id und
+//!   Nonce unter `minds-intent-activate` (eine zweite Berührung) — der
+//!   Witness prüft sie gegen den Schlüssel, den die Einrichtung festhielt.
+//!   Sonst (oder ohne festgehaltenen Schlüssel) aktiviert `sign` als
+//!   Witness-Nutzer mit der einen Erhöhung; das Passwort ist der Beleg.
 //! - **Lokal (A1):** ohne Witness die Datei `<git-dir>/minds/intent/active`,
 //!   die der lokale Checkpoint liest — eine schwächere, nicht verkettete
 //!   Bindung.
@@ -503,7 +512,16 @@ fn sign(target: Option<&str>, key: Option<&str>, witness_home: Option<&str>) -> 
         }
     }
 
-    let key = crate::sign_cmd::resolve_key(key, &ctx.root)?;
+    // `--key`, sonst der eigene Freigabe-Schlüssel (`minds.intentKey`, den
+    // `minds enable` am geschützten Witness festhält), sonst
+    // `user.signingkey`.
+    let key = match key {
+        Some(key) => key.to_owned(),
+        None => match crate::sign_cmd::intent_key_config(&ctx.root) {
+            Some(key) => key,
+            None => crate::sign_cmd::resolve_key(None, &ctx.root)?,
+        },
+    };
     // Der Pfad kann aus der Repo-Konfiguration stammen (`user.signingkey`),
     // und `ssh-keygen` zitiert ihn auf dem geerbten stderr.
     if crate::text::sanitize(&key) != key {
@@ -548,7 +566,19 @@ fn sign(target: Option<&str>, key: Option<&str>, witness_home: Option<&str>) -> 
     // unlesbar, sieht der Mensch eine etwaige Berührungs-Aufforderung —
     // sonst blinkte der Schlüssel stumm.
     let software = public_type.is_some_and(|kind| !minds_attest::is_security_key_type(kind));
-    let signature = if software {
+    // Am geschützten Witness signiert immer der abgeschirmte Signierer
+    // ([`TouchSigner`]) — was die `.pub` behauptet, entscheidet das nicht:
+    // Die kann der Agent gelöscht oder umgeschrieben haben.
+    let shielded = match &route {
+        Route::Protected { .. } | Route::ProtectedPassword => Some(shielded_signer(&ctx.root)?),
+        Route::Witness { .. } | Route::Local => None,
+    };
+    let signature = if let Some(signer) = &shielded {
+        if !software {
+            eprintln!("Touch your security key to approve this intent.");
+        }
+        signer.sign(&stored.text, Path::new(&key), minds_attest::NS_INTENT)?
+    } else if software {
         minds_attest::ssh_sign_ns(&stored.text, Path::new(&key), minds_attest::NS_INTENT)?
     } else {
         if public_type.is_some() {
@@ -562,8 +592,15 @@ fn sign(target: Option<&str>, key: Option<&str>, witness_home: Option<&str>) -> 
         labeled("signed", &signer_line(&key, public.as_deref(), &signature))
     );
 
-    let activation = activate(&ctx, route, &stored.text, &signature)
-        .map_err(|err| format!("signature stored, but the intent is not active: {err}"))?;
+    let activation = activate(
+        &ctx,
+        route,
+        &stored.text,
+        &signature,
+        shielded.as_ref(),
+        Path::new(&key),
+    )
+    .map_err(|err| format!("signature stored, but the intent is not active: {err}"))?;
     println!("{}", labeled("active", &activation));
     Ok(())
 }
@@ -627,8 +664,50 @@ pub(crate) fn signer_line(key: &str, public: Option<&str>, signature: &str) -> S
 enum Route {
     /// Der Steuer-Socket eines laufenden Witness.
     Witness { home: PathBuf, socket: PathBuf },
+    /// Der geschützte Witness dieses Repos: sein Socket der Agent-Seite
+    /// und die Kennung, die die Gegenstelle haben muss.
+    Protected { socket: PathBuf, peer: u32 },
+    /// Der geschützte Witness, dessen Socket diese Sitzung (noch) nicht
+    /// erreicht — nur der Weg über das Passwort bleibt.
+    ProtectedPassword,
     /// Die A1-Datei.
     Local,
+}
+
+/// Was über den geschützten Witness dieses Repos feststeht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectedState {
+    /// Keiner eingerichtet (oder nicht an einem vertrauenswürdigen Ort).
+    Absent,
+    /// Gefunden, sein Socket antwortet.
+    Reachable,
+    /// Gefunden, aber stumm.
+    Silent,
+    /// Für dieses Repo eingerichtet, sein Home ist für diese Sitzung aber
+    /// verschlossen, und dieser Nutzer steht in seiner Gruppe, die die
+    /// Sitzung noch nicht hat (Linux: erst nach dem nächsten Anmelden).
+    GroupPending,
+}
+
+/// Die Entscheidung für den geschützten Witness — `None`: keiner, weiter
+/// mit den anderen Wegen.
+fn protected_route(
+    state: ProtectedState,
+    found: Option<(PathBuf, u32)>,
+) -> Option<Fallible<Route>> {
+    match (state, found) {
+        (ProtectedState::Reachable, Some((socket, peer))) => {
+            Some(Ok(Route::Protected { socket, peer }))
+        }
+        // Den Weg über das Passwort braucht die Gruppe nicht.
+        (ProtectedState::GroupPending, _) => Some(Ok(Route::ProtectedPassword)),
+        (ProtectedState::Silent, _) | (ProtectedState::Reachable, None) => Some(Err(
+            "the protected witness of this repository did not answer — is its service running \
+             (minds doctor)? Nothing was signed"
+                .into(),
+        )),
+        (ProtectedState::Absent, _) => None,
+    }
 }
 
 /// Bestimmt den Weg: ein ausdrücklich genanntes oder vorgefundenes
@@ -637,6 +716,23 @@ enum Route {
 /// einen Witness ohne erreichbaren Steuer-Socket, ist das ein Fehler: Die
 /// Datei liest ein Witness nie, die Bindung ginge still verloren.
 fn route(root: &Path, witness_home: Option<&str>) -> Fallible<Route> {
+    // Der geschützte Witness zuerst — wie für die Hooks. Ein ausdrücklich
+    // genanntes Home geht vor.
+    if witness_home.is_none() {
+        let found = protected(root);
+        let state = match &found {
+            Some((socket, _)) if reachable(socket) => ProtectedState::Reachable,
+            Some(_) => ProtectedState::Silent,
+            // Eingerichtet, aber ohne Socket: ein angehaltener Dienst — nie
+            // „kein geschützter Witness" (die A1-Datei läse er nie).
+            None if protected_home(root) => ProtectedState::Silent,
+            None if group_pending(root) => ProtectedState::GroupPending,
+            None => ProtectedState::Absent,
+        };
+        if let Some(route) = protected_route(state, found) {
+            return route;
+        }
+    }
     if let Some((home, explicit)) = witness_home_for(root, witness_home)? {
         let socket = home.join(control_socket());
         if explicit || std::fs::symlink_metadata(&socket).is_ok() {
@@ -678,10 +774,167 @@ fn reachable(_: &Path) -> bool {
     false
 }
 
+/// Der geschützte Witness dieses Repos, wie die Hooks ihn finden.
+#[cfg(unix)]
+fn protected(root: &Path) -> Option<(PathBuf, u32)> {
+    crate::enable_protected::discover(&root.canonicalize().ok()?)
+}
+
+#[cfg(not(unix))]
+fn protected(_: &Path) -> Option<(PathBuf, u32)> {
+    None
+}
+
+/// Belegt wie in `minds doctor`: Das Home des geschützten Witness für
+/// dieses Repo ist für diese Sitzung verschlossen, und dieser Nutzer steht
+/// in der Witness-Gruppe, die die Sitzung noch nicht hat.
+#[cfg(unix)]
+fn group_pending(root: &Path) -> bool {
+    root.canonicalize().is_ok_and(|root| {
+        std::fs::symlink_metadata(crate::enable_protected::home_of(&root))
+            .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+    }) && crate::enable_protected::membership_pending()
+}
+
+#[cfg(not(unix))]
+fn group_pending(_: &Path) -> bool {
+    false
+}
+
+/// Ob für dieses Repo ein geschützter Witness eingerichtet ist (ein
+/// vertrauenswürdiger Ort), auch wenn sein Socket fehlt.
+#[cfg(unix)]
+fn protected_home(root: &Path) -> bool {
+    root.canonicalize()
+        .is_ok_and(|root| crate::enable_protected::trusted_home(&root).is_some())
+}
+
+#[cfg(not(unix))]
+fn protected_home(_: &Path) -> bool {
+    false
+}
+
+/// Wie `sign` am geschützten Witness signiert — beide Berührungen, die
+/// Freigabe des Ankers und die der Aktivierung: ein root-eigenes
+/// `ssh-keygen` außerhalb des Checkouts (wie `spec sign` — eins, das der
+/// Agent in den `PATH` gelegt hat, sähe die Berührung des Menschen und
+/// könnte sie für einen anderen Text verwenden), der Text über stdin, eine
+/// leere Umgebung — `SSH_SK_PROVIDER` nur, wenn er `internal` ist oder
+/// eine Bibliothek, die samt aller Verzeichnisse darüber root gehört
+/// (weitergereicht als ihr kanonischer Pfad).
+#[cfg(unix)]
+struct TouchSigner {
+    program: PathBuf,
+    env: Vec<(&'static str, std::ffi::OsString)>,
+}
+
+#[cfg(unix)]
+impl TouchSigner {
+    fn resolve(root: &Path, provider: Option<std::ffi::OsString>) -> Result<Self, &'static str> {
+        let program = crate::verify_cmd::conformance::spec_program(root)
+            .filter(|program| minds_attest::ssh_keygen_available_at(program))
+            .ok_or(
+                "no root-owned ssh-keygen outside the checkout — required to sign at the \
+                 protected witness",
+            )?;
+        Ok(Self {
+            program,
+            env: trusted_provider(provider)
+                .map(|provider| vec![("SSH_SK_PROVIDER", provider)])
+                .unwrap_or_default(),
+        })
+    }
+
+    fn sign(&self, text: &str, key: &Path, namespace: &str) -> Fallible<String> {
+        let env: Vec<(&str, &std::ffi::OsStr)> = self
+            .env
+            .iter()
+            .map(|(name, value)| (*name, value.as_os_str()))
+            .collect();
+        Ok(minds_attest::ssh_sign_ns_presence_isolated(
+            &self.program,
+            text,
+            key,
+            namespace,
+            &env,
+        )?)
+    }
+}
+
+/// `SSH_SK_PROVIDER`, wenn er vertraut werden kann: `internal` oder der
+/// kanonische Pfad einer root-eigenen Bibliothek. Sonst keiner — ein
+/// Sicherheitsschlüssel lässt sich dann (mit Apples `ssh-keygen`) nicht
+/// abgeschirmt nutzen; `sign` sagt es.
+#[cfg(unix)]
+fn trusted_provider(provider: Option<std::ffi::OsString>) -> Option<std::ffi::OsString> {
+    let provider = provider?;
+    if provider == "internal" {
+        return Some(provider);
+    }
+    let real = Path::new(&provider)
+        .is_absolute()
+        .then(|| std::fs::canonicalize(&provider).ok())
+        .flatten()
+        .filter(|real| crate::verify_cmd::conformance::root_owned_chain(real));
+    if real.is_none() {
+        eprintln!(
+            "minds: SSH_SK_PROVIDER is not root-owned — not used for signing at the protected \
+             witness (a security key then needs a root-owned provider; a software key works)"
+        );
+    }
+    real.map(PathBuf::into_os_string)
+}
+
+/// Der abgeschirmte Signierer für den geschützten Witness.
+#[cfg(unix)]
+fn shielded_signer(root: &Path) -> Fallible<TouchSigner> {
+    Ok(TouchSigner::resolve(
+        root,
+        std::env::var_os("SSH_SK_PROVIDER"),
+    )?)
+}
+
+#[cfg(not(unix))]
+fn shielded_signer(_: &Path) -> Fallible<TouchSigner> {
+    Err("the protected witness is not supported on this platform".into())
+}
+
+/// Ohne Unix gibt es keinen geschützten Witness.
+#[cfg(not(unix))]
+struct TouchSigner;
+
+#[cfg(not(unix))]
+impl TouchSigner {
+    fn sign(&self, _: &str, _: &Path, _: &str) -> Fallible<String> {
+        Err("the protected witness is not supported on this platform".into())
+    }
+}
+
 /// Aktiviert den Anker auf dem vorab bestimmten Weg und sagt, auf welchem
-/// (`witness (container)` oder die lokale Datei).
-fn activate(ctx: &Context, route: Route, anchor: &str, signature: &str) -> Fallible<String> {
+/// (`witness (container)` oder die lokale Datei). `touch`: Der Anker wurde
+/// für die Freigabe per Berührung signiert.
+fn activate(
+    ctx: &Context,
+    route: Route,
+    anchor: &str,
+    signature: &str,
+    touch: Option<&TouchSigner>,
+    key: &Path,
+) -> Fallible<String> {
     match route {
+        Route::ProtectedPassword => {
+            eprintln!(
+                "minds: the witness socket is not reachable in this session yet (log in again \
+                 for your new group) — activating with your password"
+            );
+            activate_with_password(&ctx.root, anchor, signature)
+        }
+        Route::Protected { socket, peer } => match touch {
+            Some(signer) => {
+                activate_protected(&ctx.root, &socket, peer, anchor, signature, signer, key)
+            }
+            None => Err("no shielded signer for the protected witness".into()),
+        },
         Route::Witness { home, socket } => match activate_at_witness(&socket, anchor, signature) {
             // Das Profil steht in `witness.json` des Homes — so weit zu
             // trauen wie dieser Datei; die Bindung selbst bestätigte der
@@ -716,7 +969,284 @@ fn activate(ctx: &Context, route: Route, anchor: &str, signature: &str) -> Falli
     }
 }
 
+/// Aktiviert am geschützten Witness mit einer zweiten Berührung — wenn ein
+/// Sicherheitsschlüssel mit Berührung signierte (die Signatur selbst sagt
+/// es, nicht die `.pub`) — oder, wenn es dazu nicht kommt (kein Schlüssel
+/// festgehalten oder ein anderer, ein älterer Witness, der Socket belegt,
+/// der Witness gebremst), mit dem Passwort.
+#[cfg(unix)]
+fn activate_protected(
+    root: &Path,
+    socket: &Path,
+    peer: u32,
+    anchor: &str,
+    signature: &str,
+    signer: &TouchSigner,
+    key: &Path,
+) -> Fallible<String> {
+    // Nur mit Zähler: Ohne ihn lehnte der Witness die zweite Berührung ab —
+    // sie wäre vergeudet.
+    let touched = minds_attest::signature_key(signature).is_some_and(|signed| {
+        minds_attest::is_security_key_type(&signed.key_type) && signed.user_presence
+    }) && minds_attest::signature_counter(signature)
+        .is_some_and(|counter| counter > 0);
+    if !touched {
+        return activate_with_password(root, anchor, signature);
+    }
+    let mut sign = |text: &str, namespace: &str| signer.sign(text, key, namespace);
+    let outcome = activate_with_touch(socket, peer, anchor, signature, &mut sign, THROTTLE_BUDGET)?;
+    match after_touch(outcome) {
+        Next::Done(route) => Ok(route),
+        Next::Password(why) => {
+            eprintln!("minds: {why} — activating with your password instead");
+            activate_with_password(root, anchor, signature)
+        }
+        Next::Fail(error) => Err(error.into()),
+    }
+}
+
+/// Was nach der Freigabe per Berührung folgt.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Aktiviert; der Weg für die Ausgabe.
+    Done(String),
+    /// Weiter mit dem Passwort — warum.
+    Password(String),
+    /// Abbrechen, mit Grund.
+    Fail(String),
+}
+
+/// Entscheidet nach der Freigabe per Berührung. Das Passwort ist ein eigener
+/// Beleg: Wo die Berührung nicht zum Ziel kommt, bleibt dieser Weg — außer
+/// der Zählerstand des Witness ist kaputt (dann scheiterte auch er) oder der
+/// Witness ist nach der Berührung unerreichbar.
+#[cfg(unix)]
+fn after_touch(outcome: Touch) -> Next {
+    use crate::intent_proof::{
+        COUNTER_UNREADABLE, NO_INTENT_KEY, NOT_CHECKABLE, NOT_PINNED_PROOF, NOT_PINNED_SIGNATURE,
+        NOT_RECORDABLE,
+    };
+    match outcome {
+        // Kann der Witness schon die Nonce nicht ausgeben (`witness.json`
+        // unlesbar), scheiterte auch der Weg über das Passwort daran — kein
+        // vergebliches Passwort.
+        Touch::NoChallenge(Refusal::Refused(reason)) if reason == NOT_CHECKABLE => {
+            Next::Fail(format!(
+                "the witness cannot check approvals right now ({reason}) — as the witness user, \
+                 check witness.json in its home"
+            ))
+        }
+        Touch::Activated => Next::Done("witness (protected, security key)".to_owned()),
+        Touch::NoChallenge(Refusal::Refused(reason)) if reason == NO_INTENT_KEY => Next::Password(
+            "the protected witness has no usable security key pinned (set minds.intentKey and \
+             rerun `MINDS_WITNESS=protected minds enable`; a key pinned before is replaced only \
+             with `minds witness init --replace-intent-key`, see the docs)"
+                .to_owned(),
+        ),
+        Touch::NoChallenge(Refusal::Refused(reason)) => {
+            Next::Password(format!("the protected witness gave no nonce ({reason})"))
+        }
+        Touch::NoChallenge(Refusal::Unreachable(kind)) => Next::Password(format!(
+            "the protected witness gave no nonce ({kind}; an older witness? rerun \
+             `MINDS_WITNESS=protected minds enable` to update it)"
+        )),
+        Touch::Busy => Next::Password(
+            "the protected witness kept deferring the check (another process is flooding it \
+             with approvals)"
+                .to_owned(),
+        ),
+        Touch::Late => Next::Password(
+            "the second touch came too late (the witness's nonce is valid for two minutes)"
+                .to_owned(),
+        ),
+        Touch::Failed(Refusal::Refused(reason))
+            if reason == NOT_PINNED_PROOF || reason == NOT_PINNED_SIGNATURE =>
+        {
+            Next::Password("this key is not the one pinned at the protected witness".to_owned())
+        }
+        // Nach der Berührung nicht prüfbar (kein `ssh-keygen`, Frist): Der
+        // Weg über das Passwort prüfte dieselbe Signatur genauso.
+        Touch::Failed(Refusal::Refused(reason)) if reason == NOT_CHECKABLE => Next::Fail(format!(
+            "the witness could not check the approval ({reason}) — its ssh-keygen; retry \
+                 minds intent sign"
+        )),
+        Touch::Failed(Refusal::Refused(reason)) if reason == COUNTER_UNREADABLE => {
+            Next::Fail(format!(
+                "the witness refused it: {reason} — as the witness user, inspect or remove \
+                 evidence/intent-counter in its home"
+            ))
+        }
+        Touch::Failed(Refusal::Refused(reason)) if reason == NOT_RECORDABLE => Next::Fail(format!(
+            "the witness refused it: {reason} — it could not write to its home; check the \
+                 witness home (evidence/, free space)"
+        )),
+        Touch::Failed(Refusal::Refused(reason)) => {
+            Next::Password(format!("the witness refused the touch approval ({reason})"))
+        }
+        Touch::Failed(Refusal::Unreachable(kind)) => {
+            Next::Fail(format!("the protected witness is not reachable ({kind})"))
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn activate_protected(
+    _: &Path,
+    _: &Path,
+    _: u32,
+    _: &str,
+    _: &str,
+    _: &TouchSigner,
+    _: &Path,
+) -> Fallible<String> {
+    Err("the protected witness is not supported on this platform".into())
+}
+
+#[cfg(not(unix))]
+fn activate_with_password(_: &Path, _: &str, _: &str) -> Fallible<String> {
+    Err("the protected witness is not supported on this platform".into())
+}
+
+/// Wie die Freigabe per Berührung ausging.
+#[cfg(unix)]
+#[derive(Debug)]
+enum Touch {
+    Activated,
+    /// Keine Nonce — vor jeder Berührung; der Weg über das Passwort bleibt.
+    NoChallenge(Refusal),
+    /// Der Witness bremste die Prüfung länger als [`THROTTLE_BUDGET`].
+    Busy,
+    /// Die zweite Berührung kam nach [`TOUCH_WINDOW`].
+    Late,
+    /// Nach der Berührung abgelehnt oder abgebrochen.
+    Failed(Refusal),
+}
+
+/// So lange nach der Nonce darf die zweite Berührung dauern — knapp unter
+/// der Frist des Witness (120 s), damit eine verspätete Freigabe hier einen
+/// klaren Grund bekommt statt einer geschlossenen Verbindung.
+#[cfg(unix)]
+const TOUCH_WINDOW: std::time::Duration = std::time::Duration::from_secs(110);
+
+/// So lange schickt `sign` eine gebremste Freigabe erneut, bevor es auf das
+/// Passwort ausweicht.
+#[cfg(unix)]
+const THROTTLE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Die Pause, bevor eine gebremste Freigabe erneut geht.
+#[cfg(unix)]
+const THROTTLE_PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Nonce holen, Anker-Id, Anker-Signatur und Nonce mit Berührung signieren
+/// (`sign`: Text, Namespace), auf derselben Verbindung aktivieren —
+/// gebremst, dieselbe Freigabe erneut, höchstens `budget` lang. `Err` nur,
+/// wenn das Signieren scheitert.
+#[cfg(unix)]
+fn activate_with_touch(
+    socket: &Path,
+    peer: u32,
+    anchor: &str,
+    signature: &str,
+    sign: &mut dyn FnMut(&str, &str) -> Fallible<String>,
+    budget: std::time::Duration,
+) -> Fallible<Touch> {
+    use crate::hook::witness::Conversation;
+    use minds_capture::witness_proto::{Frame, NONCE_HEX};
+    use std::time::Instant;
+
+    let answer = |answer: Result<Frame, &'static str>| match answer {
+        Ok(Frame::Ack { status, .. }) => Ok(status),
+        Ok(Frame::Nack { reason, .. }) => Err(Refusal::Refused(crate::text::sanitize(&reason))),
+        Ok(_) => Err(Refusal::Unreachable("unexpected response")),
+        Err(kind) => Err(Refusal::Unreachable(kind)),
+    };
+    let mut conversation =
+        match Conversation::open(socket, Some(peer), Instant::now() + ACTIVATE_TIMEOUT) {
+            Ok(conversation) => conversation,
+            Err(kind) => return Ok(Touch::NoChallenge(Refusal::Unreachable(kind))),
+        };
+    let challenge = Frame::IntentChallenge {
+        request_id: request_id(),
+    };
+    let status = match answer(conversation.request(&challenge, Instant::now() + ACTIVATE_TIMEOUT)) {
+        Ok(status) => status,
+        Err(refusal) => return Ok(Touch::NoChallenge(refusal)),
+    };
+    let issued = Instant::now();
+    let Some(nonce) = status.strip_prefix("nonce ").filter(|nonce| {
+        nonce.len() == NONCE_HEX
+            && nonce
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }) else {
+        return Ok(Touch::NoChallenge(Refusal::Unreachable(
+            "unexpected response",
+        )));
+    };
+    let id = minds_core::intent_anchor::IntentAnchor::id_of_text(anchor);
+    let message = crate::intent_proof::activation_message(id.as_str(), signature, nonce);
+    eprintln!("Touch your security key again to activate the intent at the protected witness.");
+    let proof = sign(&message, minds_attest::NS_INTENT_ACTIVATE)?;
+    if issued.elapsed() >= TOUCH_WINDOW {
+        return Ok(Touch::Late);
+    }
+    let frame = Frame::IntentActivateProven {
+        anchor: anchor.to_owned(),
+        signature: Some(signature.to_owned()),
+        nonce: nonce.to_owned(),
+        proof,
+        request_id: request_id(),
+    };
+    let sent = Instant::now();
+    let mut told = false;
+    loop {
+        match answer(conversation.request(&frame, Instant::now() + ACTIVATE_TIMEOUT)) {
+            Ok(_) => return Ok(Touch::Activated),
+            Err(Refusal::Refused(reason)) if reason == crate::intent_proof::THROTTLED => {
+                if sent.elapsed() + THROTTLE_PAUSE >= budget
+                    || issued.elapsed() + THROTTLE_PAUSE >= TOUCH_WINDOW
+                {
+                    return Ok(Touch::Busy);
+                }
+                if !told {
+                    eprintln!("minds: the protected witness is busy — retrying …");
+                    told = true;
+                }
+                std::thread::sleep(THROTTLE_PAUSE);
+            }
+            Err(refusal) => return Ok(Touch::Failed(refusal)),
+        }
+    }
+}
+
+/// Aktiviert als Witness-Nutzer (`minds witness activate` mit der einen
+/// Erhöhung); das Passwort des Menschen ist der Beleg.
+#[cfg(unix)]
+fn activate_with_password(root: &Path, anchor: &str, signature: &str) -> Fallible<String> {
+    let user = crate::enable_protected::WITNESS_USER;
+    let request = serde_json::to_vec(&serde_json::json!({
+        "anchor": anchor,
+        "signature": signature,
+    }))?;
+    eprintln!(
+        "minds: activating the intent at the protected witness as {user} — your password approves it"
+    );
+    let output = crate::enable_protected::activate_elevated(&root.canonicalize()?, &request)?;
+    if !output.status.success() {
+        return Err(format!(
+            "the activation as {user} did not succeed ({}) — see the lines above; if the \
+             witness binary is older than this minds, rerun `MINDS_WITNESS=protected minds \
+             enable`",
+            output.status
+        )
+        .into());
+    }
+    Ok("witness (protected, approved with your password)".to_owned())
+}
+
 /// Warum der Witness nicht aktiviert hat.
+#[derive(Debug)]
 enum Refusal {
     /// Er hat geantwortet und abgelehnt (fester Grund).
     Refused(String),
@@ -794,7 +1324,7 @@ fn activate_at_witness(socket: &Path, anchor: &str, signature: &str) -> Result<(
 }
 
 /// Eine Anfrage-Id — eindeutig, nicht geheim (wie beim Checkpoint).
-fn request_id() -> [u8; 16] {
+pub(crate) fn request_id() -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"minds intent activate");
     hasher.update(&std::process::id().to_le_bytes());
@@ -1098,6 +1628,313 @@ fn hex16(bytes: &[u8; 16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ein Stand-in für den geschützten Witness: beantwortet die Nonce-Frage
+    /// mit `nonce`, jede Freigabe mit der nächsten Antwort aus `answers`;
+    /// liefert die empfangenen Freigaben zurück.
+    #[cfg(unix)]
+    fn stand_in(
+        challenge: minds_capture::witness_proto::Frame,
+        answers: Vec<&'static str>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        std::thread::JoinHandle<Vec<minds_capture::witness_proto::Frame>>,
+    ) {
+        use minds_capture::witness_proto::{self, Frame};
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("w.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut seen = Vec::new();
+            let mut bytes = Vec::new();
+            let mut answers = answers.into_iter();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let frame = loop {
+                    if let Ok((frame, used)) = witness_proto::decode(&bytes) {
+                        bytes.drain(..used);
+                        break Some(frame);
+                    }
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => break None,
+                        Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                    }
+                };
+                let Some(frame) = frame else {
+                    return seen;
+                };
+                let answer = match &frame {
+                    Frame::IntentChallenge { request_id } => match &challenge {
+                        Frame::Ack { status, .. } => Frame::Ack {
+                            request_id: *request_id,
+                            status: status.clone(),
+                        },
+                        Frame::Nack { reason, .. } => Frame::Nack {
+                            request_id: *request_id,
+                            reason: reason.clone(),
+                        },
+                        _ => unreachable!(),
+                    },
+                    Frame::IntentActivateProven { request_id, .. } => {
+                        let request_id = *request_id;
+                        seen.push(frame.clone());
+                        match answers.next().unwrap_or("intent active b3-x") {
+                            ok if ok.starts_with("intent active") => Frame::Ack {
+                                request_id,
+                                status: ok.into(),
+                            },
+                            reason => Frame::Nack {
+                                request_id,
+                                reason: reason.into(),
+                            },
+                        }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                };
+                stream
+                    .write_all(&witness_proto::encode(&answer).unwrap())
+                    .unwrap();
+            }
+        });
+        (dir, socket, handle)
+    }
+
+    #[cfg(unix)]
+    fn nonce_ack() -> minds_capture::witness_proto::Frame {
+        minds_capture::witness_proto::Frame::Ack {
+            request_id: [0; 16],
+            status: format!("nonce {}", "c3".repeat(32)),
+        }
+    }
+
+    #[cfg(unix)]
+    fn me() -> u32 {
+        // SAFETY: geteuid hat keine Vorbedingungen.
+        unsafe { libc::geteuid() }
+    }
+
+    /// Die Freigabe per Berührung: Nonce, Signatur über Anker-Id,
+    /// Anker-Signatur und Nonce; gebremst dieselbe Freigabe erneut, bis
+    /// der Witness sie annimmt.
+    #[cfg(unix)]
+    #[test]
+    fn a_touch_approval_is_resent_while_the_witness_defers_it() {
+        use minds_capture::witness_proto::Frame;
+        let (_dir, socket, handle) = stand_in(
+            nonce_ack(),
+            vec![crate::intent_proof::THROTTLED, "intent active b3-x"],
+        );
+        let mut signed = Vec::new();
+        let mut sign = |text: &str, namespace: &str| -> Fallible<String> {
+            signed.push((text.to_owned(), namespace.to_owned()));
+            Ok("PROOF".to_owned())
+        };
+        let outcome = activate_with_touch(
+            &socket,
+            me(),
+            "ANCHOR",
+            "SIG",
+            &mut sign,
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Touch::Activated), "{outcome:?}");
+        let id = minds_core::intent_anchor::IntentAnchor::id_of_text("ANCHOR");
+        assert_eq!(
+            signed,
+            [(
+                crate::intent_proof::activation_message(id.as_str(), "SIG", &"c3".repeat(32)),
+                minds_attest::NS_INTENT_ACTIVATE.to_owned()
+            )]
+        );
+        let frames = handle.join().unwrap();
+        assert_eq!(frames.len(), 2, "sent again after the throttle");
+        assert_eq!(frames[0], frames[1]);
+        assert!(matches!(
+            &frames[0],
+            Frame::IntentActivateProven { anchor, signature: Some(signature), proof, .. }
+                if anchor == "ANCHOR" && signature == "SIG" && proof == "PROOF"
+        ));
+    }
+
+    /// Bremst der Witness länger als das Budget: `Busy` (dann das
+    /// Passwort). Ohne festgehaltenen Schlüssel: keine Nonce, keine
+    /// Berührung. Ein anderer Schlüssel: abgelehnt (dann das Passwort).
+    #[cfg(unix)]
+    #[test]
+    fn a_touch_approval_gives_way_to_the_password() {
+        use minds_capture::witness_proto::Frame;
+        let never = |_: &str, _: &str| -> Fallible<String> { panic!("no touch without a nonce") };
+
+        let (_dir, socket, handle) =
+            stand_in(nonce_ack(), vec![crate::intent_proof::THROTTLED; 50]);
+        let mut sign = |_: &str, _: &str| -> Fallible<String> { Ok("PROOF".to_owned()) };
+        let outcome = activate_with_touch(
+            &socket,
+            me(),
+            "ANCHOR",
+            "SIG",
+            &mut sign,
+            std::time::Duration::from_millis(700),
+        )
+        .unwrap();
+        assert!(matches!(outcome, Touch::Busy), "{outcome:?}");
+        drop(handle);
+
+        let (_dir, socket, _handle) = stand_in(
+            Frame::Nack {
+                request_id: [0; 16],
+                reason: crate::intent_proof::NO_INTENT_KEY.into(),
+            },
+            vec![],
+        );
+        let outcome = activate_with_touch(
+            &socket,
+            me(),
+            "ANCHOR",
+            "SIG",
+            &mut { never },
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Touch::NoChallenge(Refusal::Refused(reason))
+                if reason == crate::intent_proof::NO_INTENT_KEY),
+            "{outcome:?}"
+        );
+
+        let (_dir, socket, _handle) =
+            stand_in(nonce_ack(), vec![crate::intent_proof::NOT_PINNED_PROOF]);
+        let mut sign = |_: &str, _: &str| -> Fallible<String> { Ok("PROOF".to_owned()) };
+        let outcome = activate_with_touch(
+            &socket,
+            me(),
+            "ANCHOR",
+            "SIG",
+            &mut sign,
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            matches!(&outcome, Touch::Failed(Refusal::Refused(reason))
+                if reason == crate::intent_proof::NOT_PINNED_PROOF),
+            "{outcome:?}"
+        );
+    }
+
+    /// Nach der Berührung: Wohin jeder Ausgang führt — der Weg über das
+    /// Passwort bleibt, außer der Zählerstand des Witness ist kaputt oder er
+    /// ist nach der Berührung unerreichbar.
+    #[cfg(unix)]
+    #[test]
+    fn after_a_touch_every_outcome_has_its_route() {
+        use crate::intent_proof::{
+            COUNTER_UNREADABLE, NO_INTENT_KEY, NOT_PINNED_PROOF, NOT_PINNED_SIGNATURE,
+            NOT_RECORDABLE, THROTTLED,
+        };
+        let refused = |reason: &str| Refusal::Refused(reason.to_owned());
+        assert_eq!(
+            after_touch(Touch::Activated),
+            Next::Done("witness (protected, security key)".to_owned())
+        );
+        for outcome in [
+            Touch::NoChallenge(refused(NO_INTENT_KEY)),
+            Touch::NoChallenge(refused("too many open approvals at this witness")),
+            Touch::NoChallenge(Refusal::Unreachable("connection closed")),
+            Touch::Busy,
+            Touch::Late,
+            Touch::Failed(refused(NOT_PINNED_PROOF)),
+            Touch::Failed(refused(NOT_PINNED_SIGNATURE)),
+            Touch::Failed(refused(THROTTLED)),
+            Touch::Failed(refused(
+                "this intent approval was already used for an activation — sign again",
+            )),
+        ] {
+            let label = format!("{outcome:?}");
+            assert!(matches!(after_touch(outcome), Next::Password(_)), "{label}");
+        }
+        for (outcome, hint) in [
+            (
+                Touch::Failed(refused(COUNTER_UNREADABLE)),
+                "evidence/intent-counter",
+            ),
+            (Touch::Failed(refused(NOT_RECORDABLE)), "free space"),
+            (
+                Touch::NoChallenge(refused(crate::intent_proof::NOT_CHECKABLE)),
+                "witness.json",
+            ),
+            (
+                Touch::Failed(refused(crate::intent_proof::NOT_CHECKABLE)),
+                "retry minds intent sign",
+            ),
+            (
+                Touch::Failed(Refusal::Unreachable("connection closed")),
+                "not reachable",
+            ),
+        ] {
+            let label = format!("{outcome:?}");
+            assert!(
+                matches!(after_touch(outcome), Next::Fail(error) if error.contains(hint)),
+                "{label}"
+            );
+        }
+    }
+
+    /// `SSH_SK_PROVIDER` geht nur als `internal` oder als kanonischer Pfad
+    /// einer root-eigenen Datei weiter — nie relativ, nie eine Datei des
+    /// Nutzers, und ein Symlink wird zu seinem Ziel.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_root_owned_security_key_provider_is_passed_on() {
+        use std::ffi::OsString;
+        assert_eq!(
+            trusted_provider(Some("internal".into())),
+            Some(OsString::from("internal"))
+        );
+        assert_eq!(trusted_provider(None), None);
+        assert_eq!(trusted_provider(Some("libsk.dylib".into())), None);
+        let dir = tempfile::tempdir().unwrap();
+        let own = dir.path().join("libsk.dylib");
+        std::fs::write(&own, b"").unwrap();
+        assert_eq!(trusted_provider(Some(own.clone().into_os_string())), None);
+        // Eine root-eigene Datei (als Stand-in für eine Bibliothek) über
+        // einen Symlink des Nutzers: weiter geht ihr kanonischer Pfad.
+        let real = std::fs::canonicalize("/bin/sh").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(
+            trusted_provider(Some(link.into_os_string())),
+            Some(real.into_os_string())
+        );
+    }
+
+    /// Der geschützte Witness geht vor; erreicht diese Sitzung seinen
+    /// Socket noch nicht (neue Gruppe), bleibt der Weg über das Passwort;
+    /// ein stummer ist ein Fehler vor dem Signieren; ohne ihn die anderen
+    /// Wege.
+    #[test]
+    fn the_protected_witness_route_follows_its_state() {
+        let found = || {
+            Some((
+                PathBuf::from("/var/lib/minds-witness/x/run/witness.sock"),
+                498,
+            ))
+        };
+        assert!(matches!(
+            protected_route(ProtectedState::Reachable, found()),
+            Some(Ok(Route::Protected { peer: 498, .. }))
+        ));
+        assert!(matches!(
+            protected_route(ProtectedState::GroupPending, None),
+            Some(Ok(Route::ProtectedPassword))
+        ));
+        let silent = protected_route(ProtectedState::Silent, found());
+        assert!(matches!(&silent, Some(Err(err)) if err.to_string().contains("did not answer")),);
+        assert!(protected_route(ProtectedState::Absent, None).is_none());
+    }
 
     /// Key-Typ-Erkennung (EA-15): aus der `.pub`-Zeile für die Frage, ob
     /// stderr geerbt wird, aus der Signatur für die Ausgabe.

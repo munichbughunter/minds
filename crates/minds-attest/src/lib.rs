@@ -30,6 +30,9 @@ pub const NS_INTENT: &str = "minds-intent";
 pub const NS_ANCHOR: &str = "minds-anchor";
 /// Human-signed specs (the target state for conformance).
 pub const NS_SPEC: &str = "minds-spec";
+/// A human's approval, just now, to activate an intent at a protected witness
+/// (signed with a security key over anchor id and the witness's nonce).
+pub const NS_INTENT_ACTIVATE: &str = "minds-intent-activate";
 /// Backwards-compatible name for the default namespace.
 pub const NAMESPACE: &str = NS_DEFAULT;
 
@@ -112,6 +115,53 @@ pub fn ssh_sign_ns_file_only(
     namespace: &str,
 ) -> Result<String, AttestError> {
     sign_inner(program, payload, key, namespace, false, true)
+}
+
+/// Signiert eine Freigabe, deren **Inhalt** zählt (eine Berührung, die einem
+/// Text gilt): mit genau dem Programm `program`, den Text über stdin (keine
+/// Temp-Datei, die ein Prozess derselben Kennung zwischen Schreiben und
+/// Lesen tauschen könnte), die Signatur über stdout, stderr geerbt (die
+/// Aufforderung zur Berührung) — und mit einer Umgebung, die nur `env`
+/// enthält: kein `SSH_AUTH_SOCK` (ein untergeschobener Agent sähe den Text
+/// und könnte einen anderen signieren lassen), kein `SSH_SK_PROVIDER`, außer
+/// der Aufrufer reicht einen geprüften durch.
+pub fn ssh_sign_ns_presence_isolated(
+    program: &Path,
+    payload: &str,
+    key: &Path,
+    namespace: &str,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> Result<String, AttestError> {
+    let mut command = Command::new(program);
+    command
+        .env_clear()
+        .envs(env.iter().copied())
+        .args(["-Y", "sign", "-n", namespace, "-f"])
+        .arg(key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = command.spawn()?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("ssh-keygen: no stdin"))?;
+        if let Err(err) = stdin.write_all(payload.as_bytes()) {
+            if err.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(err.into());
+            }
+        }
+    }
+    let output = child.wait_with_output()?;
+    let signature = String::from_utf8(output.stdout).unwrap_or_default();
+    if !output.status.success() || !signature.starts_with("-----BEGIN SSH SIGNATURE-----") {
+        return Err(AttestError::Keygen {
+            operation: "sign",
+            stderr: "see the ssh-keygen output above".to_string(),
+        });
+    }
+    Ok(signature)
 }
 
 /// Wie [`ssh_sign_ns`], aber mit **geerbtem stderr**: Für einen FIDO-Schlüssel
@@ -302,6 +352,37 @@ pub fn signature_key(armored: &str) -> Option<SignatureKey> {
     })
 }
 
+/// Der Signaturzähler eines FIDO-Schlüssels (`sk-…`) aus einer armierten
+/// `ssh-sig`-Signatur — wie das User-Presence-Flag Teil der signierten
+/// Daten (`PROTOCOL.u2f`), also nicht ohne den Schlüssel änderbar. `None`
+/// für andere Schlüssel oder alles, was nicht so aussieht. Prüft die
+/// Signatur **nicht** (siehe [`signature_key`]).
+pub fn signature_counter(armored: &str) -> Option<u32> {
+    let blob = armored_blob(armored)?;
+    let rest = blob.strip_prefix(b"SSHSIG")?;
+    if rest.get(..4)? != 1u32.to_be_bytes() {
+        return None;
+    }
+    let (public_key, rest) = ssh_string(&rest[4..])?;
+    let (kind, _) = ssh_string(public_key)?;
+    if !is_security_key_type(std::str::from_utf8(kind).ok()?) {
+        return None;
+    }
+    let (_, rest) = ssh_string(rest)?; // Namespace
+    let (_, rest) = ssh_string(rest)?; // reserviert
+    let (_, rest) = ssh_string(rest)?; // Hash-Algorithmus
+    let (signature, rest) = ssh_string(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let (_, tail) = ssh_string(signature)?; // Typ
+    let (_, tail) = ssh_string(tail)?; // Signaturbytes
+    let [_, a, b, c, d] = tail else {
+        return None;
+    };
+    Some(u32::from_be_bytes([*a, *b, *c, *d]))
+}
+
 /// Die Bytes hinter genau einem armierten Block: BEGIN, Base64-Zeilen, END —
 /// nichts davor oder danach.
 fn armored_blob(armored: &str) -> Option<Vec<u8>> {
@@ -363,6 +444,40 @@ pub fn ssh_public_key_with(program: &Path, key: &Path) -> Result<String, AttestE
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The SHA256 fingerprint of a `.pub` line (`SHA256:<base64>`, as
+/// `ssh-keygen -l` shows it), computed by exactly `program`. `None` if
+/// `ssh-keygen` cannot read the line.
+pub fn ssh_fingerprint_with(program: &Path, line: &str) -> Option<String> {
+    // Über stdin, nicht über eine Datei: Die könnte ein Prozess derselben
+    // Kennung tauschen, bevor `ssh-keygen` sie liest — gezeigt würde dann
+    // ein anderer Fingerabdruck als der des festgehaltenen Schlüssels.
+    let mut child = keygen_command(program)
+        .args(["-l", "-E", "sha256", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    {
+        let mut stdin = child.stdin.take()?;
+        let _ = stdin.write_all(format!("{}\n", line.trim()).as_bytes());
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    text.split_whitespace()
+        .nth(1)
+        .filter(|fingerprint| {
+            fingerprint.starts_with("SHA256:")
+                && fingerprint[7..]
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        })
+        .map(str::to_owned)
 }
 
 /// Der Schlüsseltyp einer armierten `ssh-sig`-Signatur — siehe
@@ -490,6 +605,31 @@ pub fn ssh_check_novalidate_with(
     Ok(child.wait()?.success())
 }
 
+/// Wie [`ssh_verify_ns_with`], aber höchstens `timeout` lang: Hängt
+/// `ssh-keygen`, wird es beendet, und das Ergebnis ist ein Fehler
+/// (`TimedOut`) — kein Urteil über die Signatur; für einen
+/// Aufrufer, der niemanden aufhalten darf (der Witness prüft in seiner
+/// Eventloop).
+pub fn ssh_verify_ns_within(
+    program: &Path,
+    payload: &str,
+    signature: &str,
+    signers: &Path,
+    identity: &str,
+    namespace: &str,
+    timeout: std::time::Duration,
+) -> Result<bool, AttestError> {
+    verify_inner(
+        program,
+        payload,
+        signature,
+        signers,
+        identity,
+        namespace,
+        Some(timeout),
+    )
+}
+
 /// Wie [`ssh_verify_ns`], aber mit genau dem Programm `program` — für CI,
 /// wo `ssh-keygen` aufgelöst wird, bevor etwas aus dem Checkout läuft.
 pub fn ssh_verify_ns_with(
@@ -500,11 +640,26 @@ pub fn ssh_verify_ns_with(
     identity: &str,
     namespace: &str,
 ) -> Result<bool, AttestError> {
+    verify_inner(
+        program, payload, signature, signers, identity, namespace, None,
+    )
+}
+
+fn verify_inner(
+    program: &Path,
+    payload: &str,
+    signature: &str,
+    signers: &Path,
+    identity: &str,
+    namespace: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<bool, AttestError> {
     // A missing/unreadable trust file is an operational error, not tampering.
     std::fs::File::open(signers)?;
     let dir = private_tempdir()?;
     let sig = dir.path().join("attest.sig");
     write_private(&sig, signature.as_bytes())?;
+    let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
     let mut child = keygen_command(program)
         .args(["-Y", "verify", "-n", namespace, "-I", identity, "-f"])
         .arg(signers)
@@ -514,22 +669,68 @@ pub fn ssh_verify_ns_with(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    {
-        // Die signierten Daten kommen über stdin; das Schließen (Drop) signalisiert
-        // ssh-keygen das Ende. Stirbt ssh-keygen früh (kaputte Signaturdatei),
-        // ist der Write ein EPIPE — kein Fehler: Das Urteil fällt allein der
-        // Exit-Status, sonst wäre „ungültig" mal Ok(false), mal Err (Race).
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| std::io::Error::other("ssh-keygen: no stdin"))?;
+    // Die signierten Daten kommen über stdin; das Schließen (Drop) signalisiert
+    // ssh-keygen das Ende. Stirbt ssh-keygen früh (kaputte Signaturdatei),
+    // ist der Write ein EPIPE — kein Fehler: Das Urteil fällt allein der
+    // Exit-Status, sonst wäre „ungültig" mal Ok(false), mal Err (Race).
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("ssh-keygen: no stdin"))?;
+    let Some(deadline) = deadline else {
         if let Err(err) = stdin.write_all(payload.as_bytes()) {
             if err.kind() != std::io::ErrorKind::BrokenPipe {
                 return Err(err.into());
             }
         }
+        drop(stdin);
+        return Ok(child.wait()?.success());
+    };
+    // Mit Frist schreibt ein eigener Thread: Liest `ssh-keygen` nie, hält
+    // auch ein großer Payload den Aufrufer nicht über die Frist hinaus auf
+    // (nach dem Beenden scheitert der Write mit EPIPE, der Thread endet).
+    let payload = payload.as_bytes().to_vec();
+    let writer = match std::thread::Builder::new().spawn(move || {
+        let _ = stdin.write_all(&payload);
+    }) {
+        Ok(writer) => writer,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err.into());
+        }
+    };
+    loop {
+        match child.try_wait() {
+            // Ein Ende durch ein Signal (etwa der OOM-Killer) ist kein
+            // Urteil über die Signatur.
+            Ok(Some(status)) if status.code().is_none() => {
+                let _ = writer.join();
+                return Err(std::io::Error::other("ssh-keygen ended by a signal").into());
+            }
+            Ok(Some(status)) => {
+                let _ = writer.join();
+                return Ok(status.success());
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            // Frist abgelaufen oder Fehler beim Warten: beenden und
+            // einsammeln — kein Zombie im langlebigen Aufrufer. Auf den
+            // Schreiber wird dann nicht gewartet (er endet mit EPIPE, sobald
+            // niemand mehr liest). Eine Frist ist kein Urteil: `Err`.
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut).into());
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(err.into());
+            }
+        }
     }
-    Ok(child.wait()?.success())
 }
 
 /// Finds candidate principals for a signature's key. This does not verify the
@@ -1029,5 +1230,222 @@ mod tests {
         // create_new: ein zweites Anlegen desselben Pfads scheitert, statt zu
         // überschreiben oder einem Symlink zu folgen.
         assert!(write_private(&path, b"nochmal").is_err());
+    }
+
+    /// Die abgeschirmte Signatur: Der Text kommt über stdin (keine Datei),
+    /// das Programm sieht nur die genannte Umgebung — kein `SSH_AUTH_SOCK`,
+    /// kein `SSH_SK_PROVIDER` aus der Umgebung des Aufrufers.
+    #[cfg(unix)]
+    #[test]
+    fn isolated_signing_passes_the_text_over_stdin_and_only_the_named_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let seen = dir.path().join("seen");
+        let stub = dir.path().join("ssh-keygen");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nenv > '{0}.env'\nprintf '%s\\n' \"$@\" > '{0}.args'\ncat > '{0}'\n\
+                 printf -- '-----BEGIN SSH SIGNATURE-----\\nAAAA\\n-----END SSH SIGNATURE-----\\n'\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let signature = ssh_sign_ns_presence_isolated(
+            &stub,
+            "the text",
+            Path::new("/keys/id_sk"),
+            NS_INTENT_ACTIVATE,
+            &[("HOME", std::ffi::OsStr::new("/home/dev"))],
+        )
+        .unwrap();
+        assert!(signature.starts_with("-----BEGIN SSH SIGNATURE-----"));
+        assert_eq!(std::fs::read_to_string(&seen).unwrap(), "the text");
+        let env = std::fs::read_to_string(format!("{}.env", seen.display())).unwrap();
+        assert!(env.contains("HOME=/home/dev"), "{env}");
+        assert!(!env.contains("SSH_AUTH_SOCK"), "{env}");
+        assert!(!env.contains("SSH_SK_PROVIDER"), "{env}");
+        let args = std::fs::read_to_string(format!("{}.args", seen.display())).unwrap();
+        assert_eq!(
+            args,
+            "-Y\nsign\n-n\nminds-intent-activate\n-f\n/keys/id_sk\n"
+        );
+        // Ohne Signatur auf stdout: ein Fehler, nie ein leerer Wert.
+        std::fs::write(&stub, "#!/bin/sh\ncat >/dev/null\nexit 0\n").unwrap();
+        assert!(
+            ssh_sign_ns_presence_isolated(&stub, "x", Path::new("/k"), NS_INTENT, &[]).is_err()
+        );
+    }
+
+    #[test]
+    fn a_fingerprint_is_read_over_stdin() {
+        let line =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl";
+        let fingerprint = ssh_fingerprint_with(Path::new("ssh-keygen"), line).unwrap();
+        assert!(fingerprint.starts_with("SHA256:"), "{fingerprint}");
+        assert_eq!(fingerprint.len(), 7 + 43);
+        assert!(ssh_fingerprint_with(Path::new("ssh-keygen"), "not a key").is_none());
+    }
+
+    /// Der Zähler steht genau in den fünf Bytes nach der Signatur (Flags,
+    /// Zähler) eines `sk-`-Schlüssels — alles andere ergibt keinen.
+    #[test]
+    fn a_signature_counter_is_read_only_from_a_plain_security_key_signature() {
+        fn string(bytes: &[u8]) -> Vec<u8> {
+            let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(bytes);
+            out
+        }
+        fn b64(bytes: &[u8]) -> String {
+            const A: &[u8; 64] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut out = String::new();
+            for chunk in bytes.chunks(3) {
+                let word = chunk
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |w, (i, b)| w | u32::from(*b) << (16 - 8 * i));
+                for i in 0..4 {
+                    out.push(if i <= chunk.len() {
+                        A[(word >> (18 - 6 * i) & 63) as usize] as char
+                    } else {
+                        '='
+                    });
+                }
+            }
+            out
+        }
+        let armored = |key_type: &str, sig_type: &str, tail: &[u8], version: u32| {
+            let key = [
+                string(key_type.as_bytes()),
+                string(&[1; 32]),
+                string(b"ssh:"),
+            ]
+            .concat();
+            let signature = [string(sig_type.as_bytes()), string(&[7; 64]), tail.to_vec()].concat();
+            let blob = [
+                b"SSHSIG".to_vec(),
+                version.to_be_bytes().to_vec(),
+                string(&key),
+                string(b"minds-intent"),
+                string(b""),
+                string(b"sha512"),
+                string(&signature),
+            ]
+            .concat();
+            format!(
+                "-----BEGIN SSH SIGNATURE-----\n{}\n-----END SSH SIGNATURE-----\n",
+                b64(&blob)
+            )
+        };
+        let sk = "sk-ssh-ed25519@openssh.com";
+        let ecdsa = "sk-ecdsa-sha2-nistp256@openssh.com";
+        assert_eq!(
+            signature_counter(&armored(sk, sk, &[1, 0, 0, 1, 2], 1)),
+            Some(258)
+        );
+        assert_eq!(
+            signature_counter(&armored(ecdsa, ecdsa, &[5, 0, 0, 0, 9], 1)),
+            Some(9)
+        );
+        // Ein Byte zu viel oder zu wenig, eine andere Version, kein `sk-`.
+        assert_eq!(
+            signature_counter(&armored(sk, sk, &[1, 0, 0, 1, 2, 0], 1)),
+            None
+        );
+        assert_eq!(signature_counter(&armored(sk, sk, &[1, 0, 0, 1], 1)), None);
+        assert_eq!(
+            signature_counter(&armored(sk, sk, &[1, 0, 0, 1, 2], 2)),
+            None
+        );
+        assert_eq!(
+            signature_counter(&armored("ssh-ed25519", "ssh-ed25519", &[1, 0, 0, 1, 2], 1)),
+            None
+        );
+        // WebAuthn-Signaturen tragen nach dem Zähler weitere Felder.
+        let webauthn = [
+            vec![1, 0, 0, 0, 3],
+            string(b"origin"),
+            string(b"{}"),
+            string(b""),
+        ]
+        .concat();
+        assert_eq!(
+            signature_counter(&armored(ecdsa, ecdsa, &webauthn, 1)),
+            None
+        );
+        assert_eq!(signature_counter("not a signature"), None);
+    }
+
+    /// Ein hängendes `ssh-keygen` hält den Aufrufer höchstens die Frist
+    /// lang auf; das Ergebnis ist dann ein Fehler (`TimedOut`), kein Urteil.
+    #[cfg(unix)]
+    #[test]
+    fn a_hanging_verify_is_cut_off() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("ssh-keygen");
+        // Liest stdin nie: Auch ein Payload weit über dem Pipe-Puffer hält
+        // nicht über die Frist hinaus auf.
+        std::fs::write(&stub, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let signers = dir.path().join("signers");
+        std::fs::write(&signers, "").unwrap();
+        let payload = "x".repeat(1024 * 1024);
+        let started = std::time::Instant::now();
+        let outcome = ssh_verify_ns_within(
+            &stub,
+            &payload,
+            "sig",
+            &signers,
+            "who",
+            NS_INTENT,
+            std::time::Duration::from_millis(300),
+        );
+        assert!(
+            matches!(&outcome, Err(AttestError::Io(err)) if err.kind() == std::io::ErrorKind::TimedOut),
+            "{outcome:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// Ein `ssh-keygen`, das durch ein Signal endet, ist nicht prüfbar —
+    /// kein Urteil; eines, das mit einem Fehlercode endet, sagt „ungültig".
+    #[cfg(unix)]
+    #[test]
+    fn a_verify_killed_by_a_signal_is_no_verdict() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let signers = dir.path().join("signers");
+        std::fs::write(&signers, "").unwrap();
+        let stub = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let killed = stub("killed", "kill -KILL $$");
+        let outcome = ssh_verify_ns_within(
+            &killed,
+            "text",
+            "sig",
+            &signers,
+            "who",
+            NS_INTENT,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(matches!(outcome, Err(AttestError::Io(_))), "{outcome:?}");
+        let refused = stub("refused", "cat >/dev/null; exit 1");
+        let outcome = ssh_verify_ns_within(
+            &refused,
+            "text",
+            "sig",
+            &signers,
+            "who",
+            NS_INTENT,
+            std::time::Duration::from_secs(5),
+        );
+        assert!(matches!(outcome, Ok(false)), "{outcome:?}");
     }
 }

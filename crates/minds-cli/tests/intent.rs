@@ -1305,3 +1305,351 @@ fn intent_bind_refuses_hard_links_fifos_and_links_out() {
         ""
     );
 }
+
+/// Der SHA256-Fingerabdruck einer `.pub`-Zeile, von `ssh-keygen -l`.
+fn fingerprint_of(line: &str) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("key.pub");
+    fs::write(&file, format!("{line}\n")).unwrap();
+    let out = Command::new("ssh-keygen")
+        .args(["-l", "-E", "sha256", "-f"])
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", text(&out));
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .to_owned()
+}
+
+/// Ein ausgedachter FIDO-Schlüssel (`sk-ssh-ed25519`) als `.pub`-Zeile —
+/// zum Festhalten genügt die Form; signieren kann mit ihm niemand.
+fn made_up_security_key() -> String {
+    made_up_security_key_from(4)
+}
+
+fn made_up_security_key_from(seed: u8) -> String {
+    fn string(bytes: &[u8]) -> Vec<u8> {
+        let mut out = (bytes.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(bytes);
+        out
+    }
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let kind = "sk-ssh-ed25519@openssh.com";
+    let blob = [
+        string(kind.as_bytes()),
+        string(&[seed; 32]),
+        string(b"ssh:"),
+    ]
+    .concat();
+    let mut text = String::new();
+    for chunk in blob.chunks(3) {
+        let word = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |word, (i, b)| word | u32::from(*b) << (16 - 8 * i));
+        for i in 0..4 {
+            text.push(if i <= chunk.len() {
+                ALPHABET[(word >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    format!("{kind} {text}")
+}
+
+fn witness(f: &Fixture, args: &[&str], stdin: Option<&[u8]>) -> Output {
+    use std::io::Write;
+    let mut child = minds()
+        .args(["witness"])
+        .args(args)
+        .arg("--home")
+        .arg(&f.home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    input.write_all(stdin.unwrap_or_default()).unwrap();
+    drop(input);
+    child.wait_with_output().unwrap()
+}
+
+/// `witness init --intent-key`: nur ein Sicherheitsschlüssel, ohne
+/// Kommentar festgehalten, gezeigt; ein erneutes `init` mit einem anderen
+/// nennt ihn, ersetzt ihn aber nicht (nur `--replace-intent-key`), eins
+/// ohne lässt ihn stehen. Mit ihm gibt der Witness der
+/// Agent-Seite eine Nonce — ohne ihn nicht.
+#[test]
+fn witness_init_pins_a_security_key_for_intent_approvals() {
+    use minds_capture::witness_proto::Frame;
+    let f = Fixture::new();
+    let root = f.root.to_str().unwrap().to_owned();
+    let key = made_up_security_key();
+    let human = human_key(&f);
+
+    let out = witness(
+        &f,
+        &["init", "--repo", &root, "--intent-key", &public(&human)],
+        None,
+    );
+    assert!(!out.status.success());
+    assert!(
+        text(&out).contains("--intent-key must be a security key"),
+        "{}",
+        text(&out)
+    );
+
+    // Ohne Schlüssel: keine Nonce.
+    {
+        let _daemon = f.start();
+        let mut stream = std::os::unix::net::UnixStream::connect(f.socket()).unwrap();
+        assert_eq!(
+            converse(
+                &mut stream,
+                &Frame::IntentChallenge {
+                    request_id: [1; 16]
+                }
+            ),
+            Frame::Nack {
+                request_id: [1; 16],
+                reason: "no intent key pinned at this witness".into(),
+            }
+        );
+    }
+
+    let with_comment = format!("{key} patrick@host");
+    let out = witness(
+        &f,
+        &["init", "--repo", &root, "--intent-key", &with_comment],
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let fingerprint = fingerprint_of(&key);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!(
+            "intent key:     sk-ssh-ed25519 {fingerprint} (newly pinned — in effect at once)\n"
+        )),
+        "{}",
+        text(&out)
+    );
+    let config = fs::read_to_string(f.home.join("witness.json")).unwrap();
+    assert!(
+        config.contains(&format!("\"intent_key\": \"{key}\"")),
+        "{config}"
+    );
+    // Ein `init` ohne Schlüssel lässt ihn stehen.
+    let out = witness(&f, &["init", "--repo", &root], None);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(f.home.join("witness.json")).unwrap(),
+        config
+    );
+    // Ein anderer genannter Schlüssel ersetzt ihn nie still: genannt, nicht
+    // festgehalten. Nur `--replace-intent-key` ersetzt.
+    let other = made_up_security_key_from(5);
+    let out = witness(&f, &["init", "--repo", &root, "--intent-key", &other], None);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("intent key:     sk-ssh-ed25519 {fingerprint}\n")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "intent key:     sk-ssh-ed25519 {} NOT pinned",
+            fingerprint_of(&other)
+        )),
+        "{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(f.home.join("witness.json")).unwrap(),
+        config
+    );
+    let both = [
+        "init",
+        "--repo",
+        &root,
+        "--intent-key",
+        &other,
+        "--replace-intent-key",
+        &other,
+    ];
+    assert!(!witness(&f, &both, None).status.success());
+    let out = witness(
+        &f,
+        &["init", "--repo", &root, "--replace-intent-key", &other],
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(
+        fs::read_to_string(f.home.join("witness.json"))
+            .unwrap()
+            .contains(&other)
+    );
+    let out = witness(
+        &f,
+        &["init", "--repo", &root, "--replace-intent-key", &key],
+        None,
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        fs::read_to_string(f.home.join("witness.json")).unwrap(),
+        config
+    );
+
+    // Nach dem Neustart: eine Nonce, gültig auf dieser Verbindung; eine
+    // Freigabe mit einem anderen Schlüssel zählt nicht und verbraucht sie.
+    let _daemon = f.start();
+    let mut stream = std::os::unix::net::UnixStream::connect(f.socket()).unwrap();
+    let Frame::Ack { status, .. } = converse(
+        &mut stream,
+        &Frame::IntentChallenge {
+            request_id: [1; 16],
+        },
+    ) else {
+        panic!("no nonce");
+    };
+    let nonce = status.strip_prefix("nonce ").unwrap().to_owned();
+    git(&f.root, &["config", "user.name", "Human"]);
+    git(&f.root, &["config", "user.email", "human@example.invalid"]);
+    commit_requirement(&f);
+    let e = bind(&f);
+    let anchor = anchor_text(&f, &e);
+    let signature = minds_attest::ssh_sign_ns(&anchor, &human, minds_attest::NS_INTENT).unwrap();
+    // Die Freigabe im heutigen Format — sie scheitert am Schlüssel, nicht an
+    // der Form.
+    let proof = minds_attest::ssh_sign_ns(
+        &format!(
+            "minds-intent-activate-v1\nanchor {}\nsignature b3-{}\nnonce {nonce}\n",
+            e.id,
+            blake3::hash(signature.as_bytes()).to_hex()
+        ),
+        &human,
+        minds_attest::NS_INTENT_ACTIVATE,
+    )
+    .unwrap();
+    let frame = Frame::IntentActivateProven {
+        anchor,
+        signature: Some(signature),
+        nonce,
+        proof,
+        request_id: [2; 16],
+    };
+    assert_eq!(
+        converse(&mut stream, &frame),
+        Frame::Nack {
+            request_id: [2; 16],
+            reason: "activation proof is not from the pinned intent key".into(),
+        }
+    );
+    assert_eq!(
+        converse(&mut stream, &frame),
+        Frame::Nack {
+            request_id: [2; 16],
+            reason: "no fresh challenge on this connection".into(),
+        }
+    );
+    assert!(!f.home.join("evidence/intent.json").exists());
+}
+
+/// `minds witness activate`: Anker und Signatur als JSON über stdin, über
+/// den Steuer-Socket — der Weg, den `intent sign` beim geschützten Witness
+/// mit der einen Erhöhung nimmt. Eine Ablehnung kommt mit ihrem Grund
+/// zurück; unbekannte Felder und Übergroßes werden nicht gesendet.
+#[test]
+fn witness_activate_reads_the_request_from_stdin() {
+    let f = Fixture::new();
+    git(&f.root, &["config", "user.name", "Human"]);
+    git(&f.root, &["config", "user.email", "human@example.invalid"]);
+    commit_requirement(&f);
+    let e = bind(&f);
+    let anchor = anchor_text(&f, &e);
+    let key = human_key(&f);
+    let signature = minds_attest::ssh_sign_ns(&anchor, &key, minds_attest::NS_INTENT).unwrap();
+    let _daemon = f.start();
+
+    let request = serde_json::json!({"anchor": anchor, "signature": signature}).to_string();
+    let out = witness(&f, &["activate"], Some(request.as_bytes()));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("intent active {}\n", e.id)
+    );
+    let active = fs::read_to_string(f.home.join("evidence/intent.json")).unwrap();
+    assert!(active.contains(&e.id), "{active}");
+
+    let unknown = serde_json::json!({"anchor": "-", "extra": 1}).to_string();
+    let out = witness(&f, &["activate"], Some(unknown.as_bytes()));
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out).contains("activation request unreadable"),
+        "{}",
+        text(&out)
+    );
+
+    let huge = vec![b' '; 64 * 1024 + 1];
+    let out = witness(&f, &["activate"], Some(&huge));
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out).contains("activation request too large"),
+        "{}",
+        text(&out)
+    );
+
+    let refused = serde_json::json!({"anchor": "-", "signature": signature}).to_string();
+    let out = witness(&f, &["activate"], Some(refused.as_bytes()));
+    assert_eq!(out.status.code(), Some(4));
+    assert!(
+        text(&out).contains("the witness refused it: clearing an intent takes no signature"),
+        "{}",
+        text(&out)
+    );
+
+    let clear = serde_json::json!({"anchor": "-"}).to_string();
+    let out = witness(&f, &["activate"], Some(clear.as_bytes()));
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "intent cleared\n");
+    assert!(!f.home.join("evidence/intent.json").exists());
+}
+
+/// Der Ankertext aus dem Store (wie `intent show` ihn liest).
+fn anchor_text(f: &Fixture, e: &Expected) -> String {
+    use minds_store::ContextStore;
+    let id: minds_core::ContentHash = e.id.parse().unwrap();
+    minds_store::InRepoStore::open(&f.root)
+        .unwrap()
+        .get_intent(&id)
+        .unwrap()
+        .unwrap()
+        .text
+}
+
+/// Ein Frame hin, die Antwort zurück — auf derselben Verbindung.
+fn converse(
+    stream: &mut std::os::unix::net::UnixStream,
+    frame: &minds_capture::witness_proto::Frame,
+) -> minds_capture::witness_proto::Frame {
+    use minds_capture::witness_proto;
+    use std::io::{Read, Write};
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .write_all(&witness_proto::encode(frame).unwrap())
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Ok((answer, _)) = witness_proto::decode(&bytes) {
+            return answer;
+        }
+        let n = stream.read(&mut chunk).unwrap();
+        assert!(n > 0, "witness hung up");
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+}
