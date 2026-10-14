@@ -42,8 +42,12 @@ the witness under its own user — the only setup that can reach A2:
    that user; installs and starts a system service (`/Library/LaunchDaemons/dev.minds.witness.<repo-id>.plist`
    or `/etc/systemd/system/minds-witness-<repo-id>.service` with `NoNewPrivileges`,
    `ProtectSystem=strict`; umask 007); and writes Claude Code managed settings with deny rules
-   only (`minds witness`, writes to `.git/refs/minds`, the witness home) — only if no
-   `managed-settings.json` exists (an identical one counts as ours), otherwise a
+   only (`minds witness`, `Edit` of `.git/refs/minds`, `Read`/`Edit` of the witness home — Claude
+   Code checks file access only against `Read(…)`/`Edit(…)`, and `Edit` covers every
+   file-writing tool; a file minds installed earlier, in exactly its own form, is merged — the
+   rules of other repositories stay and only accumulate; delete the file by hand to clean up) — only
+   if no
+   `managed-settings.json` exists or it is minds' own; any other file gets a
    `managed-settings.minds-proposed.json` next to it.
 3. `enable` waits for the witness (a slow first start is reported, not replaced by the local
    witness), stops and disables the local user service of this repository (if any), and
@@ -126,6 +130,15 @@ minds doctor [--probe-home <dir>]
 
 Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of reason; exit 0 without `fail`, otherwise 1. Checks the agent hook registrations, the Git hooks and the store config (same wording as `minds fsck`), then the witness:
 
+- **Hook binary**: the agent hooks call `minds hook …` through `PATH`; if that `minds` is another
+  program than the one running `doctor` (other bytes), `warn` — an older one would not know newer
+  setups such as the protected witness and record into the local journal. No `minds` on `PATH`
+  is `warn` as well. `minds enable` prints the same warnings. This looks at your shell's `PATH`;
+  an agent started elsewhere (e.g. from the Dock) may see another one.
+- **Protected witness** (found at its fixed place, see `minds enable`): it answers `ping` (`fail`
+  if not) and its home is not readable for you (`ok` on permission denied, `fail` if it opens).
+- **Protected witness, not reachable yet** (Linux): set up for this repository, but its group is
+  not yet in effect for your session (after your next login) — `warn`, not "not configured".
 - **Agent side** (`MINDS_WITNESS_SOCKET` set or `--probe-home` given): the socket variable is set, the witness answers `ping`, and the **isolation probe** — `doctor` tries to open the witness home given with `--probe-home` and the private files in it (non-blocking; a FIFO does not hang it). If anything opens, the result is `fail` ("agent can reach the witness home"). A home that exists but is refused (`EACCES`, e.g. the `user` profile) is `ok` — that is proof. A home that is simply absent (the `container` profile) is only `warn`: absence in another mount namespace proves nothing. On Linux, `doctor` also reads `/proc/self/mountinfo` and fails if a mount exposes the witness home other than its `run/` — a heuristic that does not recognise a mount of a parent directory or a source on another partition, so "nothing found" stays `warn`. Check the container's mounts yourself. An empty `--probe-home` is `fail`, and so is an unclear error (anything but `EACCES`/`ENOENT`/`ENOTDIR`) with `--probe-home`. Without it, `doctor` probes `MINDS_WITNESS_HOME` or the default location: nothing there is at most `warn`, since a missing default path proves little; something that opens is still `fail`. Nothing is read; an opened path is closed immediately.
 - **Host side** (`witness.json` in the witness home): profile, pins (`fail` without them), whether the witness answers, the key private, and — for the `container` profile — whether `.devcontainer/` holds exactly the two unchanged templates plus at most their two proposals (`devcontainer.json.minds-proposed`, `compose.yaml.minds-proposed`), all as regular files, and the repository root has no `.devcontainer.json` (`fail` if not). It also looks for code a `git` on the host would run — hooks other than the minds blocks (and `*.sample`), and `.git/config` keys known to run commands (`core.hooksPath`, `core.fsmonitor`, `core.sshCommand`, `filter.*`, `diff.*.textconv`, `include.path`, `!`-aliases and others) — and reports findings as `warn`. This is a heuristic, not proof: a list cannot cover everything an agent can put into `.git` (`commondir`, `config.worktree`, new git keys, nested repositories). Do not run git on the host in a tree the agent wrote. A `.env` at the repository root is a `warn`. If a witness dev container is set up but no witness home is found, that is `fail`, not "not configured". The home is derived from the repository directory itself, never via `git rev-parse` (which follows `core.worktree`). Run it right before every reopen or rebuild of the container. A host-side `ok` is a snapshot of the files, not proof of how the running container was built; an agent-side `ok` comes from a binary running in the agent's environment and is advisory.
 

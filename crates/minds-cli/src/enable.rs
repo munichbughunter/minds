@@ -203,6 +203,24 @@ pub fn run(
         if let Some(note) = &note {
             eprintln!("{note}");
         }
+        // Die Agent-Hooks rufen `minds` über `PATH` — ein anderes (etwa
+        // älteres) Programm dort kennte Neues dieses nicht, etwa den
+        // geschützten Witness, und schriebe still ins lokale Journal.
+        match hook_binary() {
+            HookBinary::Other(found) => crate::text::warn(&format!(
+                "the agent hooks run `minds` from PATH ({}), which is another program than this \
+                 one ({}) — install this one there (e.g. copy it over) so hooks and setup match",
+                crate::text::sanitize(&found.display().to_string()),
+                std::env::current_exe()
+                    .map(|exe| crate::text::sanitize(&exe.display().to_string()))
+                    .unwrap_or_default()
+            )),
+            HookBinary::Missing => crate::text::warn(
+                "no `minds` on PATH — the agent hooks call `minds hook …` and will not run; put \
+                 this binary on PATH",
+            ),
+            HookBinary::Same => {}
+        }
         match profile {
             Some(profile) => crate::enable_witness::run(&paths.root, profile, store),
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
@@ -399,6 +417,84 @@ impl Which {
                     || spec.binaries.iter().any(|binary| on_path(binary))
             })
             .collect()
+    }
+}
+
+/// Welches `minds` die Agent-Hooks aufrufen (`minds hook …` über `PATH`).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum HookBinary {
+    /// Dieses Programm (gleicher Pfad oder gleiche Bytes) — oder nicht
+    /// feststellbar.
+    Same,
+    /// Ein anderes Programm.
+    Other(PathBuf),
+    /// Keins im `PATH`: Die Hooks liefen gar nicht.
+    Missing,
+}
+
+/// Höchstgröße, bis zu der zwei Programme byteweise verglichen werden.
+const MAX_COMPARED_BINARY: u64 = 256 * 1024 * 1024;
+
+/// [`HookBinary`] für den `PATH` dieses Prozesses — eine Heuristik: Ein
+/// Agent, der etwa aus dem Dock gestartet wird, kann einen anderen `PATH`
+/// haben. Größe zuerst; gelesen wird höchstens [`MAX_COMPARED_BINARY`], nur
+/// eine reguläre Datei, über **einen** geöffneten Deskriptor (ein FIFO hält
+/// nichts auf).
+pub(crate) fn hook_binary() -> HookBinary {
+    let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.canonicalize().ok())
+    else {
+        return HookBinary::Same;
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let Some(found) = std::env::split_paths(&path)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(if cfg!(windows) { "minds.exe" } else { "minds" }))
+        .find(|candidate| executable(candidate))
+    else {
+        return HookBinary::Missing;
+    };
+    if found.canonicalize().is_ok_and(|real| real == exe) {
+        return HookBinary::Same;
+    }
+    let digest = |path: &Path| -> Option<(u64, blake3::Hash)> {
+        use std::io::Read;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = options.open(path).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || meta.len() > MAX_COMPARED_BINARY {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        let mut reader = file.take(MAX_COMPARED_BINARY);
+        let mut buffer = vec![0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Some((meta.len(), hasher.finalize()))
+    };
+    let sizes_differ = std::fs::metadata(&found)
+        .and_then(|a| std::fs::metadata(&exe).map(|b| a.len() != b.len()))
+        .unwrap_or(false);
+    if sizes_differ {
+        return HookBinary::Other(found);
+    }
+    // Nicht vergleichbar (nicht lesbar, zu groß): wie dokumentiert `Same` —
+    // eine Warnung ohne Beleg wäre Lärm.
+    match (digest(&found), digest(&exe)) {
+        (Some(a), Some(b)) if a != b => HookBinary::Other(found),
+        _ => HookBinary::Same,
     }
 }
 

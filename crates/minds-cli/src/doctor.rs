@@ -101,6 +101,26 @@ fn checks(probe_home: Option<&Path>) -> Vec<Check> {
             None
         }
     };
+    // Nur mit einem Repo, in dem es Agent-Hooks geben kann.
+    if root.is_some() {
+        match crate::enable::hook_binary() {
+            crate::enable::HookBinary::Other(found) => checks.push(Check::new(
+                Status::Warn,
+                "hook binary",
+                format!(
+                    "the agent hooks run `minds` from PATH ({}), another program than this one — \
+                     it may not know newer setups (e.g. the protected witness)",
+                    crate::text::sanitize(&found.display().to_string())
+                ),
+            )),
+            crate::enable::HookBinary::Missing => checks.push(Check::new(
+                Status::Warn,
+                "hook binary",
+                "no `minds` on PATH — the agent hooks call `minds hook …` and do not run",
+            )),
+            crate::enable::HookBinary::Same => {}
+        }
+    }
     witness_checks(root.as_deref(), probe_home, &mut checks);
     checks
 }
@@ -159,8 +179,34 @@ fn witness_checks(root: Option<&Path>, probe_home: Option<&Path>, checks: &mut V
     // Agent-Seite der Kandidat, den die Probe ohne `--probe-home` versucht.
     let default_home =
         root.and_then(|root| crate::witness_cmd::resolve_home_for(None, Some(root.to_str()?)).ok());
+    let protected = root
+        .and_then(|root| root.canonicalize().ok())
+        .and_then(|root| crate::enable_protected::discover(&root));
+    let pending = protected.is_none()
+        && root
+            .and_then(|root| root.canonicalize().ok())
+            .is_some_and(|root| {
+                std::fs::symlink_metadata(crate::enable_protected::home_of(&root))
+                    .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+            })
+        && crate::enable_protected::membership_pending();
     if socket.is_some() || probe_home.is_some() {
         agent_side(socket.as_deref(), probe_home, default_home, checks);
+    } else if let Some((socket, _)) = protected {
+        protected_side(&socket, checks);
+    } else if pending {
+        // Belegt, nicht geraten: Für dieses Repo ist ein geschützter Witness
+        // eingerichtet (sein Home liegt da, ist für diese Sitzung aber
+        // verschlossen), und dieser Nutzer steht in dessen Gruppe, die die
+        // Sitzung noch nicht hat (Linux: erst nach dem nächsten Anmelden).
+        // Vor dem lokalen Witness: Nach dem Wechsel liegen dessen Dateien
+        // noch da.
+        checks.push(Check::new(
+            Status::Warn,
+            "witness",
+            "a protected witness is set up for this repository and you were added to its \
+             group, but this session does not have it yet — log out and back in",
+        ));
     } else if let Some(home) =
         default_home.filter(|home| std::fs::symlink_metadata(home.join("witness.json")).is_ok())
     {
@@ -188,6 +234,75 @@ fn witness_checks(root: Option<&Path>, probe_home: Option<&Path>, checks: &mut V
              witness)",
         ));
     }
+}
+
+/// Der geschützte Witness (eigener Nutzer, Systemdienst): antwortet er, und
+/// ist sein Home für diesen Nutzer verschlossen?
+#[cfg(unix)]
+fn protected_side(socket: &Path, checks: &mut Vec<Check>) {
+    let home = socket.parent().and_then(Path::parent);
+    checks.extend(protected_checks(
+        socket,
+        crate::witness_cmd::ping(socket),
+        home.map(|home| std::fs::read_dir(home).map(drop)),
+        // SAFETY: geteuid hat keine Vorbedingungen.
+        unsafe { libc::geteuid() } == 0,
+    ));
+}
+
+/// Die Zeilen zu [`protected_side`] aus den Befunden — ohne Dateisystem,
+/// testbar. `home`: ob sich das Home (zwei Ebenen über dem Socket) lesen
+/// ließ.
+#[cfg(unix)]
+fn protected_checks(
+    socket: &Path,
+    answers: bool,
+    home: Option<std::io::Result<()>>,
+    root: bool,
+) -> Vec<Check> {
+    let user = crate::enable_protected::WITNESS_USER;
+    let mut checks = vec![if answers {
+        Check::new(
+            Status::Ok,
+            "witness",
+            format!("protected, runs as {user}, answers ping"),
+        )
+    } else {
+        Check::new(
+            Status::Fail,
+            "witness",
+            format!(
+                "protected witness installed but not answering (socket \"{}\") — check its \
+                 system service or rerun `MINDS_WITNESS=protected minds enable`",
+                crate::text::sanitize(&socket.display().to_string())
+            ),
+        )
+    }];
+    if let Some(home) = home {
+        checks.push(match home {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => Check::new(
+                Status::Ok,
+                "witness home",
+                "not readable for you (permission denied)",
+            ),
+            Ok(()) if root => Check::new(
+                Status::Warn,
+                "witness home",
+                "not probed — doctor runs as root",
+            ),
+            Ok(()) => Check::new(
+                Status::Fail,
+                "witness home",
+                "readable for you — the witness is not separated",
+            ),
+            Err(err) => Check::new(
+                Status::Warn,
+                "witness home",
+                format!("not probed ({})", crate::text::sanitize(&err.to_string())),
+            ),
+        });
+    }
+    checks
 }
 
 /// Die Agent-Seite: Socket, `ping`, Isolationsprobe.
@@ -782,6 +897,51 @@ fn devcontainer_check(root: &Path, checks: &mut Vec<Check>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Die Zeilen zum geschützten Witness: antwortet er, ist sein Home
+    /// verschlossen — als root ohne falschen `fail`.
+    #[cfg(unix)]
+    #[test]
+    fn protected_witness_checks_map_every_finding() {
+        let socket = Path::new("/private/var/db/minds-witness/x/run/witness.sock");
+        let denied = || {
+            Some(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+        };
+        let status = |checks: Vec<Check>| -> Vec<Status> {
+            checks.into_iter().map(|check| check.status).collect()
+        };
+        assert_eq!(
+            status(protected_checks(socket, true, denied(), false)),
+            [Status::Ok, Status::Ok]
+        );
+        assert_eq!(
+            status(protected_checks(socket, false, denied(), false)),
+            [Status::Fail, Status::Ok]
+        );
+        assert_eq!(
+            status(protected_checks(socket, true, Some(Ok(())), false)),
+            [Status::Ok, Status::Fail]
+        );
+        assert_eq!(
+            status(protected_checks(socket, true, Some(Ok(())), true)),
+            [Status::Ok, Status::Warn]
+        );
+        assert_eq!(
+            status(protected_checks(
+                socket,
+                true,
+                Some(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+                false
+            )),
+            [Status::Ok, Status::Warn]
+        );
+        assert_eq!(
+            status(protected_checks(socket, true, None, false)),
+            [Status::Ok]
+        );
+    }
 
     #[test]
     fn lines_carry_status_name_and_reason() {

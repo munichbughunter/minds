@@ -81,7 +81,12 @@ impl Fixture {
             minds
                 .env("MINDS_WITNESS", "off")
                 .env_remove("MINDS_WITNESS_HOME")
-                .env_remove("MINDS_WITNESS_SOCKET");
+                .env_remove("MINDS_WITNESS_SOCKET")
+                // Nie der echte Ort geschützter Witnesses auf diesem Rechner.
+                .env(
+                    "MINDS_PROTECTED_BASE",
+                    self.dir.path().join("protected-base"),
+                );
             minds
         };
         command
@@ -316,6 +321,39 @@ fn doctor_fails_on_a_witness_home_of_another_repository() {
     let out = a.minds(&["doctor"], &[("MINDS_WITNESS_HOME", a.home.as_path())]);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(!stdout.contains("witness repository"), "{stdout}");
+}
+
+/// Die Agent-Hooks rufen `minds` über `PATH`: ein anderes Programm dort
+/// oder keins ist ein Hinweis; dieses selbst keine Zeile.
+#[test]
+fn doctor_reports_which_minds_the_hooks_run() {
+    let f = Fixture::new();
+    let run = |path: &str| {
+        let out = f.minds(&["doctor"], &[("PATH", Path::new(path))]);
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let other = f.dir.path().join("other-bin");
+    std::fs::create_dir_all(&other).unwrap();
+    let stale = other.join("minds");
+    std::fs::write(&stale, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&stale, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+
+    let stdout = run(&format!("{}:/usr/bin:/bin", other.display()));
+    let hook = line(&stdout, "hook binary");
+    assert!(
+        hook.starts_with("warn") && hook.contains("another program"),
+        "{stdout}"
+    );
+
+    let stdout = run("/usr/bin:/bin");
+    assert!(
+        line(&stdout, "hook binary").contains("no `minds` on PATH"),
+        "{stdout}"
+    );
+
+    let own = Path::new(MINDS).parent().unwrap();
+    let stdout = run(&format!("{}:/usr/bin:/bin", own.display()));
+    assert!(!stdout.contains("hook binary"), "{stdout}");
 }
 
 /// Ohne Witness: ein Hinweis, kein Fehler.
