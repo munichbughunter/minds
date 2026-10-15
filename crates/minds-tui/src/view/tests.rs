@@ -4207,6 +4207,7 @@ mod overview_tab {
     mod a1b;
     mod a6;
     mod b1;
+    mod b2;
     mod b3;
 }
 

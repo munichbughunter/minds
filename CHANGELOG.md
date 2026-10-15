@@ -27,6 +27,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **The way back across tabs.** Every jump from one tab to another
+  (Enter on a commit, session, anchor or artifact; `w` on a line) is recorded
+  with its origin — tab, layers, cursor, search. Esc on the layer the jump
+  opened returns exactly there. The second header line is a breadcrumb
+  (`Verify › 1a2b3c4 › Session b3-4f… › Why`), shortened from the left; the
+  global statistics follow it while there is room.
 - **Esc never quits `minds inspect`.** Esc follows one order in every tab:
   close the help or the tamper banner, clear the search, close the top
   layer — otherwise nothing (the way back across tabs follows with the

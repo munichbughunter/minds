@@ -233,6 +233,9 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// Der Navigationsverlauf (B2): je tabübergreifendem Sprung der
+    /// Ursprung — Esc kehrt von der Ebene des Sprungs genau dorthin zurück.
+    pub history: Vec<NavEntry>,
     /// Der aktive Commit (B3): die Auswahl der Übersicht, der Commit in
     /// Verify und in Changes — einer für alle drei; `[ ]` verschiebt ihn.
     pub active_commit: Option<CommitId>,
@@ -240,6 +243,36 @@ pub struct App<'a> {
     /// durch ein Neuladen neu manipuliert sind. Esc schließt es, Enter
     /// öffnet die erste.
     pub tamper: Option<TamperAlert>,
+}
+
+/// Ein Eintrag des Navigationsverlaufs: wo ein tabübergreifender Sprung
+/// begann (Tab, Ebenen, Cursor, Suche, der Zustand des Ursprungs-Tabs) und
+/// wohin er führte.
+#[derive(Debug, Clone)]
+pub struct NavEntry {
+    /// Der Ursprungs-Tab.
+    pub tab: Tab,
+    /// Die Ebenen des Sessions-Tabs beim Sprung.
+    pub views: Vec<View>,
+    /// Die Listenzeile beim Sprung.
+    pub cursor: usize,
+    /// Die Suche beim Sprung.
+    pub query: String,
+    /// Der Zustand des Ursprungs-Tabs (nur der eine).
+    pub overview: Option<OverviewState>,
+    /// …
+    pub verify: Option<VerifyState>,
+    /// …
+    pub changes: Option<ChangesState>,
+    /// …
+    pub intent: Option<IntentTab>,
+    /// Der aktive Commit beim Sprung.
+    pub active_commit: Option<CommitId>,
+    /// Wohin der Sprung führte.
+    pub target: Tab,
+    /// Wie viele Ebenen der Sprung im Ziel öffnete — Esc auf dieser Tiefe
+    /// kehrt zurück, statt die Ebene nur zu schließen.
+    pub base: usize,
 }
 
 /// Was das Tamper-Banner meldet.
@@ -302,6 +335,7 @@ impl<'a> App<'a> {
             nerd: false,
             tamper: None,
             active_commit: None,
+            history: Vec::new(),
         };
         // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
         let tampered = tampered_of(&app.cards);
@@ -1267,7 +1301,29 @@ impl<'a> App<'a> {
     /// Wendet eine Aktion an — und übernimmt danach den Commit des
     /// sichtbaren Tabs als aktiven (B3).
     pub fn reduce(&mut self, action: Action) {
-        self.reduce_action(action);
+        // Esc, Schritt 4 (B1/B2): auf der Ebene eines Sprungs zurück zum
+        // Ursprung — mit Ebenen und Cursor.
+        if action == Action::Back && self.at_jump_base() {
+            self.go_back();
+        } else {
+            // Nur Enter, w und e springen über Tab-Grenzen; nur dann lohnt
+            // der Schnappschuss.
+            let origin = matches!(action, Action::Enter | Action::Why | Action::Evidence)
+                .then(|| self.snapshot());
+            self.reduce_action(action);
+            if let Some(mut entry) = origin
+                && entry.tab != self.tab
+                && !self.quit
+            {
+                entry.target = self.tab;
+                entry.base = if self.tab == Tab::Sessions {
+                    self.views.len()
+                } else {
+                    0
+                };
+                self.history.push(entry);
+            }
+        }
         let shown = match self.tab {
             Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
                 Some(crate::overview::Selected::Commit(row)) => Some(row.id),
@@ -1280,6 +1336,121 @@ impl<'a> App<'a> {
         if shown.is_some() {
             self.active_commit = shown;
         }
+    }
+
+    /// Der Ursprung, wie er gerade ist.
+    fn snapshot(&self) -> NavEntry {
+        NavEntry {
+            tab: self.tab,
+            views: self.views.clone(),
+            cursor: self.cursor,
+            query: self.query.clone(),
+            overview: (self.tab == Tab::Overview)
+                .then(|| self.overview.clone())
+                .flatten(),
+            verify: (self.tab == Tab::Verify)
+                .then(|| self.verify.clone())
+                .flatten(),
+            changes: (self.tab == Tab::Changes)
+                .then(|| self.changes.clone())
+                .flatten(),
+            intent: (self.tab == Tab::Intent)
+                .then(|| self.intent.clone())
+                .flatten(),
+            active_commit: self.active_commit,
+            target: self.tab,
+            base: 0,
+        }
+    }
+
+    /// Ob Esc jetzt zum Ursprung des letzten Sprungs führt: nichts davor zu
+    /// schließen oder zu leeren, noch im Ziel des Sprungs, auf seiner Ebene.
+    fn at_jump_base(&self) -> bool {
+        let Some(entry) = self.history.last() else {
+            return false;
+        };
+        if self.help
+            || self.tamper.is_some()
+            || self.searching
+            || !self.query.is_empty()
+            || entry.target != self.tab
+        {
+            return false;
+        }
+        match self.tab {
+            Tab::Sessions => self.views.len() <= entry.base,
+            Tab::Overview => self
+                .overview
+                .as_ref()
+                .is_none_or(|s| s.focus == crate::overview::OverviewFocus::Graph),
+            Tab::Changes => self
+                .changes
+                .as_ref()
+                .is_none_or(|s| s.focus == Focus::Files),
+            Tab::Verify | Tab::Intent => true,
+        }
+    }
+
+    /// Kehrt zum Ursprung des letzten Sprungs zurück.
+    fn go_back(&mut self) {
+        let Some(entry) = self.history.pop() else {
+            return;
+        };
+        self.tab = entry.tab;
+        match entry.tab {
+            Tab::Sessions => {
+                self.query = entry.query;
+                self.refilter();
+                self.cursor = entry.cursor.min(self.visible.len().saturating_sub(1));
+                self.views = entry.views;
+            }
+            Tab::Overview => {
+                if entry.overview.is_some() {
+                    self.overview = entry.overview;
+                }
+            }
+            Tab::Verify => {
+                if entry.verify.is_some() {
+                    self.verify = entry.verify;
+                }
+            }
+            Tab::Changes => {
+                if entry.changes.is_some() {
+                    self.changes = entry.changes;
+                }
+            }
+            Tab::Intent => {
+                if entry.intent.is_some() {
+                    self.intent = entry.intent;
+                }
+            }
+        }
+        self.active_commit = entry.active_commit.or(self.active_commit);
+    }
+
+    /// Der Pfad für den Breadcrumb: je Sprung der Ursprung, dann der
+    /// aktuelle Ort.
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in &self.history {
+            out.extend(place(
+                entry.tab,
+                &entry.views,
+                entry
+                    .verify
+                    .as_ref()
+                    .and_then(|s| s.commit())
+                    .or(entry.changes.as_ref().and_then(|s| s.commit()))
+                    .or(entry.active_commit),
+            ));
+        }
+        let shown = match self.tab {
+            Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
+            Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
+            _ => self.active_commit,
+        };
+        out.extend(place(self.tab, &self.views, shown));
+        out
     }
 
     fn reduce_action(&mut self, action: Action) {
@@ -1878,4 +2049,26 @@ pub(crate) fn clock(now: SystemTime) -> String {
         .unwrap_or(0)
         % 86_400;
     format!("{:02}:{:02}:{:02}Z", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+/// Ein Ort für den Breadcrumb: der Tab mit seinem Gegenstand — im
+/// Sessions-Tab die Ebenen.
+fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
+    let short_commit = |c: CommitId| c.to_string().chars().take(7).collect::<String>();
+    match tab {
+        Tab::Sessions if !views.is_empty() => views
+            .iter()
+            .map(|view| match view {
+                View::Graph { id, .. } => format!("Session {}…", short(*id)),
+                View::Why { .. } => "Why".to_string(),
+                View::Evidence { .. } => "Evidence".to_string(),
+            })
+            .collect(),
+        Tab::Overview | Tab::Verify | Tab::Changes => {
+            let mut out = vec![tab.title().to_string()];
+            out.extend(commit.map(short_commit));
+            out
+        }
+        _ => vec![tab.title().to_string()],
+    }
 }

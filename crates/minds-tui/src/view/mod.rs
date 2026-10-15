@@ -227,24 +227,40 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     ];
     title.extend(tabs);
     let title = Line::from(title);
-    let mut stats = vec![
-        Span::raw(format!("{} Sessions", h.sessions)),
-        Span::raw(" · "),
-        Span::raw(format!("{} Changes", h.changes)),
-        Span::raw(" · "),
-        Span::raw(format!(
-            "{:.0} % context coverage",
-            h.coverage.ratio() * 100.0
-        )),
-    ];
+    // Zeile 2: der Breadcrumb (B2) — wo bin ich, über welche Sprünge. Von
+    // links gekürzt; die globale Statistik steht dahinter, solange Platz
+    // ist, und weicht als Erstes (C3 zieht sie in die Übersicht).
+    let crumb = app.breadcrumb().join(" › ");
+    let mut stats = format!(
+        "{} Sessions · {} Changes · {:.0} % context coverage",
+        h.sessions,
+        h.changes,
+        h.coverage.ratio() * 100.0
+    );
     if h.degraded > 0 {
-        stats.push(Span::raw(" · "));
-        stats.push(Span::styled(
-            format!("{} degraded", h.degraded),
-            theme::dim(),
-        ));
+        stats.push_str(&format!(" · {} degraded", h.degraded));
     }
-    frame.render_widget(Paragraph::new(vec![title, Line::from(stats)]), area);
+    let width = area.width as usize;
+    let crumb_w = crumb.chars().count();
+    let stats_w = stats.chars().count();
+    // Die Statistik direkt hinter dem Pfad, gedimmt — nur mit Luft: Eine
+    // Zeile, die exakt aufgeht, sähe aus wie abgeschnitten.
+    let line = if crumb_w + 3 + stats_w < width {
+        Line::from(vec![
+            Span::styled(crumb, theme::title()),
+            Span::styled("   ", theme::dim()),
+            Span::styled(stats, theme::dim()),
+        ])
+    } else if crumb_w <= width {
+        Line::from(Span::styled(crumb, theme::title()))
+    } else {
+        let tail: String = crumb
+            .chars()
+            .skip(crumb_w - width.saturating_sub(1))
+            .collect();
+        Line::from(Span::styled(format!("…{tail}"), theme::title()))
+    };
+    frame.render_widget(Paragraph::new(vec![title, line]), area);
 }
 
 /// Die Fußzeile des Changes-Tabs: der Commit und die Tasten des Fokus.
