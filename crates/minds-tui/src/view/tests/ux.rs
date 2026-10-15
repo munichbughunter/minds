@@ -634,3 +634,71 @@ fn a4_no_own_trust_strings_outside_the_component() {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// B5 · Fokus beim Zoom- und Ansichtswechsel erhalten
+// ---------------------------------------------------------------------
+
+fn focused_kind(app: &App) -> Option<String> {
+    match app.top() {
+        Some(View::Graph { rows, cursor, .. }) => rows
+            .get(*cursor)
+            .map(|r| format!("{:?} {}", r.kind, r.label)),
+        _ => None,
+    }
+}
+
+#[test]
+fn b5_zoom_and_timeline_keep_the_focused_node() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Enter);
+    // YOU, AGENT, READ, EDIT: der Cursor auf EDIT.
+    for _ in 0..3 {
+        app.reduce(Action::Down);
+    }
+    let edit = focused_kind(&app).unwrap();
+    assert!(edit.contains("Edit"), "{edit}");
+    // Verbose fügt Züge davor ein — der Cursor folgt dem Knoten, nicht dem Index.
+    app.reduce(Action::Zoom(3));
+    assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
+    app.reduce(Action::Zoom(1));
+    assert!(
+        focused_kind(&app).unwrap().contains("Edit"),
+        "{:?}",
+        focused_kind(&app)
+    );
+    app.reduce(Action::Zoom(2));
+    assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
+    // Baum ↔ Zeitleiste: derselbe Knoten.
+    app.reduce(Action::ToggleTimeline);
+    assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
+    app.reduce(Action::ToggleTimeline);
+    assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
+}
+
+/// Ein ausgeblendeter Zug (Zoom 3 → 2) landet auf der Zeile, die ihn
+/// enthält — seinem sichtbaren Vorfahren.
+#[test]
+fn b5_a_hidden_node_lands_on_the_row_that_contains_it() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Enter);
+    app.reduce(Action::Zoom(3));
+    let turn = match app.top() {
+        Some(View::Graph { rows, .. }) => rows
+            .iter()
+            .position(|r| matches!(r.kind, minds_reader::graph::NodeKind::Turn(_)))
+            .expect("a turn row"),
+        _ => unreachable!(),
+    };
+    for _ in 0..turn {
+        app.reduce(Action::Down);
+    }
+    app.reduce(Action::Zoom(2));
+    assert!(
+        focused_kind(&app).unwrap().contains("Agent"),
+        "{:?}",
+        focused_kind(&app)
+    );
+}

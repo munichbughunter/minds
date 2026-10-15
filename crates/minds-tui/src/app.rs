@@ -1227,12 +1227,16 @@ impl<'a> App<'a> {
                 ..
             } = view
             {
+                // Der Cursor folgt dem Knoten, nicht dem Index (B5).
+                let node = rows.get(*cursor).map(|r| r.node);
                 *rows = if *timeline {
                     layout::timeline(graph, zoom)
                 } else {
                     layout::rows(graph, zoom)
                 };
-                *cursor = (*cursor).min(rows.len().saturating_sub(1));
+                *cursor = node
+                    .and_then(|n| layout::locate(graph, zoom, rows, n))
+                    .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)));
             }
         }
     }
@@ -1435,12 +1439,16 @@ impl<'a> App<'a> {
                     _ => {}
                 }
                 if keep {
+                    // Baum ↔ Zeitleiste: derselbe Knoten bleibt fokussiert (B5).
+                    let node = rows.get(cursor).map(|r| r.node);
                     let rows = if timeline {
                         layout::timeline(&graph, self.zoom)
                     } else {
                         layout::rows(&graph, self.zoom)
                     };
-                    let cursor = cursor.min(rows.len().saturating_sub(1));
+                    let cursor = node
+                        .and_then(|n| layout::locate(&graph, self.zoom, &rows, n))
+                        .unwrap_or_else(|| cursor.min(rows.len().saturating_sub(1)));
                     self.views.push(View::Graph {
                         id,
                         graph,

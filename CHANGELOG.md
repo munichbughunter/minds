@@ -27,6 +27,10 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **The graph keeps its focus.** Changing the zoom level or switching
+  between tree and timeline keeps the cursor on the same node — on a merged
+  row, the row that contains it; on a node hidden by the zoom, its visible
+  ancestor — instead of on the same line number.
 - **`minds inspect` fits narrow terminals.** `? help  q quit` is pinned to
   the right of the footer and never drops; the other keys and the status
   line are shortened from the right with `…`. Below 100 columns the header
