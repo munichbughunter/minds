@@ -1052,3 +1052,123 @@ fn c7_graph_rows_keep_glyph_and_word_in_every_zoom_even_without_color() {
         }
     }
 }
+
+/// C6 · Jeder Zustand ist **allein über Glyph + Wort** unterscheidbar —
+/// geprüft ohne jeden Stil, über alle Zustandsfunktionen hinweg: zwei
+/// verschiedene Zustände ergeben nie denselben Text.
+#[test]
+fn c6_every_state_differs_by_glyph_and_word_alone() {
+    use minds_core::{EvidenceMark as M, EvidenceSource as S, EvidenceStatus as St};
+    use minds_reader::graph::ToolKind;
+    use minds_reader::model::{EvidenceState, EvidenceVerdict, Provenance, Verdict};
+    use minds_reader::overview::SealMark;
+    use minds_reader::reconcile::ReconClass;
+    let mut seen: std::collections::BTreeMap<String, String> = Default::default();
+    let mut add = |state: String, glyph: &str, word: &str| {
+        let text = format!("{glyph} {word}");
+        if let Some(other) = seen.insert(text.clone(), state.clone()) {
+            assert_eq!(other, state, "{other} and {state} both read {text:?}");
+        }
+    };
+    for source in [
+        S::Observed,
+        S::ContentDerived,
+        S::HumanDeclared,
+        S::Heuristic,
+    ] {
+        for status in [St::Verified, St::Partial, St::Unknown, St::Missing] {
+            let (g, w, _) = theme::evidence(Some(M { source, status }));
+            add(format!("evidence {source:?}/{status:?}"), &g, &w);
+        }
+    }
+    let (g, w, _) = theme::evidence(None);
+    add("evidence none".into(), &g, &w);
+    let chained = |verdict| {
+        Provenance::Chained(EvidenceState {
+            verdict,
+            seals: 1,
+            events: 1,
+            gaps: 0,
+            pre_chain: 0,
+            rejected: false,
+            chain_closed: true,
+            signed: 0,
+        })
+    };
+    for (name, p) in [
+        ("sealed", chained(EvidenceVerdict::Verified)),
+        ("incomplete", chained(EvidenceVerdict::Incomplete)),
+        ("tampered", chained(EvidenceVerdict::Tampered)),
+        ("legacy", Provenance::Legacy),
+    ] {
+        let (g, w, _) = theme::provenance(&p);
+        add(format!("provenance {name}"), g, w);
+    }
+    for mark in [
+        SealMark::Sealed,
+        SealMark::Unsigned,
+        SealMark::Partial,
+        SealMark::Incomplete,
+        SealMark::Unsealed,
+        SealMark::Tampered,
+    ] {
+        let (g, w, _) = theme::seal(mark);
+        // Dieselbe Bedeutung wie die Herkunft darf denselben Text tragen.
+        let state = match mark {
+            SealMark::Sealed => "provenance sealed".to_string(),
+            SealMark::Incomplete => "provenance incomplete".to_string(),
+            SealMark::Tampered => "provenance tampered".to_string(),
+            other => format!("seal {other:?}"),
+        };
+        add(state, g, w);
+    }
+    for class in [
+        ReconClass::Explained,
+        ReconClass::ExplainedFsOnly,
+        ReconClass::ReportedOnly,
+        ReconClass::Unexplained,
+    ] {
+        let (g, w, _) = theme::recon(class);
+        add(format!("recon {class:?}"), g, w);
+    }
+    for v in [
+        Verdict::Open,
+        Verdict::Approved,
+        Verdict::NeedsWork,
+        Verdict::Rejected,
+    ] {
+        let (g, w, _) = theme::verdict(v);
+        add(format!("verdict {v:?}"), g, w);
+    }
+    for kind in [
+        ToolKind::Read,
+        ToolKind::Edit,
+        ToolKind::Exec,
+        ToolKind::Delete,
+        ToolKind::Other,
+        ToolKind::Uninterpreted,
+    ] {
+        let (g, w, _) = theme::tool(kind);
+        add(format!("tool {kind:?}"), g, w);
+    }
+    let (g, w, _) = theme::claim();
+    add("claim".into(), g, w);
+    let (g, w, _) = theme::tampered();
+    add("provenance tampered".into(), g, w);
+    let (g, w, _) = theme::not_observed();
+    add("recon Unexplained".into(), g, w);
+    // Der Trust Strip zeigt dieselben Zustände wie die Herkunft — gleicher
+    // Zustand, gleiches Bild (Design-Regel 2); eigene Zustände eigen.
+    for axes in all_axes() {
+        for slot in super::super::trust::slots(&axes) {
+            let state = match (slot.label, slot.word.as_str()) {
+                ("Integrity", "sealed") => "provenance sealed".to_string(),
+                ("Integrity", "TAMPERED") => "provenance tampered".to_string(),
+                ("Integrity", "legacy") => "provenance legacy".to_string(),
+                ("Coverage", "incomplete") => "provenance incomplete".to_string(),
+                (label, word) => format!("{label} {word}"),
+            };
+            add(state, slot.glyph, &slot.word);
+        }
+    }
+}
