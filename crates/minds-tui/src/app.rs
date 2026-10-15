@@ -37,6 +37,10 @@ use crate::{Background, CommitVerify, Source, Stamp};
 /// (Größenänderung des Terminals).
 const TICK: Duration = Duration::from_millis(250);
 
+/// Ab so vielen Zeilen in der Normalstufe startet ein Graph in der
+/// Übersicht (C7).
+pub const LARGE_GRAPH: usize = 40;
+
 /// Wie oft die Quelle nach ihrem Fingerabdruck gefragt wird.
 const CHECK: Duration = Duration::from_secs(1);
 
@@ -1306,6 +1310,12 @@ impl<'a> App<'a> {
         let Some(graph) = self.inspection.graph(id) else {
             return;
         };
+        // Ein großer Graph startet in der Übersicht (C7) — die Fußzeile
+        // sagt, dass mehr da ist.
+        if self.zoom == Zoom::Normal && layout::rows(&graph, Zoom::Normal).len() > LARGE_GRAPH {
+            self.zoom = Zoom::Summary;
+            self.relayout();
+        }
         let rows = layout::rows(&graph, self.zoom);
         self.views.push(View::Graph {
             id,

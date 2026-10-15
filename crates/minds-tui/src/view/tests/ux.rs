@@ -937,3 +937,59 @@ fn c5_terms_no_longer_collide() {
     assert!(text.contains("NOT CHECKED — run minds verify"), "{text}");
     assert!(text.contains("press v"), "{text}");
 }
+
+// ---------------------------------------------------------------------
+// C7 · Graph-Lesbarkeit
+// ---------------------------------------------------------------------
+
+fn busy(calls: usize, path: &str) -> Inspection {
+    let mut s = session("Touch one file many times", "2026-07-25T14:10:00Z");
+    let call = s.turns[0].tool_calls[0].clone();
+    for _ in 0..calls {
+        let mut c = call.clone();
+        if let Some(effect) = c.effect.as_mut() {
+            effect.path = Some(path.into());
+        }
+        s.turns[0].tool_calls.push(c);
+    }
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), s);
+    Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new()),
+        Vec::new(),
+        "repo",
+    )
+}
+
+#[test]
+fn c7_a_large_graph_starts_in_summary_and_says_more_is_there() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(busy(45, "src/lib.rs"), &repo, None);
+    app.reduce(Action::Enter);
+    assert_eq!(
+        app.zoom,
+        crate::Zoom::Summary,
+        "more than 40 rows at zoom 2"
+    );
+    let out = render_sized(&mut app, 160, 40);
+    let footer: String = out.lines().rev().take(2).collect::<Vec<_>>().join("\n");
+    assert!(footer.contains("z shows"), "{footer}");
+    // Ein kleiner Graph bleibt in der Normalstufe.
+    let (_small_dir, small_repo) = super::repo();
+    let mut app = App::new(filled(), &small_repo, None);
+    app.reduce(Action::Enter);
+    assert_eq!(app.zoom, crate::Zoom::Normal);
+}
+
+#[test]
+fn c7_labels_use_the_actual_width() {
+    // 80 Zeichen: Der pauschale Abzug ließ bei 100 Spalten 70 frei (kürzte
+    // ihn), die tatsächliche Breite lässt 87 (zeigt ihn ganz).
+    let long = format!("src/{}.rs", "x".repeat(73));
+    assert_eq!(long.chars().count(), 80);
+    let (_dir, repo) = repo();
+    let mut app = App::new(busy(1, &long), &repo, None);
+    app.reduce(Action::Enter);
+    let out = render_sized(&mut app, 100, 30);
+    assert!(out.contains(&long), "{long} clipped too early\n{out}");
+}

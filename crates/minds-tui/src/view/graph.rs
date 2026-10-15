@@ -142,11 +142,25 @@ pub fn draw(
                 Span::styled(row.prefix.clone(), theme::lane(row.depth)),
                 Span::styled(format!("{glyph} "), style),
                 Span::styled(format!("{word} "), style.patch(theme::title())),
-                Span::raw(clip(
-                    &row.label,
-                    (body.width as usize)
-                        .saturating_sub(row.prefix.chars().count() + word.len() + 20),
-                )),
+                // Die tatsächlich belegte Breite (C7): Spur, Glyph, Wort,
+                // Leerzeichen — und in der Zeitleiste die Zeit dahinter.
+                Span::raw(clip(&row.label, {
+                    let time = if timeline {
+                        row.at
+                            .as_deref()
+                            .map_or(0, |at| 2 + when(Some(at)).chars().count())
+                    } else {
+                        0
+                    };
+                    (body.width as usize).saturating_sub(
+                        row.prefix.chars().count()
+                            + glyph.chars().count()
+                            + 1
+                            + word.chars().count()
+                            + 1
+                            + time,
+                    )
+                })),
             ];
             if timeline && let Some(at) = &row.at {
                 spans.push(Span::styled(format!("  {}", when(Some(at))), theme::dim()));

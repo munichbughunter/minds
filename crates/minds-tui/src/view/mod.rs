@@ -432,7 +432,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 )),
                 _ => None,
             };
-            match word {
+            let sentence = match word {
                 Some(word) => explain(word),
                 None => Line::from(Span::styled(
                     app.inspection
@@ -441,6 +441,22 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                         .unwrap_or_default(),
                     theme::dim(),
                 )),
+            };
+            // Ein großer Graph in der Übersicht sagt, dass mehr da ist (C7).
+            let full = app
+                .inspection
+                .graph(*id)
+                .map(|g| crate::layout::rows(&g, crate::Zoom::Normal).len())
+                .unwrap_or(0);
+            if app.zoom == crate::Zoom::Summary && full > crate::app::LARGE_GRAPH {
+                let mut spans = vec![Span::styled(
+                    format!("Summary of a large graph: {full} rows at zoom 2 — z shows more  ·  "),
+                    theme::title(),
+                )];
+                spans.extend(sentence.spans);
+                Line::from(spans)
+            } else {
+                sentence
             }
         }
         Some(View::Why { chain, .. }) => {

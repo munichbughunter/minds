@@ -27,6 +27,10 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Large graphs stay readable.** A graph with more than 40 rows at zoom 2
+  opens in the summary zoom, and the footer says how many rows zoom 2 has
+  (`z shows more`). Node labels use the width that is really free instead of
+  a flat 20 columns less.
 - **`minds inspect` honours `NO_COLOR`.** With `NO_COLOR` set (not empty),
   the interface draws without any foreground or background colour, like the
   CLI; bold, inverted and underlined stay, so every state still reads by
