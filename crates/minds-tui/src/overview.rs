@@ -136,6 +136,20 @@ impl OverviewState {
         *self = next;
     }
 
+    /// Wählt die Zeile des Commits, wenn es sie gibt (B3: der aktive Commit).
+    pub fn select_commit(&mut self, commit: CommitId) -> bool {
+        match self.position(&Key::Commit(commit)) {
+            Some(at) => {
+                if at != self.cursor {
+                    self.cursor = at;
+                    self.session = 0;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Wie viele Zeilen der Graph hat (WIP-Sessions und Commits).
     pub fn len(&self) -> usize {
         self.data

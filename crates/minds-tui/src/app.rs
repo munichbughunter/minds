@@ -233,6 +233,9 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// Der aktive Commit (B3): die Auswahl der Übersicht, der Commit in
+    /// Verify und in Changes — einer für alle drei; `[ ]` verschiebt ihn.
+    pub active_commit: Option<CommitId>,
     /// Das Tamper-Banner: Sessions, die beim Start manipuliert waren oder
     /// durch ein Neuladen neu manipuliert sind. Esc schließt es, Enter
     /// öffnet die erste.
@@ -298,6 +301,7 @@ impl<'a> App<'a> {
             overview: None,
             nerd: false,
             tamper: None,
+            active_commit: None,
         };
         // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
         let tampered = tampered_of(&app.cards);
@@ -785,14 +789,29 @@ impl<'a> App<'a> {
 
     /// Zeigt `tab`; Changes und Verify laden beim ersten Mal.
     fn show_tab(&mut self, tab: Tab) {
-        if tab == Tab::Changes && self.changes.is_none() {
-            self.open_changes(None);
-        } else if tab == Tab::Verify && self.verify.is_none() {
-            self.open_verify(None);
+        // Der aktive Commit gilt in jedem Tab, der einen Commit zeigt (B3).
+        let active = self.active_commit;
+        let differs = |shown: Option<CommitId>| active.is_some() && shown != active;
+        if tab == Tab::Changes
+            && (self.changes.is_none() || differs(self.changes.as_ref().and_then(|s| s.commit())))
+        {
+            let keep = self.changes.as_ref().map(|s| (s.split, s.why));
+            self.open_changes(active);
+            if let (Some((split, why)), Some(state)) = (keep, self.changes.as_mut()) {
+                state.split = split;
+                state.why = why;
+            }
+        } else if tab == Tab::Verify
+            && (self.verify.is_none() || differs(self.verify.as_ref().and_then(|s| s.commit())))
+        {
+            self.open_verify(active);
         } else if tab == Tab::Intent {
             self.open_intent(None);
         } else if tab == Tab::Overview {
             self.open_overview();
+            if let (Some(commit), Some(state)) = (active, self.overview.as_mut()) {
+                state.select_commit(commit);
+            }
         } else {
             // Zurück im Verify-Tab: Eine ausstehende Prüfung ist jetzt vom
             // Nutzer verlangt, nicht gedrosselt.
@@ -1241,8 +1260,25 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Wendet eine Aktion an.
+    /// Wendet eine Aktion an — und übernimmt danach den Commit des
+    /// sichtbaren Tabs als aktiven (B3).
     pub fn reduce(&mut self, action: Action) {
+        self.reduce_action(action);
+        let shown = match self.tab {
+            Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
+                Some(crate::overview::Selected::Commit(row)) => Some(row.id),
+                _ => None,
+            },
+            Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
+            Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
+            Tab::Sessions | Tab::Intent => None,
+        };
+        if shown.is_some() {
+            self.active_commit = shown;
+        }
+    }
+
+    fn reduce_action(&mut self, action: Action) {
         // Der Hinweis auf eine geschlossene Ebene gilt dem Moment des
         // Neuladens; mit der nächsten Taste ist er gelesen — mit jeder, auch
         // einer unbelegten, nur nicht mit `r`, das ihn gerade erst erzeugen

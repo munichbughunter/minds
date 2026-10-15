@@ -27,6 +27,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **One active commit for Overview, Verify and Changes.** The commit
+  selected in the overview is the one F3/F4 open; `[ ]` in Verify or Changes
+  moves it for all three tabs, and the overview selects it again when shown.
 - **The graph keeps its focus.** Changing the zoom level or switching
   between tree and timeline keeps the cursor on the same node — on a merged
   row, the row that contains it; on a node hidden by the zoom, its visible
