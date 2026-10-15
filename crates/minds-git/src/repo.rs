@@ -372,6 +372,13 @@ mod tests {
             );
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
+        // Keine Wartung im Hintergrund: `git commit` stößt sonst eine
+        // abgekoppelte `git maintenance run --auto` an, die unter Last
+        // parallel zu den Schritten unten am Objektspeicher arbeitet — der
+        // Test tauscht unten eine Loose-Datei aus und braucht einen ruhigen
+        // Speicher.
+        git(&["config", "maintenance.auto", "false"]);
+        git(&["config", "gc.auto", "0"]);
         std::fs::write(fixture.path().join("policy.json"), "reviewed").unwrap();
         git(&["add", "policy.json"]);
         git(&[
@@ -412,6 +419,16 @@ mod tests {
         // Lesen nicht nach — `read_blob_bounded` schon.
         let objects = fixture.path().join(".git/objects");
         let loose = |id: &str| objects.join(&id[..2]).join(&id[2..]);
+        // Die Vorbedingung ausdrücklich: Beide Blobs liegen lose vor — sonst
+        // sagt die Meldung, was stattdessen im Speicher liegt.
+        for id in [&original, &swapped] {
+            assert!(
+                loose(id).is_file(),
+                "blob {id} is not a loose object; objects: {:?}",
+                std::fs::read_dir(&objects)
+                    .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            );
+        }
         std::fs::remove_file(loose(&original)).unwrap();
         std::fs::copy(loose(&swapped), loose(&original)).unwrap();
         let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
