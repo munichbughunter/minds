@@ -45,7 +45,7 @@ pub const LARGE_GRAPH: usize = 40;
 const CHECK: Duration = Duration::from_secs(1);
 
 /// Wie oft der Verify-Tab nach einem Neuladen von selbst neu prüft.
-const VERIFY_EVERY: Duration = Duration::from_secs(5);
+pub(crate) const VERIFY_EVERY: Duration = Duration::from_secs(5);
 
 /// Wie oft `r` höchstens lädt, auch wenn die Taste gehalten wird.
 const REPEAT: Duration = Duration::from_millis(250);

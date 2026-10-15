@@ -51,3 +51,31 @@ fn b6_the_spinner_is_ascii_and_turns() {
     let frames: Vec<char> = (0..5).map(crate::app::spinner).collect();
     assert_eq!(frames, ['|', '/', '-', '\\', '|']);
 }
+
+/// B6: „Das bestehende Drosseln (`VERIFY_EVERY`) bleibt" — auch mit Worker:
+/// Ein Neuladen stößt eine Prüfung erst nach `VERIFY_EVERY` an, ein vom
+/// Nutzer verlangter Check sofort; der Worker nimmt nur eine zur Zeit.
+#[test]
+fn b6_the_throttle_stays_with_the_worker() {
+    let (_dir, repo) = repo();
+    let mut app = app(&repo);
+    app.reduce(Action::TabTo(2));
+    let every = crate::app::VERIFY_EVERY;
+    let state = app.verify.as_mut().unwrap();
+    state.pending = true;
+    state.urgent = false;
+    assert!(!state.due(every / 2, every), "throttled after a reload");
+    assert!(state.due(every, every), "due once VERIFY_EVERY has passed");
+    state.urgent = true;
+    assert!(
+        state.due(Duration::ZERO, every),
+        "a user request is not throttled"
+    );
+    let mut worker = crate::app::Worker::spawn(Box::new(Slow(witnessed(false))));
+    assert!(app.send_check(&mut worker));
+    assert!(
+        !app.verify.as_ref().unwrap().urgent,
+        "the request is consumed"
+    );
+    assert!(!app.send_check(&mut worker), "one check at a time");
+}
