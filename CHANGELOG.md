@@ -19,6 +19,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **One source for every number in the overview.** The overview title counts
+  exactly the rows it shows — `4 commits · 1 with an agent session` — computed
+  by the reader (`Overview::counts`), so the number on top can be counted in
+  the list below. No percentage any more (it hid the denominator), no Change-Id
+  count; a capped list says `500 commits read (limit)`. The second header line
+  is only the breadcrumb; the number of sessions moved into the frame of the
+  Sessions list (`SESSIONS · 2 captured · 1 degraded`). `minds metrics` keeps
+  its coverage figure unchanged.
 - **`minds inspect` shows what the agent discarded.** The Why chain lists the
   constraints and the considered-and-discarded approaches of an intent (up to
   five each, `… N more`) instead of only counting them; the graph detail shows

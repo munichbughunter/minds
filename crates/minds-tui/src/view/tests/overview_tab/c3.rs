@@ -42,8 +42,10 @@ fn c3_the_subject_leads_and_states_stand_right() {
         list_part.contains("   · unsealed"),
         "padding before the states: {row}"
     );
-    // Die globale Statistik steht im Titel der Übersicht.
-    assert!(lines[2].contains("Sessions"), "{}", lines[2]);
+    // Die Zahlen stehen im Titel der Übersicht — gezählt über die Zeilen
+    // (C3.1), nicht mehr die globale Statistik.
+    assert!(lines[2].contains("with an agent session"), "{}", lines[2]);
+    assert!(!lines[2].contains("Sessions"), "{}", lines[2]);
 }
 
 #[test]

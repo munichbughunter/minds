@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use minds_reader::model::Verdict;
-use minds_reader::overview::{CommitRow, RefLabel, WipSession, WipState, one_line};
+use minds_reader::overview::{CommitRow, OverviewCounts, RefLabel, WipSession, WipState, one_line};
 
 use crate::overview::MAX_SESSION_LINES;
 
@@ -228,6 +228,25 @@ fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     spans
 }
 
+/// Die Zahlen des Titels (C3.1): keine Prozente, die den Nenner verstecken;
+/// gekappt sagt die Zahl, dass sie nur das Gelesene zählt.
+pub(crate) fn counts_title(counts: &OverviewCounts, budget_hit: bool) -> String {
+    let commits = if counts.limited {
+        let why = if budget_hit {
+            "read budget reached"
+        } else {
+            "limit"
+        };
+        format!("{} commits read ({why})", counts.commits)
+    } else {
+        format!("{} commits", counts.commits)
+    };
+    format!(
+        "{commits} · {} with an agent session",
+        counts.with_agent_session
+    )
+}
+
 /// Zeichnet den Tab.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let Some(state) = &app.overview else {
@@ -323,17 +342,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
-    let mut title = if overview.budget_hit {
-        format!(
-            " {}OVERVIEW · newest {} commits (read budget reached)",
-            mark,
-            overview.rows.len()
-        )
-    } else if overview.truncated {
-        format!(" {}OVERVIEW · newest {} commits", mark, overview.rows.len())
-    } else {
-        format!(" {}OVERVIEW · {} commits", mark, overview.rows.len())
-    };
+    // Die Zahlen genau einmal, hier (C3.1) — aus den gelesenen Zeilen.
+    let mut title = format!(
+        " {}OVERVIEW · {}",
+        mark,
+        counts_title(&overview.counts(), overview.budget_hit)
+    );
     if !state.filter.is_empty() {
         title.push_str(&format!(
             " · filter: {} ({} of {total})",
@@ -341,14 +355,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             shown.len()
         ));
     }
-    // Die globale Statistik gehört hierher, zum Einstieg (C3).
-    let h = app.inspection.header();
-    title.push_str(&format!(
-        " · {} Sessions · {} Changes · {:.0} % of commits with a session",
-        h.sessions,
-        h.changes,
-        h.coverage.ratio() * 100.0
-    ));
     if overview.wip_more > 0 {
         title.push_str(&format!(
             " · {} more sessions without a commit",

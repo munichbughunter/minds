@@ -928,8 +928,9 @@ fn c5_terms_no_longer_collide() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     let out = render_sized(&mut app, 300, 30);
-    // Der Anteil der Commits mit Session ist nicht die Coverage-Achse.
-    assert!(out.contains("% of commits with a session"), "{out}");
+    // Der Anteil der Commits mit Session ist nicht die Coverage-Achse — und
+    // seit C3.1 gar kein Prozentwert mehr (er versteckt den Nenner).
+    assert!(!out.contains("% of commits"), "{out}");
     assert!(!out.contains("context coverage"), "{out}");
     assert!(out.contains("1 file · 0 tok"), "{out}");
     assert!(!out.contains(" D · "), "{out}");

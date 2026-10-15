@@ -170,6 +170,51 @@ pub struct CommitRow {
     pub graph: Vec<Cell>,
 }
 
+/// Die Zahlen der Übersicht (C3.1) — gezählt über genau die gelesenen
+/// Zeilen ([`Overview::rows`], [`Overview::wip`]), nie über eine andere
+/// Bezugsmenge. Die Teile ergeben immer das Ganze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OverviewCounts {
+    /// Die gelesenen Commits.
+    pub commits: usize,
+    /// Davon Commits mit einer Agent-Session ([`CommitRow::has_agent_session`]).
+    pub with_agent_session: usize,
+    /// Davon Commits ohne Agent-Session — der Rest.
+    pub without_agent_session: usize,
+    /// Sessions, die an keinem Commit hängen — gezeigte und weitere.
+    pub sessions_without_commit: usize,
+    /// Ob die Historie gekappt oder lückenhaft gelesen wurde — die Zahlen
+    /// zählen dann ausdrücklich nur das Gelesene.
+    pub limited: bool,
+}
+
+impl Overview {
+    /// Die Zahlen über die gelesenen Zeilen.
+    pub fn counts(&self) -> OverviewCounts {
+        let commits = self.rows.len();
+        let with_agent_session = self
+            .rows
+            .iter()
+            .filter(|row| row.has_agent_session())
+            .count();
+        OverviewCounts {
+            commits,
+            with_agent_session,
+            without_agent_session: commits - with_agent_session,
+            sessions_without_commit: self.wip.len() + self.wip_more,
+            limited: self.truncated || self.budget_hit || self.incomplete,
+        }
+    }
+}
+
+impl CommitRow {
+    /// Ob an diesem Commit eine lesbare Agent-Session hängt — dieselbe
+    /// Frage für Badge, Zahl und Filter (C3.1, C3.3).
+    pub fn has_agent_session(&self) -> bool {
+        self.agent.is_some()
+    }
+}
+
 /// Ein Text einzeilig und begrenzt — vor dem Entschärfen gekürzt.
 pub fn one_line(text: &str, limit: usize) -> String {
     let head: String = text.chars().take(limit.saturating_mul(4)).collect();
@@ -681,6 +726,116 @@ mod tests {
             "{:?}",
             overview.rows[0].refs
         );
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=A", "-c", "user.email=a@x"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn agent_session(request: &str) -> minds_core::Session {
+        use minds_core::{Agent, Intent, Model, Session};
+        Session::new(
+            Agent {
+                name: "claude-code".into(),
+                version: "1".into(),
+            },
+            Model {
+                provider: "t".into(),
+                id: "t".into(),
+            },
+            Intent {
+                request: request.into(),
+                ..Intent::default()
+            },
+        )
+    }
+
+    /// C3.1: Die Zahlen der Übersicht kommen aus genau den gelesenen Zeilen
+    /// — „with an agent session" ist die Zahl der Zeilen mit Agent-Badge,
+    /// über 0, 1 und n Agent-Commits, zwei Branches und Sessions ohne
+    /// Commit; die Teile ergeben immer das Ganze.
+    #[test]
+    fn the_counts_are_the_rows_read() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        let mut ids: Vec<CommitId> = Vec::new();
+        for m in ["one", "two", "three"] {
+            git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", m]);
+            ids.push(git_in(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap());
+        }
+        git_in(dir.path(), &["switch", "-q", "-c", "feat", "HEAD~2"]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "side"]);
+        ids.push(git_in(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap());
+        let repo = Repo::open(dir.path()).unwrap();
+        for agent_commits in [0usize, 1, 3] {
+            let mut sessions = BTreeMap::new();
+            let mut links = BTreeMap::new();
+            for (n, commit) in ids.iter().enumerate().take(agent_commits) {
+                let s = agent_session(&format!("task {n}"));
+                let id = SessionId::of(&s).unwrap();
+                sessions.insert(id, s);
+                links.insert(*commit, vec![id]);
+            }
+            // Zwei Sessions ohne Commit.
+            for n in 0..2 {
+                let s = agent_session(&format!("wip {n}"));
+                sessions.insert(SessionId::of(&s).unwrap(), s);
+            }
+            let inspection = crate::Inspection::from_index(
+                crate::Index::from_parts(sessions, links),
+                Vec::new(),
+                "t",
+            );
+            let overview = inspection.overview(&repo).unwrap();
+            let counts = overview.counts();
+            assert_eq!(counts.commits, overview.rows.len());
+            assert_eq!(counts.commits, 4, "both branches are read");
+            let badged = overview
+                .rows
+                .iter()
+                .filter(|r| r.has_agent_session())
+                .count();
+            assert_eq!(counts.with_agent_session, badged);
+            assert_eq!(counts.with_agent_session, agent_commits);
+            assert_eq!(
+                counts.with_agent_session + counts.without_agent_session,
+                counts.commits
+            );
+            assert_eq!(counts.sessions_without_commit, 2);
+            assert!(!counts.limited);
+        }
+    }
+
+    /// C3.1: Eine gekappte Liste sagt, dass die Zahlen nur das Gelesene
+    /// zählen.
+    #[test]
+    fn capped_counts_say_they_count_what_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        for m in ["one", "two", "three"] {
+            git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", m]);
+        }
+        let repo = Repo::open(dir.path()).unwrap();
+        let inspection = crate::Inspection::from_index(
+            crate::Index::from_parts(Default::default(), Default::default()),
+            Vec::new(),
+            "t",
+        );
+        let counts = inspection.overview_with(&repo, 2).unwrap().counts();
+        assert_eq!(counts.commits, 2);
+        assert!(counts.limited);
     }
 
     /// Mehr Sessions, als die Zeile ansieht: nie „sealed".

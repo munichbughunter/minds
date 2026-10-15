@@ -249,31 +249,13 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     ];
     title.extend(tabs);
     let title = Line::from(title);
-    // Zeile 2: der Breadcrumb (B2) — wo bin ich, über welche Sprünge. Von
-    // links gekürzt; die globale Statistik steht dahinter, solange Platz
-    // ist, und weicht als Erstes (C3 zieht sie in die Übersicht).
+    // Zeile 2: nur der Breadcrumb (B2, C3.1) — wo bin ich, über welche
+    // Sprünge. Von links gekürzt. Die Zahlen stehen genau einmal: die der
+    // Historie im Titel der Übersicht, die der Sessions im Rahmen der Liste.
     let crumb = app.breadcrumb().join(" › ");
-    let mut stats = format!(
-        "{} Sessions · {} Changes · {:.0} % of commits with a session",
-        h.sessions,
-        h.changes,
-        h.coverage.ratio() * 100.0
-    );
-    if h.degraded > 0 {
-        stats.push_str(&format!(" · {} degraded", h.degraded));
-    }
     let width = area.width as usize;
     let crumb_w = crumb.chars().count();
-    let stats_w = stats.chars().count();
-    // Die Statistik direkt hinter dem Pfad, gedimmt — nur mit Luft: Eine
-    // Zeile, die exakt aufgeht, sähe aus wie abgeschnitten.
-    let line = if crumb_w + 3 + stats_w < width {
-        Line::from(vec![
-            Span::styled(crumb, theme::title()),
-            Span::styled("   ", theme::dim()),
-            Span::styled(stats, theme::dim()),
-        ])
-    } else if crumb_w <= width {
+    let line = if crumb_w <= width {
         Line::from(Span::styled(crumb, theme::title()))
     } else {
         let tail: String = crumb
