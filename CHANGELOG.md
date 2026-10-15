@@ -27,6 +27,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **A reproducible demo for `minds inspect`.** `cargo xtask demo-fixture
+  <dir>` builds a repository with the real binary and git: a clean session
+  (clear request, three discarded approaches, a commit with the trailer), a
+  commit with a gap (a file no session observed), and `cargo xtask
+  demo-tamper <dir>` changes the seal material of the clean case afterwards
+  — the tamper banner appears, Verify says TAMPERED.
 - **Large graphs stay readable.** A graph with more than 40 rows at zoom 2
   opens in the summary zoom, and the footer says how many rows zoom 2 has
   (`z shows more`). Node labels use the width that is really free instead of
