@@ -501,7 +501,7 @@ impl Inspection {
                 model: sanitize(&session.model.id),
             },
             WhyStep::Intent {
-                request: sanitize(&session.intent.request),
+                request: crate::text::sanitize_lines(session.intent.request.split('\n')),
                 constraints: session
                     .intent
                     .constraints

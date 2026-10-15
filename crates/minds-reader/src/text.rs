@@ -53,6 +53,18 @@ pub fn sanitize(text: &str) -> String {
     escape(text, true)
 }
 
+/// Wie [`sanitize`], aber zeilenweise: Jede Zeile wird für sich entschärft,
+/// die Zeilen bleiben durch echte `\n` getrennt — für mehrzeilige Aussagen
+/// (Auftrag, Constraints), die die Oberfläche Zeile für Zeile zeigt. Andere
+/// Zeilentrenner (`\r`, U+2028 …) bleiben entschärft.
+pub(crate) fn sanitize_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> String {
+    lines
+        .into_iter()
+        .map(sanitize)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Wie [`sanitize`], nur ohne den Backslash.
 ///
 /// Für Pfade, die in einer Meldung stehen: Dort ist der Backslash unter Windows
@@ -200,6 +212,19 @@ const INVISIBLE_CARRIERS: [std::ops::RangeInclusive<char>; 9] = [
 
 #[cfg(test)]
 mod tests {
+
+    /// Zeilenweise heißt nicht weniger entschärft: Nur `\n` trennt, alles
+    /// andere — ANSI, `\r`, Unicode-Zeilentrenner — bleibt sichtbar maskiert.
+    #[test]
+    fn sanitize_lines_keeps_lines_and_escapes_the_rest() {
+        let out = sanitize_lines(["first\x1b[31m", "second\rthird", "x\u{2028}y"]);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(!out.contains('\x1b') && !out.contains('\r'), "{out}");
+        assert!(!out.contains('\u{2028}'), "{out}");
+        assert_eq!(lines[0], sanitize("first\x1b[31m"));
+    }
+
     use super::*;
 
     /// Was unverändert durchgehen muss. Ein Entschärfer, der Umlaute

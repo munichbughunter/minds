@@ -14,7 +14,7 @@ use minds_core::{EdgeKind, EffectKind, Endpoint, Role, Session, SessionId, extra
 
 use crate::index::Index;
 use crate::model::{ReviewState, Verdict};
-use crate::text::{sanitize, sanitize_path};
+use crate::text::{sanitize, sanitize_lines, sanitize_path};
 
 /// Auf so viele Zeichen werden Argumente und Zugtexte im Detail gekürzt —
 /// Zeichen, nicht Bytes, damit kein Umlaut zerschnitten wird.
@@ -131,14 +131,17 @@ impl SessionGraph {
             NodeKind::Intent,
             crate::summary::headline(&session.intent.request, DETAIL_MAX),
             vec![
-                ("Prompt".into(), sanitize(&session.intent.request)),
+                (
+                    "Prompt".into(),
+                    sanitize_lines(session.intent.request.split('\n')),
+                ),
                 (
                     "Constraints".into(),
-                    sanitize(&session.intent.constraints.join("\n")),
+                    sanitize_lines(session.intent.constraints.iter().map(String::as_str)),
                 ),
                 (
                     "Discarded".into(),
-                    sanitize(&session.intent.discarded.join("\n")),
+                    sanitize_lines(session.intent.discarded.iter().map(String::as_str)),
                 ),
             ],
             session.lineage.as_ref().and_then(|l| l.started_at.clone()),

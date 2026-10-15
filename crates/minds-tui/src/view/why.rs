@@ -119,8 +119,18 @@ pub fn draw(
                     ),
                 ]));
             }
+            // Der Record-Text eines Claim-Glieds steht im Claim-Stil — nie
+            // im Stil eines Belegs.
+            let text_style = if matches!(step, WhyStep::Intent { .. }) {
+                theme::claim().2
+            } else {
+                Style::default()
+            };
             for t in text {
-                lines.push(Line::from(vec![Span::raw("     "), Span::raw(t)]));
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(t, text_style),
+                ]));
             }
         }
         if i + 1 < chain.steps.len() {
@@ -136,7 +146,16 @@ pub fn draw(
             Some(WhyStep::Evidence { links }) if !links.is_empty() => 1 + edge.min(links.len() - 1),
             _ => 0,
         };
-    let first = offset(anchor, lines.len(), height);
+    let mut first = offset(anchor, lines.len(), height);
+    // Das fokussierte Glied ganz zeigen, solange es ins Fenster passt — ein
+    // Claim-Abschnitt am Ende eines langen Intents darf nicht unter den
+    // Rand fallen.
+    if let Some(&start) = starts.get(cursor) {
+        let end = starts.get(cursor + 1).copied().unwrap_or(lines.len());
+        if end > first + height {
+            first = start.max(end.saturating_sub(height)).min(anchor);
+        }
+    }
     let shown: Vec<Line> = lines.into_iter().skip(first).take(height).collect();
     frame.render_widget(Paragraph::new(shown), body);
 
@@ -319,12 +338,9 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             // Das CLAIM-Label rendert `draw` gestylt VOR diesen Zeilen —
             // hier steht nur der Record-Text selbst.
             let mut text: Vec<String> = request.lines().take(4).map(|l| clip(l, width)).collect();
-            if !constraints.is_empty() {
-                text.push(format!("Constraints: {}", constraints.len()));
-            }
-            if !discarded.is_empty() {
-                text.push(format!("Discarded: {}", discarded.len()));
-            }
+            // Leer ist leer: Ein Abschnitt ohne Einträge erscheint nicht.
+            claim_section(&mut text, "Constraints", constraints, width);
+            claim_section(&mut text, "Considered & discarded", discarded, width);
             // Der Anker als eigenes Glied der Kette: Enter öffnet ihn im
             // Intent-Tab (Beleg, Signatur, Snapshot).
             match anchor {
@@ -380,6 +396,24 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             }));
             (glyph, "REVIEW", style, text)
         }
+    }
+}
+
+/// Höchstens so viele Einträge je Claim-Abschnitt; der Rest wird gezählt.
+const SECTION_MAX: usize = 5;
+
+/// Hängt einen Claim-Abschnitt an (Überschrift, je Eintrag eine geclippte
+/// Zeile, ab [`SECTION_MAX`] ein „… N more"). Ohne Einträge: nichts.
+fn claim_section(text: &mut Vec<String>, title: &str, entries: &[String], width: usize) {
+    if entries.is_empty() {
+        return;
+    }
+    text.push(title.to_string());
+    for entry in entries.iter().take(SECTION_MAX) {
+        text.push(format!("  - {}", clip(entry, width.saturating_sub(4))));
+    }
+    if entries.len() > SECTION_MAX {
+        text.push(format!("  … {} more", entries.len() - SECTION_MAX));
     }
 }
 

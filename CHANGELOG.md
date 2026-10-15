@@ -17,6 +17,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`minds inspect` shows what the agent discarded.** The Why chain lists the
+  constraints and the considered-and-discarded approaches of an intent (up to
+  five each, `… N more`) instead of only counting them; the graph detail shows
+  multi-line values in full, and the YOU box shows up to three lines of the
+  request plus `◌ N discarded · N constraints`. All of it in the claim style —
+  recorded by the agent, never styled like evidence. Empty sections are not
+  shown. The reader keeps the lines of request, constraints and discarded
+  approaches apart (each line sanitized) instead of escaping the line breaks.
+
 ### Fixed
 
 - **Managed settings without `Write(…)` rules.** Claude Code checks file
