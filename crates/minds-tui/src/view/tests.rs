@@ -3339,6 +3339,7 @@ mod verify_tab {
     }
 
     mod b4;
+    mod b6;
     mod c5;
 }
 

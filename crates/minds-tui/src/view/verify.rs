@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let mut lines: Vec<Line> = Vec::new();
-    headline(state, &mut lines);
+    headline(state, app.spin, &mut lines);
     commit_line(state, &mut lines);
     lines.push(Line::raw(""));
 
@@ -353,8 +353,13 @@ fn rank(signature: &IntentSignature) -> u8 {
 }
 
 /// Erste Zeile: Urteil, Stufe, Intent — das, was man zuerst wissen will.
-fn headline(state: &VerifyState, lines: &mut Vec<Line<'static>>) {
-    let (word, style) = crate::view::trust::verify_headline(state.overall());
+fn headline(state: &VerifyState, spin: usize, lines: &mut Vec<Line<'static>>) {
+    let (mut word, style) = crate::view::trust::verify_headline(state.overall());
+    // Während der Worker prüft, dreht sich ein ASCII-Spinner (B6).
+    if state.overall() == Overall::Checking {
+        word.push(' ');
+        word.push(crate::app::spinner(spin));
+    }
     let mut spans = vec![Span::styled(
         format!(" {word} "),
         style.add_modifier(Modifier::BOLD | Modifier::REVERSED),

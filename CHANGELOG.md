@@ -27,6 +27,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Verify no longer freezes `minds inspect`.** The check behind the Verify
+  tab (`minds verify`, ssh-keygen per seal) runs in a worker thread; the
+  interface stays responsive and shows `… CHECKING` with an ASCII spinner
+  until the result arrives on the next tick. The throttling stays. For
+  library users this is opt-in: `Source::background()` (default `None`, as
+  before) may return a `minds_tui::Background` that owns its data.
 - **Terms that no longer collide.** The share of commits that carry a
   session reads `62 % of commits with a session` (it was "context coverage",
   easily mistaken for the coverage axis); the session size reads `3 files ·

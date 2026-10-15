@@ -160,6 +160,19 @@ pub trait Source {
     ) -> Option<minds_reader::conformance::Report> {
         None
     }
+
+    /// Eine Prüfung, die abseits des Event-Loops laufen darf (B6). `None`
+    /// (Vorgabe): Prüfungen laufen wie bisher synchron über [`Source::verify`].
+    fn background(&self) -> Option<Box<dyn Background>> {
+        None
+    }
+}
+
+/// Eine Prüfung, die abseits des Event-Loops laufen darf. Hält nur eigene,
+/// besessene Daten — öffnet, was sie braucht, im Worker selbst.
+pub trait Background: Send {
+    /// Das Urteil von `minds verify` über `commit` — wie [`Source::verify`].
+    fn verify(&mut self, commit: minds_git::CommitId) -> Result<CommitVerify, String>;
 }
 
 /// Die Anker eines Durchgangs.

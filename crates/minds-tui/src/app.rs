@@ -31,7 +31,7 @@ use crate::overview::{OverviewFocus, OverviewState, Selected};
 use crate::term::Guard;
 use crate::verify::VerifyState;
 use crate::view;
-use crate::{Source, Stamp};
+use crate::{Background, CommitVerify, Source, Stamp};
 
 /// Wie lange auf eine Taste gewartet wird, bevor neu gezeichnet wird
 /// (Größenänderung des Terminals).
@@ -233,6 +233,8 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// Der Tick des Spinners, solange eine Prüfung im Worker läuft (B6).
+    pub spin: usize,
     /// Die Uhr für relative Zeiten in Listen (C4) — `run` stellt sie je
     /// Tick, Tests setzen sie fest.
     pub now: SystemTime,
@@ -246,6 +248,42 @@ pub struct App<'a> {
     /// durch ein Neuladen neu manipuliert sind. Esc schließt es, Enter
     /// öffnet die erste.
     pub tamper: Option<TamperAlert>,
+}
+
+/// Der Worker für Prüfungen (B6): ein Thread, der eine [`Background`]-
+/// Prüfung besitzt; Aufträge und Ergebnisse laufen über `mpsc`-Kanäle. Der
+/// Thread endet, sobald der Worker fallen gelassen wird.
+pub struct Worker {
+    requests: std::sync::mpsc::Sender<CommitId>,
+    results: std::sync::mpsc::Receiver<(CommitId, Result<CommitVerify, String>)>,
+    /// Der Commit, der gerade geprüft wird — eine Prüfung zur Zeit.
+    pub busy: Option<CommitId>,
+}
+
+impl Worker {
+    /// Startet den Thread.
+    pub fn spawn(mut background: Box<dyn Background>) -> Self {
+        let (requests, inbox) = std::sync::mpsc::channel::<CommitId>();
+        let (outbox, results) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(commit) = inbox.recv() {
+                let answer = background.verify(commit);
+                if outbox.send((commit, answer)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests,
+            results,
+            busy: None,
+        }
+    }
+}
+
+/// Ein Bild des ASCII-Spinners (B6), je Tick weiter.
+pub fn spinner(tick: usize) -> char {
+    ['|', '/', '-', '\\'][tick % 4]
 }
 
 /// Ein Eintrag des Navigationsverlaufs: wo ein tabübergreifender Sprung
@@ -340,6 +378,7 @@ impl<'a> App<'a> {
             active_commit: None,
             history: Vec::new(),
             now: SystemTime::now(),
+            spin: 0,
         };
         // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
         let tampered = tampered_of(&app.cards);
@@ -711,6 +750,44 @@ impl<'a> App<'a> {
     /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
     /// der Quelle; `reduce` merkt sich nur den Bedarf.
     /// Nur bei sichtbarem Tab: Ein verdeckter Tab startet kein ssh-keygen.
+    /// Gibt die ausstehende Prüfung des gezeigten Commits an den Worker —
+    /// `true`, wenn sie unterwegs ist. Die Prüfung bleibt „pending": Der Tab
+    /// zeigt „checking", bis das Ergebnis da ist (B6).
+    pub fn send_check(&mut self, worker: &mut Worker) -> bool {
+        if worker.busy.is_some() {
+            return false;
+        }
+        let Some(state) = self.verify.as_mut().filter(|s| s.pending) else {
+            return false;
+        };
+        let Some(commit) = state.commit() else {
+            return false;
+        };
+        state.urgent = false;
+        if worker.requests.send(commit).is_err() {
+            return false;
+        }
+        worker.busy = Some(commit);
+        true
+    }
+
+    /// Übernimmt fertige Prüfungen des Workers — `true`, wenn eine kam. Ein
+    /// Ergebnis für einen inzwischen anderen Commit wird verworfen; dessen
+    /// Prüfung steht dann weiter aus.
+    pub fn take_checks(&mut self, worker: &mut Worker) -> bool {
+        let Ok((commit, answer)) = worker.results.try_recv() else {
+            return false;
+        };
+        worker.busy = None;
+        if let Some(state) = self.verify.as_mut()
+            && state.commit() == Some(commit)
+        {
+            state.pending = false;
+            state.cli = Some(answer);
+        }
+        true
+    }
+
     pub fn fill_verify(&mut self, source: &dyn Source) {
         if self.tab != Tab::Verify {
             return;
@@ -2261,6 +2338,9 @@ impl<'a> App<'a> {
             .checked_sub(VERIFY_EVERY)
             .unwrap_or_else(Instant::now);
         let mut anchored = verified;
+        // Prüfungen im Worker, wenn die Quelle das anbietet (B6) — sonst
+        // synchron wie bisher.
+        let mut worker = source.background().map(Worker::spawn);
         while !self.quit {
             self.now = SystemTime::now();
             terminal.draw(|frame| view::draw(frame, &mut self))?;
@@ -2274,9 +2354,27 @@ impl<'a> App<'a> {
                 .as_ref()
                 .is_some_and(|v| v.due(verified.elapsed(), VERIFY_EVERY));
             if self.tab == Tab::Verify && due {
-                self.fill_verify(source);
-                verified = Instant::now();
-                continue;
+                match worker.as_mut() {
+                    // Im Worker (B6): die Schleife bleibt bei den Tasten.
+                    Some(worker) => {
+                        if self.send_check(worker) {
+                            verified = Instant::now();
+                        }
+                    }
+                    None => {
+                        self.fill_verify(source);
+                        verified = Instant::now();
+                        continue;
+                    }
+                }
+            }
+            if let Some(worker) = worker.as_mut() {
+                if self.take_checks(worker) {
+                    continue;
+                }
+                if worker.busy.is_some() {
+                    self.spin = self.spin.wrapping_add(1);
+                }
             }
             let due = self
                 .intent
