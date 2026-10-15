@@ -107,6 +107,19 @@ pub struct ChangeSet {
     pub files: Vec<FileDiff>,
 }
 
+impl ChangeSet {
+    /// Wie viele `+`-Zeilen des Commits nicht erklärt sind — die Summe über
+    /// [`FileDiff::unexplained`], dieselbe Zahl wie `◦n` je Datei (C3.4).
+    pub fn unexplained(&self) -> usize {
+        self.files.iter().map(FileDiff::unexplained).sum()
+    }
+
+    /// Wie viele Zeilen der Commit hinzufügt.
+    pub fn added(&self) -> usize {
+        self.files.iter().map(|f| f.added).sum()
+    }
+}
+
 /// Warum eine Zeile existiert — aus der Session, die sie schrieb.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineReason {
@@ -348,5 +361,63 @@ fn lines_of(recon: Option<&FileRecon>) -> Lines {
         ),
         Some((LineLevel::Unavailable(_), class)) => Lines::All(Some(class)),
         None => Lines::All(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(class: Option<ReconClass>) -> DiffRow {
+        DiffRow {
+            kind: DiffKind::Added,
+            old: None,
+            new: Some(1),
+            text: String::new(),
+            class,
+            source: None,
+        }
+    }
+
+    fn file(added: usize, rows: Vec<DiffRow>) -> FileDiff {
+        FileDiff {
+            path: "f".into(),
+            identity: "f".into(),
+            added,
+            removed: 0,
+            class: None,
+            gap: None,
+            note: None,
+            rows,
+        }
+    }
+
+    /// C3.4: Die Zahl unerklärter Zeilen eines Commits ist die Summe der
+    /// Zahlen je Datei (`◦n` im Changes-Tab) — eine Funktion, keine zweite
+    /// Rechnung.
+    #[test]
+    fn the_commit_total_is_the_sum_of_the_files() {
+        let set = ChangeSet {
+            commit: format!("{:040x}", 1).parse().unwrap(),
+            subject: None,
+            change: None,
+            review: ReviewState::default(),
+            unassessed: None,
+            files: vec![
+                file(
+                    3,
+                    vec![
+                        row(Some(ReconClass::Unexplained)),
+                        row(Some(ReconClass::Unexplained)),
+                        row(None),
+                    ],
+                ),
+                file(2, vec![row(Some(ReconClass::Unexplained))]),
+            ],
+        };
+        let per_file: usize = set.files.iter().map(FileDiff::unexplained).sum();
+        assert_eq!(set.unexplained(), per_file);
+        assert_eq!(set.unexplained(), 3);
+        assert_eq!(set.added(), 5);
     }
 }

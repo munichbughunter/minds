@@ -31,6 +31,10 @@ pub const MAX_LABELS: usize = 4;
 /// So viele Sessions ohne Commit stehen oben höchstens (die neuesten).
 pub const MAX_WIP: usize = 20;
 
+/// So viele Branches, die einen Commit enthalten, nennt eine Zeile; der Rest
+/// als Zahl.
+pub const MAX_CONTAINING: usize = 3;
+
 /// Über so viele Sessions eines Commits rechnet die Zeile Seal und Intent.
 pub const MAX_SESSIONS_PER_ROW: usize = 64;
 
@@ -166,6 +170,14 @@ pub struct CommitRow {
     pub seal: Option<SealMark>,
     /// Ob eine Session des Commits einen Intent-Anker nennt (Record).
     pub intent: bool,
+    /// Die Anker-Ids, die seine Sessions nennen — je Anker einmal, in der
+    /// Reihenfolge der Sessions (C3.4). Genannt, nicht geprüft.
+    pub anchors: Vec<minds_core::ContentHash>,
+    /// Die Branches, die den Commit enthalten — aus dem gelesenen Graphen,
+    /// HEAD zuerst, höchstens [`MAX_CONTAINING`] (C3.4).
+    pub branches: Vec<String>,
+    /// Wie viele weitere Branches ihn enthalten.
+    pub branches_more: usize,
     /// Die Zeile des Graphen.
     pub graph: Vec<Cell>,
 }
@@ -318,6 +330,58 @@ impl crate::Inspection {
             }
         }
 
+        // Welche Branches welchen Commit enthalten — über den gelesenen
+        // Graphen (Kinder vor Eltern), ohne weiteren Git-Zugriff: Jede Spitze
+        // setzt ihr Bit, jeder Commit reicht seine Bits an die Eltern weiter.
+        let mut names: Vec<String> = Vec::new();
+        let mut tip_bits: Vec<(CommitId, usize)> = Vec::new();
+        if let (Some(name), Some(commit)) = (&current, head_commit) {
+            names.push(ref_name(name));
+            tip_bits.push((commit, 0));
+        }
+        for (name, id) in branches {
+            let short = name.strip_prefix("refs/heads/").unwrap_or(name);
+            if current.as_deref() == Some(short) {
+                continue;
+            }
+            names.push(ref_name(short));
+            tip_bits.push((*id, names.len() - 1));
+        }
+        let words = names.len().div_ceil(64);
+        let position: std::collections::HashMap<CommitId, usize> = graph
+            .commits
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id, i))
+            .collect();
+        let mut bits = vec![vec![0u64; words]; graph.commits.len()];
+        for (tip, bit) in tip_bits {
+            if let Some(&i) = position.get(&tip) {
+                bits[i][bit / 64] |= 1 << (bit % 64);
+            }
+        }
+        for i in 0..graph.commits.len() {
+            let mine = bits[i].clone();
+            for parent in &graph.commits[i].parents {
+                if let Some(&j) = position.get(parent).filter(|&&j| j > i) {
+                    for (word, set) in bits[j].iter_mut().zip(&mine) {
+                        *word |= set;
+                    }
+                }
+            }
+        }
+        let mut containing = bits.into_iter().map(|set| {
+            let all: Vec<usize> = (0..names.len())
+                .filter(|b| set[b / 64] & (1 << (b % 64)) != 0)
+                .collect();
+            let shown: Vec<String> = all
+                .iter()
+                .take(MAX_CONTAINING)
+                .map(|b| names[*b].clone())
+                .collect();
+            (shown, all.len().saturating_sub(MAX_CONTAINING))
+        });
+
         let (graphs, lanes) = layout(&graph.commits);
         let rows = graph
             .commits
@@ -353,11 +417,19 @@ impl crate::Inspection {
                         SealMark::Sealed
                     }
                 });
-                let intent = considered.iter().any(|id| {
-                    index
+                let mut anchors: Vec<minds_core::ContentHash> = Vec::new();
+                for id in considered {
+                    if let Some(anchor) = index
                         .session(*id)
-                        .is_some_and(|s| crate::intent::bound_anchor(s).is_some())
-                });
+                        .and_then(crate::intent::bound_anchor)
+                        .map(|a| a.id)
+                        && !anchors.contains(&anchor)
+                    {
+                        anchors.push(anchor);
+                    }
+                }
+                let intent = !anchors.is_empty();
+                let (branches, branches_more) = containing.next().unwrap_or_default();
                 CommitRow {
                     refs: labels.remove(&commit.id).unwrap_or_default(),
                     subject: one_line(&commit.summary, 200),
@@ -373,6 +445,9 @@ impl crate::Inspection {
                     parents: commit.parents,
                     seal,
                     intent,
+                    anchors,
+                    branches,
+                    branches_more,
                     sessions,
                     graph: cells,
                     id: commit.id,
@@ -836,6 +911,62 @@ mod tests {
         let counts = inspection.overview_with(&repo, 2).unwrap().counts();
         assert_eq!(counts.commits, 2);
         assert!(counts.limited);
+    }
+
+    /// C3.4: Jeder Commit kennt die Branches, die ihn enthalten — aus dem
+    /// schon gelesenen Graphen, HEAD zuerst, höchstens drei und der Rest als
+    /// Zahl — und die Anker-Ids, die seine Sessions nennen.
+    #[test]
+    fn rows_know_their_branches_and_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "base"]);
+        let base: CommitId = git_in(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "top"]);
+        for b in ["b1", "b2", "b3", "b4"] {
+            git_in(dir.path(), &["branch", b, &base.to_string()]);
+        }
+        git_in(
+            dir.path(),
+            &["switch", "-q", "-c", "feat", &base.to_string()],
+        );
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "side"]);
+        let side: CommitId = git_in(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+        git_in(dir.path(), &["switch", "-q", "main"]);
+        let repo = Repo::open(dir.path()).unwrap();
+        let mut s = agent_session("with an anchor");
+        s.intent_events
+            .push(minds_core::intent_anchor::IntentEvent {
+                seq: 1,
+                anchor_id: minds_core::ContentHash::from_bytes([7; 32]),
+                opens_session: true,
+            });
+        let id = SessionId::of(&s).unwrap();
+        let mut sessions = BTreeMap::new();
+        sessions.insert(id, s);
+        let mut links = BTreeMap::new();
+        links.insert(side, vec![id]);
+        let inspection = crate::Inspection::from_index(
+            crate::Index::from_parts(sessions, links),
+            Vec::new(),
+            "t",
+        );
+        let overview = inspection.overview(&repo).unwrap();
+        let row = |id: CommitId| overview.rows.iter().find(|r| r.id == id).unwrap();
+        // Der Seitenzweig liegt nur auf `feat`.
+        assert_eq!(row(side).branches, ["feat"]);
+        assert_eq!(row(side).branches_more, 0);
+        assert_eq!(
+            row(side).anchors,
+            [minds_core::ContentHash::from_bytes([7; 32])]
+        );
+        // Die Basis liegt auf allen sechs: HEAD (main) zuerst, drei Namen,
+        // drei weitere als Zahl.
+        let b = row(base);
+        assert_eq!(b.branches.len(), 3, "{:?}", b.branches);
+        assert_eq!(b.branches[0], "main");
+        assert_eq!(b.branches_more, 3);
+        assert!(b.anchors.is_empty());
     }
 
     /// Mehr Sessions, als die Zeile ansieht: nie „sealed".
