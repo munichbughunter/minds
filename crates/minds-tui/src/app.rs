@@ -220,6 +220,35 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// Das Tamper-Banner: Sessions, die beim Start manipuliert waren oder
+    /// durch ein Neuladen neu manipuliert sind. Esc schließt es, Enter
+    /// öffnet die erste.
+    pub tamper: Option<TamperAlert>,
+}
+
+/// Was das Tamper-Banner meldet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TamperAlert {
+    /// Die neu manipulierten Sessions, in Listenreihenfolge.
+    pub sessions: Vec<SessionId>,
+    /// Seit wann (`HH:MM:SSZ` des vorigen Ladens) — `None` beim Start.
+    pub since: Option<String>,
+}
+
+/// Die Sessions, deren Seal-Material nicht mehr passt (TAMPERED), in
+/// Listenreihenfolge.
+fn tampered_of(cards: &[SessionCard]) -> Vec<SessionId> {
+    cards
+        .iter()
+        .filter(|card| {
+            matches!(
+                &card.provenance,
+                minds_reader::model::Provenance::Chained(state)
+                    if state.verdict == minds_reader::model::EvidenceVerdict::Tampered
+            )
+        })
+        .map(|card| card.id)
+        .collect()
 }
 
 impl<'a> App<'a> {
@@ -254,7 +283,16 @@ impl<'a> App<'a> {
             intent: None,
             overview: None,
             nerd: false,
+            tamper: None,
         };
+        // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
+        let tampered = tampered_of(&app.cards);
+        if !tampered.is_empty() {
+            app.tamper = Some(TamperAlert {
+                sessions: tampered,
+                since: None,
+            });
+        }
         app.refilter();
         app
     }
@@ -302,7 +340,27 @@ impl<'a> App<'a> {
         };
         let keep = self.selected().map(|card| card.id);
         let at = self.cursor;
+        let was_tampered = tampered_of(&self.cards);
         self.cards = inspection.cards();
+        // Neu manipuliert: das Banner, laut. Was schon gemeldet (und
+        // vielleicht weggeklickt) war, kommt nicht wieder.
+        let now_tampered = tampered_of(&self.cards);
+        let fresh: Vec<SessionId> = now_tampered
+            .iter()
+            .copied()
+            .filter(|id| !was_tampered.contains(id))
+            .collect();
+        if !fresh.is_empty() {
+            self.tamper = Some(TamperAlert {
+                sessions: fresh,
+                since: Some(self.loaded_at.clone()),
+            });
+        } else if let Some(alert) = self.tamper.as_mut() {
+            alert.sessions.retain(|id| now_tampered.contains(id));
+            if alert.sessions.is_empty() {
+                self.tamper = None;
+            }
+        }
         let before = std::mem::replace(&mut self.inspection, inspection);
         self.refilter_keeping(keep);
         if keep.is_some() && self.selected().map(|card| card.id) != keep {
@@ -1189,6 +1247,30 @@ impl<'a> App<'a> {
                 self.help = false;
             }
             return;
+        }
+        // Das Banner zuerst: Enter öffnet die erste manipulierte Session,
+        // Esc schließt es. Alle anderen Tasten wirken wie sonst.
+        if let Some(alert) = &self.tamper {
+            match action {
+                Action::Enter => {
+                    let first = alert.sessions.first().copied();
+                    self.tamper = None;
+                    if let Some(id) = first {
+                        self.tab = Tab::Sessions;
+                        self.searching = false;
+                        self.query.clear();
+                        self.refilter_keeping(Some(id));
+                        self.views.clear();
+                        self.push_evidence(id);
+                    }
+                    return;
+                }
+                Action::Back => {
+                    self.tamper = None;
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.searching {
             match action {

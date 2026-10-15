@@ -20,6 +20,7 @@ use crate::changes::Focus;
 use crate::theme;
 
 pub mod activity;
+mod banner;
 pub mod changes;
 pub mod evidence;
 pub mod graph;
@@ -51,14 +52,19 @@ const DEGRADED: &str =
 
 /// Zeichnet den ganzen Bildschirm.
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let [head, body, foot] = Layout::vertical([
+    let banner_h = u16::from(app.tamper.is_some());
+    let [head, alert, body, foot] = Layout::vertical([
         Constraint::Length(2),
+        Constraint::Length(banner_h),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
     .areas(frame.area());
 
     header(frame, app, head);
+    if let Some(tamper) = &app.tamper {
+        banner::draw(frame, alert, tamper);
+    }
     if app.tab == Tab::Changes {
         changes::draw(frame, app, body);
         footer(frame, app, foot);

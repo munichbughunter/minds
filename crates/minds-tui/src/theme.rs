@@ -104,10 +104,16 @@ pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style
         Provenance::Chained(state) => match state.verdict {
             EvidenceVerdict::Verified => ("◈", "sealed", Style::default().fg(OK)),
             EvidenceVerdict::Incomplete => ("!", "incomplete", Style::default().fg(REVIEW)),
-            EvidenceVerdict::Tampered => ("✗", "TAMPERED", Style::default().fg(DELETE)),
+            EvidenceVerdict::Tampered => tampered(),
         },
         Provenance::Legacy => ("·", "legacy", Style::default().fg(DIM)),
     }
+}
+
+/// Glyph, Wort und Stil der Manipulation — der eine Zustand, der immer rot
+/// und immer laut ist (Badge, Karte, Banner sagen dasselbe).
+pub fn tampered() -> (&'static str, &'static str, Style) {
+    ("✗", "TAMPERED", Style::default().fg(DELETE))
 }
 
 /// Glyph, Wort und Stil einer **Aussage** aus dem Session-Record (Intent,

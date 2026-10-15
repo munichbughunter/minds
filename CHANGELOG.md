@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Tampering is loud in `minds inspect`.** When a session is TAMPERED at
+  start, or turns TAMPERED on a live reload, a red, inverted banner spans the
+  full width under the header (`✗ TAMPERED — seal material changed since …`,
+  or `✗ N sessions TAMPERED`). Enter opens the evidence of the (first) session,
+  Esc dismisses it; a reload without new tampering does not bring it back.
 
 ### Fixed
 

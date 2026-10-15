@@ -4181,4 +4181,5 @@ mod overview_tab {
     }
 }
 
+mod tamper;
 mod ux;
