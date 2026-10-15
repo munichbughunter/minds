@@ -30,6 +30,7 @@ use minds_reader::Inspection;
 
 mod app;
 mod changes;
+mod copy;
 mod filter;
 mod input;
 mod intent;
@@ -159,6 +160,19 @@ pub trait Source {
     ) -> Option<minds_reader::conformance::Report> {
         None
     }
+
+    /// Eine Prüfung, die abseits des Event-Loops laufen darf (B6). `None`
+    /// (Vorgabe): Prüfungen laufen wie bisher synchron über [`Source::verify`].
+    fn background(&self) -> Option<Box<dyn Background>> {
+        None
+    }
+}
+
+/// Eine Prüfung, die abseits des Event-Loops laufen darf. Hält nur eigene,
+/// besessene Daten — öffnet, was sie braucht, im Worker selbst.
+pub trait Background: Send {
+    /// Das Urteil von `minds verify` über `commit` — wie [`Source::verify`].
+    fn verify(&mut self, commit: minds_git::CommitId) -> Result<CommitVerify, String>;
 }
 
 /// Die Anker eines Durchgangs.
@@ -278,6 +292,8 @@ pub fn run(source: &dyn Source, repo: &Repo, opts: Options) -> Result<(), TuiErr
     app.live = stamp.is_some();
     app.stamp = stamp;
     app.nerd = opts.nerd_font;
+    // Wie die CLI: `NO_COLOR` (nicht leer) schaltet alle Farben ab (C6).
+    app.no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     if let Start::Why { path, line } = &opts.start {
         app.open_why_line(path, *line)?;
     } else if start_overview {

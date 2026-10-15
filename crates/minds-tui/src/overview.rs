@@ -73,12 +73,14 @@ pub struct OverviewState {
     /// Gerechnet wird im Leerlauf, für den gewählten Commit und HEAD; ein
     /// Neuladen beginnt leer (eine neue Signatur kann alles ändern).
     pub conformance: HashMap<CommitId, Option<ConformanceMark>>,
+    /// Der Filter aus `/` (B4) — leer: alles.
+    pub filter: String,
 }
 
 impl OverviewState {
     /// Liest die Übersicht.
     pub fn build(inspection: &Inspection, repo: &Repo) -> Self {
-        Self {
+        let mut state = Self {
             data: inspection
                 .overview(repo)
                 .map_err(|err| minds_reader::sanitize(&err.to_string())),
@@ -87,7 +89,29 @@ impl OverviewState {
             session: 0,
             stale: false,
             conformance: HashMap::new(),
+            filter: String::new(),
+        };
+        // Die Startauswahl ist HEAD (C3) — laufende Sessions stehen darüber.
+        if let Some(head) = state.head() {
+            state.select_commit(head);
         }
+        state
+    }
+
+    /// Der Commit, auf dem HEAD steht, falls die Übersicht ihn zeigt.
+    pub fn head(&self) -> Option<CommitId> {
+        self.data.as_ref().ok()?.rows.iter().find_map(|row| {
+            row.refs
+                .iter()
+                .any(|label| {
+                    matches!(
+                        label,
+                        minds_reader::overview::RefLabel::Head(_)
+                            | minds_reader::overview::RefLabel::Detached
+                    )
+                })
+                .then_some(row.id)
+        })
     }
 
     /// Der nächste Commit, dessen Conformance noch fehlt: der gewählte,
@@ -133,7 +157,50 @@ impl OverviewState {
             next.session = self.session;
         }
         next.session = next.session.min(next.sessions().len().saturating_sub(1));
+        next.filter = std::mem::take(&mut self.filter);
         *self = next;
+    }
+
+    /// Wählt die Zeile des Commits, wenn es sie gibt (B3: der aktive Commit).
+    pub fn select_commit(&mut self, commit: CommitId) -> bool {
+        match self.position(&Key::Commit(commit)) {
+            Some(at) => {
+                if at != self.cursor {
+                    self.cursor = at;
+                    self.session = 0;
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Die Zeilen, die der Filter durchlässt: Betreff, Autor, Agent, Refs —
+    /// bei einer WIP-Session Agent und Auftrag.
+    pub fn shown(&self) -> Vec<usize> {
+        let Ok(overview) = self.data.as_ref() else {
+            return Vec::new();
+        };
+        crate::filter::shown_by(self.len(), &self.filter, |i| {
+            match i.checked_sub(overview.wip.len()) {
+                None => {
+                    let wip = &overview.wip[i];
+                    format!("{} {}", wip.agent, wip.request)
+                }
+                Some(at) => {
+                    let row = &overview.rows[at];
+                    let refs: Vec<String> = row.refs.iter().map(|r| format!("{r:?}")).collect();
+                    format!(
+                        "{} {} {} {} {}",
+                        row.subject,
+                        row.author,
+                        row.agent.clone().unwrap_or_default(),
+                        refs.join(" "),
+                        row.id
+                    )
+                }
+            }
+        })
     }
 
     /// Wie viele Zeilen der Graph hat (WIP-Sessions und Commits).

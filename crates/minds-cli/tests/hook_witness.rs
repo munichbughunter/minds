@@ -202,13 +202,35 @@ fn hook_unset_env_is_unchanged() {
     assert_eq!(f.hook_log(), None, "ohne Witness kein Logeintrag");
 }
 
+/// Eine verwaiste Socket-Datei, an der Verbinden mit ECONNREFUSED scheitert
+/// — geprüft, nicht angenommen.
+///
+/// macOS kennt kein atomares `SOCK_CLOEXEC`: Zwischen `socket()` und dem
+/// Setzen von `FD_CLOEXEC` kann ein parallel gestarteter Prozess (die Tests
+/// hier starten Witness-Daemons) den Socket erben. Dann lauscht er nach
+/// `drop` weiter, der Hook verbindet sich erfolgreich, und das Event käme
+/// nie im Journal an. Unter Last ist das Fenster breiter — daher der Test
+/// selbst: verwaist erst, wenn Verbinden abgewiesen wird; sonst ein neuer
+/// Pfad.
+fn stale_socket(dir: &std::path::Path) -> std::path::PathBuf {
+    for attempt in 0..20 {
+        let stale = dir.join(format!("stale-{attempt}.sock"));
+        drop(UnixListener::bind(&stale).unwrap());
+        match std::os::unix::net::UnixStream::connect(&stale) {
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => return stale,
+            // Geerbt und noch offen: nicht verwaist — nächster Pfad.
+            _ => continue,
+        }
+    }
+    panic!("no stale socket after 20 attempts — something keeps inheriting them");
+}
+
 #[test]
 fn hook_falls_back_when_witness_down() {
     let f = Fixture::repo_only();
     let missing = f.dir.path().join("missing.sock");
-    let stale = f.dir.path().join("stale.sock");
     // Eine verwaiste Socket-Datei: Verbinden scheitert mit ECONNREFUSED.
-    drop(UnixListener::bind(&stale).unwrap());
+    let stale = stale_socket(f.dir.path());
 
     for (n, (socket, kind)) in [(&missing, "socket missing"), (&stale, "connection refused")]
         .into_iter()

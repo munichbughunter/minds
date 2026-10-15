@@ -17,6 +17,152 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`minds inspect` shows what the agent discarded.** The Why chain lists the
+  constraints and the considered-and-discarded approaches of an intent (up to
+  five each, `… N more`) instead of only counting them; the graph detail shows
+  multi-line values in full, and the YOU box shows up to three lines of the
+  request plus `◌ N discarded · N constraints`. All of it in the claim style —
+  recorded by the agent, never styled like evidence. Empty sections are not
+  shown. The reader keeps the lines of request, constraints and discarded
+  approaches apart (each line sanitized) instead of escaping the line breaks.
+- **More room for the session headline.** Beside the preview, the session
+  list now gives the headline at least 30 columns at 120 terminal columns
+  (it had 16): the time column is narrower with relative times, the list
+  never shrinks below that, and the detail keeps 46 columns. Wide terminals
+  keep their split.
+- **A reproducible demo for `minds inspect`.** `cargo xtask demo-fixture
+  <dir>` builds a repository with the real binary and git: a clean session
+  (clear request, three discarded approaches, a commit with the trailer), a
+  commit with a gap (a file no session observed), and `cargo xtask
+  demo-tamper <dir>` changes the seal material of the clean case afterwards
+  — the tamper banner appears, Verify says TAMPERED.
+- **Large graphs stay readable.** A graph with more than 40 rows at zoom 2
+  opens in the summary zoom, and the footer says how many rows zoom 2 has
+  (`z shows more`). Node labels use the width that is really free instead of
+  a flat 20 columns less.
+- **`minds inspect` honours `NO_COLOR`.** With `NO_COLOR` set (not empty),
+  the interface draws without any foreground or background colour, like the
+  CLI; bold, inverted and underlined stay, so every state still reads by
+  glyph and word, the cursor stays inverted and the focused pane keeps its
+  `▸`. Nerd Font glyphs stay opt-in.
+- **Verify no longer freezes `minds inspect`.** The check behind the Verify
+  tab (`minds verify`, ssh-keygen per seal) runs in a worker thread; the
+  interface stays responsive and shows `… CHECKING` with an ASCII spinner
+  until the result arrives on the next tick. The throttling stays. For
+  library users this is opt-in: `Source::background()` (default `None`, as
+  before) may return a `minds_tui::Background` that owns its data.
+- **Terms that no longer collide.** The share of commits that carry a
+  session reads `62 % of commits with a session` (it was "context coverage",
+  easily mistaken for the coverage axis); the session size reads `3 files ·
+  5.7k tok` instead of `3 D · 1200/4500 T`; Verify's `NOT CHECKED` says
+  `or press v`, and `v` in Verify starts the check again right away.
+- **Times read the same everywhere.** Lists show relative times (`just
+  now`, `5m ago`, `3h ago`, `2d ago`); details and the timeline show
+  `2026-10-14 09:00 UTC` instead of the German-style `14.10. 09:00Z`.
+- **The overview leads with the subject.** Each commit row reads lanes ·
+  badge · refs · subject · (dim) request, with what Minds knows — seal state,
+  a deviating review, intent, several sessions, conformance — right-aligned;
+  the text is shortened, never the states. The detail answers "can I trust
+  this commit?" (seal state and review, separately) and names the next
+  action (`Enter: how it was made · v: verify · d: diff`). The global
+  statistics are in the overview title. Below 100 columns the overview shows
+  only the list, or the detail when the focus is on it.
+  The overview starts on HEAD, not on the first row (sessions in progress
+  stand above it).
+- **Two footer lines with fixed roles.** Line 1 is the context of what is in
+  focus — the session with its trust strip, the commit or the anchor — and
+  the glossary sentence for its state; line 2 holds the four to six most
+  frequent actions, `? help  q quit` pinned to the right (while typing a
+  search, the search keys). Everything else is in the help.
+- **A glossary, explained in context.** Every status word has one plain
+  sentence in one place (`copy.rs`), with the distinctions that matter:
+  sealed is not verified, observed is not checked, a claim is not evidence,
+  not observed is not wrong, incomplete is not tampered — and the jargon
+  (hash-valid, epoch, witness, conformance, A0–A3) is explained. The first
+  footer line shows the sentence for the focused state in every view (the
+  session's seal state, the graph node, the evidence section, the Verify
+  verdict, the overview commit, intent bindings) instead of static
+  explanations; the help ends with the whole glossary and carries the
+  overview legend.
+- **One selection and focus style.** Every cursor row uses the same
+  inverted style (the overview's grey bar and the bold rows of Verify and
+  Intent are gone). The focused pane — session list, overview graph or
+  detail, changed files or diff — carries `▸` in its title and a bold
+  border; unfocused panes have a dim border. Both work without colour.
+- **Consistent keys in `minds inspect`.** `1`–`5` switch tabs (F1–F5 and
+  Tab/Shift-Tab still work); zoom moved to `z` (finer) and `Z` (coarser). The
+  object verbs mean the same in every tab, on any session or commit in
+  focus: `w` why, `e` evidence, `v` verify, `d` diff, `i` intent — where one
+  does not fit, the footer says why instead of doing nothing. In Changes,
+  `c` toggles the "why this line?" column and `w` opens the why chain. PgUp
+  and PgDn page in Verify too.
+  `/` filters in every tab — sessions, overview commits (subject, author,
+  agent, refs), changed files, intent anchors; Esc clears the filter first.
+- **The way back across tabs.** Every jump from one tab to another
+  (Enter on a commit, session, anchor or artifact; `w` on a line) is recorded
+  with its origin — tab, layers, cursor, search. Esc on the layer the jump
+  opened returns exactly there. The second header line is a breadcrumb
+  (`Verify › 1a2b3c4 › Session b3-4f… › Why`), shortened from the left; the
+  global statistics follow it while there is room.
+- **Esc never quits `minds inspect`.** Esc follows one order in every tab:
+  close the help or the tamper banner, clear the search, close the top
+  layer — otherwise nothing (the way back across tabs follows with the
+  navigation history). Only `q` and Ctrl-C quit; Verify, Changes and Intent
+  no longer jump to Sessions on Esc.
+- **One active commit for Overview, Verify and Changes.** The commit
+  selected in the overview is the one F3/F4 open; `[ ]` in Verify or Changes
+  moves it for all three tabs, and the overview selects it again when shown.
+- **The graph keeps its focus.** Changing the zoom level or switching
+  between tree and timeline keeps the cursor on the same node — on a merged
+  row, the row that contains it; on a node hidden by the zoom, its visible
+  ancestor — instead of on the same line number.
+- **`minds inspect` fits narrow terminals.** `? help  q quit` is pinned to
+  the right of the footer and never drops; the other keys and the status
+  line are shortened from the right with `…`. Below 100 columns the header
+  uses short tab labels (`F1 Ovw F2 Ses F3 Ver F4 Chg F5 Int`) and shortens
+  repository and branch first, never the tabs. The help scrolls (↑↓, PgUp,
+  PgDn, g/G) and starts with the keys of the current tab. The Why chain uses
+  a one-line connector and shows the gap block only when there are gaps.
+- **One trust strip in `minds inspect`.** Integrity, coverage and
+  interpretation are shown by one component, everywhere in the same order
+  and the same words — never merged into one value, score or traffic light.
+  The session list shows `◈ sealed ● ✓` (integrity as a word, so legacy stays
+  `· legacy`), the footer and the graph head `◈ sealed · ● complete · ✓
+  interpreted` (the graph head now leads with it), the evidence verdict its
+  three axis rows with the same glyphs, a legacy session one line per axis,
+  and the Why chain each session with its three glyphs. The words of
+  `minds verify` (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT VERIFIABLE,
+  hash-valid) stay as they are. Review stays a separate statement; "open" —
+  the normal state — is no longer shown as a pill or in the VERDICT column.
+  The reader provides the three axes (`SessionCard::axes`, `TrustAxes`).
+- **One meaning per glyph in `minds inspect`.** A central glyph register
+  separates epistemic glyphs (evidence source, check result, seal state,
+  claim, reconciliation, review) from structural ones (node kinds, effects);
+  no structural element uses an epistemic glyph any more. READ is `→`
+  (was `◇`), CHANGE/COMMIT `■` (was `◆`), the YOU node `◌` (it is a claim),
+  TURN `›` and other tools `+` (was `·`, which means "nothing attested"),
+  review approved `⊕` (was `✓`, which means "check passed") and rejected `⊘`
+  (was `✕`, which stays DELETE). The bullet before every session row is gone.
+  The legend in the help is generated from the register.
+  In the overview, the agent badge is `◉CC` (was `◆CC`), the HEAD pill
+  `▲ HEAD` (was `● HEAD`), commit nodes `■` (was `●`) and a session without a
+  commit `□` (was `◌`); the seal pills use the same glyphs as everywhere else
+  (`! incomplete`, `✗ TAMPERED` instead of `◇ incomplete`, `✗ tampered`) and
+  `◎ sealed · unsigned` instead of `◇ sealed · unsigned`.
+- **A claim no longer reads as checked in the Why chain.** The INTENT link
+  carries the claim marker `◌` in the claim style instead of the green `✓` of
+  an attested link; unsigned review notes — and a review head whose verdict rests on unsigned
+  notes only — carry `◌` as well. "No gap"
+  now speaks of the evidence links only (`✓ no gap in the evidence links ·
+  intent is a recorded claim`) instead of "every link is attested".
+- **Tampering is loud in `minds inspect`.** When a session is TAMPERED at
+  start, or turns TAMPERED on a live reload, a red, inverted banner spans the
+  full width under the header (`✗ TAMPERED — seal material changed since …`,
+  or `✗ N sessions TAMPERED`). Enter opens the evidence of the (first) session,
+  Esc dismisses it; a reload without new tampering does not bring it back.
+
 ### Fixed
 
 - **Managed settings without `Write(…)` rules.** Claude Code checks file

@@ -1,0 +1,187 @@
+//! B7 · Ein Auswahl- und Fokusstil: `theme::cursor()` für jede Cursorzeile;
+//! der fokussierte Bereich trägt `▸` im Titel und einen hervorgehobenen
+//! Rahmen, unfokussierte einen gedimmten — auch ohne Farbe erkennbar.
+
+use super::*;
+use ratatui::style::Modifier;
+
+fn buffer_sized(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| super::super::super::draw(frame, app))
+        .unwrap();
+    terminal.backend().buffer().clone()
+}
+
+fn text(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+    let area = buffer.area;
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buffer[(x, y)].symbol().to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// Ob die Zeile mit `needle` (ab dessen Spalte) invertiert gezeichnet ist.
+fn reversed_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> bool {
+    let lines = text(buffer);
+    lines.iter().enumerate().any(|(y, line)| {
+        line.find(needle).is_some_and(|byte| {
+            let x = line[..byte].chars().count() as u16;
+            buffer[(x, y as u16)].modifier.contains(Modifier::REVERSED)
+        })
+    })
+}
+
+#[test]
+fn b7_one_cursor_style_in_overview_verify_and_intent() {
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    let selected = match app.overview.as_ref().and_then(|s| s.selected()) {
+        Some(crate::overview::Selected::Commit(row)) => row.subject.clone(),
+        Some(crate::overview::Selected::Wip(wip)) => wip.request.clone(),
+        None => panic!("nothing selected"),
+    };
+    let buffer = buffer_sized(&mut app, 160, 40);
+    let needle: String = selected.chars().take(12).collect();
+    assert!(
+        reversed_at(&buffer, &needle),
+        "overview cursor uses theme::cursor()"
+    );
+    app.reduce(Action::TabTo(2));
+    let buffer = buffer_sized(&mut app, 160, 40);
+    let lines = text(&buffer);
+    if let Some((y, line)) = lines.iter().enumerate().find(|(_, l)| l.contains("▸ ")) {
+        let x = line[..line.find("▸ ").unwrap()].chars().count() as u16;
+        assert!(
+            buffer[(x, y as u16)].modifier.contains(Modifier::REVERSED),
+            "verify cursor uses theme::cursor()"
+        );
+    }
+}
+
+#[test]
+fn b7_the_focused_pane_is_marked_without_color() {
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    let lines = text(&buffer_sized(&mut app, 160, 40));
+    assert!(lines[2].contains("▸ OVERVIEW"), "{}", lines[2]);
+    assert!(!lines[2].contains("▸ DETAIL"), "{}", lines[2]);
+    if let Some(state) = app.overview.as_mut() {
+        state.focus = crate::overview::OverviewFocus::Sessions;
+    }
+    let lines = text(&buffer_sized(&mut app, 160, 40));
+    assert!(lines[2].contains("▸ DETAIL"), "{}", lines[2]);
+    assert!(!lines[2].contains("▸ OVERVIEW"), "{}", lines[2]);
+    // Sessions: die Liste fokussiert, bis eine Ebene liegt.
+    app.reduce(Action::TabTo(1));
+    let lines = text(&buffer_sized(&mut app, 160, 40));
+    assert!(
+        lines.iter().any(|l| l.contains("▸ SESSIONS")),
+        "{}",
+        lines.join("\n")
+    );
+    app.reduce(Action::Enter);
+    let lines = text(&buffer_sized(&mut app, 160, 40));
+    assert!(
+        lines.iter().any(|l| l.contains(" SESSIONS ")),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("▸ SESSIONS")),
+        "{}",
+        lines.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------
+// C2 · Fußzeilen nach der Zwei-Zeilen-Regel
+// ---------------------------------------------------------------------
+
+/// Zeile 1: Kontext des fokussierten Gegenstands (Id, Trust Strip, Satz);
+/// Zeile 2: 4–6 Aktionen, `? help  q quit` rechts — in jedem Tab.
+#[test]
+fn c2_two_footer_lines_with_fixed_roles() {
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        app.reduce(Action::TabTo(i as u8));
+        let actions = super::super::super::actions(&app);
+        assert!(
+            (4..=6).contains(&actions.len()),
+            "{tab:?}: {} actions {actions:?}",
+            actions.len()
+        );
+        let lines = text(&buffer_sized(&mut app, 300, 30));
+        let line2 = lines[lines.len() - 1].trim_end();
+        for action in &actions {
+            assert!(line2.contains(action), "{tab:?}: {action} in {line2}");
+        }
+        assert!(line2.ends_with("? help  q quit"), "{tab:?}: {line2}");
+    }
+    // Sessions: Zeile 1 nennt die Session und ihren Trust Strip (Short).
+    app.reduce(Action::TabTo(1));
+    let lines = text(&buffer_sized(&mut app, 300, 30));
+    let line1 = &lines[lines.len() - 2];
+    let id = app.selected().unwrap().id.to_string();
+    assert!(line1.contains(&id[..11]), "{line1}");
+    assert!(
+        line1.contains(" · ") && line1.contains("interpreted"),
+        "{line1}"
+    );
+    // Overview: Zeile 1 nennt den gewählten Commit.
+    app.reduce(Action::TabTo(0));
+    let lines = text(&buffer_sized(&mut app, 300, 30));
+    let line1 = &lines[lines.len() - 2];
+    if let Some(crate::overview::Selected::Commit(row)) =
+        app.overview.as_ref().and_then(|s| s.selected())
+    {
+        assert!(line1.contains(&row.id.to_string()[..7]), "{line1}");
+    }
+}
+
+// ---------------------------------------------------------------------
+// C6 · Ohne Farbe und mit einfachen Fonts benutzbar
+// ---------------------------------------------------------------------
+
+/// `NO_COLOR`: keine fg/bg-Farbe in keiner Zelle — aber Cursor (invertiert),
+/// Fokus (▸) und jeder Zustand (Glyph + Wort) bleiben erkennbar.
+#[test]
+fn c6_monochrome_keeps_every_state_cursor_and_focus() {
+    use ratatui::style::Color;
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    app.no_color = true;
+    for tab in 0..5u8 {
+        app.reduce(Action::TabTo(tab));
+        let buffer = buffer_sized(&mut app, 160, 40);
+        let area = buffer.area;
+        let mut reversed = false;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, Color::Reset, "tab {tab}: fg at {x},{y}");
+                assert_eq!(cell.bg, Color::Reset, "tab {tab}: bg at {x},{y}");
+                reversed |= cell.modifier.contains(Modifier::REVERSED);
+            }
+        }
+        let lines = text(&buffer);
+        if tab == 0 || tab == 1 {
+            assert!(reversed, "tab {tab}: the cursor stays visible");
+            assert!(
+                lines.iter().any(|l| l.contains("▸ ")),
+                "tab {tab}: focus mark"
+            );
+        }
+    }
+    // Die Zustände tragen Glyph und Wort — dieselben wie in Farbe.
+    app.reduce(Action::TabTo(1));
+    let lines = text(&buffer_sized(&mut app, 160, 40)).join("\n");
+    assert!(
+        lines.contains("· legacy") || lines.contains("◈ sealed"),
+        "{lines}"
+    );
+}

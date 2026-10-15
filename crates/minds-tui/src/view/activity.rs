@@ -15,26 +15,31 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
 use crate::app::App;
 use crate::theme;
-use crate::view::{clip, offset, when};
+use crate::view::{ago, clip, offset};
 
 /// Die schmalste Breite, in der die kompakte Stufe alle ihre Spalten zeigt
 /// — die Untergrenze für die Listenspalte neben der Vorschau.
-pub const COMPACT_WIDTH: u16 = 64;
+pub const COMPACT_WIDTH: u16 = 59;
 /// Ab hier stehen alle Beweisspalten (Seal **und** Verdict) nebeneinander.
-pub const FULL_WIDTH: u16 = 97;
+pub const FULL_WIDTH: u16 = 92;
 /// Ab hier kommt der Umfang (Dateien, Tokens) dazu.
 pub const WIDE_WIDTH: u16 = 120;
 
-const TIME_W: u16 = 13;
+/// Die Zeit relativ (`just now`, `82d ago`, C4) — schmaler als das alte
+/// `25.07. 14:10Z`; die Überschrift bekommt den Platz (A6).
+const TIME_W: u16 = 8;
 const AGENT_W: u16 = 22;
 const AGENT_COMPACT_W: u16 = 12;
 const SIZE_W: u16 = 20;
+/// Die SEAL-Spalte: Trust Strip (Compact, bis `✗ TAMPERED ? ◐`) und der
+/// Kanten-Beleg daneben — zusammen höchstens 18 Zeichen.
 const SEAL_W: u16 = 18;
 const VERDICT_W: u16 = 14;
 /// Rahmen links und rechts.
 const BORDER_W: u16 = 2;
-/// Der Zeilen-Glyph vor der Überschrift (`● `).
-const GLYPH_W: u16 = 2;
+/// Der Zeilen-Glyph vor der Überschrift — seit A1 keiner mehr (der Bullet
+/// trug keine Information); die Konstante hält die Breitenrechnung lesbar.
+const GLYPH_W: u16 = 0;
 
 /// Welche Spalten die Breite trägt. Was zuerst weicht, ist was der
 /// Graph-Kopf daneben ohnehin sagt: erst der Umfang, dann das Review-
@@ -155,7 +160,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(text)
                 .style(theme::dim())
-                .block(sessions_block()),
+                .block(sessions_block(app.top().is_none())),
             table_area,
         );
         draw_notice(frame, notice_area, rejected.len());
@@ -181,7 +186,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .skip(first)
         .take(height)
         .map(|(i, card)| {
-            let mut row = row_of(card, columns, headline_w);
+            let mut row = row_of(card, columns, headline_w, app.now_secs());
             if i == app.cursor {
                 row = row.style(theme::cursor());
             }
@@ -192,21 +197,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Table::new(rows, columns.widths())
             .header(header)
             .column_spacing(1)
-            .block(sessions_block()),
+            .block(sessions_block(app.top().is_none())),
         table_area,
     );
     draw_notice(frame, notice_area, rejected.len());
 }
 
-fn sessions_block() -> Block<'static> {
+/// Der Rahmen der Liste — fokussiert, solange keine Ebene über ihr liegt
+/// (B7).
+fn sessions_block(focused: bool) -> Block<'static> {
+    let (border, mark) = theme::pane(focused);
     Block::bordered()
-        .title(" SESSIONS ")
+        .title(format!(" {mark}SESSIONS "))
         .title_style(theme::title())
+        .border_style(border)
 }
 
 /// Eine Karte als Tabellenzeile. Degradierte Zeilen sind gedimmt und tragen
 /// ihren Zustand in der SEAL-Spalte — das Verdict bleibt leer, wo keines ist.
-fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row<'a> {
+fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize, now: i64) -> Row<'a> {
     let degraded = card.is_degraded();
     let base = if degraded {
         theme::dim()
@@ -214,23 +223,19 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row
         Style::default()
     };
 
-    let session = Line::from(vec![
-        Span::styled(
-            if degraded { "⌦ " } else { "● " },
-            if degraded {
-                theme::dim()
-            } else {
-                theme::lane(0)
-            },
-        ),
-        Span::styled(
-            clip(&card.summary.headline, headline_w),
-            base.patch(theme::title()),
-        ),
-    ]);
+    // Kein Zeilen-Glyph davor: Ein Bullet vor jeder Zeile trug keine
+    // Information (A1) — eine degradierte Zeile sagt ihren Zustand in der
+    // SEAL-Spalte.
+    let session = Line::from(Span::styled(
+        clip(&card.summary.headline, headline_w),
+        base.patch(theme::title()),
+    ));
 
     let mut cells = vec![
-        Cell::from(Span::styled(when(card.started_at.as_deref()), base)),
+        Cell::from(Span::styled(
+            clip(&ago(card.started_at.as_deref(), now), TIME_W as usize),
+            base,
+        )),
         Cell::from(session),
         // Je Agent eine feste Farbe — das Wort steht daneben. Eine
         // degradierte Zeile bleibt ganz grau: Ihr Akteur ist „—", kein Agent.
@@ -245,9 +250,20 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row
     ];
     if columns.show_size() {
         cells.push(Cell::from(Span::styled(
+            // Der Umfang in Wörtern (C5): „3 files · 5.7k tok", nicht „D/T".
             format!(
-                "{} D · {}/{} T",
-                card.summary.files, card.summary.input_tokens, card.summary.output_tokens
+                "{} {} · {}",
+                card.summary.files,
+                if card.summary.files == 1 {
+                    "file"
+                } else {
+                    "files"
+                },
+                crate::view::tokens(
+                    card.summary
+                        .input_tokens
+                        .saturating_add(card.summary.output_tokens)
+                )
             ),
             base,
         )));
@@ -262,19 +278,24 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row
         // Seal-Verdikt als WORT, der beste Kanten-Beleg als Glyph daneben
         // (das Wort erklärt die Fußzeile für die fokussierte Karte), das
         // Review-Verdict als eigene Spalte.
-        let (s_glyph, s_word, s_style) = theme::provenance(&card.provenance);
+        // Der Trust Strip in der Listen-Dichte (A4): Integrität als Wort —
+        // Legacy bleibt Legacy, nie ein bloßes Zeichen —, Coverage und
+        // Deutung als Glyph.
         let (ev_glyph, _, ev_style) = theme::evidence(card.evidence);
-        cells.push(Cell::from(Line::from(vec![
-            Span::styled(format!("{s_glyph} {s_word}"), s_style),
-            Span::raw("  "),
-            Span::styled(ev_glyph, ev_style),
-        ])));
+        let mut spans =
+            crate::view::trust::spans(&card.axes(), crate::view::trust::Density::Compact);
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(ev_glyph, ev_style));
+        cells.push(Cell::from(Line::from(spans)));
         if columns.show_verdict() {
-            let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
-            cells.push(Cell::from(Span::styled(
-                format!("{v_glyph} {v_word}"),
-                v_style,
-            )));
+            // „open" ist der Normalzustand — leise; nur Abweichungen zeigen.
+            let cell = if card.review.verdict == minds_reader::model::Verdict::Open {
+                Cell::from("")
+            } else {
+                let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
+                Cell::from(Span::styled(format!("{v_glyph} {v_word}"), v_style))
+            };
+            cells.push(cell);
         }
     }
     Row::new(cells)

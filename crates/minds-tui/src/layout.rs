@@ -140,6 +140,21 @@ fn shown(node: &GraphNode, zoom: Zoom) -> bool {
 /// Die sichtbaren Knoten, bereits an sichtbare Eltern gehängt und — in der
 /// Übersicht — je Datei zusammengefasst.
 fn visible(graph: &SessionGraph, zoom: Zoom) -> Vec<Item> {
+    visible_with_map(graph, zoom).0
+}
+
+/// Die Zeile in `rows`, die den Knoten `node` zeigt — bei einer
+/// Zusammenfassung die zusammenfassende Zeile, bei einem ausgeblendeten
+/// Knoten die seines sichtbaren Vorfahren (B5). `None`, wenn keine passt.
+pub fn locate(graph: &SessionGraph, zoom: Zoom, rows: &[Row], node: usize) -> Option<usize> {
+    let (items, visible_of) = visible_with_map(graph, zoom);
+    let item = visible_of.get(node).copied().flatten()?;
+    let shown = items.get(item)?.node;
+    rows.iter().position(|row| row.node == shown)
+}
+
+/// Wie [`visible`], dazu je Knoten das Item, das ihn zeigt.
+fn visible_with_map(graph: &SessionGraph, zoom: Zoom) -> (Vec<Item>, Vec<Option<usize>>) {
     // Sichtbarer Vorfahr je Knoten (Index in `items`).
     let mut visible_of: Vec<Option<usize>> = vec![None; graph.nodes.len()];
     let mut items: Vec<Item> = Vec::new();
@@ -176,7 +191,7 @@ fn visible(graph: &SessionGraph, zoom: Zoom) -> Vec<Item> {
             at: node.at.clone(),
         });
     }
-    items
+    (items, visible_of)
 }
 
 fn walk(

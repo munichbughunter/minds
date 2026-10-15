@@ -31,17 +31,21 @@ use crate::overview::{OverviewFocus, OverviewState, Selected};
 use crate::term::Guard;
 use crate::verify::VerifyState;
 use crate::view;
-use crate::{Source, Stamp};
+use crate::{Background, CommitVerify, Source, Stamp};
 
 /// Wie lange auf eine Taste gewartet wird, bevor neu gezeichnet wird
 /// (Größenänderung des Terminals).
 const TICK: Duration = Duration::from_millis(250);
 
+/// Ab so vielen Zeilen in der Normalstufe startet ein Graph in der
+/// Übersicht (C7).
+pub const LARGE_GRAPH: usize = 40;
+
 /// Wie oft die Quelle nach ihrem Fingerabdruck gefragt wird.
 const CHECK: Duration = Duration::from_secs(1);
 
 /// Wie oft der Verify-Tab nach einem Neuladen von selbst neu prüft.
-const VERIFY_EVERY: Duration = Duration::from_secs(5);
+pub(crate) const VERIFY_EVERY: Duration = Duration::from_secs(5);
 
 /// Wie oft `r` höchstens lädt, auch wenn die Taste gehalten wird.
 const REPEAT: Duration = Duration::from_millis(250);
@@ -146,6 +150,17 @@ impl Tab {
         Tab::Intent,
     ];
 
+    /// Das Kurzlabel im Kopf, wenn der Platz nicht reicht (A6).
+    pub fn short(self) -> &'static str {
+        match self {
+            Tab::Overview => "Ovw",
+            Tab::Sessions => "Ses",
+            Tab::Verify => "Ver",
+            Tab::Changes => "Chg",
+            Tab::Intent => "Int",
+        }
+    }
+
     /// Der Name im Kopf.
     pub fn title(self) -> &'static str {
         match self {
@@ -180,6 +195,8 @@ pub struct App<'a> {
     pub views: Vec<View>,
     /// Ob die Hilfe liegt.
     pub help: bool,
+    /// Die erste sichtbare Zeile der Hilfe — sie scrollt (A6).
+    pub help_scroll: u16,
     /// Ob die Schleife enden soll.
     pub quit: bool,
     /// Zeilen je Seite — setzt die Zeichenroutine.
@@ -220,6 +237,114 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// `NO_COLOR` (C6): ohne fg/bg-Farben zeichnen, Modifier bleiben.
+    pub no_color: bool,
+    /// Der Tick des Spinners, solange eine Prüfung im Worker läuft (B6).
+    pub spin: usize,
+    /// Die Uhr für relative Zeiten in Listen (C4) — `run` stellt sie je
+    /// Tick, Tests setzen sie fest.
+    pub now: SystemTime,
+    /// Der Navigationsverlauf (B2): je tabübergreifendem Sprung der
+    /// Ursprung — Esc kehrt von der Ebene des Sprungs genau dorthin zurück.
+    pub history: Vec<NavEntry>,
+    /// Der aktive Commit (B3): die Auswahl der Übersicht, der Commit in
+    /// Verify und in Changes — einer für alle drei; `[ ]` verschiebt ihn.
+    pub active_commit: Option<CommitId>,
+    /// Das Tamper-Banner: Sessions, die beim Start manipuliert waren oder
+    /// durch ein Neuladen neu manipuliert sind. Esc schließt es, Enter
+    /// öffnet die erste.
+    pub tamper: Option<TamperAlert>,
+}
+
+/// Der Worker für Prüfungen (B6): ein Thread, der eine [`Background`]-
+/// Prüfung besitzt; Aufträge und Ergebnisse laufen über `mpsc`-Kanäle. Der
+/// Thread endet, sobald der Worker fallen gelassen wird.
+pub struct Worker {
+    requests: std::sync::mpsc::Sender<CommitId>,
+    results: std::sync::mpsc::Receiver<(CommitId, Result<CommitVerify, String>)>,
+    /// Der Commit, der gerade geprüft wird — eine Prüfung zur Zeit.
+    pub busy: Option<CommitId>,
+}
+
+impl Worker {
+    /// Startet den Thread.
+    pub fn spawn(mut background: Box<dyn Background>) -> Self {
+        let (requests, inbox) = std::sync::mpsc::channel::<CommitId>();
+        let (outbox, results) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok(commit) = inbox.recv() {
+                let answer = background.verify(commit);
+                if outbox.send((commit, answer)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            requests,
+            results,
+            busy: None,
+        }
+    }
+}
+
+/// Ein Bild des ASCII-Spinners (B6), je Tick weiter.
+pub fn spinner(tick: usize) -> char {
+    ['|', '/', '-', '\\'][tick % 4]
+}
+
+/// Ein Eintrag des Navigationsverlaufs: wo ein tabübergreifender Sprung
+/// begann (Tab, Ebenen, Cursor, Suche, der Zustand des Ursprungs-Tabs) und
+/// wohin er führte.
+#[derive(Debug, Clone)]
+pub struct NavEntry {
+    /// Der Ursprungs-Tab.
+    pub tab: Tab,
+    /// Die Ebenen des Sessions-Tabs beim Sprung.
+    pub views: Vec<View>,
+    /// Die Listenzeile beim Sprung.
+    pub cursor: usize,
+    /// Die Suche beim Sprung.
+    pub query: String,
+    /// Der Zustand des Ursprungs-Tabs (nur der eine).
+    pub overview: Option<OverviewState>,
+    /// …
+    pub verify: Option<VerifyState>,
+    /// …
+    pub changes: Option<ChangesState>,
+    /// …
+    pub intent: Option<IntentTab>,
+    /// Der aktive Commit beim Sprung.
+    pub active_commit: Option<CommitId>,
+    /// Wohin der Sprung führte.
+    pub target: Tab,
+    /// Wie viele Ebenen der Sprung im Ziel öffnete — Esc auf dieser Tiefe
+    /// kehrt zurück, statt die Ebene nur zu schließen.
+    pub base: usize,
+}
+
+/// Was das Tamper-Banner meldet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TamperAlert {
+    /// Die neu manipulierten Sessions, in Listenreihenfolge.
+    pub sessions: Vec<SessionId>,
+    /// Seit wann (`HH:MM:SSZ` des vorigen Ladens) — `None` beim Start.
+    pub since: Option<String>,
+}
+
+/// Die Sessions, deren Seal-Material nicht mehr passt (TAMPERED), in
+/// Listenreihenfolge.
+fn tampered_of(cards: &[SessionCard]) -> Vec<SessionId> {
+    cards
+        .iter()
+        .filter(|card| {
+            matches!(
+                &card.provenance,
+                minds_reader::model::Provenance::Chained(state)
+                    if state.verdict == minds_reader::model::EvidenceVerdict::Tampered
+            )
+        })
+        .map(|card| card.id)
+        .collect()
 }
 
 impl<'a> App<'a> {
@@ -237,6 +362,7 @@ impl<'a> App<'a> {
             zoom: Zoom::Normal,
             views: Vec::new(),
             help: false,
+            help_scroll: 0,
             quit: false,
             page: 20,
             width: 0,
@@ -254,7 +380,21 @@ impl<'a> App<'a> {
             intent: None,
             overview: None,
             nerd: false,
+            tamper: None,
+            active_commit: None,
+            history: Vec::new(),
+            now: SystemTime::now(),
+            spin: 0,
+            no_color: false,
         };
+        // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
+        let tampered = tampered_of(&app.cards);
+        if !tampered.is_empty() {
+            app.tamper = Some(TamperAlert {
+                sessions: tampered,
+                since: None,
+            });
+        }
         app.refilter();
         app
     }
@@ -302,7 +442,27 @@ impl<'a> App<'a> {
         };
         let keep = self.selected().map(|card| card.id);
         let at = self.cursor;
+        let was_tampered = tampered_of(&self.cards);
         self.cards = inspection.cards();
+        // Neu manipuliert: das Banner, laut. Was schon gemeldet (und
+        // vielleicht weggeklickt) war, kommt nicht wieder.
+        let now_tampered = tampered_of(&self.cards);
+        let fresh: Vec<SessionId> = now_tampered
+            .iter()
+            .copied()
+            .filter(|id| !was_tampered.contains(id))
+            .collect();
+        if !fresh.is_empty() {
+            self.tamper = Some(TamperAlert {
+                sessions: fresh,
+                since: Some(self.loaded_at.clone()),
+            });
+        } else if let Some(alert) = self.tamper.as_mut() {
+            alert.sessions.retain(|id| now_tampered.contains(id));
+            if alert.sessions.is_empty() {
+                self.tamper = None;
+            }
+        }
         let before = std::mem::replace(&mut self.inspection, inspection);
         self.refilter_keeping(keep);
         if keep.is_some() && self.selected().map(|card| card.id) != keep {
@@ -425,7 +585,6 @@ impl<'a> App<'a> {
         let Some(state) = self.overview.as_mut() else {
             return;
         };
-        let last = state.len().saturating_sub(1);
         let page = self.page.max(1);
         if state.focus == OverviewFocus::Sessions {
             let sessions = state.sessions();
@@ -447,12 +606,15 @@ impl<'a> App<'a> {
         }
         let at = state.cursor;
         match action {
-            Action::Up => state.cursor = state.cursor.saturating_sub(1),
-            Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::PageUp => state.cursor = state.cursor.saturating_sub(page),
-            Action::PageDown => state.cursor = (state.cursor + page).min(last),
-            Action::Home => state.cursor = 0,
-            Action::End => state.cursor = last,
+            // Über die gezeigten Zeilen — der Filter aus `/` blendet aus (B4).
+            Action::Up
+            | Action::Down
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Home
+            | Action::End => {
+                state.cursor = crate::filter::step(&state.shown(), state.cursor, &action, page);
+            }
             Action::Enter => match state.selected() {
                 Some(Selected::Wip(wip)) => {
                     let id = wip.id;
@@ -483,6 +645,9 @@ impl<'a> App<'a> {
                     self.tab = Tab::Sessions;
                     self.views.clear();
                     self.push_why(WhyOrigin::Commit(commit), chain);
+                } else {
+                    // Eine Session ohne Commit hat keine Kette (B4: sagen).
+                    self.closed = Some("w: no commit here — Enter opens the session".into());
                 }
                 return;
             }
@@ -531,9 +696,9 @@ impl<'a> App<'a> {
         let last = state.list().len().saturating_sub(1);
         let at = state.cursor;
         match action {
-            Action::Up => state.cursor = state.cursor.saturating_sub(1),
-            Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::Home => state.cursor = 0,
+            Action::Up | Action::Down | Action::Home => {
+                state.cursor = crate::filter::step(&state.shown(), state.cursor, &action, 1);
+            }
             Action::End => state.cursor = last,
             // Bild hoch/runter blättert im Detail (Snapshot).
             Action::PageUp => {
@@ -542,7 +707,9 @@ impl<'a> App<'a> {
             Action::PageDown => {
                 state.scroll = state.scroll.saturating_add(10).min(state.max_scroll.get());
             }
-            Action::Back => self.tab = Tab::Sessions,
+            // Esc (B1): keine Ebene zu schließen — der Rückweg zum Ursprung
+            // kommt mit dem Navigationsverlauf (B2), sonst nichts.
+            Action::Back => {}
             Action::Enter => {
                 // Eine Session, die sich an den Anker gebunden nennt (die
                 // kleinste Id): ihr Graph im Sessions-Tab.
@@ -590,6 +757,44 @@ impl<'a> App<'a> {
     /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
     /// der Quelle; `reduce` merkt sich nur den Bedarf.
     /// Nur bei sichtbarem Tab: Ein verdeckter Tab startet kein ssh-keygen.
+    /// Gibt die ausstehende Prüfung des gezeigten Commits an den Worker —
+    /// `true`, wenn sie unterwegs ist. Die Prüfung bleibt „pending": Der Tab
+    /// zeigt „checking", bis das Ergebnis da ist (B6).
+    pub fn send_check(&mut self, worker: &mut Worker) -> bool {
+        if worker.busy.is_some() {
+            return false;
+        }
+        let Some(state) = self.verify.as_mut().filter(|s| s.pending) else {
+            return false;
+        };
+        let Some(commit) = state.commit() else {
+            return false;
+        };
+        state.urgent = false;
+        if worker.requests.send(commit).is_err() {
+            return false;
+        }
+        worker.busy = Some(commit);
+        true
+    }
+
+    /// Übernimmt fertige Prüfungen des Workers — `true`, wenn eine kam. Ein
+    /// Ergebnis für einen inzwischen anderen Commit wird verworfen; dessen
+    /// Prüfung steht dann weiter aus.
+    pub fn take_checks(&mut self, worker: &mut Worker) -> bool {
+        let Ok((commit, answer)) = worker.results.try_recv() else {
+            return false;
+        };
+        worker.busy = None;
+        if let Some(state) = self.verify.as_mut()
+            && state.commit() == Some(commit)
+        {
+            state.pending = false;
+            state.cli = Some(answer);
+        }
+        true
+    }
+
     pub fn fill_verify(&mut self, source: &dyn Source) {
         if self.tab != Tab::Verify {
             return;
@@ -653,12 +858,16 @@ impl<'a> App<'a> {
         let Some(state) = self.verify.as_mut() else {
             return;
         };
+        let page = self.page.max(1);
         let last = state.rows().saturating_sub(1);
         match action {
             Action::Up => state.cursor = state.cursor.saturating_sub(1),
             Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::Home | Action::PageUp => state.cursor = 0,
-            Action::End | Action::PageDown => state.cursor = last,
+            Action::Home => state.cursor = 0,
+            Action::End => state.cursor = last,
+            // Bild hoch/runter blättern seitenweise, wie überall (B4).
+            Action::PageUp => state.cursor = state.cursor.saturating_sub(page),
+            Action::PageDown => state.cursor = (state.cursor + page).min(last),
             Action::Bracket(forward) => {
                 let at = if forward {
                     (state.at + 1).min(state.commits.len().saturating_sub(1))
@@ -671,7 +880,8 @@ impl<'a> App<'a> {
                         Some(VerifyState::build(&self.inspection, self.repo, commits, at));
                 }
             }
-            Action::Back => self.tab = Tab::Sessions,
+            // Esc (B1): keine Ebene zu schließen — sonst nichts.
+            Action::Back => {}
             Action::Enter => {
                 let cursor = state.cursor;
                 let commit = state.commit();
@@ -713,14 +923,29 @@ impl<'a> App<'a> {
 
     /// Zeigt `tab`; Changes und Verify laden beim ersten Mal.
     fn show_tab(&mut self, tab: Tab) {
-        if tab == Tab::Changes && self.changes.is_none() {
-            self.open_changes(None);
-        } else if tab == Tab::Verify && self.verify.is_none() {
-            self.open_verify(None);
+        // Der aktive Commit gilt in jedem Tab, der einen Commit zeigt (B3).
+        let active = self.active_commit;
+        let differs = |shown: Option<CommitId>| active.is_some() && shown != active;
+        if tab == Tab::Changes
+            && (self.changes.is_none() || differs(self.changes.as_ref().and_then(|s| s.commit())))
+        {
+            let keep = self.changes.as_ref().map(|s| (s.split, s.why));
+            self.open_changes(active);
+            if let (Some((split, why)), Some(state)) = (keep, self.changes.as_mut()) {
+                state.split = split;
+                state.why = why;
+            }
+        } else if tab == Tab::Verify
+            && (self.verify.is_none() || differs(self.verify.as_ref().and_then(|s| s.commit())))
+        {
+            self.open_verify(active);
         } else if tab == Tab::Intent {
             self.open_intent(None);
         } else if tab == Tab::Overview {
             self.open_overview();
+            if let (Some(commit), Some(state)) = (active, self.overview.as_mut()) {
+                state.select_commit(commit);
+            }
         } else {
             // Zurück im Verify-Tab: Eine ausstehende Prüfung ist jetzt vom
             // Nutzer verlangt, nicht gedrosselt.
@@ -823,7 +1048,7 @@ impl<'a> App<'a> {
         };
         match (state.focus, action) {
             (_, Action::Split) => state.split = !state.split,
-            (_, Action::Why) => state.why = !state.why,
+            (_, Action::Context) => state.why = !state.why,
             (_, Action::Unexplained(forward)) => {
                 if state.jump_unexplained(forward) {
                     state.focus = Focus::Diff;
@@ -851,7 +1076,8 @@ impl<'a> App<'a> {
                 }
             }
             (Focus::Files, Action::Bracket(forward)) => self.step_commit(forward),
-            (Focus::Files, Action::Back) => self.tab = Tab::Sessions,
+            // Esc (B1): die Dateiliste ist die oberste Ebene — sonst nichts.
+            (Focus::Files, Action::Back) => {}
             // Im gezeigten Split paarweise, wie gezeichnet.
             (Focus::Diff, Action::Up) if state.split && split_shown => state.move_pair(-1),
             (Focus::Diff, Action::Down) if state.split && split_shown => state.move_pair(1),
@@ -874,16 +1100,18 @@ impl<'a> App<'a> {
     /// Sessions-Tab, `Esc` führt zurück in die Liste. Auf HEAD die Kette der
     /// Zeile (Blame), auf älteren Commits die des Commits.
     fn why_of_row(&mut self) {
-        let Some(state) = &self.changes else {
+        // Nie still nichts (B4): Fehlt Commit oder Zeile, sagt die Fußzeile es.
+        let Some(commit) = self.changes.as_ref().and_then(|s| s.commit()) else {
+            self.closed = Some("w: no commit here to explain".into());
             return;
         };
-        let Some(commit) = state.commit() else {
-            return;
-        };
-        let target = state
-            .current()
-            .and_then(|f| f.rows.get(state.row).map(|r| (f.identity.clone(), r.new)));
+        let target = self.changes.as_ref().and_then(|state| {
+            state
+                .current()
+                .and_then(|f| f.rows.get(state.row).map(|r| (f.identity.clone(), r.new)))
+        });
         let Some((path, line)) = target else {
+            self.closed = Some("w: no line here — open a file's diff first".into());
             return;
         };
         match line {
@@ -1082,6 +1310,12 @@ impl<'a> App<'a> {
         let Some(graph) = self.inspection.graph(id) else {
             return;
         };
+        // Ein großer Graph startet in der Übersicht (C7) — die Fußzeile
+        // sagt, dass mehr da ist.
+        if self.zoom == Zoom::Normal && layout::rows(&graph, Zoom::Normal).len() > LARGE_GRAPH {
+            self.zoom = Zoom::Summary;
+            self.relayout();
+        }
         let rows = layout::rows(&graph, self.zoom);
         self.views.push(View::Graph {
             id,
@@ -1155,18 +1389,407 @@ impl<'a> App<'a> {
                 ..
             } = view
             {
+                // Der Cursor folgt dem Knoten, nicht dem Index (B5).
+                let node = rows.get(*cursor).map(|r| r.node);
                 *rows = if *timeline {
                     layout::timeline(graph, zoom)
                 } else {
                     layout::rows(graph, zoom)
                 };
-                *cursor = (*cursor).min(rows.len().saturating_sub(1));
+                *cursor = node
+                    .and_then(|n| layout::locate(graph, zoom, rows, n))
+                    .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)));
             }
         }
     }
 
-    /// Wendet eine Aktion an.
+    /// Wendet eine Aktion an — und übernimmt danach den Commit des
+    /// sichtbaren Tabs als aktiven (B3).
     pub fn reduce(&mut self, action: Action) {
+        // Auch vorher: Die Startauswahl (HEAD) ist schon aktiv, bevor die
+        // erste Taste fällt.
+        self.sync_active();
+        // Esc, Schritt 4 (B1/B2): auf der Ebene eines Sprungs zurück zum
+        // Ursprung — mit Ebenen und Cursor.
+        if action == Action::Back && self.at_jump_base() {
+            self.go_back();
+        } else {
+            // Nur Enter und die Objekt-Verben springen über Tab-Grenzen; nur
+            // dann lohnt der Schnappschuss.
+            let origin = matches!(
+                action,
+                Action::Enter
+                    | Action::Why
+                    | Action::Evidence
+                    | Action::Verify
+                    | Action::Diff
+                    | Action::Intent
+            )
+            .then(|| self.snapshot());
+            self.reduce_action(action);
+            if let Some(mut entry) = origin
+                && entry.tab != self.tab
+                && !self.quit
+            {
+                entry.target = self.tab;
+                entry.base = if self.tab == Tab::Sessions {
+                    self.views.len()
+                } else {
+                    0
+                };
+                self.history.push(entry);
+            }
+        }
+        self.sync_active();
+    }
+
+    /// Die Uhr in Sekunden seit Epoch (C4).
+    pub fn now_secs(&self) -> i64 {
+        self.now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Übernimmt den Commit des sichtbaren Tabs als aktiven (B3).
+    fn sync_active(&mut self) {
+        let shown = match self.tab {
+            Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
+                Some(crate::overview::Selected::Commit(row)) => Some(row.id),
+                _ => None,
+            },
+            Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
+            Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
+            Tab::Sessions | Tab::Intent => None,
+        };
+        if shown.is_some() {
+            self.active_commit = shown;
+        }
+    }
+
+    /// Der Gegenstand unter dem Fokus — Session und/oder Commit (B4).
+    fn focus_object(&self) -> (Option<SessionId>, Option<CommitId>) {
+        let commit_of = |id: SessionId| {
+            self.inspection
+                .card(id)
+                .and_then(|card| card.commits.first().copied())
+        };
+        match self.tab {
+            Tab::Sessions => {
+                let session = match self.top() {
+                    Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
+                    Some(View::Why { origin, .. }) => match origin {
+                        WhyOrigin::Session(id) => Some(*id),
+                        _ => None,
+                    },
+                    None => self.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
+                };
+                let commit = match self.top() {
+                    Some(View::Why {
+                        origin: WhyOrigin::Commit(commit),
+                        ..
+                    }) => Some(*commit),
+                    _ => session.and_then(commit_of),
+                };
+                (session, commit)
+            }
+            Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
+                Some(Selected::Commit(row)) => (
+                    self.overview
+                        .as_ref()
+                        .and_then(|s| s.chosen_session())
+                        .or(row.sessions.first().copied()),
+                    Some(row.id),
+                ),
+                Some(Selected::Wip(wip)) => (Some(wip.id), None),
+                None => (None, None),
+            },
+            Tab::Verify => {
+                let state = self.verify.as_ref();
+                let session = state
+                    .and_then(|s| s.sessions.get(s.cursor).map(|row| row.id))
+                    .or_else(|| state.and_then(|s| s.sessions.first().map(|row| row.id)));
+                (session, state.and_then(|s| s.commit()))
+            }
+            Tab::Changes => {
+                let commit = self.changes.as_ref().and_then(|s| s.commit());
+                let session =
+                    commit.and_then(|c| self.inspection.index().sessions_of(c).first().copied());
+                (session, commit)
+            }
+            Tab::Intent => {
+                let session = self.intent.as_ref().and_then(|state| {
+                    state.selected().and_then(|anchor| {
+                        crate::intent::bound_sessions(&self.inspection, &anchor.id)
+                            .first()
+                            .map(|(id, _)| *id)
+                    })
+                });
+                (session, session.and_then(commit_of))
+            }
+        }
+    }
+
+    /// Ein Objekt-Verb auf dem Gegenstand unter dem Fokus — oder ein kurzer
+    /// Hinweis, warum es hier nicht passt (B4: nie still nichts).
+    fn verb(&mut self, action: Action) {
+        let (session, commit) = self.focus_object();
+        match action {
+            // Im Verify-Tab selbst: dieselbe Prüfung jetzt noch einmal (C5).
+            Action::Verify if self.tab == Tab::Verify && self.verify.is_some() => {
+                if let Some(state) = self.verify.as_mut() {
+                    state.pending = true;
+                    state.urgent = true;
+                }
+            }
+            Action::Verify => match commit {
+                Some(commit) => self.open_verify(Some(commit)),
+                None => self.closed = Some("v: no commit here to verify".into()),
+            },
+            Action::Diff => match commit {
+                Some(commit) => self.open_changes(Some(commit)),
+                None => self.closed = Some("d: no commit here to diff".into()),
+            },
+            Action::Intent => {
+                let anchor = session.and_then(|id| {
+                    crate::intent::named_anchors(&self.inspection)
+                        .into_iter()
+                        .find(|a| {
+                            crate::intent::bound_sessions(&self.inspection, a)
+                                .iter()
+                                .any(|(s, _)| *s == id)
+                        })
+                });
+                match anchor {
+                    Some(anchor) => self.open_intent(Some(anchor)),
+                    None => {
+                        self.closed = Some("i: no intent anchor is bound to this session".into())
+                    }
+                }
+            }
+            Action::Why if self.tab == Tab::Changes => self.why_of_row(),
+            Action::Why => match (commit, session) {
+                (Some(commit), _) => {
+                    let chain = self.inspection.why_commit(commit);
+                    self.tab = Tab::Sessions;
+                    self.views.clear();
+                    self.push_why(WhyOrigin::Commit(commit), chain);
+                }
+                (None, Some(id)) => match self.inspection.why_session(id) {
+                    Some(chain) => {
+                        self.tab = Tab::Sessions;
+                        self.views.clear();
+                        self.push_why(WhyOrigin::Session(id), chain);
+                    }
+                    None => self.closed = Some("w: this session is not readable".into()),
+                },
+                (None, None) => self.closed = Some("w: nothing here to explain".into()),
+            },
+            Action::Evidence => match session {
+                Some(id) => {
+                    self.tab = Tab::Sessions;
+                    self.query.clear();
+                    self.refilter_keeping(Some(id));
+                    self.views.clear();
+                    self.push_evidence(id);
+                }
+                None => self.closed = Some("e: no session here".into()),
+            },
+            Action::Context => {
+                self.closed = Some("c: the why column belongs to the Changes tab".into())
+            }
+            _ => {}
+        }
+    }
+
+    /// Der Filter aus `/` des sichtbaren Tabs (B4); Sessions nutzen `query`.
+    pub fn tab_filter(&self) -> Option<&str> {
+        match self.tab {
+            Tab::Overview => self.overview.as_ref().map(|s| s.filter.as_str()),
+            Tab::Changes => self.changes.as_ref().map(|s| s.filter.as_str()),
+            Tab::Intent => self.intent.as_ref().map(|s| s.filter.as_str()),
+            Tab::Sessions | Tab::Verify => None,
+        }
+    }
+
+    fn tab_filter_mut(&mut self) -> Option<&mut String> {
+        match self.tab {
+            Tab::Overview => self.overview.as_mut().map(|s| &mut s.filter),
+            Tab::Changes => self.changes.as_mut().map(|s| &mut s.filter),
+            Tab::Intent => self.intent.as_mut().map(|s| &mut s.filter),
+            Tab::Sessions | Tab::Verify => None,
+        }
+    }
+
+    /// Der Cursor des Tabs auf einen Treffer des Filters.
+    fn refit_tab(&mut self) {
+        match self.tab {
+            Tab::Overview => {
+                if let Some(state) = self.overview.as_mut() {
+                    let cursor = crate::filter::refit(&state.shown(), state.cursor);
+                    if cursor != state.cursor {
+                        state.cursor = cursor;
+                        state.session = 0;
+                    }
+                }
+            }
+            Tab::Changes => {
+                if let Some(state) = self.changes.as_mut() {
+                    let file = crate::filter::refit(&state.shown(), state.file);
+                    if file != state.file {
+                        state.file = file;
+                        state.row = 0;
+                    }
+                }
+            }
+            Tab::Intent => {
+                if let Some(state) = self.intent.as_mut() {
+                    state.cursor = crate::filter::refit(&state.shown(), state.cursor);
+                }
+            }
+            Tab::Sessions | Tab::Verify => {}
+        }
+    }
+
+    /// ↑↓ beim Tippen eines Filters: über die Treffer.
+    fn step_tab(&mut self, action: &Action) {
+        match self.tab {
+            Tab::Overview => {
+                if let Some(state) = self.overview.as_mut() {
+                    state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
+                }
+            }
+            Tab::Changes => {
+                if let Some(state) = self.changes.as_mut() {
+                    state.move_file(*action == Action::Down);
+                }
+            }
+            Tab::Intent => {
+                if let Some(state) = self.intent.as_mut() {
+                    state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
+                }
+            }
+            Tab::Sessions | Tab::Verify => {}
+        }
+    }
+
+    /// Der Ursprung, wie er gerade ist.
+    fn snapshot(&self) -> NavEntry {
+        NavEntry {
+            tab: self.tab,
+            views: self.views.clone(),
+            cursor: self.cursor,
+            query: self.query.clone(),
+            overview: (self.tab == Tab::Overview)
+                .then(|| self.overview.clone())
+                .flatten(),
+            verify: (self.tab == Tab::Verify)
+                .then(|| self.verify.clone())
+                .flatten(),
+            changes: (self.tab == Tab::Changes)
+                .then(|| self.changes.clone())
+                .flatten(),
+            intent: (self.tab == Tab::Intent)
+                .then(|| self.intent.clone())
+                .flatten(),
+            active_commit: self.active_commit,
+            target: self.tab,
+            base: 0,
+        }
+    }
+
+    /// Ob Esc jetzt zum Ursprung des letzten Sprungs führt: nichts davor zu
+    /// schließen oder zu leeren, noch im Ziel des Sprungs, auf seiner Ebene.
+    fn at_jump_base(&self) -> bool {
+        let Some(entry) = self.history.last() else {
+            return false;
+        };
+        if self.help
+            || self.tamper.is_some()
+            || self.searching
+            || !self.query.is_empty()
+            || self.tab_filter().is_some_and(|f| !f.is_empty())
+            || entry.target != self.tab
+        {
+            return false;
+        }
+        match self.tab {
+            Tab::Sessions => self.views.len() <= entry.base,
+            Tab::Overview => self
+                .overview
+                .as_ref()
+                .is_none_or(|s| s.focus == crate::overview::OverviewFocus::Graph),
+            Tab::Changes => self
+                .changes
+                .as_ref()
+                .is_none_or(|s| s.focus == Focus::Files),
+            Tab::Verify | Tab::Intent => true,
+        }
+    }
+
+    /// Kehrt zum Ursprung des letzten Sprungs zurück.
+    fn go_back(&mut self) {
+        let Some(entry) = self.history.pop() else {
+            return;
+        };
+        self.tab = entry.tab;
+        match entry.tab {
+            Tab::Sessions => {
+                self.query = entry.query;
+                self.refilter();
+                self.cursor = entry.cursor.min(self.visible.len().saturating_sub(1));
+                self.views = entry.views;
+            }
+            Tab::Overview => {
+                if entry.overview.is_some() {
+                    self.overview = entry.overview;
+                }
+            }
+            Tab::Verify => {
+                if entry.verify.is_some() {
+                    self.verify = entry.verify;
+                }
+            }
+            Tab::Changes => {
+                if entry.changes.is_some() {
+                    self.changes = entry.changes;
+                }
+            }
+            Tab::Intent => {
+                if entry.intent.is_some() {
+                    self.intent = entry.intent;
+                }
+            }
+        }
+        self.active_commit = entry.active_commit.or(self.active_commit);
+    }
+
+    /// Der Pfad für den Breadcrumb: je Sprung der Ursprung, dann der
+    /// aktuelle Ort.
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for entry in &self.history {
+            out.extend(place(
+                entry.tab,
+                &entry.views,
+                entry
+                    .verify
+                    .as_ref()
+                    .and_then(|s| s.commit())
+                    .or(entry.changes.as_ref().and_then(|s| s.commit()))
+                    .or(entry.active_commit),
+            ));
+        }
+        let shown = match self.tab {
+            Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
+            Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
+            _ => self.active_commit,
+        };
+        out.extend(place(self.tab, &self.views, shown));
+        out
+    }
+
+    fn reduce_action(&mut self, action: Action) {
         // Der Hinweis auf eine geschlossene Ebene gilt dem Moment des
         // Neuladens; mit der nächsten Taste ist er gelesen — mit jeder, auch
         // einer unbelegten, nur nicht mit `r`, das ihn gerade erst erzeugen
@@ -1185,10 +1808,93 @@ impl<'a> App<'a> {
             return;
         }
         if self.help {
-            if matches!(action, Action::Help | Action::Back | Action::Enter) {
-                self.help = false;
+            // Die Hilfe scrollt; schließen wie bisher mit ?, Esc oder Enter.
+            let page = self.page.max(1) as u16;
+            match action {
+                Action::Help | Action::Back | Action::Enter => {
+                    self.help = false;
+                    self.help_scroll = 0;
+                }
+                Action::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                Action::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                Action::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                Action::PageDown => self.help_scroll = self.help_scroll.saturating_add(page),
+                Action::Home => self.help_scroll = 0,
+                Action::End => self.help_scroll = u16::MAX,
+                _ => {}
             }
             return;
+        }
+        // Das Banner zuerst: Enter öffnet die erste manipulierte Session,
+        // Esc schließt es. Alle anderen Tasten wirken wie sonst.
+        if let Some(alert) = &self.tamper {
+            match action {
+                Action::Enter => {
+                    let first = alert.sessions.first().copied();
+                    self.tamper = None;
+                    if let Some(id) = first {
+                        self.tab = Tab::Sessions;
+                        self.searching = false;
+                        self.query.clear();
+                        self.refilter_keeping(Some(id));
+                        self.views.clear();
+                        self.push_evidence(id);
+                    }
+                    return;
+                }
+                Action::Back => {
+                    self.tamper = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // `/` außerhalb der Sessions (B4): derselbe Suchmodus, sein Filter
+        // gehört dem Tab.
+        if self.tab != Tab::Sessions {
+            if self.searching {
+                match action {
+                    Action::SearchInput(c) => {
+                        if let Some(filter) = self.tab_filter_mut() {
+                            filter.push(c);
+                        }
+                        self.refit_tab();
+                    }
+                    Action::SearchBackspace => {
+                        if let Some(filter) = self.tab_filter_mut() {
+                            filter.pop();
+                        }
+                        self.refit_tab();
+                    }
+                    Action::SearchCommit => self.searching = false,
+                    Action::Back => {
+                        if let Some(filter) = self.tab_filter_mut() {
+                            filter.clear();
+                        }
+                        self.searching = false;
+                        self.refit_tab();
+                    }
+                    Action::Up | Action::Down => self.step_tab(&action),
+                    _ => {}
+                }
+                return;
+            }
+            if action == Action::SearchStart {
+                if self.tab_filter_mut().is_some() {
+                    self.searching = true;
+                } else {
+                    self.closed = Some("/: nothing to filter here yet".into());
+                }
+                return;
+            }
+            // Esc, Schritt 2 (B1): erst den Filter leeren.
+            if action == Action::Back && self.tab_filter().is_some_and(|f| !f.is_empty()) {
+                if let Some(filter) = self.tab_filter_mut() {
+                    filter.clear();
+                }
+                self.refit_tab();
+                return;
+            }
         }
         if self.searching {
             match action {
@@ -1212,6 +1918,19 @@ impl<'a> App<'a> {
             }
             return;
         }
+        // `z` / `Z` (B4): ein Schritt feiner bzw. gröber, an den Enden bleibt
+        // die Stufe.
+        let action = match action {
+            Action::ZoomStep(finer) => {
+                let d = self.zoom.digit();
+                Action::Zoom(if finer {
+                    (d + 1).min(3)
+                } else {
+                    d.saturating_sub(1).max(1)
+                })
+            }
+            other => other,
+        };
         if let Action::Zoom(d) = action {
             self.zoom = self.zoom.from_digit(d);
             self.relayout();
@@ -1219,6 +1938,19 @@ impl<'a> App<'a> {
         }
         if action == Action::Help {
             self.help = true;
+            return;
+        }
+        // Die Objekt-Verben (B4): `v d i` überall, `w e` dort, wo der Tab
+        // sie nicht selbst trägt.
+        let verb = match (action.clone(), self.tab) {
+            (Action::Verify | Action::Diff | Action::Intent, _) => true,
+            (Action::Why, Tab::Verify | Tab::Changes | Tab::Intent) => true,
+            (Action::Evidence, Tab::Overview | Tab::Verify | Tab::Changes | Tab::Intent) => true,
+            (Action::Context, tab) => tab != Tab::Changes,
+            _ => false,
+        };
+        if verb {
+            self.verb(action);
             return;
         }
         match action {
@@ -1327,12 +2059,16 @@ impl<'a> App<'a> {
                     _ => {}
                 }
                 if keep {
+                    // Baum ↔ Zeitleiste: derselbe Knoten bleibt fokussiert (B5).
+                    let node = rows.get(cursor).map(|r| r.node);
                     let rows = if timeline {
                         layout::timeline(&graph, self.zoom)
                     } else {
                         layout::rows(&graph, self.zoom)
                     };
-                    let cursor = cursor.min(rows.len().saturating_sub(1));
+                    let cursor = node
+                        .and_then(|n| layout::locate(&graph, self.zoom, &rows, n))
+                        .unwrap_or_else(|| cursor.min(rows.len().saturating_sub(1)));
                     self.views.push(View::Graph {
                         id,
                         graph,
@@ -1567,13 +2303,11 @@ impl<'a> App<'a> {
                 }
             }
             Action::SearchStart => self.searching = true,
-            Action::Back => {
-                if self.query.is_empty() {
-                    self.quit = true;
-                } else {
-                    self.query.clear();
-                    self.refilter();
-                }
+            // Esc (B1): die Suche leeren — sonst nichts. Esc beendet nie;
+            // das tun nur `q` und Ctrl-C.
+            Action::Back if !self.query.is_empty() => {
+                self.query.clear();
+                self.refilter();
             }
             _ => {}
         }
@@ -1617,7 +2351,11 @@ impl<'a> App<'a> {
             .checked_sub(VERIFY_EVERY)
             .unwrap_or_else(Instant::now);
         let mut anchored = verified;
+        // Prüfungen im Worker, wenn die Quelle das anbietet (B6) — sonst
+        // synchron wie bisher.
+        let mut worker = source.background().map(Worker::spawn);
         while !self.quit {
+            self.now = SystemTime::now();
             terminal.draw(|frame| view::draw(frame, &mut self))?;
             // Steht eine Prüfung der Signer aus, ist „checking…" jetzt
             // gezeichnet: erst dann prüfen (ssh-keygen je Seal) und sofort
@@ -1629,9 +2367,27 @@ impl<'a> App<'a> {
                 .as_ref()
                 .is_some_and(|v| v.due(verified.elapsed(), VERIFY_EVERY));
             if self.tab == Tab::Verify && due {
-                self.fill_verify(source);
-                verified = Instant::now();
-                continue;
+                match worker.as_mut() {
+                    // Im Worker (B6): die Schleife bleibt bei den Tasten.
+                    Some(worker) => {
+                        if self.send_check(worker) {
+                            verified = Instant::now();
+                        }
+                    }
+                    None => {
+                        self.fill_verify(source);
+                        verified = Instant::now();
+                        continue;
+                    }
+                }
+            }
+            if let Some(worker) = worker.as_mut() {
+                if self.take_checks(worker) {
+                    continue;
+                }
+                if worker.busy.is_some() {
+                    self.spin = self.spin.wrapping_add(1);
+                }
             }
             let due = self
                 .intent
@@ -1724,4 +2480,26 @@ pub(crate) fn clock(now: SystemTime) -> String {
         .unwrap_or(0)
         % 86_400;
     format!("{:02}:{:02}:{:02}Z", secs / 3600, secs / 60 % 60, secs % 60)
+}
+
+/// Ein Ort für den Breadcrumb: der Tab mit seinem Gegenstand — im
+/// Sessions-Tab die Ebenen.
+fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
+    let short_commit = |c: CommitId| c.to_string().chars().take(7).collect::<String>();
+    match tab {
+        Tab::Sessions if !views.is_empty() => views
+            .iter()
+            .map(|view| match view {
+                View::Graph { id, .. } => format!("Session {}…", short(*id)),
+                View::Why { .. } => "Why".to_string(),
+                View::Evidence { .. } => "Evidence".to_string(),
+            })
+            .collect(),
+        Tab::Overview | Tab::Verify | Tab::Changes => {
+            let mut out = vec![tab.title().to_string()];
+            out.extend(commit.map(short_commit));
+            out
+        }
+        _ => vec![tab.title().to_string()],
+    }
 }

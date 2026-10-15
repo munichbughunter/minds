@@ -34,6 +34,8 @@ pub struct ChangesState {
     pub split: bool,
     /// Die Spalte „Warum diese Zeile?" ist sichtbar.
     pub why: bool,
+    /// Der Filter aus `/` (B4) — leer: alle Dateien.
+    pub filter: String,
 }
 
 impl ChangesState {
@@ -48,6 +50,7 @@ impl ChangesState {
             row: 0,
             split: false,
             why: true,
+            filter: String::new(),
         };
         state.file = state.first_interesting_file();
         state
@@ -113,13 +116,20 @@ impl ChangesState {
 
     /// Eine Datei weiter oder zurück.
     pub fn move_file(&mut self, down: bool) {
-        let last = self.files().len().saturating_sub(1);
-        self.file = if down {
-            (self.file + 1).min(last)
+        let shown = self.shown();
+        let action = if down {
+            crate::input::Action::Down
         } else {
-            self.file.saturating_sub(1)
+            crate::input::Action::Up
         };
+        self.file = crate::filter::step(&shown, self.file, &action, 1);
         self.row = 0;
+    }
+
+    /// Die Dateien, die der Filter aus `/` durchlässt (B4) — nach Pfad.
+    pub fn shown(&self) -> Vec<usize> {
+        let files = self.files();
+        crate::filter::shown_by(files.len(), &self.filter, |i| files[i].path.clone())
     }
 
     fn rows_len(&self) -> usize {

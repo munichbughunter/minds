@@ -28,7 +28,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let mut lines: Vec<Line> = Vec::new();
-    headline(state, &mut lines);
+    headline(state, app.spin, &mut lines);
     commit_line(state, &mut lines);
     lines.push(Line::raw(""));
 
@@ -59,11 +59,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 // Kein eigenes Verdikt je Zeile — das sagt die Kopfzeile, von
                 // `verify` selbst. Hier nur Fakten; ✗ nur bei Manipulation.
                 let tampered = cli_tampered || report.state.verdict == EvidenceVerdict::Tampered;
-                let (glyph, word, style) = if tampered {
-                    ("✗", "TAMPERED", Style::default().fg(theme::DELETE))
-                } else {
-                    ("·", "hash-valid", theme::dim())
-                };
+                let (glyph, word, style) = crate::view::trust::verify_session_mark(tampered);
                 spans.push(Span::styled(format!("{glyph} {word:<10}"), style));
                 spans.push(Span::raw(format!(" {short}…  ")));
                 spans.push(Span::styled(
@@ -106,10 +102,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     let unsealed = state.sessions.len() - reports.len();
     let overall = state.overall();
-    let tampered = overall == Overall::Tampered;
     // Ohne geprüftes Urteil von `verify` weder ✓ noch „complete": Der Reader
-    // sieht keine ungültige Witness-Signatur und nicht alle Lücken.
-    let unchecked = matches!(overall, Overall::Checking | Overall::NotChecked);
+    // sieht keine ungültige Witness-Signatur und nicht alle Lücken
+    // (`trust::verify_integrity`).
     let pending_word = if state.pending {
         "signatures checking…"
     } else {
@@ -123,36 +118,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             String::new()
         };
-        let (g, style, text) = if tampered {
-            (
-                "✗",
-                Style::default().fg(theme::DELETE),
-                "TAMPERED — seal material altered or a witness signature invalid".to_string(),
-            )
-        } else if unchecked {
-            (
-                "·",
-                theme::dim(),
-                format!("{seals} seal(s) hash-valid · {pending_word}{without}"),
-            )
-        } else if overall == Overall::NotVerifiable {
-            // Kein ✓ neben „nichts prüfbar".
-            (
-                "·",
-                theme::dim(),
-                format!("{seals} seal(s) hash-valid{without}"),
-            )
-        } else {
-            // „trägt eine Signatur", nicht „gültig signiert": Gültigkeit
-            // steht in der Stufe (gegen die vertrauenswürdigen Signer).
-            (
-                "✓",
-                Style::default().fg(theme::OK),
-                format!(
-                    "intact · {seals} seal(s) hash-valid · {signed}/{seals} carry a signature{without}"
-                ),
-            )
-        };
+        let (g, style, text) =
+            crate::view::trust::verify_integrity(overall, seals, signed, &without, pending_word);
         lines.push(Line::from(vec![
             Span::raw("  "),
             label("Integrity"),
@@ -174,13 +141,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         };
         // Das Wort folgt dem Urteil von `verify`, nicht den Lücken des
         // Readers: Nur `verify` sieht alle Seals des Namensraums.
-        let (g, style, word) = match overall {
-            Overall::Tampered => ("·", theme::dim(), "not assessable"),
-            Overall::Verified => ("✓", Style::default().fg(theme::OK), "complete"),
-            Overall::Incomplete => ("!", Style::default().fg(theme::REVIEW), "incomplete"),
-            Overall::NotVerifiable => ("·", theme::dim(), "not verifiable (no seal)"),
-            _ => ("·", theme::dim(), pending_word),
-        };
+        let (g, style, word) = crate::view::trust::verify_coverage(overall, pending_word);
         lines.push(Line::from(vec![
             Span::raw("  "),
             label("Coverage"),
@@ -375,7 +336,7 @@ fn conformance_lines(state: &VerifyState, lines: &mut Vec<Line<'static>>) {
 
 fn emphasis(line: Line<'static>, on: bool) -> Line<'static> {
     if on {
-        line.style(Style::default().add_modifier(Modifier::BOLD))
+        line.style(theme::cursor())
     } else {
         line
     }
@@ -392,25 +353,13 @@ fn rank(signature: &IntentSignature) -> u8 {
 }
 
 /// Erste Zeile: Urteil, Stufe, Intent — das, was man zuerst wissen will.
-fn headline(state: &VerifyState, lines: &mut Vec<Line<'static>>) {
-    let (word, style) = match state.overall() {
-        Overall::Verified => ("✓ VERIFIED".to_string(), Style::default().fg(theme::OK)),
-        Overall::Incomplete => (
-            "! VERIFIED, INCOMPLETE".to_string(),
-            Style::default().fg(theme::REVIEW),
-        ),
-        Overall::NotVerifiable => (
-            "? NOT VERIFIABLE".to_string(),
-            Style::default().fg(theme::REVIEW),
-        ),
-        Overall::Tampered => ("✗ TAMPERED".to_string(), Style::default().fg(theme::DELETE)),
-        Overall::Checking => ("… CHECKING".to_string(), theme::dim()),
-        Overall::NotChecked => (
-            "? NOT CHECKED — run minds verify".to_string(),
-            Style::default().fg(theme::REVIEW),
-        ),
-        Overall::NoSession => ("· NO SESSION".to_string(), theme::dim()),
-    };
+fn headline(state: &VerifyState, spin: usize, lines: &mut Vec<Line<'static>>) {
+    let (mut word, style) = crate::view::trust::verify_headline(state.overall());
+    // Während der Worker prüft, dreht sich ein ASCII-Spinner (B6).
+    if state.overall() == Overall::Checking {
+        word.push(' ');
+        word.push(crate::app::spinner(spin));
+    }
     let mut spans = vec![Span::styled(
         format!(" {word} "),
         style.add_modifier(Modifier::BOLD | Modifier::REVERSED),

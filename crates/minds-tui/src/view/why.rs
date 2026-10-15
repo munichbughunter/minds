@@ -28,7 +28,8 @@ pub fn draw(
     inspector: Option<&[LinkEvidence]>,
 ) {
     let gaps = chain.gaps();
-    let gaps_h = if area.height < 14 {
+    // Der Gap-Block nur bei Lücken: „keine Lücke" sagt die Fußzeile (A6).
+    let gaps_h = if area.height < 14 || gaps.is_empty() {
         0
     } else {
         (2 + gaps.len().max(1) as u16 * 2).min(10)
@@ -49,10 +50,16 @@ pub fn draw(
     let mut starts: Vec<usize> = Vec::new();
     for (i, step) in chain.steps.iter().enumerate() {
         starts.push(lines.len());
-        let (_, word, style, text) = describe(step, width.saturating_sub(8));
+        let (word, style, text) = describe(step, width.saturating_sub(8));
         let is_gap = gaps.iter().any(|g| g.step == i);
+        // Drei Fälle, nie zwei: Ein Claim-Glied (der Intent — aufgezeichnet,
+        // nie beobachtet) trägt den Claim-Marker, nie das grüne ✓ eines
+        // Belegs; sonst ✓ belegt oder ⚠ Lücke.
         let (mark, mark_style) = if is_gap {
             ("⚠", Style::default().fg(theme::REVIEW))
+        } else if is_claim(step) {
+            let (glyph, _, style) = theme::claim();
+            (glyph, style)
         } else {
             ("✓", Style::default().fg(theme::OK))
         };
@@ -119,12 +126,22 @@ pub fn draw(
                     ),
                 ]));
             }
+            // Der Record-Text eines Claim-Glieds steht im Claim-Stil — nie
+            // im Stil eines Belegs.
+            // Eine unsignierte Review-Notiz ist ebenfalls nur aufgezeichnet:
+            // Sie beginnt mit dem Claim-Glyph und trägt dessen Stil.
+            let (claim_glyph, _, claim_style) = theme::claim();
             for t in text {
-                lines.push(Line::from(vec![Span::raw("     "), Span::raw(t)]));
+                let style = if is_claim(step) || t.starts_with(claim_glyph) {
+                    claim_style
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![Span::raw("     "), Span::styled(t, style)]));
             }
         }
+        // Ein einzeiliger Verbinder (A6) — die Kette braucht ihre Höhe.
         if i + 1 < chain.steps.len() {
-            lines.push(Line::from(Span::styled("  │", theme::dim())));
             lines.push(Line::from(Span::styled("  ▼", theme::dim())));
         }
     }
@@ -136,7 +153,16 @@ pub fn draw(
             Some(WhyStep::Evidence { links }) if !links.is_empty() => 1 + edge.min(links.len() - 1),
             _ => 0,
         };
-    let first = offset(anchor, lines.len(), height);
+    let mut first = offset(anchor, lines.len(), height);
+    // Das fokussierte Glied ganz zeigen, solange es ins Fenster passt — ein
+    // Claim-Abschnitt am Ende eines langen Intents darf nicht unter den
+    // Rand fallen.
+    if let Some(&start) = starts.get(cursor) {
+        let end = starts.get(cursor + 1).copied().unwrap_or(lines.len());
+        if end > first + height {
+            first = start.max(end.saturating_sub(height)).min(anchor);
+        }
+    }
     let shown: Vec<Line> = lines.into_iter().skip(first).take(height).collect();
     frame.render_widget(Paragraph::new(shown), body);
 
@@ -194,12 +220,12 @@ pub fn draw(
         let mut lines: Vec<Line> = Vec::new();
         if gaps.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Every link is attested — the chain closes without guesswork.",
+                "No gap in the evidence links — the intent is a recorded claim, not evidence.",
                 theme::dim(),
             )));
         }
         for gap in &gaps {
-            let (_, word, _, _) = describe(&chain.steps[gap.step], 0);
+            let (word, _, _) = describe(&chain.steps[gap.step], 0);
             lines.push(Line::from(vec![
                 Span::styled("⚠ ", style),
                 Span::styled(word.to_string(), theme::title()),
@@ -218,6 +244,21 @@ pub fn draw(
     }
 }
 
+/// Ob ein Glied eine **Aussage** ist — aufgezeichnet, nie beobachtet, nie
+/// geprüft. Der Intent ist es immer; ein Review, wenn sein Urteil nur aus
+/// unsignierten Notizen stammt. Das SESSION-Glied nicht: Dass die Session
+/// im Store liegt und wie ihre Seals stehen, ist belegt — eine Lücke dort
+/// (unversiegelt) meldet `chain.gaps()` als ⚠.
+fn is_claim(step: &WhyStep) -> bool {
+    match step {
+        WhyStep::Intent { .. } => true,
+        WhyStep::Review { state } => {
+            !state.notes.is_empty() && state.notes.iter().all(|n| !n.signed)
+        }
+        _ => false,
+    }
+}
+
 fn enterable(step: &WhyStep) -> bool {
     match step {
         // Das Evidence-Glied trägt den Hinweis nicht am Kopf: Enter wirkt
@@ -232,18 +273,17 @@ fn enterable(step: &WhyStep) -> bool {
     }
 }
 
-/// Glyph, Wort, Stil und Textzeilen eines Glieds.
-fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style, Vec<String>) {
+/// Wort, Stil und Textzeilen eines Glieds — das Glied-Glyph setzt `draw`
+/// (✓, ⚠ oder der Claim-Marker), nicht die Art des Glieds.
+fn describe(step: &WhyStep, width: usize) -> (&'static str, Style, Vec<String>) {
     match step {
         WhyStep::Line { path, line } => (
-            "▸",
             "LINE",
             Style::default().fg(theme::EXEC),
             vec![format!("{path}:{line}")],
         ),
         WhyStep::Commit { id, subject } => match id {
             Some(id) => (
-                "◆",
                 "COMMIT",
                 Style::default().fg(theme::CHANGE),
                 vec![format!(
@@ -253,7 +293,6 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 )],
             ),
             None => (
-                "◆",
                 "COMMIT",
                 theme::dim(),
                 vec!["Blame does not know this line (empty HEAD or not checked in)".into()],
@@ -261,13 +300,11 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
         },
         WhyStep::Change { id } => match id {
             Some(id) => (
-                "◆",
                 "CHANGE",
                 Style::default().fg(theme::CHANGE),
                 vec![id.to_string()],
             ),
             None => (
-                "◆",
                 "CHANGE",
                 theme::dim(),
                 vec!["no Minds-Change-Id trailer".into()],
@@ -275,22 +312,25 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
         },
         WhyStep::Sessions { cards } => {
             if cards.is_empty() {
-                (
-                    "●",
-                    "SESSION",
-                    theme::dim(),
-                    vec!["no context captured".into()],
-                )
+                ("SESSION", theme::dim(), vec!["no context captured".into()])
             } else {
                 (
-                    "●",
                     "SESSION",
                     Style::default().fg(theme::AGENT),
                     cards
                         .iter()
                         .map(|c| {
+                            // Der Trust Strip in der dichtesten Form (A4):
+                            // je Achse ein Glyph, in fester Reihenfolge.
+                            let strip: String = crate::view::trust::spans(
+                                &c.axes(),
+                                crate::view::trust::Density::Glyphs,
+                            )
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect();
                             format!(
-                                "{}…  {}  {}",
+                                "{strip}  {}…  {}  {}",
                                 c.id.to_string().chars().take(11).collect::<String>(),
                                 when(c.started_at.as_deref()),
                                 clip(&c.summary.headline, width.saturating_sub(30))
@@ -305,7 +345,6 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             version,
             model,
         } => (
-            "◉",
             "AGENT",
             Style::default().fg(theme::AGENT),
             vec![format!("{name} {version} · {model}")],
@@ -319,12 +358,9 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             // Das CLAIM-Label rendert `draw` gestylt VOR diesen Zeilen —
             // hier steht nur der Record-Text selbst.
             let mut text: Vec<String> = request.lines().take(4).map(|l| clip(l, width)).collect();
-            if !constraints.is_empty() {
-                text.push(format!("Constraints: {}", constraints.len()));
-            }
-            if !discarded.is_empty() {
-                text.push(format!("Discarded: {}", discarded.len()));
-            }
+            // Leer ist leer: Ein Abschnitt ohne Einträge erscheint nicht.
+            claim_section(&mut text, "Constraints", constraints, width);
+            claim_section(&mut text, "Considered & discarded", discarded, width);
             // Der Anker als eigenes Glied der Kette: Enter öffnet ihn im
             // Intent-Tab (Beleg, Signatur, Snapshot).
             match anchor {
@@ -341,16 +377,15 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 }
                 None => text.push("Anchor: none bound".into()),
             }
-            ("●", "INTENT", Style::default().fg(theme::HUMAN), text)
+            ("INTENT", Style::default().fg(theme::HUMAN), text)
         }
         WhyStep::Evidence { links } => {
             if links.is_empty() {
-                ("·", "EVIDENCE", theme::dim(), vec!["no edge".into()])
+                ("EVIDENCE", theme::dim(), vec!["no edge".into()])
             } else {
                 let best = links.iter().map(|l| l.evidence).max();
                 let (_, _, style) = theme::evidence(best);
                 (
-                    "●",
                     "EVIDENCE",
                     style,
                     links
@@ -367,19 +402,42 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             }
         }
         WhyStep::Review { state } => {
-            let (glyph, word, style) = theme::verdict(state.verdict);
+            let (_, word, style) = theme::verdict(state.verdict);
             let mut text = vec![word.to_string()];
             text.extend(state.notes.iter().map(|n| {
                 format!(
-                    "{} · {}{} · {}",
+                    "{}{} · {}{} · {}",
+                    if n.signed {
+                        String::new()
+                    } else {
+                        format!("{} ", theme::claim().0)
+                    },
                     n.reviewer,
                     n.decision.as_str(),
                     if n.signed { " (signed)" } else { "" },
                     clip(&n.summary, width.saturating_sub(30))
                 )
             }));
-            (glyph, "REVIEW", style, text)
+            ("REVIEW", style, text)
         }
+    }
+}
+
+/// Höchstens so viele Einträge je Claim-Abschnitt; der Rest wird gezählt.
+const SECTION_MAX: usize = 5;
+
+/// Hängt einen Claim-Abschnitt an (Überschrift, je Eintrag eine geclippte
+/// Zeile, ab [`SECTION_MAX`] ein „… N more"). Ohne Einträge: nichts.
+fn claim_section(text: &mut Vec<String>, title: &str, entries: &[String], width: usize) {
+    if entries.is_empty() {
+        return;
+    }
+    text.push(title.to_string());
+    for entry in entries.iter().take(SECTION_MAX) {
+        text.push(format!("  - {}", clip(entry, width.saturating_sub(4))));
+    }
+    if entries.len() > SECTION_MAX {
+        text.push(format!("  … {} more", entries.len() - SECTION_MAX));
     }
 }
 

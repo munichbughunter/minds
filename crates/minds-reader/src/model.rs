@@ -105,6 +105,87 @@ impl SessionCard {
     pub fn evidence_state(&self) -> Option<&EvidenceState> {
         self.provenance.state()
     }
+
+    /// Die drei Vertrauensachsen, je für sich — nie verschmolzen, nie ein
+    /// Score. Die Oberfläche zeigt sie, sie rechnet sie nicht.
+    pub fn axes(&self) -> TrustAxes {
+        TrustAxes::of(&self.provenance, self.uninterpreted_calls)
+    }
+}
+
+/// Integrität: Passt das Seal-Material noch?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityAxis {
+    /// Versiegelt, das Material passt — **nicht** „verifiziert": Signaturen
+    /// prüft erst `minds verify`.
+    Sealed,
+    /// Das Seal-Material wurde verändert.
+    Tampered,
+    /// Vor der Evidence-Chain erfasst: nichts zu prüfen.
+    Legacy,
+}
+
+/// Coverage: Ist der beobachtete Bereich lückenlos belegt?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageAxis {
+    /// Keine Lücke, nichts vor der Kette — innerhalb der Beobachtungsgrenze.
+    Complete,
+    /// Lücken oder Ereignisse vor der Kette.
+    Incomplete,
+    /// Das Material ist verändert: Die Coverage-Aussage trägt nicht.
+    NotAssessable,
+    /// Legacy: keine Coverage aufgezeichnet.
+    NotRecorded,
+}
+
+/// Deutung: Sind die beobachteten Tool-Aufrufe gedeutet?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterpretationAxis {
+    /// Jeder Aufruf hat eine bekannte Wirkung.
+    Interpreted,
+    /// So viele Aufrufe sind beobachtet, aber nicht gedeutet.
+    Uninterpreted(usize),
+}
+
+/// Die drei Achsen einer Session (ADR-0011) — getrennt, in fester
+/// Reihenfolge: Integrität, Coverage, Deutung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustAxes {
+    /// Integrität.
+    pub integrity: IntegrityAxis,
+    /// Coverage.
+    pub coverage: CoverageAxis,
+    /// Deutung.
+    pub interpretation: InterpretationAxis,
+}
+
+impl TrustAxes {
+    /// Die Achsen aus der Herkunftslage und der Zahl ungedeuteter Aufrufe.
+    pub fn of(provenance: &Provenance, uninterpreted: usize) -> Self {
+        let (integrity, coverage) = match provenance {
+            Provenance::Legacy => (IntegrityAxis::Legacy, CoverageAxis::NotRecorded),
+            Provenance::Chained(state) => match state.verdict {
+                EvidenceVerdict::Tampered => (IntegrityAxis::Tampered, CoverageAxis::NotAssessable),
+                // Vollständig nur, wenn der Reader die Kette vollständig nennt
+                // UND keine Lücke vorliegt — ein Block-Seal oder eine offene
+                // Kette ist unvollständig, auch ohne gezählte Lücke.
+                EvidenceVerdict::Verified if state.gaps == 0 && state.pre_chain == 0 => {
+                    (IntegrityAxis::Sealed, CoverageAxis::Complete)
+                }
+                _ => (IntegrityAxis::Sealed, CoverageAxis::Incomplete),
+            },
+        };
+        let interpretation = if uninterpreted == 0 {
+            InterpretationAxis::Interpreted
+        } else {
+            InterpretationAxis::Uninterpreted(uninterpreted)
+        };
+        Self {
+            integrity,
+            coverage,
+            interpretation,
+        }
+    }
 }
 
 /// Das Verdict, auf einen Blick.
@@ -721,7 +802,60 @@ impl WhyChain {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    /// Die Achsen bleiben getrennt: Manipulation macht die Coverage-Aussage
+    /// unbrauchbar, Legacy hat keine, Lücken treffen nur die Coverage, und
+    /// die Deutung hängt an keiner der beiden.
+    #[test]
+    fn trust_axes_stay_separate() {
+        let state = |verdict, gaps, pre_chain| {
+            Provenance::Chained(EvidenceState {
+                verdict,
+                seals: 1,
+                events: 4,
+                gaps,
+                pre_chain,
+                rejected: false,
+                chain_closed: true,
+                signed: 0,
+            })
+        };
+        let axes = TrustAxes::of(&state(EvidenceVerdict::Verified, 0, 0), 0);
+        assert_eq!(axes.integrity, IntegrityAxis::Sealed);
+        assert_eq!(axes.coverage, CoverageAxis::Complete);
+        assert_eq!(axes.interpretation, InterpretationAxis::Interpreted);
+        let axes = TrustAxes::of(&state(EvidenceVerdict::Incomplete, 2, 0), 3);
+        assert_eq!(axes.integrity, IntegrityAxis::Sealed);
+        assert_eq!(axes.coverage, CoverageAxis::Incomplete);
+        assert_eq!(axes.interpretation, InterpretationAxis::Uninterpreted(3));
+        let axes = TrustAxes::of(&state(EvidenceVerdict::Verified, 0, 1), 0);
+        assert_eq!(axes.coverage, CoverageAxis::Incomplete);
+        let axes = TrustAxes::of(&state(EvidenceVerdict::Tampered, 0, 0), 0);
+        assert_eq!(axes.integrity, IntegrityAxis::Tampered);
+        assert_eq!(axes.coverage, CoverageAxis::NotAssessable);
+        // Kein „complete", solange der Reader die Kette unvollständig nennt —
+        // auch ohne Lücke: ein Block-Seal in der Kette, eine offene Kette.
+        let blocked = Provenance::Chained(EvidenceState {
+            verdict: EvidenceVerdict::Incomplete,
+            seals: 1,
+            events: 4,
+            gaps: 0,
+            pre_chain: 0,
+            rejected: true,
+            chain_closed: false,
+            signed: 0,
+        });
+        assert_eq!(
+            TrustAxes::of(&blocked, 0).coverage,
+            CoverageAxis::Incomplete
+        );
+        let axes = TrustAxes::of(&Provenance::Legacy, 1);
+        assert_eq!(axes.integrity, IntegrityAxis::Legacy);
+        assert_eq!(axes.coverage, CoverageAxis::NotRecorded);
+        assert_eq!(axes.interpretation, InterpretationAxis::Uninterpreted(1));
+    }
 
     fn card_with_state(state: Option<EvidenceState>) -> SessionCard {
         let id: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();

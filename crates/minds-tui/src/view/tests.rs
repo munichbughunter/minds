@@ -305,8 +305,12 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     assert!(out.contains("● ?"), "{out}");
     assert!(out.contains("↻ needs work"), "{out}");
     assert!(out.contains("⌦ forgotten"), "{out}");
-    assert!(out.contains("25.07. 14:10Z"), "{out}");
-    assert!(out.contains("context coverage"), "{out}");
+    // Listen zeigen relative Zeit (C4) — das alte deutsche Datumsformat nicht.
+    assert!(out.contains(" ago"), "{out}");
+    assert!(!out.contains("25.07. 14:10Z"), "{out}");
+    // Der Anteil der Commits mit Session — nicht die Coverage-Achse (C5).
+    assert!(out.contains("of commits with a session"), "{out}");
+    assert!(!out.contains("context coverage"), "{out}");
 }
 
 #[test]
@@ -348,10 +352,14 @@ fn enter_opens_the_graph_and_the_zoom_levels_fold_the_lane() {
     assert!(out.contains(" YOU "), "{out}");
     assert!(out.contains("Fix retry handling"), "{out}");
     assert!(out.contains("◉ AGENT claude-code · opus"), "{out}");
-    assert!(out.contains("◇ READ src/http/retry.rs"), "{out}");
+    // READ ist eine Art, kein Beweiszustand: nicht das ◇ der Evidenz (A1).
+    assert!(out.contains("→ READ src/http/retry.rs"), "{out}");
+    assert!(!out.contains("◇ READ"), "{out}");
     assert!(out.contains("✎ EDIT src/http/retry.rs"), "{out}");
     assert!(out.contains("▶ EXEC cargo test"), "{out}");
-    assert!(out.contains("◆ CHANGE I"), "{out}");
+    // CHANGE ist eine Art, nicht das ◆ der content-Evidenz (A1).
+    assert!(out.contains("■ CHANGE I"), "{out}");
+    assert!(!out.contains("◆ CHANGE"), "{out}");
     assert!(out.contains("↻ REVIEW needs work"), "{out}");
     assert!(out.contains("┣━"), "{out}");
     assert!(out.contains("┗━"), "{out}");
@@ -360,9 +368,11 @@ fn enter_opens_the_graph_and_the_zoom_levels_fold_the_lane() {
     app.reduce(Action::Zoom(3));
     let out = render(&mut app);
     assert!(
-        out.contains("· TURN ASSISTANT · Ich lese und ändere."),
+        out.contains("› TURN ASSISTANT · Ich lese und ändere."),
         "{out}"
     );
+    // `·` heißt „nichts belegt" — ein Zug ist eine Art (A1).
+    assert!(!out.contains("· TURN"), "{out}");
     app.reduce(Action::Zoom(1));
     let out = render(&mut app);
     assert!(!out.contains("ASSISTANT"), "{out}");
@@ -385,7 +395,9 @@ fn the_timeline_is_the_same_rows_without_the_tree() {
     let out = render(&mut app);
     assert!(out.contains("TIMELINE"), "{out}");
     assert!(!out.contains("┣━"), "{out}");
-    assert!(out.contains("25.07. 14:10Z"), "{out}");
+    // Zeitleiste und Detail: absolute Zeit in UTC (C4).
+    assert!(out.contains("2026-07-25 14:10 UTC"), "{out}");
+    assert!(!out.contains("25.07. 14:10Z"), "{out}");
 }
 
 #[test]
@@ -400,7 +412,9 @@ fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
     // ehrliche Luecke (UnsealedRange), zusaetzlich zur fehlenden Bewertung.
     assert!(out.contains("⚠ SESSION"), "{out}");
     assert!(out.contains("✓ AGENT"), "{out}");
-    assert!(out.contains("✓ INTENT"), "{out}");
+    // Der Intent ist eine Aussage, kein Beleg: Claim-Marker, nie ✓ (A2).
+    assert!(out.contains("◌ INTENT"), "{out}");
+    assert!(!out.contains("✓ INTENT"), "{out}");
     // Aussage != Beweis (ADR-0011): der Intent-Text traegt das CLAIM-Label,
     // die observed-Kanten daneben bleiben das einzige Beweismittel.
     assert!(
@@ -428,7 +442,9 @@ fn a_fully_backed_chain_says_so_and_focus_explains_the_evidence_without_enter() 
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Why); // „Fix retry handling" — Trailer, Change-Id, Review
     let out = render(&mut app);
-    assert!(out.contains(" NO GAP "), "{out}");
+    // Lückenlos sagt die Fußzeile (`✓ no gap`, unten); der Gap-Block steht
+    // nur bei Lücken (A6).
+    assert!(!out.contains(" NO GAP "), "{out}");
     assert!(out.contains("✓ EVIDENCE"), "{out}");
     assert!(out.contains("✓ no gap"), "{out}");
     assert!(!out.contains("WHY IS THIS LINKED?"), "{out}");
@@ -1060,7 +1076,8 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     assert!(detail.contains("SESSION b3-aaaaaaaa…"), "{out}");
     assert!(detail.contains(" YOU "), "{out}");
     assert!(detail.contains("Fix retry handling"), "{out}");
-    assert!(detail.contains("◇ READ src/http/retry.rs"), "{out}");
+    assert!(detail.contains("→ READ src/http/retry.rs"), "{out}");
+    assert!(!detail.contains("◇ READ"), "{out}");
     // Die Vorschau ist nicht navigierbar: kein Detailkasten unter einem
     // Cursor, den es nicht gibt — und keine zweite invertierte Zeile neben
     // dem Listencursor.
@@ -1091,10 +1108,11 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     app.reduce(Action::Zoom(3));
     let out = render_at(&mut app, SPLIT);
     assert!(out.contains("TURN ASSISTANT"), "{out}");
-    // Esc auf der Liste ist weiter „Suche loeschen, dann Ende" — die
-    // Vorschau kostet keinen Tastendruck.
+    // Esc auf der Liste ist „Suche loeschen, sonst nichts" — Esc beendet nie
+    // (B1); die Vorschau kostet keinen Tastendruck.
     app.reduce(Action::Back);
-    assert!(app.quit);
+    assert!(!app.quit);
+    assert!(app.top().is_none());
 }
 
 /// Gelegte Ebenen — Graph, Why, Evidence — verdraengen die Liste nicht
@@ -2498,8 +2516,10 @@ mod changes_tab {
         );
         app.reduce(Action::Back);
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
+        // Esc auf der obersten Ebene ohne Ursprung: nichts (B1).
         app.reduce(Action::Back);
-        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.tab, Tab::Changes);
+        assert!(!app.quit);
     }
 
     /// „Warum diese Zeile?": was die Session zu genau diesem Schritt
@@ -2524,7 +2544,7 @@ mod changes_tab {
         assert!(out.contains("NOT OBSERVED"), "{out}");
         assert!(out.contains("No evidence of the sessions linked"), "{out}");
 
-        app.reduce(Action::Why);
+        app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(
             !render(&mut app).contains("WHY THIS LINE?"),
             "w hides the column"
@@ -2585,7 +2605,7 @@ mod changes_tab {
         let mut app = app_with_changes(&repo);
         app.reduce(Action::Enter);
         app.reduce(Action::Split);
-        app.reduce(Action::Why);
+        app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         let out = render_at(&mut app, 260);
         let line = out
             .lines()
@@ -2781,9 +2801,12 @@ mod changes_tab {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
-        app.reduce(Action::Why);
+        app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(!app.changes.as_ref().unwrap().why);
     }
+
+    mod b4;
+    mod b4b;
 }
 
 // --- Verify-Tab -------------------------------------------------------------
@@ -3066,10 +3089,12 @@ mod verify_tab {
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Changes);
         assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
-        // Esc im Verify-Tab: zurück zu den Sessions.
+        // Esc im Verify-Tab, per Tab-Taste geöffnet (kein Ursprung): nichts
+        // (B1) — den Rückweg trägt der Navigationsverlauf (B2).
         app.reduce(Action::TabTo(2));
         app.reduce(Action::Back);
-        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.tab, Tab::Verify);
+        assert_ne!(app.tab, Tab::Sessions);
     }
 
     /// Neu laden prüft die Signer immer neu: Eine ausgetauschte `seal.sig`
@@ -3312,6 +3337,10 @@ mod verify_tab {
             "{out}"
         );
     }
+
+    mod b4;
+    mod b6;
+    mod c5;
 }
 
 mod intent_tab {
@@ -3652,6 +3681,8 @@ mod intent_tab {
         let back = render_at(&mut app, 120);
         assert_ne!(out, back);
     }
+
+    mod b4b;
 }
 
 mod overview_tab {
@@ -3743,13 +3774,17 @@ mod overview_tab {
         assert!(out.contains("OVERVIEW · 3 commits"), "{out}");
         assert!(out.contains("open · no commit linked yet"), "{out}");
         assert!(out.contains("Add exponential backoff"), "{out}");
-        assert!(out.contains(" ◆CC "), "agent badge: {out}");
+        // Das Badge trägt das Agenten-Glyph, nicht das ◆ der content-Evidenz (A1).
+        assert!(out.contains(" ◉CC "), "agent badge: {out}");
+        assert!(!out.contains(" ◆CC "), "agent badge: {out}");
         assert!(out.contains(" PD "), "human badge: {out}");
         assert!(out.contains("feat(sort): agent work"), "{out}");
         assert!(out.contains("• Fix retry handling"), "{out}");
         assert!(out.contains("⚑ intent"), "{out}");
         assert!(out.contains("◉2"), "{out}");
-        assert!(out.contains("● HEAD"), "{out}");
+        // HEAD ist eine Ref, kein beobachteter Zustand (A1).
+        assert!(out.contains("▲ HEAD"), "{out}");
+        assert!(!out.contains("● HEAD"), "{out}");
         // Kein Nerd Font: keine Private-Use-Glyphen.
         assert!(!out.contains('\u{e0b6}'), "{out}");
     }
@@ -3819,6 +3854,9 @@ mod overview_tab {
     fn enter_on_a_session_in_progress_opens_its_graph() {
         let (_dir, repo, _, inspection) = history();
         let mut app = opened(&repo, inspection);
+        // Start auf HEAD (C3), nicht auf der laufenden Session: erst hinauf.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
+        app.reduce(Action::Home);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Sessions);
         assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('b')));
@@ -3829,7 +3867,8 @@ mod overview_tab {
     fn a_commit_with_two_sessions_lets_you_choose() {
         let (_dir, repo, _, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down); // vom WIP auf den neuesten Commit
+        // Start auf HEAD, dem neuesten Commit (C3) — kein Schritt vom WIP.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Overview);
         assert_eq!(
@@ -3851,7 +3890,8 @@ mod overview_tab {
     fn enter_follows_the_sessions_of_a_commit() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
         assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
@@ -3867,7 +3907,8 @@ mod overview_tab {
     fn w_opens_the_why_chain_of_the_commit() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3) — kein Schritt vom WIP nötig.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Why);
         assert_eq!(app.tab, Tab::Sessions);
         let Some(View::Why { chain, .. }) = app.top() else {
@@ -3887,7 +3928,8 @@ mod overview_tab {
     fn a_reload_keeps_the_selected_commit() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         let mut index = app.inspection.index().clone();
         let mut more = BTreeMap::new();
@@ -3982,6 +4024,9 @@ mod overview_tab {
         let inspection =
             Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
         let mut app = opened(&repo, inspection);
+        // Start auf HEAD (C3), nicht auf der Session ohne Commit: hinauf.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
+        app.reduce(Action::Home);
         let out = render(&mut app);
         assert!(
             out.contains("open · no commit linked yet  Still working"),
@@ -4012,7 +4057,10 @@ mod overview_tab {
             Index::from_parts(sessions, links).with_seals(sid('a'), vec![(seal_id, seal, false)]);
         let mut app = opened(&repo, Inspection::from_index(index, Vec::new(), "demo"));
         let out = render(&mut app);
-        assert!(out.contains("◇ sealed · unsigned"), "{out}");
+        // Eigenes Glyph für „versiegelt, nicht signiert" — nicht ◇, das
+        // „ausgesagt, nicht bezeugt" heißt (A1).
+        assert!(out.contains("◎ sealed · unsigned"), "{out}");
+        assert!(!out.contains("◇ sealed"), "{out}");
         let row = out
             .lines()
             .find(|l| l.contains("docs: two sessions"))
@@ -4026,7 +4074,8 @@ mod overview_tab {
     fn a_hidden_overview_is_rebuilt_when_shown() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         app.reduce(Action::TabTo(1));
         let mut sessions = BTreeMap::new();
@@ -4175,8 +4224,21 @@ mod overview_tab {
         };
         assert!(row("docs: two sessions").contains("◈ sealed"), "{out}");
         assert!(
-            row("feat(sort): agent work").contains("◇ sealed · unsigned"),
+            row("feat(sort): agent work").contains("◎ sealed · unsigned"),
             "{out}"
         );
+        assert!(!out.contains("◇ sealed"), "{out}");
     }
+
+    mod a1b;
+    mod a6;
+    mod b1;
+    mod b2;
+    mod b3;
+    mod b4b;
+    mod b7;
+    mod c3;
 }
+
+mod tamper;
+mod ux;

@@ -63,6 +63,134 @@ pub fn agent_color(name: &str) -> Color {
     AGENT_PALETTE[hash as usize % AGENT_PALETTE.len()]
 }
 
+/// Die Klasse eines Glyphs: **epistemisch** (was belegt, geprüft, behauptet
+/// ist — Evidence-Quelle, Prüfergebnis, Seal-Zustand, Claim, Recon-Klasse,
+/// Urteil) oder **strukturell** (was etwas ist — Knotenart, Effekt, Ref,
+/// Badge). Epistemische Glyphen sind exklusiv: Kein strukturelles Element
+/// benutzt eines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GlyphClass {
+    /// Trägt einen Beweis-, Prüf- oder Urteilszustand.
+    Epistemic,
+    /// Trägt eine Art, keinen Zustand.
+    Structural,
+}
+
+/// Ein Eintrag des Glyph-Registers: das Zeichen, seine Klasse, seine eine
+/// Bedeutung (ein Schlüssel) und das Wort, mit dem die Hilfe es erklärt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Glyph {
+    /// Das Zeichen — genau eine Zelle breit.
+    pub symbol: &'static str,
+    /// Epistemisch oder strukturell.
+    pub class: GlyphClass,
+    /// Die eine Bedeutung.
+    pub meaning: &'static str,
+    /// Das Wort für die Legende.
+    pub word: &'static str,
+}
+
+const fn glyph(
+    symbol: &'static str,
+    class: GlyphClass,
+    meaning: &'static str,
+    word: &'static str,
+) -> Glyph {
+    Glyph {
+        symbol,
+        class,
+        meaning,
+        word,
+    }
+}
+
+/// Das Glyph-Register: jedes Zeichen der Oberfläche **genau einmal**, also
+/// mit genau einer Bedeutung. Die Theme-Funktionen unten zeichnen nur, was
+/// hier steht; die Legende der Hilfe wird daraus erzeugt.
+///
+/// `◇` heißt „ausgesagt, nicht bezeugt" — für eine von Hand erklärte
+/// Verbindung (declared) wie für einen Tool-Claim ohne Zeugen (reported
+/// only); `·` heißt „nichts belegt" (unverbunden, Legacy, unversiegelt).
+pub const REGISTER: &[Glyph] = &[
+    // Evidence-Quelle
+    glyph("●", GlyphClass::Epistemic, "observed", "observed"),
+    glyph("◆", GlyphClass::Epistemic, "content", "content-derived"),
+    glyph(
+        "◇",
+        GlyphClass::Epistemic,
+        "stated",
+        "stated (declared / reported only)",
+    ),
+    glyph("○", GlyphClass::Epistemic, "inferred", "inferred"),
+    glyph(
+        "·",
+        GlyphClass::Epistemic,
+        "none",
+        "nothing attested (unlinked / legacy / unsealed)",
+    ),
+    // Prüfergebnis
+    glyph("✓", GlyphClass::Epistemic, "passed", "check passed"),
+    glyph("~", GlyphClass::Epistemic, "partial", "partially checked"),
+    glyph("?", GlyphClass::Epistemic, "unchecked", "not checked"),
+    glyph(
+        "✗",
+        GlyphClass::Epistemic,
+        "failed",
+        "check failed / tampered",
+    ),
+    // Seal-Zustand
+    glyph("◈", GlyphClass::Epistemic, "sealed", "sealed"),
+    glyph("!", GlyphClass::Epistemic, "incomplete", "incomplete"),
+    glyph(
+        "◎",
+        GlyphClass::Epistemic,
+        "unsigned",
+        "sealed, not every seal signed",
+    ),
+    // Aussage, Abgleich, Deutung
+    glyph(
+        "◌",
+        GlyphClass::Epistemic,
+        "claim",
+        "claim (recorded, not evidence)",
+    ),
+    glyph(
+        "◍",
+        GlyphClass::Epistemic,
+        "fs only",
+        "explained by the file system only",
+    ),
+    glyph("◦", GlyphClass::Epistemic, "not observed", "not observed"),
+    glyph(
+        "◐",
+        GlyphClass::Epistemic,
+        "uninterpreted",
+        "observed, not interpreted",
+    ),
+    // Urteil (Review)
+    glyph("⚠", GlyphClass::Epistemic, "gap", "gap / no decision"),
+    glyph("⊕", GlyphClass::Epistemic, "approved", "approved"),
+    glyph("↻", GlyphClass::Epistemic, "needs work", "needs work"),
+    glyph("⊘", GlyphClass::Epistemic, "rejected", "rejected"),
+    // Struktur
+    glyph("◉", GlyphClass::Structural, "agent", "agent"),
+    glyph("›", GlyphClass::Structural, "turn", "turn"),
+    glyph("→", GlyphClass::Structural, "read", "READ"),
+    glyph("✎", GlyphClass::Structural, "edit", "EDIT"),
+    glyph("▶", GlyphClass::Structural, "exec", "EXEC"),
+    glyph("✕", GlyphClass::Structural, "delete", "DELETE"),
+    glyph("+", GlyphClass::Structural, "tool", "other tool"),
+    glyph("⇄", GlyphClass::Structural, "handover", "handover"),
+    glyph("■", GlyphClass::Structural, "change", "change / commit"),
+    glyph("▲", GlyphClass::Structural, "head", "HEAD"),
+    glyph(
+        "□",
+        GlyphClass::Structural,
+        "pending",
+        "session without a commit",
+    ),
+];
+
 /// Glyph, Wort und Stil einer Evidenz-Klasse; `None` heißt „mit keinem
 /// Commit verbunden".
 ///
@@ -104,10 +232,43 @@ pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style
         Provenance::Chained(state) => match state.verdict {
             EvidenceVerdict::Verified => ("◈", "sealed", Style::default().fg(OK)),
             EvidenceVerdict::Incomplete => ("!", "incomplete", Style::default().fg(REVIEW)),
-            EvidenceVerdict::Tampered => ("✗", "TAMPERED", Style::default().fg(DELETE)),
+            EvidenceVerdict::Tampered => tampered(),
         },
         Provenance::Legacy => ("·", "legacy", Style::default().fg(DIM)),
     }
+}
+
+/// Die HEAD-Pille der Übersicht — eine Ref, kein Zustand.
+pub const HEAD: &str = "▲";
+
+/// Eine Session ohne Commit im Graphen der Übersicht — ein Platzhalter-
+/// Knoten, kein Claim.
+pub const PENDING: &str = "□";
+
+/// Glyph, Wort und Stil einer Seal-Pille der Übersicht — dieselben Glyphen
+/// wie [`provenance`], wo die Bedeutung dieselbe ist. „Versiegelt, aber
+/// nicht jedes Seal signiert" ist **nicht** `◈ sealed`: Wer `refs/minds/`
+/// schreibt, kann unsigniertes Material erzeugen.
+pub fn seal(mark: minds_reader::overview::SealMark) -> (&'static str, &'static str, Style) {
+    use minds_reader::overview::SealMark;
+    match mark {
+        SealMark::Sealed => ("◈", "sealed", Style::default().fg(OK)),
+        SealMark::Unsigned => ("◎", "sealed · unsigned", Style::default().fg(Color::Gray)),
+        SealMark::Partial => (
+            "◎",
+            "sealed · first 64 checked",
+            Style::default().fg(Color::Gray),
+        ),
+        SealMark::Incomplete => ("!", "incomplete", Style::default().fg(REVIEW)),
+        SealMark::Unsealed => ("·", "unsealed", Style::default().fg(Color::Gray)),
+        SealMark::Tampered => tampered(),
+    }
+}
+
+/// Glyph, Wort und Stil der Manipulation — der eine Zustand, der immer rot
+/// und immer laut ist (Badge, Karte, Banner sagen dasselbe).
+pub fn tampered() -> (&'static str, &'static str, Style) {
+    ("✗", "TAMPERED", Style::default().fg(DELETE))
 }
 
 /// Glyph, Wort und Stil einer **Aussage** aus dem Session-Record (Intent,
@@ -149,8 +310,8 @@ pub fn not_observed() -> (&'static str, &'static str, Style) {
 pub fn verdict(verdict: Verdict) -> (&'static str, &'static str, Style) {
     match verdict {
         Verdict::Open => ("⚠", "open", Style::default().fg(REVIEW)),
-        Verdict::Approved => ("✓", "approved", Style::default().fg(OK)),
-        Verdict::Rejected => ("✕", "rejected", Style::default().fg(DELETE)),
+        Verdict::Approved => ("⊕", "approved", Style::default().fg(OK)),
+        Verdict::Rejected => ("⊘", "rejected", Style::default().fg(DELETE)),
         Verdict::NeedsWork => ("↻", "needs work", Style::default().fg(REVIEW)),
     }
 }
@@ -158,11 +319,11 @@ pub fn verdict(verdict: Verdict) -> (&'static str, &'static str, Style) {
 /// Glyph, Wort und Stil eines Tool-Effekts.
 pub fn tool(kind: ToolKind) -> (&'static str, &'static str, Style) {
     match kind {
-        ToolKind::Read => ("◇", "READ", Style::default().fg(READ)),
+        ToolKind::Read => ("→", "READ", Style::default().fg(READ)),
         ToolKind::Edit => ("✎", "EDIT", Style::default().fg(EDIT)),
         ToolKind::Exec => ("▶", "EXEC", Style::default().fg(EXEC)),
         ToolKind::Delete => ("✕", "DELETE", Style::default().fg(DELETE)),
-        ToolKind::Other => ("·", "TOOL", Style::default().fg(DIM)),
+        ToolKind::Other => ("+", "TOOL", Style::default().fg(DIM)),
         // Beobachtet, nicht gedeutet (ADR-0011): halb sichtbar — Wirkung
         // unbekannt, und das darf man sehen.
         ToolKind::Uninterpreted => ("◐", "OBSERVED", Style::default().fg(REVIEW)),
@@ -172,14 +333,15 @@ pub fn tool(kind: ToolKind) -> (&'static str, &'static str, Style) {
 /// Glyph, Wort und Stil eines Graph-Knotens.
 pub fn node(kind: &NodeKind) -> (&'static str, &'static str, Style) {
     match kind {
-        NodeKind::Intent => ("●", "YOU", Style::default().fg(HUMAN)),
+        // Der Auftrag *ist* eine Aussage: dasselbe Glyph wie `claim`.
+        NodeKind::Intent => ("◌", "YOU", Style::default().fg(HUMAN)),
         NodeKind::Agent => ("◉", "AGENT", Style::default().fg(AGENT)),
-        NodeKind::Turn(_) => ("·", "TURN", Style::default().fg(DIM)),
+        NodeKind::Turn(_) => ("›", "TURN", Style::default().fg(DIM)),
         NodeKind::Tool(kind) => tool(*kind),
         NodeKind::Subagent(_) => ("◉", "SUBAGENT", Style::default().fg(AGENT)),
         NodeKind::Handover { .. } => ("⇄", "HANDOVER", Style::default().fg(OK)),
-        NodeKind::Change(_) => ("◆", "CHANGE", Style::default().fg(CHANGE)),
-        NodeKind::Commit(_) => ("◆", "COMMIT", Style::default().fg(CHANGE)),
+        NodeKind::Change(_) => ("■", "CHANGE", Style::default().fg(CHANGE)),
+        NodeKind::Commit(_) => ("■", "COMMIT", Style::default().fg(CHANGE)),
         NodeKind::Review(v) => {
             let (glyph, _, style) = verdict(*v);
             (glyph, "REVIEW", style)
@@ -197,9 +359,20 @@ pub fn lane(depth: usize) -> Style {
     }
 }
 
-/// Die Cursorzeile.
+/// Die Cursorzeile — der eine Auswahlstil der Oberfläche (B7).
 pub fn cursor() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// Rahmenstil und Titel-Marke eines Bereichs (B7): der fokussierte mit
+/// hervorgehobenem Rahmen und `▸` im Titel, ein unfokussierter gedimmt — die
+/// Marke trägt den Fokus auch ohne Farbe.
+pub fn pane(focused: bool) -> (Style, &'static str) {
+    if focused {
+        (Style::default().add_modifier(Modifier::BOLD), "▸ ")
+    } else {
+        (dim(), "")
+    }
 }
 
 /// Gedimmter Nebentext.

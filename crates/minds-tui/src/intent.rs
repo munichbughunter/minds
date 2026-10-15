@@ -41,6 +41,8 @@ pub struct IntentTab {
     pub stale: bool,
     /// Der Anker, auf den nach dem nächsten Holen gesprungen wird.
     pub want: Option<ContentHash>,
+    /// Der Filter aus `/` (B4) — leer: alle Anker.
+    pub filter: String,
 }
 
 impl IntentTab {
@@ -57,6 +59,7 @@ impl IntentTab {
             urgent: true,
             stale: false,
             want,
+            filter: String::new(),
         }
     }
 
@@ -72,6 +75,19 @@ impl IntentTab {
             Some(Ok(list)) => list,
             _ => &[],
         }
+    }
+
+    /// Die Anker, die der Filter aus `/` durchlässt (B4): Id, Quelle,
+    /// Bereich.
+    pub fn shown(&self) -> Vec<usize> {
+        let list = self.list();
+        crate::filter::shown_by(list.len(), &self.filter, |i| {
+            let info = &list[i];
+            match &info.detail {
+                Ok(detail) => format!("{} {} {}", info.id, detail.source, detail.scope.join(" ")),
+                Err(_) => info.id.to_string(),
+            }
+        })
     }
 
     /// Der Anker unter dem Cursor.

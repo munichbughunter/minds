@@ -6,6 +6,8 @@
 //! `minds-core` (EA-13). Die Tabelle in `docs/verification-guide.md` wird
 //! hier daraus erzeugt, und ein Test hält sie mit dem Code gleich (EA-21).
 
+pub mod demo;
+
 use minds_core::evidence::{DOES_NOT_PROVE_V2, Level, PROVES_V2, ProofSentence};
 
 /// Die Marke, ab der die erzeugte Tabelle in der Doku steht.

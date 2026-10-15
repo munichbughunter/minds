@@ -48,6 +48,48 @@ fn haystack(card: &SessionCard, index: &Index) -> Vec<String> {
     out
 }
 
+/// Die Zeilen `0..len`, die `filter` durchlässt — dieselben Terme wie die
+/// Session-Suche (UND, Groß-/Kleinschreibung egal), über den Text, den
+/// `text` je Zeile liefert (B4: `/` filtert in jedem Tab).
+pub fn shown_by(len: usize, filter: &str, text: impl Fn(usize) -> String) -> Vec<usize> {
+    let terms = terms(filter);
+    (0..len)
+        .filter(|&i| {
+            let hay = text(i).to_lowercase();
+            terms.iter().all(|t| hay.contains(t.as_str()))
+        })
+        .collect()
+}
+
+/// Der Cursor nach einer Bewegung über die gezeigten Zeilen.
+pub fn step(shown: &[usize], cursor: usize, action: &crate::input::Action, page: usize) -> usize {
+    use crate::input::Action;
+    let Some(last) = shown.len().checked_sub(1) else {
+        return cursor;
+    };
+    let at = shown.iter().position(|&i| i >= cursor).unwrap_or(last);
+    let next = match action {
+        Action::Up => at.saturating_sub(1),
+        Action::Down => (at + 1).min(last),
+        Action::PageUp => at.saturating_sub(page.max(1)),
+        Action::PageDown => (at + page.max(1)).min(last),
+        Action::Home => 0,
+        Action::End => last,
+        _ => at,
+    };
+    shown[next]
+}
+
+/// Der Cursor auf einer gezeigten Zeile: der alte, wenn er durchkommt,
+/// sonst der erste Treffer (ohne Treffer bleibt er).
+pub fn refit(shown: &[usize], cursor: usize) -> usize {
+    if shown.contains(&cursor) {
+        cursor
+    } else {
+        shown.first().copied().unwrap_or(cursor)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

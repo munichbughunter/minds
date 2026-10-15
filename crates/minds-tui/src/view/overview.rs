@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use minds_reader::model::Verdict;
-use minds_reader::overview::{CommitRow, RefLabel, SealMark, WipSession, WipState, one_line};
+use minds_reader::overview::{CommitRow, RefLabel, WipSession, WipState, one_line};
 
 use crate::overview::MAX_SESSION_LINES;
 
@@ -48,11 +48,15 @@ fn pill(spans: &mut Vec<Span<'static>>, text: String, bg: Color, nerd: bool) {
     spans.push(Span::raw(" "));
 }
 
-/// Das Badge: Initialen des Agenten (magenta, mit `◆` bzw. Roboter-Icon —
+/// Das Badge: Initialen des Agenten (magenta, mit `◉` bzw. Roboter-Icon —
 /// nicht nur die Farbe unterscheidet) oder des Autors (cyan).
 fn badge(spans: &mut Vec<Span<'static>>, name: &str, agent: bool, nerd: bool) {
     if agent {
-        let mark = if nerd { "\u{f06a9} " } else { "◆" };
+        let mark = if nerd {
+            "\u{f06a9} "
+        } else {
+            theme::node(&minds_reader::graph::NodeKind::Agent).0
+        };
         pill(
             spans,
             format!("{mark}{}", initials(name)),
@@ -71,12 +75,9 @@ const BRANCH_REF: Color = Color::Indexed(24);
 const TAG_REF: Color = Color::Indexed(94);
 
 /// Die Pillen eines Commits: Refs, dann was Minds weiß.
-fn pills(
-    spans: &mut Vec<Span<'static>>,
-    row: &CommitRow,
-    conformance: Option<ConformanceMark>,
-    nerd: bool,
-) {
+/// Die Refs eines Commits als kompakte Pillen — direkt hinter dem Badge
+/// (C3).
+fn refs(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
     // Refs tragen immer ein Präfix (Icon oder `@`/`#`), nie eine
     // Belegfarbe — sonst könnte ein Branch-Name einen Status vortäuschen.
     let (branch, tag) = if nerd {
@@ -86,10 +87,10 @@ fn pills(
     };
     for label in &row.refs {
         let (text, bg) = match label {
-            RefLabel::Head(name) => (format!("{branch}{name} ● HEAD"), HEAD_REF),
+            RefLabel::Head(name) => (format!("{branch}{name} {} HEAD", theme::HEAD), HEAD_REF),
             RefLabel::Branch(name) => (format!("{branch}{name}"), BRANCH_REF),
             RefLabel::Tag(name) => (format!("{tag}{name}"), TAG_REF),
-            RefLabel::Detached => ("● HEAD (detached)".into(), HEAD_REF),
+            RefLabel::Detached => (format!("{} HEAD (detached)", theme::HEAD), HEAD_REF),
             RefLabel::More(n) => (format!("+{n}"), Color::Indexed(238)),
         };
         let body = Style::default().fg(Color::White).bg(bg);
@@ -102,6 +103,17 @@ fn pills(
         }
         spans.push(Span::raw(" "));
     }
+}
+
+/// Was Minds über den Commit weiß, als Pillen — rechtsbündig in der Zeile
+/// (C3): Conformance, Seal-Zustand, abweichendes Review, Intent, mehrere
+/// Sessions. Normalzustände bekommen keine Pille.
+fn states(
+    spans: &mut Vec<Span<'static>>,
+    row: &CommitRow,
+    conformance: Option<ConformanceMark>,
+    nerd: bool,
+) {
     // Die Conformance gilt jedem Commit, auch einem ohne Session — eine
     // Pille, sobald sie gerechnet ist (gewählter Commit, HEAD). Farbe nie
     // allein: Glyph und Wort tragen das Ergebnis.
@@ -114,23 +126,25 @@ fn pills(
         return;
     }
     if let Some(seal) = row.seal {
-        let (text, color) = match seal {
-            SealMark::Sealed => ("◈ sealed", theme::OK),
-            SealMark::Unsigned => ("◇ sealed · unsigned", Color::Gray),
-            SealMark::Partial => ("◇ sealed · first 64 checked", Color::Gray),
-            SealMark::Incomplete => ("◇ incomplete", theme::REVIEW),
-            SealMark::Unsealed => ("· unsealed", Color::Gray),
-            SealMark::Tampered => ("✗ tampered", theme::DELETE),
-        };
-        pill(spans, text.into(), color, nerd);
+        let (glyph, word, style) = theme::seal(seal);
+        pill(
+            spans,
+            format!("{glyph} {word}"),
+            style.fg.unwrap_or(Color::Gray),
+            nerd,
+        );
     }
-    let (glyph, word, style) = theme::verdict(row.review);
-    pill(
-        spans,
-        format!("{glyph} {word}"),
-        style.fg.unwrap_or(Color::Gray),
-        nerd,
-    );
+    // Review „open" ist der Normalzustand — keine Pille; nur Abweichungen
+    // (approved, needs work, rejected) sind laut (A4).
+    if row.review != Verdict::Open {
+        let (glyph, word, style) = theme::verdict(row.review);
+        pill(
+            spans,
+            format!("{glyph} {word}"),
+            style.fg.unwrap_or(Color::Gray),
+            nerd,
+        );
+    }
     if row.intent {
         pill(spans, "⚑ intent".into(), theme::HUMAN, nerd);
     }
@@ -169,8 +183,12 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for cell in &row.graph {
         let style = Style::default().fg(lane(cell.lane));
+        // Der Reader zeichnet den Commit-Knoten als `●`; die Oberfläche
+        // zeigt ihn mit dem Register-Glyph für „Commit" (A1) — `●` heißt
+        // dort „beobachtet".
         let glyph = if cell.glyph == '●' {
-            Span::styled("●", style.add_modifier(Modifier::BOLD))
+            let (commit, _, _) = theme::node(&minds_reader::graph::NodeKind::Commit(row.id));
+            Span::styled(commit, style.add_modifier(Modifier::BOLD))
         } else {
             Span::styled(cell.glyph.to_string(), style)
         };
@@ -186,7 +204,7 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
 
 fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     let mut spans = vec![
-        Span::styled("◌", Style::default().fg(theme::AGENT)),
+        Span::styled(theme::PENDING, Style::default().fg(theme::AGENT)),
         Span::styled("┄", theme::dim()),
     ];
     if width > 1 {
@@ -216,8 +234,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let nerd = app.nerd;
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).areas(area);
+    // Unter 100 Spalten nur eine Fläche (C3): die Liste — oder, mit dem
+    // Fokus rechts, das Detail.
+    let narrow = area.width < 100;
+    let [left, right] = if narrow {
+        [area, area]
+    } else {
+        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).areas(area)
+    };
+    if narrow && state.focus == OverviewFocus::Sessions {
+        draw_detail(frame, app, area);
+        return;
+    }
+    // Die Zeilenbreite: Rahmen links/rechts und die Cursor-Spalte.
+    let row_w = usize::from(left.width.saturating_sub(3));
 
     let overview = match &state.data {
         Ok(overview) => overview,
@@ -233,9 +263,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     };
     let width = overview.lanes.max(1);
     let total = overview.wip.len() + overview.rows.len();
+    // Nur die Treffer des Filters aus `/` (B4); ohne Filter alle.
+    let shown = state.shown();
     // Was fehlt, steht im Titel — nie still.
     let height = usize::from(left.height.saturating_sub(2));
-    let first = crate::view::offset(state.cursor, total, height);
+    let at = shown.iter().position(|&i| i == state.cursor).unwrap_or(0);
+    let first = crate::view::offset(at, shown.len(), height);
     let mut lines: Vec<Line> = Vec::new();
     if total == 0 {
         lines.push(Line::from(Span::styled(
@@ -243,7 +276,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             theme::dim(),
         )));
     }
-    for i in first..total.min(first + height.max(1)) {
+    for &i in shown.iter().skip(first).take(height.max(1)) {
         let mut spans = match i.checked_sub(overview.wip.len()) {
             None => wip_spans(&overview.wip[i], width, nerd),
             Some(at) => {
@@ -254,39 +287,68 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     Some(agent) => badge(&mut spans, agent, true, nerd),
                     None => badge(&mut spans, &row.author, false, nerd),
                 }
+                // Lanes · Badge · Refs · **Betreff** · Auftrag (gedimmt) —
+                // rechtsbündig die Zustände (C3): Was man überfliegt, steht
+                // vorn; gekürzt wird der Text, nie die Zustände.
+                refs(&mut spans, row, nerd);
                 let mark = state.conformance.get(&row.id).copied().flatten();
-                pills(&mut spans, row, mark, nerd);
-                spans.push(Span::raw(row.subject.clone()));
+                let mut right: Vec<Span<'static>> = Vec::new();
+                states(&mut right, row, mark, nerd);
+                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
+                let room = row_w.saturating_sub(used + right_w + 1);
+                let mut text = row.subject.clone();
                 if let Some(request) = &row.request {
-                    spans.push(Span::styled(format!("  • {request}"), theme::dim()));
+                    text.push_str(&format!("  • {request}"));
                 }
+                let text = crate::view::clip(&text, room);
+                let subject_len = row.subject.chars().count().min(text.chars().count());
+                let subject: String = text.chars().take(subject_len).collect();
+                let rest: String = text.chars().skip(subject_len).collect();
+                let pad = room.saturating_sub(text.chars().count());
+                spans.push(Span::raw(subject));
+                spans.push(Span::styled(rest, theme::dim()));
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                spans.extend(right);
                 spans
             }
         };
+        // Der eine Auswahlstil (B7): theme::cursor(), wie überall.
         if i == state.cursor {
-            spans.insert(0, Span::styled("▌", theme::title()));
-            lines.push(
-                Line::from(spans).style(
-                    Style::default()
-                        .bg(Color::Indexed(236))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            );
+            spans.insert(0, Span::raw(" "));
+            lines.push(Line::from(spans).style(theme::cursor()));
         } else {
             spans.insert(0, Span::raw(" "));
             lines.push(Line::from(spans));
         }
     }
+    let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
     let mut title = if overview.budget_hit {
         format!(
-            " OVERVIEW · newest {} commits (read budget reached)",
+            " {}OVERVIEW · newest {} commits (read budget reached)",
+            mark,
             overview.rows.len()
         )
     } else if overview.truncated {
-        format!(" OVERVIEW · newest {} commits", overview.rows.len())
+        format!(" {}OVERVIEW · newest {} commits", mark, overview.rows.len())
     } else {
-        format!(" OVERVIEW · {} commits", overview.rows.len())
+        format!(" {}OVERVIEW · {} commits", mark, overview.rows.len())
     };
+    if !state.filter.is_empty() {
+        title.push_str(&format!(
+            " · filter: {} ({} of {total})",
+            state.filter,
+            shown.len()
+        ));
+    }
+    // Die globale Statistik gehört hierher, zum Einstieg (C3).
+    let h = app.inspection.header();
+    title.push_str(&format!(
+        " · {} Sessions · {} Changes · {:.0} % of commits with a session",
+        h.sessions,
+        h.changes,
+        h.coverage.ratio() * 100.0
+    ));
     if overview.wip_more > 0 {
         title.push_str(&format!(
             " · {} more sessions without a commit",
@@ -304,11 +366,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     }
     title.push(' ');
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title).title_style(theme::title())),
+        Paragraph::new(lines).block({
+            let (border, _) = theme::pane(state.focus == OverviewFocus::Graph);
+            Block::bordered()
+                .title(title)
+                .title_style(theme::title())
+                .border_style(border)
+        }),
         left,
     );
 
-    draw_detail(frame, app, right);
+    if !narrow {
+        draw_detail(frame, app, right);
+    }
 }
 
 /// Rechts: der gewählte Commit (oder die WIP-Session) und seine Sessions.
@@ -339,7 +409,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(started) = &wip.started {
                 lines.push(Line::from(vec![
                     label("Started"),
-                    Span::raw(started.clone()),
+                    Span::raw(crate::view::when(Some(started))),
                 ]));
             }
             lines.push(Line::from(vec![
@@ -380,7 +450,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 label("Author"),
                 Span::raw(row.author.clone()),
             ]));
-            lines.push(Line::from(vec![label("Date"), Span::raw(row.date.clone())]));
+            // Im Detail absolut, in UTC (C4).
+            lines.push(Line::from(vec![
+                label("Date"),
+                Span::raw(format!("{} UTC", row.date.trim_end_matches('Z'))),
+            ]));
             if !row.refs.is_empty() {
                 let names: Vec<String> = row
                     .refs
@@ -407,6 +481,15 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(change.to_string()),
                 ]));
             }
+            // „Kann ich diesem Commit trauen?" (C3): Seal-Zustand, Review —
+            // getrennt, nie verschmolzen.
+            if let Some(seal) = row.seal {
+                let (glyph, word, style) = theme::seal(seal);
+                lines.push(Line::from(vec![
+                    label("Seal"),
+                    Span::styled(format!("{glyph} {word}"), style),
+                ]));
+            }
             let (glyph, word, style) = theme::verdict(row.review);
             lines.push(Line::from(vec![
                 label("Review"),
@@ -418,6 +501,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(format!("{} parents", row.parents.len())),
                 ]));
             }
+            // Die nächste Aktion.
+            lines.push(Line::from(Span::styled(
+                "Enter: how it was made · v: verify · d: diff",
+                theme::dim(),
+            )));
             lines.push(Line::raw(""));
             let focused = state.focus == OverviewFocus::Sessions;
             lines.push(Line::from(Span::styled(
@@ -512,11 +600,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).block({
+            let (border, mark) = theme::pane(state.focus == OverviewFocus::Sessions);
             Block::bordered()
-                .title(" DETAIL ")
-                .title_style(theme::title()),
-        ),
+                .title(format!(" {mark}DETAIL "))
+                .title_style(theme::title())
+                .border_style(border)
+        }),
         area,
     );
 }

@@ -116,6 +116,15 @@ impl Source for Live<'_> {
             .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
 
+    fn background(&self) -> Option<Box<dyn minds_tui::Background>> {
+        // Die Verify-Prüfung im Worker (B6): nur das festgehaltene Binary
+        // und der Pfad — den Kontext öffnet sie dort selbst.
+        Some(Box::new(BackgroundVerify {
+            root: self.ctx.root.clone(),
+            exe: self.exe.clone(),
+        }))
+    }
+
     fn conformance(&self, commit: CommitId) -> Option<minds_reader::conformance::Report> {
         // Dieselben Signer wie der Verify-Tab (`~/.ssh/allowed_signers`) —
         // die Pille sagt nie mehr als `verify`. Je Aufruf frisch gelesen: Ein
@@ -126,6 +135,30 @@ impl Source for Live<'_> {
             crate::verify_cmd::conformance::spec_program(&self.ctx.root),
         );
         crate::verify_cmd::conformance::report(self.ctx, &trust, commit, None)
+    }
+}
+
+/// Die Prüfung des Verify-Tabs abseits des Event-Loops (B6): besitzt nur
+/// eigene Daten — das festgehaltene Binary und die Wurzel des Repos — und
+/// öffnet Repo und Store je Prüfung im Worker selbst (`Context` ist nicht
+/// `Send`). Urteilt wie [`Live`]'s `verify`.
+struct BackgroundVerify {
+    root: std::path::PathBuf,
+    exe: Result<PinnedExe, &'static str>,
+}
+
+impl minds_tui::Background for BackgroundVerify {
+    fn verify(&mut self, commit: CommitId) -> Result<CommitVerify, String> {
+        let open = || -> Fallible<Context> {
+            Ok(Context {
+                repo: Repo::open(&self.root)?,
+                root: self.root.clone(),
+                store: crate::config::load(&self.root).open(&self.root)?,
+            })
+        };
+        let ctx = open().map_err(|err| minds_reader::sanitize(&err.to_string()))?;
+        verify_commit(&ctx, commit, self.exe.as_ref().map_err(|why| *why))
+            .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
 }
 
@@ -1145,6 +1178,62 @@ mod tests {
     /// Der signaturabhängige Teil des Verify-Tabs gegen ein echtes Repo: Die
     /// Session am Trailer wird gefunden und bewertet; ohne gebundenen Intent
     /// sagt der Scope, warum er nicht geprüft wurde.
+    /// B6: Die Prüfung im Worker besitzt nur eigene Daten (Send) und
+    /// urteilt wie die synchrone — sie öffnet den Kontext selbst.
+    #[test]
+    fn background_verify_is_send_and_agrees_with_the_live_verify() {
+        fn assert_send<T: Send>() {}
+        assert_send::<super::BackgroundVerify>();
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        let session = Session::new(
+            Agent {
+                name: "claude-code".into(),
+                version: "1".into(),
+            },
+            Model {
+                provider: "anthropic".into(),
+                id: "opus".into(),
+            },
+            Intent {
+                request: "Worker-Probe".into(),
+                ..Intent::default()
+            },
+        );
+        let redacted = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_session(session)
+            .unwrap();
+        let id = store.put(&redacted).unwrap().id();
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(
+            dir.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("probe\n\nMinds-Session-Id: {id}"),
+            ],
+        );
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let head = ctx.repo.head().unwrap().commit().unwrap();
+        let live = super::verify_commit(&ctx, head, Err("not available"))
+            .map_err(|err| minds_reader::sanitize(&err.to_string()));
+        let mut background = super::BackgroundVerify {
+            root: dir.path().to_path_buf(),
+            exe: Err("not available"),
+        };
+        let answer = minds_tui::Background::verify(&mut background, head);
+        assert_eq!(answer, live);
+        assert_eq!(answer.unwrap().sessions[0].session, id);
+    }
+
     #[test]
     fn verify_commit_assesses_the_trailer_sessions() {
         let dir = code_repo();
