@@ -80,7 +80,7 @@ pub struct OverviewState {
 impl OverviewState {
     /// Liest die Übersicht.
     pub fn build(inspection: &Inspection, repo: &Repo) -> Self {
-        Self {
+        let mut state = Self {
             data: inspection
                 .overview(repo)
                 .map_err(|err| minds_reader::sanitize(&err.to_string())),
@@ -90,7 +90,28 @@ impl OverviewState {
             stale: false,
             conformance: HashMap::new(),
             filter: String::new(),
+        };
+        // Die Startauswahl ist HEAD (C3) — laufende Sessions stehen darüber.
+        if let Some(head) = state.head() {
+            state.select_commit(head);
         }
+        state
+    }
+
+    /// Der Commit, auf dem HEAD steht, falls die Übersicht ihn zeigt.
+    pub fn head(&self) -> Option<CommitId> {
+        self.data.as_ref().ok()?.rows.iter().find_map(|row| {
+            row.refs
+                .iter()
+                .any(|label| {
+                    matches!(
+                        label,
+                        minds_reader::overview::RefLabel::Head(_)
+                            | minds_reader::overview::RefLabel::Detached
+                    )
+                })
+                .then_some(row.id)
+        })
     }
 
     /// Der nächste Commit, dessen Conformance noch fehlt: der gewählte,

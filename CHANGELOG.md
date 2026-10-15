@@ -35,6 +35,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   action (`Enter: how it was made · v: verify · d: diff`). The global
   statistics are in the overview title. Below 100 columns the overview shows
   only the list, or the detail when the focus is on it.
+  The overview starts on HEAD, not on the first row (sessions in progress
+  stand above it).
 - **Two footer lines with fixed roles.** Line 1 is the context of what is in
   focus — the session with its trust strip, the commit or the anchor — and
   the glossary sentence for its state; line 2 holds the four to six most

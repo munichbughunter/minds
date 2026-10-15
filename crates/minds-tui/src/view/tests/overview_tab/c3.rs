@@ -95,3 +95,19 @@ fn c3_below_100_columns_only_the_list() {
     let lines = lines_at(&mut app, 160, 40);
     assert!(lines.iter().any(|l| l.contains("DETAIL")) && lines[2].contains("OVERVIEW"));
 }
+
+/// Die Startauswahl ist HEAD — nicht zwingend die erste Zeile (C3).
+#[test]
+fn c3_the_overview_starts_on_head() {
+    let (_dir, repo, commits, inspection) = history();
+    let app = opened(&repo, inspection);
+    match app.overview.as_ref().and_then(|s| s.selected()) {
+        Some(crate::overview::Selected::Commit(row)) => assert_eq!(row.id, commits[2]),
+        _ => panic!("HEAD is selected, not the session in progress"),
+    }
+    assert_ne!(
+        app.overview.as_ref().unwrap().cursor,
+        0,
+        "row 0 is the WIP row"
+    );
+}

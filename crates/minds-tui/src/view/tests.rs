@@ -3846,6 +3846,9 @@ mod overview_tab {
     fn enter_on_a_session_in_progress_opens_its_graph() {
         let (_dir, repo, _, inspection) = history();
         let mut app = opened(&repo, inspection);
+        // Start auf HEAD (C3), nicht auf der laufenden Session: erst hinauf.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
+        app.reduce(Action::Home);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Sessions);
         assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('b')));
@@ -3856,7 +3859,8 @@ mod overview_tab {
     fn a_commit_with_two_sessions_lets_you_choose() {
         let (_dir, repo, _, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down); // vom WIP auf den neuesten Commit
+        // Start auf HEAD, dem neuesten Commit (C3) — kein Schritt vom WIP.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Overview);
         assert_eq!(
@@ -3878,7 +3882,8 @@ mod overview_tab {
     fn enter_follows_the_sessions_of_a_commit() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
         assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
@@ -3894,7 +3899,8 @@ mod overview_tab {
     fn w_opens_the_why_chain_of_the_commit() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3) — kein Schritt vom WIP nötig.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Why);
         assert_eq!(app.tab, Tab::Sessions);
         let Some(View::Why { chain, .. }) = app.top() else {
@@ -3914,7 +3920,8 @@ mod overview_tab {
     fn a_reload_keeps_the_selected_commit() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         let mut index = app.inspection.index().clone();
         let mut more = BTreeMap::new();
@@ -4009,6 +4016,9 @@ mod overview_tab {
         let inspection =
             Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
         let mut app = opened(&repo, inspection);
+        // Start auf HEAD (C3), nicht auf der Session ohne Commit: hinauf.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
+        app.reduce(Action::Home);
         let out = render(&mut app);
         assert!(
             out.contains("open · no commit linked yet  Still working"),
@@ -4056,7 +4066,8 @@ mod overview_tab {
     fn a_hidden_overview_is_rebuilt_when_shown() {
         let (_dir, repo, commits, inspection) = history();
         let mut app = opened(&repo, inspection);
-        app.reduce(Action::Down);
+        // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
+        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         app.reduce(Action::TabTo(1));
         let mut sessions = BTreeMap::new();

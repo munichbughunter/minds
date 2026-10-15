@@ -1312,6 +1312,9 @@ impl<'a> App<'a> {
     /// Wendet eine Aktion an — und übernimmt danach den Commit des
     /// sichtbaren Tabs als aktiven (B3).
     pub fn reduce(&mut self, action: Action) {
+        // Auch vorher: Die Startauswahl (HEAD) ist schon aktiv, bevor die
+        // erste Taste fällt.
+        self.sync_active();
         // Esc, Schritt 4 (B1/B2): auf der Ebene eines Sprungs zurück zum
         // Ursprung — mit Ebenen und Cursor.
         if action == Action::Back && self.at_jump_base() {
@@ -1343,6 +1346,11 @@ impl<'a> App<'a> {
                 self.history.push(entry);
             }
         }
+        self.sync_active();
+    }
+
+    /// Übernimmt den Commit des sichtbaren Tabs als aktiven (B3).
+    fn sync_active(&mut self) {
         let shown = match self.tab {
             Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
                 Some(crate::overview::Selected::Commit(row)) => Some(row.id),
