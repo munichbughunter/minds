@@ -27,6 +27,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **The overview leads with the subject.** Each commit row reads lanes ·
+  badge · refs · subject · (dim) request, with what Minds knows — seal state,
+  a deviating review, intent, several sessions, conformance — right-aligned;
+  the text is shortened, never the states. The detail answers "can I trust
+  this commit?" (seal state and review, separately) and names the next
+  action (`Enter: how it was made · v: verify · d: diff`). The global
+  statistics are in the overview title. Below 100 columns the overview shows
+  only the list, or the detail when the focus is on it.
 - **Two footer lines with fixed roles.** Line 1 is the context of what is in
   focus — the session with its trust strip, the commit or the anchor — and
   the glossary sentence for its state; line 2 holds the four to six most

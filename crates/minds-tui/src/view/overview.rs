@@ -75,12 +75,9 @@ const BRANCH_REF: Color = Color::Indexed(24);
 const TAG_REF: Color = Color::Indexed(94);
 
 /// Die Pillen eines Commits: Refs, dann was Minds weiß.
-fn pills(
-    spans: &mut Vec<Span<'static>>,
-    row: &CommitRow,
-    conformance: Option<ConformanceMark>,
-    nerd: bool,
-) {
+/// Die Refs eines Commits als kompakte Pillen — direkt hinter dem Badge
+/// (C3).
+fn refs(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
     // Refs tragen immer ein Präfix (Icon oder `@`/`#`), nie eine
     // Belegfarbe — sonst könnte ein Branch-Name einen Status vortäuschen.
     let (branch, tag) = if nerd {
@@ -106,6 +103,17 @@ fn pills(
         }
         spans.push(Span::raw(" "));
     }
+}
+
+/// Was Minds über den Commit weiß, als Pillen — rechtsbündig in der Zeile
+/// (C3): Conformance, Seal-Zustand, abweichendes Review, Intent, mehrere
+/// Sessions. Normalzustände bekommen keine Pille.
+fn states(
+    spans: &mut Vec<Span<'static>>,
+    row: &CommitRow,
+    conformance: Option<ConformanceMark>,
+    nerd: bool,
+) {
     // Die Conformance gilt jedem Commit, auch einem ohne Session — eine
     // Pille, sobald sie gerechnet ist (gewählter Commit, HEAD). Farbe nie
     // allein: Glyph und Wort tragen das Ergebnis.
@@ -226,8 +234,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let nerd = app.nerd;
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).areas(area);
+    // Unter 100 Spalten nur eine Fläche (C3): die Liste — oder, mit dem
+    // Fokus rechts, das Detail.
+    let narrow = area.width < 100;
+    let [left, right] = if narrow {
+        [area, area]
+    } else {
+        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).areas(area)
+    };
+    if narrow && state.focus == OverviewFocus::Sessions {
+        draw_detail(frame, app, area);
+        return;
+    }
+    // Die Zeilenbreite: Rahmen links/rechts und die Cursor-Spalte.
+    let row_w = usize::from(left.width.saturating_sub(3));
 
     let overview = match &state.data {
         Ok(overview) => overview,
@@ -267,12 +287,29 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     Some(agent) => badge(&mut spans, agent, true, nerd),
                     None => badge(&mut spans, &row.author, false, nerd),
                 }
+                // Lanes · Badge · Refs · **Betreff** · Auftrag (gedimmt) —
+                // rechtsbündig die Zustände (C3): Was man überfliegt, steht
+                // vorn; gekürzt wird der Text, nie die Zustände.
+                refs(&mut spans, row, nerd);
                 let mark = state.conformance.get(&row.id).copied().flatten();
-                pills(&mut spans, row, mark, nerd);
-                spans.push(Span::raw(row.subject.clone()));
+                let mut right: Vec<Span<'static>> = Vec::new();
+                states(&mut right, row, mark, nerd);
+                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
+                let room = row_w.saturating_sub(used + right_w + 1);
+                let mut text = row.subject.clone();
                 if let Some(request) = &row.request {
-                    spans.push(Span::styled(format!("  • {request}"), theme::dim()));
+                    text.push_str(&format!("  • {request}"));
                 }
+                let text = crate::view::clip(&text, room);
+                let subject_len = row.subject.chars().count().min(text.chars().count());
+                let subject: String = text.chars().take(subject_len).collect();
+                let rest: String = text.chars().skip(subject_len).collect();
+                let pad = room.saturating_sub(text.chars().count());
+                spans.push(Span::raw(subject));
+                spans.push(Span::styled(rest, theme::dim()));
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                spans.extend(right);
                 spans
             }
         };
@@ -304,6 +341,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             shown.len()
         ));
     }
+    // Die globale Statistik gehört hierher, zum Einstieg (C3).
+    let h = app.inspection.header();
+    title.push_str(&format!(
+        " · {} Sessions · {} Changes · {:.0} % context coverage",
+        h.sessions,
+        h.changes,
+        h.coverage.ratio() * 100.0
+    ));
     if overview.wip_more > 0 {
         title.push_str(&format!(
             " · {} more sessions without a commit",
@@ -331,7 +376,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         left,
     );
 
-    draw_detail(frame, app, right);
+    if !narrow {
+        draw_detail(frame, app, right);
+    }
 }
 
 /// Rechts: der gewählte Commit (oder die WIP-Session) und seine Sessions.
@@ -430,6 +477,15 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(change.to_string()),
                 ]));
             }
+            // „Kann ich diesem Commit trauen?" (C3): Seal-Zustand, Review —
+            // getrennt, nie verschmolzen.
+            if let Some(seal) = row.seal {
+                let (glyph, word, style) = theme::seal(seal);
+                lines.push(Line::from(vec![
+                    label("Seal"),
+                    Span::styled(format!("{glyph} {word}"), style),
+                ]));
+            }
             let (glyph, word, style) = theme::verdict(row.review);
             lines.push(Line::from(vec![
                 label("Review"),
@@ -441,6 +497,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                     Span::raw(format!("{} parents", row.parents.len())),
                 ]));
             }
+            // Die nächste Aktion.
+            lines.push(Line::from(Span::styled(
+                "Enter: how it was made · v: verify · d: diff",
+                theme::dim(),
+            )));
             lines.push(Line::raw(""));
             let focused = state.focus == OverviewFocus::Sessions;
             lines.push(Line::from(Span::styled(

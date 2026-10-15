@@ -4218,6 +4218,7 @@ mod overview_tab {
     mod b3;
     mod b4b;
     mod b7;
+    mod c3;
 }
 
 mod tamper;
