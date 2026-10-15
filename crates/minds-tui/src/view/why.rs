@@ -28,7 +28,8 @@ pub fn draw(
     inspector: Option<&[LinkEvidence]>,
 ) {
     let gaps = chain.gaps();
-    let gaps_h = if area.height < 14 {
+    // Der Gap-Block nur bei Lücken: „keine Lücke" sagt die Fußzeile (A6).
+    let gaps_h = if area.height < 14 || gaps.is_empty() {
         0
     } else {
         (2 + gaps.len().max(1) as u16 * 2).min(10)
@@ -139,8 +140,8 @@ pub fn draw(
                 lines.push(Line::from(vec![Span::raw("     "), Span::styled(t, style)]));
             }
         }
+        // Ein einzeiliger Verbinder (A6) — die Kette braucht ihre Höhe.
         if i + 1 < chain.steps.len() {
-            lines.push(Line::from(Span::styled("  │", theme::dim())));
             lines.push(Line::from(Span::styled("  ▼", theme::dim())));
         }
     }

@@ -70,7 +70,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         changes::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
-            help::draw(frame, frame.area());
+            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
         }
         return;
     }
@@ -78,7 +78,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         verify::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
-            help::draw(frame, frame.area());
+            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
         }
         return;
     }
@@ -86,7 +86,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         overview::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
-            help::draw(frame, frame.area());
+            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
         }
         return;
     }
@@ -94,7 +94,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         intent::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
-            help::draw(frame, frame.area());
+            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
         }
         return;
     }
@@ -119,7 +119,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     footer(frame, app, foot);
     if app.help {
-        help::draw(frame, frame.area());
+        app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
     }
 }
 
@@ -195,17 +195,15 @@ fn preview(frame: &mut Frame, app: &App, area: Rect) {
 
 fn header(frame: &mut Frame, app: &App, area: Rect) {
     let h = app.inspection.header();
-    let mut title = vec![
-        Span::styled("MINDS ", theme::title().fg(theme::AGENT)),
-        Span::styled(h.repo.clone(), theme::title()),
-        Span::raw(" · "),
-        Span::raw(h.branch.clone().unwrap_or_else(|| "(detached)".into())),
-        Span::raw("   "),
-    ];
-    // Die Tabs: der aktive invertiert, mit F-Taste — Tab/Shift-Tab wechselt.
+    // Die Tabs zuerst gerechnet: Sie fallen nie weg — unter 100 Spalten mit
+    // Kurzlabel; Repo und Branch weichen vorher (mit „…").
+    let short = area.width < 100;
+    let mut tabs: Vec<Span> = Vec::new();
     for (i, tab) in Tab::ALL.iter().enumerate() {
-        let label = format!(" F{} {} ", i + 1, tab.title());
-        title.push(if *tab == app.tab {
+        let name = if short { tab.short() } else { tab.title() };
+        let label = format!(" F{} {name} ", i + 1);
+        // Der aktive invertiert, mit F-Taste — Tab/Shift-Tab wechselt.
+        tabs.push(if *tab == app.tab {
             Span::styled(
                 label,
                 theme::title().add_modifier(ratatui::style::Modifier::REVERSED),
@@ -213,8 +211,21 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             Span::styled(label, theme::dim())
         });
-        title.push(Span::raw(" "));
+        tabs.push(Span::raw(" "));
     }
+    let tabs_w: usize = tabs.iter().map(|s| s.content.chars().count()).sum();
+    let place = format!(
+        "{} · {}",
+        h.repo,
+        h.branch.clone().unwrap_or_else(|| "(detached)".into())
+    );
+    let room = (area.width as usize).saturating_sub(tabs_w + "MINDS ".len() + 3);
+    let mut title = vec![
+        Span::styled("MINDS ", theme::title().fg(theme::AGENT)),
+        Span::styled(clip(&place, room), theme::title()),
+        Span::raw("   "),
+    ];
+    title.extend(tabs);
     let title = Line::from(title);
     let mut stats = vec![
         Span::raw(format!("{} Sessions", h.sessions)),
@@ -275,7 +286,13 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(keys, theme::dim()),
     ]);
-    frame.render_widget(Paragraph::new(vec![status, keys]), area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            status_line(status, area.width),
+            pinned(keys, area.width, app.searching),
+        ]),
+        area,
+    );
 }
 
 fn footer(frame: &mut Frame, app: &App, area: Rect) {
@@ -296,7 +313,13 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 theme::dim(),
             ),
         ]);
-        frame.render_widget(Paragraph::new(vec![status, keys]), area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                status_line(status, area.width),
+                pinned(keys, area.width, app.searching),
+            ]),
+            area,
+        );
         return;
     }
     if app.tab == Tab::Overview {
@@ -327,7 +350,13 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(closed) = &app.closed {
             keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
         }
-        frame.render_widget(Paragraph::new(vec![status, Line::from(keys)]), area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                status_line(status, area.width),
+                pinned(Line::from(keys), area.width, app.searching),
+            ]),
+            area,
+        );
         return;
     }
     if app.tab == Tab::Intent {
@@ -346,7 +375,13 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         if let Some(closed) = &app.closed {
             keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
         }
-        frame.render_widget(Paragraph::new(vec![status, Line::from(keys)]), area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                status_line(status, area.width),
+                pinned(Line::from(keys), area.width, app.searching),
+            ]),
+            area,
+        );
         return;
     }
     // Erste Zeile: was der Fokus bedeutet — der Evidenz-Satz zur gewählten
@@ -471,7 +506,79 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         ));
         Line::from(spans)
     };
-    frame.render_widget(Paragraph::new(vec![status, keys]), area);
+    frame.render_widget(
+        Paragraph::new(vec![
+            status_line(status, area.width),
+            pinned(keys, area.width, app.searching),
+        ]),
+        area,
+    );
+}
+
+/// Die rechts fixierten Tasten der Fußzeile: Hilfe und Ausgang fallen nie
+/// weg (A6).
+const PINNED: &str = "? help  q quit";
+/// Beim Tippen einer Suche sind `?` und `q` Zeichen der Suche — dort stehen
+/// rechts die Suchaktionen (C2: im Suchmodus haben sie Vorrang).
+const PINNED_SEARCH: &str = "Enter apply  Esc clear";
+
+/// Kürzt eine Zeile auf `width` Zeichen — von rechts, mit „…", nie hart.
+fn fit(line: Line<'static>, width: usize) -> (Vec<Span<'static>>, usize) {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in line.spans {
+        let n = span.content.chars().count();
+        if used + n <= width {
+            used += n;
+            out.push(span);
+        } else {
+            let rest = width.saturating_sub(used);
+            if rest > 0 {
+                out.push(Span::styled(clip(&span.content, rest), span.style));
+                used += rest;
+            } else if let Some(last) = out.pop() {
+                // Kein Platz mehr für den nächsten Span: Das „…" ersetzt das
+                // letzte Zeichen des vorigen — nie ein harter Schnitt.
+                let n = last.content.chars().count();
+                let keep: String = last.content.chars().take(n.saturating_sub(1)).collect();
+                out.push(Span::styled(format!("{keep}…"), last.style));
+            }
+            break;
+        }
+    }
+    (out, used)
+}
+
+/// Zeile 1 der Fußzeile, auf die Breite gekürzt (A6).
+fn status_line(line: Line<'static>, width: u16) -> Line<'static> {
+    Line::from(fit(line, width as usize).0)
+}
+
+/// Zeile 2 der Fußzeile: links Kontext und Tasten in Prioritätsfolge — von
+/// rechts gekürzt, mit „…" —, rechts fixiert [`PINNED`].
+fn pinned(line: Line<'static>, width: u16, searching: bool) -> Line<'static> {
+    let width = width as usize;
+    let pin = if searching { PINNED_SEARCH } else { PINNED };
+    let right = pin.chars().count();
+    let room = width.saturating_sub(right + 2);
+    let stripped = Line::from(
+        line.spans
+            .into_iter()
+            .map(|span| {
+                let text = span
+                    .content
+                    .replace("  ? help  q quit", "")
+                    .replace("  ? help", "")
+                    .replace("  q quit", "");
+                Span::styled(text, span.style)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let (left, used) = fit(stripped, room);
+    let mut spans = left;
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used + right))));
+    spans.push(Span::styled(pin, theme::title()));
+    Line::from(spans)
 }
 
 /// Wie frisch das Gezeigte ist — und, wenn es das nicht ist, warum (Glyph und

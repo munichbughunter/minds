@@ -436,7 +436,9 @@ fn a_fully_backed_chain_says_so_and_focus_explains_the_evidence_without_enter() 
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Why); // „Fix retry handling" — Trailer, Change-Id, Review
     let out = render(&mut app);
-    assert!(out.contains(" NO GAP "), "{out}");
+    // Lückenlos sagt die Fußzeile (`✓ no gap`, unten); der Gap-Block steht
+    // nur bei Lücken (A6).
+    assert!(!out.contains(" NO GAP "), "{out}");
     assert!(out.contains("✓ EVIDENCE"), "{out}");
     assert!(out.contains("✓ no gap"), "{out}");
     assert!(!out.contains("WHY IS THIS LINKED?"), "{out}");
@@ -4198,6 +4200,7 @@ mod overview_tab {
     }
 
     mod a1b;
+    mod a6;
 }
 
 mod tamper;

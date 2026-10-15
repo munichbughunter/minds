@@ -27,6 +27,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **`minds inspect` fits narrow terminals.** `? help  q quit` is pinned to
+  the right of the footer and never drops; the other keys and the status
+  line are shortened from the right with `…`. Below 100 columns the header
+  uses short tab labels (`F1 Ovw F2 Ses F3 Ver F4 Chg F5 Int`) and shortens
+  repository and branch first, never the tabs. The help scrolls (↑↓, PgUp,
+  PgDn, g/G) and starts with the keys of the current tab. The Why chain uses
+  a one-line connector and shows the gap block only when there are gaps.
 - **One trust strip in `minds inspect`.** Integrity, coverage and
   interpretation are shown by one component, everywhere in the same order
   and the same words — never merged into one value, score or traffic light.

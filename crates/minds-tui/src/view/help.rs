@@ -2,7 +2,10 @@
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::{Block, Clear, Paragraph};
+
+use crate::app::Tab;
 
 use crate::theme;
 
@@ -20,14 +23,42 @@ t                  graph ↔ timeline
 1 / 2 / 3          zoom: summary / normal / verbose
 r                  reload now (it also reloads by itself when the store changes)
 Tab / F1 … F5      switch tab: Overview · Sessions · Verify · Changes · Intent
-?                  this help
-q / Ctrl-C         quit
+?                  this help (↑↓ PgUp PgDn scroll it)
+q / Ctrl-C         quit";
 
-Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next unexplained
-          s unified ↔ split · w why this line · Enter why chain · Esc back
-Overview: ↑↓ commit · Enter its session(s) / graph · w why chain · Esc back (sessions)
-Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it
-          in why: Enter on the anchor";
+/// Die Tasten eines Tabs — der Abschnitt des aktuellen steht oben (A6).
+fn section(tab: Tab) -> &'static str {
+    match tab {
+        Tab::Overview => {
+            "Overview: ↑↓ commit · Enter its session(s) / graph · w why chain · Esc back (sessions)"
+        }
+        Tab::Sessions => {
+            "Sessions: ↑↓ session · Enter graph · w why · e evidence · t timeline · / search"
+        }
+        Tab::Verify => "Verify:   ↑↓ row · Enter open (session, diff) · [ ] commit",
+        Tab::Changes => {
+            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next unexplained\n          s unified ↔ split · w why this line · Enter why chain · Esc back"
+        }
+        Tab::Intent => {
+            "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it\n          in why: Enter on the anchor"
+        }
+    }
+}
+
+/// Der ganze Inhalt: der aktuelle Tab, die allgemeinen Tasten, die übrigen
+/// Tabs, die Legende.
+fn content(tab: Tab, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = section(tab).lines().map(str::to_string).collect();
+    lines.push(String::new());
+    lines.extend(TEXT.lines().map(str::to_string));
+    lines.push(String::new());
+    for other in Tab::ALL.iter().filter(|t| **t != tab) {
+        lines.extend(section(*other).lines().map(str::to_string));
+    }
+    lines.push(String::new());
+    lines.extend(legend(width));
+    lines
+}
 
 /// Die Legende, aus dem Glyph-Register erzeugt (A1): erst die Zustände
 /// (epistemisch), dann die Arten (strukturell), auf `width` umbrochen.
@@ -56,37 +87,34 @@ pub fn legend(width: usize) -> Vec<String> {
     lines
 }
 
-/// Zeichnet die Hilfe mittig.
-pub fn draw(frame: &mut Frame, area: Rect) {
+/// Zeichnet die Hilfe mittig — so hoch wie ihr Inhalt, höchstens das
+/// Terminal; was nicht passt, erreicht man mit ↑↓ / PgUp / PgDn. Gibt den
+/// tatsächlich gezeigten Scroll-Wert zurück — der Zustand bleibt so im
+/// Möglichen, ↑ nach `End` wirkt sofort.
+pub fn draw(frame: &mut Frame, area: Rect, tab: Tab, scroll: u16) -> u16 {
     let width = 84.min(area.width);
-    // So hoch wie der Inhalt (Tasten, Leerzeile, Legende), höchstens das
-    // Terminal — die Legende fällt nicht mehr unter den Rand, wo Platz ist.
-    let content = TEXT.lines().count() + 1 + legend(width.saturating_sub(2) as usize).len();
-    let height = (content as u16 + 2).min(area.height);
+    let lines = content(tab, width.saturating_sub(2) as usize);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let inner = height.saturating_sub(2);
+    let max = (lines.len() as u16).saturating_sub(inner);
+    let scroll = scroll.min(max);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
         width,
         height,
     };
+    let title = if max > 0 {
+        format!(" Help · {}/{} · ↑↓ scroll ", scroll + inner, lines.len())
+    } else {
+        " Help ".to_string()
+    };
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new({
-            let mut text: Vec<ratatui::text::Line> =
-                TEXT.lines().map(ratatui::text::Line::from).collect();
-            text.push(ratatui::text::Line::from(""));
-            text.extend(
-                legend(width.saturating_sub(2) as usize)
-                    .into_iter()
-                    .map(ratatui::text::Line::from),
-            );
-            text
-        })
-        .block(
-            Block::bordered()
-                .title(" Help ")
-                .title_style(theme::title()),
-        ),
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .scroll((scroll, 0))
+            .block(Block::bordered().title(title).title_style(theme::title())),
         rect,
     );
+    scroll
 }

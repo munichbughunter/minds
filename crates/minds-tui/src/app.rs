@@ -146,6 +146,17 @@ impl Tab {
         Tab::Intent,
     ];
 
+    /// Das Kurzlabel im Kopf, wenn der Platz nicht reicht (A6).
+    pub fn short(self) -> &'static str {
+        match self {
+            Tab::Overview => "Ovw",
+            Tab::Sessions => "Ses",
+            Tab::Verify => "Ver",
+            Tab::Changes => "Chg",
+            Tab::Intent => "Int",
+        }
+    }
+
     /// Der Name im Kopf.
     pub fn title(self) -> &'static str {
         match self {
@@ -180,6 +191,8 @@ pub struct App<'a> {
     pub views: Vec<View>,
     /// Ob die Hilfe liegt.
     pub help: bool,
+    /// Die erste sichtbare Zeile der Hilfe — sie scrollt (A6).
+    pub help_scroll: u16,
     /// Ob die Schleife enden soll.
     pub quit: bool,
     /// Zeilen je Seite — setzt die Zeichenroutine.
@@ -266,6 +279,7 @@ impl<'a> App<'a> {
             zoom: Zoom::Normal,
             views: Vec::new(),
             help: false,
+            help_scroll: 0,
             quit: false,
             page: 20,
             width: 0,
@@ -1243,8 +1257,20 @@ impl<'a> App<'a> {
             return;
         }
         if self.help {
-            if matches!(action, Action::Help | Action::Back | Action::Enter) {
-                self.help = false;
+            // Die Hilfe scrollt; schließen wie bisher mit ?, Esc oder Enter.
+            let page = self.page.max(1) as u16;
+            match action {
+                Action::Help | Action::Back | Action::Enter => {
+                    self.help = false;
+                    self.help_scroll = 0;
+                }
+                Action::Up => self.help_scroll = self.help_scroll.saturating_sub(1),
+                Action::Down => self.help_scroll = self.help_scroll.saturating_add(1),
+                Action::PageUp => self.help_scroll = self.help_scroll.saturating_sub(page),
+                Action::PageDown => self.help_scroll = self.help_scroll.saturating_add(page),
+                Action::Home => self.help_scroll = 0,
+                Action::End => self.help_scroll = u16::MAX,
+                _ => {}
             }
             return;
         }
