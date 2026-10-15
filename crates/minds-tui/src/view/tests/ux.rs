@@ -226,3 +226,218 @@ fn a2_an_unsigned_review_note_reads_as_a_claim() {
     assert_eq!(glyph, "◌");
     assert_ne!(color, theme::OK);
 }
+
+// ---------------------------------------------------------------------
+// A1 · Glyph-Register: eine Bedeutung pro Glyph
+// ---------------------------------------------------------------------
+
+/// Jedes Glyph, das eine Theme-Funktion zeichnet, steht im Register — mit
+/// genau der Bedeutung und Klasse, die der Aufruf meint. Weil das Register
+/// je Glyph nur **einen** Eintrag hat, folgt: Jedes epistemische Glyph hat
+/// genau eine Bedeutung, und kein strukturelles Element benutzt eines.
+/// Erweitert `every_epistemic_state_differs_in_glyph_or_word_never_only_in_color`
+/// (das bleibt unverändert und prüft weiter Glyph-oder-Wort).
+#[test]
+fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
+    use minds_core::{EvidenceMark as M, EvidenceSource as S, EvidenceStatus as St};
+    use minds_reader::graph::{NodeKind, ToolKind};
+    use minds_reader::model::{EvidenceState, EvidenceVerdict, Provenance, Verdict};
+    use minds_reader::reconcile::ReconClass;
+    use theme::GlyphClass::{Epistemic, Structural};
+
+    let mut symbols = std::collections::BTreeSet::new();
+    for entry in theme::REGISTER {
+        assert!(symbols.insert(entry.symbol), "twice: {}", entry.symbol);
+        assert!(!entry.meaning.is_empty() && !entry.word.is_empty());
+        assert_eq!(
+            entry.symbol.chars().count(),
+            1,
+            "one cell: {}",
+            entry.symbol
+        );
+    }
+
+    let mut uses: Vec<(String, theme::GlyphClass, &str, String)> = Vec::new();
+    let mut add = |glyph: &str, class, meaning, at: String| {
+        uses.push((glyph.to_string(), class, meaning, at));
+    };
+    for (source, meaning) in [
+        (S::Observed, "observed"),
+        (S::ContentDerived, "content"),
+        (S::HumanDeclared, "stated"),
+        (S::Heuristic, "inferred"),
+    ] {
+        for (status, check) in [
+            (St::Verified, "passed"),
+            (St::Partial, "partial"),
+            (St::Unknown, "unchecked"),
+            (St::Missing, "failed"),
+        ] {
+            let (g, _, _) = theme::evidence(Some(M { source, status }));
+            let mut parts = g.split(' ');
+            add(
+                parts.next().unwrap(),
+                Epistemic,
+                meaning,
+                format!("evidence {g}"),
+            );
+            add(
+                parts.next().unwrap(),
+                Epistemic,
+                check,
+                format!("evidence {g}"),
+            );
+        }
+    }
+    add(
+        theme::evidence(None).0.as_str(),
+        Epistemic,
+        "none",
+        "unlinked".into(),
+    );
+    let chained = |verdict| {
+        Provenance::Chained(EvidenceState {
+            verdict,
+            seals: 1,
+            events: 1,
+            gaps: 0,
+            pre_chain: 0,
+            rejected: false,
+            chain_closed: true,
+            signed: 0,
+        })
+    };
+    for (p, meaning) in [
+        (chained(EvidenceVerdict::Verified), "sealed"),
+        (chained(EvidenceVerdict::Incomplete), "incomplete"),
+        (chained(EvidenceVerdict::Tampered), "failed"),
+        (Provenance::Legacy, "none"),
+    ] {
+        add(
+            theme::provenance(&p).0,
+            Epistemic,
+            meaning,
+            "provenance".into(),
+        );
+    }
+    add(theme::tampered().0, Epistemic, "failed", "tampered".into());
+    add(theme::claim().0, Epistemic, "claim", "claim".into());
+    add(
+        theme::not_observed().0,
+        Epistemic,
+        "not observed",
+        "not_observed".into(),
+    );
+    for (class, meaning) in [
+        (ReconClass::Explained, "observed"),
+        (ReconClass::ExplainedFsOnly, "fs only"),
+        (ReconClass::ReportedOnly, "stated"),
+        (ReconClass::Unexplained, "not observed"),
+    ] {
+        add(
+            theme::recon(class).0,
+            Epistemic,
+            meaning,
+            format!("{class:?}"),
+        );
+    }
+    for (v, meaning) in [
+        (Verdict::Open, "gap"),
+        (Verdict::Approved, "approved"),
+        (Verdict::NeedsWork, "needs work"),
+        (Verdict::Rejected, "rejected"),
+    ] {
+        add(theme::verdict(v).0, Epistemic, meaning, format!("{v:?}"));
+    }
+    for (kind, class, meaning) in [
+        (ToolKind::Read, Structural, "read"),
+        (ToolKind::Edit, Structural, "edit"),
+        (ToolKind::Exec, Structural, "exec"),
+        (ToolKind::Delete, Structural, "delete"),
+        (ToolKind::Other, Structural, "tool"),
+        (ToolKind::Uninterpreted, Epistemic, "uninterpreted"),
+    ] {
+        add(theme::tool(kind).0, class, meaning, format!("{kind:?}"));
+    }
+    let change: minds_core::ChangeId = format!("I{}", "c".repeat(40)).parse().unwrap();
+    for (kind, class, meaning) in [
+        (NodeKind::Intent, Epistemic, "claim"),
+        (NodeKind::Agent, Structural, "agent"),
+        (
+            NodeKind::Turn(minds_core::Role::Assistant),
+            Structural,
+            "turn",
+        ),
+        (NodeKind::Subagent(sid('f')), Structural, "agent"),
+        (
+            NodeKind::Handover {
+                other: sid('e'),
+                incoming: true,
+            },
+            Structural,
+            "handover",
+        ),
+        (NodeKind::Change(change), Structural, "change"),
+        (NodeKind::Commit(commit('1')), Structural, "change"),
+        (NodeKind::Review(Verdict::Rejected), Epistemic, "rejected"),
+    ] {
+        add(theme::node(&kind).0, class, meaning, format!("{kind:?}"));
+    }
+
+    for (glyph, class, meaning, at) in uses {
+        let entry = theme::REGISTER
+            .iter()
+            .find(|e| e.symbol == glyph)
+            .unwrap_or_else(|| panic!("{at}: {glyph:?} is not in the register"));
+        assert_eq!(entry.class, class, "{at}: {glyph} has the wrong class");
+        assert_eq!(
+            entry.meaning, meaning,
+            "{at}: {glyph} means {:?}",
+            entry.meaning
+        );
+    }
+}
+
+/// Die Legende der Hilfe kommt aus dem Register: jedes Glyph mit seinem Wort.
+#[test]
+fn a1_the_help_legend_is_generated_from_the_register() {
+    let legend = super::super::help::legend(80).join("\n");
+    for entry in theme::REGISTER {
+        assert!(
+            legend.contains(&format!("{} {}", entry.symbol, entry.word)),
+            "{} {} missing:\n{legend}",
+            entry.symbol,
+            entry.word
+        );
+    }
+    for line in super::super::help::legend(80) {
+        assert!(line.chars().count() <= 80, "{line}");
+    }
+}
+
+/// Der Listen-Bullet ist gestrichen — er trug keine Information.
+#[test]
+fn a1_the_session_list_has_no_bullet() {
+    for (w, h) in SIZES {
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled(), &repo, None);
+        let out = render_sized(&mut app, w, h);
+        assert!(!out.contains("● Fix retry"), "{w}x{h}\n{out}");
+        assert!(!out.contains("● Add exponential"), "{w}x{h}\n{out}");
+        assert!(out.contains("Fix retry"), "{w}x{h}\n{out}");
+    }
+}
+
+/// Die Hilfe zeigt die ganze Legende, wo Platz ist — die erzeugten Zeilen
+/// dürfen nicht unter den Rand des Overlays fallen.
+#[test]
+fn a1_the_help_overlay_shows_the_whole_legend() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Help);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("State:"), "{out}");
+    assert!(out.contains("Kinds:"), "{out}");
+    assert!(out.contains("■ change / commit"), "{out}");
+    assert!(out.contains("◇ stated (declared / reported only)"), "{out}");
+}

@@ -27,6 +27,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **One meaning per glyph in `minds inspect`.** A central glyph register
+  separates epistemic glyphs (evidence source, check result, seal state,
+  claim, reconciliation, review) from structural ones (node kinds, effects);
+  no structural element uses an epistemic glyph any more. READ is `→`
+  (was `◇`), CHANGE/COMMIT `■` (was `◆`), the YOU node `◌` (it is a claim),
+  TURN `›` and other tools `+` (was `·`, which means "nothing attested"),
+  review approved `⊕` (was `✓`, which means "check passed") and rejected `⊘`
+  (was `✕`, which stays DELETE). The bullet before every session row is gone.
+  The legend in the help is generated from the register.
 - **A claim no longer reads as checked in the Why chain.** The INTENT link
   carries the claim marker `◌` in the claim style instead of the green `✓` of
   an attested link; unsigned review notes — and a review head whose verdict rests on unsigned

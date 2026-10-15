@@ -49,7 +49,7 @@ pub fn draw(
     let mut starts: Vec<usize> = Vec::new();
     for (i, step) in chain.steps.iter().enumerate() {
         starts.push(lines.len());
-        let (_, word, style, text) = describe(step, width.saturating_sub(8));
+        let (word, style, text) = describe(step, width.saturating_sub(8));
         let is_gap = gaps.iter().any(|g| g.step == i);
         // Drei Fälle, nie zwei: Ein Claim-Glied (der Intent — aufgezeichnet,
         // nie beobachtet) trägt den Claim-Marker, nie das grüne ✓ eines
@@ -224,7 +224,7 @@ pub fn draw(
             )));
         }
         for gap in &gaps {
-            let (_, word, _, _) = describe(&chain.steps[gap.step], 0);
+            let (word, _, _) = describe(&chain.steps[gap.step], 0);
             lines.push(Line::from(vec![
                 Span::styled("⚠ ", style),
                 Span::styled(word.to_string(), theme::title()),
@@ -272,18 +272,17 @@ fn enterable(step: &WhyStep) -> bool {
     }
 }
 
-/// Glyph, Wort, Stil und Textzeilen eines Glieds.
-fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style, Vec<String>) {
+/// Wort, Stil und Textzeilen eines Glieds — das Glied-Glyph setzt `draw`
+/// (✓, ⚠ oder der Claim-Marker), nicht die Art des Glieds.
+fn describe(step: &WhyStep, width: usize) -> (&'static str, Style, Vec<String>) {
     match step {
         WhyStep::Line { path, line } => (
-            "▸",
             "LINE",
             Style::default().fg(theme::EXEC),
             vec![format!("{path}:{line}")],
         ),
         WhyStep::Commit { id, subject } => match id {
             Some(id) => (
-                "◆",
                 "COMMIT",
                 Style::default().fg(theme::CHANGE),
                 vec![format!(
@@ -293,7 +292,6 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 )],
             ),
             None => (
-                "◆",
                 "COMMIT",
                 theme::dim(),
                 vec!["Blame does not know this line (empty HEAD or not checked in)".into()],
@@ -301,13 +299,11 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
         },
         WhyStep::Change { id } => match id {
             Some(id) => (
-                "◆",
                 "CHANGE",
                 Style::default().fg(theme::CHANGE),
                 vec![id.to_string()],
             ),
             None => (
-                "◆",
                 "CHANGE",
                 theme::dim(),
                 vec!["no Minds-Change-Id trailer".into()],
@@ -315,15 +311,9 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
         },
         WhyStep::Sessions { cards } => {
             if cards.is_empty() {
-                (
-                    "●",
-                    "SESSION",
-                    theme::dim(),
-                    vec!["no context captured".into()],
-                )
+                ("SESSION", theme::dim(), vec!["no context captured".into()])
             } else {
                 (
-                    "●",
                     "SESSION",
                     Style::default().fg(theme::AGENT),
                     cards
@@ -345,7 +335,6 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             version,
             model,
         } => (
-            "◉",
             "AGENT",
             Style::default().fg(theme::AGENT),
             vec![format!("{name} {version} · {model}")],
@@ -378,16 +367,15 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                 }
                 None => text.push("Anchor: none bound".into()),
             }
-            ("●", "INTENT", Style::default().fg(theme::HUMAN), text)
+            ("INTENT", Style::default().fg(theme::HUMAN), text)
         }
         WhyStep::Evidence { links } => {
             if links.is_empty() {
-                ("·", "EVIDENCE", theme::dim(), vec!["no edge".into()])
+                ("EVIDENCE", theme::dim(), vec!["no edge".into()])
             } else {
                 let best = links.iter().map(|l| l.evidence).max();
                 let (_, _, style) = theme::evidence(best);
                 (
-                    "●",
                     "EVIDENCE",
                     style,
                     links
@@ -404,7 +392,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             }
         }
         WhyStep::Review { state } => {
-            let (glyph, word, style) = theme::verdict(state.verdict);
+            let (_, word, style) = theme::verdict(state.verdict);
             let mut text = vec![word.to_string()];
             text.extend(state.notes.iter().map(|n| {
                 format!(
@@ -420,7 +408,7 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
                     clip(&n.summary, width.saturating_sub(30))
                 )
             }));
-            (glyph, "REVIEW", style, text)
+            ("REVIEW", style, text)
         }
     }
 }

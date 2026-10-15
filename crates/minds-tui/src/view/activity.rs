@@ -33,8 +33,9 @@ const SEAL_W: u16 = 18;
 const VERDICT_W: u16 = 14;
 /// Rahmen links und rechts.
 const BORDER_W: u16 = 2;
-/// Der Zeilen-Glyph vor der Überschrift (`● `).
-const GLYPH_W: u16 = 2;
+/// Der Zeilen-Glyph vor der Überschrift — seit A1 keiner mehr (der Bullet
+/// trug keine Information); die Konstante hält die Breitenrechnung lesbar.
+const GLYPH_W: u16 = 0;
 
 /// Welche Spalten die Breite trägt. Was zuerst weicht, ist was der
 /// Graph-Kopf daneben ohnehin sagt: erst der Umfang, dann das Review-
@@ -214,20 +215,13 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row
         Style::default()
     };
 
-    let session = Line::from(vec![
-        Span::styled(
-            if degraded { "⌦ " } else { "● " },
-            if degraded {
-                theme::dim()
-            } else {
-                theme::lane(0)
-            },
-        ),
-        Span::styled(
-            clip(&card.summary.headline, headline_w),
-            base.patch(theme::title()),
-        ),
-    ]);
+    // Kein Zeilen-Glyph davor: Ein Bullet vor jeder Zeile trug keine
+    // Information (A1) — eine degradierte Zeile sagt ihren Zustand in der
+    // SEAL-Spalte.
+    let session = Line::from(Span::styled(
+        clip(&card.summary.headline, headline_w),
+        base.patch(theme::title()),
+    ));
 
     let mut cells = vec![
         Cell::from(Span::styled(when(card.started_at.as_deref()), base)),

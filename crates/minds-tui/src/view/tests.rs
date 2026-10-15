@@ -348,10 +348,14 @@ fn enter_opens_the_graph_and_the_zoom_levels_fold_the_lane() {
     assert!(out.contains(" YOU "), "{out}");
     assert!(out.contains("Fix retry handling"), "{out}");
     assert!(out.contains("◉ AGENT claude-code · opus"), "{out}");
-    assert!(out.contains("◇ READ src/http/retry.rs"), "{out}");
+    // READ ist eine Art, kein Beweiszustand: nicht das ◇ der Evidenz (A1).
+    assert!(out.contains("→ READ src/http/retry.rs"), "{out}");
+    assert!(!out.contains("◇ READ"), "{out}");
     assert!(out.contains("✎ EDIT src/http/retry.rs"), "{out}");
     assert!(out.contains("▶ EXEC cargo test"), "{out}");
-    assert!(out.contains("◆ CHANGE I"), "{out}");
+    // CHANGE ist eine Art, nicht das ◆ der content-Evidenz (A1).
+    assert!(out.contains("■ CHANGE I"), "{out}");
+    assert!(!out.contains("◆ CHANGE"), "{out}");
     assert!(out.contains("↻ REVIEW needs work"), "{out}");
     assert!(out.contains("┣━"), "{out}");
     assert!(out.contains("┗━"), "{out}");
@@ -360,9 +364,11 @@ fn enter_opens_the_graph_and_the_zoom_levels_fold_the_lane() {
     app.reduce(Action::Zoom(3));
     let out = render(&mut app);
     assert!(
-        out.contains("· TURN ASSISTANT · Ich lese und ändere."),
+        out.contains("› TURN ASSISTANT · Ich lese und ändere."),
         "{out}"
     );
+    // `·` heißt „nichts belegt" — ein Zug ist eine Art (A1).
+    assert!(!out.contains("· TURN"), "{out}");
     app.reduce(Action::Zoom(1));
     let out = render(&mut app);
     assert!(!out.contains("ASSISTANT"), "{out}");
@@ -1062,7 +1068,8 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     assert!(detail.contains("SESSION b3-aaaaaaaa…"), "{out}");
     assert!(detail.contains(" YOU "), "{out}");
     assert!(detail.contains("Fix retry handling"), "{out}");
-    assert!(detail.contains("◇ READ src/http/retry.rs"), "{out}");
+    assert!(detail.contains("→ READ src/http/retry.rs"), "{out}");
+    assert!(!detail.contains("◇ READ"), "{out}");
     // Die Vorschau ist nicht navigierbar: kein Detailkasten unter einem
     // Cursor, den es nicht gibt — und keine zweite invertierte Zeile neben
     // dem Listencursor.
