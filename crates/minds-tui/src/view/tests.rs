@@ -3752,13 +3752,17 @@ mod overview_tab {
         assert!(out.contains("OVERVIEW · 3 commits"), "{out}");
         assert!(out.contains("open · no commit linked yet"), "{out}");
         assert!(out.contains("Add exponential backoff"), "{out}");
-        assert!(out.contains(" ◆CC "), "agent badge: {out}");
+        // Das Badge trägt das Agenten-Glyph, nicht das ◆ der content-Evidenz (A1).
+        assert!(out.contains(" ◉CC "), "agent badge: {out}");
+        assert!(!out.contains(" ◆CC "), "agent badge: {out}");
         assert!(out.contains(" PD "), "human badge: {out}");
         assert!(out.contains("feat(sort): agent work"), "{out}");
         assert!(out.contains("• Fix retry handling"), "{out}");
         assert!(out.contains("⚑ intent"), "{out}");
         assert!(out.contains("◉2"), "{out}");
-        assert!(out.contains("● HEAD"), "{out}");
+        // HEAD ist eine Ref, kein beobachteter Zustand (A1).
+        assert!(out.contains("▲ HEAD"), "{out}");
+        assert!(!out.contains("● HEAD"), "{out}");
         // Kein Nerd Font: keine Private-Use-Glyphen.
         assert!(!out.contains('\u{e0b6}'), "{out}");
     }
@@ -4021,7 +4025,10 @@ mod overview_tab {
             Index::from_parts(sessions, links).with_seals(sid('a'), vec![(seal_id, seal, false)]);
         let mut app = opened(&repo, Inspection::from_index(index, Vec::new(), "demo"));
         let out = render(&mut app);
-        assert!(out.contains("◇ sealed · unsigned"), "{out}");
+        // Eigenes Glyph für „versiegelt, nicht signiert" — nicht ◇, das
+        // „ausgesagt, nicht bezeugt" heißt (A1).
+        assert!(out.contains("◎ sealed · unsigned"), "{out}");
+        assert!(!out.contains("◇ sealed"), "{out}");
         let row = out
             .lines()
             .find(|l| l.contains("docs: two sessions"))
@@ -4184,10 +4191,13 @@ mod overview_tab {
         };
         assert!(row("docs: two sessions").contains("◈ sealed"), "{out}");
         assert!(
-            row("feat(sort): agent work").contains("◇ sealed · unsigned"),
+            row("feat(sort): agent work").contains("◎ sealed · unsigned"),
             "{out}"
         );
+        assert!(!out.contains("◇ sealed"), "{out}");
     }
+
+    mod a1b;
 }
 
 mod tamper;

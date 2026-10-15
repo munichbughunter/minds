@@ -300,7 +300,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     if app.tab == Tab::Overview {
         let status = Line::from(Span::styled(
-            "Each commit with what Minds knows: ◆CC = agent session, initials = author · @branch #tag · ◈ sealed (as recorded) · ⚑ intent · ◉ sessions",
+            "Each commit with what Minds knows: ◉CC = agent session, initials = author · @branch #tag · ◈ sealed (as recorded) · ⚑ intent · ◉ sessions",
             theme::dim(),
         ));
         let focused = app

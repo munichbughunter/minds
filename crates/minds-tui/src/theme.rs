@@ -141,6 +141,12 @@ pub const REGISTER: &[Glyph] = &[
     // Seal-Zustand
     glyph("◈", GlyphClass::Epistemic, "sealed", "sealed"),
     glyph("!", GlyphClass::Epistemic, "incomplete", "incomplete"),
+    glyph(
+        "◎",
+        GlyphClass::Epistemic,
+        "unsigned",
+        "sealed, not every seal signed",
+    ),
     // Aussage, Abgleich, Deutung
     glyph(
         "◌",
@@ -176,6 +182,13 @@ pub const REGISTER: &[Glyph] = &[
     glyph("+", GlyphClass::Structural, "tool", "other tool"),
     glyph("⇄", GlyphClass::Structural, "handover", "handover"),
     glyph("■", GlyphClass::Structural, "change", "change / commit"),
+    glyph("▲", GlyphClass::Structural, "head", "HEAD"),
+    glyph(
+        "□",
+        GlyphClass::Structural,
+        "pending",
+        "session without a commit",
+    ),
 ];
 
 /// Glyph, Wort und Stil einer Evidenz-Klasse; `None` heißt „mit keinem
@@ -222,6 +235,33 @@ pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style
             EvidenceVerdict::Tampered => tampered(),
         },
         Provenance::Legacy => ("·", "legacy", Style::default().fg(DIM)),
+    }
+}
+
+/// Die HEAD-Pille der Übersicht — eine Ref, kein Zustand.
+pub const HEAD: &str = "▲";
+
+/// Eine Session ohne Commit im Graphen der Übersicht — ein Platzhalter-
+/// Knoten, kein Claim.
+pub const PENDING: &str = "□";
+
+/// Glyph, Wort und Stil einer Seal-Pille der Übersicht — dieselben Glyphen
+/// wie [`provenance`], wo die Bedeutung dieselbe ist. „Versiegelt, aber
+/// nicht jedes Seal signiert" ist **nicht** `◈ sealed`: Wer `refs/minds/`
+/// schreibt, kann unsigniertes Material erzeugen.
+pub fn seal(mark: minds_reader::overview::SealMark) -> (&'static str, &'static str, Style) {
+    use minds_reader::overview::SealMark;
+    match mark {
+        SealMark::Sealed => ("◈", "sealed", Style::default().fg(OK)),
+        SealMark::Unsigned => ("◎", "sealed · unsigned", Style::default().fg(Color::Gray)),
+        SealMark::Partial => (
+            "◎",
+            "sealed · first 64 checked",
+            Style::default().fg(Color::Gray),
+        ),
+        SealMark::Incomplete => ("!", "incomplete", Style::default().fg(REVIEW)),
+        SealMark::Unsealed => ("·", "unsealed", Style::default().fg(Color::Gray)),
+        SealMark::Tampered => tampered(),
     }
 }
 

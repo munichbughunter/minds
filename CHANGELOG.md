@@ -36,6 +36,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   review approved `⊕` (was `✓`, which means "check passed") and rejected `⊘`
   (was `✕`, which stays DELETE). The bullet before every session row is gone.
   The legend in the help is generated from the register.
+  In the overview, the agent badge is `◉CC` (was `◆CC`), the HEAD pill
+  `▲ HEAD` (was `● HEAD`), commit nodes `■` (was `●`) and a session without a
+  commit `□` (was `◌`); the seal pills use the same glyphs as everywhere else
+  (`! incomplete`, `✗ TAMPERED` instead of `◇ incomplete`, `✗ tampered`) and
+  `◎ sealed · unsigned` instead of `◇ sealed · unsigned`.
 - **A claim no longer reads as checked in the Why chain.** The INTENT link
   carries the claim marker `◌` in the claim style instead of the green `✓` of
   an attested link; unsigned review notes — and a review head whose verdict rests on unsigned

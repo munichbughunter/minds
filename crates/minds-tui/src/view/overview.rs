@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use minds_reader::model::Verdict;
-use minds_reader::overview::{CommitRow, RefLabel, SealMark, WipSession, WipState, one_line};
+use minds_reader::overview::{CommitRow, RefLabel, WipSession, WipState, one_line};
 
 use crate::overview::MAX_SESSION_LINES;
 
@@ -48,11 +48,15 @@ fn pill(spans: &mut Vec<Span<'static>>, text: String, bg: Color, nerd: bool) {
     spans.push(Span::raw(" "));
 }
 
-/// Das Badge: Initialen des Agenten (magenta, mit `◆` bzw. Roboter-Icon —
+/// Das Badge: Initialen des Agenten (magenta, mit `◉` bzw. Roboter-Icon —
 /// nicht nur die Farbe unterscheidet) oder des Autors (cyan).
 fn badge(spans: &mut Vec<Span<'static>>, name: &str, agent: bool, nerd: bool) {
     if agent {
-        let mark = if nerd { "\u{f06a9} " } else { "◆" };
+        let mark = if nerd {
+            "\u{f06a9} "
+        } else {
+            theme::node(&minds_reader::graph::NodeKind::Agent).0
+        };
         pill(
             spans,
             format!("{mark}{}", initials(name)),
@@ -86,10 +90,10 @@ fn pills(
     };
     for label in &row.refs {
         let (text, bg) = match label {
-            RefLabel::Head(name) => (format!("{branch}{name} ● HEAD"), HEAD_REF),
+            RefLabel::Head(name) => (format!("{branch}{name} {} HEAD", theme::HEAD), HEAD_REF),
             RefLabel::Branch(name) => (format!("{branch}{name}"), BRANCH_REF),
             RefLabel::Tag(name) => (format!("{tag}{name}"), TAG_REF),
-            RefLabel::Detached => ("● HEAD (detached)".into(), HEAD_REF),
+            RefLabel::Detached => (format!("{} HEAD (detached)", theme::HEAD), HEAD_REF),
             RefLabel::More(n) => (format!("+{n}"), Color::Indexed(238)),
         };
         let body = Style::default().fg(Color::White).bg(bg);
@@ -114,15 +118,13 @@ fn pills(
         return;
     }
     if let Some(seal) = row.seal {
-        let (text, color) = match seal {
-            SealMark::Sealed => ("◈ sealed", theme::OK),
-            SealMark::Unsigned => ("◇ sealed · unsigned", Color::Gray),
-            SealMark::Partial => ("◇ sealed · first 64 checked", Color::Gray),
-            SealMark::Incomplete => ("◇ incomplete", theme::REVIEW),
-            SealMark::Unsealed => ("· unsealed", Color::Gray),
-            SealMark::Tampered => ("✗ tampered", theme::DELETE),
-        };
-        pill(spans, text.into(), color, nerd);
+        let (glyph, word, style) = theme::seal(seal);
+        pill(
+            spans,
+            format!("{glyph} {word}"),
+            style.fg.unwrap_or(Color::Gray),
+            nerd,
+        );
     }
     let (glyph, word, style) = theme::verdict(row.review);
     pill(
@@ -169,8 +171,12 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for cell in &row.graph {
         let style = Style::default().fg(lane(cell.lane));
+        // Der Reader zeichnet den Commit-Knoten als `●`; die Oberfläche
+        // zeigt ihn mit dem Register-Glyph für „Commit" (A1) — `●` heißt
+        // dort „beobachtet".
         let glyph = if cell.glyph == '●' {
-            Span::styled("●", style.add_modifier(Modifier::BOLD))
+            let (commit, _, _) = theme::node(&minds_reader::graph::NodeKind::Commit(row.id));
+            Span::styled(commit, style.add_modifier(Modifier::BOLD))
         } else {
             Span::styled(cell.glyph.to_string(), style)
         };
@@ -186,7 +192,7 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
 
 fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     let mut spans = vec![
-        Span::styled("◌", Style::default().fg(theme::AGENT)),
+        Span::styled(theme::PENDING, Style::default().fg(theme::AGENT)),
         Span::styled("┄", theme::dim()),
     ];
     if width > 1 {
