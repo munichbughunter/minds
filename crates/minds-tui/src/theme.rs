@@ -160,7 +160,12 @@ pub const REGISTER: &[Glyph] = &[
         "fs only",
         "explained by the file system only",
     ),
-    glyph("◦", GlyphClass::Epistemic, "not observed", "not observed"),
+    glyph(
+        "◦",
+        GlyphClass::Epistemic,
+        "open",
+        "open — not observed / not yet; no error",
+    ),
     glyph(
         "◐",
         GlyphClass::Epistemic,
@@ -366,6 +371,12 @@ pub fn lane(depth: usize) -> Style {
 }
 
 /// Die Cursorzeile — der eine Auswahlstil der Oberfläche (B7).
+/// „Offen" (C3.4): fehlt noch, ist aber kein Fehler — nicht beobachtet,
+/// nicht signiert, nicht reviewt. Nie rot.
+pub fn open() -> (&'static str, &'static str, Style) {
+    ("◦", "open", Style::default().fg(DIM))
+}
+
 pub fn cursor() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use minds_core::SessionId;
+use minds_core::{ContentHash, SessionId};
 use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::conformance::Outcome;
@@ -78,6 +78,35 @@ pub struct OverviewState {
     /// `a` (C3.3): nur Commits mit Agent-Session (und die Sessions ohne
     /// Commit). Bleibt über Tab-Wechsel und Neuladen.
     pub agent_only: bool,
+    /// Das Urteil von `minds verify` je Commit (C3.4) — nur für den
+    /// gewählten, gedrosselt; ein Neuladen beginnt leer (nie ein altes
+    /// Urteil übernehmen).
+    pub checks: HashMap<CommitId, Result<crate::CommitVerify, String>>,
+    /// Wann das Urteil kam (Sekunden seit Epoch).
+    pub checked_at: HashMap<CommitId, i64>,
+    /// Der Commit, dessen Prüfung beim Worker liegt.
+    pub asked: Option<CommitId>,
+    /// Die Zeilen je Commit (C3.4): unerklärte und hinzugefügte — aus
+    /// derselben Rechnung wie der Changes-Tab — oder warum nicht.
+    pub lines: HashMap<CommitId, Result<LineCount, String>>,
+    /// Die gelesenen Anker (C3.4), aus derselben Quelle wie der Intent-Tab.
+    pub requirements: HashMap<ContentHash, Result<crate::IntentDetail, String>>,
+    /// Ob der Anforderungstext aufgeklappt ist (Space).
+    pub requirement_open: bool,
+    /// Wie weit das Detail gescrollt ist (aufgeklappt, PgUp/PgDn).
+    pub detail_scroll: u16,
+    /// Ob die Übersicht schmal gezeichnet wird (unter 100 Spalten): dann
+    /// ist das Detail eine eigene Ebene hinter Enter.
+    pub narrow: bool,
+}
+
+/// Die Zeilen eines Commits für die Coverage-Zeile des Details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineCount {
+    /// Unerklärte `+`-Zeilen — [`minds_reader::changes::ChangeSet::unexplained`].
+    pub unexplained: usize,
+    /// Hinzugefügte Zeilen.
+    pub added: usize,
 }
 
 impl OverviewState {
@@ -94,6 +123,14 @@ impl OverviewState {
             conformance: HashMap::new(),
             filter: String::new(),
             agent_only: false,
+            checks: HashMap::new(),
+            checked_at: HashMap::new(),
+            asked: None,
+            lines: HashMap::new(),
+            requirements: HashMap::new(),
+            requirement_open: false,
+            detail_scroll: 0,
+            narrow: false,
         };
         // Die Startauswahl ist HEAD (C3) — laufende Sessions stehen darüber.
         if let Some(head) = state.head() {
@@ -163,8 +200,30 @@ impl OverviewState {
         next.session = next.session.min(next.sessions().len().saturating_sub(1));
         next.filter = std::mem::take(&mut self.filter);
         next.agent_only = self.agent_only;
+        next.narrow = self.narrow;
         next.cursor = next.nearest_shown(next.cursor);
         *self = next;
+    }
+
+    /// Space (C3.4): klappt den Anforderungstext auf oder zu.
+    pub fn toggle_requirement(&mut self) {
+        self.requirement_open = !self.requirement_open;
+        self.detail_scroll = 0;
+    }
+
+    /// Der gewählte Commit, wenn eine Agent-Session an ihm hängt — nur für
+    /// ihn rechnet das Detail Beleg und Zeilen (C3.4).
+    pub fn agent_commit(&self) -> Option<&CommitRow> {
+        match self.selected()? {
+            Selected::Commit(row) if row.has_agent_session() => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Der gewählte Commit, dessen Urteil noch fehlt und nicht unterwegs ist.
+    pub fn check_due(&self) -> Option<CommitId> {
+        let row = self.agent_commit()?;
+        (!self.checks.contains_key(&row.id) && self.asked != Some(row.id)).then_some(row.id)
     }
 
     /// Wählt die Zeile des Commits, wenn es sie gibt (B3: der aktive Commit).

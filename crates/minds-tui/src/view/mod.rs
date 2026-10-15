@@ -75,6 +75,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_inner(frame: &mut Frame, app: &mut App) {
+    // Schmal ist das Detail der Übersicht eine Ebene hinter Enter (C3.4).
+    let narrow = frame.area().width < 100;
+    if let Some(state) = app.overview.as_mut() {
+        state.narrow = narrow;
+    }
     let banner_h = u16::from(app.tamper.is_some());
     let [head, alert, body, foot] = Layout::vertical([
         Constraint::Length(2),

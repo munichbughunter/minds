@@ -146,12 +146,8 @@ fn c32_subject_status_refs_time_and_the_request_below() {
     let row = &lines[at];
     let subject = row.find("feat(sort): agent work").unwrap();
     let status = row.find("· unsealed").expect("status");
-    // Frisch angelegt: „just now" — sonst „3h ago" (dieselben Wörter wie
-    // die Sessions-Liste, C4).
-    let time = row
-        .find("just now")
-        .or_else(|| row.find(" ago"))
-        .expect("relative time");
+    // Frisch angelegt: „now" — sonst kurz „3h", „1d" (C3.2).
+    let time = row.rfind(" now").expect("relative time");
     assert!(subject < status && status < time, "{out}");
     // Der Auftrag steht nicht mehr in der Zeile, sondern darunter.
     assert!(!row.contains("Fix retry handling"), "{out}");
@@ -169,7 +165,7 @@ fn c32_subject_status_refs_time_and_the_request_below() {
         .unwrap();
     let refs = head.find("@main ▲ HEAD").expect("refs column");
     assert!(head.find("◉2").unwrap() < refs, "{out}");
-    assert!(refs < head.find("just now").unwrap(), "{out}");
+    assert!(refs < head.rfind(" now").unwrap(), "{out}");
     // Der menschliche Commit bleibt einzeilig.
     let human = lines
         .iter()
@@ -238,8 +234,15 @@ fn c32_the_selection_is_one_bar() {
             .map(|x| buffer[(x, y)].symbol().to_string())
             .collect()
     };
+    // Die Zeile in der Liste — das Detail rechts nennt den Betreff auch.
     let y = (0..40)
-        .find(|y| text(*y).contains("docs: two sessions"))
+        .find(|y| {
+            let row = text(*y);
+            row.split("││")
+                .next()
+                .unwrap_or(&row)
+                .contains("docs: two sessions")
+        })
         .unwrap();
     // Die Liste endet an ihrer rechten Rahmenkante (das zweite `│`).
     let edge = text(y)
@@ -485,4 +488,356 @@ fn c33_a_elsewhere_says_where_it_works() {
             .as_deref()
             .is_some_and(|c| c.contains("Overview"))
     );
+}
+
+// ---------------------------------------------------------------------
+// C3.4 · Detail: Auftrag, Sessions, Beleg
+// ---------------------------------------------------------------------
+
+/// Eine Quelle für das Detail: Anker und Urteil, wie vorgegeben.
+struct Detailed {
+    detail: Option<crate::IntentDetail>,
+    verdict: Option<crate::VerifyVerdict>,
+}
+
+impl crate::Source for Detailed {
+    fn load(&self) -> minds_reader::Result<Inspection> {
+        unreachable!("this test never reloads")
+    }
+    fn stamp(&self) -> Option<crate::Stamp> {
+        None
+    }
+    fn intents(&self, named: &[minds_core::ContentHash]) -> Result<crate::IntentList, String> {
+        let entries = named
+            .iter()
+            .map(|id| crate::IntentInfo {
+                id: id.clone(),
+                active: false,
+                detail: self
+                    .detail
+                    .clone()
+                    .ok_or_else(|| "not in the store".to_string()),
+            })
+            .collect::<Vec<_>>();
+        Ok(crate::IntentList {
+            total: entries.len(),
+            entries,
+            skipped: 0,
+        })
+    }
+    fn verify(&self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
+        match self.verdict {
+            Some(verdict) => Ok(crate::CommitVerify {
+                verdict: Ok(verdict),
+                sessions: Vec::new(),
+                out_of_scope: None,
+                out_of_scope_paths: Vec::new(),
+                scope_note: None,
+                conformance: None,
+            }),
+            None => Err("minds verify not found".into()),
+        }
+    }
+}
+
+fn anchor_detail(proven: bool) -> crate::IntentDetail {
+    crate::IntentDetail {
+        source: "file:docs/anforderung.md@abc".into(),
+        content: minds_core::ContentHash::from_bytes([2; 32]),
+        scope: vec!["src/sort.rs".into(), "tests/**".into()],
+        version: Some("HEAD version".into()),
+        proof: if proven {
+            Ok(())
+        } else {
+            Err("snapshot does not match the anchor".into())
+        },
+        signature: minds_reader::assurance::IntentSignature::Unsigned,
+        snapshot_len: 40,
+        snapshot: proven.then(|| vec!["Sort stably.".into(), "Keep equal keys in order.".into()]),
+        snapshot_clipped: false,
+    }
+}
+
+/// Der Agent-Commit mit Anker (`feat(sort): agent work`) gewählt.
+fn on_agent_commit<'r>(repo: &'r Repo, inspection: Inspection, commit: CommitId) -> App<'r> {
+    let mut app = opened(repo, inspection);
+    app.overview.as_mut().unwrap().select_commit(commit);
+    app
+}
+
+fn detail_text(app: &mut App, w: u16, h: u16) -> String {
+    let lines = lines_at(app, w, h);
+    let edge = lines[2]
+        .find("┐┌")
+        .map(|b| lines[2][..b].chars().count() + 1);
+    lines
+        .iter()
+        .map(|l| match edge {
+            Some(e) => l.chars().skip(e).collect::<String>(),
+            None => l.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Keine Tastenhinweise im Detail — Tasten stehen nur in der Fußzeile.
+/// Der Kopf: Kurz-Id + Betreff, darunter leise Branches, Autor, Datum UTC.
+#[test]
+fn c34_the_detail_leads_with_the_commit_and_names_no_keys() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[2]);
+    for (w, h) in [(120u16, 30u16), (160, 40)] {
+        let detail = detail_text(&mut app, w, h);
+        assert!(!detail.contains("Enter: how it was made"), "{w}: {detail}");
+        assert!(
+            !detail.contains("Enter: the session's graph"),
+            "{w}: {detail}"
+        );
+        assert!(!detail.contains("Enter: choose a session"), "{w}: {detail}");
+        let short = &commits[2].to_string()[..7];
+        assert!(
+            detail.contains(&format!("{short} · docs: two sessions")),
+            "{w}: {detail}"
+        );
+        assert!(
+            detail.contains("on main · Patrick Döring · "),
+            "{w}: {detail}"
+        );
+        assert!(detail.contains(" UTC"), "{w}: {detail}");
+        assert!(detail.contains("SESSIONS (2)"), "{w}: {detail}");
+        assert!(detail.contains("EVIDENCE"), "{w}: {detail}");
+        for axis in [
+            "INTEGRITY",
+            "COVERAGE",
+            "INTERPRETATION",
+            "REQUIREMENT",
+            "REVIEW",
+        ] {
+            assert!(detail.contains(axis), "{w}: {axis} {detail}");
+        }
+    }
+}
+
+/// Belegter Anker: Space zeigt die Snapshot-Zeilen. Unbelegter: Der Text
+/// ist nie sichtbar, der Grund schon.
+#[test]
+fn c34_space_shows_the_requirement_only_when_proven() {
+    for proven in [true, false] {
+        let (_dir, repo, commits, inspection) = history();
+        let mut app = on_agent_commit(&repo, inspection, commits[1]);
+        let source = Detailed {
+            detail: Some(anchor_detail(proven)),
+            verdict: None,
+        };
+        while app.fill_overview(&source) {}
+        let before = detail_text(&mut app, 160, 40);
+        assert!(before.contains("REQUIREMENT"), "{before}");
+        assert!(before.contains("⚑ anchor 01010101"), "{before}");
+        assert!(before.contains("file:docs/anforderung.md@abc"), "{before}");
+        assert!(before.contains("scope  src/sort.rs, tests/**"), "{before}");
+        assert!(!before.contains("Sort stably."), "{before}");
+        app.reduce(Action::Space);
+        let after = detail_text(&mut app, 160, 40);
+        if proven {
+            assert!(before.contains("Space: show text (2 lines)"), "{before}");
+            assert!(after.contains("Sort stably."), "{after}");
+            assert!(after.contains("Keep equal keys in order."), "{after}");
+        } else {
+            assert!(!after.contains("Sort stably."), "{after}");
+            assert!(
+                after.contains("text hidden — snapshot does not match the anchor"),
+                "{after}"
+            );
+        }
+    }
+}
+
+/// EVIDENCE vor dem Urteil: `… checking`, kein ✓ in INTEGRITY. Danach die
+/// Wörter von `minds verify`; TAMPERED ist ✗ und rot; „not signed" ist ◦,
+/// nie ✗ und nie rot.
+#[test]
+fn c34_evidence_waits_for_the_verdict_and_never_alarms_wrongly() {
+    let integrity = |detail: &str| {
+        detail
+            .lines()
+            .find(|l| l.contains("INTEGRITY"))
+            .unwrap_or_else(|| panic!("{detail}"))
+            .to_string()
+    };
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[1]);
+    let detail = detail_text(&mut app, 160, 40);
+    assert!(integrity(&detail).contains("… checking"), "{detail}");
+    assert!(!integrity(&detail).contains('✓'), "{detail}");
+    assert!(!detail.contains("VERIFIED"), "{detail}");
+
+    let source = Detailed {
+        detail: Some(anchor_detail(true)),
+        verdict: Some(crate::VerifyVerdict::Verified),
+    };
+    while app.fill_overview(&source) {}
+    assert!(app.fill_overview_verify(&source));
+    let detail = detail_text(&mut app, 160, 40);
+    assert!(integrity(&detail).contains("✓ VERIFIED"), "{detail}");
+    assert!(detail.contains("checked "), "{detail}");
+    let requirement = detail
+        .lines()
+        .rfind(|l| l.contains("REQUIREMENT"))
+        .unwrap()
+        .to_string();
+    assert!(requirement.contains("✓ proven"), "{detail}");
+    assert!(requirement.contains("◦ not signed"), "{detail}");
+    assert!(!requirement.contains('✗'), "{detail}");
+    // Die CLI nimmt nur die volle Id — kein Kurz-Befehl, den es nicht gibt.
+    assert!(
+        detail.contains("→ minds intent sign <id> (Intent tab, i)"),
+        "{detail}"
+    );
+    // „not signed" nie rot.
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| super::super::super::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let red = crate::theme::tampered().2.fg;
+    for y in 0..40 {
+        let row: String = (0..160)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        if let Some(at) = row.find("◦ not signed") {
+            let x = row[..at].chars().count() as u16;
+            assert_ne!(buffer[(x, y)].fg, red.unwrap(), "{row}");
+        }
+    }
+
+    // TAMPERED: ✗ und rot.
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[1]);
+    let source = Detailed {
+        detail: None,
+        verdict: Some(crate::VerifyVerdict::Tampered),
+    };
+    assert!(app.fill_overview_verify(&source));
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| super::super::super::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let y = (0..40)
+        .find(|y| {
+            (0..160)
+                .map(|x| buffer[(x, *y)].symbol().to_string())
+                .collect::<String>()
+                .contains("✗ TAMPERED")
+        })
+        .expect("TAMPERED in INTEGRITY");
+    let row: String = (0..160)
+        .map(|x| buffer[(x, y)].symbol().to_string())
+        .collect();
+    assert!(row.contains("INTEGRITY"), "{row}");
+    let x = row[..row.find("✗ TAMPERED").unwrap()].chars().count() as u16;
+    assert_eq!(buffer[(x, y)].fg, red.unwrap());
+
+    // Ohne Urteil (Fehler): „not checked" mit Grund, kein ✓.
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[1]);
+    let source = Detailed {
+        detail: None,
+        verdict: None,
+    };
+    assert!(app.fill_overview_verify(&source));
+    let detail = detail_text(&mut app, 160, 40);
+    assert!(
+        integrity(&detail).contains("not checked — minds verify not found"),
+        "{detail}"
+    );
+    assert!(!integrity(&detail).contains('✓'), "{detail}");
+}
+
+/// Die Zahl unerklärter Zeilen im Detail ist die ◦n des Changes-Tabs für
+/// denselben Commit.
+#[test]
+fn c34_unexplained_lines_match_the_changes_tab() {
+    let (_dir, repo, inspection) = reconciled(true);
+    let mut app = App::new(inspection, &repo, None);
+    app.open_overview();
+    let source = Detailed {
+        detail: None,
+        verdict: None,
+    };
+    while app.fill_overview(&source) {}
+    let state = app.overview.as_ref().unwrap();
+    let commit = state.agent_commit().expect("agent commit").id;
+    let detail = detail_text(&mut app, 160, 40);
+    let set = app.inspection.changes(&repo, commit).unwrap();
+    let per_file: usize = set.files.iter().map(|f| f.unexplained()).sum();
+    assert!(per_file > 0);
+    assert!(
+        detail.contains(&format!(
+            "◦ {per_file} of {} added lines unexplained",
+            set.added()
+        )),
+        "{detail}"
+    );
+    assert!(detail.contains("→ d, then n"), "{detail}");
+    // Der Changes-Tab zeigt dieselbe Zahl je Datei.
+    app.open_changes(Some(commit));
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(out.contains(&format!("◦{per_file}")), "{out}");
+}
+
+/// Ein Commit ohne Agent-Session: Kopf und ein Satz — kein Block voller ·.
+#[test]
+fn c34_a_commit_without_an_agent_session_says_so() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[0]);
+    let detail = detail_text(&mut app, 160, 40);
+    assert!(
+        detail.contains("No agent session linked to this commit."),
+        "{detail}"
+    );
+    for gone in ["REQUIREMENT", "SESSIONS", "EVIDENCE", "INTEGRITY"] {
+        assert!(!detail.contains(gone), "{gone}: {detail}");
+    }
+}
+
+/// Breite: Das Detail bekommt mindestens 60 Spalten; unter 100 nur die
+/// Liste, das Detail per Enter als eigene Ebene, Esc zurück.
+#[test]
+fn c34_the_detail_gets_sixty_columns_and_is_a_level_when_narrow() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[1]);
+    for (w, h) in [(120u16, 30u16), (160, 40)] {
+        let lines = lines_at(&mut app, w, h);
+        let title = &lines[2];
+        let at = title
+            .find("┐┌")
+            .unwrap_or_else(|| panic!("{}", lines.join("\n")));
+        let list_w = title[..at].chars().count() + 1;
+        assert!(usize::from(w) - list_w >= 60, "{w}: {}", lines.join("\n"));
+    }
+    let lines = lines_at(&mut app, 80, 24);
+    assert!(!lines.iter().any(|l| l.contains("DETAIL")));
+    app.reduce(Action::Enter);
+    let out = lines_at(&mut app, 80, 24).join("\n");
+    assert!(out.contains("DETAIL"), "{out}");
+    assert!(out.contains("EVIDENCE"), "{out}");
+    app.reduce(Action::Back);
+    let out = lines_at(&mut app, 80, 24).join("\n");
+    assert!(!out.contains("DETAIL"), "{out}");
+    assert!(out.contains("OVERVIEW"), "{out}");
+}
+
+/// `◦` heißt im Register „open" — offen, kein Fehler (C3.4).
+#[test]
+fn c34_the_open_glyph_is_registered_as_open() {
+    let entry = crate::theme::REGISTER
+        .iter()
+        .find(|e| e.symbol == "◦")
+        .unwrap();
+    assert_eq!(entry.meaning, "open");
+    assert_ne!(entry.meaning, "not observed");
+    let (glyph, word, style) = crate::theme::open();
+    assert_eq!((glyph, word), ("◦", "open"));
+    assert_ne!(style.fg, crate::theme::tampered().2.fg, "open is never red");
 }

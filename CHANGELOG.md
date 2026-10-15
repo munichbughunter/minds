@@ -19,6 +19,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Overview detail: requirement, sessions, evidence.** The detail answers
+  what was asked and how far it is backed — without key hints (keys live in
+  the footer). Head: short id and subject, then quietly the branches that
+  contain the commit (`on main`, at most three and `+N`), author and the date
+  in UTC. REQUIREMENT (only when a session names an anchor): anchor, source,
+  scope; `Space` shows the requirement text — only when the anchor is proven,
+  otherwise the reason (`text hidden — …`). SESSIONS: agent, model, id, time,
+  files, events, gaps, record state and the request over up to three lines.
+  EVIDENCE: one line per axis — INTEGRITY (the words of `minds verify`;
+  `… checking` before the verdict, never ✓ before it; TAMPERED ✗ in red),
+  COVERAGE (the same unexplained-line count as `◦n` in the Changes tab, with
+  `→ d, then n`), INTERPRETATION, REQUIREMENT (bound · proven · signed, each
+  on its own; `◦ not signed` is open, never red), REVIEW. A commit without an
+  agent session says so in one sentence. The detail gets at least 60 columns;
+  below 100 columns it is a level behind Enter (Esc returns). `◦` now means
+  "open — not observed / not yet; no error" in the glyph register.
 - **`a` shows only commits with an agent session.** In the overview, `a`
   toggles between all commits and those with an agent session (sessions
   without a commit stay on top). Hidden commits are summarised, never dropped:

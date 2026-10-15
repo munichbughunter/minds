@@ -3887,7 +3887,9 @@ mod overview_tab {
             OverviewFocus::Sessions
         );
         let out = render(&mut app);
-        assert!(out.contains("Sessions (2)"), "{out}");
+        // Die Überschrift des Blocks wie EVIDENCE und REQUIREMENT (C3.4).
+        assert!(out.contains("SESSIONS (2)"), "{out}");
+        assert!(!out.contains("Sessions (2)"), "{out}");
         assert!(out.contains("▸ "), "{out}");
         app.reduce(Action::Down);
         app.reduce(Action::Enter);

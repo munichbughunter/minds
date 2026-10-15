@@ -35,8 +35,13 @@ fn c3_the_subject_leads_and_states_stand_right() {
     // steht Luft; die Zeile endet mit der Zeit (C3.2: Status · Refs ·
     // Zeit), nicht mehr mit einer Pille.
     let list_part = &row[subject..row[subject..].find('│').map_or(row.len(), |b| b + subject)];
+    // Kurz relativ (C3.2: „now", „3h", „1d") — nicht mehr „just now".
     assert!(
-        list_part.trim_end().ends_with("just now"),
+        list_part.trim_end().ends_with(" now"),
+        "right-aligned: {row}"
+    );
+    assert!(
+        !list_part.trim_end().ends_with("just now"),
         "right-aligned: {row}"
     );
     assert!(
@@ -64,13 +69,18 @@ fn c3_the_detail_names_the_next_action() {
         app.reduce(Action::Down);
     }
     let lines = lines_at(&mut app, 160, 40);
+    // C3.4: Die nächste Aktion steht in der Fußzeile, nie im Detail.
     assert!(
-        lines
+        !lines
             .iter()
             .any(|l| l.contains("Enter: how it was made · v: verify · d: diff")),
         "{}",
         lines.join("\n")
     );
+    let footer = &lines[lines.len() - 1];
+    for key in ["Enter how it was made", "v verify", "d diff"] {
+        assert!(footer.contains(key), "{key}: {}", lines.join("\n"));
+    }
 }
 
 #[test]
