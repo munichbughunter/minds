@@ -618,7 +618,9 @@ impl<'a> App<'a> {
             Action::PageDown => {
                 state.scroll = state.scroll.saturating_add(10).min(state.max_scroll.get());
             }
-            Action::Back => self.tab = Tab::Sessions,
+            // Esc (B1): keine Ebene zu schließen — der Rückweg zum Ursprung
+            // kommt mit dem Navigationsverlauf (B2), sonst nichts.
+            Action::Back => {}
             Action::Enter => {
                 // Eine Session, die sich an den Anker gebunden nennt (die
                 // kleinste Id): ihr Graph im Sessions-Tab.
@@ -747,7 +749,8 @@ impl<'a> App<'a> {
                         Some(VerifyState::build(&self.inspection, self.repo, commits, at));
                 }
             }
-            Action::Back => self.tab = Tab::Sessions,
+            // Esc (B1): keine Ebene zu schließen — sonst nichts.
+            Action::Back => {}
             Action::Enter => {
                 let cursor = state.cursor;
                 let commit = state.commit();
@@ -942,7 +945,8 @@ impl<'a> App<'a> {
                 }
             }
             (Focus::Files, Action::Bracket(forward)) => self.step_commit(forward),
-            (Focus::Files, Action::Back) => self.tab = Tab::Sessions,
+            // Esc (B1): die Dateiliste ist die oberste Ebene — sonst nichts.
+            (Focus::Files, Action::Back) => {}
             // Im gezeigten Split paarweise, wie gezeichnet.
             (Focus::Diff, Action::Up) if state.split && split_shown => state.move_pair(-1),
             (Focus::Diff, Action::Down) if state.split && split_shown => state.move_pair(1),
@@ -1719,13 +1723,11 @@ impl<'a> App<'a> {
                 }
             }
             Action::SearchStart => self.searching = true,
-            Action::Back => {
-                if self.query.is_empty() {
-                    self.quit = true;
-                } else {
-                    self.query.clear();
-                    self.refilter();
-                }
+            // Esc (B1): die Suche leeren — sonst nichts. Esc beendet nie;
+            // das tun nur `q` und Ctrl-C.
+            Action::Back if !self.query.is_empty() => {
+                self.query.clear();
+                self.refilter();
             }
             _ => {}
         }

@@ -2,7 +2,7 @@
 //! ohne Terminal prüfbar ist.
 //!
 //! Vim-nah, nicht Vim: `j`/`k` und die Pfeile sind gleich, `q` beendet,
-//! `Esc` geht einen Schritt zurück (und beendet auf der obersten Ebene).
+//! `Esc` geht einen Schritt zurück und beendet nie (B1).
 //! Im Suchmodus gehen Zeichen in die Suche — bis auf `Esc`, `Enter` und
 //! `Ctrl-C`, die immer dasselbe tun.
 

@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Esc never quits `minds inspect`.** Esc follows one order in every tab:
+  close the help or the tamper banner, clear the search, close the top
+  layer — otherwise nothing (the way back across tabs follows with the
+  navigation history). Only `q` and Ctrl-C quit; Verify, Changes and Intent
+  no longer jump to Sessions on Esc.
 - **One active commit for Overview, Verify and Changes.** The commit
   selected in the overview is the one F3/F4 open; `[ ]` in Verify or Changes
   moves it for all three tabs, and the overview selects it again when shown.

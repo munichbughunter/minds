@@ -14,7 +14,7 @@ j / k  ↑ / ↓      one line
 PgUp / PgDn        one page
 g / G              start / end
 Enter / l          open, descend
-Esc / h            back; on the list: clear the search, then quit
+Esc / h            back: close, clear the search, return — never quits
 
 /                  search (terms AND-combined, over prompt, agent, paths, ids)
 w                  why — the provenance chain

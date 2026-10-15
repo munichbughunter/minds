@@ -1102,10 +1102,11 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     app.reduce(Action::Zoom(3));
     let out = render_at(&mut app, SPLIT);
     assert!(out.contains("TURN ASSISTANT"), "{out}");
-    // Esc auf der Liste ist weiter „Suche loeschen, dann Ende" — die
-    // Vorschau kostet keinen Tastendruck.
+    // Esc auf der Liste ist „Suche loeschen, sonst nichts" — Esc beendet nie
+    // (B1); die Vorschau kostet keinen Tastendruck.
     app.reduce(Action::Back);
-    assert!(app.quit);
+    assert!(!app.quit);
+    assert!(app.top().is_none());
 }
 
 /// Gelegte Ebenen — Graph, Why, Evidence — verdraengen die Liste nicht
@@ -2509,8 +2510,10 @@ mod changes_tab {
         );
         app.reduce(Action::Back);
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
+        // Esc auf der obersten Ebene ohne Ursprung: nichts (B1).
         app.reduce(Action::Back);
-        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.tab, Tab::Changes);
+        assert!(!app.quit);
     }
 
     /// „Warum diese Zeile?": was die Session zu genau diesem Schritt
@@ -3077,10 +3080,12 @@ mod verify_tab {
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Changes);
         assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
-        // Esc im Verify-Tab: zurück zu den Sessions.
+        // Esc im Verify-Tab, per Tab-Taste geöffnet (kein Ursprung): nichts
+        // (B1) — den Rückweg trägt der Navigationsverlauf (B2).
         app.reduce(Action::TabTo(2));
         app.reduce(Action::Back);
-        assert_eq!(app.tab, Tab::Sessions);
+        assert_eq!(app.tab, Tab::Verify);
+        assert_ne!(app.tab, Tab::Sessions);
     }
 
     /// Neu laden prüft die Signer immer neu: Eine ausgetauschte `seal.sig`
@@ -4201,6 +4206,7 @@ mod overview_tab {
 
     mod a1b;
     mod a6;
+    mod b1;
     mod b3;
 }
 
