@@ -111,12 +111,17 @@ fn a6_the_help_scrolls_and_starts_with_the_current_tab() {
     }
     // Bei 24 Zeilen passt nicht alles — die Legende ist erreichbar.
     assert!(!out.contains("Kinds:"), "{out}");
-    for _ in 0..40 {
+    // Scrollen erreicht die Legende (die Hilfe ist länger als sie).
+    let mut reached = false;
+    for _ in 0..120 {
         app.reduce(Action::Down);
+        if render_sized(&mut app, 80, 24).contains("Kinds:") {
+            reached = true;
+            break;
+        }
     }
-    let out = render_sized(&mut app, 80, 24);
     assert!(app.help, "scrolling keeps the help open");
-    assert!(out.contains("Kinds:"), "{out}");
+    assert!(reached, "the legend is reachable by scrolling");
     app.reduce(Action::Home);
     let out = render_sized(&mut app, 80, 24);
     assert!(out.contains("Changes:"), "{out}");

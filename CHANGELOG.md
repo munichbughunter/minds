@@ -27,6 +27,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **A glossary, explained in context.** Every status word has one plain
+  sentence in one place (`copy.rs`), with the distinctions that matter:
+  sealed is not verified, observed is not checked, a claim is not evidence,
+  not observed is not wrong, incomplete is not tampered — and the jargon
+  (hash-valid, epoch, witness, conformance, A0–A3) is explained. The first
+  footer line shows the sentence for the focused state in every view (the
+  session's seal state, the graph node, the evidence section, the Verify
+  verdict, the overview commit, intent bindings) instead of static
+  explanations; the help ends with the whole glossary and carries the
+  overview legend.
 - **One selection and focus style.** Every cursor row uses the same
   inverted style (the overview's grey bar and the bold rows of Verify and
   Intent are gone). The focused pane — session list, overview graph or

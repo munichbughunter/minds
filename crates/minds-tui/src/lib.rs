@@ -30,6 +30,7 @@ use minds_reader::Inspection;
 
 mod app;
 mod changes;
+mod copy;
 mod filter;
 mod input;
 mod intent;

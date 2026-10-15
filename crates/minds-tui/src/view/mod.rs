@@ -317,10 +317,9 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.tab == Tab::Verify {
-        let status = Line::from(Span::styled(
-            "The verdict of `minds verify` at a glance — signatures checked against the trusted signers, as verify does, once the check has run.",
-            theme::dim(),
-        ));
+        // Zeile 1: der Satz zum Urteil (C1) — kein statischer Erklärsatz.
+        let word = crate::copy::overall(app.verify.as_ref().map(|v| v.overall()));
+        let status = explain(word);
         let keys = Line::from(vec![
             freshness(app),
             Span::raw("  "),
@@ -339,14 +338,14 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.tab == Tab::Overview {
-        let status = Line::from(Span::styled(
-            format!(
-                "Each commit with what Minds knows: ◉CC = agent session, initials = author · @branch #tag · {} {} (as recorded) · ⚑ intent · ◉ sessions",
-                theme::seal(minds_reader::overview::SealMark::Sealed).0,
-                theme::seal(minds_reader::overview::SealMark::Sealed).1
-            ),
-            theme::dim(),
-        ));
+        // Zeile 1: der Satz zum Seal-Zustand des gewählten Commits (C1);
+        // die Legende der Pillen steht in der Hilfe.
+        let word = match app.overview.as_ref().and_then(|o| o.selected()) {
+            Some(crate::overview::Selected::Commit(row)) => crate::copy::seal(row.seal),
+            Some(crate::overview::Selected::Wip(_)) => "observed",
+            None => crate::copy::seal(None),
+        };
+        let status = explain(word);
         let focused = app
             .overview
             .as_ref()
@@ -376,10 +375,8 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.tab == Tab::Intent {
-        let status = Line::from(Span::styled(
-            "Intent anchors under refs/minds/intents — proof as `minds intent show`, signature as `minds verify`, bindings as recorded.",
-            theme::dim(),
-        ));
+        // Zeile 1 (C1): Bindungen an einen Anker sind aufgezeichnet — Aussagen.
+        let status = explain("claim");
         let mut keys = vec![
             freshness(app),
             Span::raw("  "),
@@ -410,17 +407,43 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                     Line::from(Span::styled(DEGRADED, theme::dim()))
                 } else {
                     let (glyph, word, style) = theme::evidence(card.evidence);
+                    // Der Evidenz-Satz vorn, dahinter der Satz zum Seal-Zustand
+                    // (C1) — Wörter ohne Glyph, der Badge steht in Zeile 2.
                     Line::from(vec![
                         Span::styled(format!("{glyph} {word}  "), style),
                         Span::styled(evidence_sentence(card.evidence).to_string(), theme::dim()),
+                        Span::styled("  ·  ", theme::dim()),
+                        Span::styled(integrity_sentence(card.axes()), theme::dim()),
                     ])
                 }
             })
             .unwrap_or_default(),
-        Some(View::Graph { .. }) => Line::from(Span::styled(
-            "Graph: intent → agent → effects → change → review. Details under the cursor.",
-            theme::dim(),
-        )),
+        // Graph (C1): der Satz zum Knoten unter dem Cursor — der Auftrag ist
+        // eine Aussage, ein ungedeuteter Aufruf beobachtet, sonst der
+        // Seal-Zustand der Session.
+        Some(View::Graph {
+            id, rows, cursor, ..
+        }) => {
+            let word = match rows.get(*cursor).map(|r| &r.kind) {
+                Some(minds_reader::graph::NodeKind::Intent) => Some("claim"),
+                Some(minds_reader::graph::NodeKind::Tool(
+                    minds_reader::graph::ToolKind::Uninterpreted,
+                )) => Some(crate::copy::interpretation(
+                    minds_reader::model::InterpretationAxis::Uninterpreted(1),
+                )),
+                _ => None,
+            };
+            match word {
+                Some(word) => explain(word),
+                None => Line::from(Span::styled(
+                    app.inspection
+                        .card(*id)
+                        .map(|c| integrity_sentence(c.axes()))
+                        .unwrap_or_default(),
+                    theme::dim(),
+                )),
+            }
+        }
         Some(View::Why { chain, .. }) => {
             let gaps = chain.gaps();
             if gaps.is_empty() {
@@ -439,13 +462,38 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 ))
             }
         }
-        Some(View::Evidence { report, .. }) => Line::from(Span::styled(
-            report
-                .as_ref()
-                .map(|r| r.sentence())
-                .unwrap_or(minds_reader::model::LEGACY_SENTENCE),
-            theme::dim(),
-        )),
+        // Evidence: der Satz des Reports, dahinter der Glossar-Satz der
+        // fokussierten Achse (C1).
+        Some(View::Evidence {
+            report,
+            uninterpreted,
+            cursor,
+            ..
+        }) => {
+            let axes = report.as_ref().map(|r| {
+                minds_reader::model::TrustAxes::of(
+                    &minds_reader::model::Provenance::Chained(r.state),
+                    *uninterpreted,
+                )
+            });
+            let word = axes.and_then(|axes| match cursor {
+                0 => Some(crate::copy::integrity(axes.integrity)),
+                1 => Some(crate::copy::coverage(axes.coverage)),
+                5 => Some(crate::copy::interpretation(axes.interpretation)),
+                _ => None,
+            });
+            let mut spans = vec![Span::styled(
+                report
+                    .as_ref()
+                    .map(|r| r.sentence())
+                    .unwrap_or(minds_reader::model::LEGACY_SENTENCE),
+                theme::dim(),
+            )];
+            if let Some(sentence) = word.and_then(crate::copy::sentence) {
+                spans.push(Span::styled(format!("  ·  {sentence}"), theme::dim()));
+            }
+            Line::from(spans)
+        }
     };
     let keys = if app.searching {
         Line::from(vec![
@@ -537,6 +585,21 @@ const PINNED: &str = "? help  q quit";
 /// Beim Tippen einer Suche sind `?` und `q` Zeichen der Suche — dort stehen
 /// rechts die Suchaktionen (C2: im Suchmodus haben sie Vorrang).
 const PINNED_SEARCH: &str = "Enter apply  Esc clear";
+
+/// Der Glossar-Satz zur Integrität einer Session.
+fn integrity_sentence(axes: minds_reader::model::TrustAxes) -> String {
+    crate::copy::sentence(crate::copy::integrity(axes.integrity))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Der Glossar-Satz zu `word` als Statuszeile (C1).
+fn explain(word: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        crate::copy::sentence(word).unwrap_or_default(),
+        theme::dim(),
+    ))
+}
 
 /// Kürzt eine Zeile auf `width` Zeichen — von rechts, mit „…", nie hart.
 fn fit(line: Line<'static>, width: usize) -> (Vec<Span<'static>>, usize) {

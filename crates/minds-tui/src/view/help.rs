@@ -31,7 +31,7 @@ q / Ctrl-C         quit";
 fn section(tab: Tab) -> &'static str {
     match tab {
         Tab::Overview => {
-            "Overview: ↑↓ commit · Enter its session(s) / graph · w why chain · Esc back (sessions)"
+            "Overview: ↑↓ commit · Enter its session(s) / graph · w why chain · Esc back (sessions)\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ intent · ◉N sessions"
         }
         Tab::Sessions => {
             "Sessions: ↑↓ session · Enter graph · w why · e evidence · t timeline · / search"
@@ -53,12 +53,36 @@ fn content(tab: Tab, width: usize) -> Vec<String> {
     lines.push(String::new());
     lines.extend(TEXT.lines().map(str::to_string));
     lines.push(String::new());
+    lines.extend(legend(width));
+    lines.push(String::new());
     for other in Tab::ALL.iter().filter(|t| **t != tab) {
         lines.extend(section(*other).lines().map(str::to_string));
     }
+    // Das Glossar (C1): dieselben Sätze, die die Fußzeile im Kontext zeigt.
     lines.push(String::new());
-    lines.extend(legend(width));
+    lines.push("Glossary".to_string());
+    for term in crate::copy::GLOSSARY {
+        lines.extend(wrap(term.sentence, width));
+    }
     lines
+}
+
+/// Bricht einen Satz an Wortgrenzen auf `width` um (Folgezeilen eingerückt).
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            out.push(std::mem::take(&mut line));
+            line.push_str("  ");
+        }
+        if !line.is_empty() && !line.ends_with("  ") {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    out.push(line);
+    out
 }
 
 /// Die Legende, aus dem Glyph-Register erzeugt (A1): erst die Zustände

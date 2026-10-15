@@ -778,3 +778,104 @@ fn b4_verbs_without_an_object_say_why() {
         "w in Changes"
     );
 }
+
+// ---------------------------------------------------------------------
+// C1 · Glossar an einer Stelle, Erklärung im Kontext
+// ---------------------------------------------------------------------
+
+#[test]
+fn c1_the_glossary_says_each_word_in_one_sentence() {
+    use crate::copy::{GLOSSARY, sentence};
+    for term in GLOSSARY {
+        assert!(!term.sentence.is_empty(), "{}", term.word);
+        assert!(term.sentence.ends_with('.'), "{}: one sentence", term.word);
+        assert_eq!(
+            term.sentence.matches(". ").count(),
+            0,
+            "{}: one sentence",
+            term.word
+        );
+    }
+    // Die Pflicht-Unterscheidungen.
+    for (word, says) in [
+        ("sealed", "not verified"),
+        ("observed", "not checked"),
+        ("claim", "not evidence"),
+        ("not observed", "not wrong"),
+        ("incomplete", "not tampered"),
+    ] {
+        let s = sentence(word).unwrap_or_else(|| panic!("{word} missing"));
+        assert!(s.contains(says), "{word}: {s}");
+    }
+    // Fachjargon ist erklärt.
+    for word in [
+        "hash-valid",
+        "epoch",
+        "witness",
+        "conformance",
+        "A0",
+        "A1",
+        "A2",
+        "A3",
+    ] {
+        assert!(sentence(word).is_some(), "{word} missing");
+    }
+}
+
+/// Die Hilfe nutzt dasselbe Glossar.
+#[test]
+fn c1_the_help_carries_the_glossary() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Help);
+    app.reduce(Action::End);
+    let mut seen = String::new();
+    for _ in 0..80 {
+        seen.push_str(&render_sized(&mut app, 160, 40));
+        app.reduce(Action::Up);
+    }
+    assert!(seen.contains("Glossary"), "{seen}");
+    // Lange Sätze bricht die Hilfe um — der Anfang steht auf einer Zeile.
+    for word in ["sealed", "hash-valid"] {
+        let head: String = crate::copy::sentence(word)
+            .unwrap()
+            .chars()
+            .take(40)
+            .collect();
+        assert!(seen.contains(&head), "{word}");
+    }
+}
+
+/// Zeile 1 der Fußzeile erklärt den fokussierten Zustand — in jeder Ansicht.
+#[test]
+fn c1_footer_line_one_explains_the_focused_state() {
+    use crate::copy::sentence;
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let footer = |out: &str| out.lines().rev().nth(1).unwrap_or("").to_string();
+    // Liste: Evidenz-Satz bleibt vorn, der Seal-Satz folgt.
+    let out = render_sized(&mut app, 300, 30);
+    assert!(
+        footer(&out).contains("Observed: the commit carries the"),
+        "{out}"
+    );
+    assert!(footer(&out).contains(sentence("sealed").unwrap()), "{out}");
+    // Graph auf YOU: der Auftrag ist eine Aussage.
+    app.reduce(Action::Enter);
+    let out = render_sized(&mut app, 300, 30);
+    assert!(footer(&out).contains(sentence("claim").unwrap()), "{out}");
+    app.reduce(Action::Back);
+    // Verify: das Urteilswort mit seinem Satz.
+    app.reduce(Action::TabTo(2));
+    let out = render_sized(&mut app, 300, 30);
+    assert!(
+        !footer(&out).contains("at a glance"),
+        "static sentence gone\n{out}"
+    );
+    assert!(
+        crate::copy::GLOSSARY
+            .iter()
+            .any(|t| footer(&out).contains(t.sentence)),
+        "{out}"
+    );
+}
