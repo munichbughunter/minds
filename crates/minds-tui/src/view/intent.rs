@@ -5,7 +5,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
@@ -98,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 let line = Line::from(spans);
                 rows.push(if i == state.cursor {
-                    line.style(Style::default().add_modifier(Modifier::BOLD))
+                    line.style(theme::cursor())
                 } else {
                     line
                 });

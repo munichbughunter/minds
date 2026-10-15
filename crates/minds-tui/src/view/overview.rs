@@ -276,29 +276,26 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 spans
             }
         };
+        // Der eine Auswahlstil (B7): theme::cursor(), wie überall.
         if i == state.cursor {
-            spans.insert(0, Span::styled("▌", theme::title()));
-            lines.push(
-                Line::from(spans).style(
-                    Style::default()
-                        .bg(Color::Indexed(236))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            );
+            spans.insert(0, Span::raw(" "));
+            lines.push(Line::from(spans).style(theme::cursor()));
         } else {
             spans.insert(0, Span::raw(" "));
             lines.push(Line::from(spans));
         }
     }
+    let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
     let mut title = if overview.budget_hit {
         format!(
-            " OVERVIEW · newest {} commits (read budget reached)",
+            " {}OVERVIEW · newest {} commits (read budget reached)",
+            mark,
             overview.rows.len()
         )
     } else if overview.truncated {
-        format!(" OVERVIEW · newest {} commits", overview.rows.len())
+        format!(" {}OVERVIEW · newest {} commits", mark, overview.rows.len())
     } else {
-        format!(" OVERVIEW · {} commits", overview.rows.len())
+        format!(" {}OVERVIEW · {} commits", mark, overview.rows.len())
     };
     if !state.filter.is_empty() {
         title.push_str(&format!(
@@ -324,7 +321,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     }
     title.push(' ');
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title).title_style(theme::title())),
+        Paragraph::new(lines).block({
+            let (border, _) = theme::pane(state.focus == OverviewFocus::Graph);
+            Block::bordered()
+                .title(title)
+                .title_style(theme::title())
+                .border_style(border)
+        }),
         left,
     );
 
@@ -532,11 +535,13 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(lines).block({
+            let (border, mark) = theme::pane(state.focus == OverviewFocus::Sessions);
             Block::bordered()
-                .title(" DETAIL ")
-                .title_style(theme::title()),
-        ),
+                .title(format!(" {mark}DETAIL "))
+                .title_style(theme::title())
+                .border_style(border)
+        }),
         area,
     );
 }

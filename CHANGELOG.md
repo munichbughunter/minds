@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **One selection and focus style.** Every cursor row uses the same
+  inverted style (the overview's grey bar and the bold rows of Verify and
+  Intent are gone). The focused pane — session list, overview graph or
+  detail, changed files or diff — carries `▸` in its title and a bold
+  border; unfocused panes have a dim border. Both work without colour.
 - **Consistent keys in `minds inspect`.** `1`–`5` switch tabs (F1–F5 and
   Tab/Shift-Tab still work); zoom moved to `z` (finer) and `Z` (coarser). The
   object verbs mean the same in every tab, on any session or commit in

@@ -158,7 +158,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(text)
                 .style(theme::dim())
-                .block(sessions_block()),
+                .block(sessions_block(app.top().is_none())),
             table_area,
         );
         draw_notice(frame, notice_area, rejected.len());
@@ -195,16 +195,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Table::new(rows, columns.widths())
             .header(header)
             .column_spacing(1)
-            .block(sessions_block()),
+            .block(sessions_block(app.top().is_none())),
         table_area,
     );
     draw_notice(frame, notice_area, rejected.len());
 }
 
-fn sessions_block() -> Block<'static> {
+/// Der Rahmen der Liste — fokussiert, solange keine Ebene über ihr liegt
+/// (B7).
+fn sessions_block(focused: bool) -> Block<'static> {
+    let (border, mark) = theme::pane(focused);
     Block::bordered()
-        .title(" SESSIONS ")
+        .title(format!(" {mark}SESSIONS "))
         .title_style(theme::title())
+        .border_style(border)
 }
 
 /// Eine Karte als Tabellenzeile. Degradierte Zeilen sind gedimmt und tragen

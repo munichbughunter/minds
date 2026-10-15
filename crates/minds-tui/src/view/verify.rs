@@ -336,7 +336,7 @@ fn conformance_lines(state: &VerifyState, lines: &mut Vec<Line<'static>>) {
 
 fn emphasis(line: Line<'static>, on: bool) -> Line<'static> {
     if on {
-        line.style(Style::default().add_modifier(Modifier::BOLD))
+        line.style(theme::cursor())
     } else {
         line
     }

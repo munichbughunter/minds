@@ -359,9 +359,20 @@ pub fn lane(depth: usize) -> Style {
     }
 }
 
-/// Die Cursorzeile.
+/// Die Cursorzeile — der eine Auswahlstil der Oberfläche (B7).
 pub fn cursor() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
+}
+
+/// Rahmenstil und Titel-Marke eines Bereichs (B7): der fokussierte mit
+/// hervorgehobenem Rahmen und `▸` im Titel, ein unfokussierter gedimmt — die
+/// Marke trägt den Fokus auch ohne Farbe.
+pub fn pane(focused: bool) -> (Style, &'static str) {
+    if focused {
+        (Style::default().add_modifier(Modifier::BOLD), "▸ ")
+    } else {
+        (dim(), "")
+    }
 }
 
 /// Gedimmter Nebentext.

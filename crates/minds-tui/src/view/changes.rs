@@ -176,8 +176,9 @@ fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
             }
         })
         .collect();
+    let (_, mark) = theme::pane(state.focus == Focus::Files);
     let mut title = format!(
-        " FILES · {short} · {}/{} ",
+        " {mark}FILES · {short} · {}/{} ",
         state.at + 1,
         state.commits.len()
     );
@@ -190,7 +191,13 @@ fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
         ));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(Block::bordered().title(title).title_style(theme::title())),
+        Paragraph::new(lines).block({
+            let (border, _) = theme::pane(state.focus == Focus::Files);
+            Block::bordered()
+                .title(title)
+                .title_style(theme::title())
+                .border_style(border)
+        }),
         area,
     );
 }
@@ -218,7 +225,14 @@ fn draw_file_head(
         _ => "unified".to_string(),
     };
     let title = Line::from(vec![
-        Span::styled(format!(" {}", file.path), theme::title()),
+        Span::styled(
+            format!(
+                " {}{}",
+                theme::pane(state.focus == Focus::Diff).1,
+                file.path
+            ),
+            theme::title(),
+        ),
         Span::raw("   "),
         Span::styled(format!("+{}", file.added), Style::default().fg(theme::OK)),
         Span::raw(" "),
