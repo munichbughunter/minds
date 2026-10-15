@@ -184,6 +184,12 @@ pub const REGISTER: &[Glyph] = &[
     glyph("■", GlyphClass::Structural, "change", "change / commit"),
     glyph("▲", GlyphClass::Structural, "head", "HEAD"),
     glyph(
+        "⚑",
+        GlyphClass::Structural,
+        "requirement",
+        "a session names a requirement",
+    ),
+    glyph(
         "□",
         GlyphClass::Structural,
         "pending",

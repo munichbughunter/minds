@@ -19,6 +19,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Overview rows: subject first, the request below, status quiet.** Each
+  commit reads lanes · badge · subject · status · refs · time. Status and refs
+  are fixed right-aligned columns; the subject gets the rest (at least 30
+  characters at 120 columns before the refs give way). The status column shows
+  the seal state with glyph and word, `⚑` when a session names a requirement,
+  `◉N` for several sessions and the review only when it differs from open.
+  Refs are a quiet text column, no coloured pills; times are relative
+  (`3h ago`). An agent commit carries a second, dimmed line with its request;
+  the selection is one bar over both lines without partial backgrounds.
 - **One source for every number in the overview.** The overview title counts
   exactly the rows it shows — `4 commits · 1 with an agent session` — computed
   by the reader (`Overview::counts`), so the number on top can be counted in

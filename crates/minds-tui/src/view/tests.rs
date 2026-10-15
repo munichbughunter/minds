@@ -3785,8 +3785,13 @@ mod overview_tab {
         assert!(!out.contains(" ◆CC "), "agent badge: {out}");
         assert!(out.contains(" PD "), "human badge: {out}");
         assert!(out.contains("feat(sort): agent work"), "{out}");
-        assert!(out.contains("• Fix retry handling"), "{out}");
-        assert!(out.contains("⚑ intent"), "{out}");
+        // Der Auftrag steht in der zweiten Zeile, ohne `•` (C3.2).
+        assert!(out.contains("Fix retry handling"), "{out}");
+        assert!(!out.contains("• Fix retry handling"), "{out}");
+        // Die Anforderung als Zeichen in der Status-Spalte, nicht als
+        // Pille „intent" (C3: requirement, nicht intent).
+        assert!(out.contains(" ⚑"), "{out}");
+        assert!(!out.contains("⚑ intent"), "{out}");
         assert!(out.contains("◉2"), "{out}");
         // HEAD ist eine Ref, kein beobachteter Zustand (A1).
         assert!(out.contains("▲ HEAD"), "{out}");

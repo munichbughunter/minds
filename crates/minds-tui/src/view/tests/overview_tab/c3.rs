@@ -31,15 +31,20 @@ fn c3_the_subject_leads_and_states_stand_right() {
     let subject = row.find("feat(sort): agent work").unwrap();
     let state = row.find("unsealed").expect("seal state pill");
     assert!(subject < state, "subject first: {row}");
-    // Rechtsbündig: Die Zeile der Liste endet mit den Zustands-Pillen,
-    // davor steht Luft.
+    // Rechtsbündig: Die Zustände stehen in einer festen Spalte, davor
+    // steht Luft; die Zeile endet mit der Zeit (C3.2: Status · Refs ·
+    // Zeit), nicht mehr mit einer Pille.
     let list_part = &row[subject..row[subject..].find('│').map_or(row.len(), |b| b + subject)];
     assert!(
-        list_part.trim_end().ends_with("⚑ intent"),
+        list_part.trim_end().ends_with("just now"),
         "right-aligned: {row}"
     );
     assert!(
-        list_part.contains("   · unsealed"),
+        !list_part.trim_end().ends_with("⚑ intent"),
+        "right-aligned: {row}"
+    );
+    assert!(
+        list_part.contains("   · unsealed ⚑"),
         "padding before the states: {row}"
     );
     // Die Zahlen stehen im Titel der Übersicht — gezählt über die Zeilen

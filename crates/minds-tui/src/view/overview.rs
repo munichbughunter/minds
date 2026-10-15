@@ -68,94 +68,98 @@ fn badge(spans: &mut Vec<Span<'static>>, name: &str, agent: bool, nerd: bool) {
     }
 }
 
-/// Die Ref-Farben — nie das Grün der Belege (`theme::OK`): Ein Branch, der
-/// `✓approved` heißt, darf nicht wie ein Review aussehen.
-const HEAD_REF: Color = Color::Indexed(31);
-const BRANCH_REF: Color = Color::Indexed(24);
-const TAG_REF: Color = Color::Indexed(94);
-
-/// Die Pillen eines Commits: Refs, dann was Minds weiß.
-/// Die Refs eines Commits als kompakte Pillen — direkt hinter dem Badge
-/// (C3).
-fn refs(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
-    // Refs tragen immer ein Präfix (Icon oder `@`/`#`), nie eine
-    // Belegfarbe — sonst könnte ein Branch-Name einen Status vortäuschen.
+/// Die Refs eines Commits als leise Textspalte (C3.2) — keine Pillen, nie
+/// eine Belegfarbe: Ein Branch, der `✓approved` heißt, darf nicht wie ein
+/// Review aussehen. Jede Ref trägt ihr Präfix (Icon oder `@`/`#`).
+fn refs_text(row: &CommitRow, nerd: bool) -> String {
     let (branch, tag) = if nerd {
         ("\u{e0a0} ", "\u{f02b} ")
     } else {
         ("@", "#")
     };
-    for label in &row.refs {
-        let (text, bg) = match label {
-            RefLabel::Head(name) => (format!("{branch}{name} {} HEAD", theme::HEAD), HEAD_REF),
-            RefLabel::Branch(name) => (format!("{branch}{name}"), BRANCH_REF),
-            RefLabel::Tag(name) => (format!("{tag}{name}"), TAG_REF),
-            RefLabel::Detached => (format!("{} HEAD (detached)", theme::HEAD), HEAD_REF),
-            RefLabel::More(n) => (format!("+{n}"), Color::Indexed(238)),
-        };
-        let body = Style::default().fg(Color::White).bg(bg);
-        if nerd {
-            spans.push(Span::styled("\u{e0b6}", Style::default().fg(bg)));
-            spans.push(Span::styled(text, body));
-            spans.push(Span::styled("\u{e0b4}", Style::default().fg(bg)));
-        } else {
-            spans.push(Span::styled(format!(" {text} "), body));
-        }
-        spans.push(Span::raw(" "));
-    }
+    row.refs
+        .iter()
+        .map(|label| match label {
+            RefLabel::Head(name) => format!("{branch}{name} {} HEAD", theme::HEAD),
+            RefLabel::Branch(name) => format!("{branch}{name}"),
+            RefLabel::Tag(name) => format!("{tag}{name}"),
+            RefLabel::Detached => format!("{} HEAD (detached)", theme::HEAD),
+            RefLabel::More(n) => format!("+{n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Was Minds über den Commit weiß, als Pillen — rechtsbündig in der Zeile
-/// (C3): Conformance, Seal-Zustand, abweichendes Review, Intent, mehrere
-/// Sessions. Normalzustände bekommen keine Pille.
-fn states(
-    spans: &mut Vec<Span<'static>>,
-    row: &CommitRow,
-    conformance: Option<ConformanceMark>,
-    nerd: bool,
-) {
-    // Die Conformance gilt jedem Commit, auch einem ohne Session — eine
-    // Pille, sobald sie gerechnet ist (gewählter Commit, HEAD). Farbe nie
-    // allein: Glyph und Wort tragen das Ergebnis.
+/// Die Status-Spalte eines Commits (C3.2): Conformance, Seal-Zustand (Glyph
+/// **und** Wort — „sealed" nur, wenn jedes Seal signiert ist), abweichendes
+/// Review, `⚑` für eine gebundene Anforderung, `◉N` bei mehreren Sessions.
+/// Normalzustände (Review „open") bleiben leise. Nur Vordergrundfarben —
+/// die Auswahl ist ein einziger Balken.
+fn status(row: &CommitRow, conformance: Option<ConformanceMark>) -> Vec<Span<'static>> {
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    // Die Conformance gilt jedem Commit, auch einem ohne Session — sobald
+    // sie gerechnet ist (gewählter Commit, HEAD). Farbe nie allein.
     if let Some(mark) = conformance {
-        pill(spans, conformance_pill(mark), conformance_color(mark), nerd);
+        parts.push(Span::styled(
+            conformance_pill(mark),
+            Style::default().fg(conformance_color(mark)),
+        ));
     }
     // Was Minds weiß — nur an Commits, die Minds kennt (Session, Change-Id
     // oder ein Review), sonst bliebe jeder fremde Commit „open".
-    if row.sessions.is_empty() && row.change.is_none() && row.review == Verdict::Open {
-        return;
+    if !(row.sessions.is_empty() && row.change.is_none() && row.review == Verdict::Open) {
+        if let Some(seal) = row.seal {
+            let (glyph, word, style) = theme::seal(seal);
+            parts.push(Span::styled(format!("{glyph} {word}"), style));
+        }
+        if row.review != Verdict::Open {
+            let (glyph, word, style) = theme::verdict(row.review);
+            parts.push(Span::styled(format!("{glyph} {word}"), style));
+        }
+        if row.intent {
+            parts.push(Span::styled("⚑", Style::default().fg(theme::HUMAN)));
+        }
+        if row.sessions.len() > 1 {
+            parts.push(Span::styled(
+                format!("◉{}", row.sessions.len()),
+                Style::default().fg(theme::AGENT),
+            ));
+        }
     }
-    if let Some(seal) = row.seal {
-        let (glyph, word, style) = theme::seal(seal);
-        pill(
-            spans,
-            format!("{glyph} {word}"),
-            style.fg.unwrap_or(Color::Gray),
-            nerd,
-        );
+    let mut spans = Vec::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(part);
     }
-    // Review „open" ist der Normalzustand — keine Pille; nur Abweichungen
-    // (approved, needs work, rejected) sind laut (A4).
-    if row.review != Verdict::Open {
-        let (glyph, word, style) = theme::verdict(row.review);
-        pill(
-            spans,
-            format!("{glyph} {word}"),
-            style.fg.unwrap_or(Color::Gray),
-            nerd,
-        );
-    }
-    if row.intent {
-        pill(spans, "⚑ intent".into(), theme::HUMAN, nerd);
-    }
-    if row.sessions.len() > 1 {
-        pill(
-            spans,
-            format!("◉{}", row.sessions.len()),
-            theme::AGENT,
-            nerd,
-        );
-    }
+    spans
+}
+
+/// Das Badge in der Liste als Text, ohne eigenen Hintergrund (C3.2):
+/// Initialen des Agenten mit `◉` (bzw. Roboter-Icon) oder des Autors —
+/// nicht nur die Farbe unterscheidet. Vier Spalten breit.
+fn badge_text(name: &str, agent: bool, nerd: bool) -> Span<'static> {
+    let text = if agent {
+        let mark = if nerd {
+            "\u{f06a9}"
+        } else {
+            theme::node(&minds_reader::graph::NodeKind::Agent).0
+        };
+        format!("{mark}{}", initials(name))
+    } else {
+        initials(name)
+    };
+    let pad = 4usize.saturating_sub(text.chars().count());
+    let color = if agent { theme::AGENT } else { theme::HUMAN };
+    Span::styled(
+        format!("{text}{}", " ".repeat(pad)),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn width_of(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
 /// Der Text der Conformance-Pille.
@@ -202,6 +206,23 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
     spans
 }
 
+/// Die Lanes unter einem Commit — für die zweite Zeile eines
+/// Agent-Commits: `│`, wo ein Zweig zur nächsten Zeile weiterläuft.
+fn graph_through(next: Option<&CommitRow>, width: usize) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for i in 0..width {
+        let cell = next.and_then(|n| n.graph.get(i));
+        match cell {
+            Some(cell) if matches!(cell.glyph, '●' | '│' | '┼' | '╯' | '╰' | '┤' | '├' | '…') =>
+            {
+                spans.push(Span::styled("│ ", Style::default().fg(lane(cell.lane))));
+            }
+            _ => spans.push(Span::raw("  ")),
+        }
+    }
+    spans
+}
+
 fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(theme::PENDING, Style::default().fg(theme::AGENT)),
@@ -211,7 +232,8 @@ fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
         spans.push(Span::raw(" ".repeat((width - 1) * 2)));
     }
     spans.push(Span::raw(" "));
-    badge(&mut spans, &wip.agent, true, nerd);
+    spans.push(badge_text(&wip.agent, true, nerd));
+    spans.push(Span::raw(" "));
     // Nur, was bekannt ist: `SessionEnd` gesehen oder nicht.
     let (word, style) = match wip.state {
         WipState::Ended => ("ended · no commit linked  ", theme::dim()),
@@ -227,6 +249,10 @@ fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     spans.push(Span::styled(wip.request.clone(), theme::dim()));
     spans
 }
+
+/// So viele Zeichen soll der Betreff mindestens bekommen, bevor die Refs
+/// weichen (C3.2).
+const SUBJECT_MIN: usize = 30;
 
 /// Die Zahlen des Titels (C3.1): keine Prozente, die den Nenner verstecken;
 /// gekappt sagt die Zahl, dass sie nur das Gelesene zählt.
@@ -284,10 +310,126 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let total = overview.wip.len() + overview.rows.len();
     // Nur die Treffer des Filters aus `/` (B4); ohne Filter alle.
     let shown = state.shown();
-    // Was fehlt, steht im Titel — nie still.
     let height = usize::from(left.height.saturating_sub(2));
-    let at = shown.iter().position(|&i| i == state.cursor).unwrap_or(0);
-    let first = crate::view::offset(at, shown.len(), height);
+    let now = app.now_secs();
+    // Feste, rechtsbündige Spalten (C3.2): Status, Refs, Zeit — so breit
+    // wie ihr breitester Eintrag; der Betreff bekommt den Rest. Wird es eng,
+    // weichen zuerst die Refs (sekundär), nie der Status.
+    let commit_rows: Vec<&CommitRow> = shown
+        .iter()
+        .filter_map(|&i| i.checked_sub(overview.wip.len()))
+        .filter_map(|at| overview.rows.get(at))
+        .collect();
+    let conformance = |row: &CommitRow| state.conformance.get(&row.id).copied().flatten();
+    let status_w = commit_rows
+        .iter()
+        .map(|row| width_of(&status(row, conformance(row))))
+        .max()
+        .unwrap_or(0);
+    let refs_full = commit_rows
+        .iter()
+        .map(|row| refs_text(row, nerd).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    let time_w = commit_rows
+        .iter()
+        .map(|row| crate::view::ago_secs(row.time, now).chars().count())
+        .max()
+        .unwrap_or(0);
+    // Lead, Lanes, Badge (4) und Luft.
+    let lead_w = 1 + width * 2 + 5;
+    let fixed = |refs: usize| lead_w + status_w + 1 + refs + usize::from(refs > 0) + time_w + 1;
+    // Der Betreff höchstens so breit, wie der längste ihn braucht — dann
+    // rücken Status, Refs und Zeit heran, statt weit rechts zu stehen.
+    let longest = commit_rows
+        .iter()
+        .map(|row| row.subject.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Gekürzt kostet die Ellipse ein Zeichen: 30 sichtbare plus `…`.
+    let needed = if longest > SUBJECT_MIN {
+        SUBJECT_MIN + 1
+    } else {
+        longest
+    };
+    let refs_w = if row_w.saturating_sub(fixed(refs_full)) >= needed {
+        refs_full
+    } else {
+        0
+    };
+    let subject_w = row_w.saturating_sub(fixed(refs_w)).min(longest).max(1);
+
+    // Jeder Eintrag als eine oder zwei Bildschirmzeilen; das Fenster
+    // rechnet in Bildschirmzeilen, die Auswahl bleibt ganz sichtbar.
+    let mut entries: Vec<(usize, Vec<Line>)> = Vec::new();
+    for &i in &shown {
+        let selected = i == state.cursor;
+        let mut lines = match i.checked_sub(overview.wip.len()) {
+            None => {
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(wip_spans(&overview.wip[i], width, nerd));
+                vec![Line::from(spans)]
+            }
+            Some(at) => {
+                let row = &overview.rows[at];
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(graph_spans(row, width));
+                spans.push(match &row.agent {
+                    Some(agent) => badge_text(agent, true, nerd),
+                    None => badge_text(&row.author, false, nerd),
+                });
+                spans.push(Span::raw(" "));
+                let subject = crate::view::clip(&row.subject, subject_w);
+                let pad = subject_w.saturating_sub(subject.chars().count());
+                spans.push(Span::raw(subject));
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                let state_spans = status(row, conformance(row));
+                let gap = status_w.saturating_sub(width_of(&state_spans));
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.extend(state_spans);
+                if refs_w > 0 {
+                    let refs = crate::view::clip(&refs_text(row, nerd), refs_w);
+                    let gap = refs_w.saturating_sub(refs.chars().count());
+                    spans.push(Span::raw(" ".repeat(gap + 1)));
+                    spans.push(Span::styled(refs, theme::dim()));
+                }
+                let time = crate::view::ago_secs(row.time, now);
+                let gap = time_w.saturating_sub(time.chars().count());
+                spans.push(Span::raw(" ".repeat(gap + 1)));
+                spans.push(Span::styled(time, theme::dim()));
+                let mut lines = vec![Line::from(spans)];
+                // Der Auftrag eines Agent-Commits darunter, gedimmt (C3.2).
+                if let (Some(_), Some(request)) = (&row.agent, &row.request) {
+                    let mut below = vec![Span::raw(" ")];
+                    below.extend(graph_through(overview.rows.get(at + 1), width));
+                    below.push(Span::raw("     "));
+                    let room = row_w.saturating_sub(lead_w);
+                    below.push(Span::styled(
+                        crate::view::clip(request, room),
+                        theme::dim().add_modifier(Modifier::ITALIC),
+                    ));
+                    lines.push(Line::from(below));
+                }
+                lines
+            }
+        };
+        // Der eine Auswahlstil (B7): theme::cursor() über alle Zeilen des
+        // Eintrags, ohne Teil-Hintergründe.
+        if selected {
+            lines = lines
+                .into_iter()
+                .map(|line| {
+                    let used = width_of(&line.spans);
+                    let mut line = line;
+                    line.spans
+                        .push(Span::raw(" ".repeat(row_w.saturating_sub(used) + 1)));
+                    line.style(theme::cursor())
+                })
+                .collect();
+        }
+        entries.push((i, lines));
+    }
     let mut lines: Vec<Line> = Vec::new();
     if total == 0 {
         lines.push(Line::from(Span::styled(
@@ -295,52 +437,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             theme::dim(),
         )));
     }
-    for &i in shown.iter().skip(first).take(height.max(1)) {
-        let mut spans = match i.checked_sub(overview.wip.len()) {
-            None => wip_spans(&overview.wip[i], width, nerd),
-            Some(at) => {
-                let row = &overview.rows[at];
-                let mut spans = graph_spans(row, width);
-                spans.push(Span::raw(" "));
-                match &row.agent {
-                    Some(agent) => badge(&mut spans, agent, true, nerd),
-                    None => badge(&mut spans, &row.author, false, nerd),
-                }
-                // Lanes · Badge · Refs · **Betreff** · Auftrag (gedimmt) —
-                // rechtsbündig die Zustände (C3): Was man überfliegt, steht
-                // vorn; gekürzt wird der Text, nie die Zustände.
-                refs(&mut spans, row, nerd);
-                let mark = state.conformance.get(&row.id).copied().flatten();
-                let mut right: Vec<Span<'static>> = Vec::new();
-                states(&mut right, row, mark, nerd);
-                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
-                let room = row_w.saturating_sub(used + right_w + 1);
-                let mut text = row.subject.clone();
-                if let Some(request) = &row.request {
-                    text.push_str(&format!("  • {request}"));
-                }
-                let text = crate::view::clip(&text, room);
-                let subject_len = row.subject.chars().count().min(text.chars().count());
-                let subject: String = text.chars().take(subject_len).collect();
-                let rest: String = text.chars().skip(subject_len).collect();
-                let pad = room.saturating_sub(text.chars().count());
-                spans.push(Span::raw(subject));
-                spans.push(Span::styled(rest, theme::dim()));
-                spans.push(Span::raw(" ".repeat(pad + 1)));
-                spans.extend(right);
-                spans
-            }
-        };
-        // Der eine Auswahlstil (B7): theme::cursor(), wie überall.
-        if i == state.cursor {
-            spans.insert(0, Span::raw(" "));
-            lines.push(Line::from(spans).style(theme::cursor()));
-        } else {
-            spans.insert(0, Span::raw(" "));
-            lines.push(Line::from(spans));
-        }
-    }
+    let all: usize = entries.iter().map(|(_, l)| l.len()).sum();
+    let (start, len) = entries
+        .iter()
+        .scan(0usize, |at, (i, l)| {
+            let here = *at;
+            *at += l.len();
+            Some((*i, here, l.len()))
+        })
+        .find(|(i, _, _)| *i == state.cursor)
+        .map(|(_, here, len)| (here, len))
+        .unwrap_or((0, 1));
+    let first = crate::view::offset(start + len - 1, all, height).min(start);
+    lines.extend(
+        entries
+            .into_iter()
+            .flat_map(|(_, l)| l)
+            .skip(first)
+            .take(height.max(1)),
+    );
     let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
     // Die Zahlen genau einmal, hier (C3.1) — aus den gelesenen Zeilen.
     let mut title = format!(

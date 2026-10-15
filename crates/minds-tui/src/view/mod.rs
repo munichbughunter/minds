@@ -832,9 +832,16 @@ pub fn ago(ts: Option<&str>, now: i64) -> String {
     let Some(at) = ts.and_then(minds_metrics::epoch_seconds) else {
         return when(ts);
     };
-    let secs = now - at;
-    match secs {
-        s if s < 0 => when(ts),
+    if now < at {
+        return when(ts);
+    }
+    ago_secs(at, now)
+}
+
+/// [`ago`] für einen Zeitpunkt in Sekunden seit Epoch — dieselben Wörter;
+/// in der Zukunft `just now` (Uhrenversatz zwischen Rechnern).
+pub fn ago_secs(at: i64, now: i64) -> String {
+    match now - at {
         s if s < 60 => "just now".into(),
         s if s < 3_600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3_600),

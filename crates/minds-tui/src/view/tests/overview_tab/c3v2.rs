@@ -117,3 +117,189 @@ fn c31_a_capped_title_says_what_was_read() {
     );
     assert!(!crate::view::overview::counts_title(&open, false).contains('%'));
 }
+
+// ---------------------------------------------------------------------
+// C3.2 · Die Liste: Betreff vorn, Auftrag sichtbar, Status leise
+// ---------------------------------------------------------------------
+
+/// Das Raster der Liste — die Zeilen links der Grenze zum Detail.
+fn list_lines(lines: &[String]) -> Vec<String> {
+    lines
+        .iter()
+        .map(|l| l.split("││").next().unwrap_or(l).to_string())
+        .collect()
+}
+
+/// Spalten: Lanes · Badge · Betreff · Status · Refs · Zeit. Agent-Commits
+/// tragen eine zweite, gedimmte Zeile mit dem Auftrag; menschliche bleiben
+/// einzeilig. Der Graph läuft mit `│` an der zweiten Zeile vorbei.
+#[test]
+fn c32_subject_status_refs_time_and_the_request_below() {
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    let lines = list_lines(&lines_at(&mut app, 160, 40));
+    let out = lines.join("\n");
+    let at = lines
+        .iter()
+        .position(|l| l.contains("feat(sort): agent work"))
+        .expect("agent row");
+    let row = &lines[at];
+    let subject = row.find("feat(sort): agent work").unwrap();
+    let status = row.find("· unsealed").expect("status");
+    // Frisch angelegt: „just now" — sonst „3h ago" (dieselben Wörter wie
+    // die Sessions-Liste, C4).
+    let time = row
+        .find("just now")
+        .or_else(|| row.find(" ago"))
+        .expect("relative time");
+    assert!(subject < status && status < time, "{out}");
+    // Der Auftrag steht nicht mehr in der Zeile, sondern darunter.
+    assert!(!row.contains("Fix retry handling"), "{out}");
+    assert!(!out.contains("• Fix retry handling"), "{out}");
+    let below = &lines[at + 1];
+    assert!(below.contains("Fix retry handling"), "{out}");
+    assert!(
+        below.trim_start_matches(['│', ' ']).starts_with("│") || below.contains("│ "),
+        "{out}"
+    );
+    // HEAD-Zeile: Refs als leise Textspalte zwischen Status und Zeit.
+    let head = lines
+        .iter()
+        .find(|l| l.contains("docs: two sessions"))
+        .unwrap();
+    let refs = head.find("@main ▲ HEAD").expect("refs column");
+    assert!(head.find("◉2").unwrap() < refs, "{out}");
+    assert!(refs < head.find("just now").unwrap(), "{out}");
+    // Der menschliche Commit bleibt einzeilig.
+    let human = lines
+        .iter()
+        .position(|l| l.contains("init: empty"))
+        .unwrap();
+    assert!(
+        lines[human + 1]
+            .trim_matches(['│', ' ', '└', '─', '┘'])
+            .is_empty(),
+        "{out}"
+    );
+    // Keine farbigen Pillen mehr: der Auftrag nicht hinter einem `•`, das
+    // Requirement-Zeichen ohne Pillen-Wort.
+    assert!(out.contains("⚑"), "{out}");
+    assert!(!out.contains("⚑ intent"), "{out}");
+}
+
+/// Bei 120 Spalten (geteilt) bekommt der Betreff mindestens 30 Zeichen, und
+/// die Status-Spalte bleibt vollständig; bei 80 und 160 ebenso vollständig.
+#[test]
+fn c32_the_subject_gets_thirty_columns_at_120() {
+    let (dir, _, _, _) = history();
+    let long = "feat(sort): a stable sort that keeps equal keys in input order";
+    git(dir.path(), &["commit", "-q", "--allow-empty", "-m", long]);
+    let head: CommitId = git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+    let repo = Repo::open(dir.path()).unwrap();
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    sessions.insert(sid('c'), session("Write the docs", "2026-07-25T15:00:00Z"));
+    let mut links = BTreeMap::new();
+    links.insert(head, vec![sid('a'), sid('c')]);
+    let inspection = Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
+    let mut app = opened(&repo, inspection);
+    for (w, h) in [(80u16, 24u16), (120, 30), (160, 40)] {
+        let lines = list_lines(&lines_at(&mut app, w, h));
+        let out = lines.join("\n");
+        let row = lines
+            .iter()
+            .find(|l| l.contains("feat(sort): a stable"))
+            .unwrap_or_else(|| panic!("{w}: {out}"));
+        assert!(row.contains("· unsealed"), "{w}: {out}");
+        assert!(row.contains("◉2"), "{w}: {out}");
+        if w >= 120 {
+            let shown: String = long.chars().take(30).collect();
+            assert!(row.contains(&shown), "{w}: {out}");
+        }
+    }
+}
+
+/// Ein Auswahlbalken über die volle Zeile (beide Zeilen beim Agent-Commit):
+/// kein Span der Auswahl hat einen eigenen Hintergrund.
+#[test]
+fn c32_the_selection_is_one_bar() {
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+    terminal
+        .draw(|frame| super::super::super::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let text = |y: u16| -> String {
+        (0..160)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect()
+    };
+    let y = (0..40)
+        .find(|y| text(*y).contains("docs: two sessions"))
+        .unwrap();
+    // Die Liste endet an ihrer rechten Rahmenkante (das zweite `│`).
+    let edge = text(y)
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| *c == '│')
+        .nth(1)
+        .map(|(x, _)| x as u16)
+        .unwrap();
+    for row in [y, y + 1] {
+        for x in 1..edge {
+            let cell = &buffer[(x, row)];
+            assert_eq!(
+                cell.bg,
+                ratatui::style::Color::Reset,
+                "bg at {x},{row}: {}",
+                text(row)
+            );
+            assert!(
+                cell.modifier.contains(ratatui::style::Modifier::REVERSED),
+                "cursor at {x},{row}: {}",
+                text(row)
+            );
+        }
+    }
+    // Keine ▌-Fragmente.
+    assert!(!(0..40).any(|y| text(y).contains('▌')));
+}
+
+/// Review „open" ist der Normalzustand und leise; ein freigegebener Commit
+/// sagt es — mit dem Glyph des Registers (`⊕`, nicht `✓`: `✓` heißt
+/// „Prüfung bestanden").
+#[test]
+fn c32_open_is_quiet_and_approved_is_said() {
+    let (_dir, repo, commits, _) = history();
+    let mut sessions = BTreeMap::new();
+    sessions.insert(
+        sid('a'),
+        session("Fix retry handling", "2026-07-25T14:10:00Z"),
+    );
+    sessions.insert(sid('c'), session("Write the docs", "2026-07-25T15:00:00Z"));
+    let mut links = BTreeMap::new();
+    links.insert(commits[2], vec![sid('a')]);
+    links.insert(commits[1], vec![sid('c')]);
+    let review = minds_core::Review::new(
+        minds_core::Subject::Session(sid('a').to_string()),
+        minds_core::Decision::Approve,
+        "pd",
+        "ok",
+        Some("2026-07-26T00:00:00Z".into()),
+    );
+    let inspection =
+        Inspection::from_index(Index::from_parts(sessions, links), vec![review], "demo");
+    let mut app = opened(&repo, inspection);
+    let lines = list_lines(&lines_at(&mut app, 160, 40));
+    let out = lines.join("\n");
+    assert!(!out.contains("⚠ open"), "{out}");
+    let approved = lines
+        .iter()
+        .find(|l| l.contains("docs: two sessions"))
+        .unwrap();
+    assert!(approved.contains("⊕ approved"), "{out}");
+}
