@@ -19,13 +19,15 @@ use crate::view::{ago, clip, offset};
 
 /// Die schmalste Breite, in der die kompakte Stufe alle ihre Spalten zeigt
 /// — die Untergrenze für die Listenspalte neben der Vorschau.
-pub const COMPACT_WIDTH: u16 = 64;
+pub const COMPACT_WIDTH: u16 = 59;
 /// Ab hier stehen alle Beweisspalten (Seal **und** Verdict) nebeneinander.
-pub const FULL_WIDTH: u16 = 97;
+pub const FULL_WIDTH: u16 = 92;
 /// Ab hier kommt der Umfang (Dateien, Tokens) dazu.
 pub const WIDE_WIDTH: u16 = 120;
 
-const TIME_W: u16 = 13;
+/// Die Zeit relativ (`just now`, `82d ago`, C4) — schmaler als das alte
+/// `25.07. 14:10Z`; die Überschrift bekommt den Platz (A6).
+const TIME_W: u16 = 8;
 const AGENT_W: u16 = 22;
 const AGENT_COMPACT_W: u16 = 12;
 const SIZE_W: u16 = 20;
@@ -230,7 +232,10 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize, now: i
     ));
 
     let mut cells = vec![
-        Cell::from(Span::styled(ago(card.started_at.as_deref(), now), base)),
+        Cell::from(Span::styled(
+            clip(&ago(card.started_at.as_deref(), now), TIME_W as usize),
+            base,
+        )),
         Cell::from(session),
         // Je Agent eine feste Farbe — das Wort steht daneben. Eine
         // degradierte Zeile bleibt ganz grau: Ihr Akteur ist „—", kein Agent.

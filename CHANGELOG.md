@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **More room for the session headline.** Beside the preview, the session
+  list now gives the headline at least 30 columns at 120 terminal columns
+  (it had 16): the time column is narrower with relative times, the list
+  never shrinks below that, and the detail keeps 46 columns. Wide terminals
+  keep their split.
 - **A reproducible demo for `minds inspect`.** `cargo xtask demo-fixture
   <dir>` builds a repository with the real binary and git: a clean session
   (clear request, three discarded approaches, a commit with the trailer), a

@@ -37,11 +37,15 @@ mod tests;
 /// Eine Spalte Luft zwischen Listenrahmen und Detail.
 const GUTTER_WIDTH: u16 = 1;
 /// Was das Detail neben der Liste mindestens braucht: Kopf, YOU-Box und
-/// eine Spur, in der ein Pfad noch lesbar ist.
-const DETAIL_MIN_WIDTH: u16 = 55;
+/// eine Spur, in der ein Pfad noch lesbar ist — bei 120 Spalten genau das,
+/// was neben einer Liste mit 30 Zeichen Überschrift bleibt (A6).
+const DETAIL_MIN_WIDTH: u16 = 46;
+/// Die schmalste Liste neben der Vorschau: die kompakte Stufe mit 30 Zeichen
+/// Überschrift statt ihres Minimums (A6) — das Ziel bei 120 Spalten.
+const LIST_MIN_WIDTH: u16 = activity::COMPACT_WIDTH + 14;
 /// Ab dieser Breite liegen Liste und Detail nebeneinander; darunter füllt
 /// wie bisher eine Fläche den Bildschirm.
-pub const SPLIT_MIN_WIDTH: u16 = activity::COMPACT_WIDTH + GUTTER_WIDTH + DETAIL_MIN_WIDTH;
+pub const SPLIT_MIN_WIDTH: u16 = LIST_MIN_WIDTH + GUTTER_WIDTH + DETAIL_MIN_WIDTH;
 /// Der Anteil der Liste an der Breite — begrenzt auf das, was ihre Spalten
 /// brauchen, und auf das, was ihnen noch etwas bringt.
 const LIST_SHARE_PERCENT: u32 = 40;
@@ -148,7 +152,7 @@ fn split(body: Rect) -> Option<(Rect, Rect)> {
         return None;
     }
     let share = (u32::from(body.width) * LIST_SHARE_PERCENT / 100) as u16;
-    let list_w = share.clamp(activity::COMPACT_WIDTH, activity::WIDE_WIDTH);
+    let list_w = share.clamp(LIST_MIN_WIDTH, activity::WIDE_WIDTH);
     let [list, detail] = Layout::horizontal([Constraint::Length(list_w), Constraint::Min(1)])
         .spacing(GUTTER_WIDTH)
         .areas(body);

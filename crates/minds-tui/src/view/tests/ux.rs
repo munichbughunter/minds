@@ -993,3 +993,62 @@ fn c7_labels_use_the_actual_width() {
     let out = render_sized(&mut app, 100, 30);
     assert!(out.contains(&long), "{long} clipped too early\n{out}");
 }
+
+/// A6: Neben der Vorschau bekommt die Überschrift bei 120 Spalten mindestens
+/// 30 Zeichen — die Spalten ringsum sind schmaler geworden (relative Zeit,
+/// Trust Strip), nicht die Zustände.
+#[test]
+fn a6_the_list_headline_gets_thirty_columns_at_120() {
+    let mut s = session(&"x".repeat(60), "2026-07-25T14:10:00Z");
+    s.intent.request = "y".repeat(60);
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), s);
+    let inspection = Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new()),
+        Vec::new(),
+        "repo",
+    );
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    let out = render_sized(&mut app, 120, 30);
+    assert!(
+        out.contains(" SESSION b3-"),
+        "the preview stands beside the list\n{out}"
+    );
+    let row = out
+        .lines()
+        .find(|l| l.contains("yyyy"))
+        .unwrap_or_else(|| panic!("{out}"));
+    let shown = row.chars().filter(|c| *c == 'y').count();
+    assert!(shown >= 29, "headline {shown}+… < 30 columns\n{out}");
+}
+
+/// C7 · Geprüft: Reichen Glyph + Pfad in Zoom 1/2? Nein — ohne Farbe trägt
+/// das Wort die Art mit (Regel „Farbe trägt nie allein": Glyph **und**
+/// Wort). Die Zeilen behalten daher in jeder Stufe Glyph und Wort, auch
+/// monochrom.
+#[test]
+fn c7_graph_rows_keep_glyph_and_word_in_every_zoom_even_without_color() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.no_color = true;
+    app.reduce(Action::Enter);
+    for zoom in [1u8, 2] {
+        app.reduce(Action::Zoom(zoom));
+        let out = render_sized(&mut app, 160, 40);
+        for (kind, label) in [
+            (minds_reader::graph::ToolKind::Read, "src/http/retry.rs"),
+            (minds_reader::graph::ToolKind::Edit, "src/http/retry.rs"),
+            (minds_reader::graph::ToolKind::Exec, "cargo test"),
+        ] {
+            let (glyph, word, _) = theme::tool(kind);
+            let row = format!("{glyph} {word} {label}");
+            // In der Übersicht trägt eine zusammengefasste Zeile `×N`.
+            let merged = format!("{glyph} {word} {label} ×");
+            assert!(
+                out.contains(&row) || out.contains(&merged),
+                "zoom {zoom}: {row}\n{out}"
+            );
+        }
+    }
+}
