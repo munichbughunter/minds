@@ -369,7 +369,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             let gaps = chain.gaps();
             if gaps.is_empty() {
                 Line::from(Span::styled(
-                    "✓ no gap — every link is attested",
+                    "✓ no gap in the evidence links · intent is a recorded claim",
                     Style::default().fg(theme::OK),
                 ))
             } else {

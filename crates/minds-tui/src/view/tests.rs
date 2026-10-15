@@ -400,7 +400,9 @@ fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
     // ehrliche Luecke (UnsealedRange), zusaetzlich zur fehlenden Bewertung.
     assert!(out.contains("⚠ SESSION"), "{out}");
     assert!(out.contains("✓ AGENT"), "{out}");
-    assert!(out.contains("✓ INTENT"), "{out}");
+    // Der Intent ist eine Aussage, kein Beleg: Claim-Marker, nie ✓ (A2).
+    assert!(out.contains("◌ INTENT"), "{out}");
+    assert!(!out.contains("✓ INTENT"), "{out}");
     // Aussage != Beweis (ADR-0011): der Intent-Text traegt das CLAIM-Label,
     // die observed-Kanten daneben bleiben das einzige Beweismittel.
     assert!(

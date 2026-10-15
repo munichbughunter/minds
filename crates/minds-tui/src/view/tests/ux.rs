@@ -146,3 +146,83 @@ fn a3_empty_is_empty() {
     let out = render_sized(&mut app, 160, 40);
     assert!(!out.contains("discarded ·"), "{out}");
 }
+
+// ---------------------------------------------------------------------
+// A2 · Claim und Evidence in der Why-Kette trennen
+// ---------------------------------------------------------------------
+
+/// Die Zelle des Glied-Markers vor `word` (`"INTENT"` …) — Symbol und Farbe.
+fn marker_of(buffer: &ratatui::buffer::Buffer, word: &str) -> Option<(String, Color)> {
+    let area = buffer.area;
+    for y in 0..area.height {
+        let line: String = (0..area.width)
+            .map(|x| buffer[(x, y)].symbol().to_string())
+            .collect();
+        let chars: Vec<char> = line.chars().collect();
+        let text: String = chars.iter().collect();
+        if let Some(byte) = text.find(&format!(" {word}")) {
+            let at = text[..byte].chars().count();
+            // Ein Glied-Kopf: Marker, Leerzeichen, Wort — am Zeilenanfang
+            // der Kette (Rahmen und Liste davor sind erlaubt).
+            if at >= 1 && !chars[at - 1].is_whitespace() {
+                let x = (at - 1) as u16;
+                return Some((buffer[(x, y)].symbol().to_string(), buffer[(x, y)].fg));
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn a2_the_intent_link_is_a_claim_never_a_check() {
+    for (w, h) in SIZES {
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled(), &repo, None);
+        app.reduce(Action::Why); // Session a: Trailer, belegt
+        let out = render_sized(&mut app, w, h);
+        assert!(out.contains("◌ INTENT"), "{w}x{h}\n{out}");
+        assert!(!out.contains("✓ INTENT"), "{w}x{h}\n{out}");
+        let buffer = buffer_sized(&mut app, w, h);
+        let (glyph, color) = marker_of(&buffer, "INTENT").expect("INTENT link");
+        assert_eq!(glyph, "◌", "{w}x{h}");
+        assert_ne!(color, theme::OK, "{w}x{h}: a claim is never OK-green");
+        assert_eq!(color, theme::claim().2.fg.unwrap(), "{w}x{h}");
+        // Ein belegtes Glied bleibt ✓ in OK.
+        let (glyph, color) = marker_of(&buffer, "EVIDENCE").expect("EVIDENCE link");
+        assert_eq!((glyph.as_str(), color), ("✓", theme::OK), "{w}x{h}");
+    }
+}
+
+#[test]
+fn a2_no_gap_never_includes_the_claims() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Why);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("✓ no gap in the evidence links"), "{out}");
+    assert!(out.contains("intent is a recorded claim"), "{out}");
+    assert!(!out.contains("every link is attested"), "{out}");
+    assert!(!out.contains("Every link is attested"), "{out}");
+}
+
+#[test]
+fn a2_an_unsigned_review_note_reads_as_a_claim() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Why);
+    let out = render_sized(&mut app, 160, 40);
+    let note = out
+        .lines()
+        .find(|l| l.contains("Retry bei 5xx fehlt"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(note.contains("◌ pd"), "{out}");
+    assert!(!note.contains("(signed)"), "{out}");
+    // Ein Urteil nur aus unsignierten Notizen ist aufgezeichnet, nicht
+    // belegt: Der REVIEW-Kopf trägt den Claim-Marker, nie das grüne ✓.
+    assert!(out.contains("◌ REVIEW"), "{out}");
+    assert!(!out.contains("✓ REVIEW"), "{out}");
+    let buffer = buffer_sized(&mut app, 160, 40);
+    let (glyph, color) = marker_of(&buffer, "REVIEW").expect("REVIEW link");
+    assert_eq!(glyph, "◌");
+    assert_ne!(color, theme::OK);
+}

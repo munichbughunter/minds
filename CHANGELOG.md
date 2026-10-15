@@ -27,6 +27,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **A claim no longer reads as checked in the Why chain.** The INTENT link
+  carries the claim marker `◌` in the claim style instead of the green `✓` of
+  an attested link; unsigned review notes — and a review head whose verdict rests on unsigned
+  notes only — carry `◌` as well. "No gap"
+  now speaks of the evidence links only (`✓ no gap in the evidence links ·
+  intent is a recorded claim`) instead of "every link is attested".
 - **Tampering is loud in `minds inspect`.** When a session is TAMPERED at
   start, or turns TAMPERED on a live reload, a red, inverted banner spans the
   full width under the header (`✗ TAMPERED — seal material changed since …`,

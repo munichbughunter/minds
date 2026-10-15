@@ -51,8 +51,14 @@ pub fn draw(
         starts.push(lines.len());
         let (_, word, style, text) = describe(step, width.saturating_sub(8));
         let is_gap = gaps.iter().any(|g| g.step == i);
+        // Drei Fälle, nie zwei: Ein Claim-Glied (der Intent — aufgezeichnet,
+        // nie beobachtet) trägt den Claim-Marker, nie das grüne ✓ eines
+        // Belegs; sonst ✓ belegt oder ⚠ Lücke.
         let (mark, mark_style) = if is_gap {
             ("⚠", Style::default().fg(theme::REVIEW))
+        } else if is_claim(step) {
+            let (glyph, _, style) = theme::claim();
+            (glyph, style)
         } else {
             ("✓", Style::default().fg(theme::OK))
         };
@@ -121,16 +127,16 @@ pub fn draw(
             }
             // Der Record-Text eines Claim-Glieds steht im Claim-Stil — nie
             // im Stil eines Belegs.
-            let text_style = if matches!(step, WhyStep::Intent { .. }) {
-                theme::claim().2
-            } else {
-                Style::default()
-            };
+            // Eine unsignierte Review-Notiz ist ebenfalls nur aufgezeichnet:
+            // Sie beginnt mit dem Claim-Glyph und trägt dessen Stil.
+            let (claim_glyph, _, claim_style) = theme::claim();
             for t in text {
-                lines.push(Line::from(vec![
-                    Span::raw("     "),
-                    Span::styled(t, text_style),
-                ]));
+                let style = if is_claim(step) || t.starts_with(claim_glyph) {
+                    claim_style
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(vec![Span::raw("     "), Span::styled(t, style)]));
             }
         }
         if i + 1 < chain.steps.len() {
@@ -213,7 +219,7 @@ pub fn draw(
         let mut lines: Vec<Line> = Vec::new();
         if gaps.is_empty() {
             lines.push(Line::from(Span::styled(
-                "Every link is attested — the chain closes without guesswork.",
+                "No gap in the evidence links — the intent is a recorded claim, not evidence.",
                 theme::dim(),
             )));
         }
@@ -234,6 +240,21 @@ pub fn draw(
             ),
             gaps_area,
         );
+    }
+}
+
+/// Ob ein Glied eine **Aussage** ist — aufgezeichnet, nie beobachtet, nie
+/// geprüft. Der Intent ist es immer; ein Review, wenn sein Urteil nur aus
+/// unsignierten Notizen stammt. Das SESSION-Glied nicht: Dass die Session
+/// im Store liegt und wie ihre Seals stehen, ist belegt — eine Lücke dort
+/// (unversiegelt) meldet `chain.gaps()` als ⚠.
+fn is_claim(step: &WhyStep) -> bool {
+    match step {
+        WhyStep::Intent { .. } => true,
+        WhyStep::Review { state } => {
+            !state.notes.is_empty() && state.notes.iter().all(|n| !n.signed)
+        }
+        _ => false,
     }
 }
 
@@ -387,7 +408,12 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, &'static str, Style,
             let mut text = vec![word.to_string()];
             text.extend(state.notes.iter().map(|n| {
                 format!(
-                    "{} · {}{} · {}",
+                    "{}{} · {}{} · {}",
+                    if n.signed {
+                        String::new()
+                    } else {
+                        format!("{} ", theme::claim().0)
+                    },
                     n.reviewer,
                     n.decision.as_str(),
                     if n.signed { " (signed)" } else { "" },
