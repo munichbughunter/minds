@@ -291,7 +291,7 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let keys = match state.focus {
         Focus::Files => {
-            "↑↓ file  Enter diff  [ ] commit  n next unexplained  s split  c why column  w why chain  ? help"
+            "↑↓ file  Enter diff  [ ] commit  n next unexplained  / filter  c why column  w why chain  ? help"
         }
         Focus::Diff => {
             "↑↓ line  ] [ hunk  n N unexplained  s split  c why column  w why chain  Esc files  ? help"
@@ -358,7 +358,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 if focused {
                     "↑↓ session  Enter its graph  Esc back to the history  ? help"
                 } else {
-                    "↑↓ commit  Enter sessions / graph  w why chain  Tab next tab  ? help"
+                    "↑↓ commit  Enter sessions / graph  w why chain  / filter  Tab next tab  ? help"
                 },
                 theme::dim(),
             ),
@@ -384,7 +384,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             freshness(app),
             Span::raw("  "),
             Span::styled(
-                "↑↓ anchor  Enter graph of a session naming it  Tab next tab  ? help",
+                "↑↓ anchor  Enter graph of a session naming it  / filter  Tab next tab  ? help",
                 theme::dim(),
             ),
         ];

@@ -34,6 +34,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   does not fit, the footer says why instead of doing nothing. In Changes,
   `c` toggles the "why this line?" column and `w` opens the why chain. PgUp
   and PgDn page in Verify too.
+  `/` filters in every tab — sessions, overview commits (subject, author,
+  agent, refs), changed files, intent anchors; Esc clears the filter first.
 - **The way back across tabs.** Every jump from one tab to another
   (Enter on a commit, session, anchor or artifact; `w` on a line) is recorded
   with its origin — tab, layers, cursor, search. Esc on the layer the jump

@@ -73,6 +73,8 @@ pub struct OverviewState {
     /// Gerechnet wird im Leerlauf, für den gewählten Commit und HEAD; ein
     /// Neuladen beginnt leer (eine neue Signatur kann alles ändern).
     pub conformance: HashMap<CommitId, Option<ConformanceMark>>,
+    /// Der Filter aus `/` (B4) — leer: alles.
+    pub filter: String,
 }
 
 impl OverviewState {
@@ -87,6 +89,7 @@ impl OverviewState {
             session: 0,
             stale: false,
             conformance: HashMap::new(),
+            filter: String::new(),
         }
     }
 
@@ -133,6 +136,7 @@ impl OverviewState {
             next.session = self.session;
         }
         next.session = next.session.min(next.sessions().len().saturating_sub(1));
+        next.filter = std::mem::take(&mut self.filter);
         *self = next;
     }
 
@@ -148,6 +152,34 @@ impl OverviewState {
             }
             None => false,
         }
+    }
+
+    /// Die Zeilen, die der Filter durchlässt: Betreff, Autor, Agent, Refs —
+    /// bei einer WIP-Session Agent und Auftrag.
+    pub fn shown(&self) -> Vec<usize> {
+        let Ok(overview) = self.data.as_ref() else {
+            return Vec::new();
+        };
+        crate::filter::shown_by(self.len(), &self.filter, |i| {
+            match i.checked_sub(overview.wip.len()) {
+                None => {
+                    let wip = &overview.wip[i];
+                    format!("{} {}", wip.agent, wip.request)
+                }
+                Some(at) => {
+                    let row = &overview.rows[at];
+                    let refs: Vec<String> = row.refs.iter().map(|r| format!("{r:?}")).collect();
+                    format!(
+                        "{} {} {} {} {}",
+                        row.subject,
+                        row.author,
+                        row.agent.clone().unwrap_or_default(),
+                        refs.join(" "),
+                        row.id
+                    )
+                }
+            }
+        })
     }
 
     /// Wie viele Zeilen der Graph hat (WIP-Sessions und Commits).

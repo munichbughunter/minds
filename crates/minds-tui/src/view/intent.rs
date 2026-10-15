@@ -51,8 +51,24 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             }
             // Ein Fenster um den Cursor: bei vielen Ankern bleibt ▸ sichtbar.
             let height = (left.height as usize).saturating_sub(2 + rows.len());
-            let first = crate::view::offset(state.cursor, list.len(), height);
-            for (i, info) in list.iter().enumerate().skip(first).take(height.max(1)) {
+            // Nur die Treffer des Filters aus `/` (B4).
+            let shown = state.shown();
+            if !state.filter.is_empty() {
+                rows.push(Line::from(Span::styled(
+                    format!(
+                        "filter: {} ({} of {})",
+                        state.filter,
+                        shown.len(),
+                        list.len()
+                    ),
+                    theme::dim(),
+                )));
+            }
+            let height = height.saturating_sub(usize::from(!state.filter.is_empty()));
+            let at = shown.iter().position(|&i| i == state.cursor).unwrap_or(0);
+            let first = crate::view::offset(at, shown.len(), height);
+            for &i in shown.iter().skip(first).take(height.max(1)) {
+                let info = &list[i];
                 let id = info.id.to_string();
                 let short = id.get(..14).unwrap_or(&id);
                 let (glyph, style) = match detail(info).map(|d| d.signature) {

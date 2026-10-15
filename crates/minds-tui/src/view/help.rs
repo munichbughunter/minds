@@ -16,7 +16,7 @@ g / G              start / end
 Enter / l          open, descend
 Esc / h            back: close, clear the search, return — never quits
 
-/                  search (terms AND-combined, over prompt, agent, paths, ids)
+/                  filter in every tab: sessions, commits, files, anchors (AND)
 w                  why — the provenance chain (on any session, commit or line)
 e                  evidence of the session — verdict, coverage, epochs, signature
 v / d / i          verify · diff · intent of the commit or session in focus

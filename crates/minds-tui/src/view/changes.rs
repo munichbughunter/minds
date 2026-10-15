@@ -125,12 +125,15 @@ fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
     let inner_w = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
     let files = state.files();
-    let first = offset(state.file, files.len(), height);
-    let lines: Vec<Line> = files
+    // Nur die Treffer des Filters aus `/` (B4).
+    let shown = state.shown();
+    let at = shown.iter().position(|&i| i == state.file).unwrap_or(0);
+    let first = offset(at, shown.len(), height);
+    let lines: Vec<Line> = shown
         .iter()
-        .enumerate()
         .skip(first)
         .take(height)
+        .map(|&i| (i, &files[i]))
         .map(|(i, file)| {
             let (glyph, _, style) = match file.class {
                 Some(class) => theme::recon(class),
@@ -173,11 +176,19 @@ fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
             }
         })
         .collect();
-    let title = format!(
+    let mut title = format!(
         " FILES · {short} · {}/{} ",
         state.at + 1,
         state.commits.len()
     );
+    if !state.filter.is_empty() {
+        title.push_str(&format!(
+            "· filter: {} ({} of {}) ",
+            state.filter,
+            shown.len(),
+            files.len()
+        ));
+    }
     frame.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(title).title_style(theme::title())),
         area,

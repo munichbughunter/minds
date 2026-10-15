@@ -243,9 +243,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     };
     let width = overview.lanes.max(1);
     let total = overview.wip.len() + overview.rows.len();
+    // Nur die Treffer des Filters aus `/` (B4); ohne Filter alle.
+    let shown = state.shown();
     // Was fehlt, steht im Titel — nie still.
     let height = usize::from(left.height.saturating_sub(2));
-    let first = crate::view::offset(state.cursor, total, height);
+    let at = shown.iter().position(|&i| i == state.cursor).unwrap_or(0);
+    let first = crate::view::offset(at, shown.len(), height);
     let mut lines: Vec<Line> = Vec::new();
     if total == 0 {
         lines.push(Line::from(Span::styled(
@@ -253,7 +256,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             theme::dim(),
         )));
     }
-    for i in first..total.min(first + height.max(1)) {
+    for &i in shown.iter().skip(first).take(height.max(1)) {
         let mut spans = match i.checked_sub(overview.wip.len()) {
             None => wip_spans(&overview.wip[i], width, nerd),
             Some(at) => {
@@ -297,6 +300,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" OVERVIEW · {} commits", overview.rows.len())
     };
+    if !state.filter.is_empty() {
+        title.push_str(&format!(
+            " · filter: {} ({} of {total})",
+            state.filter,
+            shown.len()
+        ));
+    }
     if overview.wip_more > 0 {
         title.push_str(&format!(
             " · {} more sessions without a commit",

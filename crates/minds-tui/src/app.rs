@@ -535,7 +535,6 @@ impl<'a> App<'a> {
         let Some(state) = self.overview.as_mut() else {
             return;
         };
-        let last = state.len().saturating_sub(1);
         let page = self.page.max(1);
         if state.focus == OverviewFocus::Sessions {
             let sessions = state.sessions();
@@ -557,12 +556,15 @@ impl<'a> App<'a> {
         }
         let at = state.cursor;
         match action {
-            Action::Up => state.cursor = state.cursor.saturating_sub(1),
-            Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::PageUp => state.cursor = state.cursor.saturating_sub(page),
-            Action::PageDown => state.cursor = (state.cursor + page).min(last),
-            Action::Home => state.cursor = 0,
-            Action::End => state.cursor = last,
+            // Über die gezeigten Zeilen — der Filter aus `/` blendet aus (B4).
+            Action::Up
+            | Action::Down
+            | Action::PageUp
+            | Action::PageDown
+            | Action::Home
+            | Action::End => {
+                state.cursor = crate::filter::step(&state.shown(), state.cursor, &action, page);
+            }
             Action::Enter => match state.selected() {
                 Some(Selected::Wip(wip)) => {
                     let id = wip.id;
@@ -644,9 +646,9 @@ impl<'a> App<'a> {
         let last = state.list().len().saturating_sub(1);
         let at = state.cursor;
         match action {
-            Action::Up => state.cursor = state.cursor.saturating_sub(1),
-            Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::Home => state.cursor = 0,
+            Action::Up | Action::Down | Action::Home => {
+                state.cursor = crate::filter::step(&state.shown(), state.cursor, &action, 1);
+            }
             Action::End => state.cursor = last,
             // Bild hoch/runter blättert im Detail (Snapshot).
             Action::PageUp => {
@@ -1483,6 +1485,77 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Der Filter aus `/` des sichtbaren Tabs (B4); Sessions nutzen `query`.
+    pub fn tab_filter(&self) -> Option<&str> {
+        match self.tab {
+            Tab::Overview => self.overview.as_ref().map(|s| s.filter.as_str()),
+            Tab::Changes => self.changes.as_ref().map(|s| s.filter.as_str()),
+            Tab::Intent => self.intent.as_ref().map(|s| s.filter.as_str()),
+            Tab::Sessions | Tab::Verify => None,
+        }
+    }
+
+    fn tab_filter_mut(&mut self) -> Option<&mut String> {
+        match self.tab {
+            Tab::Overview => self.overview.as_mut().map(|s| &mut s.filter),
+            Tab::Changes => self.changes.as_mut().map(|s| &mut s.filter),
+            Tab::Intent => self.intent.as_mut().map(|s| &mut s.filter),
+            Tab::Sessions | Tab::Verify => None,
+        }
+    }
+
+    /// Der Cursor des Tabs auf einen Treffer des Filters.
+    fn refit_tab(&mut self) {
+        match self.tab {
+            Tab::Overview => {
+                if let Some(state) = self.overview.as_mut() {
+                    let cursor = crate::filter::refit(&state.shown(), state.cursor);
+                    if cursor != state.cursor {
+                        state.cursor = cursor;
+                        state.session = 0;
+                    }
+                }
+            }
+            Tab::Changes => {
+                if let Some(state) = self.changes.as_mut() {
+                    let file = crate::filter::refit(&state.shown(), state.file);
+                    if file != state.file {
+                        state.file = file;
+                        state.row = 0;
+                    }
+                }
+            }
+            Tab::Intent => {
+                if let Some(state) = self.intent.as_mut() {
+                    state.cursor = crate::filter::refit(&state.shown(), state.cursor);
+                }
+            }
+            Tab::Sessions | Tab::Verify => {}
+        }
+    }
+
+    /// ↑↓ beim Tippen eines Filters: über die Treffer.
+    fn step_tab(&mut self, action: &Action) {
+        match self.tab {
+            Tab::Overview => {
+                if let Some(state) = self.overview.as_mut() {
+                    state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
+                }
+            }
+            Tab::Changes => {
+                if let Some(state) = self.changes.as_mut() {
+                    state.move_file(*action == Action::Down);
+                }
+            }
+            Tab::Intent => {
+                if let Some(state) = self.intent.as_mut() {
+                    state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
+                }
+            }
+            Tab::Sessions | Tab::Verify => {}
+        }
+    }
+
     /// Der Ursprung, wie er gerade ist.
     fn snapshot(&self) -> NavEntry {
         NavEntry {
@@ -1518,6 +1591,7 @@ impl<'a> App<'a> {
             || self.tamper.is_some()
             || self.searching
             || !self.query.is_empty()
+            || self.tab_filter().is_some_and(|f| !f.is_empty())
             || entry.target != self.tab
         {
             return false;
@@ -1656,6 +1730,53 @@ impl<'a> App<'a> {
                     return;
                 }
                 _ => {}
+            }
+        }
+        // `/` außerhalb der Sessions (B4): derselbe Suchmodus, sein Filter
+        // gehört dem Tab.
+        if self.tab != Tab::Sessions {
+            if self.searching {
+                match action {
+                    Action::SearchInput(c) => {
+                        if let Some(filter) = self.tab_filter_mut() {
+                            filter.push(c);
+                        }
+                        self.refit_tab();
+                    }
+                    Action::SearchBackspace => {
+                        if let Some(filter) = self.tab_filter_mut() {
+                            filter.pop();
+                        }
+                        self.refit_tab();
+                    }
+                    Action::SearchCommit => self.searching = false,
+                    Action::Back => {
+                        if let Some(filter) = self.tab_filter_mut() {
+                            filter.clear();
+                        }
+                        self.searching = false;
+                        self.refit_tab();
+                    }
+                    Action::Up | Action::Down => self.step_tab(&action),
+                    _ => {}
+                }
+                return;
+            }
+            if action == Action::SearchStart {
+                if self.tab_filter_mut().is_some() {
+                    self.searching = true;
+                } else {
+                    self.closed = Some("/: nothing to filter here yet".into());
+                }
+                return;
+            }
+            // Esc, Schritt 2 (B1): erst den Filter leeren.
+            if action == Action::Back && self.tab_filter().is_some_and(|f| !f.is_empty()) {
+                if let Some(filter) = self.tab_filter_mut() {
+                    filter.clear();
+                }
+                self.refit_tab();
+                return;
             }
         }
         if self.searching {

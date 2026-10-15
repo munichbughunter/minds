@@ -2800,6 +2800,7 @@ mod changes_tab {
     }
 
     mod b4;
+    mod b4b;
 }
 
 // --- Verify-Tab -------------------------------------------------------------
@@ -3672,6 +3673,8 @@ mod intent_tab {
         let back = render_at(&mut app, 120);
         assert_ne!(out, back);
     }
+
+    mod b4b;
 }
 
 mod overview_tab {
@@ -4213,6 +4216,7 @@ mod overview_tab {
     mod b1;
     mod b2;
     mod b3;
+    mod b4b;
 }
 
 mod tamper;
