@@ -302,7 +302,15 @@ fn list_title(state: &crate::overview::OverviewState) -> (String, &'static str) 
         format!(
             " {}OVERVIEW · {}",
             mark,
-            counts_title(&counts, overview.budget_hit)
+            // „(limit)" nur, wenn eine Grenze griff; eine lückenhafte
+            // Historie sagt der Titel weiter hinten selbst.
+            counts_title(
+                &OverviewCounts {
+                    limited: overview.truncated || overview.budget_hit,
+                    ..counts
+                },
+                overview.budget_hit
+            )
         )
     };
     if !state.filter.is_empty() {
@@ -492,6 +500,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let mut hidden: Vec<&CommitRow> = Vec::new();
     // Mit `a` (C3.3) wird Ausgeblendetes zusammengefasst, nie spurlos
     // entfernt: eine gedimmte Zeile je Lauf, mit den Refs darin.
+    let visible: std::collections::HashSet<usize> = shown.iter().copied().collect();
     let order: Vec<usize> = if state.agent_only {
         (0..total).collect()
     } else {
@@ -520,7 +529,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         hidden.clear();
     };
     for i in order {
-        if !shown.contains(&i) {
+        if !visible.contains(&i) {
             if let Some(row) = i
                 .checked_sub(overview.wip.len())
                 .and_then(|at| overview.rows.get(at))
@@ -1111,50 +1120,82 @@ fn integrity_lines(
     out
 }
 
-/// COVERAGE: unerklärte Zeilen — dieselbe Zahl wie `◦n` im Changes-Tab.
-fn coverage_lines(
-    count: Option<&Result<crate::overview::LineCount, String>>,
+/// COVERAGE: die hinzugefügten Zeilen nach Klasse (C3.4) — die Zahl der
+/// unerklärten ist `◦n` des Changes-Tabs. ✓ nur, wenn jede Zeile beobachtet
+/// ist; Ausgesagtes, nur im Dateisystem Gesehenes und nicht Bewertetes steht
+/// für sich, nie als erklärt.
+pub(crate) fn coverage_lines(
+    count: Option<&Result<minds_reader::changes::LineClasses, String>>,
 ) -> Vec<Line<'static>> {
-    match count {
-        None => vec![axis(
-            "COVERAGE",
-            vec![mark("…", "counting lines", theme::dim())],
-        )],
-        Some(Err(why)) => vec![axis(
-            "COVERAGE",
-            vec![mark(
-                "?",
-                format!("not assessed — {why}"),
-                Style::default().fg(theme::REVIEW),
-            )],
-        )],
-        Some(Ok(c)) if c.added == 0 => vec![axis(
-            "COVERAGE",
-            vec![mark("·", "no added lines", theme::dim())],
-        )],
-        Some(Ok(c)) if c.unexplained == 0 => vec![axis(
+    let c = match count {
+        None => {
+            return vec![axis(
+                "COVERAGE",
+                vec![mark("…", "counting lines", theme::dim())],
+            )];
+        }
+        Some(Err(why)) => {
+            return vec![axis(
+                "COVERAGE",
+                vec![mark(
+                    "?",
+                    format!("not assessed — {why}"),
+                    Style::default().fg(theme::REVIEW),
+                )],
+            )];
+        }
+        Some(Ok(c)) => *c,
+    };
+    if c.all_explained() {
+        return vec![axis(
             "COVERAGE",
             vec![mark(
                 "✓",
-                format!("all {} added lines explained", c.added),
+                format!("all {} added lines observed", c.added),
                 ok(),
             )],
-        )],
-        Some(Ok(c)) => {
-            let (glyph, _, style) = theme::open();
-            vec![
-                axis(
-                    "COVERAGE",
-                    vec![mark(
-                        glyph,
-                        format!("{} of {} added lines unexplained", c.unexplained, c.added),
-                        style,
-                    )],
-                ),
-                under("→ d, then n".into(), theme::dim()),
-            ]
-        }
+        )];
     }
+    let (open_glyph, _, open_style) = theme::open();
+    let head = if c.unexplained > 0 {
+        mark(
+            open_glyph,
+            format!("{} of {} added lines unexplained", c.unexplained, c.added),
+            open_style,
+        )
+    } else if c.added == 0 && c.skipped_files == 0 {
+        mark("·", "no added lines", theme::dim())
+    } else {
+        mark("·", format!("{} added lines", c.added), theme::dim())
+    };
+    let mut out = vec![axis("COVERAGE", vec![head])];
+    let mut parts: Vec<String> = Vec::new();
+    if c.explained > 0 && c.explained < c.added {
+        parts.push(format!("● {} observed", c.explained));
+    }
+    if c.stated > 0 {
+        parts.push(format!("◇ {} stated", c.stated));
+    }
+    if c.fs_only > 0 {
+        parts.push(format!("◍ {} fs only", c.fs_only));
+    }
+    if c.not_assessed > 0 {
+        parts.push(format!("? {} not assessed", c.not_assessed));
+    }
+    if c.skipped_files > 0 {
+        parts.push(format!(
+            "{} file{} not diffed",
+            c.skipped_files,
+            if c.skipped_files == 1 { "" } else { "s" }
+        ));
+    }
+    if !parts.is_empty() {
+        out.push(under(parts.join(" · "), theme::dim()));
+    }
+    if c.unexplained > 0 {
+        out.push(under("→ d, then n".into(), theme::dim()));
+    }
+    out
 }
 
 /// INTERPRETATION: gedeutete Tool-Aufrufe — je Session, wenn sie sich

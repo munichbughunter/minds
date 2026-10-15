@@ -830,10 +830,7 @@ impl<'a> App<'a> {
             let count = match self.inspection.changes(self.repo, commit) {
                 Ok(set) => match &set.unassessed {
                     Some(why) => Err(why.clone()),
-                    None => Ok(crate::overview::LineCount {
-                        unexplained: set.unexplained(),
-                        added: set.added(),
-                    }),
+                    None => Ok(set.line_classes()),
                 },
                 Err(err) => Err(minds_reader::sanitize(&err.to_string())),
             };

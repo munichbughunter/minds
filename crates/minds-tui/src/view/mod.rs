@@ -561,7 +561,19 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
                 .as_ref()
                 .is_some_and(|o| o.focus == crate::overview::OverviewFocus::Sessions)
             {
-                let mut keys = vec!["↑↓ session", "Enter its graph"];
+                // Ohne Session öffnet Enter den Diff (schmales Detail).
+                let none = app
+                    .overview
+                    .as_ref()
+                    .is_some_and(|o| o.sessions().is_empty());
+                let mut keys = vec![
+                    "↑↓ session",
+                    if none {
+                        "Enter its diff"
+                    } else {
+                        "Enter its graph"
+                    },
+                ];
                 if requirement_text(app) {
                     keys.push("Space requirement");
                 }
@@ -689,17 +701,9 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
 /// Ob Space im Detail der Übersicht etwas aufklappt: ein belegter Anker
 /// mit Text (C3.4).
 fn requirement_text(app: &App) -> bool {
-    let Some(state) = app.overview.as_ref() else {
-        return false;
-    };
-    state.agent_commit().is_some_and(|row| {
-        row.anchors.iter().any(|a| {
-            matches!(
-                state.requirements.get(a),
-                Some(Ok(d)) if d.proof.is_ok() && d.snapshot.is_some()
-            )
-        })
-    })
+    app.overview
+        .as_ref()
+        .is_some_and(|state| state.has_requirement_text())
 }
 
 /// Der Filterzustand der Übersicht für Zeile 1 der Fußzeile (C3.5).

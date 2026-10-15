@@ -915,3 +915,116 @@ fn c35_the_footer_says_where_you_are_and_what_you_can_do() {
         lines.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------
+// Review-Funde zu C3.3/C3.4
+// ---------------------------------------------------------------------
+
+/// COVERAGE behauptet nie mehr als beobachtet: ✓ nur, wenn jede Zeile
+/// beobachtet ist; ausgesagte (◇), nicht bewertete und nicht gediffte
+/// Zeilen werden genannt, nie als erklärt gezählt.
+#[test]
+fn review_coverage_never_counts_a_claim_as_explained() {
+    use minds_reader::changes::LineClasses;
+    let text = |c: LineClasses| {
+        crate::view::overview::coverage_lines(Some(&Ok(c)))
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let stated = text(LineClasses {
+        added: 40,
+        stated: 40,
+        ..LineClasses::default()
+    });
+    assert!(!stated.contains('✓'), "{stated}");
+    assert!(stated.contains("◇ 40 stated"), "{stated}");
+    let skipped = text(LineClasses {
+        added: 0,
+        skipped_files: 2,
+        ..LineClasses::default()
+    });
+    assert!(!skipped.contains('✓'), "{skipped}");
+    assert!(!skipped.contains("no added lines"), "{skipped}");
+    assert!(skipped.contains("2 files not diffed"), "{skipped}");
+    let clean = text(LineClasses {
+        added: 3,
+        explained: 3,
+        ..LineClasses::default()
+    });
+    assert!(clean.contains("✓ all 3 added lines observed"), "{clean}");
+}
+
+/// Eine Worker-Antwort, die nach einem Neuladen ankommt, gehört zum alten
+/// Stand — sie wird verworfen, nie als Urteil übernommen.
+#[test]
+fn review_a_stale_worker_answer_after_reload_is_dropped() {
+    struct Verified;
+    impl crate::Background for Verified {
+        fn verify(&mut self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
+            Ok(crate::CommitVerify {
+                verdict: Ok(crate::VerifyVerdict::Verified),
+                sessions: Vec::new(),
+                out_of_scope: None,
+                out_of_scope_paths: Vec::new(),
+                scope_note: None,
+                conformance: None,
+            })
+        }
+    }
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[1]);
+    let mut worker = crate::app::Worker::spawn(Box::new(Verified));
+    assert!(app.send_overview_check(&mut worker));
+    let again = app.inspection.clone();
+    app.reload(Ok(again), None, now());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !app.take_checks(&mut worker) {
+        assert!(std::time::Instant::now() < deadline, "the worker answers");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let detail = detail_text(&mut app, 160, 40);
+    let integrity = detail.lines().find(|l| l.contains("INTEGRITY")).unwrap();
+    assert!(integrity.contains("… checking"), "{detail}");
+    assert!(!detail.contains("VERIFIED"), "{detail}");
+    // Der neue Stand fragt selbst — und nimmt seine Antwort.
+    assert!(app.send_overview_check(&mut worker));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !app.take_checks(&mut worker) {
+        assert!(std::time::Instant::now() < deadline, "the worker answers");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(detail_text(&mut app, 160, 40).contains("✓ VERIFIED"));
+}
+
+/// Space klappt nur auf, wenn es Text gibt — sonst blättern PgUp/PgDn
+/// weiter in der Liste.
+#[test]
+fn review_space_without_text_changes_nothing() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[0]);
+    app.reduce(Action::Space);
+    assert!(!app.overview.as_ref().unwrap().requirement_open);
+}
+
+/// Leerzustand des Agent-Filters: Kein ausgeblendeter Commit bleibt gewählt.
+#[test]
+fn review_an_empty_agent_filter_selects_nothing_hidden() {
+    let (_dir, repo, _, _) = history();
+    let inspection = Inspection::from_index(
+        Index::from_parts(BTreeMap::new(), BTreeMap::new()),
+        Vec::new(),
+        "demo",
+    );
+    let mut app = opened(&repo, inspection);
+    app.reduce(Action::AgentFilter);
+    assert!(app.overview.as_ref().unwrap().selected().is_none());
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(!out.contains("init: empty"), "{out}");
+}

@@ -370,13 +370,13 @@ pub fn lane(depth: usize) -> Style {
     }
 }
 
-/// Die Cursorzeile — der eine Auswahlstil der Oberfläche (B7).
 /// „Offen" (C3.4): fehlt noch, ist aber kein Fehler — nicht beobachtet,
 /// nicht signiert, nicht reviewt. Nie rot.
 pub fn open() -> (&'static str, &'static str, Style) {
     ("◦", "open", Style::default().fg(DIM))
 }
 
+/// Die Cursorzeile — der eine Auswahlstil der Oberfläche (B7).
 pub fn cursor() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }

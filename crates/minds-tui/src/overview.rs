@@ -88,7 +88,7 @@ pub struct OverviewState {
     pub asked: Option<CommitId>,
     /// Die Zeilen je Commit (C3.4): unerklärte und hinzugefügte — aus
     /// derselben Rechnung wie der Changes-Tab — oder warum nicht.
-    pub lines: HashMap<CommitId, Result<LineCount, String>>,
+    pub lines: HashMap<CommitId, Result<minds_reader::changes::LineClasses, String>>,
     /// Die gelesenen Anker (C3.4), aus derselben Quelle wie der Intent-Tab.
     pub requirements: HashMap<ContentHash, Result<crate::IntentDetail, String>>,
     /// Ob der Anforderungstext aufgeklappt ist (Space).
@@ -98,15 +98,6 @@ pub struct OverviewState {
     /// Ob die Übersicht schmal gezeichnet wird (unter 100 Spalten): dann
     /// ist das Detail eine eigene Ebene hinter Enter.
     pub narrow: bool,
-}
-
-/// Die Zeilen eines Commits für die Coverage-Zeile des Details.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LineCount {
-    /// Unerklärte `+`-Zeilen — [`minds_reader::changes::ChangeSet::unexplained`].
-    pub unexplained: usize,
-    /// Hinzugefügte Zeilen.
-    pub added: usize,
 }
 
 impl OverviewState {
@@ -205,10 +196,26 @@ impl OverviewState {
         *self = next;
     }
 
-    /// Space (C3.4): klappt den Anforderungstext auf oder zu.
+    /// Space (C3.4): klappt den Anforderungstext auf oder zu — nur, wenn
+    /// es ihn gibt; sonst bleibt PgUp/PgDn bei der Liste.
     pub fn toggle_requirement(&mut self) {
+        if !self.has_requirement_text() {
+            return;
+        }
         self.requirement_open = !self.requirement_open;
         self.detail_scroll = 0;
+    }
+
+    /// Ob der gewählte Commit einen belegten Anker mit Text hat.
+    pub fn has_requirement_text(&self) -> bool {
+        self.agent_commit().is_some_and(|row| {
+            row.anchors.iter().any(|a| {
+                matches!(
+                    self.requirements.get(a),
+                    Some(Ok(d)) if d.proof.is_ok() && d.snapshot.is_some()
+                )
+            })
+        })
     }
 
     /// Der gewählte Commit, wenn eine Agent-Session an ihm hängt — nur für
@@ -316,7 +323,13 @@ impl OverviewState {
         let overview = self.data.as_ref().ok()?;
         match self.cursor.checked_sub(overview.wip.len()) {
             None => overview.wip.get(self.cursor).map(Selected::Wip),
-            Some(at) => overview.rows.get(at).map(Selected::Commit),
+            // Mit `a` ist ein Commit ohne Agent-Session ausgeblendet — nie
+            // gewählt (Leerzustand des Filters).
+            Some(at) => overview
+                .rows
+                .get(at)
+                .filter(|row| !self.agent_only || row.has_agent_session())
+                .map(Selected::Commit),
         }
     }
 

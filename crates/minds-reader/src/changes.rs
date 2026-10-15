@@ -107,11 +107,64 @@ pub struct ChangeSet {
     pub files: Vec<FileDiff>,
 }
 
+/// Die hinzugefügten Zeilen eines Commits nach Klasse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LineClasses {
+    /// Alle hinzugefügten Zeilen.
+    pub added: usize,
+    /// Beobachtet und vom Tool beansprucht (●).
+    pub explained: usize,
+    /// Nur im Dateisystem beobachtet (◍).
+    pub fs_only: usize,
+    /// Nur ausgesagt, ohne Zeugen (◇).
+    pub stated: usize,
+    /// Unerklärt (◦) — wie [`FileDiff::unexplained`].
+    pub unexplained: usize,
+    /// Nicht bewertet: ohne Klasse oder in Dateien ohne Diff.
+    pub not_assessed: usize,
+    /// Dateien ohne Diff (binär, zu groß, …).
+    pub skipped_files: usize,
+}
+
+impl LineClasses {
+    /// Ob jede hinzugefügte Zeile beobachtet ist — nur dann ✓.
+    pub fn all_explained(&self) -> bool {
+        self.added > 0 && self.explained == self.added && self.skipped_files == 0
+    }
+}
+
 impl ChangeSet {
     /// Wie viele `+`-Zeilen des Commits nicht erklärt sind — die Summe über
     /// [`FileDiff::unexplained`], dieselbe Zahl wie `◦n` je Datei (C3.4).
     pub fn unexplained(&self) -> usize {
         self.files.iter().map(FileDiff::unexplained).sum()
+    }
+
+    /// Die hinzugefügten Zeilen nach Klasse (C3.4): Nur beobachtete gelten
+    /// als erklärt; ausgesagte, nur im Dateisystem gesehene, unerklärte und
+    /// nicht bewertete (ohne Klasse oder in Dateien ohne Diff) getrennt.
+    pub fn line_classes(&self) -> LineClasses {
+        let mut c = LineClasses {
+            added: self.added(),
+            unexplained: self.unexplained(),
+            ..LineClasses::default()
+        };
+        for file in &self.files {
+            if file.note.is_some() {
+                c.skipped_files += 1;
+            }
+            for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
+                match row.class {
+                    Some(ReconClass::Explained) => c.explained += 1,
+                    Some(ReconClass::ExplainedFsOnly) => c.fs_only += 1,
+                    Some(ReconClass::ReportedOnly) => c.stated += 1,
+                    Some(ReconClass::Unexplained) | None => {}
+                }
+            }
+        }
+        let classified = c.explained + c.fs_only + c.stated + c.unexplained;
+        c.not_assessed = c.added.saturating_sub(classified);
+        c
     }
 
     /// Wie viele Zeilen der Commit hinzufügt.
@@ -419,5 +472,51 @@ mod tests {
         assert_eq!(set.unexplained(), per_file);
         assert_eq!(set.unexplained(), 3);
         assert_eq!(set.added(), 5);
+    }
+
+    /// Review C3.4: Nur beobachtete Zeilen sind „erklärt" — ausgesagte
+    /// (ReportedOnly), unklassifizierte und nicht gediffte zählen getrennt,
+    /// nie als erklärt.
+    #[test]
+    fn line_classes_never_count_a_claim_as_explained() {
+        let mut skipped = file(7, Vec::new());
+        skipped.note = Some("binary".into());
+        let set = ChangeSet {
+            commit: format!("{:040x}", 1).parse().unwrap(),
+            subject: None,
+            change: None,
+            review: ReviewState::default(),
+            unassessed: None,
+            files: vec![
+                file(
+                    5,
+                    vec![
+                        row(Some(ReconClass::Explained)),
+                        row(Some(ReconClass::ExplainedFsOnly)),
+                        row(Some(ReconClass::ReportedOnly)),
+                        row(Some(ReconClass::Unexplained)),
+                        row(None),
+                    ],
+                ),
+                skipped,
+            ],
+        };
+        let c = set.line_classes();
+        assert_eq!(c.added, 12);
+        assert_eq!(c.explained, 1);
+        assert_eq!(c.fs_only, 1);
+        assert_eq!(c.stated, 1);
+        assert_eq!(c.unexplained, set.unexplained());
+        assert_eq!(
+            c.not_assessed, 8,
+            "one unclassified row and seven in the binary"
+        );
+        assert_eq!(c.skipped_files, 1);
+        assert!(!c.all_explained());
+        let clean = ChangeSet {
+            files: vec![file(1, vec![row(Some(ReconClass::Explained))])],
+            ..set
+        };
+        assert!(clean.line_classes().all_explained());
     }
 }
