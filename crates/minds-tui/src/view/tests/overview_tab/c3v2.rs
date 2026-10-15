@@ -303,3 +303,186 @@ fn c32_open_is_quiet_and_approved_is_said() {
         .unwrap();
     assert!(approved.contains("⊕ approved"), "{out}");
 }
+
+// ---------------------------------------------------------------------
+// C3.3 · Filter a: nur Commits mit Agent-Session
+// ---------------------------------------------------------------------
+
+/// Die Historie mit einem menschlichen Commit obenauf (HEAD) — damit der
+/// Filter auch HEAD ausblendet und die Trennzeile ihn nennen muss.
+fn human_on_top() -> (tempfile::TempDir, Repo, Vec<CommitId>, Inspection) {
+    let (dir, _, mut commits, inspection) = history();
+    git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "chore: by hand"],
+    );
+    commits.push(git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap());
+    let repo = Repo::open(dir.path()).unwrap();
+    (dir, repo, commits, inspection)
+}
+
+fn agent_only(app: &App) -> bool {
+    app.overview.as_ref().unwrap().agent_only
+}
+
+/// `a` schaltet hin und zurück; der Titel nennt Filter und N of M, rechts
+/// steht, was `a` jetzt bewirkt.
+#[test]
+fn c33_a_toggles_there_and_back() {
+    let (_dir, repo, _, inspection) = human_on_top();
+    let mut app = opened(&repo, inspection);
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(out.contains("a: agent sessions only"), "{out}");
+    app.reduce(Action::AgentFilter);
+    assert!(agent_only(&app));
+    let lines = lines_at(&mut app, 160, 40);
+    let out = lines.join("\n");
+    assert!(
+        lines[2].contains("OVERVIEW · agent sessions · 2 of 4 commits"),
+        "{out}"
+    );
+    assert!(lines[2].contains("a: all"), "{out}");
+    assert!(!out.contains("init: empty"), "{out}");
+    assert!(!out.contains("chore: by hand"), "{out}");
+    app.reduce(Action::AgentFilter);
+    assert!(!agent_only(&app));
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(out.contains("init: empty"), "{out}");
+    assert!(out.contains("OVERVIEW · 4 commits"), "{out}");
+}
+
+/// Esc setzt den Filter zurück (B1: Overlay → Suche → Filter → Ebene).
+#[test]
+fn c33_esc_resets_the_filter() {
+    let (_dir, repo, _, inspection) = human_on_top();
+    let mut app = opened(&repo, inspection);
+    app.reduce(Action::AgentFilter);
+    app.reduce(Action::SearchStart);
+    app.reduce(Action::SearchInput('f'));
+    app.reduce(Action::SearchCommit);
+    // Erst die Suche, dann der Agent-Filter.
+    app.reduce(Action::Back);
+    assert!(app.overview.as_ref().unwrap().filter.is_empty());
+    assert!(agent_only(&app));
+    app.reduce(Action::Back);
+    assert!(!agent_only(&app));
+    assert!(!app.quit, "Esc never quits");
+}
+
+/// Ausgeblendetes wird zusammengefasst, nie spurlos entfernt: eine gedimmte
+/// Zeile je Lauf, mit Zahl und den Refs darin — HEAD bleibt auffindbar.
+/// Gezeigte + ausgeblendete Commits ergeben die Gesamtzahl (C3.1).
+#[test]
+fn c33_separators_carry_count_and_refs_and_the_sum_holds() {
+    let (_dir, repo, _, inspection) = human_on_top();
+    let mut app = opened(&repo, inspection);
+    app.reduce(Action::AgentFilter);
+    for (w, h) in [(80u16, 24u16), (120, 30), (160, 40)] {
+        let lines = list_lines(&lines_at(&mut app, w, h));
+        let out = lines.join("\n");
+        let top = lines
+            .iter()
+            .find(|l| l.contains("┆ 1 commit hidden"))
+            .unwrap_or_else(|| panic!("{w}: {out}"));
+        assert!(top.contains("HEAD"), "{w}: {out}");
+        let hidden: usize = lines
+            .iter()
+            .filter_map(|l| {
+                let at = l.find("┆ ")?;
+                l[at + "┆ ".len()..]
+                    .split(' ')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .sum();
+        let state = app.overview.as_ref().unwrap();
+        let data = state.data.as_ref().unwrap();
+        let shown_commits = state
+            .shown()
+            .iter()
+            .filter(|&&i| i >= data.wip.len())
+            .count();
+        assert_eq!(hidden, 2, "{w}: {out}");
+        assert_eq!(shown_commits + hidden, data.counts().commits, "{w}: {out}");
+    }
+}
+
+/// Die Auswahl springt auf den nächsten sichtbaren Commit — HEAD war ein
+/// menschlicher Commit.
+#[test]
+fn c33_the_selection_stays_on_a_visible_commit() {
+    let (_dir, repo, commits, inspection) = human_on_top();
+    let mut app = opened(&repo, inspection);
+    let selected = |app: &App| match app.overview.as_ref().unwrap().selected() {
+        Some(crate::overview::Selected::Commit(row)) => Some(row.id),
+        _ => None,
+    };
+    assert_eq!(selected(&app), Some(commits[3]), "starts on HEAD");
+    app.reduce(Action::AgentFilter);
+    assert_eq!(selected(&app), Some(commits[2]));
+    let state = app.overview.as_ref().unwrap();
+    assert!(state.shown().contains(&state.cursor));
+    // ↑↓ bleibt auf gezeigten Zeilen.
+    app.reduce(Action::Down);
+    assert_eq!(selected(&app), Some(commits[1]));
+    app.reduce(Action::Down);
+    assert_eq!(
+        selected(&app),
+        Some(commits[1]),
+        "the human commit stays hidden"
+    );
+}
+
+/// Der Filter bleibt beim Tab-Wechsel und beim Neuladen erhalten.
+#[test]
+fn c33_the_filter_survives_tabs_and_reloads() {
+    let (_dir, repo, _, inspection) = human_on_top();
+    let mut app = opened(&repo, inspection);
+    app.reduce(Action::AgentFilter);
+    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(0));
+    assert!(agent_only(&app));
+    let again = app.inspection.clone();
+    app.reload(Ok(again), None, now());
+    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(0));
+    assert!(agent_only(&app));
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(out.contains("agent sessions · 2 of 4 commits"), "{out}");
+}
+
+/// Keine Agent-Session in der Historie: ein Leerzustand, der sagt, was los
+/// ist und was hilft — keine leere Liste.
+#[test]
+fn c33_no_agent_session_says_so() {
+    let (_dir, repo, _, _) = history();
+    let inspection = Inspection::from_index(
+        Index::from_parts(BTreeMap::new(), BTreeMap::new()),
+        Vec::new(),
+        "demo",
+    );
+    let mut app = opened(&repo, inspection);
+    app.reduce(Action::AgentFilter);
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(
+        out.contains("No commit with an agent session in the 3 commits read. a shows all."),
+        "{out}"
+    );
+    assert!(out.contains("┆ 3 commits hidden"), "{out}");
+}
+
+/// `a` außerhalb der Übersicht tut nicht still nichts.
+#[test]
+fn c33_a_elsewhere_says_where_it_works() {
+    let (_dir, repo, _, inspection) = human_on_top();
+    let mut app = opened(&repo, inspection);
+    app.reduce(Action::TabTo(1));
+    app.reduce(Action::AgentFilter);
+    assert!(!agent_only(&app));
+    assert!(
+        app.closed
+            .as_deref()
+            .is_some_and(|c| c.contains("Overview"))
+    );
+}

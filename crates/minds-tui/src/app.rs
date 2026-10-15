@@ -1895,6 +1895,15 @@ impl<'a> App<'a> {
                 self.refit_tab();
                 return;
             }
+            // Danach der Agent-Filter der Übersicht (C3.3) — vor der Ebene.
+            if action == Action::Back
+                && self.tab == Tab::Overview
+                && let Some(state) = self.overview.as_mut()
+                && state.agent_only
+            {
+                state.toggle_agent_only();
+                return;
+            }
         }
         if self.searching {
             match action {
@@ -1951,6 +1960,18 @@ impl<'a> App<'a> {
         };
         if verb {
             self.verb(action);
+            return;
+        }
+        // `a` (C3.3): nur in der Übersicht — anderswo ein Hinweis statt
+        // still nichts.
+        if action == Action::AgentFilter {
+            match self.overview.as_mut().filter(|_| self.tab == Tab::Overview) {
+                Some(state) => state.toggle_agent_only(),
+                None => {
+                    self.closed =
+                        Some("a: shows only commits with an agent session — in Overview (1)".into())
+                }
+            }
             return;
         }
         match action {

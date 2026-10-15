@@ -19,6 +19,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`a` shows only commits with an agent session.** In the overview, `a`
+  toggles between all commits and those with an agent session (sessions
+  without a commit stay on top). Hidden commits are summarised, never dropped:
+  one dimmed line per run, `┆ 2 commits hidden · @main ▲ HEAD`, so HEAD and
+  branches stay findable. The title names the filter and `N of M`; on its
+  right it says what `a` does now. Esc resets the filter (after the search,
+  before the level); the filter survives tab switches and reloads, and the
+  selection moves to the next visible commit. Without any agent session the
+  list says so and that `a` shows all. In search mode `a` is a letter.
 - **Overview rows: subject first, the request below, status quiet.** Each
   commit reads lanes · badge · subject · status · refs · time. Status and refs
   are fixed right-aligned columns; the subject gets the rest (at least 30

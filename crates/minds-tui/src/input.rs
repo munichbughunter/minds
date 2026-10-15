@@ -66,6 +66,9 @@ pub enum Action {
     Unexplained(bool),
     /// `s` — Unified ↔ Split.
     Split,
+    /// `a` — in der Übersicht: alle Commits ↔ nur die mit Agent-Session
+    /// (C3.3).
+    AgentFilter,
     /// Hilfe ein/aus.
     Help,
     /// Beenden.
@@ -122,6 +125,7 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Char('n') => Action::Unexplained(true),
         KeyCode::Char('N') => Action::Unexplained(false),
         KeyCode::Char('s') => Action::Split,
+        KeyCode::Char('a') => Action::AgentFilter,
         KeyCode::Char('/') => Action::SearchStart,
         KeyCode::Char('?') => Action::Help,
         KeyCode::Char('q') => Action::Quit,
@@ -218,5 +222,13 @@ mod tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(map(ctrl_c, false), Action::Quit);
         assert_eq!(map(ctrl_c, true), Action::Quit);
+    }
+
+    /// C3.3: `a` schaltet den Agent-Filter — im Suchmodus landet `a` in
+    /// der Suche wie jeder Buchstabe.
+    #[test]
+    fn a_toggles_the_agent_filter_and_searching_takes_it_as_a_letter() {
+        assert_eq!(map(key(KeyCode::Char('a')), false), Action::AgentFilter);
+        assert_eq!(map(key(KeyCode::Char('a')), true), Action::SearchInput('a'));
     }
 }

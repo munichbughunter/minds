@@ -75,6 +75,9 @@ pub struct OverviewState {
     pub conformance: HashMap<CommitId, Option<ConformanceMark>>,
     /// Der Filter aus `/` (B4) — leer: alles.
     pub filter: String,
+    /// `a` (C3.3): nur Commits mit Agent-Session (und die Sessions ohne
+    /// Commit). Bleibt über Tab-Wechsel und Neuladen.
+    pub agent_only: bool,
 }
 
 impl OverviewState {
@@ -90,6 +93,7 @@ impl OverviewState {
             stale: false,
             conformance: HashMap::new(),
             filter: String::new(),
+            agent_only: false,
         };
         // Die Startauswahl ist HEAD (C3) — laufende Sessions stehen darüber.
         if let Some(head) = state.head() {
@@ -158,6 +162,8 @@ impl OverviewState {
         }
         next.session = next.session.min(next.sessions().len().saturating_sub(1));
         next.filter = std::mem::take(&mut self.filter);
+        next.agent_only = self.agent_only;
+        next.cursor = next.nearest_shown(next.cursor);
         *self = next;
     }
 
@@ -175,12 +181,47 @@ impl OverviewState {
         }
     }
 
-    /// Die Zeilen, die der Filter durchlässt: Betreff, Autor, Agent, Refs —
-    /// bei einer WIP-Session Agent und Auftrag.
+    /// `a` (C3.3): schaltet den Agent-Filter um; die Auswahl springt auf
+    /// den nächsten sichtbaren Eintrag.
+    pub fn toggle_agent_only(&mut self) {
+        self.agent_only = !self.agent_only;
+        let cursor = self.nearest_shown(self.cursor);
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            self.session = 0;
+        }
+    }
+
+    /// Der gezeigte Eintrag an `cursor` oder der nächste darunter, sonst der
+    /// letzte darüber.
+    pub fn nearest_shown(&self, cursor: usize) -> usize {
+        let shown = self.shown();
+        shown
+            .iter()
+            .find(|&&i| i >= cursor)
+            .or_else(|| shown.last())
+            .copied()
+            .unwrap_or(cursor)
+    }
+
+    /// Die Zeilen, die die Filter durchlassen: `a` nur Commits mit
+    /// Agent-Session (C3.3), dazu `/` über Betreff, Autor, Agent, Refs — bei
+    /// einer WIP-Session Agent und Auftrag.
     pub fn shown(&self) -> Vec<usize> {
         let Ok(overview) = self.data.as_ref() else {
             return Vec::new();
         };
+        let mut shown = self.matching(overview);
+        if self.agent_only {
+            shown.retain(|&i| match i.checked_sub(overview.wip.len()) {
+                None => true,
+                Some(at) => overview.rows[at].has_agent_session(),
+            });
+        }
+        shown
+    }
+
+    fn matching(&self, overview: &Overview) -> Vec<usize> {
         crate::filter::shown_by(self.len(), &self.filter, |i| {
             match i.checked_sub(overview.wip.len()) {
                 None => {

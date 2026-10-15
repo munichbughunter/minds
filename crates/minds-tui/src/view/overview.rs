@@ -363,7 +363,47 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // Jeder Eintrag als eine oder zwei Bildschirmzeilen; das Fenster
     // rechnet in Bildschirmzeilen, die Auswahl bleibt ganz sichtbar.
     let mut entries: Vec<(usize, Vec<Line>)> = Vec::new();
-    for &i in &shown {
+    let mut hidden: Vec<&CommitRow> = Vec::new();
+    // Mit `a` (C3.3) wird Ausgeblendetes zusammengefasst, nie spurlos
+    // entfernt: eine gedimmte Zeile je Lauf, mit den Refs darin.
+    let order: Vec<usize> = if state.agent_only {
+        (0..total).collect()
+    } else {
+        shown.clone()
+    };
+    let flush = |hidden: &mut Vec<&CommitRow>, entries: &mut Vec<(usize, Vec<Line>)>| {
+        if hidden.is_empty() {
+            return;
+        }
+        let n = hidden.len();
+        let mut text = format!("┆ {n} commit{} hidden", if n == 1 { "" } else { "s" });
+        let refs: Vec<String> = hidden
+            .iter()
+            .map(|row| refs_text(row, nerd))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if !refs.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&refs.join(" · "));
+        }
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(crate::view::clip(&text, row_w), theme::dim()),
+        ]);
+        entries.push((usize::MAX, vec![line]));
+        hidden.clear();
+    };
+    for i in order {
+        if !shown.contains(&i) {
+            if let Some(row) = i
+                .checked_sub(overview.wip.len())
+                .and_then(|at| overview.rows.get(at))
+            {
+                hidden.push(row);
+            }
+            continue;
+        }
+        flush(&mut hidden, &mut entries);
         let selected = i == state.cursor;
         let mut lines = match i.checked_sub(overview.wip.len()) {
             None => {
@@ -430,10 +470,21 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
         entries.push((i, lines));
     }
+    flush(&mut hidden, &mut entries);
+    let counts = overview.counts();
     let mut lines: Vec<Line> = Vec::new();
     if total == 0 {
         lines.push(Line::from(Span::styled(
             "No commits yet — the history appears here once there is one.",
+            theme::dim(),
+        )));
+    } else if state.agent_only && counts.with_agent_session == 0 && overview.wip.is_empty() {
+        // Ein Leerzustand, der sagt, was los ist und was hilft (C3.3).
+        lines.push(Line::from(Span::styled(
+            format!(
+                " No commit with an agent session in the {} commits read. a shows all.",
+                counts.commits
+            ),
             theme::dim(),
         )));
     }
@@ -458,11 +509,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     );
     let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
     // Die Zahlen genau einmal, hier (C3.1) — aus den gelesenen Zeilen.
-    let mut title = format!(
-        " {}OVERVIEW · {}",
-        mark,
-        counts_title(&overview.counts(), overview.budget_hit)
-    );
+    let mut title = if state.agent_only {
+        let visible = shown.iter().filter(|&&i| i >= overview.wip.len()).count();
+        format!(
+            " {}OVERVIEW · agent sessions · {visible} of {} commits",
+            mark, counts.commits
+        )
+    } else {
+        format!(
+            " {}OVERVIEW · {}",
+            mark,
+            counts_title(&counts, overview.budget_hit)
+        )
+    };
     if !state.filter.is_empty() {
         title.push_str(&format!(
             " · filter: {} ({} of {total})",
@@ -489,8 +548,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines).block({
             let (border, _) = theme::pane(state.focus == OverviewFocus::Graph);
+            // Rechts im Titel: was `a` jetzt bewirkt (C3.3).
+            let hint = if state.agent_only {
+                " a: all "
+            } else {
+                " a: agent sessions only "
+            };
             Block::bordered()
                 .title(title)
+                .title(Line::from(Span::styled(hint, theme::dim())).right_aligned())
                 .title_style(theme::title())
                 .border_style(border)
         }),
