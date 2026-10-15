@@ -33,8 +33,18 @@ pub enum Action {
     Why,
     /// Der Evidence-Report der Session.
     Evidence,
-    /// Die Detailstufe 1–3.
+    /// Die Detailstufe 1–3 (direkt; die Tasten sind `z` / `Z`).
     Zoom(u8),
+    /// `z` (`true`): feiner — mehr Details; `Z`: gröber.
+    ZoomStep(bool),
+    /// `v` — der Commit unter dem Fokus im Verify-Tab.
+    Verify,
+    /// `d` — der Diff des Commits unter dem Fokus.
+    Diff,
+    /// `i` — der Intent-Anker der Session unter dem Fokus.
+    Intent,
+    /// `c` — im Changes-Tab die Spalte „Why this line?“ ein/aus.
+    Context,
     /// Suche beginnen.
     SearchStart,
     /// Ein Zeichen in die Suche.
@@ -94,9 +104,15 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Char('t') => Action::ToggleTimeline,
         KeyCode::Char('w') => Action::Why,
         KeyCode::Char('e') => Action::Evidence,
-        KeyCode::Char('1') => Action::Zoom(1),
-        KeyCode::Char('2') => Action::Zoom(2),
-        KeyCode::Char('3') => Action::Zoom(3),
+        // B4: Ziffern wählen den Tab, `z` / `Z` zoomen, die Objekt-Verben
+        // sind in jedem Tab dieselben.
+        KeyCode::Char(c @ '1'..='5') => Action::TabTo(c as u8 - b'1'),
+        KeyCode::Char('z') => Action::ZoomStep(true),
+        KeyCode::Char('Z') => Action::ZoomStep(false),
+        KeyCode::Char('v') => Action::Verify,
+        KeyCode::Char('d') => Action::Diff,
+        KeyCode::Char('i') => Action::Intent,
+        KeyCode::Char('c') => Action::Context,
         KeyCode::Char('r') => Action::Reload,
         KeyCode::Tab => Action::CycleTab(true),
         KeyCode::BackTab => Action::CycleTab(false),
@@ -137,9 +153,18 @@ mod tests {
             ('w', Action::Why),
             ('e', Action::Evidence),
             ('t', Action::ToggleTimeline),
-            ('1', Action::Zoom(1)),
-            ('2', Action::Zoom(2)),
-            ('3', Action::Zoom(3)),
+            // B4: Ziffern sind Tabs, Zoom liegt auf z / Z.
+            ('1', Action::TabTo(0)),
+            ('2', Action::TabTo(1)),
+            ('3', Action::TabTo(2)),
+            ('4', Action::TabTo(3)),
+            ('5', Action::TabTo(4)),
+            ('z', Action::ZoomStep(true)),
+            ('Z', Action::ZoomStep(false)),
+            ('v', Action::Verify),
+            ('d', Action::Diff),
+            ('i', Action::Intent),
+            ('c', Action::Context),
             ('/', Action::SearchStart),
             ('?', Action::Help),
             ('q', Action::Quit),
@@ -157,6 +182,26 @@ mod tests {
         assert_eq!(map(key(KeyCode::Enter), false), Action::Enter);
         assert_eq!(map(key(KeyCode::Esc), false), Action::Back);
         assert_eq!(map(key(KeyCode::Char('x')), false), Action::None);
+        // Keine Ziffer zoomt mehr (B4).
+        for c in ['1', '2', '3'] {
+            assert!(
+                !matches!(map(key(KeyCode::Char(c)), false), Action::Zoom(_)),
+                "{c}"
+            );
+        }
+    }
+
+    /// B4 erweitert die Such-Regel (Klasse 1, unverändert oben): Auch die
+    /// neuen Tasten landen beim Tippen einer Suche in der Suche.
+    #[test]
+    fn b4_while_searching_the_new_keys_go_into_the_query() {
+        for c in ['1', '2', '3', '4', '5', 'z', 'Z', 'v', 'd', 'i', 'c'] {
+            assert_eq!(
+                map(key(KeyCode::Char(c)), true),
+                Action::SearchInput(c),
+                "{c}"
+            );
+        }
     }
 
     #[test]

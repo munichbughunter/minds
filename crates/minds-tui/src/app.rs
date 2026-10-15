@@ -593,6 +593,9 @@ impl<'a> App<'a> {
                     self.tab = Tab::Sessions;
                     self.views.clear();
                     self.push_why(WhyOrigin::Commit(commit), chain);
+                } else {
+                    // Eine Session ohne Commit hat keine Kette (B4: sagen).
+                    self.closed = Some("w: no commit here — Enter opens the session".into());
                 }
                 return;
             }
@@ -765,12 +768,16 @@ impl<'a> App<'a> {
         let Some(state) = self.verify.as_mut() else {
             return;
         };
+        let page = self.page.max(1);
         let last = state.rows().saturating_sub(1);
         match action {
             Action::Up => state.cursor = state.cursor.saturating_sub(1),
             Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::Home | Action::PageUp => state.cursor = 0,
-            Action::End | Action::PageDown => state.cursor = last,
+            Action::Home => state.cursor = 0,
+            Action::End => state.cursor = last,
+            // Bild hoch/runter blättern seitenweise, wie überall (B4).
+            Action::PageUp => state.cursor = state.cursor.saturating_sub(page),
+            Action::PageDown => state.cursor = (state.cursor + page).min(last),
             Action::Bracket(forward) => {
                 let at = if forward {
                     (state.at + 1).min(state.commits.len().saturating_sub(1))
@@ -951,7 +958,7 @@ impl<'a> App<'a> {
         };
         match (state.focus, action) {
             (_, Action::Split) => state.split = !state.split,
-            (_, Action::Why) => state.why = !state.why,
+            (_, Action::Context) => state.why = !state.why,
             (_, Action::Unexplained(forward)) => {
                 if state.jump_unexplained(forward) {
                     state.focus = Focus::Diff;
@@ -1003,16 +1010,18 @@ impl<'a> App<'a> {
     /// Sessions-Tab, `Esc` führt zurück in die Liste. Auf HEAD die Kette der
     /// Zeile (Blame), auf älteren Commits die des Commits.
     fn why_of_row(&mut self) {
-        let Some(state) = &self.changes else {
+        // Nie still nichts (B4): Fehlt Commit oder Zeile, sagt die Fußzeile es.
+        let Some(commit) = self.changes.as_ref().and_then(|s| s.commit()) else {
+            self.closed = Some("w: no commit here to explain".into());
             return;
         };
-        let Some(commit) = state.commit() else {
-            return;
-        };
-        let target = state
-            .current()
-            .and_then(|f| f.rows.get(state.row).map(|r| (f.identity.clone(), r.new)));
+        let target = self.changes.as_ref().and_then(|state| {
+            state
+                .current()
+                .and_then(|f| f.rows.get(state.row).map(|r| (f.identity.clone(), r.new)))
+        });
         let Some((path, line)) = target else {
+            self.closed = Some("w: no line here — open a file's diff first".into());
             return;
         };
         match line {
@@ -1306,10 +1315,18 @@ impl<'a> App<'a> {
         if action == Action::Back && self.at_jump_base() {
             self.go_back();
         } else {
-            // Nur Enter, w und e springen über Tab-Grenzen; nur dann lohnt
-            // der Schnappschuss.
-            let origin = matches!(action, Action::Enter | Action::Why | Action::Evidence)
-                .then(|| self.snapshot());
+            // Nur Enter und die Objekt-Verben springen über Tab-Grenzen; nur
+            // dann lohnt der Schnappschuss.
+            let origin = matches!(
+                action,
+                Action::Enter
+                    | Action::Why
+                    | Action::Evidence
+                    | Action::Verify
+                    | Action::Diff
+                    | Action::Intent
+            )
+            .then(|| self.snapshot());
             self.reduce_action(action);
             if let Some(mut entry) = origin
                 && entry.tab != self.tab
@@ -1335,6 +1352,134 @@ impl<'a> App<'a> {
         };
         if shown.is_some() {
             self.active_commit = shown;
+        }
+    }
+
+    /// Der Gegenstand unter dem Fokus — Session und/oder Commit (B4).
+    fn focus_object(&self) -> (Option<SessionId>, Option<CommitId>) {
+        let commit_of = |id: SessionId| {
+            self.inspection
+                .card(id)
+                .and_then(|card| card.commits.first().copied())
+        };
+        match self.tab {
+            Tab::Sessions => {
+                let session = match self.top() {
+                    Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
+                    Some(View::Why { origin, .. }) => match origin {
+                        WhyOrigin::Session(id) => Some(*id),
+                        _ => None,
+                    },
+                    None => self.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
+                };
+                let commit = match self.top() {
+                    Some(View::Why {
+                        origin: WhyOrigin::Commit(commit),
+                        ..
+                    }) => Some(*commit),
+                    _ => session.and_then(commit_of),
+                };
+                (session, commit)
+            }
+            Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
+                Some(Selected::Commit(row)) => (
+                    self.overview
+                        .as_ref()
+                        .and_then(|s| s.chosen_session())
+                        .or(row.sessions.first().copied()),
+                    Some(row.id),
+                ),
+                Some(Selected::Wip(wip)) => (Some(wip.id), None),
+                None => (None, None),
+            },
+            Tab::Verify => {
+                let state = self.verify.as_ref();
+                let session = state
+                    .and_then(|s| s.sessions.get(s.cursor).map(|row| row.id))
+                    .or_else(|| state.and_then(|s| s.sessions.first().map(|row| row.id)));
+                (session, state.and_then(|s| s.commit()))
+            }
+            Tab::Changes => {
+                let commit = self.changes.as_ref().and_then(|s| s.commit());
+                let session =
+                    commit.and_then(|c| self.inspection.index().sessions_of(c).first().copied());
+                (session, commit)
+            }
+            Tab::Intent => {
+                let session = self.intent.as_ref().and_then(|state| {
+                    state.selected().and_then(|anchor| {
+                        crate::intent::bound_sessions(&self.inspection, &anchor.id)
+                            .first()
+                            .map(|(id, _)| *id)
+                    })
+                });
+                (session, session.and_then(commit_of))
+            }
+        }
+    }
+
+    /// Ein Objekt-Verb auf dem Gegenstand unter dem Fokus — oder ein kurzer
+    /// Hinweis, warum es hier nicht passt (B4: nie still nichts).
+    fn verb(&mut self, action: Action) {
+        let (session, commit) = self.focus_object();
+        match action {
+            Action::Verify => match commit {
+                Some(commit) => self.open_verify(Some(commit)),
+                None => self.closed = Some("v: no commit here to verify".into()),
+            },
+            Action::Diff => match commit {
+                Some(commit) => self.open_changes(Some(commit)),
+                None => self.closed = Some("d: no commit here to diff".into()),
+            },
+            Action::Intent => {
+                let anchor = session.and_then(|id| {
+                    crate::intent::named_anchors(&self.inspection)
+                        .into_iter()
+                        .find(|a| {
+                            crate::intent::bound_sessions(&self.inspection, a)
+                                .iter()
+                                .any(|(s, _)| *s == id)
+                        })
+                });
+                match anchor {
+                    Some(anchor) => self.open_intent(Some(anchor)),
+                    None => {
+                        self.closed = Some("i: no intent anchor is bound to this session".into())
+                    }
+                }
+            }
+            Action::Why if self.tab == Tab::Changes => self.why_of_row(),
+            Action::Why => match (commit, session) {
+                (Some(commit), _) => {
+                    let chain = self.inspection.why_commit(commit);
+                    self.tab = Tab::Sessions;
+                    self.views.clear();
+                    self.push_why(WhyOrigin::Commit(commit), chain);
+                }
+                (None, Some(id)) => match self.inspection.why_session(id) {
+                    Some(chain) => {
+                        self.tab = Tab::Sessions;
+                        self.views.clear();
+                        self.push_why(WhyOrigin::Session(id), chain);
+                    }
+                    None => self.closed = Some("w: this session is not readable".into()),
+                },
+                (None, None) => self.closed = Some("w: nothing here to explain".into()),
+            },
+            Action::Evidence => match session {
+                Some(id) => {
+                    self.tab = Tab::Sessions;
+                    self.query.clear();
+                    self.refilter_keeping(Some(id));
+                    self.views.clear();
+                    self.push_evidence(id);
+                }
+                None => self.closed = Some("e: no session here".into()),
+            },
+            Action::Context => {
+                self.closed = Some("c: the why column belongs to the Changes tab".into())
+            }
+            _ => {}
         }
     }
 
@@ -1535,6 +1680,19 @@ impl<'a> App<'a> {
             }
             return;
         }
+        // `z` / `Z` (B4): ein Schritt feiner bzw. gröber, an den Enden bleibt
+        // die Stufe.
+        let action = match action {
+            Action::ZoomStep(finer) => {
+                let d = self.zoom.digit();
+                Action::Zoom(if finer {
+                    (d + 1).min(3)
+                } else {
+                    d.saturating_sub(1).max(1)
+                })
+            }
+            other => other,
+        };
         if let Action::Zoom(d) = action {
             self.zoom = self.zoom.from_digit(d);
             self.relayout();
@@ -1542,6 +1700,19 @@ impl<'a> App<'a> {
         }
         if action == Action::Help {
             self.help = true;
+            return;
+        }
+        // Die Objekt-Verben (B4): `v d i` überall, `w e` dort, wo der Tab
+        // sie nicht selbst trägt.
+        let verb = match (action.clone(), self.tab) {
+            (Action::Verify | Action::Diff | Action::Intent, _) => true,
+            (Action::Why, Tab::Verify | Tab::Changes | Tab::Intent) => true,
+            (Action::Evidence, Tab::Overview | Tab::Verify | Tab::Changes | Tab::Intent) => true,
+            (Action::Context, tab) => tab != Tab::Changes,
+            _ => false,
+        };
+        if verb {
+            self.verb(action);
             return;
         }
         match action {

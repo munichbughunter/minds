@@ -27,6 +27,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Consistent keys in `minds inspect`.** `1`–`5` switch tabs (F1–F5 and
+  Tab/Shift-Tab still work); zoom moved to `z` (finer) and `Z` (coarser). The
+  object verbs mean the same in every tab, on any session or commit in
+  focus: `w` why, `e` evidence, `v` verify, `d` diff, `i` intent — where one
+  does not fit, the footer says why instead of doing nothing. In Changes,
+  `c` toggles the "why this line?" column and `w` opens the why chain. PgUp
+  and PgDn page in Verify too.
 - **The way back across tabs.** Every jump from one tab to another
   (Enter on a commit, session, anchor or artifact; `w` on a line) is recorded
   with its origin — tab, layers, cursor, search. Esc on the layer the jump

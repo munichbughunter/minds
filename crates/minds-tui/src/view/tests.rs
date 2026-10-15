@@ -2538,7 +2538,7 @@ mod changes_tab {
         assert!(out.contains("NOT OBSERVED"), "{out}");
         assert!(out.contains("No evidence of the sessions linked"), "{out}");
 
-        app.reduce(Action::Why);
+        app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(
             !render(&mut app).contains("WHY THIS LINE?"),
             "w hides the column"
@@ -2599,7 +2599,7 @@ mod changes_tab {
         let mut app = app_with_changes(&repo);
         app.reduce(Action::Enter);
         app.reduce(Action::Split);
-        app.reduce(Action::Why);
+        app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         let out = render_at(&mut app, 260);
         let line = out
             .lines()
@@ -2795,9 +2795,11 @@ mod changes_tab {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
-        app.reduce(Action::Why);
+        app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(!app.changes.as_ref().unwrap().why);
     }
+
+    mod b4;
 }
 
 // --- Verify-Tab -------------------------------------------------------------
@@ -3328,6 +3330,8 @@ mod verify_tab {
             "{out}"
         );
     }
+
+    mod b4;
 }
 
 mod intent_tab {

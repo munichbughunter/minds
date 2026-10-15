@@ -17,12 +17,13 @@ Enter / l          open, descend
 Esc / h            back: close, clear the search, return — never quits
 
 /                  search (terms AND-combined, over prompt, agent, paths, ids)
-w                  why — the provenance chain
-e                  evidence — verdict, coverage, epochs, signature, limits
+w                  why — the provenance chain (on any session, commit or line)
+e                  evidence of the session — verdict, coverage, epochs, signature
+v / d / i          verify · diff · intent of the commit or session in focus
 t                  graph ↔ timeline
-1 / 2 / 3          zoom: summary / normal / verbose
+z / Z              zoom: finer / coarser
 r                  reload now (it also reloads by itself when the store changes)
-Tab / F1 … F5      switch tab: Overview · Sessions · Verify · Changes · Intent
+1 … 5 / Tab / F1   switch tab: Overview · Sessions · Verify · Changes · Intent
 ?                  this help (↑↓ PgUp PgDn scroll it)
 q / Ctrl-C         quit";
 
@@ -37,7 +38,7 @@ fn section(tab: Tab) -> &'static str {
         }
         Tab::Verify => "Verify:   ↑↓ row · Enter open (session, diff) · [ ] commit",
         Tab::Changes => {
-            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next unexplained\n          s unified ↔ split · w why this line · Enter why chain · Esc back"
+            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next unexplained\n          s unified ↔ split · c why column · w why chain of the line · Esc back"
         }
         Tab::Intent => {
             "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it\n          in why: Enter on the anchor"

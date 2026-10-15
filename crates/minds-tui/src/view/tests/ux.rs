@@ -702,3 +702,79 @@ fn b5_a_hidden_node_lands_on_the_row_that_contains_it() {
         focused_kind(&app)
     );
 }
+
+// ---------------------------------------------------------------------
+// B4 · Konsistente Tasten
+// ---------------------------------------------------------------------
+
+#[test]
+fn b4_z_and_shift_z_step_the_zoom() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::Enter);
+    assert_eq!(app.zoom, crate::Zoom::Normal);
+    app.reduce(Action::ZoomStep(true));
+    assert_eq!(app.zoom, crate::Zoom::Verbose);
+    app.reduce(Action::ZoomStep(true));
+    assert_eq!(app.zoom, crate::Zoom::Verbose, "finest stays");
+    app.reduce(Action::ZoomStep(false));
+    app.reduce(Action::ZoomStep(false));
+    assert_eq!(app.zoom, crate::Zoom::Summary);
+    app.reduce(Action::ZoomStep(false));
+    assert_eq!(app.zoom, crate::Zoom::Summary, "coarsest stays");
+    // Breit genug, dass die Fußzeile den Zoom-Hinweis nicht kürzt.
+    let out = render_sized(&mut app, 300, 30);
+    assert!(out.contains("z Z zoom"), "{out}");
+    assert!(!out.contains("1·2·3 zoom"), "{out}");
+}
+
+/// Dieselben Verben auf jedem Element mit Session oder Commit; was nicht
+/// passt, sagt es, statt still nichts zu tun.
+#[test]
+fn b4_the_object_verbs_work_on_a_session() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    // Session a trägt Commit 1.
+    app.reduce(Action::Verify);
+    assert_eq!(app.tab, crate::app::Tab::Verify);
+    assert_eq!(app.verify.as_ref().unwrap().commit(), Some(commit('1')));
+    app.reduce(Action::Back); // B2: zurück
+    assert_eq!(app.tab, crate::app::Tab::Sessions);
+    app.reduce(Action::Diff);
+    assert_eq!(app.tab, crate::app::Tab::Changes);
+    assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
+    app.reduce(Action::Back);
+    assert_eq!(app.tab, crate::app::Tab::Sessions);
+    // Kein Intent-Anker: ein Hinweis, kein stiller Nicht-Effekt.
+    app.reduce(Action::Intent);
+    assert_eq!(app.tab, crate::app::Tab::Sessions);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("no intent anchor"), "{out}");
+    // Session b hat keinen Commit: v und d sagen es.
+    app.reduce(Action::Down);
+    app.reduce(Action::Verify);
+    assert_eq!(app.tab, crate::app::Tab::Sessions);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("no commit"), "{out}");
+}
+
+/// Auch in Randfällen nie still nichts: `w` ohne erklärbaren Gegenstand und
+/// `c` außerhalb von Changes sagen, warum nicht.
+#[test]
+fn b4_verbs_without_an_object_say_why() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    app.reduce(Action::TabTo(4)); // Intent: kein Anker, keine Session
+    app.reduce(Action::Why);
+    assert!(app.closed.is_some(), "w in an empty Intent tab");
+    app.reduce(Action::TabTo(1));
+    app.reduce(Action::Context);
+    assert!(app.closed.is_some(), "c outside Changes");
+    // Changes ohne Zeile: w sagt es.
+    app.reduce(Action::TabTo(3));
+    app.reduce(Action::Why);
+    assert!(
+        app.closed.is_some() || matches!(app.top(), Some(View::Why { .. })),
+        "w in Changes"
+    );
+}

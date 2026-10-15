@@ -291,10 +291,10 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let keys = match state.focus {
         Focus::Files => {
-            "↑↓ file  Enter diff  [ ] commit  n next unexplained  s split  Tab sessions  ? help"
+            "↑↓ file  Enter diff  [ ] commit  n next unexplained  s split  c why column  w why chain  ? help"
         }
         Focus::Diff => {
-            "↑↓ line  ] [ hunk  n N unexplained  s split  w why  Enter why chain  Esc files  ? help"
+            "↑↓ line  ] [ hunk  n N unexplained  s split  c why column  w why chain  Esc files  ? help"
         }
     };
     let keys = Line::from(vec![
@@ -507,10 +507,10 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         let keys = match app.top() {
             None => {
-                "↑↓ select  Enter descend  w why  e evidence  / search  1·2·3 zoom  ? help  q quit"
+                "↑↓ select  Enter descend  w why  e evidence  / search  z Z zoom  ? help  q quit"
             }
             Some(View::Graph { .. }) => {
-                "↑↓ select  Enter descend  w why  e evidence  t timeline  1·2·3 zoom  Esc back  ? help"
+                "↑↓ select  Enter descend  w why  e evidence  t timeline  z Z zoom  Esc back  ? help"
             }
             Some(View::Why { .. }) => "↑↓ select  Enter open  Esc back  ? help",
             Some(View::Evidence { .. }) => "↑↓ section  Esc back  ? help",
