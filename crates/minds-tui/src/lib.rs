@@ -292,6 +292,8 @@ pub fn run(source: &dyn Source, repo: &Repo, opts: Options) -> Result<(), TuiErr
     app.live = stamp.is_some();
     app.stamp = stamp;
     app.nerd = opts.nerd_font;
+    // Wie die CLI: `NO_COLOR` (nicht leer) schaltet alle Farben ab (C6).
+    app.no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     if let Start::Why { path, line } = &opts.start {
         app.open_why_line(path, *line)?;
     } else if start_overview {

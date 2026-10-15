@@ -233,6 +233,8 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// `NO_COLOR` (C6): ohne fg/bg-Farben zeichnen, Modifier bleiben.
+    pub no_color: bool,
     /// Der Tick des Spinners, solange eine Prüfung im Worker läuft (B6).
     pub spin: usize,
     /// Die Uhr für relative Zeiten in Listen (C4) — `run` stellt sie je
@@ -379,6 +381,7 @@ impl<'a> App<'a> {
             history: Vec::new(),
             now: SystemTime::now(),
             spin: 0,
+            no_color: false,
         };
         // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
         let tampered = tampered_of(&app.cards);

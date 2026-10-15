@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **`minds inspect` honours `NO_COLOR`.** With `NO_COLOR` set (not empty),
+  the interface draws without any foreground or background colour, like the
+  CLI; bold, inverted and underlined stay, so every state still reads by
+  glyph and word, the cursor stays inverted and the focused pane keeps its
+  `▸`. Nerd Font glyphs stay opt-in.
 - **Verify no longer freezes `minds inspect`.** The check behind the Verify
   tab (`minds verify`, ssh-keygen per seal) runs in a worker thread; the
   interface stays responsive and shows `… CHECKING` with an ASCII spinner

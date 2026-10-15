@@ -53,6 +53,24 @@ const DEGRADED: &str =
 
 /// Zeichnet den ganzen Bildschirm.
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    draw_inner(frame, app);
+    // `NO_COLOR` (C6): alle fg/bg-Farben fallen weg, Modifier (fett,
+    // invertiert, unterstrichen) bleiben — Glyph und Wort tragen jeden
+    // Zustand, der Cursor bleibt invertiert, der Fokus trägt `▸`.
+    if app.no_color {
+        let area = frame.area();
+        let buffer = frame.buffer_mut();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let cell = &mut buffer[(x, y)];
+                cell.set_fg(ratatui::style::Color::Reset);
+                cell.set_bg(ratatui::style::Color::Reset);
+            }
+        }
+    }
+}
+
+fn draw_inner(frame: &mut Frame, app: &mut App) {
     let banner_h = u16::from(app.tamper.is_some());
     let [head, alert, body, foot] = Layout::vertical([
         Constraint::Length(2),

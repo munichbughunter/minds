@@ -142,3 +142,46 @@ fn c2_two_footer_lines_with_fixed_roles() {
         assert!(line1.contains(&row.id.to_string()[..7]), "{line1}");
     }
 }
+
+// ---------------------------------------------------------------------
+// C6 · Ohne Farbe und mit einfachen Fonts benutzbar
+// ---------------------------------------------------------------------
+
+/// `NO_COLOR`: keine fg/bg-Farbe in keiner Zelle — aber Cursor (invertiert),
+/// Fokus (▸) und jeder Zustand (Glyph + Wort) bleiben erkennbar.
+#[test]
+fn c6_monochrome_keeps_every_state_cursor_and_focus() {
+    use ratatui::style::Color;
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    app.no_color = true;
+    for tab in 0..5u8 {
+        app.reduce(Action::TabTo(tab));
+        let buffer = buffer_sized(&mut app, 160, 40);
+        let area = buffer.area;
+        let mut reversed = false;
+        for y in 0..area.height {
+            for x in 0..area.width {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.fg, Color::Reset, "tab {tab}: fg at {x},{y}");
+                assert_eq!(cell.bg, Color::Reset, "tab {tab}: bg at {x},{y}");
+                reversed |= cell.modifier.contains(Modifier::REVERSED);
+            }
+        }
+        let lines = text(&buffer);
+        if tab == 0 || tab == 1 {
+            assert!(reversed, "tab {tab}: the cursor stays visible");
+            assert!(
+                lines.iter().any(|l| l.contains("▸ ")),
+                "tab {tab}: focus mark"
+            );
+        }
+    }
+    // Die Zustände tragen Glyph und Wort — dieselben wie in Farbe.
+    app.reduce(Action::TabTo(1));
+    let lines = text(&buffer_sized(&mut app, 160, 40)).join("\n");
+    assert!(
+        lines.contains("· legacy") || lines.contains("◈ sealed"),
+        "{lines}"
+    );
+}
