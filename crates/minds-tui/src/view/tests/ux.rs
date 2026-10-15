@@ -879,3 +879,38 @@ fn c1_footer_line_one_explains_the_focused_state() {
         "{out}"
     );
 }
+
+// ---------------------------------------------------------------------
+// C4 · Zeiten
+// ---------------------------------------------------------------------
+
+#[test]
+fn c4_relative_times_in_lists_absolute_in_details() {
+    use super::super::{ago, when};
+    let at = "2026-10-14T09:00:00Z";
+    let base = minds_metrics::epoch_seconds(at).unwrap();
+    assert_eq!(ago(Some(at), base + 30), "just now");
+    assert_eq!(ago(Some(at), base + 5 * 60), "5m ago");
+    assert_eq!(ago(Some(at), base + 3 * 3600), "3h ago");
+    assert_eq!(ago(Some(at), base + 2 * 86_400), "2d ago");
+    // In der Zukunft oder unlesbar: die absolute Form, nie ein Unsinn.
+    assert_eq!(ago(Some(at), base - 3600), "2026-10-14 09:00 UTC");
+    assert_eq!(ago(Some("kaputt"), base), "kaputt");
+    assert_eq!(ago(None, base), "—");
+    assert_eq!(when(Some(at)), "2026-10-14 09:00 UTC");
+}
+
+#[test]
+fn c4_the_list_shows_relative_times() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let started = minds_metrics::epoch_seconds("2026-07-25T14:10:00Z").unwrap();
+    app.now = std::time::UNIX_EPOCH + std::time::Duration::from_secs((started + 3 * 3600) as u64);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("3h ago"), "{out}");
+    assert!(!out.contains("25.07. 14:10Z"), "{out}");
+    // Im Detail (Graph-Kopf) die absolute Zeit in UTC.
+    app.reduce(Action::Enter);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("2026-07-25 14:10 UTC"), "{out}");
+}

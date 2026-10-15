@@ -305,7 +305,9 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     assert!(out.contains("● ?"), "{out}");
     assert!(out.contains("↻ needs work"), "{out}");
     assert!(out.contains("⌦ forgotten"), "{out}");
-    assert!(out.contains("25.07. 14:10Z"), "{out}");
+    // Listen zeigen relative Zeit (C4) — das alte deutsche Datumsformat nicht.
+    assert!(out.contains(" ago"), "{out}");
+    assert!(!out.contains("25.07. 14:10Z"), "{out}");
     assert!(out.contains("context coverage"), "{out}");
 }
 
@@ -391,7 +393,9 @@ fn the_timeline_is_the_same_rows_without_the_tree() {
     let out = render(&mut app);
     assert!(out.contains("TIMELINE"), "{out}");
     assert!(!out.contains("┣━"), "{out}");
-    assert!(out.contains("25.07. 14:10Z"), "{out}");
+    // Zeitleiste und Detail: absolute Zeit in UTC (C4).
+    assert!(out.contains("2026-07-25 14:10 UTC"), "{out}");
+    assert!(!out.contains("25.07. 14:10Z"), "{out}");
 }
 
 #[test]

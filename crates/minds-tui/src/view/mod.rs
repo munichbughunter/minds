@@ -781,15 +781,35 @@ fn freshness(app: &App) -> Span<'static> {
 /// `DD.MM. HH:MMZ` aus dem RFC-3339-Präfix; `—`, wenn keine Zeit erfasst ist.
 /// UTC, wie der Zeitstempel selbst — ohne Datums-Crate keine Ortszeit.
 pub fn when(ts: Option<&str>) -> String {
-    // `get` statt Index-Slicing: Der Wert kann fremdbestimmt sein (etwa die
-    // Zeitzeile eines handgebauten Seals) — ein Multi-Byte-Zeichen an der
-    // falschen Stelle darf die Oberfläche nicht panicken.
+    // Im Detail absolut, in UTC und ohne Landesformat (C4):
+    // `2026-10-14 09:00 UTC`. `get` statt Index-Slicing: Der Wert kann
+    // fremdbestimmt sein (etwa die Zeitzeile eines handgebauten Seals) — ein
+    // Multi-Byte-Zeichen an der falschen Stelle darf nicht panicken.
     match ts {
-        Some(ts) => match (ts.get(8..10), ts.get(5..7), ts.get(11..16)) {
-            (Some(d), Some(m), Some(hm)) => format!("{d}.{m}. {hm}Z"),
+        Some(ts) => match (ts.get(0..10), ts.get(11..16)) {
+            (Some(date), Some(hm)) if minds_metrics::epoch_seconds(ts).is_some() => {
+                format!("{date} {hm} UTC")
+            }
             _ => ts.to_string(),
         },
         None => "—".into(),
+    }
+}
+
+/// Wie lange her, für Listen (C4): `just now`, `5m ago`, `3h ago`, `2d ago`
+/// — gemessen an `now` (Sekunden seit Epoch). In der Zukunft oder unlesbar:
+/// die absolute Form aus [`when`].
+pub fn ago(ts: Option<&str>, now: i64) -> String {
+    let Some(at) = ts.and_then(minds_metrics::epoch_seconds) else {
+        return when(ts);
+    };
+    let secs = now - at;
+    match secs {
+        s if s < 0 => when(ts),
+        s if s < 60 => "just now".into(),
+        s if s < 3_600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3_600),
+        s => format!("{}d ago", s / 86_400),
     }
 }
 

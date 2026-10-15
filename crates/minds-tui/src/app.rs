@@ -233,6 +233,9 @@ pub struct App<'a> {
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
     pub nerd: bool,
+    /// Die Uhr für relative Zeiten in Listen (C4) — `run` stellt sie je
+    /// Tick, Tests setzen sie fest.
+    pub now: SystemTime,
     /// Der Navigationsverlauf (B2): je tabübergreifendem Sprung der
     /// Ursprung — Esc kehrt von der Ebene des Sprungs genau dorthin zurück.
     pub history: Vec<NavEntry>,
@@ -336,6 +339,7 @@ impl<'a> App<'a> {
             tamper: None,
             active_commit: None,
             history: Vec::new(),
+            now: SystemTime::now(),
         };
         // Auch beim Start: Was schon manipuliert ist, meldet das Banner.
         let tampered = tampered_of(&app.cards);
@@ -1349,6 +1353,14 @@ impl<'a> App<'a> {
         self.sync_active();
     }
 
+    /// Die Uhr in Sekunden seit Epoch (C4).
+    pub fn now_secs(&self) -> i64 {
+        self.now
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
     /// Übernimmt den Commit des sichtbaren Tabs als aktiven (B3).
     fn sync_active(&mut self) {
         let shown = match self.tab {
@@ -2243,6 +2255,7 @@ impl<'a> App<'a> {
             .unwrap_or_else(Instant::now);
         let mut anchored = verified;
         while !self.quit {
+            self.now = SystemTime::now();
             terminal.draw(|frame| view::draw(frame, &mut self))?;
             // Steht eine Prüfung der Signer aus, ist „checking…" jetzt
             // gezeichnet: erst dann prüfen (ssh-keygen je Seal) und sofort

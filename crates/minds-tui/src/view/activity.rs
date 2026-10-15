@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
 
 use crate::app::App;
 use crate::theme;
-use crate::view::{clip, offset, when};
+use crate::view::{ago, clip, offset};
 
 /// Die schmalste Breite, in der die kompakte Stufe alle ihre Spalten zeigt
 /// — die Untergrenze für die Listenspalte neben der Vorschau.
@@ -184,7 +184,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .skip(first)
         .take(height)
         .map(|(i, card)| {
-            let mut row = row_of(card, columns, headline_w);
+            let mut row = row_of(card, columns, headline_w, app.now_secs());
             if i == app.cursor {
                 row = row.style(theme::cursor());
             }
@@ -213,7 +213,7 @@ fn sessions_block(focused: bool) -> Block<'static> {
 
 /// Eine Karte als Tabellenzeile. Degradierte Zeilen sind gedimmt und tragen
 /// ihren Zustand in der SEAL-Spalte — das Verdict bleibt leer, wo keines ist.
-fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row<'a> {
+fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize, now: i64) -> Row<'a> {
     let degraded = card.is_degraded();
     let base = if degraded {
         theme::dim()
@@ -230,7 +230,7 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row
     ));
 
     let mut cells = vec![
-        Cell::from(Span::styled(when(card.started_at.as_deref()), base)),
+        Cell::from(Span::styled(ago(card.started_at.as_deref(), now), base)),
         Cell::from(session),
         // Je Agent eine feste Farbe — das Wort steht daneben. Eine
         // degradierte Zeile bleibt ganz grau: Ihr Akteur ist „—", kein Agent.

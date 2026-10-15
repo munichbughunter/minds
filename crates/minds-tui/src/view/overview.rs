@@ -409,7 +409,7 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             if let Some(started) = &wip.started {
                 lines.push(Line::from(vec![
                     label("Started"),
-                    Span::raw(started.clone()),
+                    Span::raw(crate::view::when(Some(started))),
                 ]));
             }
             lines.push(Line::from(vec![
@@ -450,7 +450,11 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                 label("Author"),
                 Span::raw(row.author.clone()),
             ]));
-            lines.push(Line::from(vec![label("Date"), Span::raw(row.date.clone())]));
+            // Im Detail absolut, in UTC (C4).
+            lines.push(Line::from(vec![
+                label("Date"),
+                Span::raw(format!("{} UTC", row.date.trim_end_matches('Z'))),
+            ]));
             if !row.refs.is_empty() {
                 let names: Vec<String> = row
                     .refs

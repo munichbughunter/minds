@@ -27,6 +27,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Times read the same everywhere.** Lists show relative times (`just
+  now`, `5m ago`, `3h ago`, `2d ago`); details and the timeline show
+  `2026-10-14 09:00 UTC` instead of the German-style `14.10. 09:00Z`.
 - **The overview leads with the subject.** Each commit row reads lanes ·
   badge · refs · subject · (dim) request, with what Minds knows — seal state,
   a deviating review, intent, several sessions, conformance — right-aligned;
