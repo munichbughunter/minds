@@ -31,19 +31,31 @@ fn c3_the_subject_leads_and_states_stand_right() {
     let subject = row.find("feat(sort): agent work").unwrap();
     let state = row.find("unsealed").expect("seal state pill");
     assert!(subject < state, "subject first: {row}");
-    // Rechtsbündig: Die Zeile der Liste endet mit den Zustands-Pillen,
-    // davor steht Luft.
+    // Rechtsbündig: Die Zustände stehen in einer festen Spalte, davor
+    // steht Luft; die Zeile endet mit der Zeit (C3.2: Status · Refs ·
+    // Zeit), nicht mehr mit einer Pille.
     let list_part = &row[subject..row[subject..].find('│').map_or(row.len(), |b| b + subject)];
+    // Kurz relativ (C3.2: „now", „3h", „1d") — nicht mehr „just now".
     assert!(
-        list_part.trim_end().ends_with("⚑ intent"),
+        list_part.trim_end().ends_with(" now"),
         "right-aligned: {row}"
     );
     assert!(
-        list_part.contains("   · unsealed"),
+        !list_part.trim_end().ends_with("just now"),
+        "right-aligned: {row}"
+    );
+    assert!(
+        !list_part.trim_end().ends_with("⚑ intent"),
+        "right-aligned: {row}"
+    );
+    assert!(
+        list_part.contains("   · unsealed ⚑"),
         "padding before the states: {row}"
     );
-    // Die globale Statistik steht im Titel der Übersicht.
-    assert!(lines[2].contains("Sessions"), "{}", lines[2]);
+    // Die Zahlen stehen im Titel der Übersicht — gezählt über die Zeilen
+    // (C3.1), nicht mehr die globale Statistik.
+    assert!(lines[2].contains("with an agent session"), "{}", lines[2]);
+    assert!(!lines[2].contains("Sessions"), "{}", lines[2]);
 }
 
 #[test]
@@ -57,13 +69,18 @@ fn c3_the_detail_names_the_next_action() {
         app.reduce(Action::Down);
     }
     let lines = lines_at(&mut app, 160, 40);
+    // C3.4: Die nächste Aktion steht in der Fußzeile, nie im Detail.
     assert!(
-        lines
+        !lines
             .iter()
             .any(|l| l.contains("Enter: how it was made · v: verify · d: diff")),
         "{}",
         lines.join("\n")
     );
+    let footer = &lines[lines.len() - 1];
+    for key in ["Enter how it was made", "v verify", "d diff"] {
+        assert!(footer.contains(key), "{key}: {}", lines.join("\n"));
+    }
 }
 
 #[test]

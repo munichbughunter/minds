@@ -160,7 +160,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(text)
                 .style(theme::dim())
-                .block(sessions_block(app.top().is_none())),
+                .block(sessions_block(app)),
             table_area,
         );
         draw_notice(frame, notice_area, rejected.len());
@@ -197,18 +197,24 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Table::new(rows, columns.widths())
             .header(header)
             .column_spacing(1)
-            .block(sessions_block(app.top().is_none())),
+            .block(sessions_block(app)),
         table_area,
     );
     draw_notice(frame, notice_area, rejected.len());
 }
 
 /// Der Rahmen der Liste — fokussiert, solange keine Ebene über ihr liegt
-/// (B7).
-fn sessions_block(focused: bool) -> Block<'static> {
-    let (border, mark) = theme::pane(focused);
+/// (B7). Der Titel trägt die Zahl der Sessions (aus dem Kopf hierher, C3.1).
+fn sessions_block(app: &App) -> Block<'static> {
+    let (border, mark) = theme::pane(app.top().is_none());
+    let h = app.inspection.header();
+    let mut title = format!(" {mark}SESSIONS · {} captured", h.sessions);
+    if h.degraded > 0 {
+        title.push_str(&format!(" · {} degraded", h.degraded));
+    }
+    title.push(' ');
     Block::bordered()
-        .title(format!(" {mark}SESSIONS "))
+        .title(title)
         .title_style(theme::title())
         .border_style(border)
 }

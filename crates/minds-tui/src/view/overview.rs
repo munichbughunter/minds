@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use minds_reader::model::Verdict;
-use minds_reader::overview::{CommitRow, RefLabel, WipSession, WipState, one_line};
+use minds_reader::overview::{
+    CommitRow, OverviewCounts, RefLabel, SealMark, WipSession, WipState, one_line,
+};
 
 use crate::overview::MAX_SESSION_LINES;
 
@@ -68,94 +70,109 @@ fn badge(spans: &mut Vec<Span<'static>>, name: &str, agent: bool, nerd: bool) {
     }
 }
 
-/// Die Ref-Farben — nie das Grün der Belege (`theme::OK`): Ein Branch, der
-/// `✓approved` heißt, darf nicht wie ein Review aussehen.
-const HEAD_REF: Color = Color::Indexed(31);
-const BRANCH_REF: Color = Color::Indexed(24);
-const TAG_REF: Color = Color::Indexed(94);
-
-/// Die Pillen eines Commits: Refs, dann was Minds weiß.
-/// Die Refs eines Commits als kompakte Pillen — direkt hinter dem Badge
-/// (C3).
-fn refs(spans: &mut Vec<Span<'static>>, row: &CommitRow, nerd: bool) {
-    // Refs tragen immer ein Präfix (Icon oder `@`/`#`), nie eine
-    // Belegfarbe — sonst könnte ein Branch-Name einen Status vortäuschen.
+/// Die Refs eines Commits als leise Textspalte (C3.2) — keine Pillen, nie
+/// eine Belegfarbe: Ein Branch, der `✓approved` heißt, darf nicht wie ein
+/// Review aussehen. Jede Ref trägt ihr Präfix (Icon oder `@`/`#`).
+fn refs_text(row: &CommitRow, nerd: bool) -> String {
     let (branch, tag) = if nerd {
         ("\u{e0a0} ", "\u{f02b} ")
     } else {
         ("@", "#")
     };
-    for label in &row.refs {
-        let (text, bg) = match label {
-            RefLabel::Head(name) => (format!("{branch}{name} {} HEAD", theme::HEAD), HEAD_REF),
-            RefLabel::Branch(name) => (format!("{branch}{name}"), BRANCH_REF),
-            RefLabel::Tag(name) => (format!("{tag}{name}"), TAG_REF),
-            RefLabel::Detached => (format!("{} HEAD (detached)", theme::HEAD), HEAD_REF),
-            RefLabel::More(n) => (format!("+{n}"), Color::Indexed(238)),
-        };
-        let body = Style::default().fg(Color::White).bg(bg);
-        if nerd {
-            spans.push(Span::styled("\u{e0b6}", Style::default().fg(bg)));
-            spans.push(Span::styled(text, body));
-            spans.push(Span::styled("\u{e0b4}", Style::default().fg(bg)));
-        } else {
-            spans.push(Span::styled(format!(" {text} "), body));
-        }
-        spans.push(Span::raw(" "));
-    }
+    row.refs
+        .iter()
+        .map(|label| match label {
+            RefLabel::Head(name) => format!("{branch}{name} {} HEAD", theme::HEAD),
+            RefLabel::Branch(name) => format!("{branch}{name}"),
+            RefLabel::Tag(name) => format!("{tag}{name}"),
+            RefLabel::Detached => format!("{} HEAD (detached)", theme::HEAD),
+            RefLabel::More(n) => format!("+{n}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Was Minds über den Commit weiß, als Pillen — rechtsbündig in der Zeile
-/// (C3): Conformance, Seal-Zustand, abweichendes Review, Intent, mehrere
-/// Sessions. Normalzustände bekommen keine Pille.
-fn states(
-    spans: &mut Vec<Span<'static>>,
-    row: &CommitRow,
-    conformance: Option<ConformanceMark>,
-    nerd: bool,
-) {
-    // Die Conformance gilt jedem Commit, auch einem ohne Session — eine
-    // Pille, sobald sie gerechnet ist (gewählter Commit, HEAD). Farbe nie
-    // allein: Glyph und Wort tragen das Ergebnis.
+/// Nur HEAD, wenn die Refs nicht passen.
+fn head_text(row: &CommitRow) -> String {
+    row.refs
+        .iter()
+        .find_map(|label| match label {
+            RefLabel::Head(_) | RefLabel::Detached => Some(format!("{} HEAD", theme::HEAD)),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Die Status-Spalte eines Commits (C3.2): Conformance, Seal-Zustand (Glyph
+/// **und** Wort — „sealed" nur, wenn jedes Seal signiert ist), abweichendes
+/// Review, `⚑` für eine gebundene Anforderung, `◉N` bei mehreren Sessions.
+/// Normalzustände (Review „open") bleiben leise. Nur Vordergrundfarben —
+/// die Auswahl ist ein einziger Balken.
+fn status(row: &CommitRow, conformance: Option<ConformanceMark>) -> Vec<Span<'static>> {
+    let mut parts: Vec<Span<'static>> = Vec::new();
+    // Die Conformance gilt jedem Commit, auch einem ohne Session — sobald
+    // sie gerechnet ist (gewählter Commit, HEAD). Farbe nie allein.
     if let Some(mark) = conformance {
-        pill(spans, conformance_pill(mark), conformance_color(mark), nerd);
+        parts.push(Span::styled(
+            conformance_pill(mark),
+            Style::default().fg(conformance_color(mark)),
+        ));
     }
     // Was Minds weiß — nur an Commits, die Minds kennt (Session, Change-Id
     // oder ein Review), sonst bliebe jeder fremde Commit „open".
-    if row.sessions.is_empty() && row.change.is_none() && row.review == Verdict::Open {
-        return;
+    if !(row.sessions.is_empty() && row.change.is_none() && row.review == Verdict::Open) {
+        if let Some(seal) = row.seal {
+            let (glyph, word, style) = theme::seal(seal);
+            parts.push(Span::styled(format!("{glyph} {word}"), style));
+        }
+        if row.review != Verdict::Open {
+            let (glyph, word, style) = theme::verdict(row.review);
+            parts.push(Span::styled(format!("{glyph} {word}"), style));
+        }
+        if row.intent {
+            parts.push(Span::styled("⚑", Style::default().fg(theme::HUMAN)));
+        }
+        if row.sessions.len() > 1 {
+            parts.push(Span::styled(
+                format!("◉{}", row.sessions.len()),
+                Style::default().fg(theme::AGENT),
+            ));
+        }
     }
-    if let Some(seal) = row.seal {
-        let (glyph, word, style) = theme::seal(seal);
-        pill(
-            spans,
-            format!("{glyph} {word}"),
-            style.fg.unwrap_or(Color::Gray),
-            nerd,
-        );
+    let mut spans = Vec::new();
+    for (i, part) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(part);
     }
-    // Review „open" ist der Normalzustand — keine Pille; nur Abweichungen
-    // (approved, needs work, rejected) sind laut (A4).
-    if row.review != Verdict::Open {
-        let (glyph, word, style) = theme::verdict(row.review);
-        pill(
-            spans,
-            format!("{glyph} {word}"),
-            style.fg.unwrap_or(Color::Gray),
-            nerd,
-        );
-    }
-    if row.intent {
-        pill(spans, "⚑ intent".into(), theme::HUMAN, nerd);
-    }
-    if row.sessions.len() > 1 {
-        pill(
-            spans,
-            format!("◉{}", row.sessions.len()),
-            theme::AGENT,
-            nerd,
-        );
-    }
+    spans
+}
+
+/// Das Badge in der Liste als Text, ohne eigenen Hintergrund (C3.2):
+/// Initialen des Agenten mit `◉` (bzw. Roboter-Icon) oder des Autors —
+/// nicht nur die Farbe unterscheidet. Vier Spalten breit.
+fn badge_text(name: &str, agent: bool, nerd: bool) -> Span<'static> {
+    let text = if agent {
+        let mark = if nerd {
+            "\u{f06a9}"
+        } else {
+            theme::node(&minds_reader::graph::NodeKind::Agent).0
+        };
+        format!("{mark}{}", initials(name))
+    } else {
+        initials(name)
+    };
+    let pad = 4usize.saturating_sub(text.chars().count());
+    let color = if agent { theme::AGENT } else { theme::HUMAN };
+    Span::styled(
+        format!("{text}{}", " ".repeat(pad)),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn width_of(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|s| s.content.chars().count()).sum()
 }
 
 /// Der Text der Conformance-Pille.
@@ -202,6 +219,23 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
     spans
 }
 
+/// Die Lanes unter einem Commit — für die zweite Zeile eines
+/// Agent-Commits: `│`, wo ein Zweig zur nächsten Zeile weiterläuft.
+fn graph_through(next: Option<&CommitRow>, width: usize) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for i in 0..width {
+        let cell = next.and_then(|n| n.graph.get(i));
+        match cell {
+            Some(cell) if matches!(cell.glyph, '●' | '│' | '┼' | '╯' | '╰' | '┤' | '├' | '…') =>
+            {
+                spans.push(Span::styled("│ ", Style::default().fg(lane(cell.lane))));
+            }
+            _ => spans.push(Span::raw("  ")),
+        }
+    }
+    spans
+}
+
 fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(theme::PENDING, Style::default().fg(theme::AGENT)),
@@ -211,7 +245,8 @@ fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
         spans.push(Span::raw(" ".repeat((width - 1) * 2)));
     }
     spans.push(Span::raw(" "));
-    badge(&mut spans, &wip.agent, true, nerd);
+    spans.push(badge_text(&wip.agent, true, nerd));
+    spans.push(Span::raw(" "));
     // Nur, was bekannt ist: `SessionEnd` gesehen oder nicht.
     let (word, style) = match wip.state {
         WipState::Ended => ("ended · no commit linked  ", theme::dim()),
@@ -228,6 +263,135 @@ fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     spans
 }
 
+/// Wie lange her, kurz für die Liste (C3.2): `now`, `5m`, `3h`, `2d`.
+fn ago_short(at: i64, now: i64) -> String {
+    match now - at {
+        s if s < 60 => "now".into(),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3_600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// So viele Zeichen soll der Betreff mindestens bekommen, bevor die Refs
+/// weichen (C3.2).
+const SUBJECT_MIN: usize = 30;
+
+/// Der Titel der Liste und, rechts, was `a` jetzt bewirkt (C3.3). Die
+/// Zahlen genau einmal, hier (C3.1) — aus den gelesenen Zeilen.
+fn list_title(state: &crate::overview::OverviewState) -> (String, &'static str) {
+    let hint = if state.agent_only {
+        " a: all "
+    } else {
+        " a: agent sessions only "
+    };
+    let Ok(overview) = state.data.as_ref() else {
+        return (" OVERVIEW ".into(), hint);
+    };
+    let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
+    let counts = overview.counts();
+    let shown = state.shown();
+    let total = overview.wip.len() + overview.rows.len();
+    let mut title = if state.agent_only {
+        let visible = shown.iter().filter(|&&i| i >= overview.wip.len()).count();
+        format!(
+            " {}OVERVIEW · agent sessions · {visible} of {} commits",
+            mark, counts.commits
+        )
+    } else {
+        format!(
+            " {}OVERVIEW · {}",
+            mark,
+            // „(limit)" nur, wenn eine Grenze griff; eine lückenhafte
+            // Historie sagt der Titel weiter hinten selbst.
+            counts_title(
+                &OverviewCounts {
+                    limited: overview.truncated || overview.budget_hit,
+                    ..counts
+                },
+                overview.budget_hit
+            )
+        )
+    };
+    if !state.filter.is_empty() {
+        title.push_str(&format!(
+            " · filter: {} ({} of {total})",
+            state.filter,
+            shown.len()
+        ));
+    }
+    if overview.wip_more > 0 {
+        title.push_str(&format!(
+            " · {} more sessions without a commit",
+            overview.wip_more
+        ));
+    }
+    if overview.skipped_refs > 0 {
+        title.push_str(&format!(" · {} ref(s) not shown", overview.skipped_refs));
+    }
+    if overview.refs_capped {
+        title.push_str(" · not all branches/tags read");
+    }
+    if overview.incomplete {
+        title.push_str(" · history incomplete (object missing, too large or not a commit)");
+    }
+    title.push(' ');
+    (title, hint)
+}
+
+/// So breit wird das Detail mindestens (C3.4).
+const DETAIL_MIN: u16 = 60;
+
+/// So breit wäre die Liste, wenn alles ungekürzt passte: Lead, Lanes,
+/// Badge, längster Betreff, Status, Refs, Zeit — mindestens der Titel.
+fn natural_width(app: &App) -> u16 {
+    let Some(Ok(overview)) = app.overview.as_ref().map(|s| s.data.as_ref()) else {
+        return u16::MAX;
+    };
+    let state = app.overview.as_ref().expect("checked above");
+    let now = app.now_secs();
+    let rows = &overview.rows;
+    let max = |f: &dyn Fn(&CommitRow) -> usize| rows.iter().map(f).max().unwrap_or(0);
+    let status_w = max(&|r| width_of(&status(r, state.conformance.get(&r.id).copied().flatten())));
+    let refs_w = max(&|r| refs_text(r, app.nerd).chars().count()).min(32);
+    let subject_w = max(&|r| r.subject.chars().count());
+    let time_w = max(&|r| ago_short(r.time, now).chars().count());
+    let wip_w = overview
+        .wip
+        .iter()
+        .map(|w| 40 + w.request.chars().count())
+        .max()
+        .unwrap_or(0);
+    let commits =
+        1 + overview.lanes.max(1) * 2 + 5 + subject_w + 1 + status_w + 1 + refs_w + 1 + time_w + 1;
+    let (title, hint) = list_title(state);
+    let mut title = title.chars().count() + hint.chars().count() + 4;
+    if state.agent_only {
+        // Der Leerzustand des Filters steht in einer Zeile.
+        title = title.max(72);
+    }
+    u16::try_from(commits.max(wip_w).max(title)).unwrap_or(u16::MAX)
+}
+
+/// Die Zahlen des Titels (C3.1): keine Prozente, die den Nenner verstecken;
+/// gekappt sagt die Zahl, dass sie nur das Gelesene zählt.
+pub(crate) fn counts_title(counts: &OverviewCounts, budget_hit: bool) -> String {
+    let commits = if counts.limited {
+        let why = if budget_hit {
+            "read budget reached"
+        } else {
+            "limit"
+        };
+        format!("{} commits read ({why})", counts.commits)
+    } else {
+        format!("{} commits", counts.commits)
+    };
+    format!(
+        "{commits} · {} with an agent session",
+        counts.with_agent_session
+    )
+}
+
 /// Zeichnet den Tab.
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let Some(state) = &app.overview else {
@@ -237,10 +401,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // Unter 100 Spalten nur eine Fläche (C3): die Liste — oder, mit dem
     // Fokus rechts, das Detail.
     let narrow = area.width < 100;
+    // Das Detail bekommt mindestens 60 Spalten (C3.4); die Liste den Rest,
+    // höchstens so breit, wie ihr Inhalt braucht.
+    let list_w = area
+        .width
+        .saturating_sub(DETAIL_MIN)
+        .min(natural_width(app).saturating_add(3));
     let [left, right] = if narrow {
         [area, area]
     } else {
-        Layout::horizontal([Constraint::Percentage(64), Constraint::Percentage(36)]).areas(area)
+        Layout::horizontal([Constraint::Length(list_w), Constraint::Min(DETAIL_MIN)]).areas(area)
     };
     if narrow && state.focus == OverviewFocus::Sessions {
         draw_detail(frame, app, area);
@@ -265,111 +435,228 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let total = overview.wip.len() + overview.rows.len();
     // Nur die Treffer des Filters aus `/` (B4); ohne Filter alle.
     let shown = state.shown();
-    // Was fehlt, steht im Titel — nie still.
     let height = usize::from(left.height.saturating_sub(2));
-    let at = shown.iter().position(|&i| i == state.cursor).unwrap_or(0);
-    let first = crate::view::offset(at, shown.len(), height);
+    let now = app.now_secs();
+    // Feste, rechtsbündige Spalten (C3.2): Status, Refs, Zeit — so breit
+    // wie ihr breitester Eintrag; der Betreff bekommt den Rest. Wird es eng,
+    // weichen zuerst die Refs (sekundär), nie der Status.
+    let commit_rows: Vec<&CommitRow> = shown
+        .iter()
+        .filter_map(|&i| i.checked_sub(overview.wip.len()))
+        .filter_map(|at| overview.rows.get(at))
+        .collect();
+    let conformance = |row: &CommitRow| state.conformance.get(&row.id).copied().flatten();
+    let status_w = commit_rows
+        .iter()
+        .map(|row| width_of(&status(row, conformance(row))))
+        .max()
+        .unwrap_or(0);
+    let refs_full = commit_rows
+        .iter()
+        .map(|row| refs_text(row, nerd).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(32);
+    let time_w = commit_rows
+        .iter()
+        .map(|row| ago_short(row.time, now).chars().count())
+        .max()
+        .unwrap_or(0);
+    // Lead, Lanes, Badge (4) und Luft.
+    let lead_w = 1 + width * 2 + 5;
+    let fixed = |refs: usize| lead_w + status_w + 1 + refs + usize::from(refs > 0) + time_w + 1;
+    // Der Betreff höchstens so breit, wie der längste ihn braucht — dann
+    // rücken Status, Refs und Zeit heran, statt weit rechts zu stehen.
+    let longest = commit_rows
+        .iter()
+        .map(|row| row.subject.chars().count())
+        .max()
+        .unwrap_or(0);
+    // Gekürzt kostet die Ellipse ein Zeichen: 30 sichtbare plus `…`.
+    let needed = if longest > SUBJECT_MIN {
+        SUBJECT_MIN + 1
+    } else {
+        longest
+    };
+    // Passen die Refs nicht, bleibt HEAD (`▲ HEAD`) — auffindbar, auch
+    // wenn Branch-Namen weichen.
+    let head_w = commit_rows
+        .iter()
+        .map(|row| head_text(row).chars().count())
+        .max()
+        .unwrap_or(0);
+    let (refs_w, head_only) = if row_w.saturating_sub(fixed(refs_full)) >= needed {
+        (refs_full, false)
+    } else if head_w > 0 && row_w.saturating_sub(fixed(head_w)) >= needed {
+        (head_w, true)
+    } else {
+        (0, false)
+    };
+    let subject_w = row_w.saturating_sub(fixed(refs_w)).min(longest).max(1);
+
+    // Jeder Eintrag als eine oder zwei Bildschirmzeilen; das Fenster
+    // rechnet in Bildschirmzeilen, die Auswahl bleibt ganz sichtbar.
+    let mut entries: Vec<(usize, Vec<Line>)> = Vec::new();
+    let mut hidden: Vec<&CommitRow> = Vec::new();
+    // Mit `a` (C3.3) wird Ausgeblendetes zusammengefasst, nie spurlos
+    // entfernt: eine gedimmte Zeile je Lauf, mit den Refs darin.
+    let visible: std::collections::HashSet<usize> = shown.iter().copied().collect();
+    let order: Vec<usize> = if state.agent_only {
+        (0..total).collect()
+    } else {
+        shown.clone()
+    };
+    let flush = |hidden: &mut Vec<&CommitRow>, entries: &mut Vec<(usize, Vec<Line>)>| {
+        if hidden.is_empty() {
+            return;
+        }
+        let n = hidden.len();
+        let mut text = format!("┆ {n} commit{} hidden", if n == 1 { "" } else { "s" });
+        let refs: Vec<String> = hidden
+            .iter()
+            .map(|row| refs_text(row, nerd))
+            .filter(|r| !r.is_empty())
+            .collect();
+        if !refs.is_empty() {
+            text.push_str(" · ");
+            text.push_str(&refs.join(" · "));
+        }
+        let line = Line::from(vec![
+            Span::raw(" "),
+            Span::styled(crate::view::clip(&text, row_w), theme::dim()),
+        ]);
+        entries.push((usize::MAX, vec![line]));
+        hidden.clear();
+    };
+    for i in order {
+        if !visible.contains(&i) {
+            if let Some(row) = i
+                .checked_sub(overview.wip.len())
+                .and_then(|at| overview.rows.get(at))
+            {
+                hidden.push(row);
+            }
+            continue;
+        }
+        flush(&mut hidden, &mut entries);
+        let selected = i == state.cursor;
+        let mut lines = match i.checked_sub(overview.wip.len()) {
+            None => {
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(wip_spans(&overview.wip[i], width, nerd));
+                vec![Line::from(spans)]
+            }
+            Some(at) => {
+                let row = &overview.rows[at];
+                let mut spans = vec![Span::raw(" ")];
+                spans.extend(graph_spans(row, width));
+                spans.push(match &row.agent {
+                    Some(agent) => badge_text(agent, true, nerd),
+                    None => badge_text(&row.author, false, nerd),
+                });
+                spans.push(Span::raw(" "));
+                let subject = crate::view::clip(&row.subject, subject_w);
+                let pad = subject_w.saturating_sub(subject.chars().count());
+                spans.push(Span::raw(subject));
+                spans.push(Span::raw(" ".repeat(pad + 1)));
+                let state_spans = status(row, conformance(row));
+                let gap = status_w.saturating_sub(width_of(&state_spans));
+                spans.push(Span::raw(" ".repeat(gap)));
+                spans.extend(state_spans);
+                if refs_w > 0 {
+                    let refs = if head_only {
+                        head_text(row)
+                    } else {
+                        refs_text(row, nerd)
+                    };
+                    let refs = crate::view::clip(&refs, refs_w);
+                    let gap = refs_w.saturating_sub(refs.chars().count());
+                    spans.push(Span::raw(" ".repeat(gap + 1)));
+                    spans.push(Span::styled(refs, theme::dim()));
+                }
+                let time = ago_short(row.time, now);
+                let gap = time_w.saturating_sub(time.chars().count());
+                spans.push(Span::raw(" ".repeat(gap + 1)));
+                spans.push(Span::styled(time, theme::dim()));
+                let mut lines = vec![Line::from(spans)];
+                // Der Auftrag eines Agent-Commits darunter, gedimmt (C3.2).
+                if let (Some(_), Some(request)) = (&row.agent, &row.request) {
+                    let mut below = vec![Span::raw(" ")];
+                    below.extend(graph_through(overview.rows.get(at + 1), width));
+                    below.push(Span::raw("     "));
+                    let room = row_w.saturating_sub(lead_w);
+                    below.push(Span::styled(
+                        crate::view::clip(request, room),
+                        theme::dim().add_modifier(Modifier::ITALIC),
+                    ));
+                    lines.push(Line::from(below));
+                }
+                lines
+            }
+        };
+        // Der eine Auswahlstil (B7): theme::cursor() über alle Zeilen des
+        // Eintrags, ohne Teil-Hintergründe.
+        if selected {
+            lines = lines
+                .into_iter()
+                .map(|line| {
+                    let used = width_of(&line.spans);
+                    let mut line = line;
+                    line.spans
+                        .push(Span::raw(" ".repeat(row_w.saturating_sub(used) + 1)));
+                    line.style(theme::cursor())
+                })
+                .collect();
+        }
+        entries.push((i, lines));
+    }
+    flush(&mut hidden, &mut entries);
+    let counts = overview.counts();
     let mut lines: Vec<Line> = Vec::new();
     if total == 0 {
         lines.push(Line::from(Span::styled(
             "No commits yet — the history appears here once there is one.",
             theme::dim(),
         )));
+    } else if state.agent_only && counts.with_agent_session == 0 && overview.wip.is_empty() {
+        // Ein Leerzustand, der sagt, was los ist und was hilft (C3.3).
+        lines.push(Line::from(Span::styled(
+            format!(
+                " No commit with an agent session in the {} commits read. a shows all.",
+                counts.commits
+            ),
+            theme::dim(),
+        )));
     }
-    for &i in shown.iter().skip(first).take(height.max(1)) {
-        let mut spans = match i.checked_sub(overview.wip.len()) {
-            None => wip_spans(&overview.wip[i], width, nerd),
-            Some(at) => {
-                let row = &overview.rows[at];
-                let mut spans = graph_spans(row, width);
-                spans.push(Span::raw(" "));
-                match &row.agent {
-                    Some(agent) => badge(&mut spans, agent, true, nerd),
-                    None => badge(&mut spans, &row.author, false, nerd),
-                }
-                // Lanes · Badge · Refs · **Betreff** · Auftrag (gedimmt) —
-                // rechtsbündig die Zustände (C3): Was man überfliegt, steht
-                // vorn; gekürzt wird der Text, nie die Zustände.
-                refs(&mut spans, row, nerd);
-                let mark = state.conformance.get(&row.id).copied().flatten();
-                let mut right: Vec<Span<'static>> = Vec::new();
-                states(&mut right, row, mark, nerd);
-                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                let right_w: usize = right.iter().map(|s| s.content.chars().count()).sum();
-                let room = row_w.saturating_sub(used + right_w + 1);
-                let mut text = row.subject.clone();
-                if let Some(request) = &row.request {
-                    text.push_str(&format!("  • {request}"));
-                }
-                let text = crate::view::clip(&text, room);
-                let subject_len = row.subject.chars().count().min(text.chars().count());
-                let subject: String = text.chars().take(subject_len).collect();
-                let rest: String = text.chars().skip(subject_len).collect();
-                let pad = room.saturating_sub(text.chars().count());
-                spans.push(Span::raw(subject));
-                spans.push(Span::styled(rest, theme::dim()));
-                spans.push(Span::raw(" ".repeat(pad + 1)));
-                spans.extend(right);
-                spans
-            }
-        };
-        // Der eine Auswahlstil (B7): theme::cursor(), wie überall.
-        if i == state.cursor {
-            spans.insert(0, Span::raw(" "));
-            lines.push(Line::from(spans).style(theme::cursor()));
-        } else {
-            spans.insert(0, Span::raw(" "));
-            lines.push(Line::from(spans));
-        }
-    }
-    let (_, mark) = theme::pane(state.focus == OverviewFocus::Graph);
-    let mut title = if overview.budget_hit {
-        format!(
-            " {}OVERVIEW · newest {} commits (read budget reached)",
-            mark,
-            overview.rows.len()
-        )
-    } else if overview.truncated {
-        format!(" {}OVERVIEW · newest {} commits", mark, overview.rows.len())
-    } else {
-        format!(" {}OVERVIEW · {} commits", mark, overview.rows.len())
-    };
-    if !state.filter.is_empty() {
-        title.push_str(&format!(
-            " · filter: {} ({} of {total})",
-            state.filter,
-            shown.len()
-        ));
-    }
-    // Die globale Statistik gehört hierher, zum Einstieg (C3).
-    let h = app.inspection.header();
-    title.push_str(&format!(
-        " · {} Sessions · {} Changes · {:.0} % of commits with a session",
-        h.sessions,
-        h.changes,
-        h.coverage.ratio() * 100.0
-    ));
-    if overview.wip_more > 0 {
-        title.push_str(&format!(
-            " · {} more sessions without a commit",
-            overview.wip_more
-        ));
-    }
-    if overview.skipped_refs > 0 {
-        title.push_str(&format!(" · {} ref(s) not shown", overview.skipped_refs));
-    }
-    if overview.refs_capped {
-        title.push_str(" · not all branches/tags read");
-    }
-    if overview.incomplete {
-        title.push_str(" · history incomplete (object missing, too large or not a commit)");
-    }
-    title.push(' ');
+    let all: usize = entries.iter().map(|(_, l)| l.len()).sum();
+    let (start, len) = entries
+        .iter()
+        .scan(0usize, |at, (i, l)| {
+            let here = *at;
+            *at += l.len();
+            Some((*i, here, l.len()))
+        })
+        .find(|(i, _, _)| *i == state.cursor)
+        .map(|(_, here, len)| (here, len))
+        .unwrap_or((0, 1));
+    let first = crate::view::offset(start + len - 1, all, height).min(start);
+    lines.extend(
+        entries
+            .into_iter()
+            .flat_map(|(_, l)| l)
+            .skip(first)
+            .take(height.max(1)),
+    );
+    let (title, hint) = list_title(state);
+    // Der Hinweis rechts ist sekundär: Wird es eng, weicht er vor den Zahlen.
+    let roomy = usize::from(left.width) >= title.chars().count() + hint.chars().count() + 4;
+    let hint = if roomy { hint } else { "" };
     frame.render_widget(
         Paragraph::new(lines).block({
             let (border, _) = theme::pane(state.focus == OverviewFocus::Graph);
             Block::bordered()
                 .title(title)
+                .title(Line::from(Span::styled(hint, theme::dim())).right_aligned())
                 .title_style(theme::title())
                 .border_style(border)
         }),
@@ -428,187 +715,615 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
             for part in wrapped(&wip.request, inner, 6) {
                 lines.push(Line::raw(part));
             }
-            lines.push(Line::raw(""));
-            lines.push(Line::from(Span::styled(
-                "Enter: its graph in Sessions",
-                theme::dim(),
-            )));
         }
         Some(Selected::Commit(row)) => {
-            let id = row.id.to_string();
-            lines.push(Line::from(Span::styled(
-                format!("COMMIT {}", id.get(..10).unwrap_or(&id)),
-                Style::default()
-                    .fg(theme::CHANGE)
-                    .add_modifier(Modifier::BOLD),
-            )));
-            for part in wrapped(&row.subject, inner, 3) {
-                lines.push(Line::raw(part));
-            }
-            lines.push(Line::raw(""));
-            lines.push(Line::from(vec![
-                label("Author"),
-                Span::raw(row.author.clone()),
-            ]));
-            // Im Detail absolut, in UTC (C4).
-            lines.push(Line::from(vec![
-                label("Date"),
-                Span::raw(format!("{} UTC", row.date.trim_end_matches('Z'))),
-            ]));
-            if !row.refs.is_empty() {
-                let names: Vec<String> = row
-                    .refs
-                    .iter()
-                    .map(|label| match label {
-                        RefLabel::Head(name) => format!("{name} (HEAD)"),
-                        RefLabel::Branch(name) => name.clone(),
-                        RefLabel::Tag(name) => format!("tag {name}"),
-                        RefLabel::Detached => "HEAD (detached)".into(),
-                        RefLabel::More(n) => format!("+{n} more"),
-                    })
-                    .collect();
-                lines.push(Line::from(vec![
-                    label("Refs"),
-                    Span::raw(crate::view::clip(
-                        &names.join(", "),
-                        inner.saturating_sub(8),
-                    )),
-                ]));
-            }
-            if let Some(change) = &row.change {
-                lines.push(Line::from(vec![
-                    label("Change"),
-                    Span::raw(change.to_string()),
-                ]));
-            }
-            // „Kann ich diesem Commit trauen?" (C3): Seal-Zustand, Review —
-            // getrennt, nie verschmolzen.
-            if let Some(seal) = row.seal {
-                let (glyph, word, style) = theme::seal(seal);
-                lines.push(Line::from(vec![
-                    label("Seal"),
-                    Span::styled(format!("{glyph} {word}"), style),
-                ]));
-            }
-            let (glyph, word, style) = theme::verdict(row.review);
-            lines.push(Line::from(vec![
-                label("Review"),
-                Span::styled(format!("{glyph} {word}"), style),
-            ]));
-            if row.parents.len() > 1 {
-                lines.push(Line::from(vec![
-                    label("Merge"),
-                    Span::raw(format!("{} parents", row.parents.len())),
-                ]));
-            }
-            // Die nächste Aktion.
-            lines.push(Line::from(Span::styled(
-                "Enter: how it was made · v: verify · d: diff",
-                theme::dim(),
-            )));
-            lines.push(Line::raw(""));
-            let focused = state.focus == OverviewFocus::Sessions;
-            lines.push(Line::from(Span::styled(
-                format!("Sessions ({})", row.sessions.len()),
-                theme::title(),
-            )));
-            if row.sessions.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "  no session linked in this store",
-                    theme::dim(),
-                )));
-                lines.push(Line::from(Span::styled(
-                    "  Enter: the diff in Changes",
-                    theme::dim(),
-                )));
-            }
-            // Ein Fenster um den Cursor: so viele Sessions, wie unter dem Kopf
-            // Platz haben (Rahmen, Hinweise) — die gewählte bleibt sichtbar.
-            let listed = row.sessions.len().min(MAX_SESSION_LINES);
-            let room = usize::from(area.height)
-                .saturating_sub(2 + lines.len() + 4)
-                .max(1);
-            let first = crate::view::offset(state.session, listed, room);
-            if first > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!("  … {first} above"),
-                    theme::dim(),
-                )));
-            }
-            for (i, sid) in row
-                .sessions
-                .iter()
-                .enumerate()
-                .take(listed)
-                .skip(first)
-                .take(room)
-            {
-                let session = app.inspection.index().session(*sid);
-                // Vor dem Entschärfen gekürzt: kein Megabyte-Auftrag je Frame.
-                let agent = session.map(|s| one_line(&s.agent.name, 40));
-                let request = session
-                    .map(|s| one_line(&s.intent.request, 120))
-                    .unwrap_or_else(|| "not readable".into());
-                let id = sid.to_string();
-                let marker = if focused && i == state.session {
-                    Span::styled("▸ ", theme::title())
-                } else {
-                    Span::raw("  ")
-                };
-                let mut spans = vec![marker];
-                match &agent {
-                    Some(agent) => badge(&mut spans, agent, true, app.nerd),
-                    None => pill(&mut spans, "?".into(), Color::Gray, app.nerd),
+            commit_detail(&mut lines, app, row, inner, usize::from(area.height));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((state.detail_scroll, 0))
+            .block({
+                let (border, mark) = theme::pane(state.focus == OverviewFocus::Sessions);
+                Block::bordered()
+                    .title(format!(" {mark}DETAIL "))
+                    .title_style(theme::title())
+                    .border_style(border)
+            }),
+        area,
+    );
+}
+
+/// Die Kurzform eines Ankers: acht Hex-Zeichen ohne Präfix.
+fn anchor_short(id: &minds_core::ContentHash) -> String {
+    let text = id.to_string();
+    // `b3-<hex>` (oder `<algo>:<hex>`): nur die Hex-Ziffern.
+    let hex = text.rsplit(['-', ':']).next().unwrap_or(&text);
+    hex.chars().take(8).collect()
+}
+
+/// `HH:MM` (UTC) eines Zeitpunkts in Sekunden seit Epoch.
+fn clock(secs: i64) -> String {
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
+}
+
+/// `HH:MM` aus einem RFC-3339-Text, sonst nichts.
+fn clock_of(ts: Option<&str>) -> Option<String> {
+    ts.and_then(minds_metrics::epoch_seconds).map(clock)
+}
+
+/// Eine Zeile des EVIDENCE-Blocks: Label (16 Spalten), dann Glyph + Wort.
+fn axis(label: &str, spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut all = vec![Span::styled(format!("{label:<16}"), theme::dim())];
+    all.extend(spans);
+    Line::from(all)
+}
+
+/// Eine eingerückte Folgezeile unter einer Achse (Aktion, Unterzeile).
+fn under(text: String, style: Style) -> Line<'static> {
+    Line::from(vec![Span::raw(" ".repeat(16)), Span::styled(text, style)])
+}
+
+fn mark(glyph: &str, word: impl Into<String>, style: Style) -> Span<'static> {
+    Span::styled(format!("{glyph} {}", word.into()), style)
+}
+
+fn ok() -> Style {
+    Style::default().fg(theme::OK)
+}
+
+/// Das Detail eines Commits (C3.4): Kopf; mit Agent-Session dann
+/// REQUIREMENT, SESSIONS und EVIDENCE — eine Zeile je Achse, nie
+/// zusammengefasst. Keine Tastenhinweise: Tasten stehen in der Fußzeile.
+fn commit_detail(
+    lines: &mut Vec<Line<'static>>,
+    app: &App,
+    row: &CommitRow,
+    inner: usize,
+    height: usize,
+) {
+    let Some(state) = &app.overview else {
+        return;
+    };
+    let id = row.id.to_string();
+    lines.push(Line::from(vec![
+        Span::styled(
+            id.get(..7).unwrap_or(&id).to_string(),
+            Style::default()
+                .fg(theme::CHANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            crate::view::clip(&format!(" · {}", row.subject), inner.saturating_sub(7)),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    // Leise: Branches, die ihn enthalten, Autor, Datum (UTC), Change-Id.
+    let mut facts: Vec<String> = Vec::new();
+    if !row.branches.is_empty() {
+        let mut on = format!("on {}", row.branches.join(", "));
+        if row.branches_more > 0 {
+            on.push_str(&format!(" +{}", row.branches_more));
+        }
+        facts.push(on);
+    }
+    facts.push(row.author.clone());
+    facts.push(format!("{} UTC", row.date.trim_end_matches('Z')));
+    for part in wrapped(&facts.join(" · "), inner, 2) {
+        lines.push(Line::from(Span::styled(part, theme::dim())));
+    }
+    if let Some(change) = &row.change {
+        lines.push(Line::from(Span::styled(
+            crate::view::clip(&format!("change {change}"), inner),
+            theme::dim(),
+        )));
+    }
+    if row.parents.len() > 1 {
+        lines.push(Line::from(Span::styled(
+            format!("merge of {} parents", row.parents.len()),
+            theme::dim(),
+        )));
+    }
+    lines.push(Line::raw(""));
+    if !row.has_agent_session() {
+        lines.push(Line::from(Span::styled(
+            "No agent session linked to this commit.",
+            theme::dim(),
+        )));
+        return;
+    }
+    let index = app.inspection.index();
+
+    // REQUIREMENT — nur, wenn eine Session einen Anker nennt.
+    if !row.anchors.is_empty() {
+        lines.push(Line::from(Span::styled("REQUIREMENT", theme::title())));
+        for anchor in &row.anchors {
+            let mut head = format!("⚑ anchor {}", anchor_short(anchor));
+            let detail = state.requirements.get(anchor);
+            if let Some(Ok(d)) = detail {
+                head.push_str(&format!(" · {}", d.source));
+                if let Some(version) = &d.version {
+                    head.push_str(&format!(" ({version})"));
                 }
-                spans.push(Span::raw(format!("{}…  ", id.get(..12).unwrap_or(&id))));
-                // Auf die Restbreite gekürzt: eine Session, eine Zeile.
-                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                spans.push(Span::styled(
-                    crate::view::clip(&request, inner.saturating_sub(used)),
-                    theme::dim(),
-                ));
-                let line = Line::from(spans);
-                lines.push(if focused && i == state.session {
-                    line.style(Style::default().add_modifier(Modifier::BOLD))
-                } else {
-                    line
-                });
             }
-            let below = row
-                .sessions
-                .len()
-                .saturating_sub(first + room.min(listed - first));
-            if below > 0 {
-                lines.push(Line::from(Span::styled(
-                    format!("  … {below} more"),
+            lines.push(Line::from(Span::styled(
+                crate::view::clip(&head, inner),
+                Style::default().fg(theme::HUMAN),
+            )));
+            match detail {
+                None => lines.push(Line::from(Span::styled(
+                    "  … reading the anchor",
                     theme::dim(),
+                ))),
+                Some(Err(why)) => lines.push(Line::from(Span::styled(
+                    crate::view::clip(&format!("  not readable — {why}"), inner),
+                    theme::dim(),
+                ))),
+                Some(Ok(d)) => {
+                    if !d.scope.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            crate::view::clip(&format!("  scope  {}", d.scope.join(", ")), inner),
+                            theme::dim(),
+                        )));
+                    }
+                    // Der Text nur, wenn der Beleg gilt — ein unbelegter
+                    // Snapshot könnte gepflanzter Klartext sein.
+                    match (&d.proof, &d.snapshot) {
+                        (Ok(()), Some(text)) if state.requirement_open => {
+                            for line in text {
+                                for part in wrapped(line, inner.saturating_sub(2).max(1), 50) {
+                                    lines.push(Line::raw(format!("  {part}")));
+                                }
+                            }
+                            if d.snapshot_clipped {
+                                lines.push(Line::from(Span::styled(
+                                    "  … clipped — minds intent show <id> has it all",
+                                    theme::dim(),
+                                )));
+                            }
+                        }
+                        (Ok(()), Some(text)) => lines.push(Line::from(Span::styled(
+                            format!("  ▸ Space: show text ({} lines)", text.len()),
+                            theme::dim(),
+                        ))),
+                        (Err(why), _) => lines.push(Line::from(Span::styled(
+                            crate::view::clip(&format!("  text hidden — {why}"), inner),
+                            theme::dim(),
+                        ))),
+                        (Ok(()), None) => lines.push(Line::from(Span::styled(
+                            "  text hidden — snapshot does not match the anchor",
+                            theme::dim(),
+                        ))),
+                    }
+                }
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    // SESSIONS — je Session Kopf, Fakten, Auftrag (umgebrochen).
+    let focused = state.focus == OverviewFocus::Sessions;
+    lines.push(Line::from(Span::styled(
+        format!("SESSIONS ({})", row.sessions.len()),
+        theme::title(),
+    )));
+    let request_lines = if row.sessions.len() <= 2 { 3 } else { 1 };
+    let per = 2 + request_lines;
+    let listed = row.sessions.len().min(MAX_SESSION_LINES);
+    // Platz für EVIDENCE (Kopf, fünf Achsen, Folgezeilen) bleibt frei.
+    let reserve = 12;
+    let room = height
+        .saturating_sub(2 + lines.len() + reserve)
+        .checked_div(per)
+        .unwrap_or(0)
+        .max(1);
+    let first = crate::view::offset(state.session, listed, room);
+    if first > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {first} above"),
+            theme::dim(),
+        )));
+    }
+    let cards: Vec<Option<minds_reader::model::SessionCard>> = row
+        .sessions
+        .iter()
+        .map(|sid| app.inspection.card(*sid))
+        .collect();
+    for (i, sid) in row
+        .sessions
+        .iter()
+        .enumerate()
+        .take(listed)
+        .skip(first)
+        .take(room)
+    {
+        let session = index.session(*sid);
+        let chosen = focused && i == state.session;
+        let mut head = vec![if chosen {
+            Span::styled("▸ ", theme::title())
+        } else {
+            Span::raw("")
+        }];
+        match session {
+            Some(s) => {
+                badge(&mut head, &one_line(&s.agent.name, 40), true, app.nerd);
+                let mut text = format!(
+                    "{} · {} · {}",
+                    one_line(&s.agent.name, 40),
+                    one_line(&s.model.id, 40),
+                    sid.to_string().get(..11).unwrap_or_default()
+                );
+                let lineage = s.lineage.as_ref();
+                if let Some(start) = clock_of(lineage.and_then(|l| l.started_at.as_deref())) {
+                    text.push_str(&format!(" · {start}"));
+                    if let Some(end) = clock_of(lineage.and_then(|l| l.ended_at.as_deref())) {
+                        text.push_str(&format!("–{end}"));
+                    }
+                }
+                let used = width_of(&head);
+                head.push(Span::raw(crate::view::clip(
+                    &text,
+                    inner.saturating_sub(used),
                 )));
             }
-            if !row.sessions.is_empty() {
-                lines.push(Line::raw(""));
+            None => head.push(Span::styled("session not readable", theme::dim())),
+        }
+        let line = Line::from(head);
+        lines.push(if chosen {
+            line.style(Style::default().add_modifier(Modifier::BOLD))
+        } else {
+            line
+        });
+        if let Some(card) = &cards[i] {
+            let mut facts = vec![format!(
+                "{} file{}",
+                card.summary.files,
+                if card.summary.files == 1 { "" } else { "s" }
+            )];
+            if let Some(e) = card.evidence_state() {
+                facts.push(format!("{} events", e.events));
+                facts.push(format!("{} gaps", e.gaps));
+            }
+            let (glyph, word, style) = theme::provenance(&card.provenance);
+            let mut spans = vec![Span::styled(
+                format!("    {}  ", facts.join(" · ")),
+                theme::dim(),
+            )];
+            spans.push(Span::styled(format!("{glyph} record {word}"), style));
+            lines.push(Line::from(spans));
+        }
+        if let Some(s) = session {
+            for part in wrapped(
+                &one_line(&s.intent.request, 400),
+                inner.saturating_sub(4).max(1),
+                request_lines,
+            ) {
                 lines.push(Line::from(Span::styled(
-                    if row.sessions.len() == 1 {
-                        "Enter: the session's graph · w: the commit's why chain"
-                    } else if focused {
-                        "↑↓ session · Enter: its graph · Esc: back to the history"
-                    } else {
-                        "Enter: choose a session · w: the commit's why chain"
-                    },
-                    theme::dim(),
+                    format!("    {part}"),
+                    theme::dim().add_modifier(Modifier::ITALIC),
                 )));
             }
         }
     }
-    frame.render_widget(
-        Paragraph::new(lines).block({
-            let (border, mark) = theme::pane(state.focus == OverviewFocus::Sessions);
-            Block::bordered()
-                .title(format!(" {mark}DETAIL "))
-                .title_style(theme::title())
-                .border_style(border)
+    let below = row
+        .sessions
+        .len()
+        .saturating_sub(first + room.min(listed.saturating_sub(first)));
+    if below > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  … {below} more"),
+            theme::dim(),
+        )));
+    }
+    lines.push(Line::raw(""));
+
+    // EVIDENCE — eine Zeile je Achse, nie zusammengefasst, kein Gesamtwert.
+    let check = state.checks.get(&row.id);
+    let mut heading = vec![Span::styled("EVIDENCE", theme::title())];
+    if let Some(at) = state.checked_at.get(&row.id) {
+        let pad = inner.saturating_sub("EVIDENCE".len() + 15);
+        heading.push(Span::raw(" ".repeat(pad)));
+        heading.push(Span::styled(
+            format!("checked {}Z", clock(*at)),
+            theme::dim(),
+        ));
+    }
+    lines.push(Line::from(heading));
+    lines.extend(integrity_lines(row, check));
+    lines.extend(coverage_lines(state.lines.get(&row.id)));
+    lines.extend(interpretation_lines(row, &cards));
+    lines.extend(requirement_lines(row, state, check));
+    let review = if row.review == Verdict::Open {
+        let (glyph, _, style) = theme::open();
+        mark(glyph, "not reviewed yet", style)
+    } else {
+        let (glyph, word, style) = theme::verdict(row.review);
+        mark(glyph, word, style)
+    };
+    lines.push(axis("REVIEW", vec![review]));
+}
+
+/// INTEGRITY: das Urteil von `minds verify`, in seinen Wörtern. Vor dem
+/// Urteil `… checking` — nie ✓; Manipulation immer ✗ und rot.
+fn integrity_lines(
+    row: &CommitRow,
+    check: Option<&Result<crate::CommitVerify, String>>,
+) -> Vec<Line<'static>> {
+    use crate::verify::Overall;
+    let tampered_cli = matches!(check, Some(Ok(c)) if c.sessions.iter().any(|s| s.tampered));
+    let overall = if row.seal == Some(SealMark::Tampered) || tampered_cli {
+        Some(Overall::Tampered)
+    } else {
+        match check {
+            None => Some(Overall::Checking),
+            Some(Err(_)) => None,
+            Some(Ok(c)) => Some(match &c.verdict {
+                Ok(crate::VerifyVerdict::Verified) => Overall::Verified,
+                Ok(crate::VerifyVerdict::Incomplete) => Overall::Incomplete,
+                Ok(crate::VerifyVerdict::Tampered) => Overall::Tampered,
+                Ok(crate::VerifyVerdict::NotVerifiable) => Overall::NotVerifiable,
+                Err(_) => Overall::NotChecked,
+            }),
+        }
+    };
+    let mut out = Vec::new();
+    match overall {
+        Some(Overall::Checking) => {
+            out.push(axis("INTEGRITY", vec![mark("…", "checking", theme::dim())]));
+        }
+        Some(Overall::NotChecked) | None => {
+            let why = match check {
+                Some(Err(why)) => why.clone(),
+                Some(Ok(c)) => c.verdict.clone().err().unwrap_or_default(),
+                None => String::new(),
+            };
+            out.push(axis(
+                "INTEGRITY",
+                vec![mark(
+                    "?",
+                    format!("not checked — {why}"),
+                    Style::default().fg(theme::REVIEW),
+                )],
+            ));
+        }
+        Some(other) => {
+            let (text, style) = super::trust::verify_headline(other);
+            out.push(axis("INTEGRITY", vec![Span::styled(text, style)]));
+        }
+    }
+    // „sealed" ist nicht „verified" — gesagt, wo es zählt (C3.5).
+    if let Some(seal @ (SealMark::Sealed | SealMark::Unsigned | SealMark::Partial)) = row.seal
+        && !matches!(overall, Some(Overall::Verified | Overall::Tampered))
+    {
+        let (glyph, word, style) = theme::seal(seal);
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(16)),
+            Span::styled(format!("{glyph} record {word}"), style),
+            Span::styled(" — sealed is not verified", theme::dim()),
+        ]));
+    }
+    // Mehrere Sessions: je Session eine Unterzeile, nie zu einem ✓ gemischt.
+    if let Some(Ok(c)) = check
+        && c.sessions.len() > 1
+    {
+        for s in &c.sessions {
+            let (glyph, word, style) = super::trust::verify_session_mark(s.tampered);
+            let id = s.session.to_string();
+            out.push(Line::from(vec![
+                Span::raw(" ".repeat(16)),
+                Span::styled(format!("{} ", id.get(..11).unwrap_or(&id)), theme::dim()),
+                Span::styled(format!("{glyph} {word}"), style),
+            ]));
+        }
+    }
+    out
+}
+
+/// COVERAGE: die hinzugefügten Zeilen nach Klasse (C3.4) — die Zahl der
+/// unerklärten ist `◦n` des Changes-Tabs. ✓ nur, wenn jede Zeile beobachtet
+/// ist; Ausgesagtes, nur im Dateisystem Gesehenes und nicht Bewertetes steht
+/// für sich, nie als erklärt.
+pub(crate) fn coverage_lines(
+    count: Option<&Result<minds_reader::changes::LineClasses, String>>,
+) -> Vec<Line<'static>> {
+    let c = match count {
+        None => {
+            return vec![axis(
+                "COVERAGE",
+                vec![mark("…", "counting lines", theme::dim())],
+            )];
+        }
+        Some(Err(why)) => {
+            return vec![axis(
+                "COVERAGE",
+                vec![mark(
+                    "?",
+                    format!("not assessed — {why}"),
+                    Style::default().fg(theme::REVIEW),
+                )],
+            )];
+        }
+        Some(Ok(c)) => *c,
+    };
+    if c.all_explained() {
+        return vec![axis(
+            "COVERAGE",
+            vec![mark(
+                "✓",
+                format!("all {} added lines observed", c.added),
+                ok(),
+            )],
+        )];
+    }
+    let (open_glyph, _, open_style) = theme::open();
+    let head = if c.unexplained > 0 {
+        mark(
+            open_glyph,
+            format!("{} of {} added lines unexplained", c.unexplained, c.added),
+            open_style,
+        )
+    } else if c.added == 0 && c.skipped_files == 0 {
+        mark("·", "no added lines", theme::dim())
+    } else {
+        mark("·", format!("{} added lines", c.added), theme::dim())
+    };
+    let mut out = vec![axis("COVERAGE", vec![head])];
+    let mut parts: Vec<String> = Vec::new();
+    if c.explained > 0 && c.explained < c.added {
+        parts.push(format!("● {} observed", c.explained));
+    }
+    if c.stated > 0 {
+        parts.push(format!("◇ {} stated", c.stated));
+    }
+    if c.fs_only > 0 {
+        parts.push(format!("◍ {} fs only", c.fs_only));
+    }
+    if c.not_assessed > 0 {
+        parts.push(format!("? {} not assessed", c.not_assessed));
+    }
+    if c.skipped_files > 0 {
+        parts.push(format!(
+            "{} file{} not diffed",
+            c.skipped_files,
+            if c.skipped_files == 1 { "" } else { "s" }
+        ));
+    }
+    if !parts.is_empty() {
+        out.push(under(parts.join(" · "), theme::dim()));
+    }
+    if c.unexplained > 0 {
+        out.push(under("→ d, then n".into(), theme::dim()));
+    }
+    out
+}
+
+/// INTERPRETATION: gedeutete Tool-Aufrufe — je Session, wenn sie sich
+/// unterscheiden.
+fn interpretation_lines(
+    row: &CommitRow,
+    cards: &[Option<minds_reader::model::SessionCard>],
+) -> Vec<Line<'static>> {
+    let counts: Vec<(String, usize)> = row
+        .sessions
+        .iter()
+        .zip(cards)
+        .filter_map(|(sid, card)| {
+            card.as_ref()
+                .map(|c| (sid.to_string(), c.uninterpreted_calls))
+        })
+        .collect();
+    let slot = |n: usize| {
+        let axis = if n == 0 {
+            minds_reader::model::InterpretationAxis::Interpreted
+        } else {
+            minds_reader::model::InterpretationAxis::Uninterpreted(n)
+        };
+        let slot = super::trust::interpretation(axis);
+        mark(slot.glyph, slot.word, slot.style)
+    };
+    let same = counts.windows(2).all(|w| w[0].1 == w[1].1);
+    match counts.first() {
+        None => vec![axis(
+            "INTERPRETATION",
+            vec![mark("·", "no session readable", theme::dim())],
+        )],
+        Some((_, n)) if same => vec![axis("INTERPRETATION", vec![slot(*n)])],
+        Some(_) => {
+            let mut out = vec![axis(
+                "INTERPRETATION",
+                vec![Span::styled("per session:", theme::dim())],
+            )];
+            for (id, n) in counts {
+                out.push(Line::from(vec![
+                    Span::raw(" ".repeat(16)),
+                    Span::styled(format!("{} ", id.get(..11).unwrap_or(&id)), theme::dim()),
+                    slot(n),
+                ]));
+            }
+            out
+        }
+    }
+}
+
+/// REQUIREMENT: gebunden · belegt · signiert — je für sich, nie verschmolzen.
+fn requirement_lines(
+    row: &CommitRow,
+    state: &crate::overview::OverviewState,
+    check: Option<&Result<crate::CommitVerify, String>>,
+) -> Vec<Line<'static>> {
+    use minds_reader::assurance::{IntentSignature, IntentState};
+    let Some(anchor) = row.anchors.first() else {
+        return vec![axis(
+            "REQUIREMENT",
+            vec![mark("·", "no requirement named", theme::dim())],
+        )];
+    };
+    let (open_glyph, _, open_style) = theme::open();
+    let dot = || Span::styled(" · ", theme::dim());
+    // Gebunden: was `minds verify` sah — sonst nur, was die Session sagt.
+    let bound = match check {
+        Some(Ok(c)) => c.sessions.iter().find_map(|s| match &s.intent {
+            IntentState::Bound { chained, .. } => Some(*chained),
+            _ => None,
         }),
-        area,
-    );
+        _ => None,
+    };
+    let bound = match bound {
+        Some(true) => mark("✓", "bound", ok()),
+        Some(false) => mark(open_glyph, "bound by a local file only", open_style),
+        None => {
+            let (glyph, _, style) = theme::claim();
+            mark(glyph, "named by the session", style)
+        }
+    };
+    let mut spans = vec![bound, dot()];
+    let mut next = None;
+    match state.requirements.get(anchor) {
+        None => spans.push(mark("…", "checking", theme::dim())),
+        Some(Err(_)) => spans.push(mark(
+            "?",
+            "not readable",
+            Style::default().fg(theme::REVIEW),
+        )),
+        Some(Ok(d)) => {
+            spans.push(match &d.proof {
+                Ok(()) => mark("✓", "proven", ok()),
+                Err(_) => mark(open_glyph, "not proven", open_style),
+            });
+            spans.push(dot());
+            spans.push(match &d.signature {
+                IntentSignature::Valid(_) => mark("✓", "signed", ok()),
+                IntentSignature::Unsigned => {
+                    next = Some("→ minds intent sign <id> (Intent tab, i)".to_string());
+                    mark(open_glyph, "not signed", open_style)
+                }
+                IntentSignature::NotChecked => mark(
+                    "?",
+                    "signature not checked",
+                    Style::default().fg(theme::REVIEW),
+                ),
+                IntentSignature::Invalid => {
+                    let (glyph, _, style) = theme::tampered();
+                    mark(glyph, "signature invalid", style)
+                }
+            });
+        }
+    }
+    let mut out = vec![axis("REQUIREMENT", spans)];
+    if row.anchors.len() > 1 {
+        out.push(under(
+            format!(
+                "+{} more anchors — see REQUIREMENT above",
+                row.anchors.len() - 1
+            ),
+            theme::dim(),
+        ));
+    }
+    if let Some(next) = next {
+        out.push(under(next, theme::dim()));
+    }
+    out
 }
 
 /// Ein Text in Stücken zu höchstens `width` Zeichen, höchstens `max` Stück;

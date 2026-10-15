@@ -201,16 +201,3 @@ pub fn overall(overall: Option<crate::verify::Overall>) -> &'static str {
         Some(Overall::NoSession) | None => "no session",
     }
 }
-
-/// Das Glossar-Wort zur Seal-Pille eines Commits der Übersicht.
-pub fn seal(mark: Option<minds_reader::overview::SealMark>) -> &'static str {
-    use minds_reader::overview::SealMark;
-    match mark {
-        Some(SealMark::Sealed) => "sealed",
-        Some(SealMark::Unsigned | SealMark::Partial) => "hash-valid",
-        Some(SealMark::Incomplete) => "incomplete",
-        Some(SealMark::Unsealed) => "unsealed",
-        Some(SealMark::Tampered) => "TAMPERED",
-        None => "no session",
-    }
-}

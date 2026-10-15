@@ -75,6 +75,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_inner(frame: &mut Frame, app: &mut App) {
+    // Schmal ist das Detail der Übersicht eine Ebene hinter Enter (C3.4).
+    let narrow = frame.area().width < 100;
+    if let Some(state) = app.overview.as_mut() {
+        state.narrow = narrow;
+    }
     let banner_h = u16::from(app.tamper.is_some());
     let [head, alert, body, foot] = Layout::vertical([
         Constraint::Length(2),
@@ -215,6 +220,15 @@ fn preview(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Der Branch im Kopf als Kurzname (C3.5): `main`, nicht `refs/heads/main`
+/// — der Reader liefert den vollen Ref-Namen, Kürzen ist Darstellung.
+pub(crate) fn branch_label(branch: Option<&str>) -> String {
+    match branch {
+        Some(name) => name.strip_prefix("refs/heads/").unwrap_or(name).to_string(),
+        None => "(detached)".into(),
+    }
+}
+
 fn header(frame: &mut Frame, app: &App, area: Rect) {
     let h = app.inspection.header();
     // Die Tabs zuerst gerechnet: Sie fallen nie weg — unter 100 Spalten mit
@@ -236,11 +250,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         tabs.push(Span::raw(" "));
     }
     let tabs_w: usize = tabs.iter().map(|s| s.content.chars().count()).sum();
-    let place = format!(
-        "{} · {}",
-        h.repo,
-        h.branch.clone().unwrap_or_else(|| "(detached)".into())
-    );
+    let place = format!("{} · {}", h.repo, branch_label(h.branch.as_deref()));
     let room = (area.width as usize).saturating_sub(tabs_w + "MINDS ".len() + 3);
     let mut title = vec![
         Span::styled("MINDS ", theme::title().fg(theme::AGENT)),
@@ -249,31 +259,13 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     ];
     title.extend(tabs);
     let title = Line::from(title);
-    // Zeile 2: der Breadcrumb (B2) — wo bin ich, über welche Sprünge. Von
-    // links gekürzt; die globale Statistik steht dahinter, solange Platz
-    // ist, und weicht als Erstes (C3 zieht sie in die Übersicht).
+    // Zeile 2: nur der Breadcrumb (B2, C3.1) — wo bin ich, über welche
+    // Sprünge. Von links gekürzt. Die Zahlen stehen genau einmal: die der
+    // Historie im Titel der Übersicht, die der Sessions im Rahmen der Liste.
     let crumb = app.breadcrumb().join(" › ");
-    let mut stats = format!(
-        "{} Sessions · {} Changes · {:.0} % of commits with a session",
-        h.sessions,
-        h.changes,
-        h.coverage.ratio() * 100.0
-    );
-    if h.degraded > 0 {
-        stats.push_str(&format!(" · {} degraded", h.degraded));
-    }
     let width = area.width as usize;
     let crumb_w = crumb.chars().count();
-    let stats_w = stats.chars().count();
-    // Die Statistik direkt hinter dem Pfad, gedimmt — nur mit Luft: Eine
-    // Zeile, die exakt aufgeht, sähe aus wie abgeschnitten.
-    let line = if crumb_w + 3 + stats_w < width {
-        Line::from(vec![
-            Span::styled(crumb, theme::title()),
-            Span::styled("   ", theme::dim()),
-            Span::styled(stats, theme::dim()),
-        ])
-    } else if crumb_w <= width {
+    let line = if crumb_w <= width {
         Line::from(Span::styled(crumb, theme::title()))
     } else {
         let tail: String = crumb
@@ -350,14 +342,10 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.tab == Tab::Overview {
-        // Zeile 1: der Satz zum Seal-Zustand des gewählten Commits (C1);
-        // die Legende der Pillen steht in der Hilfe.
-        let word = match app.overview.as_ref().and_then(|o| o.selected()) {
-            Some(crate::overview::Selected::Commit(row)) => crate::copy::seal(row.seal),
-            Some(crate::overview::Selected::Wip(_)) => "observed",
-            None => crate::copy::seal(None),
-        };
-        let status = explain(word);
+        // Zeile 1 (C3.5): die Kurz-Id (aus `context`) und der Filterzustand —
+        // kein Erklärsatz; „sealed is not verified" steht im Detail und in
+        // der Hilfe.
+        let status = Line::from(Span::styled(overview_state(app), theme::dim()));
         let mut keys = vec![
             freshness(app),
             Span::raw("  "),
@@ -573,16 +561,34 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
                 .as_ref()
                 .is_some_and(|o| o.focus == crate::overview::OverviewFocus::Sessions)
             {
-                vec!["↑↓ session", "Enter its graph", "e evidence", "Esc back"]
+                // Ohne Session öffnet Enter den Diff (schmales Detail).
+                let none = app
+                    .overview
+                    .as_ref()
+                    .is_some_and(|o| o.sessions().is_empty());
+                let mut keys = vec![
+                    "↑↓ session",
+                    if none {
+                        "Enter its diff"
+                    } else {
+                        "Enter its graph"
+                    },
+                ];
+                if requirement_text(app) {
+                    keys.push("Space requirement");
+                }
+                keys.extend(["e evidence", "Esc back"]);
+                keys
             } else {
-                vec![
-                    "↑↓ commit",
-                    "Enter how it was made",
-                    "w why",
-                    "v verify",
-                    "d diff",
-                    "/ filter",
-                ]
+                // Die sechs häufigsten (C2, C3.5) — `/ filter` und, mit
+                // Space, `d diff` stehen in der Hilfe.
+                let mut keys = vec!["↑↓ commit", "Enter how it was made", "a agent only/all"];
+                if requirement_text(app) {
+                    keys.push("Space requirement");
+                }
+                keys.extend(["w why", "v verify", "d diff"]);
+                keys.truncate(6);
+                keys
             }
         }
         Tab::Sessions => match app.top() {
@@ -690,6 +696,35 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+/// Ob Space im Detail der Übersicht etwas aufklappt: ein belegter Anker
+/// mit Text (C3.4).
+fn requirement_text(app: &App) -> bool {
+    app.overview
+        .as_ref()
+        .is_some_and(|state| state.has_requirement_text())
+}
+
+/// Der Filterzustand der Übersicht für Zeile 1 der Fußzeile (C3.5).
+fn overview_state(app: &App) -> String {
+    let Some(state) = app.overview.as_ref() else {
+        return String::new();
+    };
+    let mut text = match state.selected() {
+        Some(crate::overview::Selected::Wip(_)) => "session without a commit · ".to_string(),
+        Some(crate::overview::Selected::Commit(_)) => "· ".to_string(),
+        None => String::new(),
+    };
+    text.push_str(if state.agent_only {
+        "showing agent sessions only"
+    } else {
+        "all commits"
+    });
+    if !state.filter.is_empty() {
+        text.push_str(&format!(" · filter: {}", state.filter));
+    }
+    text
 }
 
 /// Zeile 1: Kontext vor dem Satz.
@@ -850,9 +885,16 @@ pub fn ago(ts: Option<&str>, now: i64) -> String {
     let Some(at) = ts.and_then(minds_metrics::epoch_seconds) else {
         return when(ts);
     };
-    let secs = now - at;
-    match secs {
-        s if s < 0 => when(ts),
+    if now < at {
+        return when(ts);
+    }
+    ago_secs(at, now)
+}
+
+/// [`ago`] für einen Zeitpunkt in Sekunden seit Epoch — dieselben Wörter;
+/// in der Zukunft `just now` (Uhrenversatz zwischen Rechnern).
+pub fn ago_secs(at: i64, now: i64) -> String {
+    match now - at {
         s if s < 60 => "just now".into(),
         s if s < 3_600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3_600),

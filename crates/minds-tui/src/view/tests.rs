@@ -271,7 +271,9 @@ fn the_empty_state_points_to_enable() {
     let out = render(&mut app);
     assert!(out.contains("No sessions captured yet."), "{out}");
     assert!(out.contains("minds enable"), "{out}");
-    assert!(out.contains("0 Sessions"), "{out}");
+    // Die Zahl steht im Rahmen der Liste, nicht mehr im Kopf (C3.1).
+    assert!(out.contains("SESSIONS · 0 captured"), "{out}");
+    assert!(!out.contains("0 Sessions"), "{out}");
 }
 
 /// Die volle Tabelle — alle Spalten samt Umfang. Neben der Vorschau braucht
@@ -288,7 +290,10 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     for header in ["TIME", "AGENT", "SIZE", "SEAL", "VERDICT"] {
         assert!(out.contains(header), "{header} fehlt: {out}");
     }
-    assert!(out.contains("2 Sessions · 1 Changes"), "{out}");
+    // Die Zahl der Sessions im Rahmen der Liste; Change-Ids sind keine
+    // Statistik mehr (C3.1).
+    assert!(out.contains("SESSIONS · 2 captured · 1 degraded"), "{out}");
+    assert!(!out.contains("1 Changes"), "{out}");
     assert!(out.contains("1 degraded"), "{out}");
     let fix = out.find("Fix retry handling").unwrap();
     let backoff = out.find("Add exponential backoff").unwrap();
@@ -308,8 +313,9 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     // Listen zeigen relative Zeit (C4) — das alte deutsche Datumsformat nicht.
     assert!(out.contains(" ago"), "{out}");
     assert!(!out.contains("25.07. 14:10Z"), "{out}");
-    // Der Anteil der Commits mit Session — nicht die Coverage-Achse (C5).
-    assert!(out.contains("of commits with a session"), "{out}");
+    // Der Anteil der Commits mit Session — nicht die Coverage-Achse (C5);
+    // seit C3.1 kein Prozentwert mehr, die Zahlen stehen in der Übersicht.
+    assert!(!out.contains("of commits with a session"), "{out}");
     assert!(!out.contains("context coverage"), "{out}");
 }
 
@@ -3779,8 +3785,13 @@ mod overview_tab {
         assert!(!out.contains(" ◆CC "), "agent badge: {out}");
         assert!(out.contains(" PD "), "human badge: {out}");
         assert!(out.contains("feat(sort): agent work"), "{out}");
-        assert!(out.contains("• Fix retry handling"), "{out}");
-        assert!(out.contains("⚑ intent"), "{out}");
+        // Der Auftrag steht in der zweiten Zeile, ohne `•` (C3.2).
+        assert!(out.contains("Fix retry handling"), "{out}");
+        assert!(!out.contains("• Fix retry handling"), "{out}");
+        // Die Anforderung als Zeichen in der Status-Spalte, nicht als
+        // Pille „intent" (C3: requirement, nicht intent).
+        assert!(out.contains(" ⚑"), "{out}");
+        assert!(!out.contains("⚑ intent"), "{out}");
         assert!(out.contains("◉2"), "{out}");
         // HEAD ist eine Ref, kein beobachteter Zustand (A1).
         assert!(out.contains("▲ HEAD"), "{out}");
@@ -3876,7 +3887,9 @@ mod overview_tab {
             OverviewFocus::Sessions
         );
         let out = render(&mut app);
-        assert!(out.contains("Sessions (2)"), "{out}");
+        // Die Überschrift des Blocks wie EVIDENCE und REQUIREMENT (C3.4).
+        assert!(out.contains("SESSIONS (2)"), "{out}");
+        assert!(!out.contains("Sessions (2)"), "{out}");
         assert!(out.contains("▸ "), "{out}");
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
@@ -4238,6 +4251,7 @@ mod overview_tab {
     mod b4b;
     mod b7;
     mod c3;
+    mod c3v2;
 }
 
 mod tamper;

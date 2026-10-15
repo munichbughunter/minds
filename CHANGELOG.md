@@ -19,6 +19,57 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Overview header and footer.** The header names the branch by its short
+  name (`main`, not `refs/heads/main`). Footer line 1 names the selected
+  commit and the filter state (`b89bba7 · showing agent sessions only`) — no
+  explanatory sentence; footer line 2 lists the six most common actions
+  (`↑↓ commit · Enter how it was made · a agent only/all · Space requirement`
+  when there is text to show `· w why · v verify · d diff`), with `? help  q
+  quit` fixed on the right. `docs/commands.md` describes the new overview
+  (numbers, rows, the `a` filter, the detail, the words "requirement" and
+  "session record").
+- **Overview detail: requirement, sessions, evidence.** The detail answers
+  what was asked and how far it is backed — without key hints (keys live in
+  the footer). Head: short id and subject, then quietly the branches that
+  contain the commit (`on main`, at most three and `+N`), author and the date
+  in UTC. REQUIREMENT (only when a session names an anchor): anchor, source,
+  scope; `Space` shows the requirement text — only when the anchor is proven,
+  otherwise the reason (`text hidden — …`). SESSIONS: agent, model, id, time,
+  files, events, gaps, record state and the request over up to three lines.
+  EVIDENCE: one line per axis — INTEGRITY (the words of `minds verify`;
+  `… checking` before the verdict, never ✓ before it; TAMPERED ✗ in red),
+  COVERAGE (the same unexplained-line count as `◦n` in the Changes tab, with
+  `→ d, then n`), INTERPRETATION, REQUIREMENT (bound · proven · signed, each
+  on its own; `◦ not signed` is open, never red), REVIEW. A commit without an
+  agent session says so in one sentence. The detail gets at least 60 columns;
+  below 100 columns it is a level behind Enter (Esc returns). `◦` now means
+  "open — not observed / not yet; no error" in the glyph register.
+- **`a` shows only commits with an agent session.** In the overview, `a`
+  toggles between all commits and those with an agent session (sessions
+  without a commit stay on top). Hidden commits are summarised, never dropped:
+  one dimmed line per run, `┆ 2 commits hidden · @main ▲ HEAD`, so HEAD and
+  branches stay findable. The title names the filter and `N of M`; on its
+  right it says what `a` does now. Esc resets the filter (after the search,
+  before the level); the filter survives tab switches and reloads, and the
+  selection moves to the next visible commit. Without any agent session the
+  list says so and that `a` shows all. In search mode `a` is a letter.
+- **Overview rows: subject first, the request below, status quiet.** Each
+  commit reads lanes · badge · subject · status · refs · time. Status and refs
+  are fixed right-aligned columns; the subject gets the rest (at least 30
+  characters at 120 columns before the refs give way). The status column shows
+  the seal state with glyph and word, `⚑` when a session names a requirement,
+  `◉N` for several sessions and the review only when it differs from open.
+  Refs are a quiet text column, no coloured pills; times are relative
+  (`3h ago`). An agent commit carries a second, dimmed line with its request;
+  the selection is one bar over both lines without partial backgrounds.
+- **One source for every number in the overview.** The overview title counts
+  exactly the rows it shows — `4 commits · 1 with an agent session` — computed
+  by the reader (`Overview::counts`), so the number on top can be counted in
+  the list below. No percentage any more (it hid the denominator), no Change-Id
+  count; a capped list says `500 commits read (limit)`. The second header line
+  is only the breadcrumb; the number of sessions moved into the frame of the
+  Sessions list (`SESSIONS · 2 captured · 1 degraded`). `minds metrics` keeps
+  its coverage figure unchanged.
 - **`minds inspect` shows what the agent discarded.** The Why chain lists the
   constraints and the considered-and-discarded approaches of an intent (up to
   five each, `… N more`) instead of only counting them; the graph detail shows

@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use minds_core::SessionId;
+use minds_core::{ContentHash, SessionId};
 use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::conformance::Outcome;
@@ -75,6 +75,29 @@ pub struct OverviewState {
     pub conformance: HashMap<CommitId, Option<ConformanceMark>>,
     /// Der Filter aus `/` (B4) — leer: alles.
     pub filter: String,
+    /// `a` (C3.3): nur Commits mit Agent-Session (und die Sessions ohne
+    /// Commit). Bleibt über Tab-Wechsel und Neuladen.
+    pub agent_only: bool,
+    /// Das Urteil von `minds verify` je Commit (C3.4) — nur für den
+    /// gewählten, gedrosselt; ein Neuladen beginnt leer (nie ein altes
+    /// Urteil übernehmen).
+    pub checks: HashMap<CommitId, Result<crate::CommitVerify, String>>,
+    /// Wann das Urteil kam (Sekunden seit Epoch).
+    pub checked_at: HashMap<CommitId, i64>,
+    /// Der Commit, dessen Prüfung beim Worker liegt.
+    pub asked: Option<CommitId>,
+    /// Die Zeilen je Commit (C3.4): unerklärte und hinzugefügte — aus
+    /// derselben Rechnung wie der Changes-Tab — oder warum nicht.
+    pub lines: HashMap<CommitId, Result<minds_reader::changes::LineClasses, String>>,
+    /// Die gelesenen Anker (C3.4), aus derselben Quelle wie der Intent-Tab.
+    pub requirements: HashMap<ContentHash, Result<crate::IntentDetail, String>>,
+    /// Ob der Anforderungstext aufgeklappt ist (Space).
+    pub requirement_open: bool,
+    /// Wie weit das Detail gescrollt ist (aufgeklappt, PgUp/PgDn).
+    pub detail_scroll: u16,
+    /// Ob die Übersicht schmal gezeichnet wird (unter 100 Spalten): dann
+    /// ist das Detail eine eigene Ebene hinter Enter.
+    pub narrow: bool,
 }
 
 impl OverviewState {
@@ -90,6 +113,15 @@ impl OverviewState {
             stale: false,
             conformance: HashMap::new(),
             filter: String::new(),
+            agent_only: false,
+            checks: HashMap::new(),
+            checked_at: HashMap::new(),
+            asked: None,
+            lines: HashMap::new(),
+            requirements: HashMap::new(),
+            requirement_open: false,
+            detail_scroll: 0,
+            narrow: false,
         };
         // Die Startauswahl ist HEAD (C3) — laufende Sessions stehen darüber.
         if let Some(head) = state.head() {
@@ -158,7 +190,47 @@ impl OverviewState {
         }
         next.session = next.session.min(next.sessions().len().saturating_sub(1));
         next.filter = std::mem::take(&mut self.filter);
+        next.agent_only = self.agent_only;
+        next.narrow = self.narrow;
+        next.cursor = next.nearest_shown(next.cursor);
         *self = next;
+    }
+
+    /// Space (C3.4): klappt den Anforderungstext auf oder zu — nur, wenn
+    /// es ihn gibt; sonst bleibt PgUp/PgDn bei der Liste.
+    pub fn toggle_requirement(&mut self) {
+        if !self.has_requirement_text() {
+            return;
+        }
+        self.requirement_open = !self.requirement_open;
+        self.detail_scroll = 0;
+    }
+
+    /// Ob der gewählte Commit einen belegten Anker mit Text hat.
+    pub fn has_requirement_text(&self) -> bool {
+        self.agent_commit().is_some_and(|row| {
+            row.anchors.iter().any(|a| {
+                matches!(
+                    self.requirements.get(a),
+                    Some(Ok(d)) if d.proof.is_ok() && d.snapshot.is_some()
+                )
+            })
+        })
+    }
+
+    /// Der gewählte Commit, wenn eine Agent-Session an ihm hängt — nur für
+    /// ihn rechnet das Detail Beleg und Zeilen (C3.4).
+    pub fn agent_commit(&self) -> Option<&CommitRow> {
+        match self.selected()? {
+            Selected::Commit(row) if row.has_agent_session() => Some(row),
+            _ => None,
+        }
+    }
+
+    /// Der gewählte Commit, dessen Urteil noch fehlt und nicht unterwegs ist.
+    pub fn check_due(&self) -> Option<CommitId> {
+        let row = self.agent_commit()?;
+        (!self.checks.contains_key(&row.id) && self.asked != Some(row.id)).then_some(row.id)
     }
 
     /// Wählt die Zeile des Commits, wenn es sie gibt (B3: der aktive Commit).
@@ -175,12 +247,47 @@ impl OverviewState {
         }
     }
 
-    /// Die Zeilen, die der Filter durchlässt: Betreff, Autor, Agent, Refs —
-    /// bei einer WIP-Session Agent und Auftrag.
+    /// `a` (C3.3): schaltet den Agent-Filter um; die Auswahl springt auf
+    /// den nächsten sichtbaren Eintrag.
+    pub fn toggle_agent_only(&mut self) {
+        self.agent_only = !self.agent_only;
+        let cursor = self.nearest_shown(self.cursor);
+        if cursor != self.cursor {
+            self.cursor = cursor;
+            self.session = 0;
+        }
+    }
+
+    /// Der gezeigte Eintrag an `cursor` oder der nächste darunter, sonst der
+    /// letzte darüber.
+    pub fn nearest_shown(&self, cursor: usize) -> usize {
+        let shown = self.shown();
+        shown
+            .iter()
+            .find(|&&i| i >= cursor)
+            .or_else(|| shown.last())
+            .copied()
+            .unwrap_or(cursor)
+    }
+
+    /// Die Zeilen, die die Filter durchlassen: `a` nur Commits mit
+    /// Agent-Session (C3.3), dazu `/` über Betreff, Autor, Agent, Refs — bei
+    /// einer WIP-Session Agent und Auftrag.
     pub fn shown(&self) -> Vec<usize> {
         let Ok(overview) = self.data.as_ref() else {
             return Vec::new();
         };
+        let mut shown = self.matching(overview);
+        if self.agent_only {
+            shown.retain(|&i| match i.checked_sub(overview.wip.len()) {
+                None => true,
+                Some(at) => overview.rows[at].has_agent_session(),
+            });
+        }
+        shown
+    }
+
+    fn matching(&self, overview: &Overview) -> Vec<usize> {
         crate::filter::shown_by(self.len(), &self.filter, |i| {
             match i.checked_sub(overview.wip.len()) {
                 None => {
@@ -216,7 +323,13 @@ impl OverviewState {
         let overview = self.data.as_ref().ok()?;
         match self.cursor.checked_sub(overview.wip.len()) {
             None => overview.wip.get(self.cursor).map(Selected::Wip),
-            Some(at) => overview.rows.get(at).map(Selected::Commit),
+            // Mit `a` ist ein Commit ohne Agent-Session ausgeblendet — nie
+            // gewählt (Leerzustand des Filters).
+            Some(at) => overview
+                .rows
+                .get(at)
+                .filter(|row| !self.agent_only || row.has_agent_session())
+                .map(Selected::Commit),
         }
     }
 

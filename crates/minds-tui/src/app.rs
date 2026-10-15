@@ -594,18 +594,46 @@ impl<'a> App<'a> {
                     let shown = sessions.len().min(crate::overview::MAX_SESSION_LINES);
                     state.session = (state.session + 1).min(shown.saturating_sub(1));
                 }
-                Action::Back => state.focus = OverviewFocus::Graph,
-                Action::Enter => {
-                    if let Some(id) = state.chosen_session() {
-                        self.goto_session(id);
-                    }
+                Action::Back => {
+                    state.focus = OverviewFocus::Graph;
+                    state.detail_scroll = 0;
                 }
+                Action::Enter => match state.chosen_session() {
+                    Some(id) => self.goto_session(id),
+                    // Schmal ist das Detail eine Ebene — auch ohne Session:
+                    // Enter zeigt dann, wie der Commit entstand (Diff).
+                    None => {
+                        if let Some(Selected::Commit(row)) = state.selected() {
+                            let commit = row.id;
+                            self.open_changes(Some(commit));
+                        }
+                    }
+                },
+                Action::Space => state.toggle_requirement(),
+                Action::PageUp => state.detail_scroll = state.detail_scroll.saturating_sub(10),
+                Action::PageDown => state.detail_scroll = state.detail_scroll.saturating_add(10),
                 _ => {}
             }
             return;
         }
         let at = state.cursor;
         match action {
+            // Space klappt den Anforderungstext auf (C3.4); aufgeklappt
+            // blättern PgUp/PgDn im Detail.
+            Action::Space => state.toggle_requirement(),
+            Action::PageUp if state.requirement_open => {
+                state.detail_scroll = state.detail_scroll.saturating_sub(10);
+            }
+            Action::PageDown if state.requirement_open => {
+                state.detail_scroll = state.detail_scroll.saturating_add(10);
+            }
+            // Unter 100 Spalten ist das Detail eine eigene Ebene hinter
+            // Enter (C3.4); Esc führt zurück zur Liste.
+            Action::Enter if state.narrow && state.selected().is_some() => {
+                state.focus = OverviewFocus::Sessions;
+                state.session = 0;
+                return;
+            }
             // Über die gezeigten Zeilen — der Filter aus `/` blendet aus (B4).
             Action::Up
             | Action::Down
@@ -655,6 +683,8 @@ impl<'a> App<'a> {
         }
         if state.cursor != at {
             state.session = 0;
+            state.requirement_open = false;
+            state.detail_scroll = 0;
         }
     }
 
@@ -754,6 +784,100 @@ impl<'a> App<'a> {
         true
     }
 
+    /// Liest im Leerlauf, was das Detail der Übersicht braucht (C3.4): die
+    /// Anker des gewählten Commits (dieselbe Quelle und Prüfung wie der
+    /// Intent-Tab), dann seine Zeilen (dieselbe Rechnung wie der
+    /// Changes-Tab). Eins je Aufruf; `true`, wenn gelesen wurde.
+    pub fn fill_overview(&mut self, source: &dyn Source) -> bool {
+        if self.tab != Tab::Overview {
+            return false;
+        }
+        let Some(state) = self.overview.as_mut() else {
+            return false;
+        };
+        let Some(row) = state.agent_commit() else {
+            return false;
+        };
+        let commit = row.id;
+        let missing: Vec<ContentHash> = row
+            .anchors
+            .iter()
+            .filter(|a| !state.requirements.contains_key(*a))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            match source.intents(&missing) {
+                Ok(list) => {
+                    for entry in list.entries {
+                        state.requirements.insert(entry.id, entry.detail);
+                    }
+                    for id in missing {
+                        state
+                            .requirements
+                            .entry(id)
+                            .or_insert_with(|| Err("anchor not read".into()));
+                    }
+                }
+                Err(why) => {
+                    for id in missing {
+                        state.requirements.insert(id, Err(why.clone()));
+                    }
+                }
+            }
+            return true;
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = state.lines.entry(commit) {
+            let count = match self.inspection.changes(self.repo, commit) {
+                Ok(set) => match &set.unassessed {
+                    Some(why) => Err(why.clone()),
+                    None => Ok(set.line_classes()),
+                },
+                Err(err) => Err(minds_reader::sanitize(&err.to_string())),
+            };
+            slot.insert(count);
+            return true;
+        }
+        false
+    }
+
+    /// Prüft den gewählten Commit der Übersicht synchron (ohne Worker) —
+    /// `true`, wenn geprüft wurde.
+    pub fn fill_overview_verify(&mut self, source: &dyn Source) -> bool {
+        if self.tab != Tab::Overview {
+            return false;
+        }
+        let now = self.now_secs();
+        let Some(state) = self.overview.as_mut() else {
+            return false;
+        };
+        let Some(commit) = state.check_due() else {
+            return false;
+        };
+        state.checks.insert(commit, source.verify(commit));
+        state.checked_at.insert(commit, now);
+        true
+    }
+
+    /// Gibt die ausstehende Prüfung des gewählten Commits der Übersicht an
+    /// den Worker (B6) — `true`, wenn sie unterwegs ist.
+    pub fn send_overview_check(&mut self, worker: &mut Worker) -> bool {
+        if worker.busy.is_some() || self.tab != Tab::Overview {
+            return false;
+        }
+        let Some(state) = self.overview.as_mut() else {
+            return false;
+        };
+        let Some(commit) = state.check_due() else {
+            return false;
+        };
+        if worker.requests.send(commit).is_err() {
+            return false;
+        }
+        state.asked = Some(commit);
+        worker.busy = Some(commit);
+        true
+    }
+
     /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
     /// der Quelle; `reduce` merkt sich nur den Bedarf.
     /// Nur bei sichtbarem Tab: Ein verdeckter Tab startet kein ssh-keygen.
@@ -786,6 +910,16 @@ impl<'a> App<'a> {
             return false;
         };
         worker.busy = None;
+        // Die Übersicht nimmt nur die Antwort, nach der dieser Stand gefragt
+        // hat — ein Neuladen baut sie ohne Frage neu (C3.4, B6).
+        let now = self.now_secs();
+        if let Some(state) = self.overview.as_mut()
+            && state.asked == Some(commit)
+        {
+            state.asked = None;
+            state.checks.insert(commit, answer.clone());
+            state.checked_at.insert(commit, now);
+        }
         if let Some(state) = self.verify.as_mut()
             && state.commit() == Some(commit)
         {
@@ -1895,6 +2029,15 @@ impl<'a> App<'a> {
                 self.refit_tab();
                 return;
             }
+            // Danach der Agent-Filter der Übersicht (C3.3) — vor der Ebene.
+            if action == Action::Back
+                && self.tab == Tab::Overview
+                && let Some(state) = self.overview.as_mut()
+                && state.agent_only
+            {
+                state.toggle_agent_only();
+                return;
+            }
         }
         if self.searching {
             match action {
@@ -1951,6 +2094,18 @@ impl<'a> App<'a> {
         };
         if verb {
             self.verb(action);
+            return;
+        }
+        // `a` (C3.3): nur in der Übersicht — anderswo ein Hinweis statt
+        // still nichts.
+        if action == Action::AgentFilter {
+            match self.overview.as_mut().filter(|_| self.tab == Tab::Overview) {
+                Some(state) => state.toggle_agent_only(),
+                None => {
+                    self.closed =
+                        Some("a: shows only commits with an agent session — in Overview (1)".into())
+                }
+            }
             return;
         }
         match action {
@@ -2381,6 +2536,28 @@ impl<'a> App<'a> {
                     }
                 }
             }
+            // Das Detail der Übersicht (C3.4): das Urteil des gewählten
+            // Commits, gedrosselt wie der Verify-Tab.
+            let due = self.tab == Tab::Overview
+                && self
+                    .overview
+                    .as_ref()
+                    .is_some_and(|o| o.check_due().is_some())
+                && verified.elapsed() >= VERIFY_EVERY;
+            if due {
+                match worker.as_mut() {
+                    Some(worker) => {
+                        if self.send_overview_check(worker) {
+                            verified = Instant::now();
+                        }
+                    }
+                    None => {
+                        self.fill_overview_verify(source);
+                        verified = Instant::now();
+                        continue;
+                    }
+                }
+            }
             if let Some(worker) = worker.as_mut() {
                 if self.take_checks(worker) {
                     continue;
@@ -2405,6 +2582,9 @@ impl<'a> App<'a> {
                     let action = input::map(key, self.searching);
                     self.reduce(action);
                 }
+            } else if self.fill_overview(source) {
+                // Im Leerlauf: Anker und Zeilen des gewählten Commits (C3.4).
+                continue;
             } else if self.fill_conformance(source) {
                 // Im Leerlauf, nie beim Scrollen: je Tick höchstens ein
                 // Commit, danach sofort neu zeichnen.

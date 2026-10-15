@@ -322,17 +322,20 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
     }
     add(theme::tampered().0, Epistemic, "failed", "tampered".into());
     add(theme::claim().0, Epistemic, "claim", "claim".into());
+    // C3.4 (freigegeben): ◦ heißt „open".
     add(
         theme::not_observed().0,
         Epistemic,
-        "not observed",
+        "open",
         "not_observed".into(),
     );
     for (class, meaning) in [
         (ReconClass::Explained, "observed"),
         (ReconClass::ExplainedFsOnly, "fs only"),
         (ReconClass::ReportedOnly, "stated"),
-        (ReconClass::Unexplained, "not observed"),
+        // C3.4 (freigegeben): ◦ heißt „open" — nicht beobachtet, noch
+        // nicht da; nie ein Fehler.
+        (ReconClass::Unexplained, "open"),
     ] {
         add(
             theme::recon(class).0,
@@ -928,8 +931,9 @@ fn c5_terms_no_longer_collide() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     let out = render_sized(&mut app, 300, 30);
-    // Der Anteil der Commits mit Session ist nicht die Coverage-Achse.
-    assert!(out.contains("% of commits with a session"), "{out}");
+    // Der Anteil der Commits mit Session ist nicht die Coverage-Achse — und
+    // seit C3.1 gar kein Prozentwert mehr (er versteckt den Nenner).
+    assert!(!out.contains("% of commits"), "{out}");
     assert!(!out.contains("context coverage"), "{out}");
     assert!(out.contains("1 file · 0 tok"), "{out}");
     assert!(!out.contains(" D · "), "{out}");
