@@ -289,14 +289,7 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         Err(err) => Line::from(Span::styled(err.clone(), theme::dim())),
     };
-    let keys = match state.focus {
-        Focus::Files => {
-            "↑↓ file  Enter diff  [ ] commit  n next unexplained  / filter  c why column  w why chain  ? help"
-        }
-        Focus::Diff => {
-            "↑↓ line  ] [ hunk  n N unexplained  s split  c why column  w why chain  Esc files  ? help"
-        }
-    };
+    let keys = actions(app).join("  ");
     let keys = Line::from(vec![
         freshness(app),
         Span::raw("  "),
@@ -304,7 +297,7 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
     ]);
     frame.render_widget(
         Paragraph::new(vec![
-            status_line(status, area.width),
+            status_line(with_context(app, status, area.width), area.width),
             pinned(keys, area.width, app.searching),
         ]),
         area,
@@ -323,14 +316,11 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         let keys = Line::from(vec![
             freshness(app),
             Span::raw("  "),
-            Span::styled(
-                "↑↓ row  Enter open  [ ] commit  Tab next tab  ? help",
-                theme::dim(),
-            ),
+            Span::styled(actions(app).join("  "), theme::dim()),
         ]);
         frame.render_widget(
             Paragraph::new(vec![
-                status_line(status, area.width),
+                status_line(with_context(app, status, area.width), area.width),
                 pinned(keys, area.width, app.searching),
             ]),
             area,
@@ -346,28 +336,17 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             None => crate::copy::seal(None),
         };
         let status = explain(word);
-        let focused = app
-            .overview
-            .as_ref()
-            .is_some_and(|o| o.focus == crate::overview::OverviewFocus::Sessions);
         let mut keys = vec![
             freshness(app),
             Span::raw("  "),
-            Span::styled(
-                if focused {
-                    "↑↓ session  Enter its graph  Esc back to the history  ? help"
-                } else {
-                    "↑↓ commit  Enter sessions / graph  w why chain  / filter  Tab next tab  ? help"
-                },
-                theme::dim(),
-            ),
+            Span::styled(actions(app).join("  "), theme::dim()),
         ];
         if let Some(closed) = &app.closed {
             keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
         }
         frame.render_widget(
             Paragraph::new(vec![
-                status_line(status, area.width),
+                status_line(with_context(app, status, area.width), area.width),
                 pinned(Line::from(keys), area.width, app.searching),
             ]),
             area,
@@ -380,17 +359,14 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         let mut keys = vec![
             freshness(app),
             Span::raw("  "),
-            Span::styled(
-                "↑↓ anchor  Enter graph of a session naming it  / filter  Tab next tab  ? help",
-                theme::dim(),
-            ),
+            Span::styled(actions(app).join("  "), theme::dim()),
         ];
         if let Some(closed) = &app.closed {
             keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
         }
         frame.render_widget(
             Paragraph::new(vec![
-                status_line(status, area.width),
+                status_line(with_context(app, status, area.width), area.width),
                 pinned(Line::from(keys), area.width, app.searching),
             ]),
             area,
@@ -411,7 +387,12 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                     // (C1) — Wörter ohne Glyph, der Badge steht in Zeile 2.
                     Line::from(vec![
                         Span::styled(format!("{glyph} {word}  "), style),
-                        Span::styled(evidence_sentence(card.evidence).to_string(), theme::dim()),
+                        // Nur der erste Satz: Der Prüfstatus steht im
+                        // Glossar („observed is not checked").
+                        Span::styled(
+                            first_sentence(&evidence_sentence(card.evidence)),
+                            theme::dim(),
+                        ),
                         Span::styled("  ·  ", theme::dim()),
                         Span::styled(integrity_sentence(card.axes()), theme::dim()),
                     ])
@@ -517,32 +498,6 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         // invertierter Block, immer an derselben Stelle unten links — auf
         // einer manipulierten Session springt er sichtbar auf ✗ TAMPERED.
         // Glyph UND Wort, nie nur Farbe (Farbschwäche-Regel aus `theme`).
-        let focused = match app.top() {
-            None => app.selected().map(|card| card.axes()),
-            Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => {
-                app.inspection.card(*id).map(|card| card.axes())
-            }
-            Some(View::Why { .. }) => None,
-        };
-        if let Some(axes) = focused {
-            // Der Trust Strip (A4): die Integrität als invertierter Block,
-            // dahinter Coverage und Deutung — ab 120 Spalten mit Wort
-            // (Short), darunter als Glyph (Compact). Nie verschmolzen.
-            let [integrity, _, _] = trust::slots(&axes);
-            spans.push(Span::styled(
-                format!(" {} {}", integrity.glyph, integrity.word),
-                integrity
-                    .style
-                    .add_modifier(ratatui::style::Modifier::REVERSED),
-            ));
-            let density = if area.width >= 120 {
-                trust::Density::Short
-            } else {
-                trust::Density::Compact
-            };
-            spans.extend(trust::spans(&axes, density).into_iter().skip(1));
-            spans.push(Span::raw("  "));
-        }
         // Die Frische vor den Tasten: Auf einem schmalen Terminal werden die
         // Tasten abgeschnitten, nie die Warnung, dass der Stand alt ist.
         spans.push(freshness(app));
@@ -553,16 +508,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 theme::title().fg(theme::EDIT),
             ));
         }
-        let keys = match app.top() {
-            None => {
-                "↑↓ select  Enter descend  w why  e evidence  / search  z Z zoom  ? help  q quit"
-            }
-            Some(View::Graph { .. }) => {
-                "↑↓ select  Enter descend  w why  e evidence  t timeline  z Z zoom  Esc back  ? help"
-            }
-            Some(View::Why { .. }) => "↑↓ select  Enter open  Esc back  ? help",
-            Some(View::Evidence { .. }) => "↑↓ section  Esc back  ? help",
-        };
+        let keys = actions(app).join("  ");
         spans.push(Span::styled(keys, theme::dim()));
         spans.push(Span::styled(
             format!("  Zoom {}", app.zoom.digit()),
@@ -572,11 +518,147 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            status_line(status, area.width),
+            status_line(with_context(app, status, area.width), area.width),
             pinned(keys, area.width, app.searching),
         ]),
         area,
     );
+}
+
+/// Die häufigsten Aktionen des Fokus, nach Priorität — 4 bis 6 (C2); alles
+/// Weitere steht in der Hilfe. `? help  q quit` hängt [`pinned`] rechts an.
+pub(crate) fn actions(app: &App) -> Vec<&'static str> {
+    match app.tab {
+        Tab::Overview => {
+            if app
+                .overview
+                .as_ref()
+                .is_some_and(|o| o.focus == crate::overview::OverviewFocus::Sessions)
+            {
+                vec!["↑↓ session", "Enter its graph", "e evidence", "Esc back"]
+            } else {
+                vec![
+                    "↑↓ commit",
+                    "Enter how it was made",
+                    "w why",
+                    "v verify",
+                    "d diff",
+                    "/ filter",
+                ]
+            }
+        }
+        Tab::Sessions => match app.top() {
+            None => vec![
+                "↑↓ select",
+                "Enter descend",
+                "w why",
+                "e evidence",
+                "/ search",
+                "z Z zoom",
+            ],
+            Some(View::Graph { .. }) => {
+                vec![
+                    "↑↓ select",
+                    "Enter descend",
+                    "w why",
+                    "e evidence",
+                    "z Z zoom",
+                    "Esc back",
+                ]
+            }
+            Some(View::Why { .. }) => vec!["↑↓ select", "Enter open", "e evidence", "Esc back"],
+            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "w why", "Esc back"],
+        },
+        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "w why"],
+        Tab::Changes => match app.changes.as_ref().map(|c| c.focus) {
+            Some(Focus::Diff) => vec![
+                "↑↓ line",
+                "] [ hunk",
+                "n N unexplained",
+                "s split",
+                "w why chain",
+                "Esc files",
+            ],
+            _ => vec![
+                "↑↓ file",
+                "Enter diff",
+                "[ ] commit",
+                "n next unexplained",
+                "c why column",
+                "/ filter",
+            ],
+        },
+        Tab::Intent => vec!["↑↓ anchor", "Enter graph", "PgUp PgDn scroll", "/ filter"],
+    }
+}
+
+/// Zeile 1, vorn: der fokussierte Gegenstand — Session mit Trust Strip,
+/// Commit mit seiner Kurz-Id, Anker mit seiner (C2).
+fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let session = match app.tab {
+        Tab::Sessions => match app.top() {
+            None => app.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
+            Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
+            Some(View::Why { .. }) => None,
+        },
+        _ => None,
+    };
+    if let Some(card) = session.and_then(|id| app.inspection.card(id)) {
+        let id = card.id.to_string();
+        spans.push(Span::styled(
+            format!("{}… ", id.get(..11).unwrap_or(&id)),
+            theme::title().fg(theme::AGENT),
+        ));
+        // Der Trust Strip: die Integrität als invertierter Block (A4), ab
+        // 120 Spalten mit Wort je Achse (Short), darunter als Glyph.
+        let axes = card.axes();
+        let [integrity, _, _] = trust::slots(&axes);
+        spans.push(Span::styled(
+            format!(" {} {}", integrity.glyph, integrity.word),
+            integrity
+                .style
+                .add_modifier(ratatui::style::Modifier::REVERSED),
+        ));
+        let density = if wide {
+            trust::Density::Short
+        } else {
+            trust::Density::Compact
+        };
+        spans.extend(trust::spans(&axes, density).into_iter().skip(1));
+        spans.push(Span::raw("  "));
+    }
+    let commit = match app.tab {
+        Tab::Overview => match app.overview.as_ref().and_then(|o| o.selected()) {
+            Some(crate::overview::Selected::Commit(row)) => Some(row.id),
+            _ => None,
+        },
+        Tab::Verify => app.verify.as_ref().and_then(|v| v.commit()),
+        _ => None,
+    };
+    if let Some(commit) = commit {
+        spans.push(Span::styled(
+            format!("{} ", &commit.to_string()[..7]),
+            Style::default().fg(theme::CHANGE),
+        ));
+    }
+    if app.tab == Tab::Intent
+        && let Some(anchor) = app.intent.as_ref().and_then(|i| i.selected())
+    {
+        let id = anchor.id.to_string();
+        spans.push(Span::styled(
+            format!("{}… ", id.get(..14).unwrap_or(&id)),
+            theme::title(),
+        ));
+    }
+    spans
+}
+
+/// Zeile 1: Kontext vor dem Satz.
+fn with_context(app: &App, status: Line<'static>, width: u16) -> Line<'static> {
+    let mut spans = context(app, width >= 120);
+    spans.extend(status.spans);
+    Line::from(spans)
 }
 
 /// Die rechts fixierten Tasten der Fußzeile: Hilfe und Ausgang fallen nie
@@ -591,6 +673,14 @@ fn integrity_sentence(axes: minds_reader::model::TrustAxes) -> String {
     crate::copy::sentence(crate::copy::integrity(axes.integrity))
         .unwrap_or_default()
         .to_string()
+}
+
+/// Der erste Satz eines Texts (bis zum ersten „. ").
+fn first_sentence(text: &str) -> String {
+    match text.find(". ") {
+        Some(at) => text[..=at].to_string(),
+        None => text.to_string(),
+    }
 }
 
 /// Der Glossar-Satz zu `word` als Statuszeile (C1).

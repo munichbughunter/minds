@@ -96,3 +96,49 @@ fn b7_the_focused_pane_is_marked_without_color() {
         lines.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------
+// C2 · Fußzeilen nach der Zwei-Zeilen-Regel
+// ---------------------------------------------------------------------
+
+/// Zeile 1: Kontext des fokussierten Gegenstands (Id, Trust Strip, Satz);
+/// Zeile 2: 4–6 Aktionen, `? help  q quit` rechts — in jedem Tab.
+#[test]
+fn c2_two_footer_lines_with_fixed_roles() {
+    let (_dir, repo, _, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    for (i, tab) in Tab::ALL.iter().enumerate() {
+        app.reduce(Action::TabTo(i as u8));
+        let actions = super::super::super::actions(&app);
+        assert!(
+            (4..=6).contains(&actions.len()),
+            "{tab:?}: {} actions {actions:?}",
+            actions.len()
+        );
+        let lines = text(&buffer_sized(&mut app, 300, 30));
+        let line2 = lines[lines.len() - 1].trim_end();
+        for action in &actions {
+            assert!(line2.contains(action), "{tab:?}: {action} in {line2}");
+        }
+        assert!(line2.ends_with("? help  q quit"), "{tab:?}: {line2}");
+    }
+    // Sessions: Zeile 1 nennt die Session und ihren Trust Strip (Short).
+    app.reduce(Action::TabTo(1));
+    let lines = text(&buffer_sized(&mut app, 300, 30));
+    let line1 = &lines[lines.len() - 2];
+    let id = app.selected().unwrap().id.to_string();
+    assert!(line1.contains(&id[..11]), "{line1}");
+    assert!(
+        line1.contains(" · ") && line1.contains("interpreted"),
+        "{line1}"
+    );
+    // Overview: Zeile 1 nennt den gewählten Commit.
+    app.reduce(Action::TabTo(0));
+    let lines = text(&buffer_sized(&mut app, 300, 30));
+    let line1 = &lines[lines.len() - 2];
+    if let Some(crate::overview::Selected::Commit(row)) =
+        app.overview.as_ref().and_then(|s| s.selected())
+    {
+        assert!(line1.contains(&row.id.to_string()[..7]), "{line1}");
+    }
+}

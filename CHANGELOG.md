@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Two footer lines with fixed roles.** Line 1 is the context of what is in
+  focus — the session with its trust strip, the commit or the anchor — and
+  the glossary sentence for its state; line 2 holds the four to six most
+  frequent actions, `? help  q quit` pinned to the right (while typing a
+  search, the search keys). Everything else is in the help.
 - **A glossary, explained in context.** Every status word has one plain
   sentence in one place (`copy.rs`), with the distinctions that matter:
   sealed is not verified, observed is not checked, a claim is not evidence,
