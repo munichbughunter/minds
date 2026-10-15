@@ -58,18 +58,14 @@ pub fn draw(
     // Beweiszustand der Seals (ADR-0011) steht hier, nicht nur das Review.
     let (ev_glyph, ev_word, ev_style) = theme::evidence(card.evidence);
     let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
-    let (s_glyph, s_word, s_style) = theme::provenance(&card.provenance);
     let mut seal_summary = card
         .evidence_state()
         .map(|s| format!(" · {}", s.summary()))
         .unwrap_or_default();
-    // Die uebrigen Achsen und Beziehungen, wo vorhanden: Epoche, Deutung,
-    // Content-Uebergaben — der Kopf zeigt Beweiszustaende, nicht nur Logs.
+    // Die Beziehungen, wo vorhanden: Epoche, Content-Uebergaben — Details
+    // hinter Ergebnis und Zusammenhang.
     if let Some((k, n)) = card.epoch_position {
         seal_summary.push_str(&format!(" · epoch {k}/{n}"));
-    }
-    if card.uninterpreted_calls > 0 {
-        seal_summary.push_str(&format!(" · ◐ {} uninterpreted", card.uninterpreted_calls));
     }
     if card.handovers > 0 {
         seal_summary.push_str(&format!(" · ⇄ {} handover(s)", card.handovers));
@@ -88,22 +84,30 @@ pub fn draw(
                 ),
                 Span::styled(if timeline { "TIMELINE" } else { "GRAPH" }, theme::dim()),
             ]),
-            Line::from(vec![
-                Span::styled(
+            // Ergebnis zuerst (A4/A6): Trust Strip und Review, dann Beleg,
+            // Akteur, Zeit, Umfang — die Details zuletzt, sie dürfen weichen.
+            Line::from({
+                let mut spans =
+                    crate::view::trust::spans(&card.axes(), crate::view::trust::Density::Short);
+                spans.push(Span::styled("   ", theme::dim()));
+                spans.push(Span::styled(format!("{v_glyph} {v_word}"), v_style));
+                spans.push(Span::styled("   ", theme::dim()));
+                spans.push(Span::styled(format!("{ev_glyph} {ev_word}"), ev_style));
+                spans.push(Span::raw("   "));
+                spans.push(Span::styled(
                     card.summary.actor.clone(),
                     Style::default().fg(theme::AGENT),
-                ),
-                Span::raw(format!(
-                    " · {} · {} file(s) · {}/{} tokens · ",
+                ));
+                spans.push(Span::raw(format!(
+                    " · {} · {} file(s) · {}/{} tokens",
                     when(card.started_at.as_deref()),
                     card.summary.files,
                     card.summary.input_tokens,
                     card.summary.output_tokens
-                )),
-                Span::styled(format!("{s_glyph} {s_word}{seal_summary} · "), s_style),
-                Span::styled(format!("{ev_glyph} {ev_word}  "), ev_style),
-                Span::styled(format!("{v_glyph} {v_word}"), v_style),
-            ]),
+                )));
+                spans.push(Span::styled(seal_summary, theme::dim()));
+                spans
+            }),
         ]),
         head,
     );

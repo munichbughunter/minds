@@ -319,8 +319,17 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, Style, Vec<String>) 
                     cards
                         .iter()
                         .map(|c| {
+                            // Der Trust Strip in der dichtesten Form (A4):
+                            // je Achse ein Glyph, in fester Reihenfolge.
+                            let strip: String = crate::view::trust::spans(
+                                &c.axes(),
+                                crate::view::trust::Density::Glyphs,
+                            )
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect();
                             format!(
-                                "{}…  {}  {}",
+                                "{strip}  {}…  {}  {}",
                                 c.id.to_string().chars().take(11).collect::<String>(),
                                 when(c.started_at.as_deref()),
                                 clip(&c.summary.headline, width.saturating_sub(30))

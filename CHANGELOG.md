@@ -27,6 +27,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **One trust strip in `minds inspect`.** Integrity, coverage and
+  interpretation are shown by one component, everywhere in the same order
+  and the same words — never merged into one value, score or traffic light.
+  The session list shows `◈ sealed ● ✓` (integrity as a word, so legacy stays
+  `· legacy`), the footer and the graph head `◈ sealed · ● complete · ✓
+  interpreted` (the graph head now leads with it), the evidence verdict its
+  three axis rows with the same glyphs, a legacy session one line per axis,
+  and the Why chain each session with its three glyphs. The words of
+  `minds verify` (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT VERIFIABLE,
+  hash-valid) stay as they are. Review stays a separate statement; "open" —
+  the normal state — is no longer shown as a pill or in the VERDICT column.
+  The reader provides the three axes (`SessionCard::axes`, `TrustAxes`).
 - **One meaning per glyph in `minds inspect`.** A central glyph register
   separates epistemic glyphs (evidence source, check result, seal state,
   claim, reconciliation, review) from structural ones (node kinds, effects);

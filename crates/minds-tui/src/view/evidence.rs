@@ -55,7 +55,7 @@ pub fn draw(
 ) {
     let short: String = id.to_string().chars().take(11).collect();
     let Some(report) = report else {
-        legacy(frame, area, &short, artifacts);
+        legacy(frame, area, &short, uninterpreted, artifacts);
         return;
     };
 
@@ -134,24 +134,49 @@ pub fn draw(
     );
 }
 
-fn legacy(frame: &mut Frame, area: Rect, short: &str, artifacts: &[CommitArtifact]) {
+fn legacy(
+    frame: &mut Frame,
+    area: Rect,
+    short: &str,
+    uninterpreted: usize,
+    artifacts: &[CommitArtifact],
+) {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
                 format!("EVIDENCE {short}…  "),
                 theme::title().fg(theme::AGENT),
             ),
-            Span::styled("· legacy", theme::dim().patch(theme::title())),
+            {
+                let slot =
+                    crate::view::trust::integrity(minds_reader::model::IntegrityAxis::Legacy);
+                Span::styled(
+                    format!("{} {}", slot.glyph, slot.word),
+                    slot.style.patch(theme::title()),
+                )
+            },
         ]),
         Line::default(),
         Line::from(Span::raw(LEGACY_SENTENCE)),
+        Line::default(),
+    ];
+    // Die drei Achsen in der vollen Dichte (A4): Legacy hat keine
+    // Integrität und keine Coverage zu prüfen — die Deutung schon.
+    lines.extend(crate::view::trust::render(
+        &minds_reader::model::TrustAxes::of(
+            &minds_reader::model::Provenance::Legacy,
+            uninterpreted,
+        ),
+        crate::view::trust::Density::Full,
+    ));
+    lines.extend([
         Line::default(),
         Line::from(Span::styled(
             "This session was captured before the evidence chain. It never gets a chain \
              attributed after the fact — its honest answer is this state.",
             theme::dim(),
         )),
-    ];
+    ]);
     // Der Abgleich hängt nicht an der Chain: Auch eine Legacy-Session kann
     // Zeilen eines Commits erklären — oder eben nicht.
     if !artifacts.is_empty() {
@@ -176,45 +201,16 @@ fn rows(
     artifacts: &[CommitArtifact],
 ) -> Vec<(String, String, Style)> {
     let state = &report.state;
-    let scope = report.scope.as_deref().unwrap_or("?");
     let ok = Style::default().fg(theme::OK);
     let warn = Style::default().fg(theme::REVIEW);
     let mut out = Vec::with_capacity(SECTIONS.len());
 
-    // Integrität: wurde das Seal-Material verändert?
-    out.push(
-        if state.verdict == minds_reader::model::EvidenceVerdict::Tampered {
-            (
-                "✗".into(),
-                "TAMPERED — seal material altered".into(),
-                Style::default().fg(theme::DELETE),
-            )
-        } else {
-            (
-                "✓".into(),
-                format!("intact · {} seal(s) hash-valid", state.seals),
-                ok,
-            )
-        },
-    );
-
-    // Coverage: immer gescoped — „vollständig" nur innerhalb der Grenze.
-    out.push(if state.gaps == 0 && state.pre_chain == 0 {
-        (
-            "✓".into(),
-            format!("COMPLETE · {} event(s) · within {scope}", state.events),
-            ok,
-        )
-    } else {
-        (
-            "!".into(),
-            format!(
-                "{} gap(s) · {} pre-chain · {} event(s) · within {scope}",
-                state.gaps, state.pre_chain, state.events
-            ),
-            warn,
-        )
-    });
+    // Integrität und Coverage: aus dem Trust Strip (A4) — dieselben Glyphen
+    // und Wörter wie überall, ergänzt um die Kennzahlen und die Grenze.
+    let [integrity, coverage, interpretation] =
+        crate::view::trust::evidence_rows(report, uninterpreted);
+    out.push(integrity);
+    out.push(coverage);
 
     // Artefakt: wie viel des Commits die Session erklärt.
     out.push(artifact_row(artifacts));
@@ -260,15 +256,7 @@ fn rows(
     });
 
     // Deutung: die dritte Achse, getrennt von Integrität und Coverage.
-    out.push(if uninterpreted == 0 {
-        ("✓".into(), "all tool calls interpreted".into(), ok)
-    } else {
-        (
-            "◐".into(),
-            format!("{uninterpreted} call(s) observed, not interpreted"),
-            warn,
-        )
-    });
+    out.push(interpretation);
 
     // Grenzen: keine Achse, aber Teil des Reports.
     out.push((
@@ -695,22 +683,21 @@ fn signature(report: &EvidenceReport) -> Vec<Line<'static>> {
 }
 
 fn interpretation(uninterpreted: usize) -> Vec<Line<'static>> {
-    let mut lines = if uninterpreted == 0 {
-        vec![Line::from(Span::styled(
-            "✓ All tool calls are interpreted.",
-            Style::default().fg(theme::OK),
-        ))]
+    let axis = if uninterpreted == 0 {
+        minds_reader::model::InterpretationAxis::Interpreted
     } else {
-        vec![
-            Line::from(Span::styled(
-                format!("◐ {uninterpreted} call(s) observed, but not interpreted."),
-                Style::default().fg(theme::REVIEW),
-            )),
-            Line::from(Span::raw(
-                "Observed means: name and raw arguments are evidence — the effect is not normalized.",
-            )),
-        ]
+        minds_reader::model::InterpretationAxis::Uninterpreted(uninterpreted)
     };
+    let slot = crate::view::trust::interpretation(axis);
+    let mut lines = vec![Line::from(Span::styled(
+        format!("{} {} — {}", slot.glyph, slot.word, slot.sentence),
+        slot.style,
+    ))];
+    if uninterpreted > 0 {
+        lines.push(Line::from(Span::raw(
+            "Observed means: name and raw arguments are evidence — the effect is not normalized.",
+        )));
+    }
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "Interpretation is separate from integrity and coverage: same evidence + same adapter ⇒ same interpretation; `minds reinterpret` shows the stored and the current interpretation side by side.",

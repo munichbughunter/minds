@@ -441,3 +441,196 @@ fn a1_the_help_overlay_shows_the_whole_legend() {
     assert!(out.contains("■ change / commit"), "{out}");
     assert!(out.contains("◇ stated (declared / reported only)"), "{out}");
 }
+
+// ---------------------------------------------------------------------
+// A4 · Eine Komponente für den Vertrauenszustand („Trust Strip“)
+// ---------------------------------------------------------------------
+
+fn all_axes() -> Vec<minds_reader::model::TrustAxes> {
+    use minds_reader::model::{CoverageAxis as C, IntegrityAxis as I, InterpretationAxis as D};
+    let mut out = Vec::new();
+    for integrity in [I::Sealed, I::Tampered, I::Legacy] {
+        for coverage in [C::Complete, C::Incomplete, C::NotAssessable, C::NotRecorded] {
+            for interpretation in [D::Interpreted, D::Uninterpreted(2)] {
+                out.push(minds_reader::model::TrustAxes {
+                    integrity,
+                    coverage,
+                    interpretation,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Jede Kombination der drei Achsen ist in jeder Dichte unterscheidbar —
+/// in `Glyphs` über die Glyphen, in den übrigen auch ohne Glyphen über die
+/// Wörter. Feste Reihenfolge, drei Slots, nie verschmolzen.
+#[test]
+fn a4_every_axis_combination_differs_in_every_density() {
+    use super::super::trust::{self, Density};
+    let glyphs: Vec<char> = theme::REGISTER
+        .iter()
+        .flat_map(|e| e.symbol.chars())
+        .collect();
+    let words_only =
+        |text: &str| -> String { text.chars().filter(|c| !glyphs.contains(c)).collect() };
+    for density in [
+        Density::Glyphs,
+        Density::Compact,
+        Density::Short,
+        Density::Full,
+    ] {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut seen_words = std::collections::BTreeSet::new();
+        for axes in all_axes() {
+            let text: String = match density {
+                Density::Full => trust::lines(&axes)
+                    .iter()
+                    .map(|l| {
+                        l.spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => trust::spans(&axes, density)
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect(),
+            };
+            assert!(seen.insert(text.clone()), "{density:?}: twice {text:?}");
+            // Compact trägt nur das Integritätswort — die übrigen Achsen
+            // unterscheiden dort die Glyphen.
+            if matches!(density, Density::Short | Density::Full) {
+                let words = words_only(&text);
+                assert!(
+                    seen_words.insert(words.clone()),
+                    "{density:?}: words twice {words:?}"
+                );
+            }
+            // Drei Slots, je ein Glyph aus dem Register, epistemisch.
+            let slots = trust::slots(&axes);
+            for slot in &slots {
+                let entry = theme::REGISTER.iter().find(|e| e.symbol == slot.glyph);
+                assert_eq!(
+                    entry.map(|e| e.class),
+                    Some(theme::GlyphClass::Epistemic),
+                    "{}",
+                    slot.glyph
+                );
+            }
+            if density == Density::Glyphs {
+                assert_eq!(
+                    text.chars().filter(|c| !c.is_whitespace()).count(),
+                    3,
+                    "{text}"
+                );
+            }
+            if density == Density::Short {
+                // Feste Reihenfolge: Integrität · Coverage · Deutung.
+                let at = |w: &str| text.find(w).unwrap_or_else(|| panic!("{w} in {text}"));
+                assert!(at(&slots[0].word) < at(&slots[1].word), "{text}");
+                assert!(at(&slots[1].word) < at(&slots[2].word), "{text}");
+                assert_eq!(text.matches(" · ").count(), 2, "{text}");
+            }
+        }
+    }
+}
+
+/// Liste (Compact), Fußzeile (Short) und Graph-Kopf (Short) zeigen dieselbe
+/// Komponente — die SEAL-Spalte behält ihr Wort (Klasse 1: „Legacy bleibt
+/// Legacy").
+#[test]
+fn a4_list_footer_and_graph_head_show_the_trust_strip() {
+    for (w, h) in SIZES {
+        let (_dir, repo) = repo();
+        let mut app = App::new(filled(), &repo, None);
+        let out = render_sized(&mut app, w, h);
+        assert!(out.contains("◈ sealed ● ✓"), "{w}x{h}\n{out}");
+        assert!(out.contains("· legacy · ✓"), "{w}x{h}\n{out}");
+        let footer: String = out.lines().rev().take(2).collect::<Vec<_>>().join("\n");
+        assert!(footer.contains("◈ sealed"), "{w}x{h}\n{out}");
+        if w >= 120 {
+            assert!(
+                footer.contains("◈ sealed · ● complete · ✓ interpreted"),
+                "{w}x{h}\n{out}"
+            );
+        }
+        app.reduce(Action::Enter);
+        let out = render_sized(&mut app, w, h);
+        // Die Zeile unter `SESSION …` ist der Kopf: Ergebnis zuerst — der
+        // Vertrauenszustand vor Akteur und Umfang (die bei 80 Spalten als
+        // Erstes weichen).
+        let lines: Vec<&str> = out.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("SESSION b3-aaaaaaaa"))
+            .unwrap_or_else(|| panic!("{w}x{h}\n{out}"));
+        let head = lines[at + 1];
+        let start = head
+            .find("◈ sealed")
+            .unwrap_or_else(|| panic!("{w}x{h}\n{out}"));
+        if let Some(actor) = head.find("claude-code") {
+            assert!(start < actor, "{w}x{h}\n{head}");
+        }
+    }
+}
+
+/// Review „open" ist der Normalzustand: in Liste und Übersicht leise.
+#[test]
+fn a4_an_open_review_is_quiet_in_lists() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    // Breit genug für die VERDICT-Spalte.
+    let out = render_sized(&mut app, 300, 30);
+    assert!(out.contains("VERDICT"), "{out}");
+    assert!(out.contains("↻ needs work"), "{out}");
+    assert!(!out.contains("⚠ open"), "{out}");
+}
+
+/// Keine eigenen Seal-/Verdict-Strings in `view/` außerhalb von `trust.rs`
+/// und `theme.rs`.
+#[test]
+fn a4_no_own_trust_strings_outside_the_component() {
+    let sources = [
+        ("activity.rs", include_str!("../activity.rs")),
+        ("evidence.rs", include_str!("../evidence.rs")),
+        ("graph.rs", include_str!("../graph.rs")),
+        ("mod.rs", include_str!("../mod.rs")),
+        ("overview.rs", include_str!("../overview.rs")),
+        ("verify.rs", include_str!("../verify.rs")),
+        ("why.rs", include_str!("../why.rs")),
+        ("intent.rs", include_str!("../intent.rs")),
+        ("changes.rs", include_str!("../changes.rs")),
+    ];
+    let forbidden = [
+        "TAMPERED",
+        "tampered\"",
+        "VERIFIED",
+        "hash-valid",
+        "\"◈",
+        "◈ sealed",
+        "legacy\"",
+        "incomplete\"",
+        "uninterpreted\"",
+        "interpreted\"",
+    ];
+    for (file, source) in sources {
+        // Nur Code, keine Kommentare.
+        for (n, line) in source.lines().enumerate() {
+            let code = line.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            for word in forbidden {
+                assert!(
+                    !code.contains(word),
+                    "view/{file}:{}: {word:?} belongs in trust.rs\n{line}",
+                    n + 1
+                );
+            }
+        }
+    }
+}

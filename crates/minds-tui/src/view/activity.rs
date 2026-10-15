@@ -29,6 +29,8 @@ const TIME_W: u16 = 13;
 const AGENT_W: u16 = 22;
 const AGENT_COMPACT_W: u16 = 12;
 const SIZE_W: u16 = 20;
+/// Die SEAL-Spalte: Trust Strip (Compact, bis `✗ TAMPERED ? ◐`) und der
+/// Kanten-Beleg daneben — zusammen höchstens 18 Zeichen.
 const SEAL_W: u16 = 18;
 const VERDICT_W: u16 = 14;
 /// Rahmen links und rechts.
@@ -256,19 +258,24 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize) -> Row
         // Seal-Verdikt als WORT, der beste Kanten-Beleg als Glyph daneben
         // (das Wort erklärt die Fußzeile für die fokussierte Karte), das
         // Review-Verdict als eigene Spalte.
-        let (s_glyph, s_word, s_style) = theme::provenance(&card.provenance);
+        // Der Trust Strip in der Listen-Dichte (A4): Integrität als Wort —
+        // Legacy bleibt Legacy, nie ein bloßes Zeichen —, Coverage und
+        // Deutung als Glyph.
         let (ev_glyph, _, ev_style) = theme::evidence(card.evidence);
-        cells.push(Cell::from(Line::from(vec![
-            Span::styled(format!("{s_glyph} {s_word}"), s_style),
-            Span::raw("  "),
-            Span::styled(ev_glyph, ev_style),
-        ])));
+        let mut spans =
+            crate::view::trust::spans(&card.axes(), crate::view::trust::Density::Compact);
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(ev_glyph, ev_style));
+        cells.push(Cell::from(Line::from(spans)));
         if columns.show_verdict() {
-            let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
-            cells.push(Cell::from(Span::styled(
-                format!("{v_glyph} {v_word}"),
-                v_style,
-            )));
+            // „open" ist der Normalzustand — leise; nur Abweichungen zeigen.
+            let cell = if card.review.verdict == minds_reader::model::Verdict::Open {
+                Cell::from("")
+            } else {
+                let (v_glyph, v_word, v_style) = theme::verdict(card.review.verdict);
+                Cell::from(Span::styled(format!("{v_glyph} {v_word}"), v_style))
+            };
+            cells.push(cell);
         }
     }
     Row::new(cells)

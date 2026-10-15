@@ -27,6 +27,7 @@ pub mod graph;
 pub mod help;
 mod intent;
 mod overview;
+pub mod trust;
 pub mod verify;
 pub mod why;
 
@@ -300,7 +301,11 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     if app.tab == Tab::Overview {
         let status = Line::from(Span::styled(
-            "Each commit with what Minds knows: ◉CC = agent session, initials = author · @branch #tag · ◈ sealed (as recorded) · ⚑ intent · ◉ sessions",
+            format!(
+                "Each commit with what Minds knows: ◉CC = agent session, initials = author · @branch #tag · {} {} (as recorded) · ⚑ intent · ◉ sessions",
+                theme::seal(minds_reader::overview::SealMark::Sealed).0,
+                theme::seal(minds_reader::overview::SealMark::Sealed).1
+            ),
             theme::dim(),
         ));
         let focused = app
@@ -414,18 +419,29 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         // einer manipulierten Session springt er sichtbar auf ✗ TAMPERED.
         // Glyph UND Wort, nie nur Farbe (Farbschwäche-Regel aus `theme`).
         let focused = match app.top() {
-            None => app.selected().map(|card| card.provenance),
+            None => app.selected().map(|card| card.axes()),
             Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => {
-                app.inspection.card(*id).map(|card| card.provenance)
+                app.inspection.card(*id).map(|card| card.axes())
             }
             Some(View::Why { .. }) => None,
         };
-        if let Some(provenance) = focused {
-            let (glyph, word, style) = theme::provenance(&provenance);
+        if let Some(axes) = focused {
+            // Der Trust Strip (A4): die Integrität als invertierter Block,
+            // dahinter Coverage und Deutung — ab 120 Spalten mit Wort
+            // (Short), darunter als Glyph (Compact). Nie verschmolzen.
+            let [integrity, _, _] = trust::slots(&axes);
             spans.push(Span::styled(
-                format!(" {glyph} {word} "),
-                style.add_modifier(ratatui::style::Modifier::REVERSED),
+                format!(" {} {}", integrity.glyph, integrity.word),
+                integrity
+                    .style
+                    .add_modifier(ratatui::style::Modifier::REVERSED),
             ));
+            let density = if area.width >= 120 {
+                trust::Density::Short
+            } else {
+                trust::Density::Compact
+            };
+            spans.extend(trust::spans(&axes, density).into_iter().skip(1));
             spans.push(Span::raw("  "));
         }
         // Die Frische vor den Tasten: Auf einem schmalen Terminal werden die

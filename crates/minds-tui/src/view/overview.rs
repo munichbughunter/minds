@@ -126,13 +126,17 @@ fn pills(
             nerd,
         );
     }
-    let (glyph, word, style) = theme::verdict(row.review);
-    pill(
-        spans,
-        format!("{glyph} {word}"),
-        style.fg.unwrap_or(Color::Gray),
-        nerd,
-    );
+    // Review „open" ist der Normalzustand — keine Pille; nur Abweichungen
+    // (approved, needs work, rejected) sind laut (A4).
+    if row.review != Verdict::Open {
+        let (glyph, word, style) = theme::verdict(row.review);
+        pill(
+            spans,
+            format!("{glyph} {word}"),
+            style.fg.unwrap_or(Color::Gray),
+            nerd,
+        );
+    }
     if row.intent {
         pill(spans, "⚑ intent".into(), theme::HUMAN, nerd);
     }
