@@ -19,6 +19,15 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Overview header and footer.** The header names the branch by its short
+  name (`main`, not `refs/heads/main`). Footer line 1 names the selected
+  commit and the filter state (`b89bba7 · showing agent sessions only`) — no
+  explanatory sentence; footer line 2 lists the six most common actions
+  (`↑↓ commit · Enter how it was made · a agent only/all · Space requirement`
+  when there is text to show `· w why · v verify · d diff`), with `? help  q
+  quit` fixed on the right. `docs/commands.md` describes the new overview
+  (numbers, rows, the `a` filter, the detail, the words "requirement" and
+  "session record").
 - **Overview detail: requirement, sessions, evidence.** The detail answers
   what was asked and how far it is backed — without key hints (keys live in
   the footer). Head: short id and subject, then quietly the branches that

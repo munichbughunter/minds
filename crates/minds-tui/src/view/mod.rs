@@ -220,6 +220,15 @@ fn preview(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Der Branch im Kopf als Kurzname (C3.5): `main`, nicht `refs/heads/main`
+/// — der Reader liefert den vollen Ref-Namen, Kürzen ist Darstellung.
+pub(crate) fn branch_label(branch: Option<&str>) -> String {
+    match branch {
+        Some(name) => name.strip_prefix("refs/heads/").unwrap_or(name).to_string(),
+        None => "(detached)".into(),
+    }
+}
+
 fn header(frame: &mut Frame, app: &App, area: Rect) {
     let h = app.inspection.header();
     // Die Tabs zuerst gerechnet: Sie fallen nie weg — unter 100 Spalten mit
@@ -241,11 +250,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
         tabs.push(Span::raw(" "));
     }
     let tabs_w: usize = tabs.iter().map(|s| s.content.chars().count()).sum();
-    let place = format!(
-        "{} · {}",
-        h.repo,
-        h.branch.clone().unwrap_or_else(|| "(detached)".into())
-    );
+    let place = format!("{} · {}", h.repo, branch_label(h.branch.as_deref()));
     let room = (area.width as usize).saturating_sub(tabs_w + "MINDS ".len() + 3);
     let mut title = vec![
         Span::styled("MINDS ", theme::title().fg(theme::AGENT)),
@@ -337,14 +342,10 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         return;
     }
     if app.tab == Tab::Overview {
-        // Zeile 1: der Satz zum Seal-Zustand des gewählten Commits (C1);
-        // die Legende der Pillen steht in der Hilfe.
-        let word = match app.overview.as_ref().and_then(|o| o.selected()) {
-            Some(crate::overview::Selected::Commit(row)) => crate::copy::seal(row.seal),
-            Some(crate::overview::Selected::Wip(_)) => "observed",
-            None => crate::copy::seal(None),
-        };
-        let status = explain(word);
+        // Zeile 1 (C3.5): die Kurz-Id (aus `context`) und der Filterzustand —
+        // kein Erklärsatz; „sealed is not verified" steht im Detail und in
+        // der Hilfe.
+        let status = Line::from(Span::styled(overview_state(app), theme::dim()));
         let mut keys = vec![
             freshness(app),
             Span::raw("  "),
@@ -560,16 +561,22 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
                 .as_ref()
                 .is_some_and(|o| o.focus == crate::overview::OverviewFocus::Sessions)
             {
-                vec!["↑↓ session", "Enter its graph", "e evidence", "Esc back"]
+                let mut keys = vec!["↑↓ session", "Enter its graph"];
+                if requirement_text(app) {
+                    keys.push("Space requirement");
+                }
+                keys.extend(["e evidence", "Esc back"]);
+                keys
             } else {
-                vec![
-                    "↑↓ commit",
-                    "Enter how it was made",
-                    "w why",
-                    "v verify",
-                    "d diff",
-                    "/ filter",
-                ]
+                // Die sechs häufigsten (C2, C3.5) — `/ filter` und, mit
+                // Space, `d diff` stehen in der Hilfe.
+                let mut keys = vec!["↑↓ commit", "Enter how it was made", "a agent only/all"];
+                if requirement_text(app) {
+                    keys.push("Space requirement");
+                }
+                keys.extend(["w why", "v verify", "d diff"]);
+                keys.truncate(6);
+                keys
             }
         }
         Tab::Sessions => match app.top() {
@@ -677,6 +684,43 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
         ));
     }
     spans
+}
+
+/// Ob Space im Detail der Übersicht etwas aufklappt: ein belegter Anker
+/// mit Text (C3.4).
+fn requirement_text(app: &App) -> bool {
+    let Some(state) = app.overview.as_ref() else {
+        return false;
+    };
+    state.agent_commit().is_some_and(|row| {
+        row.anchors.iter().any(|a| {
+            matches!(
+                state.requirements.get(a),
+                Some(Ok(d)) if d.proof.is_ok() && d.snapshot.is_some()
+            )
+        })
+    })
+}
+
+/// Der Filterzustand der Übersicht für Zeile 1 der Fußzeile (C3.5).
+fn overview_state(app: &App) -> String {
+    let Some(state) = app.overview.as_ref() else {
+        return String::new();
+    };
+    let mut text = match state.selected() {
+        Some(crate::overview::Selected::Wip(_)) => "session without a commit · ".to_string(),
+        Some(crate::overview::Selected::Commit(_)) => "· ".to_string(),
+        None => String::new(),
+    };
+    text.push_str(if state.agent_only {
+        "showing agent sessions only"
+    } else {
+        "all commits"
+    });
+    if !state.filter.is_empty() {
+        text.push_str(&format!(" · filter: {}", state.filter));
+    }
+    text
 }
 
 /// Zeile 1: Kontext vor dem Satz.

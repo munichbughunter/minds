@@ -31,7 +31,7 @@ q / Ctrl-C         quit";
 fn section(tab: Tab) -> &'static str {
     match tab {
         Tab::Overview => {
-            "Overview: ↑↓ commit · Enter its session(s) / graph · a agent sessions only/all · w why chain · Esc back (sessions)\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ requirement · ◉N sessions · ┆ hidden commits"
+            "Overview: ↑↓ commit · Enter its session(s) / graph · a agent sessions only/all · Space requirement text · w why chain · / filter · Esc back\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ requirement · ◉N sessions · ┆ hidden commits"
         }
         Tab::Sessions => {
             "Sessions: ↑↓ session · Enter graph · w why · e evidence · t timeline · / search"

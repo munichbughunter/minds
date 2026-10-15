@@ -841,3 +841,77 @@ fn c34_the_open_glyph_is_registered_as_open() {
     assert_eq!((glyph, word), ("◦", "open"));
     assert_ne!(style.fg, crate::theme::tampered().2.fg, "open is never red");
 }
+
+// ---------------------------------------------------------------------
+// C3.5 · Kopf und Fußzeile der Overview
+// ---------------------------------------------------------------------
+
+/// Kopf, Zeile 1: der Branch-Kurzname — `main`, nicht `refs/heads/main`.
+#[test]
+fn c35_the_header_names_the_short_branch() {
+    use crate::view::branch_label;
+    assert_eq!(branch_label(Some("refs/heads/main")), "main");
+    assert_eq!(
+        branch_label(Some("refs/heads/feat/stable-sort")),
+        "feat/stable-sort"
+    );
+    assert_eq!(branch_label(Some("main")), "main");
+    assert_eq!(branch_label(None), "(detached)");
+}
+
+/// Fußzeile, Zeile 1: Kurz-Id des gewählten Commits + Filterzustand — kein
+/// Erklärsatz, keine Backticks. Zeile 2: die Aktionen, `? help  q quit`
+/// rechts fest — in 80, 120 und 160 Spalten.
+#[test]
+fn c35_the_footer_says_where_you_are_and_what_you_can_do() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent_commit(&repo, inspection, commits[1]);
+    let short = &commits[1].to_string()[..7];
+    for (w, h) in [(80u16, 24u16), (120, 30), (160, 40)] {
+        let lines = lines_at(&mut app, w, h);
+        let context = &lines[usize::from(h) - 2];
+        let keys = &lines[usize::from(h) - 1];
+        let out = lines.join("\n");
+        assert!(
+            context.contains(&format!("{short} · all commits")),
+            "{w}: {out}"
+        );
+        assert!(!context.contains('`'), "{w}: {out}");
+        assert!(!context.contains("Unsealed:"), "{w}: {out}");
+        assert!(keys.trim_end().ends_with("? help  q quit"), "{w}: {out}");
+        assert!(keys.contains("↑↓ commit"), "{w}: {out}");
+        // Priorisiert gekürzt: bei 160 alle sechs, darunter von hinten.
+        let all = [
+            "Enter how it was made",
+            "a agent only/all",
+            "w why",
+            "v verify",
+            "d diff",
+        ];
+        let want = if w >= 160 { &all[..] } else { &all[..1] };
+        for key in want {
+            assert!(keys.contains(key), "{w}: {key}: {out}");
+        }
+        // Space nur, wenn es etwas aufzuklappen gibt.
+        assert!(!keys.contains("Space requirement"), "{w}: {out}");
+    }
+    app.reduce(Action::AgentFilter);
+    let lines = lines_at(&mut app, 160, 40);
+    assert!(
+        lines[38].contains(&format!("{short} · showing agent sessions only")),
+        "{}",
+        lines.join("\n")
+    );
+    // Belegter Anker: Space steht in den Aktionen.
+    let source = Detailed {
+        detail: Some(anchor_detail(true)),
+        verdict: None,
+    };
+    while app.fill_overview(&source) {}
+    let lines = lines_at(&mut app, 160, 40);
+    assert!(
+        lines[39].contains("Space requirement"),
+        "{}",
+        lines.join("\n")
+    );
+}
