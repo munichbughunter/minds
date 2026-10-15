@@ -232,7 +232,7 @@ fn header(frame: &mut Frame, app: &App, area: Rect) {
     // ist, und weicht als Erstes (C3 zieht sie in die Übersicht).
     let crumb = app.breadcrumb().join(" › ");
     let mut stats = format!(
-        "{} Sessions · {} Changes · {:.0} % context coverage",
+        "{} Sessions · {} Changes · {:.0} % of commits with a session",
         h.sessions,
         h.changes,
         h.coverage.ratio() * 100.0
@@ -793,6 +793,15 @@ pub fn when(ts: Option<&str>) -> String {
             _ => ts.to_string(),
         },
         None => "—".into(),
+    }
+}
+
+/// Tokens kurz (C5): `999 tok`, `5.7k tok`, `1.2M tok`.
+pub fn tokens(n: u64) -> String {
+    match n {
+        n if n < 1_000 => format!("{n} tok"),
+        n if n < 1_000_000 => format!("{:.1}k tok", n as f64 / 1_000.0),
+        n => format!("{:.1}M tok", n as f64 / 1_000_000.0),
     }
 }
 

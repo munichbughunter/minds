@@ -308,7 +308,9 @@ fn the_list_shows_newest_first_with_evidence_verdict_and_a_degraded_row() {
     // Listen zeigen relative Zeit (C4) — das alte deutsche Datumsformat nicht.
     assert!(out.contains(" ago"), "{out}");
     assert!(!out.contains("25.07. 14:10Z"), "{out}");
-    assert!(out.contains("context coverage"), "{out}");
+    // Der Anteil der Commits mit Session — nicht die Coverage-Achse (C5).
+    assert!(out.contains("of commits with a session"), "{out}");
+    assert!(!out.contains("context coverage"), "{out}");
 }
 
 #[test]
@@ -3337,6 +3339,7 @@ mod verify_tab {
     }
 
     mod b4;
+    mod c5;
 }
 
 mod intent_tab {

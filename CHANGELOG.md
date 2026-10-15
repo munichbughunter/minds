@@ -27,6 +27,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   recorded by the agent, never styled like evidence. Empty sections are not
   shown. The reader keeps the lines of request, constraints and discarded
   approaches apart (each line sanitized) instead of escaping the line breaks.
+- **Terms that no longer collide.** The share of commits that carry a
+  session reads `62 % of commits with a session` (it was "context coverage",
+  easily mistaken for the coverage axis); the session size reads `3 files ·
+  5.7k tok` instead of `3 D · 1200/4500 T`; Verify's `NOT CHECKED` says
+  `or press v`, and `v` in Verify starts the check again right away.
 - **Times read the same everywhere.** Lists show relative times (`just
   now`, `5m ago`, `3h ago`, `2d ago`); details and the timeline show
   `2026-10-14 09:00 UTC` instead of the German-style `14.10. 09:00Z`.

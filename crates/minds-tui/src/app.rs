@@ -1445,6 +1445,13 @@ impl<'a> App<'a> {
     fn verb(&mut self, action: Action) {
         let (session, commit) = self.focus_object();
         match action {
+            // Im Verify-Tab selbst: dieselbe Prüfung jetzt noch einmal (C5).
+            Action::Verify if self.tab == Tab::Verify && self.verify.is_some() => {
+                if let Some(state) = self.verify.as_mut() {
+                    state.pending = true;
+                    state.urgent = true;
+                }
+            }
             Action::Verify => match commit {
                 Some(commit) => self.open_verify(Some(commit)),
                 None => self.closed = Some("v: no commit here to verify".into()),

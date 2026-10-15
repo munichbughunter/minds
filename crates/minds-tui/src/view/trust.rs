@@ -292,7 +292,7 @@ pub fn verify_headline(overall: Overall) -> (String, Style) {
         }
         Overall::Checking => ("… CHECKING".to_string(), theme::dim()),
         Overall::NotChecked => (
-            "? NOT CHECKED — run minds verify".to_string(),
+            "? NOT CHECKED — run minds verify, or press v".to_string(),
             Style::default().fg(theme::REVIEW),
         ),
         Overall::NoSession => ("· NO SESSION".to_string(), theme::dim()),

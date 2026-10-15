@@ -344,7 +344,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // Die globale Statistik gehört hierher, zum Einstieg (C3).
     let h = app.inspection.header();
     title.push_str(&format!(
-        " · {} Sessions · {} Changes · {:.0} % context coverage",
+        " · {} Sessions · {} Changes · {:.0} % of commits with a session",
         h.sessions,
         h.changes,
         h.coverage.ratio() * 100.0

@@ -245,9 +245,20 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize, now: i
     ];
     if columns.show_size() {
         cells.push(Cell::from(Span::styled(
+            // Der Umfang in Wörtern (C5): „3 files · 5.7k tok", nicht „D/T".
             format!(
-                "{} D · {}/{} T",
-                card.summary.files, card.summary.input_tokens, card.summary.output_tokens
+                "{} {} · {}",
+                card.summary.files,
+                if card.summary.files == 1 {
+                    "file"
+                } else {
+                    "files"
+                },
+                crate::view::tokens(
+                    card.summary
+                        .input_tokens
+                        .saturating_add(card.summary.output_tokens)
+                )
             ),
             base,
         )));

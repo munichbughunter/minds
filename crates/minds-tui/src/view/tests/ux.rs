@@ -914,3 +914,26 @@ fn c4_the_list_shows_relative_times() {
     let out = render_sized(&mut app, 160, 40);
     assert!(out.contains("2026-07-25 14:10 UTC"), "{out}");
 }
+
+// ---------------------------------------------------------------------
+// C5 · Begriffe, die kollidieren
+// ---------------------------------------------------------------------
+
+#[test]
+fn c5_terms_no_longer_collide() {
+    use super::super::tokens;
+    assert_eq!(tokens(999), "999 tok");
+    assert_eq!(tokens(5_700), "5.7k tok");
+    assert_eq!(tokens(1_234_567), "1.2M tok");
+    let (_dir, repo) = repo();
+    let mut app = App::new(filled(), &repo, None);
+    let out = render_sized(&mut app, 300, 30);
+    // Der Anteil der Commits mit Session ist nicht die Coverage-Achse.
+    assert!(out.contains("% of commits with a session"), "{out}");
+    assert!(!out.contains("context coverage"), "{out}");
+    assert!(out.contains("1 file · 0 tok"), "{out}");
+    assert!(!out.contains(" D · "), "{out}");
+    let (text, _) = super::super::trust::verify_headline(crate::verify::Overall::NotChecked);
+    assert!(text.contains("NOT CHECKED — run minds verify"), "{text}");
+    assert!(text.contains("press v"), "{text}");
+}
