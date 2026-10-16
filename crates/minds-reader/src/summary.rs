@@ -17,6 +17,8 @@
 
 use minds_core::{Session, SessionId};
 
+use crate::text::sanitize;
+
 /// Wie lang eine Überschrift höchstens wird, bevor gekürzt wird.
 pub const HEADLINE_MAX: usize = 90;
 
@@ -54,6 +56,57 @@ impl Summary {
             input_tokens: session.usage.input_tokens,
             output_tokens: session.usage.output_tokens,
         }
+    }
+}
+
+/// Der Platzhalter, den `minds-capture` schreibt, wenn ein Wert nicht
+/// gelesen wurde (`adapter.rs::unknown()`, `transcript.rs::provider_of`).
+/// Er ist kein Wert: Die Oberfläche druckt ihn nie, sie lässt das Feld weg
+/// oder sagt „not recorded" (C3.6). Die Prüfung liegt hier, nicht in einer
+/// View — eine Stelle, nicht ein String-Vergleich je Widget.
+pub const PLACEHOLDER: &str = "unknown";
+
+/// Ein erfasster Wert — `None` für den Platzhalter und für Leerraum.
+pub fn recorded(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value != PLACEHOLDER).then_some(value)
+}
+
+/// Wer eine Session gefahren hat, für die Anzeige (C3.6): Agent, Version,
+/// Modell und Anbieter — jedes Feld nur, wenn es erfasst wurde. Entschärft.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Actor {
+    /// Der Agent (`claude-code`, `codex`).
+    pub agent: Option<String>,
+    /// Seine Version.
+    pub version: Option<String>,
+    /// Die Modell-Id (`claude-opus-4-1`).
+    pub model: Option<String>,
+    /// Der Anbieter in seiner Schreibweise (`Anthropic`), nur wenn bekannt.
+    pub provider: Option<String>,
+}
+
+impl Actor {
+    /// Liest Agent und Modell einer Session; Platzhalter werden `None`.
+    pub fn of(session: &Session) -> Self {
+        let field = |value: &str| recorded(value).map(sanitize);
+        Self {
+            agent: field(&session.agent.name),
+            version: field(&session.agent.version),
+            model: field(&session.model.id),
+            provider: recorded(&session.model.provider).map(provider_name),
+        }
+    }
+}
+
+/// Die Schreibweise eines Anbieters, den `minds-capture` rät; Unbekanntes
+/// bleibt, wie es ist (entschärft).
+fn provider_name(provider: &str) -> String {
+    match provider.to_ascii_lowercase().as_str() {
+        "anthropic" => "Anthropic".into(),
+        "openai" => "OpenAI".into(),
+        "google" => "Google".into(),
+        _ => sanitize(provider),
     }
 }
 
@@ -96,6 +149,67 @@ mod tests {
 
     fn sid() -> SessionId {
         format!("b3-{}", "a".repeat(64)).parse().unwrap()
+    }
+
+    fn session_of(agent: &str, version: &str, provider: &str, model: &str) -> Session {
+        Session::new(
+            Agent {
+                name: agent.into(),
+                version: version.into(),
+            },
+            Model {
+                provider: provider.into(),
+                id: model.into(),
+            },
+            Intent::default(),
+        )
+    }
+
+    /// C3.6: `unknown` ist der Platzhalter von `minds-capture`, kein Wert —
+    /// der Reader meldet ihn als „nicht erfasst", die Oberfläche druckt ihn nie.
+    #[test]
+    fn the_capture_placeholder_is_not_a_recorded_value() {
+        assert_eq!(recorded("unknown"), None);
+        assert_eq!(recorded("  "), None);
+        assert_eq!(recorded(""), None);
+        assert_eq!(recorded("claude-opus-4-1"), Some("claude-opus-4-1"));
+        assert_eq!(recorded(" opus "), Some("opus"));
+    }
+
+    /// C3.6: Agent und Modell für die Anzeige — der Anbieter nur, wenn er
+    /// bekannt ist, mit Schreibweise; Platzhalter werden zu `None`, nie zu
+    /// einem Wort, das wie ein Modellname aussieht.
+    #[test]
+    fn the_actor_names_the_provider_only_when_known() {
+        let known = Actor::of(&session_of(
+            "claude-code",
+            "2.0",
+            "anthropic",
+            "claude-opus-4-1",
+        ));
+        assert_eq!(known.agent.as_deref(), Some("claude-code"));
+        assert_eq!(known.version.as_deref(), Some("2.0"));
+        assert_eq!(known.model.as_deref(), Some("claude-opus-4-1"));
+        assert_eq!(known.provider.as_deref(), Some("Anthropic"));
+
+        let bare = Actor::of(&session_of("claude-code", "unknown", "unknown", "unknown"));
+        assert_eq!(bare.agent.as_deref(), Some("claude-code"));
+        assert_eq!(bare.version, None);
+        assert_eq!(bare.model, None);
+        assert_eq!(bare.provider, None);
+
+        let other = Actor::of(&session_of("codex", "1", "acme", "acme-1"));
+        assert_eq!(other.provider.as_deref(), Some("acme"));
+        assert_eq!(
+            Actor::of(&session_of("x", "1", "openai", "gpt-5"))
+                .provider
+                .as_deref(),
+            Some("OpenAI")
+        );
+        // Entschärft wie alles im Sichtmodell.
+        let hostile = Actor::of(&session_of("a\u{1b}[31mb", "1", "anthropic", "m\nn"));
+        assert!(!hostile.agent.unwrap().contains('\u{1b}'));
+        assert!(!hostile.model.unwrap().contains('\n'));
     }
 
     #[test]

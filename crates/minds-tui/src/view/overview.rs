@@ -1144,7 +1144,7 @@ pub(crate) fn coverage_lines(
                 )],
             )];
         }
-        Some(Ok(c)) => *c,
+        Some(Ok(c)) => c,
     };
     if c.all_explained() {
         return vec![axis(

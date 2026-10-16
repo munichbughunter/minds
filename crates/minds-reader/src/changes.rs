@@ -107,8 +107,23 @@ pub struct ChangeSet {
     pub files: Vec<FileDiff>,
 }
 
+/// Ein Grund, warum hinzugefügte Zeilen unerklärt sind, mit ihrer Zahl
+/// (C3.6). Der Grund ist das Wort von [`Gap::word`] — dasselbe, das der
+/// Changes-Tab je Zeile und `minds verify` je Commit nennen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasonCount {
+    /// Der Grund; [`NO_REASON`], wo der Abgleich keinen nennt.
+    pub reason: &'static str,
+    /// So viele unerklärte Zeilen tragen ihn.
+    pub lines: usize,
+}
+
+/// Der Grund einer unerklärten Zeile, deren Datei der Abgleich keinen
+/// gibt — gezählt, nie verschwiegen.
+pub const NO_REASON: &str = "no reason recorded by the reconciliation";
+
 /// Die hinzugefügten Zeilen eines Commits nach Klasse.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LineClasses {
     /// Alle hinzugefügten Zeilen.
     pub added: usize,
@@ -124,6 +139,13 @@ pub struct LineClasses {
     pub not_assessed: usize,
     /// Dateien ohne Diff (binär, zu groß, …).
     pub skipped_files: usize,
+    /// Alle Dateien, die der Commit ändert — mit und ohne Diff (C3.6: die
+    /// Oberfläche stellt sie den Dateiclaims der Session gegenüber).
+    pub files: usize,
+    /// Warum die unerklärten Zeilen unerklärt sind (C3.6): je Grund die
+    /// Zahl der Zeilen, häufigster zuerst; die Summe ist `unexplained`.
+    /// Leer, wenn nichts unerklärt ist.
+    pub reasons: Vec<ReasonCount>,
 }
 
 impl LineClasses {
@@ -147,6 +169,8 @@ impl ChangeSet {
         let mut c = LineClasses {
             added: self.added(),
             unexplained: self.unexplained(),
+            files: self.files.len(),
+            reasons: self.unexplained_reasons(),
             ..LineClasses::default()
         };
         for file in &self.files {
@@ -165,6 +189,29 @@ impl ChangeSet {
         let classified = c.explained + c.fs_only + c.stated + c.unexplained;
         c.not_assessed = c.added.saturating_sub(classified);
         c
+    }
+
+    /// Warum die unerklärten Zeilen unerklärt sind (C3.6): je unerklärter
+    /// Zeile der Grund ihrer Datei ([`FileDiff::gap`]), nach Wort gruppiert,
+    /// häufigster zuerst (bei Gleichstand alphabetisch). Dieselben Zeilen
+    /// wie [`ChangeSet::unexplained`] — eine Quelle für Overview- und
+    /// Changes-Tab.
+    pub fn unexplained_reasons(&self) -> Vec<ReasonCount> {
+        let mut by_word: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for file in &self.files {
+            let lines = file.unexplained();
+            if lines == 0 {
+                continue;
+            }
+            let word = file.gap.map(Gap::word).unwrap_or(NO_REASON);
+            *by_word.entry(word).or_default() += lines;
+        }
+        let mut reasons: Vec<ReasonCount> = by_word
+            .into_iter()
+            .map(|(reason, lines)| ReasonCount { reason, lines })
+            .collect();
+        reasons.sort_by(|a, b| b.lines.cmp(&a.lines).then_with(|| a.reason.cmp(b.reason)));
+        reasons
     }
 
     /// Wie viele Zeilen der Commit hinzufügt.
@@ -472,6 +519,65 @@ mod tests {
         assert_eq!(set.unexplained(), per_file);
         assert_eq!(set.unexplained(), 3);
         assert_eq!(set.added(), 5);
+    }
+
+    /// C3.6: Die Gründe je Commit kommen aus denselben Zeilen wie `◦n`:
+    /// je unerklärter Zeile der Grund ihrer Datei, gruppiert nach Wort,
+    /// häufigster zuerst — die Summe ist die Zahl der unerklärten Zeilen.
+    /// Dateien ohne Grund zählen als „kein Grund", nie stillschweigend.
+    #[test]
+    fn unexplained_reasons_group_by_word_and_sum_to_the_count() {
+        let mut untouched = file(
+            3,
+            vec![
+                row(Some(ReconClass::Unexplained)),
+                row(Some(ReconClass::Unexplained)),
+                row(Some(ReconClass::Explained)),
+            ],
+        );
+        untouched.gap = Some(Gap::Untouched { complete: true });
+        let mut unhashed = file(1, vec![row(Some(ReconClass::Unexplained))]);
+        unhashed.gap = Some(Gap::Unhashed);
+        let mut also_untouched = file(1, vec![row(Some(ReconClass::Unexplained))]);
+        also_untouched.gap = Some(Gap::Untouched { complete: true });
+        let silent = file(1, vec![row(Some(ReconClass::Unexplained))]);
+        let set = ChangeSet {
+            commit: format!("{:040x}", 1).parse().unwrap(),
+            subject: None,
+            change: None,
+            review: ReviewState::default(),
+            unassessed: None,
+            files: vec![untouched, unhashed, also_untouched, silent],
+        };
+        let c = set.line_classes();
+        assert_eq!(c.files, 4, "every file of the commit, diffed or not");
+        assert_eq!(
+            c.reasons,
+            vec![
+                ReasonCount {
+                    reason: Gap::Untouched { complete: true }.word(),
+                    lines: 3,
+                },
+                // Gleichstand: alphabetisch — „a tool claim …" vor „no reason …".
+                ReasonCount {
+                    reason: Gap::Unhashed.word(),
+                    lines: 1,
+                },
+                ReasonCount {
+                    reason: NO_REASON,
+                    lines: 1,
+                },
+            ]
+        );
+        let sum: usize = c.reasons.iter().map(|r| r.lines).sum();
+        assert_eq!(sum, c.unexplained);
+        assert_eq!(sum, set.unexplained());
+        // Ohne unerklärte Zeilen keine Gründe — „leer ist leer".
+        let clean = ChangeSet {
+            files: vec![file(1, vec![row(Some(ReconClass::Explained))])],
+            ..set
+        };
+        assert!(clean.line_classes().reasons.is_empty());
     }
 
     /// Review C3.4: Nur beobachtete Zeilen sind „erklärt" — ausgesagte

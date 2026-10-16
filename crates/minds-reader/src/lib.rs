@@ -29,7 +29,7 @@ mod file;
 pub use file::{FileView, Line};
 
 pub mod summary;
-pub use summary::Summary;
+pub use summary::{Actor, Summary, recorded};
 
 pub mod brief;
 
