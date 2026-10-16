@@ -93,6 +93,12 @@ pub struct OverviewState {
     pub requirements: HashMap<ContentHash, Result<crate::IntentDetail, String>>,
     /// Ob der Anforderungstext aufgeklappt ist (Space).
     pub requirement_open: bool,
+    /// Ob der Prompt vollständig gezeigt wird (Space, C3.6) — zugeklappt
+    /// stehen höchstens `PROMPT_LINES` Zeilen je Session.
+    pub prompt_open: bool,
+    /// Ob der letzte Draw einen Prompt gekürzt hat — gesetzt beim Zeichnen
+    /// (dort ist die Höhe bekannt), gelesen von Space und der Fußzeile.
+    pub prompt_clipped: std::cell::Cell<bool>,
     /// Wie weit das Detail gescrollt ist (aufgeklappt, PgUp/PgDn).
     pub detail_scroll: u16,
     /// Ob die Übersicht schmal gezeichnet wird (unter 100 Spalten): dann
@@ -120,6 +126,8 @@ impl OverviewState {
             lines: HashMap::new(),
             requirements: HashMap::new(),
             requirement_open: false,
+            prompt_open: false,
+            prompt_clipped: std::cell::Cell::new(false),
             detail_scroll: 0,
             narrow: false,
         };
@@ -196,13 +204,27 @@ impl OverviewState {
         *self = next;
     }
 
-    /// Space (C3.4): klappt den Anforderungstext auf oder zu — nur, wenn
-    /// es ihn gibt; sonst bleibt PgUp/PgDn bei der Liste.
-    pub fn toggle_requirement(&mut self) {
-        if !self.has_requirement_text() {
+    /// Space: klappt das Detail auf oder zu — den Anforderungstext eines
+    /// belegten Ankers (C3.4) und einen gekürzten Prompt (C3.6). Gibt es
+    /// nichts aufzuklappen, tut Space nichts und PgUp/PgDn bleiben bei der
+    /// Liste.
+    pub fn toggle_detail(&mut self) {
+        // Ein gemeinsamer Zielzustand: Ist irgendetwas offen, schließt
+        // Space alles — auch wenn der Anker erst nach dem ersten Space
+        // eintraf; beide Flags laufen nie auseinander.
+        if self.requirement_open || self.prompt_open {
+            self.requirement_open = false;
+            self.prompt_open = false;
+            self.detail_scroll = 0;
             return;
         }
-        self.requirement_open = !self.requirement_open;
+        let requirement = self.has_requirement_text();
+        let prompt = self.agent_commit().is_some() && self.prompt_clipped.get();
+        if !requirement && !prompt {
+            return;
+        }
+        self.requirement_open = requirement;
+        self.prompt_open = prompt;
         self.detail_scroll = 0;
     }
 

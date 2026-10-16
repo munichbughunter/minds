@@ -609,7 +609,7 @@ impl<'a> App<'a> {
                         }
                     }
                 },
-                Action::Space => state.toggle_requirement(),
+                Action::Space => state.toggle_detail(),
                 Action::PageUp => state.detail_scroll = state.detail_scroll.saturating_sub(10),
                 Action::PageDown => state.detail_scroll = state.detail_scroll.saturating_add(10),
                 _ => {}
@@ -620,11 +620,11 @@ impl<'a> App<'a> {
         match action {
             // Space klappt den Anforderungstext auf (C3.4); aufgeklappt
             // blättern PgUp/PgDn im Detail.
-            Action::Space => state.toggle_requirement(),
-            Action::PageUp if state.requirement_open => {
+            Action::Space => state.toggle_detail(),
+            Action::PageUp if state.requirement_open || state.prompt_open => {
                 state.detail_scroll = state.detail_scroll.saturating_sub(10);
             }
-            Action::PageDown if state.requirement_open => {
+            Action::PageDown if state.requirement_open || state.prompt_open => {
                 state.detail_scroll = state.detail_scroll.saturating_add(10);
             }
             // Unter 100 Spalten ist das Detail eine eigene Ebene hinter
@@ -684,6 +684,8 @@ impl<'a> App<'a> {
         if state.cursor != at {
             state.session = 0;
             state.requirement_open = false;
+            state.prompt_open = false;
+            state.prompt_clipped.set(false);
             state.detail_scroll = 0;
         }
     }
