@@ -39,6 +39,12 @@ pub struct ChangesState {
     /// „Warum diese Zeile?" liegt als Ebene über dem Diff (C9.2: unter 120
     /// Spalten, per `Enter` auf der Zeile; `Esc` schließt sie).
     pub why_layer: bool,
+    /// Der Diff wurde durch einen Sprung aus einem anderen Tab erreicht
+    /// (`d`, Enter auf einem Artefakt), ohne dass die Dateiliste je im Fokus
+    /// war. Solange das gilt, geht `Esc` den genommenen Weg zurück — zum
+    /// Ursprung, nicht in die Dateiliste (Paket 2: `d, Esc` leert den
+    /// Verlauf; Paket 3: „Esc files" gilt nach FILES › Enter).
+    pub landed: bool,
 }
 
 impl ChangesState {
@@ -55,6 +61,7 @@ impl ChangesState {
             why: true,
             filter: String::new(),
             why_layer: false,
+            landed: false,
         };
         state.file = state.first_interesting_file();
         // C9.1: Der Tab landet im Diff, auf der ersten Codezeile — nie auf

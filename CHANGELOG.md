@@ -307,6 +307,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Changes: `Esc` goes back the way you came.** After `d` from the Overview
+  the diff is the first thing seen, so `Esc` ends the jump and returns there
+  (the footer says `Esc back`); after FILES › `Enter` it focuses the files
+  (`Esc files`) as before.
+
 - **One word per evidence state across tabs.** The four states read the
   same everywhere: `● observed` · `◍ fs only` · `◇ reported` · `◦ not
   observed`. They live in the glyph register (`◇` means reported — declared

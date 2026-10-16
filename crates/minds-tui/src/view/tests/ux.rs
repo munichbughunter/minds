@@ -749,11 +749,6 @@ fn b4_the_object_verbs_work_on_a_session() {
     app.reduce(Action::Diff);
     assert_eq!(app.tab, crate::app::Tab::Changes);
     assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
-    // Klasse 2 (Batch 2, Paket 3 / C9.1): Changes landet im Diff; das erste
-    // `Esc` führt in die Dateiliste, das zweite zurück (B2).
-    app.reduce(Action::Back);
-    assert_eq!(app.tab, crate::app::Tab::Changes);
-    assert_ne!(app.tab, crate::app::Tab::Sessions, "the first Esc stays");
     app.reduce(Action::Back);
     assert_eq!(app.tab, crate::app::Tab::Sessions);
     // Kein Intent-Anker: ein Hinweis, kein stiller Nicht-Effekt.

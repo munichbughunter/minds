@@ -1271,7 +1271,10 @@ impl<'a> App<'a> {
             (Focus::Diff, Action::Bracket(forward)) => state.jump_hunk(forward),
             // Esc (B1): erst die Ebene zu, dann in die Dateiliste.
             (Focus::Diff, Action::Back) if state.why_layer => state.why_layer = false,
-            (Focus::Diff, Action::Back) => state.focus = Focus::Files,
+            (Focus::Diff, Action::Back) => {
+                state.focus = Focus::Files;
+                state.landed = false;
+            }
             (Focus::Diff, Action::Enter) if why_as_layer => state.why_layer = !state.why_layer,
             (Focus::Diff, Action::Enter) => self.goto_tool_call(),
             _ => {}
@@ -1676,6 +1679,12 @@ impl<'a> App<'a> {
                     0
                 };
                 self.remember(entry);
+                // Landet der Sprung im Diff, führt Esc von dort zum Ursprung.
+                if self.tab == Tab::Changes
+                    && let Some(changes) = &mut self.changes
+                {
+                    changes.landed = changes.focus == Focus::Diff;
+                }
             }
             // Ein Tab-Wechsel per Taste (F1–F5, 1–5, Tab) auf einen Tab, der
             // im Verlauf als Ursprung liegt, beendet dessen Sprung: der Nutzer
@@ -1974,7 +1983,7 @@ impl<'a> App<'a> {
 
     /// Ob Esc jetzt zum Ursprung des letzten Sprungs führt: nichts davor zu
     /// schließen oder zu leeren, noch im Ziel des Sprungs, auf seiner Ebene.
-    fn at_jump_base(&self) -> bool {
+    pub(crate) fn at_jump_base(&self) -> bool {
         let Some(entry) = self.history.last() else {
             return false;
         };
@@ -1993,10 +2002,13 @@ impl<'a> App<'a> {
                 .overview
                 .as_ref()
                 .is_none_or(|s| s.focus == crate::overview::OverviewFocus::Graph),
+            // Die Dateiliste ist die oberste Ebene; ein Diff, der direkt durch
+            // den Sprung erreicht wurde, ebenso (`landed`) — eine offene
+            // Why-Ebene schließt Esc zuerst.
             Tab::Changes => self
                 .changes
                 .as_ref()
-                .is_none_or(|s| s.focus == Focus::Files),
+                .is_none_or(|s| s.focus == Focus::Files || (s.landed && !s.why_layer)),
             Tab::Verify | Tab::Intent => true,
         }
     }

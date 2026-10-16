@@ -567,10 +567,7 @@ fn changes_actions(app: &App) -> Vec<String> {
     let open = state.map_or(0, |s| s.not_observed());
     let next = (open > 0).then(|| format!("n next not-observed ({open})"));
     let (head, tail): (&[&str], &[&str]) = match state.map(|c| c.focus) {
-        Some(Focus::Diff) => (
-            &["↑↓ line", "] [ hunk"],
-            &["s split", "w why chain", "Esc files"],
-        ),
+        Some(Focus::Diff) => (&["↑↓ line", "] [ hunk"], &["s split", "w why chain"]),
         _ => (
             &["↑↓ file", "Enter diff", "[ ] commit"],
             &["c why column", "/ filter"],
@@ -579,11 +576,21 @@ fn changes_actions(app: &App) -> Vec<String> {
     // In der Dateizeile (unter 160 Spalten) wechselt `Tab` die Datei (C9.2).
     let tab_file = (app.width > 0 && app.width < crate::view::changes::FILES_PANE_MIN)
         .then(|| "Tab file".to_string());
+    // Esc geht den genommenen Weg zurück: nach einem Sprung in den Diff zum
+    // Ursprung (`Esc back`), sonst in die Dateiliste (`Esc files`).
+    let esc = matches!(state.map(|c| c.focus), Some(Focus::Diff)).then(|| {
+        if app.at_jump_base() {
+            "Esc back".to_string()
+        } else {
+            "Esc files".to_string()
+        }
+    });
     head.iter()
         .map(|k| k.to_string())
         .chain(tab_file)
         .chain(next)
         .chain(tail.iter().map(|k| k.to_string()))
+        .chain(esc)
         .collect()
 }
 
