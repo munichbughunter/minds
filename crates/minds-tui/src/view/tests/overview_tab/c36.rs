@@ -137,16 +137,28 @@ fn c36_the_prompt_is_its_own_section_not_a_footnote() {
             "{w}: {detail}"
         );
     }
-    let detail = detail_text(&mut app, 160, 40);
+    // Mit Platz die vollen 12 Zeilen; bei 160×40 so viele, wie EVIDENCE
+    // darunter lässt (hier 10, mindestens 3) — nie mehr als 12.
+    let detail = detail_text(&mut app, 160, 60);
     assert!(detail.contains("line 12 of the request"), "{detail}");
     assert!(!detail.contains("line 13 of the request"), "{detail}");
     assert!(detail.contains("… 8 more lines"), "{detail}");
+    let detail = detail_text(&mut app, 160, 40);
+    let shown = (1..=20)
+        .filter(|i| detail.contains(&format!("line {i:02} of the request")))
+        .count();
+    assert!((3..=12).contains(&shown), "{shown}: {detail}");
+    assert!(
+        detail.contains(&format!("… {} more lines", 20 - shown)),
+        "{detail}"
+    );
+    assert!(detail.contains("REVIEW"), "{detail}");
     app.reduce(Action::Space);
-    let open = detail_text(&mut app, 160, 40);
+    let open = detail_text(&mut app, 160, 60);
     assert!(open.contains("line 20 of the request"), "{open}");
     assert!(!open.contains("more lines"), "{open}");
     app.reduce(Action::Space);
-    assert!(detail_text(&mut app, 160, 40).contains("… 8 more lines"));
+    assert!(detail_text(&mut app, 160, 60).contains("… 8 more lines"));
 }
 
 /// AC1 bei 80 Spalten: Das Detail ist eine Ebene hinter Enter — und zeigt
@@ -189,29 +201,189 @@ fn c36_coverage_names_its_reason_and_the_missing_claims() {
     let sum: usize = classes.reasons.iter().map(|r| r.lines).sum();
     assert_eq!(sum, set.unexplained());
     assert_eq!(sum, 4);
-    // Der Widerspruch steht in SESSIONS, als Lücke, nicht als Befund.
-    let sessions = sessions_block(&detail);
-    assert!(
-        sessions.contains("0 files claimed · commit changes 2 files"),
-        "{detail}"
-    );
+    // Der Widerspruch steht in SESSIONS, als Lücke, nicht als Befund — auch
+    // bei 120 Spalten ganz, nie zerschnitten.
+    for (w, h) in [(120u16, 30u16), (160, 40)] {
+        let detail = detail_text(&mut app, w, h);
+        let sessions = sessions_block(&detail);
+        assert!(
+            sessions.contains("0 files claimed · commit changes 2 files"),
+            "{w}: {detail}"
+        );
+        assert!(
+            detail.contains("no tool claim or shell mention found"),
+            "{w}: {detail}"
+        );
+    }
     let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
     terminal
         .draw(|frame| super::super::super::draw(frame, &mut app))
         .unwrap();
     let buffer = terminal.backend().buffer();
-    let mut seen = false;
+    let mut seen = (false, false);
     for y in 0..40u16 {
         let row: String = (0..160u16).map(|x| buffer[(x, y)].symbol()).collect();
         if let Some(at) = row.find("files claimed") {
-            seen = true;
+            seen.0 = true;
             let x0 = u16::try_from(row[..at].chars().count()).unwrap();
             for x in x0..x0 + 13 {
                 assert_ne!(buffer[(x, y)].fg, theme::DELETE, "a gap is not red: {row}");
             }
         }
+        // Der Claim-Kopf des PROMPT ist nie OK-grün.
+        if let Some(at) = row.find("as recorded by the agent") {
+            seen.1 = true;
+            let x0 = u16::try_from(row[..at].chars().count()).unwrap();
+            for x in x0..x0 + 24 {
+                assert_ne!(buffer[(x, y)].fg, theme::OK, "a claim is not green: {row}");
+            }
+        }
     }
-    assert!(seen);
+    assert_eq!(seen, (true, true));
+}
+
+/// Review: Der zugeklappte Prompt drängt die Trust-Achsen nie aus dem
+/// Bild — bei 120×30 und 160×40 stehen alle fünf ohne Scrollen da; bei
+/// 80×24 (Detail hinter Enter) blättert PgDn bis REVIEW.
+#[test]
+fn c36_the_collapsed_prompt_never_hides_the_evidence_axes() {
+    const AXES: [&str; 5] = [
+        "INTEGRITY",
+        "COVERAGE",
+        "INTERPRETATION",
+        "REQUIREMENT",
+        "REVIEW",
+    ];
+    let (_dir, repo, inspection) = without_claims(&twenty_lines(), ("anthropic", "opus"));
+    let mut app = on_head(&repo, inspection);
+    for (w, h) in [(120u16, 30u16), (160, 40)] {
+        let detail = detail_text(&mut app, w, h);
+        assert!(detail.contains("PROMPT"), "{w}: {detail}");
+        assert!(detail.contains("more lines"), "{w}: {detail}");
+        for axis in AXES {
+            assert!(detail.contains(axis), "{w}: {axis} missing: {detail}");
+        }
+    }
+    let _ = lines_at(&mut app, 80, 24);
+    app.reduce(Action::Enter);
+    let out = lines_at(&mut app, 80, 24).join("\n");
+    assert!(out.contains("PROMPT"), "{out}");
+    assert!(out.contains("INTEGRITY"), "{out}");
+    app.reduce(Action::PageDown);
+    let out = lines_at(&mut app, 80, 24).join("\n");
+    assert!(out.contains("REVIEW"), "{out}");
+}
+
+/// Eine Quelle mit belegtem Anker — trifft erst nach dem ersten Space ein.
+struct WithAnchor;
+
+impl crate::Source for WithAnchor {
+    fn load(&self) -> minds_reader::Result<Inspection> {
+        unreachable!("this test never reloads")
+    }
+    fn stamp(&self) -> Option<crate::Stamp> {
+        None
+    }
+    fn intents(&self, named: &[minds_core::ContentHash]) -> Result<crate::IntentList, String> {
+        let entries = named
+            .iter()
+            .map(|id| crate::IntentInfo {
+                id: id.clone(),
+                active: false,
+                detail: Ok(crate::IntentDetail {
+                    source: "file:docs/anforderung.md@abc".into(),
+                    content: minds_core::ContentHash::from_bytes([2; 32]),
+                    scope: Vec::new(),
+                    version: None,
+                    proof: Ok(()),
+                    signature: minds_reader::assurance::IntentSignature::Unsigned,
+                    snapshot_len: 1,
+                    snapshot: Some(vec!["Sort stably.".into()]),
+                    snapshot_clipped: false,
+                }),
+            })
+            .collect::<Vec<_>>();
+        Ok(crate::IntentList {
+            total: entries.len(),
+            entries,
+            skipped: 0,
+        })
+    }
+    fn verify(&self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
+        Err("minds verify not found".into())
+    }
+}
+
+/// Review: Space hält Anforderung und Prompt im Gleichschritt — auch wenn
+/// der Anker erst nach dem ersten Space gelesen wird, schließt das
+/// nächste Space beides; nie wechseln sich die Flags ab.
+#[test]
+fn c36_space_keeps_requirement_and_prompt_in_step() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = opened(&repo, inspection);
+    app.overview.as_mut().unwrap().select_commit(commits[1]);
+    let flags = |app: &App| {
+        let s = app.overview.as_ref().unwrap();
+        (s.requirement_open, s.prompt_open)
+    };
+    app.reduce(Action::Space);
+    assert_eq!(flags(&app), (false, true));
+    while app.fill_overview(&WithAnchor) {}
+    assert!(app.overview.as_ref().unwrap().has_requirement_text());
+    app.reduce(Action::Space);
+    assert_eq!(flags(&app), (false, false));
+    app.reduce(Action::Space);
+    assert_eq!(flags(&app), (true, true));
+    assert!(detail_text(&mut app, 160, 40).contains("Sort stably."));
+    app.reduce(Action::Space);
+    assert_eq!(flags(&app), (false, false));
+}
+
+/// Review: der Pfad mit mehreren Gründen und ohne Dateiclaim-Notiz — als
+/// Komponententest über `coverage_lines_with`, wie c3v2 es für die
+/// Klassen tut.
+#[test]
+fn c36_further_reasons_are_counted_and_no_claim_note_without_a_card() {
+    use minds_reader::changes::{LineClasses, ReasonCount};
+    let text = |c: &LineClasses, claimed: Option<usize>| {
+        crate::view::overview::coverage_lines_with(Some(&Ok(c.clone())), claimed, 120)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let c = LineClasses {
+        added: 9,
+        unexplained: 5,
+        files: 3,
+        reasons: vec![
+            ReasonCount {
+                reason: "a tool claim writes the file without a hash",
+                lines: 3,
+            },
+            ReasonCount {
+                reason: "no tool claim or shell mention found",
+                lines: 2,
+            },
+        ],
+        ..LineClasses::default()
+    };
+    let out = text(&c, None);
+    assert!(
+        out.contains("— a tool claim writes the file without a hash: 3"),
+        "{out}"
+    );
+    assert!(out.contains("+ 1 other reason → d"), "{out}");
+    assert!(!out.contains("all 5"), "{out}");
+    assert!(!out.contains("session records"), "{out}");
+    assert!(!out.contains('✓'), "{out}");
+    assert!(text(&c, Some(0)).contains("(session records 0 files)"));
+    assert!(!text(&c, Some(2)).contains("session records"));
 }
 
 /// AC4: `unknown` ist ein Platzhalter, kein Modellname — das Detail sagt

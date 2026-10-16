@@ -119,7 +119,7 @@ pub struct ReasonCount {
 }
 
 /// Der Grund einer unerklärten Zeile, deren Datei der Abgleich keinen
-/// gibt — gezählt, nie verschwiegen.
+/// Grund gibt — gezählt, nie verschwiegen.
 pub const NO_REASON: &str = "no reason recorded by the reconciliation";
 
 /// Die hinzugefügten Zeilen eines Commits nach Klasse.

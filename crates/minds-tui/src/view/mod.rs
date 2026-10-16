@@ -706,18 +706,7 @@ fn space_hint(app: &App) -> Option<&'static str> {
     if state.has_requirement_text() {
         return Some("Space requirement");
     }
-    let row = state.agent_commit()?;
-    let cap = if row.sessions.len() <= 2 {
-        overview::PROMPT_LINES
-    } else {
-        overview::PROMPT_LINES_MANY
-    };
-    let index = app.inspection.index();
-    row.sessions
-        .iter()
-        .filter_map(|sid| index.session(*sid))
-        .any(|s| s.intent.request.lines().count() > cap)
-        .then_some("Space prompt")
+    overview::prompt_truncated(app).then_some("Space prompt")
 }
 
 /// Der Filterzustand der Übersicht für Zeile 1 der Fußzeile (C3.5).

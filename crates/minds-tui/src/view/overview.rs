@@ -909,13 +909,32 @@ fn commit_detail(
     // Fenster über die Sessions, und die gewählte bleibt sichtbar.
     let listed = row.sessions.len().min(MAX_SESSION_LINES);
     let single = row.sessions.len() == 1;
-    let cap = if state.prompt_open {
-        usize::MAX
-    } else if row.sessions.len() <= 2 {
-        PROMPT_LINES
-    } else {
-        PROMPT_LINES_MANY
-    };
+    // Die Dateien des Commits — den Dateiclaims der Session gegenüber (C3.6).
+    let commit_files = state
+        .lines
+        .get(&row.id)
+        .and_then(|r| r.as_ref().ok())
+        .map(|c| c.files);
+    let cards: Vec<Option<minds_reader::model::SessionCard>> = row
+        .sessions
+        .iter()
+        .map(|sid| app.inspection.card(*sid))
+        .collect();
+    // Der Widerspruch „keine Dateiclaims, aber der Commit ändert Dateien"
+    // bekommt eine eigene Zeile unter den Fakten.
+    let contradicts = |card: &Option<minds_reader::model::SessionCard>| matches!((card, commit_files), (Some(c), Some(changed)) if c.summary.files == 0 && changed > 0);
+    let any_contradiction = usize::from(cards.iter().any(contradicts));
+    // Zugeklappt nur so viele Zeilen, dass SESSIONS (eine Karte) und
+    // EVIDENCE darunter sichtbar bleiben — der Prompt drängt die
+    // Trust-Achsen nie aus dem Bild; mindestens PROMPT_MIN Zeilen. Rahmen,
+    // das Bisherige, PROMPT-Kopf und -Hinweis, Leerzeile, SESSIONS-Kopf,
+    // eine Karte, Leerzeile, EVIDENCE.
+    let fixed = 2 + lines.len() + 1 + 1 + 1 + 1 + 2 + any_contradiction + 1 + EVIDENCE_RESERVE;
+    let cap = prompt_cap(
+        row.sessions.len(),
+        state.prompt_open,
+        height.saturating_sub(fixed),
+    );
     let indent = if single { 0 } else { 4 };
     let prompts: Vec<Vec<String>> = row
         .sessions
@@ -978,26 +997,21 @@ fn commit_detail(
         format!("SESSIONS ({})", row.sessions.len()),
         theme::title(),
     )));
-    // Zeilen je Session: Kopf und Fakten — bei mehreren dazu der
-    // PROMPT-Unterabschnitt, so hoch wie der höchste.
-    let per = if single {
-        2
-    } else {
-        2 + 1
-            + prompts
+    // Zeilen je Session: Kopf und Fakten (und ggf. der Widerspruch) — bei
+    // mehreren dazu der PROMPT-Unterabschnitt, so hoch wie der höchste.
+    let per = 2
+        + any_contradiction
+        + if single {
+            0
+        } else {
+            1 + prompts
                 .iter()
                 .map(|t| t.len().min(cap).max(1) + usize::from(t.len() > cap))
                 .max()
                 .unwrap_or(1)
-    };
-    // Die Dateien des Commits — den Dateiclaims der Session gegenüber (C3.6).
-    let commit_files = state
-        .lines
-        .get(&row.id)
-        .and_then(|r| r.as_ref().ok())
-        .map(|c| c.files);
+        };
     // Platz für EVIDENCE (Kopf, fünf Achsen, Folgezeilen) bleibt frei.
-    let reserve = 12;
+    let reserve = EVIDENCE_RESERVE;
     let room = height
         .saturating_sub(2 + lines.len() + reserve)
         .checked_div(per)
@@ -1010,11 +1024,6 @@ fn commit_detail(
             theme::dim(),
         )));
     }
-    let cards: Vec<Option<minds_reader::model::SessionCard>> = row
-        .sessions
-        .iter()
-        .map(|sid| app.inspection.card(*sid))
-        .collect();
     for (i, sid) in row
         .sessions
         .iter()
@@ -1035,17 +1044,19 @@ fn commit_detail(
                 // Agent und Modell, wie der Reader sie erfasst sieht (C3.6):
                 // ein Platzhalter aus `minds-capture` wird nie gedruckt.
                 let actor = minds_reader::Actor::of(s);
-                let agent = actor
-                    .agent
-                    .clone()
-                    .unwrap_or_else(|| "agent not recorded".into());
-                badge(&mut head, &agent, true, app.nerd);
-                head.push(Span::raw(format!("{} · ", crate::view::clip(&agent, 40))));
+                match &actor.agent {
+                    Some(agent) => {
+                        badge(&mut head, agent, true, app.nerd);
+                        head.push(Span::raw(format!("{} · ", crate::view::clip(agent, 40))));
+                    }
+                    // Kein Badge für einen Platzhalter — er ist kein Agent.
+                    None => head.push(Span::styled("agent not recorded · ", theme::dim())),
+                }
                 match &actor.model {
                     Some(model) => {
                         let mut text = crate::view::clip(model, 40);
                         if let Some(provider) = &actor.provider {
-                            text.push_str(&format!(" ({provider})"));
+                            text.push_str(&format!(" ({})", crate::view::clip(provider, 24)));
                         }
                         head.push(Span::raw(text));
                     }
@@ -1077,32 +1088,41 @@ fn commit_detail(
         if let Some(card) = &cards[i] {
             let claimed = card.summary.files;
             let plural = |n: usize| if n == 1 { "" } else { "s" };
-            // Ein Widerspruch wird benannt, nicht nur gezählt (C3.6): Der
-            // Commit ändert Dateien, die Session trägt keinen Dateiclaim —
-            // eine Lücke, kein Manipulationsbefund (gedimmt, nie rot).
-            let files = match commit_files {
-                Some(changed) if claimed == 0 && changed > 0 => format!(
-                    "0 files claimed · commit changes {changed} file{}",
-                    plural(changed)
-                ),
-                _ => format!("{claimed} file{}", plural(claimed)),
-            };
-            let mut facts = vec![files];
+            let mut facts = vec![format!("{claimed} file{}", plural(claimed))];
             if let Some(e) = card.evidence_state() {
                 facts.push(format!("{} events", e.events));
                 facts.push(format!("{} gaps", e.gaps));
             }
             let (glyph, word, style) = theme::provenance(&card.provenance);
             // Der Record-Zustand (Vertrauen) weicht nie — die Fakten davor
-            // werden mit `…` gekürzt, nie hart abgeschnitten.
+            // werden mit `…` gekürzt, nie hart abgeschnitten; die zwei
+            // Trennleerzeichen stehen außerhalb des Schnitts.
             let record = format!("{glyph} record {word}");
-            let room = inner.saturating_sub(record.chars().count());
+            let room = inner.saturating_sub(record.chars().count() + 2);
             let mut spans = vec![Span::styled(
-                crate::view::clip(&format!("    {}  ", facts.join(" · ")), room),
+                format!(
+                    "{}  ",
+                    crate::view::clip(&format!("    {}", facts.join(" · ")), room)
+                ),
                 theme::dim(),
             )];
             spans.push(Span::styled(record, style));
             lines.push(Line::from(spans));
+            // Ein Widerspruch wird benannt, nicht nur gezählt (C3.6): Der
+            // Commit ändert Dateien, die Session trägt keinen Dateiclaim —
+            // eine Lücke, kein Manipulationsbefund (gedimmt, nie rot).
+            if let (true, Some(changed)) = (contradicts(&cards[i]), commit_files) {
+                lines.push(Line::from(Span::styled(
+                    crate::view::clip(
+                        &format!(
+                            "    0 files claimed · commit changes {changed} file{}",
+                            plural(changed)
+                        ),
+                        inner,
+                    ),
+                    theme::dim(),
+                )));
+            }
         }
         // Mehrere Sessions: der Prompt als Unterabschnitt der Karte (C3.6).
         if !single && session.is_some() {
@@ -1134,11 +1154,16 @@ fn commit_detail(
     }
     lines.push(Line::from(heading));
     lines.extend(integrity_lines(row, check));
-    // Die Dateiclaims aller Sessions — `0` erklärt die Lücke mit (C3.6).
-    let claimed: usize = cards.iter().flatten().map(|card| card.summary.files).sum();
+    // Die Dateiclaims aller gelesenen Sessions — `0` erklärt die Lücke mit
+    // (C3.6); ohne lesbare Karte wird nichts behauptet.
+    let claimed = cards
+        .iter()
+        .flatten()
+        .map(|card| card.summary.files)
+        .reduce(|a, b| a + b);
     lines.extend(coverage_lines_with(
         state.lines.get(&row.id),
-        Some(claimed),
+        claimed,
         inner,
     ));
     lines.extend(interpretation_lines(row, &cards));
@@ -1489,6 +1514,46 @@ fn requirement_lines(
 pub(crate) const PROMPT_LINES: usize = 12;
 /// … und bei mehr als zwei Sessions je Session.
 pub(crate) const PROMPT_LINES_MANY: usize = 4;
+/// Weniger als so viele Zeilen zeigt PROMPT nie, auch im engen Detail.
+pub(crate) const PROMPT_MIN: usize = 3;
+/// So viele Zeilen bleiben für EVIDENCE frei (Kopf, fünf Achsen,
+/// Folgezeilen).
+const EVIDENCE_RESERVE: usize = 12;
+
+/// Wie viele Prompt-Zeilen das Detail zeigt: aufgeklappt alle; zugeklappt
+/// die Vorgabe nach Session-Zahl, gekappt auf den Platz `avail`, der
+/// SESSIONS und EVIDENCE übrig lässt, mindestens [`PROMPT_MIN`].
+pub(crate) fn prompt_cap(sessions: usize, open: bool, avail: usize) -> usize {
+    if open {
+        return usize::MAX;
+    }
+    let base = if sessions <= 2 {
+        PROMPT_LINES
+    } else {
+        PROMPT_LINES_MANY
+    };
+    base.min(avail).max(PROMPT_MIN)
+}
+
+/// Ob der Prompt einer Session des gewählten Agent-Commits zugeklappt
+/// gekürzt wäre — für den Fußzeilen-Hinweis `Space prompt`, gerechnet mit
+/// derselben Umbruchlogik wie das Detail bei seiner Mindestbreite.
+pub(crate) fn prompt_truncated(app: &App) -> bool {
+    let Some(state) = app.overview.as_ref() else {
+        return false;
+    };
+    let Some(row) = state.agent_commit() else {
+        return false;
+    };
+    let cap = prompt_cap(row.sessions.len(), false, usize::MAX);
+    let indent = if row.sessions.len() == 1 { 0 } else { 4 };
+    let width = usize::from(DETAIL_MIN).saturating_sub(2 + indent).max(1);
+    let index = app.inspection.index();
+    row.sessions
+        .iter()
+        .filter_map(|sid| index.session(*sid))
+        .any(|s| prompt_lines(&s.intent.request, width).len() > cap)
+}
 
 /// Der Auftrag als Anzeigezeilen (C3.6): je Quellzeile entschärft und an
 /// Wortgrenzen auf `width` umgebrochen; Leerzeilen innen bleiben, Leerraum
@@ -1600,6 +1665,8 @@ mod tests {
         assert_eq!(parts, ["one two", "three", "four five"]);
         assert!(parts.iter().all(|p| p.chars().count() <= 9));
         assert_eq!(wrap_words("  indented words", 12), ["  indented", "words"]);
+        // Zeichen, nicht Bytes: Umlaute zählen einfach.
+        assert_eq!(wrap_words("äöü ßß ñ", 4), ["äöü", "ßß ñ"]);
         assert_eq!(wrap_words(&"x".repeat(25), 10).len(), 3);
         assert_eq!(wrap_words("", 10), [""]);
         let lines = prompt_lines("\n\nfirst\n\n\nsecond line\n\n", 80);

@@ -23,7 +23,9 @@ versioning follows [Semantic Versioning](https://semver.org/).
   no `unknown`.** The request of the human is no longer a dimmed footnote
   under the session numbers: **PROMPT** shows the full text as recorded
   (`◌ as recorded by the agent` — a claim, not evidence), wrapped, up to 12
-  lines and then `… N more lines`; `Space` unfolds it. With one session the
+  lines and then `… N more lines` (4 per session from three sessions on,
+  fewer in a low terminal, never fewer than 3 — the collapsed prompt never
+  hides the EVIDENCE axes); `Space` unfolds it. With one session the
   section stands before SESSIONS, with several each session card carries
   its own, in session order; nothing is shown twice. Every `◦` line in
   EVIDENCE names its reason: COVERAGE adds the most common reason with its

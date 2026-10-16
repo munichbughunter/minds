@@ -209,12 +209,12 @@ impl OverviewState {
         if !requirement && !prompt {
             return;
         }
-        if requirement {
-            self.requirement_open = !self.requirement_open;
-        }
-        if prompt {
-            self.prompt_open = !self.prompt_open;
-        }
+        // Ein gemeinsamer Zielzustand: Ist irgendetwas offen, schließt
+        // Space alles — auch wenn der Anker erst nach dem ersten Space
+        // eintraf; beide Flags laufen nie auseinander.
+        let open = !(self.requirement_open || self.prompt_open);
+        self.requirement_open = requirement && open;
+        self.prompt_open = prompt && open;
         self.detail_scroll = 0;
     }
 
