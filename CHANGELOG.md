@@ -305,6 +305,19 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **One word per evidence state across tabs.** The four states read the
+  same everywhere: `● observed` · `◍ fs only` · `◇ reported` · `◦ not
+  observed`. They live in the glyph register (`◇` means reported — declared
+  or claimed, not witnessed; `◦` means not observed — open, never an
+  error), the help legend is generated from it, and the glossary says
+  "reported" where it said "stated". Overview COVERAGE reads `◇ 95 of 95
+  added lines reported, not observed` instead of "stated"; the line
+  `· 95 added lines` is gone (`·` means "does not apply"); the reason
+  sentence under an unexplained count is unchanged. Overview detail, the
+  FILES title and the diff legend take their numbers from one reader
+  function (`FileDiff::line_classes`, summed by `ChangeSet::line_classes`),
+  so the same commit shows the same counts in all three places.
+
 - **Navigation history never stacks the same origin.** A tab key (F1–F5,
   `1–5`, Tab) back to a tab that lies in the history as an origin ends that
   jump: every entry from it on is dropped, so `d`, F1, `d`, F1, `d` reads

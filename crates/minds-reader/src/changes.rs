@@ -87,6 +87,31 @@ impl FileDiff {
             .filter(|r| r.kind == DiffKind::Added && r.class == Some(ReconClass::Unexplained))
             .count()
     }
+
+    /// Die `+`-Zeilen dieser Datei nach Klasse (C9.4) — **die** Zählung, aus
+    /// der auch [`ChangeSet::line_classes`] summiert: Diff-Legende,
+    /// FILES-Titel und Overview-Detail rechnen damit dieselben Zahlen.
+    /// `reasons` bleibt leer; die Gründe gruppiert der Commit.
+    pub fn line_classes(&self) -> LineClasses {
+        let mut c = LineClasses {
+            added: self.added,
+            files: 1,
+            skipped_files: usize::from(self.note.is_some()),
+            ..LineClasses::default()
+        };
+        for row in self.rows.iter().filter(|r| r.kind == DiffKind::Added) {
+            match row.class {
+                Some(ReconClass::Explained) => c.explained += 1,
+                Some(ReconClass::ExplainedFsOnly) => c.fs_only += 1,
+                Some(ReconClass::ReportedOnly) => c.stated += 1,
+                Some(ReconClass::Unexplained) => c.unexplained += 1,
+                None => {}
+            }
+        }
+        let classified = c.explained + c.fs_only + c.stated + c.unexplained;
+        c.not_assessed = c.added.saturating_sub(classified);
+        c
+    }
 }
 
 /// Die Änderungen eines Commits.
@@ -166,28 +191,22 @@ impl ChangeSet {
     /// als erklärt; ausgesagte, nur im Dateisystem gesehene, unerklärte und
     /// nicht bewertete (ohne Klasse oder in Dateien ohne Diff) getrennt.
     pub fn line_classes(&self) -> LineClasses {
+        // Die Summe der Dateien ([`FileDiff::line_classes`]) — eine Zählung
+        // für Overview-Detail, FILES-Titel und Diff-Legende (C9.4).
         let mut c = LineClasses {
-            added: self.added(),
-            unexplained: self.unexplained(),
-            files: self.files.len(),
             reasons: self.unexplained_reasons(),
             ..LineClasses::default()
         };
-        for file in &self.files {
-            if file.note.is_some() {
-                c.skipped_files += 1;
-            }
-            for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
-                match row.class {
-                    Some(ReconClass::Explained) => c.explained += 1,
-                    Some(ReconClass::ExplainedFsOnly) => c.fs_only += 1,
-                    Some(ReconClass::ReportedOnly) => c.stated += 1,
-                    Some(ReconClass::Unexplained) | None => {}
-                }
-            }
+        for file in self.files.iter().map(FileDiff::line_classes) {
+            c.added += file.added;
+            c.explained += file.explained;
+            c.fs_only += file.fs_only;
+            c.stated += file.stated;
+            c.unexplained += file.unexplained;
+            c.not_assessed += file.not_assessed;
+            c.skipped_files += file.skipped_files;
+            c.files += file.files;
         }
-        let classified = c.explained + c.fs_only + c.stated + c.unexplained;
-        c.not_assessed = c.added.saturating_sub(classified);
         c
     }
 

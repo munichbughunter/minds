@@ -326,39 +326,27 @@ fn file_title(state: &ChangesState, file: &FileDiff, width: u16) -> Line<'static
     ])
 }
 
-/// Die Zählung der `+`-Zeilen einer Datei nach Zustand: beobachtet, nur im
-/// Dateisystem, berichtet, nicht beobachtet.
-fn class_counts(file: &FileDiff) -> [usize; 4] {
-    let mut counts = [0usize; 4];
-    for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
-        match row.class {
-            Some(ReconClass::Explained) => counts[0] += 1,
-            Some(ReconClass::ExplainedFsOnly) => counts[1] += 1,
-            Some(ReconClass::ReportedOnly) => counts[2] += 1,
-            Some(ReconClass::Unexplained) => counts[3] += 1,
-            None => {}
-        }
-    }
-    counts
-}
-
-/// Die Legende über dem Diff: je Zustand Glyph, Wort und Zahl.
+/// Die Legende über dem Diff: je Zustand Glyph, Wort und Zahl — die Wörter
+/// aus [`theme::state`], die Zahlen aus [`FileDiff::line_classes`] (C9.4).
 fn draw_file_head(frame: &mut Frame, file: &FileDiff, area: Rect) {
-    let counts = class_counts(file);
-    let classes = Line::from(vec![
-        Span::styled(" ● observed ", Style::default().fg(theme::OK)),
-        Span::raw(format!("{}  ", counts[0])),
-        Span::styled("◍ fs only ", Style::default().fg(theme::OK)),
-        Span::raw(format!("{}  ", counts[1])),
-        Span::raw("◇ reported "),
-        Span::raw(format!("{}  ", counts[2])),
-        Span::styled(
-            "◦ not observed ",
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!("{}", counts[3])),
-    ]);
-    frame.render_widget(Paragraph::new(vec![classes]), area);
+    let c = file.line_classes();
+    let mut spans = vec![Span::raw(" ")];
+    for (class, n) in [
+        (ReconClass::Explained, c.explained),
+        (ReconClass::ExplainedFsOnly, c.fs_only),
+        (ReconClass::ReportedOnly, c.stated),
+        (ReconClass::Unexplained, c.unexplained),
+    ] {
+        let (glyph, word, style) = theme::state(class);
+        let style = if class == ReconClass::Unexplained {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            style
+        };
+        spans.push(Span::styled(format!("{glyph} {word} "), style));
+        spans.push(Span::raw(format!("{n}  ")));
+    }
+    frame.render_widget(Paragraph::new(vec![Line::from(spans)]), area);
 }
 
 /// Die Zusammenfassung einer Datei für den Hunk-Kopf (C9.1): Pfad und Zahl
@@ -367,7 +355,8 @@ fn draw_file_head(frame: &mut Frame, file: &FileDiff, area: Rect) {
 /// stammen. Zeilenweise, damit im schmalen Panel nichts mitten im Satz
 /// umbricht.
 fn file_summary(app: &App, file: &FileDiff) -> Vec<String> {
-    let [observed, fs_only, reported, open] = class_counts(file);
+    let c = file.line_classes();
+    let (observed, fs_only, reported, open) = (c.explained, c.fs_only, c.stated, c.unexplained);
     let mut calls: std::collections::BTreeSet<(usize, usize, String)> = Default::default();
     for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
         if row.class == Some(ReconClass::ReportedOnly)
@@ -593,18 +582,6 @@ fn draw_split(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Re
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// Das Zustandswort einer Zeile (C9.3/C9.4): `observed`, `fs only`,
-/// `reported`, `not observed` — das Wort der Oberfläche, nicht das des
-/// Readers (`reported only`, `unexplained`).
-fn state_word(class: ReconClass) -> &'static str {
-    match class {
-        ReconClass::Explained => "observed",
-        ReconClass::ExplainedFsOnly => "fs only",
-        ReconClass::ReportedOnly => "reported",
-        ReconClass::Unexplained => theme::not_observed().1,
-    }
-}
-
 /// Die Brücke zum Witness — nur bei `reported` und `fs only`, wo ein
 /// Zeuge die Zeile zu `● observed` machte.
 const BRIDGE: &str = "With a witness this line would be ● observed.";
@@ -729,16 +706,13 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
             };
             let state_span = match row.class {
                 Some(class) => {
-                    let (glyph, _, style) = theme::recon(class);
+                    let (glyph, word, style) = theme::state(class);
                     let style = if class == ReconClass::Unexplained {
                         Style::default().add_modifier(Modifier::BOLD)
                     } else {
                         style.add_modifier(Modifier::BOLD)
                     };
-                    Span::styled(
-                        format!("{glyph} {}", state_word(class).to_uppercase()),
-                        style,
-                    )
+                    Span::styled(format!("{glyph} {}", word.to_uppercase()), style)
                 }
                 None => Span::styled("· NOT ASSESSED", theme::dim()),
             };
