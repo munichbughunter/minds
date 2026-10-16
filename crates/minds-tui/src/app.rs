@@ -685,6 +685,7 @@ impl<'a> App<'a> {
             state.session = 0;
             state.requirement_open = false;
             state.prompt_open = false;
+            state.prompt_clipped.set(false);
             state.detail_scroll = 0;
         }
     }

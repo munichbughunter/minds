@@ -156,7 +156,7 @@ fn c36_the_prompt_is_its_own_section_not_a_footnote() {
         );
     }
     // Mit Platz die vollen 12 Zeilen; bei 160×40 so viele, wie EVIDENCE
-    // darunter lässt (hier 10, mindestens 3) — nie mehr als 12.
+    // darunter lässt — nie mehr als 12.
     let detail = detail_text(&mut app, 160, 60);
     assert!(detail.contains("line 12 of the request"), "{detail}");
     assert!(!detail.contains("line 13 of the request"), "{detail}");
@@ -165,7 +165,7 @@ fn c36_the_prompt_is_its_own_section_not_a_footnote() {
     let shown = (1..=20)
         .filter(|i| detail.contains(&format!("line {i:02} of the request")))
         .count();
-    assert!((3..=12).contains(&shown), "{shown}: {detail}");
+    assert!((1..=12).contains(&shown), "{shown}: {detail}");
     assert!(
         detail.contains(&format!("… {} more lines", 20 - shown)),
         "{detail}"
@@ -329,6 +329,104 @@ fn c36_several_long_prompts_keep_the_axes_at_120_columns() {
             assert!(detail.contains(axis), "{w}: {axis} missing: {detail}");
         }
     }
+}
+
+/// Review: Punktgrößen fangen Modulo-Fälle der Fensterrechnung nicht —
+/// ein Höhen-Sweep über 1, 2 und 3 Sessions mit langen Prompts, 120 und
+/// 160 Spalten, Cursor nacheinander auf jeder Session: Die fünf Achsen
+/// stehen immer im Bild, sobald das Detail sie überhaupt fassen kann.
+#[test]
+fn c36_the_axes_survive_every_height_and_session_cursor() {
+    const AXES: [&str; 5] = [
+        "INTEGRITY",
+        "COVERAGE",
+        "INTERPRETATION",
+        "REQUIREMENT",
+        "REVIEW",
+    ];
+    for n in 1..=3usize {
+        let sessions = (0..n)
+            .map(|i| {
+                let id = sid(char::from(b'a' + u8::try_from(i).unwrap()));
+                (id, session(&twenty_lines(), "2026-10-02T10:00:00Z"))
+            })
+            .collect();
+        let (_dir, repo, inspection) = linked(sessions);
+        for cursor in 0..n {
+            let mut app = on_head(&repo, inspection.clone());
+            if n > 1 {
+                // Enter wählt bei mehreren Sessions zuerst (Fokus rechts).
+                app.reduce(Action::Enter);
+                for _ in 0..cursor {
+                    app.reduce(Action::Down);
+                }
+            }
+            for w in [120u16, 160] {
+                for h in 34..=60u16 {
+                    let detail = detail_text(&mut app, w, h);
+                    assert!(detail.contains("PROMPT"), "{n}/{cursor} {w}x{h}: {detail}");
+                    for axis in AXES {
+                        assert!(
+                            detail.contains(axis),
+                            "{n} sessions, cursor {cursor}, {w}x{h}: {axis} missing: {detail}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Review: Ein Cursorwechsel vergisst, dass der vorige Commit kürzte —
+/// Space auf einem Commit mit kurzem Prompt bleibt ohne Draw ein No-op,
+/// und die schmale Listenebene bietet kein veraltetes `Space prompt`.
+#[test]
+fn c36_a_stale_clipped_flag_never_survives_a_cursor_move_or_the_narrow_list() {
+    // Zwei Agent-Commits: unten einer mit langem Prompt, auf HEAD einer
+    // mit kurzem.
+    let (dir, _) = repo();
+    git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "feat: long"],
+    );
+    let long: CommitId = git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+    git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "feat: short"],
+    );
+    let short: CommitId = git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), session(&twenty_lines(), "2026-10-02T10:00:00Z"));
+    sessions.insert(sid('b'), session("short", "2026-10-02T11:00:00Z"));
+    let mut commits = BTreeMap::new();
+    commits.insert(long, vec![sid('a')]);
+    commits.insert(short, vec![sid('b')]);
+    let inspection = Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "r");
+    let repo = Repo::open(dir.path()).unwrap();
+    let mut app = on_head(&repo, inspection);
+    assert!(app.overview.as_mut().unwrap().select_commit(long));
+    while app.fill_overview(&Plain) {}
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(out.contains("Space prompt"), "{out}");
+    // Schmal, Listenebene: kein Hinweis aus dem breiten Draw.
+    let out = lines_at(&mut app, 80, 24).join("\n");
+    assert!(!out.contains("Space prompt"), "{out}");
+    assert!(!app.overview.as_ref().unwrap().prompt_clipped.get());
+    // Breit gezeichnet (kürzt), dann der Cursor auf HEAD und Space ohne
+    // neuen Draw: der kurze Prompt klappt nichts auf.
+    let _ = lines_at(&mut app, 160, 40);
+    assert!(app.overview.as_ref().unwrap().prompt_clipped.get());
+    app.reduce(Action::Up);
+    assert_eq!(
+        app.overview.as_ref().unwrap().agent_commit().map(|r| r.id),
+        Some(short)
+    );
+    app.reduce(Action::Space);
+    let state = app.overview.as_ref().unwrap();
+    assert!(!state.prompt_open, "a cursor move forgets the old clipping");
+    // Nach dem Draw auf HEAD: nichts gekürzt, kein Hinweis.
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(!out.contains("Space prompt"), "{out}");
 }
 
 /// Review: Space ist ohne etwas Aufklappbares ein No-op — ein kurzer

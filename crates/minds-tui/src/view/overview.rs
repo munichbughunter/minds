@@ -414,6 +414,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         draw_detail(frame, app, area);
         return;
     }
+    if narrow {
+        // Ohne gezeichnetes Detail kürzt dieser Draw nichts — kein
+        // veralteter `Space prompt` aus einem früheren breiten Draw.
+        state.prompt_clipped.set(false);
+    }
     // Die Zeilenbreite: Rahmen links/rechts und die Cursor-Spalte.
     let row_w = usize::from(left.width.saturating_sub(3));
 
@@ -928,16 +933,35 @@ fn commit_detail(
     // Ende gezeigt — so rechnet der Platz für den Prompt mit seiner echten
     // Höhe, nicht mit einer Schätzung.
     let evidence = evidence_lines(state, row, &cards, inner);
+    // Die Markerzeilen des Session-Fensters: `… N above` und `… N more`
+    // — bei zwei Sessions höchstens eine davon, ab drei beide.
+    let markers = match listed {
+        0 | 1 => 0,
+        2 => 1,
+        _ => 2,
+    };
     // Zugeklappt nur so viele Zeilen, dass SESSIONS (eine Karte) und
     // EVIDENCE darunter sichtbar bleiben — der Prompt drängt die
     // Trust-Achsen nie aus dem Bild, notfalls bleibt nur sein Kopf. Rahmen,
-    // das Bisherige, PROMPT-Kopf und -Hinweis, eine Zeile Abstand (bei
-    // einer Session die Leerzeile nach PROMPT, bei mehreren `… N more`),
-    // SESSIONS-Kopf, eine Karte, Leerzeile, EVIDENCE.
-    let fixed = 2 + lines.len() + 1 + 1 + 1 + 1 + 2 + any_contradiction + 1 + evidence.len();
+    // das Bisherige, PROMPT-Kopf und -Hinweis, bei einer Session die
+    // Leerzeile nach PROMPT (bei mehreren die Marker), SESSIONS-Kopf, eine
+    // Karte, die Leerzeile vor EVIDENCE, EVIDENCE.
+    let fixed = 2
+        + lines.len()
+        + 1
+        + 1
+        + if single { 1 } else { markers }
+        + 1
+        + 2
+        + any_contradiction
+        + 1
+        + evidence.len();
+    // Aufgeklappt (Prompt oder Anforderung) ist das Detail scrollbar —
+    // dann wird nichts gekappt, und der Hinweis verspricht nichts, was
+    // Space nicht hält.
     let cap = prompt_cap(
         row.sessions.len(),
-        state.prompt_open,
+        state.prompt_open || state.requirement_open,
         height.saturating_sub(fixed),
     );
     // Ob dieser Draw einen Prompt kürzt — für Space und die Fußzeile.
@@ -1026,9 +1050,10 @@ fn commit_detail(
                 .max()
                 .unwrap_or(1)
         };
-    // Platz für EVIDENCE bleibt frei — seine echte Höhe.
+    // Platz für die Marker, die Leerzeile und EVIDENCE (echte Höhe) bleibt
+    // frei — bei bindendem Cap geht das Fenster genau auf.
     let room = height
-        .saturating_sub(2 + lines.len() + evidence.len())
+        .saturating_sub(2 + lines.len() + markers + 1 + evidence.len())
         .checked_div(per)
         .unwrap_or(0)
         .max(1);
