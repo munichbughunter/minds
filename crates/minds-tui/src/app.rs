@@ -571,6 +571,20 @@ impl<'a> App<'a> {
     }
 
     /// Öffnet den Overview-Tab (beim ersten Mal gelesen).
+    /// Der erklärte Bereich eines gelesenen Ankers — so, wie die Übersicht
+    /// ihn nach `fill_overview` hält. `None`, solange er dort nicht gelesen
+    /// ist oder er keinen Bereich erklärt: die Why-Box liest nichts nach.
+    pub fn requirement_scope(&self, id: &minds_core::ContentHash) -> Option<&[String]> {
+        let detail = self
+            .overview
+            .as_ref()?
+            .requirements
+            .get(id)?
+            .as_ref()
+            .ok()?;
+        (!detail.scope.is_empty()).then_some(detail.scope.as_slice())
+    }
+
     pub fn open_overview(&mut self) {
         match self.overview.as_mut() {
             None => self.overview = Some(OverviewState::build(&self.inspection, self.repo)),

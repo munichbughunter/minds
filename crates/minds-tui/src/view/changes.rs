@@ -871,14 +871,26 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                         minds_reader::intent::AnchorRecord::WitnessEvent => "witness event",
                         minds_reader::intent::AnchorRecord::LocalFile => "local file",
                     };
-                    lines.push(Line::from(vec![
+                    let mut requirement = vec![
                         label("REQUIREMENT"),
                         Span::raw(format!(
                             "⚑ {}",
                             crate::view::overview::anchor_short(&anchor.id)
                         )),
                         Span::styled(format!(" · {how}"), theme::dim()),
-                    ]));
+                    ];
+                    // Der Bereich, wenn die Übersicht den Anker gelesen hat:
+                    // liegt die Datei der Zeile darin oder nicht.
+                    if let Some(scope) = app.requirement_scope(&anchor.id) {
+                        let inside = minds_reader::scope::Scope::from_globs(scope)
+                            .is_some_and(|s| s.contains(&file.path));
+                        let word = if inside { "in scope" } else { "out of scope" };
+                        requirement.push(Span::styled(
+                            format!(" · {word} {}", scope.join(", ")),
+                            theme::dim(),
+                        ));
+                    }
+                    lines.push(Line::from(requirement));
                 }
                 if !reason.request.is_empty() {
                     let (claim, _, claim_style) = theme::claim();

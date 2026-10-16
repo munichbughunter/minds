@@ -238,3 +238,149 @@ fn c93_clock_z_is_the_time_of_day_in_utc() {
     assert_eq!(crate::view::clock_z(Some("garbage")), None);
     assert_eq!(crate::view::clock_z(None), None);
 }
+
+/// Eine Inspection wie `filled()`, deren Session `a` an den Anker `id`
+/// gebunden ist (Witness-Event) — nur Index, keine Seals.
+fn with_anchor(id: minds_core::ContentHash) -> Inspection {
+    use minds_core::intent_anchor::IntentEvent;
+    let mut s = session("Fix retry handling", "2026-07-25T14:10:00Z");
+    s.intent_events.push(IntentEvent {
+        seq: 1,
+        anchor_id: id,
+        opens_session: true,
+    });
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), s);
+    let mut commits = BTreeMap::new();
+    commits.insert(commit('1'), vec![sid('a')]);
+    Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "demo")
+}
+
+/// Der Render ohne Rahmen, auf einfache Leerzeichen gebracht — die Why-Box
+/// bricht lange Zeilen um, der Satz steht trotzdem zusammen.
+fn flat(out: &str) -> String {
+    out.replace(['│', '"'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Die Zeile des Renders, die `needle` trägt.
+fn line_with<'a>(out: &'a str, needle: &str) -> &'a str {
+    out.lines()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("{needle:?} missing:\n{out}"))
+}
+
+/// Der gelesene Anker mit dem erklärten Bereich `scope`, wie die Übersicht
+/// ihn nach `fill_overview` hält.
+fn detail(scope: &[&str]) -> crate::IntentDetail {
+    crate::IntentDetail {
+        source: "file:docs/anforderung.md@abc".into(),
+        content: minds_core::ContentHash::from_bytes([2; 32]),
+        scope: scope.iter().map(|s| s.to_string()).collect(),
+        version: None,
+        proof: Ok(()),
+        signature: minds_reader::assurance::IntentSignature::Unsigned,
+        snapshot_len: 1,
+        snapshot: Some(vec!["Sort stably.".into()]),
+        snapshot_clipped: false,
+    }
+}
+
+/// Die App im Changes-Tab auf der `◇ reported`-Zeile, deren Session an
+/// `id` gebunden ist; der Anker ist in der Übersicht gelesen (kein I/O in
+/// der View: die Why-Box nimmt, was die Übersicht hält).
+fn on_the_reported_line_with_anchor<'a>(
+    repo: &'a Repo,
+    id: &minds_core::ContentHash,
+    scope: &[&str],
+) -> App<'a> {
+    let mut app = App::new(with_anchor(id.clone()), repo, None);
+    app.open_overview();
+    app.overview
+        .as_mut()
+        .unwrap()
+        .requirements
+        .insert(id.clone(), Ok(detail(scope)));
+    app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(set())));
+    app.tab = Tab::Changes;
+    app.reduce(Action::Down);
+    app.reduce(Action::Down);
+    assert_eq!(app.changes.as_ref().unwrap().row, 3);
+    app
+}
+
+/// REQUIREMENT nennt den Anker in der Kurzform der Übersicht, die Herkunft
+/// und den Bereich: `in scope src/**`, wenn die Datei der Zeile darin
+/// liegt, sonst `out of scope …`; ohne erklärten Bereich kein Zusatz; ohne
+/// Anker keine Zeile.
+#[test]
+fn c93_requirement_names_the_anchor_its_origin_and_the_scope() {
+    let (_dir, repo) = repo();
+    let id = minds_core::ContentHash::from_bytes([3; 32]);
+    let short = crate::view::overview::anchor_short(&id);
+
+    let mut app = on_the_reported_line_with_anchor(&repo, &id, &["src/**"]);
+    let out = panel(&render_at(&mut app, 260));
+    assert!(
+        flat(&out).contains(&format!(
+            "REQUIREMENT ⚑ {short} · witness event · in scope src/**"
+        )),
+        "{out}"
+    );
+    // Die feste Reihenfolge: SESSION vor REQUIREMENT vor ASKED FOR.
+    assert!(
+        at(&out, "SESSION      ") < at(&out, "REQUIREMENT  "),
+        "{out}"
+    );
+    assert!(
+        at(&out, "REQUIREMENT  ") < at(&out, "ASKED FOR    "),
+        "{out}"
+    );
+
+    let mut app = on_the_reported_line_with_anchor(&repo, &id, &["tests/**", "docs/*.md"]);
+    let out = panel(&render_at(&mut app, 260));
+    assert!(
+        flat(&out).contains(&format!(
+            "REQUIREMENT ⚑ {short} · witness event · out of scope tests/**, docs/*.md"
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("in scope"), "{out}");
+
+    let mut app = on_the_reported_line_with_anchor(&repo, &id, &[]);
+    let out = panel(&render_at(&mut app, 260));
+    let line = line_with(&out, "REQUIREMENT  ");
+    assert!(
+        line.contains(&format!("⚑ {short} · witness event")),
+        "{out}"
+    );
+    assert!(!line.contains("scope"), "{out}");
+
+    // Ohne Anker (die Fixture `filled()`): keine REQUIREMENT-Zeile.
+    let mut app = on_the_reported_line(&repo);
+    let out = panel(&render_at(&mut app, 260));
+    assert!(!out.contains("REQUIREMENT"), "{out}");
+}
+
+/// Ist der Anker in der Übersicht noch nicht gelesen, bleibt es bei Anker
+/// und Herkunft — die Why-Box liest nichts nach.
+#[test]
+fn c93_requirement_without_a_read_anchor_has_no_scope() {
+    let (_dir, repo) = repo();
+    let id = minds_core::ContentHash::from_bytes([3; 32]);
+    let short = crate::view::overview::anchor_short(&id);
+    let mut app = App::new(with_anchor(id.clone()), &repo, None);
+    app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(set())));
+    app.tab = Tab::Changes;
+    app.reduce(Action::Down);
+    app.reduce(Action::Down);
+    let out = panel(&render_at(&mut app, 260));
+    let line = line_with(&out, "REQUIREMENT  ");
+    assert!(
+        line.contains(&format!("⚑ {short} · witness event")),
+        "{out}"
+    );
+    assert!(!line.contains("scope"), "{out}");
+}
