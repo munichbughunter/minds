@@ -33,7 +33,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   count (`— no tool claim or shell mention found: all 46 (session records
   0 files)`) and `+ N other reasons → d`; the reader aggregates the reasons
   from the same lines the Changes tab classifies (`LineClasses::reasons`,
-  `files`), so both tabs show one number. A session that claims no files
+  `files`), so both tabs show one number — `LineClasses` therefore no
+  longer implements `Copy` (it owns the reason list; clone it). A session that claims no files
   while the commit changes some says so in SESSIONS (`0 files claimed ·
   commit changes 2 files`, dimmed — a gap, not a finding). The placeholder
   `unknown` that `minds-capture` writes for an unread model, provider or

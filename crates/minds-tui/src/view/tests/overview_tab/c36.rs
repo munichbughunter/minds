@@ -362,7 +362,7 @@ fn c36_the_axes_survive_every_height_and_session_cursor() {
                 }
             }
             for w in [120u16, 160] {
-                for h in 34..=60u16 {
+                for h in 30..=60u16 {
                     let detail = detail_text(&mut app, w, h);
                     assert!(detail.contains("PROMPT"), "{n}/{cursor} {w}x{h}: {detail}");
                     for axis in AXES {
