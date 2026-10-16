@@ -715,6 +715,7 @@ mod tests {
             ended_at: Some("2026-07-23T09:31:57.004Z".into()),
             cwd: Some("/home/anna/projects/minds".into()),
             closed: false,
+            transcript: None,
         });
         s.edges.push(Edge {
             kind: EdgeKind::SpawnedBy,

@@ -1616,6 +1616,7 @@ mod tests {
                 ended_at: Some(ended.into()),
                 cwd: None,
                 closed: false,
+                transcript: None,
             });
             s
         }
@@ -1660,6 +1661,7 @@ mod tests {
                 ended_at: Some(started.into()),
                 cwd: None,
                 closed: false,
+                transcript: None,
             });
             s
         }

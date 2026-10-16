@@ -43,7 +43,7 @@ use std::path::{Component, Path, PathBuf};
 
 use minds_core::{
     Agent, CaptureNote, ContentHash, EffectKind, Intent, Lineage, Model, Produced, Redaction, Role,
-    Session, ToolCall, Turn, WrittenUnavailable,
+    Session, ToolCall, TranscriptStatus, Turn, WrittenUnavailable,
 };
 
 use crate::edges;
@@ -140,13 +140,17 @@ pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
 /// Der Checkpoint braucht diese Brücke zurück zu den Events, um den
 /// PostToolUse-Payload eines Aufrufs zu finden ([`written_hashes`]).
 fn build_indexed(key: &SessionKey, events: &[JournalEvent]) -> (Session, Vec<usize>) {
-    build_with_transcript(key, events, read_transcript(events))
+    let (transcript, status) = read_transcript(events);
+    build_with_transcript(key, events, transcript, status)
 }
 
+/// Baut die Session aus Events und Transkript; `status` sagt, ob und warum
+/// das Transkript (nicht) gelesen wurde, und landet in der Lineage (K1).
 fn build_with_transcript(
     key: &SessionKey,
     events: &[JournalEvent],
     transcript: Transcript,
+    status: TranscriptStatus,
 ) -> (Session, Vec<usize>) {
     let agent = key.agent();
 
@@ -176,7 +180,10 @@ fn build_with_transcript(
         usage: transcript.usage,
         produced,
         redaction: Redaction::default(),
-        lineage: Some(lineage(key, events)),
+        lineage: Some(Lineage {
+            transcript: Some(status),
+            ..lineage(key, events)
+        }),
         edges: Vec::new(),
         intent_anchor: None,
         intent_events: Vec::new(),
@@ -215,14 +222,24 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
 
 /// Der Host darf aus fremden Hook-Pfaden keine Transkripte nachladen.
 /// Nur die Artefakt-Lesezugriffe werden gemappt; Evidence und Effektpfade
-/// bleiben im ursprünglichen Namensraum.
+/// bleiben im ursprünglichen Namensraum. Der Record sagt das (K1):
+/// `lineage.transcript = NotReadByWitness` — ein fehlendes Modell ist hier
+/// eine Entscheidung, kein Lesefehler. Trägt kein Event einen Pfad, gab es
+/// nichts zu entscheiden: dann `NoPathInEvents`, wie auf dem Hook-Pfad —
+/// Witness und Legacy bauen aus denselben Events dieselbe Session.
 pub fn checkpoint_witness(
     key: &SessionKey,
     events: &[JournalEvent],
     ctx: &Checkpoint,
     path_map: &[(PathBuf, PathBuf)],
 ) -> Session {
-    let (mut session, call_events) = build_with_transcript(key, events, Transcript::default());
+    let status = if events.iter().any(|e| e.transcript_path.is_some()) {
+        TranscriptStatus::NotReadByWitness
+    } else {
+        TranscriptStatus::NoPathInEvents
+    };
+    let (mut session, call_events) =
+        build_with_transcript(key, events, Transcript::default(), status);
     let agent_root = path_map
         .iter()
         .find(|(_, host)| Some(host.as_path()) == ctx.root)
@@ -884,19 +901,33 @@ fn unknown() -> String {
 /// Genommen wird der `transcript_path` des letzten Events, das einen trägt: Am
 /// Ende der Session ist das Transkript am vollständigsten. Fehlt die Datei oder
 /// lässt sie sich nicht lesen, ist das kein Fehler, sondern ein leeres
-/// Transkript — das Journal allein trägt die Session.
-fn read_transcript(events: &[JournalEvent]) -> Transcript {
+/// Transkript — das Journal allein trägt die Session. Der zweite Wert sagt,
+/// *warum* es leer blieb (K1); der Pfad selbst wird nie weitergegeben.
+fn read_transcript(events: &[JournalEvent]) -> (Transcript, TranscriptStatus) {
     let Some(path) = events
         .iter()
         .rev()
         .find_map(|e| e.transcript_path.as_deref())
     else {
-        return Transcript::default();
+        return (Transcript::default(), TranscriptStatus::NoPathInEvents);
     };
 
     match fs::read(Path::new(path)) {
-        Ok(bytes) => transcript::parse(&bytes),
-        Err(_) => Transcript::default(),
+        Ok(bytes) => {
+            let (parsed, entries) = transcript::parse_counted(&bytes);
+            let status = if parsed.model.is_some() {
+                TranscriptStatus::Read
+            } else if entries == 0 && !bytes.iter().all(u8::is_ascii_whitespace) {
+                TranscriptStatus::ParseFailed
+            } else {
+                TranscriptStatus::Empty
+            };
+            (parsed, status)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (Transcript::default(), TranscriptStatus::NotFound)
+        }
+        Err(_) => (Transcript::default(), TranscriptStatus::NotReadable),
     }
 }
 
@@ -1121,6 +1152,8 @@ fn lineage(key: &SessionKey, events: &[JournalEvent]) -> Lineage {
         closed: events
             .last()
             .is_some_and(|e| e.raw_kind == "SessionEnd" && e.kind == crate::EventKind::SessionEnd),
+        // Den Status setzt `build_with_transcript` — er weiß, ob gelesen wurde.
+        transcript: None,
     }
 }
 
@@ -1462,6 +1495,143 @@ mod tests {
         assert_eq!(s.model.id, "unknown");
         assert_eq!(s.model.provider, "unknown");
         assert_eq!(s.agent.version, "unknown");
+    }
+
+    /// Ein Prompt-Event, dessen `transcript_path` auf `path` zeigt.
+    fn pointing_at(path: Option<&Path>) -> Vec<JournalEvent> {
+        vec![JournalEvent {
+            transcript_path: path.map(|p| p.to_string_lossy().into_owned()),
+            ..ev(
+                0,
+                EventKind::Prompt,
+                "UserPromptSubmit",
+                "t0",
+                r#"{"prompt":"x"}"#,
+            )
+        }]
+    }
+
+    fn transcript_status(events: &[JournalEvent]) -> Option<TranscriptStatus> {
+        build_one(&key(), events)
+            .lineage
+            .as_ref()
+            .and_then(|l| l.transcript)
+    }
+
+    /// K1: Jeder Grund für ein ungelesenes Transkript steht in der Lineage —
+    /// und der Pfad nie. Ein lesbares Transkript mit Modell ist `Read`.
+    #[test]
+    fn the_lineage_records_why_the_transcript_was_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(
+            transcript_status(&pointing_at(None)),
+            Some(TranscriptStatus::NoPathInEvents)
+        );
+        assert_eq!(
+            transcript_status(&pointing_at(Some(&dir.path().join("missing.jsonl")))),
+            Some(TranscriptStatus::NotFound)
+        );
+
+        let empty = dir.path().join("empty.jsonl");
+        fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            transcript_status(&pointing_at(Some(&empty))),
+            Some(TranscriptStatus::Empty)
+        );
+        // Einträge ohne Assistant-Nachricht: gelesen, aber kein Modell.
+        let no_model = dir.path().join("no-model.jsonl");
+        fs::write(
+            &no_model,
+            br#"{"type":"user","message":{"role":"user","content":"hi"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            transcript_status(&pointing_at(Some(&no_model))),
+            Some(TranscriptStatus::Empty)
+        );
+
+        let garbage = dir.path().join("garbage.jsonl");
+        fs::write(&garbage, b"this is not a transcript\n<html></html>\n").unwrap();
+        assert_eq!(
+            transcript_status(&pointing_at(Some(&garbage))),
+            Some(TranscriptStatus::ParseFailed)
+        );
+
+        let read = dir.path().join("read.jsonl");
+        fs::write(
+            &read,
+            br#"{"type":"assistant","version":"1.4.2","message":{"model":"claude-opus-4","content":[{"type":"text","text":"Hallo."}]}}"#,
+        )
+        .unwrap();
+        let s = build_one(&key(), &pointing_at(Some(&read)));
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::Read)
+        );
+        assert_eq!(s.model.id, "claude-opus-4");
+        // Nie den Pfad speichern: Er trägt den Benutzernamen (PII).
+        let json = minds_core::to_canonical_string(&s).unwrap();
+        assert!(!json.contains(dir.path().to_str().unwrap()), "{json}");
+    }
+
+    /// K1: Keine Leserechte — `NotReadable`, nicht `NotFound`. Unter root
+    /// greifen Rechte nicht; dann bleibt nur der Nachweis, dass gelesen wird.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_transcript_is_not_readable_not_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked.jsonl");
+        fs::write(
+            &locked,
+            br#"{"type":"assistant","message":{"model":"claude-opus-4","content":[]}}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let expected = if fs::read(&locked).is_ok() {
+            TranscriptStatus::Read // root liest alles
+        } else {
+            TranscriptStatus::NotReadable
+        };
+        assert_eq!(
+            transcript_status(&pointing_at(Some(&locked))),
+            Some(expected)
+        );
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// K1: Der Witness liest kein Transkript — der Record sagt es.
+    #[test]
+    fn the_witness_path_records_that_it_did_not_read_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("read.jsonl");
+        fs::write(
+            &read,
+            br#"{"type":"assistant","message":{"model":"claude-opus-4","content":[]}}"#,
+        )
+        .unwrap();
+        let events = pointing_at(Some(&read));
+        let s = checkpoint_witness(&key(), &events, &Checkpoint::default(), &[]);
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::NotReadByWitness)
+        );
+        assert_eq!(s.model.id, "unknown");
+
+        // Ohne Pfad gab es nichts zu entscheiden: derselbe Status wie auf dem
+        // Hook-Pfad — und damit dieselbe Session (Parität Witness/Legacy).
+        let events = pointing_at(None);
+        let witness = checkpoint_witness(&key(), &events, &Checkpoint::default(), &[]);
+        let legacy = checkpoint(&key(), &events, &Checkpoint::default());
+        assert_eq!(
+            witness.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::NoPathInEvents)
+        );
+        assert_eq!(
+            minds_core::to_canonical_string(&witness).unwrap(),
+            minds_core::to_canonical_string(&legacy).unwrap()
+        );
     }
 
     #[test]

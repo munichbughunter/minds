@@ -322,6 +322,7 @@ mod tests {
             ended_at: None,
             cwd: Some("/repo".into()),
             closed: false,
+            transcript: None,
         });
         session.turns.push(minds_core::Turn {
             role: minds_core::Role::Assistant,
