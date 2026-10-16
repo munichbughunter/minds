@@ -2411,11 +2411,20 @@ mod changes_tab {
         assert_eq!(app.tab, Tab::Intent);
     }
 
+    /// Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landete in der Dateiliste;
+    /// jetzt liegt der Fokus beim Öffnen im Diff, auf der ersten Codezeile —
+    /// die Dateiliste ist über `Esc` erreichbar.
     #[test]
     fn opening_starts_on_the_first_file_with_unexplained_lines() {
         let state = ChangesState::new(vec![commit('1')], 0, Ok(set()));
         assert_eq!(state.file, 0);
-        assert_eq!(state.focus, Focus::Files);
+        assert_eq!(state.focus, Focus::Diff);
+        assert_ne!(
+            state.focus,
+            Focus::Files,
+            "no longer lands in the file list"
+        );
+        assert_eq!(state.row, 1, "the first code line, not the hunk header");
     }
 
     /// Wie `git diff`: Hunk-Kopf, alte und neue Nummer, `+`/`-` vor dem Text.
@@ -2502,12 +2511,14 @@ mod changes_tab {
     fn brackets_jump_hunks_in_the_diff() {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
-        app.reduce(Action::Enter);
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Kein `Enter` mehr nötig — der
+        // Tab landet selbst im Diff auf der ersten Codezeile.
         assert_eq!(
             app.changes.as_ref().unwrap().row,
             1,
-            "Enter lands on the first change"
+            "opening lands on the first change"
         );
+        assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Diff);
         app.reduce(Action::Bracket(false));
         assert_eq!(
             app.changes.as_ref().unwrap().row,
@@ -2652,12 +2663,16 @@ mod changes_tab {
     fn the_footer_names_the_commit_and_the_keys_of_the_focus() {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff, und das
+        // Wort in der Fußzeile folgt dem Zustand (`not-observed` mit Zahl)
+        // statt der internen Bezeichnung `unexplained`.
         let out = render(&mut app);
         assert!(out.contains("1111111 feat(sort): chronologisch"), "{out}");
-        assert!(out.contains("Enter diff"), "{out}");
-        app.reduce(Action::Enter);
+        assert!(out.contains("n next not-observed (2)"), "{out}");
+        assert!(!out.contains("n N unexplained"), "{out}");
+        app.reduce(Action::Back);
         let out = render(&mut app);
-        assert!(out.contains("n N unexplained"), "{out}");
+        assert!(out.contains("Enter diff"), "{out}");
     }
 
     /// Von Evidence → ARTIFACT mit Enter in den Diff des Commits.
@@ -2697,6 +2712,10 @@ mod changes_tab {
         app.stamp = Some("1".into());
         app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(set())));
         app.tab = Tab::Changes;
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff — erst
+        // `Esc` in die Dateiliste, dann die zweite Datei wählen.
+        app.reduce(Action::Back);
+        assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
         app.reload(
@@ -2806,6 +2825,10 @@ mod changes_tab {
     fn w_toggles_the_why_column_from_the_file_list_too() {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff; die
+        // Dateiliste erreicht `Esc`.
+        assert_ne!(app.changes.as_ref().unwrap().focus, Focus::Files);
+        app.reduce(Action::Back);
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
         app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(!app.changes.as_ref().unwrap().why);
@@ -2813,6 +2836,7 @@ mod changes_tab {
 
     mod b4;
     mod b4b;
+    mod c91;
 }
 
 // --- Verify-Tab -------------------------------------------------------------

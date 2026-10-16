@@ -553,7 +553,39 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Die häufigsten Aktionen des Fokus, nach Priorität — 4 bis 6 (C2); alles
 /// Weitere steht in der Hilfe. `? help  q quit` hängt [`pinned`] rechts an.
-pub(crate) fn actions(app: &App) -> Vec<&'static str> {
+pub(crate) fn actions(app: &App) -> Vec<String> {
+    if app.tab == Tab::Changes {
+        return changes_actions(app);
+    }
+    fixed_actions(app).into_iter().map(String::from).collect()
+}
+
+/// Die Tasten des Changes-Tabs (C9.1): `n` nennt den Zustand und die Zahl
+/// (`n next not-observed (29)`) — ohne solche Zeilen fällt die Taste weg.
+/// Intern heißt der Zustand weiter „unexplained"; nur das Wort folgt ihm.
+fn changes_actions(app: &App) -> Vec<String> {
+    let state = app.changes.as_ref();
+    let open = state.map_or(0, |s| s.not_observed());
+    let next = (open > 0).then(|| format!("n next not-observed ({open})"));
+    let (head, tail): (&[&str], &[&str]) = match state.map(|c| c.focus) {
+        Some(Focus::Diff) => (
+            &["↑↓ line", "] [ hunk"],
+            &["s split", "w why chain", "Esc files"],
+        ),
+        _ => (
+            &["↑↓ file", "Enter diff", "[ ] commit"],
+            &["c why column", "/ filter"],
+        ),
+    };
+    head.iter()
+        .map(|k| k.to_string())
+        .chain(next)
+        .chain(tail.iter().map(|k| k.to_string()))
+        .collect()
+}
+
+/// Die Tasten der übrigen Tabs — fest, ohne Zahlen.
+fn fixed_actions(app: &App) -> Vec<&'static str> {
     match app.tab {
         Tab::Overview => {
             if app
@@ -614,24 +646,7 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
             Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "w why", "Esc back"],
         },
         Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "w why"],
-        Tab::Changes => match app.changes.as_ref().map(|c| c.focus) {
-            Some(Focus::Diff) => vec![
-                "↑↓ line",
-                "] [ hunk",
-                "n N unexplained",
-                "s split",
-                "w why chain",
-                "Esc files",
-            ],
-            _ => vec![
-                "↑↓ file",
-                "Enter diff",
-                "[ ] commit",
-                "n next unexplained",
-                "c why column",
-                "/ filter",
-            ],
-        },
+        Tab::Changes => Vec::new(),
         Tab::Intent => vec!["↑↓ anchor", "Enter graph", "PgUp PgDn scroll", "/ filter"],
     }
 }

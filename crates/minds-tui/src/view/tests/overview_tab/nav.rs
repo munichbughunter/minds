@@ -99,6 +99,13 @@ fn nav_d_then_esc_leaves_no_history() {
     app.reduce(Action::Diff);
     assert_eq!(app.tab, Tab::Changes);
     assert_eq!(app.history.len(), 1);
+    // Klasse 2 (Batch 2, Paket 3 / C9.1): Changes landet im Diff; das erste
+    // `Esc` führt in die Dateiliste („Esc files" bleibt), erst das zweite
+    // zurück zum Ursprung — der Verlauf bleibt dazwischen erhalten.
+    app.reduce(Action::Back);
+    assert_eq!(app.tab, Tab::Changes);
+    assert_ne!(app.tab, Tab::Overview, "the first Esc stays in Changes");
+    assert_eq!(app.history.len(), 1);
     app.reduce(Action::Back);
     assert_eq!(app.tab, Tab::Overview);
     assert!(app.history.is_empty(), "{:?}", app.breadcrumb());

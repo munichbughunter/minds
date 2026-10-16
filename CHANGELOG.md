@@ -41,6 +41,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Changes lands on the first line, cursor visible.** Opening the Changes
+  tab (`d`, Enter on ARTIFACT, `F4`) puts the focus into the diff on the
+  first code line of the first hunk — never on the hunk header, never in
+  the file list; `d` from the Overview (`→ d, then n`) lands on the first
+  `◦ not observed` line (else the first `◇ reported` one). The cursor is the
+  one selection style of the interface over the whole diff line, from the
+  gutter to the end; the focused pane carries the bright frame and the `▸`
+  mark, the other is dimmed. `Esc` in the diff goes to FILES, a second `Esc`
+  back to the origin of a jump. Footer: `n next not-observed (29)` names
+  the state and the count; with no such line the key leaves the footer
+  (internally the class is still "unexplained"). On a hunk header the
+  why panel shows the file summary (`src/sort.py · 29 added lines`,
+  `29 reported by one Write (turn 2)`, `0 observed`) instead of a key hint.
+  Below 120 columns, `Enter` on a line opens the why panel as a layer,
+  `Esc` closes it.
 - **Overview detail: prompt as its own section, reasons for "unexplained",
   no `unknown`.** The request of the human is no longer a dimmed footnote
   under the session numbers: **PROMPT** shows the full text as recorded

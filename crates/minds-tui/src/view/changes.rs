@@ -33,6 +33,9 @@ pub const DEL_BG: Color = Color::Indexed(52);
 pub const SPLIT_MIN: u16 = 160;
 /// Ab dieser Breite rechts steht „Warum diese Zeile?" neben dem Diff.
 const WHY_BESIDE_MIN: u16 = 110;
+/// Unter dieser Terminalbreite ist „Warum diese Zeile?" keine Spalte,
+/// sondern eine Ebene über dem Diff (`Enter` auf der Zeile, `Esc` zurück).
+pub const WHY_LAYER_MAX: u16 = 120;
 /// Breite der Spalte „Warum diese Zeile?".
 const WHY_WIDTH: u16 = 46;
 
@@ -85,10 +88,18 @@ fn draw_state(frame: &mut Frame, app: &App, state: &ChangesState, area: Rect) ->
         Layout::horizontal([Constraint::Length(list_w), Constraint::Min(1)]).areas(area);
     draw_files(frame, state, files);
 
-    let [head, rest] = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).areas(right);
     let file = state.current()?;
     let split = split_shown(state, area.width);
-    draw_file_head(frame, state, file, head, area.width);
+    // Der Diff trägt den Rahmen seines Fokus (B7): hell, wenn der Cursor
+    // hier liegt, sonst gedimmt — die Marke im Titel sagt es auch ohne Farbe.
+    let (border, _) = theme::pane(state.focus == Focus::Diff);
+    let block = Block::bordered()
+        .title(file_title(state, file, area.width))
+        .border_style(border);
+    let inner = block.inner(right);
+    frame.render_widget(block, right);
+    let [head, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    draw_file_head(frame, file, head);
     // Im Split braucht der Diff die ganze Breite: Die Begründung steht dann
     // darunter.
     let (diff, why) = if !state.why {
@@ -202,29 +213,14 @@ fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
     );
 }
 
-fn draw_file_head(
-    frame: &mut Frame,
-    state: &ChangesState,
-    file: &FileDiff,
-    area: Rect,
-    width: u16,
-) {
-    let mut counts = [0usize; 4];
-    for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
-        match row.class {
-            Some(ReconClass::Explained) => counts[0] += 1,
-            Some(ReconClass::ExplainedFsOnly) => counts[1] += 1,
-            Some(ReconClass::ReportedOnly) => counts[2] += 1,
-            Some(ReconClass::Unexplained) => counts[3] += 1,
-            None => {}
-        }
-    }
+/// Der Titel des Diff-Bereichs: Fokus-Marke, Datei, Zahlen, Modus.
+fn file_title(state: &ChangesState, file: &FileDiff, width: u16) -> Line<'static> {
     let mode = match (state.split, split_shown(state, width)) {
         (true, true) => "split".to_string(),
         (true, false) => format!("split needs ≥{SPLIT_MIN} columns — unified"),
         _ => "unified".to_string(),
     };
-    let title = Line::from(vec![
+    Line::from(vec![
         Span::styled(
             format!(
                 " {}{}",
@@ -240,8 +236,29 @@ fn draw_file_head(
             format!("−{}", file.removed),
             Style::default().fg(theme::DELETE),
         ),
-        Span::styled(format!("   [{mode}]"), theme::dim()),
-    ]);
+        Span::styled(format!("   [{mode}] "), theme::dim()),
+    ])
+}
+
+/// Die Zählung der `+`-Zeilen einer Datei nach Zustand: beobachtet, nur im
+/// Dateisystem, berichtet, nicht beobachtet.
+fn class_counts(file: &FileDiff) -> [usize; 4] {
+    let mut counts = [0usize; 4];
+    for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
+        match row.class {
+            Some(ReconClass::Explained) => counts[0] += 1,
+            Some(ReconClass::ExplainedFsOnly) => counts[1] += 1,
+            Some(ReconClass::ReportedOnly) => counts[2] += 1,
+            Some(ReconClass::Unexplained) => counts[3] += 1,
+            None => {}
+        }
+    }
+    counts
+}
+
+/// Die Legende über dem Diff: je Zustand Glyph, Wort und Zahl.
+fn draw_file_head(frame: &mut Frame, file: &FileDiff, area: Rect) {
+    let counts = class_counts(file);
     let classes = Line::from(vec![
         Span::styled(" ● observed ", Style::default().fg(theme::OK)),
         Span::raw(format!("{}  ", counts[0])),
@@ -255,7 +272,56 @@ fn draw_file_head(
         ),
         Span::raw(format!("{}", counts[3])),
     ]);
-    frame.render_widget(Paragraph::new(vec![title, classes]), area);
+    frame.render_widget(Paragraph::new(vec![classes]), area);
+}
+
+/// Die Zusammenfassung einer Datei für den Hunk-Kopf (C9.1): Pfad und Zahl
+/// der hinzugefügten Zeilen, dann je Zustand eine Zeile mit der Zahl —
+/// `reported` mit dem Werkzeug und Turn, wenn alle Claims aus einem Aufruf
+/// stammen. Zeilenweise, damit im schmalen Panel nichts mitten im Satz
+/// umbricht.
+fn file_summary(app: &App, file: &FileDiff) -> Vec<String> {
+    let [observed, fs_only, reported, open] = class_counts(file);
+    let mut calls: std::collections::BTreeSet<(usize, usize, String)> = Default::default();
+    for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
+        if row.class == Some(ReconClass::ReportedOnly)
+            && let Some(reason) = row.source.and_then(|s| app.inspection.line_reason(s))
+        {
+            calls.insert((reason.turn, reason.call, reason.tool));
+        }
+    }
+    let mut parts = vec![format!(
+        "{} · {} added line{}",
+        file.path,
+        file.added,
+        if file.added == 1 { "" } else { "s" }
+    )];
+    if reported > 0 {
+        let by = match calls.len() {
+            0 => String::new(),
+            1 => {
+                let (turn, _, tool) = calls.iter().next().expect("one call");
+                format!(" by one {tool} (turn {})", turn + 1)
+            }
+            n => {
+                let tools: std::collections::BTreeSet<&str> =
+                    calls.iter().map(|(_, _, t)| t.as_str()).collect();
+                match tools.len() {
+                    1 => format!(" by {n} {} calls", tools.iter().next().expect("one tool")),
+                    _ => format!(" by {n} tool calls"),
+                }
+            }
+        };
+        parts.push(format!("{reported} reported{by}"));
+    }
+    if fs_only > 0 {
+        parts.push(format!("{fs_only} fs only"));
+    }
+    parts.push(format!("{observed} observed"));
+    if open > 0 {
+        parts.push(format!("{open} not observed"));
+    }
+    parts
 }
 
 /// Der Rand einer Zeile: Cursor und Klasse. Unerklärte `+`-Zeilen fett und
@@ -351,7 +417,9 @@ fn draw_unified(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: 
             }
             let line = Line::from(spans);
             if cursor {
-                line.style(Style::default().add_modifier(Modifier::BOLD))
+                // Der eine Auswahlstil (B7) über die ganze Zeile — vom Rand
+                // bis zum aufgefüllten Zeilenende.
+                line.style(theme::cursor())
             } else {
                 line
             }
@@ -405,7 +473,12 @@ fn draw_split(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Re
                 spans.push(Span::styled("│", theme::dim()));
                 spans.extend(side(*right, true));
             }
-            Line::from(spans)
+            let line = Line::from(spans);
+            if cursor {
+                line.style(theme::cursor())
+            } else {
+                line
+            }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), area);
@@ -419,10 +492,13 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
     match file.rows.get(state.row) {
         None => {}
         Some(row) if row.kind == DiffKind::Hunk => {
-            lines.push(Line::from(Span::styled(
-                "Hunk header — ] / [ jump between hunks.",
-                theme::dim(),
-            )));
+            // Der Hunk-Kopf zeigt die Datei im Ganzen — nie nur einen
+            // Tastenhinweis (C9.1).
+            lines.extend(
+                file_summary(app, file)
+                    .into_iter()
+                    .map(|part| Line::from(Span::styled(part, theme::dim()))),
+            );
         }
         Some(row) if row.kind == DiffKind::Context => {
             lines.push(Line::from(Span::styled(

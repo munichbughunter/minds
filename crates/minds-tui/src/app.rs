@@ -1194,6 +1194,8 @@ impl<'a> App<'a> {
     fn reduce_changes(&mut self, action: Action) {
         let page = self.page.max(1) as isize;
         let split_shown = self.width >= crate::view::changes::SPLIT_MIN;
+        // Unter 120 Spalten ist „Warum diese Zeile?" eine Ebene (C9.2).
+        let why_as_layer = self.width < crate::view::changes::WHY_LAYER_MAX;
         let Some(state) = self.changes.as_mut() else {
             return;
         };
@@ -1241,8 +1243,13 @@ impl<'a> App<'a> {
             (Focus::Diff, Action::Home) => state.row_to(false),
             (Focus::Diff, Action::End) => state.row_to(true),
             (Focus::Diff, Action::Bracket(forward)) => state.jump_hunk(forward),
+            // Esc (B1): erst die Ebene zu, dann in die Dateiliste.
+            (Focus::Diff, Action::Back) if state.why_layer => state.why_layer = false,
             (Focus::Diff, Action::Back) => state.focus = Focus::Files,
-            (Focus::Diff, Action::Enter) => self.why_of_row(),
+            (Focus::Diff, Action::Enter) if why_as_layer => state.why_layer = !state.why_layer,
+            (Focus::Diff, Action::Enter) => {
+                self.closed = Some("Enter: w opens the why chain of this line".into());
+            }
             _ => {}
         }
     }
@@ -1705,7 +1712,15 @@ impl<'a> App<'a> {
                 None => self.closed = Some("v: no commit here to verify".into()),
             },
             Action::Diff => match commit {
-                Some(commit) => self.open_changes(Some(commit)),
+                Some(commit) => {
+                    let from_overview = self.tab == Tab::Overview;
+                    self.open_changes(Some(commit));
+                    // Aus der Übersicht (`→ d, then n`, C9.1): auf die erste
+                    // Zeile im offenen Zustand, nicht auf die erste Codezeile.
+                    if from_overview && let Some(state) = self.changes.as_mut() {
+                        state.land_on_open();
+                    }
+                }
                 None => self.closed = Some("d: no commit here to diff".into()),
             },
             Action::Intent => {

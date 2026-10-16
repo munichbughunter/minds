@@ -36,6 +36,9 @@ pub struct ChangesState {
     pub why: bool,
     /// Der Filter aus `/` (B4) — leer: alle Dateien.
     pub filter: String,
+    /// „Warum diese Zeile?" liegt als Ebene über dem Diff (C9.2: unter 120
+    /// Spalten, per `Enter` auf der Zeile; `Esc` schließt sie).
+    pub why_layer: bool,
 }
 
 impl ChangesState {
@@ -46,14 +49,52 @@ impl ChangesState {
             at,
             set,
             file: 0,
-            focus: Focus::Files,
+            focus: Focus::Diff,
             row: 0,
             split: false,
             why: true,
             filter: String::new(),
+            why_layer: false,
         };
         state.file = state.first_interesting_file();
+        // C9.1: Der Tab landet im Diff, auf der ersten Codezeile — nie auf
+        // dem Hunk-Kopf, nie in der Dateiliste.
+        state.row = state.first_code_row();
         state
+    }
+
+    /// Die erste Codezeile der gewählten Datei — nie der Hunk-Kopf; `0`,
+    /// wenn es keine gibt.
+    pub fn first_code_row(&self) -> usize {
+        self.current()
+            .and_then(|f| f.rows.iter().position(|r| r.kind != DiffKind::Hunk))
+            .unwrap_or(0)
+    }
+
+    /// Landet auf der ersten Zeile im offenen Zustand (C9.1, der Sprung aus
+    /// `→ d, then n` der Übersicht): zuerst `◦ not observed`, sonst
+    /// `◇ reported`; gibt es keine, bleibt der Cursor, wo er ist.
+    pub fn land_on_open(&mut self) {
+        for class in [ReconClass::Unexplained, ReconClass::ReportedOnly] {
+            let hit = self.files().iter().enumerate().find_map(|(i, file)| {
+                file.rows
+                    .iter()
+                    .position(|r| r.kind == DiffKind::Added && r.class == Some(class))
+                    .map(|row| (i, row))
+            });
+            if let Some((file, row)) = hit {
+                self.file = file;
+                self.row = row;
+                self.focus = Focus::Diff;
+                return;
+            }
+        }
+    }
+
+    /// Wie viele `+`-Zeilen des Commits nicht beobachtet sind — die Zahl in
+    /// der Fußzeile (`n next not-observed (N)`), dieselbe wie `◦n`.
+    pub fn not_observed(&self) -> usize {
+        self.set.as_ref().map_or(0, ChangeSet::unexplained)
     }
 
     /// Der gezeigte Commit.
@@ -85,7 +126,7 @@ impl ChangesState {
         match self.files().iter().position(|f| f.identity == path) {
             Some(i) => {
                 self.file = i;
-                self.row = 0;
+                self.row = self.first_code_row();
                 true
             }
             None => false,
