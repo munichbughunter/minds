@@ -4253,6 +4253,7 @@ mod overview_tab {
     mod c3;
     mod c36;
     mod c3v2;
+    mod k1;
 }
 
 mod tamper;

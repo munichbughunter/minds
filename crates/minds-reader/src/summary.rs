@@ -15,7 +15,7 @@
 //! Wer den vollen Prompt will, klickt die Session an — die Verdichtung ersetzt
 //! ihn nicht, sie führt zu ihm hin.
 
-use minds_core::{Session, SessionId};
+use minds_core::{Session, SessionId, TranscriptStatus};
 
 use crate::text::sanitize;
 
@@ -49,7 +49,7 @@ impl Summary {
         Self {
             id,
             headline: headline(&session.intent.request, HEADLINE_MAX),
-            actor: format!("{} · {}", session.agent.name, session.model.id),
+            actor: actor_line(session),
             files: session.produced.files.len(),
             constraints: session.intent.constraints.len(),
             discarded: session.intent.discarded.len(),
@@ -84,7 +84,13 @@ pub struct Actor {
     pub model: Option<String>,
     /// Der Anbieter in seiner Schreibweise (`Anthropic`), nur wenn bekannt.
     pub provider: Option<String>,
+    /// Ob und warum das Transkript gelesen wurde (K1) — der Grund hinter
+    /// einem fehlenden Modell. `None`: von einem Binary ohne das Feld gebaut.
+    pub transcript: Option<TranscriptStatus>,
 }
+
+/// Was in der Oberfläche steht, wo ein Modell stünde, das nicht erfasst ist.
+pub const MODEL_NOT_RECORDED: &str = "model not recorded";
 
 impl Actor {
     /// Liest Agent und Modell einer Session; Platzhalter werden `None`.
@@ -95,8 +101,68 @@ impl Actor {
             version: field(&session.agent.version),
             model: field(&session.model.id),
             provider: recorded(&session.model.provider).map(provider_name),
+            transcript: session.lineage.as_ref().and_then(|l| l.transcript),
         }
     }
+
+    /// Das Modell samt Anbieter (`claude-opus-4-1 (Anthropic)`) — oder,
+    /// wenn es nicht erfasst ist, `model not recorded — <Grund>`; ohne
+    /// bekannten Grund nur `model not recorded`. Nie der Platzhalter.
+    pub fn model_label(&self) -> String {
+        match &self.model {
+            Some(model) => match &self.provider {
+                Some(provider) => format!("{model} ({provider})"),
+                None => model.clone(),
+            },
+            None => self.model_missing(),
+        }
+    }
+
+    /// Das Modell ohne Anbieter (`claude-opus-4-1`) für die knappe Form
+    /// `agent · modell`; nicht erfasst wie bei [`Self::model_label`].
+    pub fn model_word(&self) -> String {
+        match &self.model {
+            Some(model) => model.clone(),
+            None => self.model_missing(),
+        }
+    }
+
+    fn model_missing(&self) -> String {
+        match self.transcript {
+            // `Read` ohne Modell: das Transkript trug keines — ohne weiteren
+            // Grund, den der Record kennt.
+            Some(TranscriptStatus::Read) | None => MODEL_NOT_RECORDED.to_string(),
+            Some(status) => format!("{MODEL_NOT_RECORDED} — {}", transcript_reason(status)),
+        }
+    }
+}
+
+/// Der Glossar-Satz zu einem Transkript-Status (K1): warum das Modell fehlt,
+/// in den Worten der Oberfläche — eine Stelle, ein Satz je Status.
+pub fn transcript_reason(status: TranscriptStatus) -> &'static str {
+    match status {
+        TranscriptStatus::Read => "the transcript was read",
+        TranscriptStatus::NoPathInEvents => "the hook events carried no transcript path",
+        TranscriptStatus::NotFound => "the transcript file was not found at checkpoint time",
+        TranscriptStatus::NotReadable => "the transcript file could not be read",
+        TranscriptStatus::Empty => "the transcript held no assistant message",
+        TranscriptStatus::ParseFailed => "the transcript could not be parsed",
+        TranscriptStatus::NotReadByWitness => {
+            "the witness does not read transcripts from agent paths"
+        }
+    }
+}
+
+/// `agent · modell` für Listen, Graph-Knoten und die Why-Box — der Agent
+/// wie erfasst (oder `agent not recorded`), das Modell wie
+/// [`Actor::model_word`]. Entschärft; nie der Platzhalter `unknown`.
+pub fn actor_line(session: &Session) -> String {
+    let actor = Actor::of(session);
+    format!(
+        "{} · {}",
+        actor.agent.as_deref().unwrap_or("agent not recorded"),
+        actor.model_word()
+    )
 }
 
 /// Die Schreibweise eines Anbieters, den `minds-capture` rät; Unbekanntes
@@ -210,6 +276,67 @@ mod tests {
         let hostile = Actor::of(&session_of("a\u{1b}[31mb", "1", "anthropic", "m\nn"));
         assert!(!hostile.agent.unwrap().contains('\u{1b}'));
         assert!(!hostile.model.unwrap().contains('\n'));
+    }
+
+    /// K1: Ein fehlendes Modell nennt seinen Grund aus der Lineage — als
+    /// Satz, je Status einer; ohne Status (altes Binary) nur „not recorded".
+    /// Ein erfasstes Modell steht vollständig, mit Anbieter. Das Wort
+    /// `unknown` kommt nirgends vor.
+    #[test]
+    fn a_missing_model_names_why_the_transcript_was_not_read() {
+        let mut bare = session_of("claude-code", "unknown", "unknown", "unknown");
+        let mut lineage = minds_core::Lineage::new("l");
+        assert_eq!(Actor::of(&bare).model_label(), "model not recorded");
+        assert_eq!(actor_line(&bare), "claude-code · model not recorded");
+
+        for (status, reason) in [
+            (
+                TranscriptStatus::NoPathInEvents,
+                "the hook events carried no transcript path",
+            ),
+            (
+                TranscriptStatus::NotFound,
+                "the transcript file was not found at checkpoint time",
+            ),
+            (
+                TranscriptStatus::NotReadable,
+                "the transcript file could not be read",
+            ),
+            (
+                TranscriptStatus::Empty,
+                "the transcript held no assistant message",
+            ),
+            (
+                TranscriptStatus::ParseFailed,
+                "the transcript could not be parsed",
+            ),
+            (
+                TranscriptStatus::NotReadByWitness,
+                "the witness does not read transcripts from agent paths",
+            ),
+        ] {
+            lineage.transcript = Some(status);
+            bare.lineage = Some(lineage.clone());
+            let actor = Actor::of(&bare);
+            assert_eq!(actor.transcript, Some(status));
+            assert_eq!(
+                actor.model_label(),
+                format!("model not recorded — {reason}")
+            );
+            assert_eq!(
+                actor_line(&bare),
+                format!("claude-code · model not recorded — {reason}")
+            );
+            assert!(!actor.model_label().contains("unknown"));
+        }
+
+        let mut known = session_of("claude-code", "2.0", "anthropic", "claude-opus-4-1");
+        lineage.transcript = Some(TranscriptStatus::Read);
+        known.lineage = Some(lineage);
+        let actor = Actor::of(&known);
+        assert_eq!(actor.model_label(), "claude-opus-4-1 (Anthropic)");
+        assert_eq!(actor.model_word(), "claude-opus-4-1");
+        assert_eq!(actor_line(&known), "claude-code · claude-opus-4-1");
     }
 
     #[test]

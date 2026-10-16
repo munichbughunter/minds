@@ -428,10 +428,9 @@ impl crate::Inspection {
         };
         Some(LineReason {
             session: source.session,
-            agent: one_line(
-                &format!("{} · {}", session.agent.name, session.model.id),
-                80,
-            ),
+            // `agent · modell`, Platzhalter nie (C3.6/K1): ein fehlendes
+            // Modell nennt den Grund aus der Lineage.
+            agent: one_line(&crate::summary::actor_line(session), 120),
             request: one_line(&session.intent.request, SAID_LIMIT),
             turn: source.turn,
             call: source.call,

@@ -1100,6 +1100,7 @@ fn commit_detail(
                         }
                         head.push(Span::raw(text));
                     }
+                    // K1: der Grund aus der Lineage folgt in der nächsten Zeile.
                     None => head.push(Span::styled("model not recorded", theme::dim())),
                 }
                 let short = sid.to_string();
@@ -1125,6 +1126,20 @@ fn commit_detail(
         } else {
             line
         });
+        // K1: Fehlt das Modell und kennt der Record den Grund, steht er in
+        // einer eigenen gedimmten Zeile — der Kopf behält Id und Zeit.
+        if let Some(reason) = session
+            .map(minds_reader::Actor::of)
+            .filter(|actor| actor.model.is_none())
+            .and_then(|actor| actor.transcript)
+            .filter(|status| *status != minds_core::TranscriptStatus::Read)
+            .map(minds_reader::summary::transcript_reason)
+        {
+            lines.push(Line::from(Span::styled(
+                crate::view::clip(&format!("    — {reason}"), inner),
+                theme::dim(),
+            )));
+        }
         if let Some(card) = &cards[i] {
             let claimed = card.summary.files;
             let plural = |n: usize| if n == 1 { "" } else { "s" };

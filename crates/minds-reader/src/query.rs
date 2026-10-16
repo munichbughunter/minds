@@ -494,11 +494,18 @@ impl Inspection {
     }
 
     fn inner_steps(&self, session: &Session) -> Vec<WhyStep> {
+        // Platzhalter aus `minds-capture` werden nie weitergegeben (C3.6/K1):
+        // eine nicht erfasste Version bleibt leer, ein fehlendes Modell nennt
+        // den Grund aus der Lineage.
+        let actor = crate::summary::Actor::of(session);
         vec![
             WhyStep::Agent {
-                name: sanitize(&session.agent.name),
-                version: sanitize(&session.agent.version),
-                model: sanitize(&session.model.id),
+                name: actor
+                    .agent
+                    .clone()
+                    .unwrap_or_else(|| "agent not recorded".into()),
+                version: actor.version.clone().unwrap_or_default(),
+                model: actor.model_word(),
             },
             WhyStep::Intent {
                 request: crate::text::sanitize_lines(session.intent.request.split('\n')),

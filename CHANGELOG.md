@@ -17,6 +17,28 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **The reason for an unread transcript is recorded and shown (K1).** A
+  session record now says why its model, response texts and token counts
+  are missing: `lineage.transcript` carries one of `read`,
+  `no_path_in_events`, `not_found`, `not_readable`, `empty`, `parse_failed`
+  or `not_read_by_witness` — a fixed word, never the path (it holds the
+  user name). Additive like `closed`: absent is not written, stored sessions
+  keep their bytes and id; imported sessions are `read` by definition; a
+  session the witness builds says `not_read_by_witness` (the witness does not
+  load transcripts from agent paths) when the events carried a path, and
+  otherwise the same `no_path_in_events` as the hook path. The reader
+  (`minds_reader::Actor::transcript`, `model_label`, `actor_line`,
+  `summary::transcript_reason`) turns the word into a sentence, and the TUI
+  shows it wherever a model is named — Overview detail (own dimmed line under
+  the session), Changes why-box (`Agent  claude-code · model not recorded —
+  the witness does not read transcripts from agent paths`), graph head,
+  sessions list and why chain; with `read` the model stands in full
+  (`claude-opus-4-1 (Anthropic)`). The placeholder `unknown` is printed in no
+  view. `docs/commands.md` (show, inspect) and `docs/verification-guide.md`
+  explain the status.
+
 ### Changed
 
 - **Overview detail: prompt as its own section, reasons for "unexplained",
