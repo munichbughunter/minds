@@ -262,6 +262,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Navigation history never stacks the same origin.** A tab key (F1–F5,
+  `1–5`, Tab) back to a tab that lies in the history as an origin ends that
+  jump: every entry from it on is dropped, so `d`, F1, `d`, F1, `d` reads
+  `Overview › 609aca8 › Changes › 609aca8` — not the origin three times. An
+  origin equal to the last entry (same tab, same place) is not pushed again,
+  the breadcrumb never shows the same place twice in a row, and the history
+  keeps at most eight entries (the oldest fall away).
+
 - **Managed settings without `Write(…)` rules.** Claude Code checks file
   access only against `Read(…)`/`Edit(…)` and warned at every start about the
   `Write(…)` rules of the protected setup (and of the `managed` proposal);

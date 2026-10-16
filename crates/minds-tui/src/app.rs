@@ -322,6 +322,21 @@ pub struct NavEntry {
     pub base: usize,
 }
 
+impl NavEntry {
+    /// Der Ort des Ursprungs für den Breadcrumb (siehe [`place`]).
+    pub(crate) fn place(&self) -> Vec<String> {
+        place(
+            self.tab,
+            &self.views,
+            self.verify
+                .as_ref()
+                .and_then(|s| s.commit())
+                .or(self.changes.as_ref().and_then(|s| s.commit()))
+                .or(self.active_commit),
+        )
+    }
+}
+
 /// Was das Tamper-Banner meldet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TamperAlert {
@@ -1562,6 +1577,7 @@ impl<'a> App<'a> {
                     | Action::Intent
             )
             .then(|| self.snapshot());
+            let tab_key = matches!(action, Action::TabTo(_) | Action::CycleTab(_));
             self.reduce_action(action);
             if let Some(mut entry) = origin
                 && entry.tab != self.tab
@@ -1573,7 +1589,13 @@ impl<'a> App<'a> {
                 } else {
                     0
                 };
-                self.history.push(entry);
+                self.remember(entry);
+            }
+            // Ein Tab-Wechsel per Taste (F1–F5, 1–5, Tab) auf einen Tab, der
+            // im Verlauf als Ursprung liegt, beendet dessen Sprung: der Nutzer
+            // ist zurück am Ursprung, alles ab diesem Eintrag fällt weg.
+            if tab_key && let Some(at) = self.history.iter().position(|e| e.tab == self.tab) {
+                self.history.truncate(at);
             }
         }
         self.sync_active();
@@ -1809,8 +1831,30 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Höchstens so viele Ursprünge merkt sich der Verlauf; die ältesten
+    /// fallen weg.
+    pub(crate) const HISTORY_CAP: usize = 8;
+
+    /// Legt einen Ursprung ab — außer er gleicht dem letzten Eintrag (Tab und
+    /// Ort): dann ist der Sprung derselbe, der Breadcrumb zeigt den Ort nicht
+    /// zweimal. Über [`Self::HISTORY_CAP`] hinaus fällt der älteste Eintrag.
+    pub(crate) fn remember(&mut self, entry: NavEntry) {
+        if self
+            .history
+            .last()
+            .is_some_and(|last| last.tab == entry.tab && last.place() == entry.place())
+        {
+            return;
+        }
+        self.history.push(entry);
+        if self.history.len() > Self::HISTORY_CAP {
+            let excess = self.history.len() - Self::HISTORY_CAP;
+            self.history.drain(..excess);
+        }
+    }
+
     /// Der Ursprung, wie er gerade ist.
-    fn snapshot(&self) -> NavEntry {
+    pub(crate) fn snapshot(&self) -> NavEntry {
         NavEntry {
             tab: self.tab,
             views: self.views.clone(),
@@ -1901,27 +1945,26 @@ impl<'a> App<'a> {
     }
 
     /// Der Pfad für den Breadcrumb: je Sprung der Ursprung, dann der
-    /// aktuelle Ort.
+    /// aktuelle Ort — derselbe Ort nie zweimal hintereinander.
     pub fn breadcrumb(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for entry in &self.history {
-            out.extend(place(
-                entry.tab,
-                &entry.views,
-                entry
-                    .verify
-                    .as_ref()
-                    .and_then(|s| s.commit())
-                    .or(entry.changes.as_ref().and_then(|s| s.commit()))
-                    .or(entry.active_commit),
-            ));
-        }
         let shown = match self.tab {
             Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
             Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
             _ => self.active_commit,
         };
-        out.extend(place(self.tab, &self.views, shown));
+        let mut out: Vec<String> = Vec::new();
+        let mut last: Option<Vec<String>> = None;
+        for next in self
+            .history
+            .iter()
+            .map(NavEntry::place)
+            .chain(std::iter::once(place(self.tab, &self.views, shown)))
+        {
+            if last.as_ref() != Some(&next) {
+                out.extend(next.iter().cloned());
+                last = Some(next);
+            }
+        }
         out
     }
 

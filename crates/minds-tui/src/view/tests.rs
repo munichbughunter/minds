@@ -4254,6 +4254,7 @@ mod overview_tab {
     mod c36;
     mod c3v2;
     mod k1;
+    mod nav;
 }
 
 mod tamper;
