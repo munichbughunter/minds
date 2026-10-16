@@ -593,11 +593,106 @@ fn draw_split(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Re
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-/// „Warum diese Zeile?" für die Cursorzeile.
+/// Das Zustandswort einer Zeile (C9.3/C9.4): `observed`, `fs only`,
+/// `reported`, `not observed` — das Wort der Oberfläche, nicht das des
+/// Readers (`reported only`, `unexplained`).
+fn state_word(class: ReconClass) -> &'static str {
+    match class {
+        ReconClass::Explained => "observed",
+        ReconClass::ExplainedFsOnly => "fs only",
+        ReconClass::ReportedOnly => "reported",
+        ReconClass::Unexplained => theme::not_observed().1,
+    }
+}
+
+/// Die Brücke zum Witness — nur bei `reported` und `fs only`, wo ein
+/// Zeuge die Zeile zu `● observed` machte.
+const BRIDGE: &str = "With a witness this line would be ● observed.";
+
+/// Der Satz zu einem Zustand mit Beleg (nicht für `not observed`, dessen
+/// Gründe eigene Sätze haben). `tool` ist das Werkzeug des Claims.
+fn state_sentence(class: ReconClass, tool: &str) -> Vec<String> {
+    match class {
+        ReconClass::Explained => vec![
+            "A witness observed this content on disk after the agent's write — the hash matched."
+                .into(),
+        ],
+        ReconClass::ExplainedFsOnly => vec![
+            "The witness saw this content in the file system; no tool call claims this line."
+                .into(),
+            BRIDGE.into(),
+        ],
+        ReconClass::ReportedOnly => vec![
+            format!(
+                "The agent's {tool} tool reported this content; its hash matches the committed bytes. No witness observed the write, so this is the agent's own statement, not an observation."
+            ),
+            BRIDGE.into(),
+        ],
+        ReconClass::Unexplained => Vec::new(),
+    }
+}
+
+/// Die WRITTEN-BY-Zeile: Agent-Badge, Agent, Turn, Uhrzeit und Relativangabe
+/// — **eine** Stelle für Agent und Modell, damit der Transkript-Status
+/// (K1) hier ansetzen kann.
+fn written_by_line(reason: &minds_reader::changes::LineReason, now: i64) -> Vec<Span<'static>> {
+    let agent = reason
+        .agent
+        .split(" · ")
+        .next()
+        .unwrap_or(&reason.agent)
+        .to_string();
+    let initials = crate::overview::initials(&agent);
+    let mut text = format!("{agent} · turn {}", reason.turn + 1);
+    if let Some(clock) = crate::view::clock_z(reason.at.as_deref()) {
+        text.push_str(&format!(
+            " · {clock} · {}",
+            crate::view::ago(reason.at.as_deref(), now)
+        ));
+    }
+    vec![
+        Span::styled(
+            format!("◉{initials} "),
+            Style::default()
+                .fg(theme::AGENT)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(text),
+    ]
+}
+
+/// Die AGENT-SAID-Zeile: der Text des Agenten als Aussage (`◌ "…"`), mit
+/// dem Turn, wenn er aus einem früheren stammt; fehlt er, der Grund — **eine**
+/// Stelle, an der der Transkript-Status (K1) seinen Satz anbringt.
+fn agent_said_line(reason: &minds_reader::changes::LineReason) -> Vec<Span<'static>> {
+    let (claim, _, claim_style) = theme::claim();
+    match &reason.said {
+        Some(said) => {
+            let turn = match reason.said_turn {
+                Some(t) if t != reason.turn => format!("(turn {}) ", t + 1),
+                _ => String::new(),
+            };
+            vec![
+                Span::styled(format!("{claim} "), claim_style),
+                Span::raw(format!("{turn}\"{said}\"")),
+            ]
+        }
+        None => vec![Span::styled(
+            "— (transcript not read)".to_string(),
+            theme::dim(),
+        )],
+    }
+}
+
+/// „Warum diese Zeile?" für die Cursorzeile (C9.3). Kopf `pfad:zeile  ◇
+/// REPORTED`, der Satz zum Zustand, dann in fester Reihenfolge WRITTEN BY,
+/// SESSION, REQUIREMENT, ASKED FOR, AGENT SAID, REVIEW — leere Abschnitte
+/// entfallen; zuletzt, gedimmt, Commit und Change-Id. Keine Tastenhinweise:
+/// Tasten stehen in der Fußzeile.
 fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    let mut tail: Vec<Line> = Vec::new();
-    let label = |key: &str| Span::styled(format!("{key:<9}"), theme::dim());
+    let label = |key: &str| Span::styled(format!("{key:<13}"), theme::dim());
+    let indent = || Span::raw(" ".repeat(13));
     match file.rows.get(state.row) {
         None => {}
         Some(row) if row.kind == DiffKind::Hunk => {
@@ -626,18 +721,41 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
             )));
         }
         Some(row) => {
+            let reason = row.source.and_then(|s| app.inspection.line_reason(s));
+            // Kopf: Datei und Zeile, dann der Zustand als Glyph und Wort.
+            let place = match row.new {
+                Some(n) => format!("{}:{n}", file.path),
+                None => file.path.clone(),
+            };
+            let state_span = match row.class {
+                Some(class) => {
+                    let (glyph, _, style) = theme::recon(class);
+                    let style = if class == ReconClass::Unexplained {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        style.add_modifier(Modifier::BOLD)
+                    };
+                    Span::styled(
+                        format!("{glyph} {}", state_word(class).to_uppercase()),
+                        style,
+                    )
+                }
+                None => Span::styled("· NOT ASSESSED", theme::dim()),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(place, theme::title()),
+                Span::raw("  "),
+                state_span,
+            ]));
+            // Der Satz zum Zustand.
+            let tool = reason.as_ref().map_or("write", |r| r.tool.as_str());
             match row.class {
                 Some(ReconClass::Unexplained) => {
-                    lines.push(Line::from(Span::styled(
-                        "◦ NOT OBSERVED",
-                        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
-                    )));
-                    lines.push(Line::raw(""));
                     lines.push(Line::raw(
                         "No evidence of the sessions linked to this commit backs this line.",
                     ));
                     // Warum — aus dem, was die Sessions über die Datei wissen;
-                    // nie, wer die Zeile schrieb.
+                    // nie, wer die Zeile schrieb. Die Sätze bleiben wörtlich.
                     let (why, shell) = match file.gap {
                         Some(Gap::AfterAgent { later_shell }) => (
                             "The last tool claim on this file (write or delete) does not carry the version of this commit.",
@@ -674,132 +792,115 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                         None => ("Minds cannot attest this line.", None),
                     };
                     lines.push(Line::from(Span::styled(why, theme::dim())));
-                    if let Some(reason) = shell.and_then(|s| app.inspection.line_reason(s)) {
-                        let id = reason.session.to_string();
+                    if let Some(mention) = shell.and_then(|s| app.inspection.line_reason(s)) {
+                        let id = mention.session.to_string();
                         lines.push(Line::raw(""));
                         lines.push(Line::from(Span::styled(
                             "Mentioned by a shell command (heuristic, not evidence):",
                             theme::dim(),
                         )));
                         lines.push(Line::from(vec![
-                            label("Shell"),
+                            label("SHELL"),
                             Span::raw(format!(
                                 "turn {} · {} (call {})",
-                                reason.turn + 1,
-                                reason.tool,
-                                reason.call + 1
+                                mention.turn + 1,
+                                mention.tool,
+                                mention.call + 1
                             )),
                         ]));
                         lines.push(Line::from(vec![
-                            label("Session"),
-                            Span::raw(format!("{}… · {}", &id[..id.len().min(12)], reason.agent)),
+                            label("SESSION"),
+                            Span::raw(format!("{} · {}", short_session(&id), mention.agent)),
                         ]));
-                        if let Some(said) = reason.said {
-                            tail.push(Line::raw(""));
-                            tail.push(Line::from(Span::styled(
-                                format!(
-                                    "Agent said (turn {}, unverified)",
-                                    reason.said_turn.unwrap_or(reason.turn) + 1
-                                ),
-                                theme::title(),
-                            )));
-                            tail.push(Line::raw(said));
+                        if let Some(said) = &mention.said {
+                            let (claim, _, claim_style) = theme::claim();
+                            lines.push(Line::from(vec![
+                                label("AGENT SAID"),
+                                Span::styled(format!("{claim} "), claim_style),
+                                Span::raw(format!(
+                                    "(turn {}, unverified) \"{said}\"",
+                                    mention.said_turn.unwrap_or(mention.turn) + 1
+                                )),
+                            ]));
                         }
                     }
                 }
                 Some(class) => {
-                    let (glyph, word, style) = theme::recon(class);
-                    lines.push(Line::from(Span::styled(
-                        format!("{glyph} {}", word.to_uppercase()),
-                        style.add_modifier(Modifier::BOLD),
-                    )));
-                }
-                None => lines.push(Line::from(Span::styled("· not assessed", theme::dim()))),
-            }
-            match row.source.and_then(|s| app.inspection.line_reason(s)) {
-                Some(reason) => {
-                    let id = reason.session.to_string();
-                    lines.push(Line::raw(""));
-                    lines.push(Line::from(vec![
-                        label("Session"),
-                        Span::raw(format!("{}…", &id[..id.len().min(12)])),
-                    ]));
-                    lines.push(Line::from(vec![label("Agent"), Span::raw(reason.agent)]));
-                    lines.push(Line::from(vec![
-                        label("Step"),
-                        Span::raw(format!(
-                            "turn {} · {} (call {})",
-                            reason.turn + 1,
-                            reason.tool,
-                            reason.call + 1
-                        )),
-                    ]));
-                    if let Some(at) = reason.at {
-                        lines.push(Line::from(vec![label("At"), Span::raw(at)]));
+                    for sentence in state_sentence(class, tool) {
+                        lines.push(Line::raw(sentence));
                     }
-                    if let Some(anchor) = reason.anchor {
-                        let how = match anchor.record {
-                            minds_reader::intent::AnchorRecord::WitnessEvent => "witness event",
-                            minds_reader::intent::AnchorRecord::LocalFile => "local file",
-                        };
-                        let id = anchor.id.to_string();
-                        lines.push(Line::from(vec![
-                            label("Intent"),
-                            Span::raw(format!("anchor {}… ({how})", &id[..id.len().min(14)])),
-                        ]));
-                    }
-                    // Prosa zuletzt (nach Commit und Review): Ein langer Text des
-                    // Agenten darf die Metadaten nicht aus dem Feld schieben.
-                    if let Some(said) = reason.said {
-                        tail.push(Line::raw(""));
-                        // Stammt der Text aus einem früheren Turn, steht das dabei.
-                        let heading = match reason.said_turn {
-                            Some(t) if t != reason.turn => format!("Agent said (turn {})", t + 1),
-                            _ => "Agent said".to_string(),
-                        };
-                        tail.push(Line::from(Span::styled(heading, theme::title())));
-                        tail.push(Line::raw(said));
-                    }
-                    tail.push(Line::raw(""));
-                    tail.push(Line::from(Span::styled("Asked for", theme::title())));
-                    tail.push(Line::raw(reason.request));
-                }
-                None if row.class == Some(ReconClass::ExplainedFsOnly) => {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::from(Span::styled(
-                        "Seen in the file system; no tool call claims this line.",
-                        theme::dim(),
-                    )));
-                }
-                None if row.class.is_some_and(|c| c != ReconClass::Unexplained) => {
-                    lines.push(Line::raw(""));
-                    lines.push(Line::from(Span::styled(
-                        "Produced by the sessions' writes; the exact step could not be pinned down (repeated line or size budget).",
-                        theme::dim(),
-                    )));
                 }
                 None => {}
+            }
+            // Die Abschnitte in fester Reihenfolge; leere entfallen.
+            if let Some(reason) = &reason {
+                let id = reason.session.to_string();
+                lines.push(Line::raw(""));
+                let mut written = vec![label("WRITTEN BY")];
+                written.extend(written_by_line(reason, app.now_secs()));
+                lines.push(Line::from(written));
+                let attributed = file
+                    .rows
+                    .iter()
+                    .filter(|r| r.kind == DiffKind::Added && r.source == row.source)
+                    .count();
+                lines.push(Line::from(vec![
+                    indent(),
+                    Span::raw(format!(
+                        "{} {} ({attributed} line{})",
+                        reason.tool,
+                        file.path,
+                        if attributed == 1 { "" } else { "s" }
+                    )),
+                ]));
+                let mut session = vec![label("SESSION"), Span::raw(short_session(&id))];
+                if let Some(card) = app.inspection.card(reason.session) {
+                    let (glyph, word, style) = theme::provenance(&card.provenance);
+                    session.push(Span::styled(" · ", theme::dim()));
+                    session.push(Span::styled(format!("{glyph} record {word}"), style));
+                }
+                lines.push(Line::from(session));
+                if let Some(anchor) = &reason.anchor {
+                    let how = match anchor.record {
+                        minds_reader::intent::AnchorRecord::WitnessEvent => "witness event",
+                        minds_reader::intent::AnchorRecord::LocalFile => "local file",
+                    };
+                    lines.push(Line::from(vec![
+                        label("REQUIREMENT"),
+                        Span::raw(format!(
+                            "⚑ {}",
+                            crate::view::overview::anchor_short(&anchor.id)
+                        )),
+                        Span::styled(format!(" · {how}"), theme::dim()),
+                    ]));
+                }
+                if !reason.request.is_empty() {
+                    let (claim, _, claim_style) = theme::claim();
+                    lines.push(Line::from(vec![
+                        label("ASKED FOR"),
+                        Span::styled(format!("{claim} "), claim_style),
+                        Span::raw(format!("\"{}\"", reason.request)),
+                    ]));
+                }
+                let mut said = vec![label("AGENT SAID")];
+                said.extend(agent_said_line(reason));
+                lines.push(Line::from(said));
+            } else if row.class == Some(ReconClass::ExplainedFsOnly) {
+                // Der Satz oben sagt es schon; nichts zu ergänzen.
+            } else if row.class.is_some_and(|c| c != ReconClass::Unexplained) {
+                lines.push(Line::raw(""));
+                lines.push(Line::from(Span::styled(
+                    "Produced by the sessions' writes; the exact step could not be pinned down (repeated line or size budget).",
+                    theme::dim(),
+                )));
             }
         }
     }
     if let Ok(set) = &state.set {
         lines.push(Line::raw(""));
-        let short = set.commit.to_string()[..7].to_string();
-        let mut commit = vec![label("Commit"), Span::raw(short)];
-        if let Some(subject) = &set.subject {
-            commit.push(Span::raw(format!(" {subject}")));
-        }
-        lines.push(Line::from(commit));
-        if let Some(change) = &set.change {
-            lines.push(Line::from(vec![
-                label("Change"),
-                Span::raw(change.to_string()),
-            ]));
-        }
-        let (glyph, word, style) = theme::verdict(set.review.verdict);
         lines.push(Line::from(vec![
-            label("Review"),
-            Span::styled(format!("{glyph} {word}"), style),
+            label("REVIEW"),
+            crate::view::review_span(set.review.verdict),
         ]));
         if let Some(why) = &set.unassessed {
             lines.push(Line::from(Span::styled(
@@ -807,8 +908,13 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                 theme::dim(),
             )));
         }
+        // Commit und Change-Id nur als Kurzform in der gedimmten Schlusszeile.
+        let mut tail = format!("commit {}", &set.commit.to_string()[..7]);
+        if let Some(change) = &set.change {
+            tail.push_str(&format!(" · change {}", clip(&change.to_string(), 14)));
+        }
+        lines.push(Line::from(Span::styled(tail, theme::dim())));
     }
-    lines.extend(tail);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
@@ -817,4 +923,9 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
         ),
         area,
     );
+}
+
+/// Die Kurzform einer Session-Id wie in der Übersicht: `b3-75f030fa`.
+fn short_session(id: &str) -> String {
+    id.get(..11).unwrap_or(id).to_string()
 }

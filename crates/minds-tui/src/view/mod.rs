@@ -284,14 +284,13 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let status = match &state.set {
         Ok(set) => {
-            let (glyph, word, style) = theme::verdict(set.review.verdict);
             let mut spans = vec![
                 Span::styled(
                     set.commit.to_string()[..7].to_string(),
                     Style::default().fg(theme::CHANGE),
                 ),
                 Span::raw(format!(" {}  ", set.subject.clone().unwrap_or_default())),
-                Span::styled(format!("{glyph} {word}"), style),
+                review_span(set.review.verdict),
             ];
             if let Some(why) = &set.unassessed {
                 spans.push(Span::styled(
@@ -885,6 +884,26 @@ pub fn when(ts: Option<&str>) -> String {
             _ => ts.to_string(),
         },
         None => "—".into(),
+    }
+}
+
+/// `HH:MM:SSZ` aus dem RFC-3339-Zeitstempel (C9.3) — die Uhrzeit, nicht
+/// der volle Stempel mit Millisekunden; `None` für Unlesbares.
+pub fn clock_z(ts: Option<&str>) -> Option<String> {
+    let ts = ts?;
+    minds_metrics::epoch_seconds(ts)?;
+    ts.get(11..19).map(|hms| format!("{hms}Z"))
+}
+
+/// Das Urteil als Span: offen heißt `◦ not reviewed yet` — gedimmt, nie in
+/// der Warnfarbe (C9.3); die übrigen Urteile wie [`theme::verdict`].
+pub(crate) fn review_span(verdict: minds_reader::model::Verdict) -> Span<'static> {
+    if verdict == minds_reader::model::Verdict::Open {
+        let (glyph, _, style) = theme::open();
+        Span::styled(format!("{glyph} not reviewed yet"), style)
+    } else {
+        let (glyph, word, style) = theme::verdict(verdict);
+        Span::styled(format!("{glyph} {word}"), style)
     }
 }
 

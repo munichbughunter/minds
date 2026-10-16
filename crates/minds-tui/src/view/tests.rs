@@ -2574,11 +2574,19 @@ mod changes_tab {
         app.reduce(Action::Down);
         let out = render(&mut app);
         assert!(out.contains("WHY THIS LINE?"), "{out}");
-        assert!(out.contains("REPORTED ONLY"), "{out}");
-        assert!(out.contains("turn 1 · Edit (call 2)"), "{out}");
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): Kopf `◇ REPORTED` mit Satz
+        // statt `REPORTED ONLY`; der Schritt steht unter WRITTEN BY als
+        // Turn und Werkzeug mit Datei, nicht als `Step … (call N)`.
+        assert!(out.contains("◇ REPORTED"), "{out}");
+        assert!(!out.contains("REPORTED ONLY"), "{out}");
+        assert!(out.contains("claude-code · turn 1 ·"), "{out}");
+        assert!(out.contains("Edit src/sort/mod.rs (1 line)"), "{out}");
+        assert!(!out.contains("turn 1 · Edit (call 2)"), "{out}");
         assert!(out.contains("Ich lese und ändere."), "{out}");
         assert!(out.contains("Fix retry handling"), "{out}");
-        assert!(out.contains("Review"), "{out}");
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): das Label heißt REVIEW.
+        assert!(out.contains("REVIEW"), "{out}");
+        assert!(!out.contains("Review   "), "{out}");
 
         app.reduce(Action::Down);
         let out = render(&mut app);
@@ -2620,9 +2628,16 @@ mod changes_tab {
             out.contains("No tool claim for this file. A shell"),
             "{out}"
         );
-        assert!(out.contains("Shell    turn 1 · Bash (call 3)"), "{out}");
-        assert!(out.contains("Agent said (turn 1, unverified)"), "{out}");
-        assert!(out.contains("Session  b3-aaaaaaaaa"), "{out}");
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): die Labels der Why-Box sind
+        // die festen Abschnittsnamen (SHELL, SESSION, AGENT SAID), die
+        // Session-Id steht in der Kurzform der Übersicht; die Wörter
+        // „heuristic, not evidence" und „unverified" bleiben.
+        assert!(out.contains("SHELL        turn 1 · Bash (call 3)"), "{out}");
+        assert!(!out.contains("Shell    turn 1"), "{out}");
+        assert!(out.contains("AGENT SAID   ◌ (turn 1, unverified)"), "{out}");
+        assert!(!out.contains("Agent said (turn 1, unverified)"), "{out}");
+        assert!(out.contains("SESSION      b3-aaaaaaaa"), "{out}");
+        assert!(!out.contains("Session  b3-aaaaaaaaa"), "{out}");
 
         set_gap(&mut app, Gap::AfterAgent { later_shell: None });
         let out = render_at(&mut app, 260);
@@ -2630,7 +2645,7 @@ mod changes_tab {
             out.contains("The last tool claim on this file (write or"),
             "{out}"
         );
-        assert!(!out.contains("Shell    turn"), "{out}");
+        assert!(!out.contains("SHELL        turn"), "{out}");
 
         set_gap(&mut app, Gap::Untouched { complete: true });
         let out = render_at(&mut app, 260);
@@ -2798,10 +2813,12 @@ mod changes_tab {
         app.reduce(Action::Up);
         assert_eq!(app.changes.as_ref().unwrap().row, 3);
         let out = render_at(&mut app, 200);
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): der Kopf heißt `◇ REPORTED`.
         assert!(
-            out.contains("REPORTED ONLY"),
+            out.contains("◇ REPORTED"),
             "the why column means the new side: {out}"
         );
+        assert!(!out.contains("REPORTED ONLY"), "{out}");
     }
 
     /// Ein Commit außerhalb der HEAD-Historie (über ARTIFACT geöffnet) bleibt
@@ -2862,6 +2879,7 @@ mod changes_tab {
     mod b4b;
     mod c91;
     mod c92;
+    mod c93;
 }
 
 // --- Verify-Tab -------------------------------------------------------------

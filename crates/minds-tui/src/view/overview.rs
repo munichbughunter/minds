@@ -737,8 +737,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Die Kurzform eines Ankers: acht Hex-Zeichen ohne Präfix.
-fn anchor_short(id: &minds_core::ContentHash) -> String {
+/// Die Kurzform eines Ankers: acht Hex-Zeichen ohne Präfix — dieselbe in
+/// der Übersicht und in „Warum diese Zeile?".
+pub(crate) fn anchor_short(id: &minds_core::ContentHash) -> String {
     let text = id.to_string();
     // `b3-<hex>` (oder `<algo>:<hex>`): nur die Hex-Ziffern.
     let hex = text.rsplit(['-', ':']).next().unwrap_or(&text);

@@ -41,6 +41,23 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Why this line? in a fixed order, with a sentence and the witness
+  bridge.** The panel opens with the place and the state
+  (`src/sort.py:28  ◇ REPORTED`) and one sentence per state: observed,
+  fs only, reported, not observed (the reasons of an unexplained line
+  keep their wording); for `reported` and `fs only` it adds the bridge
+  "With a witness this line would be ● observed." Then, in this order and
+  only when there is something to say: **WRITTEN BY** (`◉CC claude-code ·
+  turn 2 · 10:39:09Z · 3d ago`, then `Write src/sort.py (29 lines)`),
+  **SESSION** (`b3-75f030fa · ◈ record sealed`), **REQUIREMENT**
+  (`⚑ ac8f1bb7 · witness event` — the short form of the Overview),
+  **ASKED FOR** and **AGENT SAID** as quoted claims (`◌ "…"`; a missing
+  answer says `— (transcript not read)`), **REVIEW** (`◦ not reviewed
+  yet`, never yellow — also in footer line 1). Commit and change id only
+  as a dimmed last line (`commit 609aca8 · change I8d166b6d5e7…`); no key
+  hints in the panel. `Enter` on a code line opens the session's graph
+  with the cursor on that tool call (`Esc` returns); `w` still opens the
+  why chain.
 - **Changes layout by width, diff without line background.** At 160
   columns and more, FILES is a pane of 28 columns, the diff takes the rest
   and WHY THIS LINE? 56; from 120 to 159 the files become one line above

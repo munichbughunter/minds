@@ -1247,14 +1247,60 @@ impl<'a> App<'a> {
             (Focus::Diff, Action::Back) if state.why_layer => state.why_layer = false,
             (Focus::Diff, Action::Back) => state.focus = Focus::Files,
             (Focus::Diff, Action::Enter) if why_as_layer => state.why_layer = !state.why_layer,
-            (Focus::Diff, Action::Enter) => {
-                self.closed = Some("Enter: w opens the why chain of this line".into());
-            }
+            (Focus::Diff, Action::Enter) => self.goto_tool_call(),
             _ => {}
         }
     }
 
-    /// Enter auf einer Diff-Zeile: die Herkunftskette dieser Zeile — im
+    /// Enter auf einer Codezeile (C9.3): der Graph der Session, die sie
+    /// schrieb, mit dem Cursor auf genau diesem Tool-Aufruf — der Rückweg
+    /// führt per Esc über den Verlauf (Paket 2). Die Zuordnung Zeile →
+    /// (Session, Turn, Aufruf) ist [`minds_reader::reconcile::LineSource`];
+    /// ohne sie sagt die Fußzeile es (B4).
+    fn goto_tool_call(&mut self) {
+        let source = self.changes.as_ref().and_then(|state| {
+            state
+                .current()
+                .and_then(|f| f.rows.get(state.row))
+                .and_then(|r| r.source)
+        });
+        let Some(source) = source else {
+            self.closed = Some(
+                "Enter: no tool call is recorded for this line — w opens the why chain".into(),
+            );
+            return;
+        };
+        let Some(graph) = self.inspection.graph(source.session) else {
+            self.closed = Some("that session is not readable".into());
+            return;
+        };
+        // Der Knoten des Aufrufs: der `call`-te Tool-Knoten unter dem
+        // `turn`-ten Zug — so baut `SessionGraph::build` den Graphen.
+        let turn = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Turn(_)))
+            .nth(source.turn)
+            .map(|n| n.id);
+        let node = turn.and_then(|turn| {
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.parent == Some(turn) && matches!(n.kind, NodeKind::Tool(_)))
+                .nth(source.call)
+                .map(|n| n.id)
+        });
+        self.goto_session(source.session);
+        if let (Some(node), Some(View::Graph { rows, cursor, .. })) = (node, self.views.last_mut())
+            && let Some(at) = rows
+                .iter()
+                .position(|r| r.node <= node && node < r.node + r.count)
+        {
+            *cursor = at;
+        }
+    }
+
+    /// `w` auf einer Diff-Zeile: die Herkunftskette dieser Zeile — im
     /// Sessions-Tab, `Esc` führt zurück in die Liste. Auf HEAD die Kette der
     /// Zeile (Blame), auf älteren Commits die des Commits.
     fn why_of_row(&mut self) {
