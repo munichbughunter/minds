@@ -167,6 +167,25 @@ impl ChangesState {
         self.row = 0;
     }
 
+    /// Die nächste (`true`) oder vorige Datei der Dateizeile, umlaufend —
+    /// `Tab`/`Shift-Tab` unter 160 Spalten (C9.2). Der Cursor landet wie beim
+    /// Öffnen auf der ersten Codezeile (C9.1), der Fokus bleibt.
+    pub fn cycle_file(&mut self, forward: bool) {
+        let shown = self.shown();
+        let Some(last) = shown.len().checked_sub(1) else {
+            return;
+        };
+        let at = shown.iter().position(|&i| i == self.file).unwrap_or(0);
+        let next = match (forward, at) {
+            (true, at) if at >= last => 0,
+            (true, at) => at + 1,
+            (false, 0) => last,
+            (false, at) => at - 1,
+        };
+        self.file = shown[next];
+        self.row = self.first_code_row();
+    }
+
     /// Die Dateien, die der Filter aus `/` durchlässt (B4) — nach Pfad.
     pub fn shown(&self) -> Vec<usize> {
         let files = self.files();

@@ -576,8 +576,12 @@ fn changes_actions(app: &App) -> Vec<String> {
             &["c why column", "/ filter"],
         ),
     };
+    // In der Dateizeile (unter 160 Spalten) wechselt `Tab` die Datei (C9.2).
+    let tab_file = (app.width > 0 && app.width < crate::view::changes::FILES_PANE_MIN)
+        .then(|| "Tab file".to_string());
     head.iter()
         .map(|k| k.to_string())
+        .chain(tab_file)
         .chain(next)
         .chain(tail.iter().map(|k| k.to_string()))
         .collect()

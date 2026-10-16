@@ -38,7 +38,7 @@ fn section(tab: Tab) -> &'static str {
         }
         Tab::Verify => "Verify:   ↑↓ row · Enter open (session, diff) · [ ] commit",
         Tab::Changes => {
-            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · w why chain of the line · Esc back"
+            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · w why chain of the line · Esc back\n          Tab / Shift-Tab next / previous file in the files line (below 160 columns)"
         }
         Tab::Intent => {
             "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it\n          in why: Enter on the anchor"

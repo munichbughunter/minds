@@ -190,3 +190,51 @@ fn c92_the_gutter_glyph_is_dim_when_it_matches_the_file_state() {
         .unwrap();
     assert_eq!(buffer[(marker, y)].fg, theme::DIM);
 }
+
+/// Unter 160 Spalten ist FILES eine Zeile über dem Diff — dort wechselt
+/// `Tab` zur nächsten, `Shift-Tab` zur vorigen Datei (umlaufend), der Cursor
+/// landet auf der ersten Codezeile der Datei; der Tab-Wechsel bleibt den
+/// Ziffern und F-Tasten.
+#[test]
+fn c92_tab_picks_the_next_file_in_the_files_line() {
+    let (_dir, repo) = repo();
+    let mut app = app_with_changes(&repo);
+    let _ = render_sized(&mut app, 120, 30);
+    assert_eq!(app.changes.as_ref().unwrap().file, 0);
+    app.reduce(Action::CycleTab(true));
+    assert_eq!(app.tab, Tab::Changes, "Tab stays in the tab");
+    let state = app.changes.as_ref().unwrap();
+    assert_eq!(state.file, 1);
+    assert_eq!(state.row, state.first_code_row());
+    assert_ne!(state.row, 0, "never the hunk header");
+    let out = render_sized(&mut app, 120, 30);
+    assert!(out.contains("▸ tests/t.rs"), "{out}");
+    assert!(!out.contains("▸ src/sort/mod.rs"), "{out}");
+    // Umlaufend: hinter der letzten Datei die erste.
+    app.reduce(Action::CycleTab(true));
+    assert_eq!(app.changes.as_ref().unwrap().file, 0);
+    app.reduce(Action::CycleTab(false));
+    assert_eq!(app.changes.as_ref().unwrap().file, 1);
+    app.reduce(Action::CycleTab(false));
+    assert_eq!(app.changes.as_ref().unwrap().file, 0);
+    // Die Fußzeile nennt die Taste nur in der Dateizeile.
+    let out = render_sized(&mut app, 120, 30);
+    assert!(out.contains("Tab file"), "{out}");
+    // Der Verlauf wächst durch den Dateiwechsel nicht (Paket 2, Regel 1
+    // gilt nur für echte Tab-Wechsel).
+    assert!(app.history.is_empty());
+}
+
+/// Ab 160 Spalten ist FILES ein Pane — `Tab` wechselt den Tab wie überall.
+#[test]
+fn c92_tab_cycles_the_tab_when_files_is_a_pane() {
+    let (_dir, repo) = repo();
+    let mut app = app_with_changes(&repo);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(!out.contains("Tab file"), "{out}");
+    app.reduce(Action::CycleTab(true));
+    assert_eq!(app.tab, Tab::Intent);
+    assert_eq!(app.changes.as_ref().unwrap().file, 0);
+    app.reduce(Action::CycleTab(false));
+    assert_eq!(app.tab, Tab::Changes);
+}

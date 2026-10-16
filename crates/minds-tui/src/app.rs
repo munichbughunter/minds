@@ -1204,6 +1204,17 @@ impl<'a> App<'a> {
         self.changes = Some(next);
     }
 
+    /// Ob `Tab` gerade die Datei wechselt: im Changes-Tab, solange FILES eine
+    /// Zeile über dem Diff ist (die letzte gezeichnete Breite unter 160
+    /// Spalten) und es Dateien gibt. Vor dem ersten Zeichnen (Breite 0) und
+    /// mit dem FILES-Pane bleibt `Tab` der Tab-Wechsel.
+    fn files_line_takes_tab(&self) -> bool {
+        self.tab == Tab::Changes
+            && self.width > 0
+            && self.width < crate::view::changes::FILES_PANE_MIN
+            && self.changes.as_ref().is_some_and(|c| !c.files().is_empty())
+    }
+
     /// Die Tasten im Changes-Tab.
     fn reduce_changes(&mut self, action: Action) {
         let page = self.page.max(1) as isize;
@@ -1215,6 +1226,7 @@ impl<'a> App<'a> {
         };
         match (state.focus, action) {
             (_, Action::Split) => state.split = !state.split,
+            (_, Action::CycleFile(forward)) => state.cycle_file(forward),
             (_, Action::Context) => state.why = !state.why,
             (_, Action::Unexplained(forward)) => {
                 if state.jump_unexplained(forward) {
@@ -1627,6 +1639,13 @@ impl<'a> App<'a> {
         // Auch vorher: Die Startauswahl (HEAD) ist schon aktiv, bevor die
         // erste Taste fällt.
         self.sync_active();
+        // In der Dateizeile des Changes-Tabs (unter 160 Spalten) wechselt
+        // `Tab` die Datei, nicht den Tab (C9.2) — kein Tab-Wechsel für den
+        // Verlauf (Paket 2, Regel 1).
+        let action = match action {
+            Action::CycleTab(forward) if self.files_line_takes_tab() => Action::CycleFile(forward),
+            other => other,
+        };
         // Esc, Schritt 4 (B1/B2): auf der Ebene eines Sprungs zurück zum
         // Ursprung — mit Ebenen und Cursor.
         if action == Action::Back && self.at_jump_base() {
