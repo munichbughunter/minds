@@ -574,8 +574,8 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
                         "Enter its graph"
                     },
                 ];
-                if requirement_text(app) {
-                    keys.push("Space requirement");
+                if let Some(hint) = space_hint(app) {
+                    keys.push(hint);
                 }
                 keys.extend(["e evidence", "Esc back"]);
                 keys
@@ -583,8 +583,8 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
                 // Die sechs häufigsten (C2, C3.5) — `/ filter` und, mit
                 // Space, `d diff` stehen in der Hilfe.
                 let mut keys = vec!["↑↓ commit", "Enter how it was made", "a agent only/all"];
-                if requirement_text(app) {
-                    keys.push("Space requirement");
+                if let Some(hint) = space_hint(app) {
+                    keys.push(hint);
                 }
                 keys.extend(["w why", "v verify", "d diff"]);
                 keys.truncate(6);
@@ -699,11 +699,25 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
 }
 
 /// Ob Space im Detail der Übersicht etwas aufklappt: ein belegter Anker
-/// mit Text (C3.4).
-fn requirement_text(app: &App) -> bool {
-    app.overview
-        .as_ref()
-        .is_some_and(|state| state.has_requirement_text())
+/// mit Text (C3.4), sonst ein gekürzter Prompt (C3.6) — `None`, wenn es
+/// nichts aufzuklappen gibt.
+fn space_hint(app: &App) -> Option<&'static str> {
+    let state = app.overview.as_ref()?;
+    if state.has_requirement_text() {
+        return Some("Space requirement");
+    }
+    let row = state.agent_commit()?;
+    let cap = if row.sessions.len() <= 2 {
+        overview::PROMPT_LINES
+    } else {
+        overview::PROMPT_LINES_MANY
+    };
+    let index = app.inspection.index();
+    row.sessions
+        .iter()
+        .filter_map(|sid| index.session(*sid))
+        .any(|s| s.intent.request.lines().count() > cap)
+        .then_some("Space prompt")
 }
 
 /// Der Filterzustand der Übersicht für Zeile 1 der Fußzeile (C3.5).

@@ -19,6 +19,26 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Overview detail: prompt as its own section, reasons for "unexplained",
+  no `unknown`.** The request of the human is no longer a dimmed footnote
+  under the session numbers: **PROMPT** shows the full text as recorded
+  (`◌ as recorded by the agent` — a claim, not evidence), wrapped, up to 12
+  lines and then `… N more lines`; `Space` unfolds it. With one session the
+  section stands before SESSIONS, with several each session card carries
+  its own, in session order; nothing is shown twice. Every `◦` line in
+  EVIDENCE names its reason: COVERAGE adds the most common reason with its
+  count (`— no tool claim or shell mention found: all 46 (session records
+  0 files)`) and `+ N other reasons → d`; the reader aggregates the reasons
+  from the same lines the Changes tab classifies (`LineClasses::reasons`,
+  `files`), so both tabs show one number. A session that claims no files
+  while the commit changes some says so in SESSIONS (`0 files claimed ·
+  commit changes 2 files`, dimmed — a gap, not a finding). The placeholder
+  `unknown` that `minds-capture` writes for an unread model, provider or
+  agent version is never printed: the reader reports it as not recorded
+  (`minds_reader::recorded`, `Actor`), the detail shows
+  `claude-code · claude-opus-4-1 (Anthropic)` or `model not recorded`.
+  `docs/commands.md` describes PROMPT, the reasons and the wording.
+
 - **Overview header and footer.** The header names the branch by its short
   name (`main`, not `refs/heads/main`). Footer line 1 names the selected
   commit and the filter state (`b89bba7 · showing agent sessions only`) — no

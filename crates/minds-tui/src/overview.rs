@@ -93,6 +93,9 @@ pub struct OverviewState {
     pub requirements: HashMap<ContentHash, Result<crate::IntentDetail, String>>,
     /// Ob der Anforderungstext aufgeklappt ist (Space).
     pub requirement_open: bool,
+    /// Ob der Prompt vollständig gezeigt wird (Space, C3.6) — zugeklappt
+    /// stehen höchstens `PROMPT_LINES` Zeilen je Session.
+    pub prompt_open: bool,
     /// Wie weit das Detail gescrollt ist (aufgeklappt, PgUp/PgDn).
     pub detail_scroll: u16,
     /// Ob die Übersicht schmal gezeichnet wird (unter 100 Spalten): dann
@@ -120,6 +123,7 @@ impl OverviewState {
             lines: HashMap::new(),
             requirements: HashMap::new(),
             requirement_open: false,
+            prompt_open: false,
             detail_scroll: 0,
             narrow: false,
         };
@@ -196,13 +200,21 @@ impl OverviewState {
         *self = next;
     }
 
-    /// Space (C3.4): klappt den Anforderungstext auf oder zu — nur, wenn
-    /// es ihn gibt; sonst bleibt PgUp/PgDn bei der Liste.
-    pub fn toggle_requirement(&mut self) {
-        if !self.has_requirement_text() {
+    /// Space: klappt das Detail auf oder zu — den Anforderungstext eines
+    /// belegten Ankers (C3.4) und den vollen Prompt (C3.6). Ohne
+    /// Agent-Commit tut Space nichts, PgUp/PgDn bleiben bei der Liste.
+    pub fn toggle_detail(&mut self) {
+        let requirement = self.has_requirement_text();
+        let prompt = self.agent_commit().is_some();
+        if !requirement && !prompt {
             return;
         }
-        self.requirement_open = !self.requirement_open;
+        if requirement {
+            self.requirement_open = !self.requirement_open;
+        }
+        if prompt {
+            self.prompt_open = !self.prompt_open;
+        }
         self.detail_scroll = 0;
     }
 
