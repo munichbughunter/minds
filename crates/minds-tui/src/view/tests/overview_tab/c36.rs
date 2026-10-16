@@ -70,32 +70,50 @@ impl crate::Source for Plain {
     }
 }
 
-/// Ein echter Commit mit zwei Dateien (vier hinzugefügte Zeilen) und eine
-/// Session, die keinen Dateiclaim trägt — wie der Screenshot vom 15.10.
-fn without_claims(request: &str, model: (&str, &str)) -> (tempfile::TempDir, Repo, Inspection) {
+/// Ein echter Commit mit zwei Dateien (vier hinzugefügte Zeilen), auf zwei
+/// Branches und mit Change-Id — der Kopf des Details ist damit so lang wie
+/// im Alltag (Branches umgebrochen, Change-Zeile), nicht so kurz wie in
+/// einer Minimal-Fixture. Die Sessions tragen keinen Dateiclaim — wie der
+/// Screenshot vom 15.10.
+fn linked(sessions_in: Vec<(SessionId, Session)>) -> (tempfile::TempDir, Repo, Inspection) {
     let (dir, _) = repo();
     std::fs::write(dir.path().join("a"), "one\ntwo\nthree\n").unwrap();
     std::fs::write(dir.path().join("b"), "four\n").unwrap();
     git(dir.path(), &["add", "a", "b"]);
     git(dir.path(), &["commit", "-q", "-m", "feat: two files"]);
+    git(dir.path(), &["branch", "feat/two-files-with-a-long-name"]);
     let head: CommitId = git(dir.path(), &["rev-parse", "HEAD"]).parse().unwrap();
+    let mut sessions = BTreeMap::new();
+    let mut ids = Vec::new();
+    for (id, mut s) in sessions_in {
+        s.produced.files.clear();
+        s.turns[0].tool_calls.clear();
+        ids.push(id);
+        sessions.insert(id, s);
+    }
+    let mut commits = BTreeMap::new();
+    commits.insert(head, ids.clone());
+    let change: minds_core::ChangeId = format!("I{}", "c".repeat(40)).parse().unwrap();
+    let mut changes = BTreeMap::new();
+    changes.insert(head, change);
+    let mut index = Index::from_parts(sessions, commits).with_changes(changes);
+    for id in ids {
+        let (seal_id, seal) = clean_seal(id);
+        index = index.with_seals(id, vec![(seal_id, seal, false)]);
+    }
+    let inspection = Inspection::from_index(index, vec![], "r");
+    let repo = Repo::open(dir.path()).unwrap();
+    (dir, repo, inspection)
+}
+
+/// Eine Session ohne Dateiclaim mit diesem Auftrag und Modell.
+fn without_claims(request: &str, model: (&str, &str)) -> (tempfile::TempDir, Repo, Inspection) {
     let mut s = session(request, "2026-10-02T10:00:00Z");
-    s.produced.files.clear();
-    s.turns[0].tool_calls.clear();
     s.model = minds_core::Model {
         provider: model.0.into(),
         id: model.1.into(),
     };
-    let mut sessions = BTreeMap::new();
-    sessions.insert(sid('a'), s);
-    let mut commits = BTreeMap::new();
-    commits.insert(head, vec![sid('a')]);
-    let (seal_id, seal) = clean_seal(sid('a'));
-    let index =
-        Index::from_parts(sessions, commits).with_seals(sid('a'), vec![(seal_id, seal, false)]);
-    let inspection = Inspection::from_index(index, vec![], "r");
-    let repo = Repo::open(dir.path()).unwrap();
-    (dir, repo, inspection)
+    linked(vec![(sid('a'), s)])
 }
 
 /// Die Übersicht auf HEAD, das Detail vollständig gelesen.
@@ -162,7 +180,8 @@ fn c36_the_prompt_is_its_own_section_not_a_footnote() {
 }
 
 /// AC1 bei 80 Spalten: Das Detail ist eine Ebene hinter Enter — und zeigt
-/// den PROMPT ebenso.
+/// den PROMPT ebenso. In 24 Zeilen hat neben dem langen Kopf und EVIDENCE
+/// kein Prompt-Text Platz: Der Kopf sagt, wie viel fehlt; Space zeigt ihn.
 #[test]
 fn c36_the_prompt_is_there_in_a_narrow_terminal_too() {
     let (_dir, repo, inspection) = without_claims(&twenty_lines(), ("anthropic", "opus"));
@@ -171,8 +190,13 @@ fn c36_the_prompt_is_there_in_a_narrow_terminal_too() {
     app.reduce(Action::Enter);
     let out = lines_at(&mut app, 80, 24).join("\n");
     assert!(out.contains("PROMPT"), "{out}");
-    assert!(out.contains("line 01 of the request"), "{out}");
+    assert!(out.contains("… 20 lines · Space shows all"), "{out}");
+    assert!(out.contains("INTEGRITY"), "{out}");
     assert!(out.contains("? help"), "{out}");
+    app.reduce(Action::Space);
+    let out = lines_at(&mut app, 80, 24).join("\n");
+    assert!(out.contains("line 01 of the request"), "{out}");
+    assert!(!out.contains("Space shows all"), "{out}");
 }
 
 /// AC2 + AC3: COVERAGE nennt den häufigsten Grund mit Zahl und die
@@ -264,6 +288,11 @@ fn c36_the_collapsed_prompt_never_hides_the_evidence_axes() {
             assert!(detail.contains(axis), "{w}: {axis} missing: {detail}");
         }
     }
+    // Die Fußzeile bietet `Space prompt`, weil der letzte Draw kürzte; der
+    // Hinweis steht auch in der Kürzungszeile selbst.
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(out.contains("Space prompt"), "{out}");
+    assert!(out.contains("more lines · Space shows all"), "{out}");
     let _ = lines_at(&mut app, 80, 24);
     app.reduce(Action::Enter);
     let out = lines_at(&mut app, 80, 24).join("\n");
@@ -272,6 +301,49 @@ fn c36_the_collapsed_prompt_never_hides_the_evidence_axes() {
     app.reduce(Action::PageDown);
     let out = lines_at(&mut app, 80, 24).join("\n");
     assert!(out.contains("REVIEW"), "{out}");
+}
+
+/// Review: Mehrere Sessions mit langen Prompts bei 120×30 — der zweite
+/// Pfad der Fensterrechnung: eine Karte mit PROMPT-Unterabschnitt, die
+/// übrigen gezählt, alle fünf Achsen sichtbar.
+#[test]
+fn c36_several_long_prompts_keep_the_axes_at_120_columns() {
+    const AXES: [&str; 5] = [
+        "INTEGRITY",
+        "COVERAGE",
+        "INTERPRETATION",
+        "REQUIREMENT",
+        "REVIEW",
+    ];
+    let (_dir, repo, inspection) = linked(vec![
+        (sid('a'), session(&twenty_lines(), "2026-10-02T10:00:00Z")),
+        (sid('b'), session(&twenty_lines(), "2026-10-02T11:00:00Z")),
+    ]);
+    let mut app = on_head(&repo, inspection);
+    for (w, h) in [(120u16, 30u16), (160, 40)] {
+        let detail = detail_text(&mut app, w, h);
+        assert!(detail.contains("SESSIONS (2)"), "{w}: {detail}");
+        assert!(detail.contains("PROMPT"), "{w}: {detail}");
+        assert!(detail.contains("more lines"), "{w}: {detail}");
+        for axis in AXES {
+            assert!(detail.contains(axis), "{w}: {axis} missing: {detail}");
+        }
+    }
+}
+
+/// Review: Space ist ohne etwas Aufklappbares ein No-op — ein kurzer
+/// Prompt ohne Anker setzt `prompt_open` nicht, PgUp/PgDn bleiben bei der
+/// Liste.
+#[test]
+fn c36_space_does_nothing_when_nothing_is_clipped() {
+    let (_dir, repo, inspection) = without_claims("Write the files", ("anthropic", "opus"));
+    let mut app = on_head(&repo, inspection);
+    let out = lines_at(&mut app, 160, 40).join("\n");
+    assert!(!out.contains("Space prompt"), "{out}");
+    assert!(!out.contains("more lines"), "{out}");
+    app.reduce(Action::Space);
+    let state = app.overview.as_ref().unwrap();
+    assert!(!state.prompt_open && !state.requirement_open);
 }
 
 /// Eine Quelle mit belegtem Anker — trifft erst nach dem ersten Space ein.
@@ -319,22 +391,34 @@ impl crate::Source for WithAnchor {
 /// nächste Space beides; nie wechseln sich die Flags ab.
 #[test]
 fn c36_space_keeps_requirement_and_prompt_in_step() {
-    let (_dir, repo, commits, inspection) = history();
-    let mut app = opened(&repo, inspection);
-    app.overview.as_mut().unwrap().select_commit(commits[1]);
+    // Ein langer Prompt und ein Anker an derselben Session.
+    let mut s = session(&twenty_lines(), "2026-10-02T10:00:00Z");
+    s.intent_events.push(IntentEvent {
+        seq: 1,
+        anchor_id: ContentHash::from_bytes([1; 32]),
+        opens_session: true,
+    });
+    let (_dir, repo, inspection) = linked(vec![(sid('a'), s)]);
+    let mut app = App::new(inspection, &repo, None);
+    app.open_overview();
     let flags = |app: &App| {
         let s = app.overview.as_ref().unwrap();
         (s.requirement_open, s.prompt_open)
     };
+    // Gezeichnet (der Prompt ist gekürzt), der Anker noch nicht gelesen.
+    let _ = detail_text(&mut app, 160, 40);
     app.reduce(Action::Space);
     assert_eq!(flags(&app), (false, true));
     while app.fill_overview(&WithAnchor) {}
     assert!(app.overview.as_ref().unwrap().has_requirement_text());
     app.reduce(Action::Space);
     assert_eq!(flags(&app), (false, false));
+    let _ = detail_text(&mut app, 160, 40);
     app.reduce(Action::Space);
     assert_eq!(flags(&app), (true, true));
-    assert!(detail_text(&mut app, 160, 40).contains("Sort stably."));
+    let open = detail_text(&mut app, 160, 60);
+    assert!(open.contains("Sort stably."), "{open}");
+    assert!(open.contains("line 20 of the request"), "{open}");
     app.reduce(Action::Space);
     assert_eq!(flags(&app), (false, false));
 }

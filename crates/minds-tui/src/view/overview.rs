@@ -924,17 +924,24 @@ fn commit_detail(
     // bekommt eine eigene Zeile unter den Fakten.
     let contradicts = |card: &Option<minds_reader::model::SessionCard>| matches!((card, commit_files), (Some(c), Some(changed)) if c.summary.files == 0 && changed > 0);
     let any_contradiction = usize::from(cards.iter().any(contradicts));
+    // EVIDENCE wird zuerst gebaut (es hängt nicht vom Prompt ab) und am
+    // Ende gezeigt — so rechnet der Platz für den Prompt mit seiner echten
+    // Höhe, nicht mit einer Schätzung.
+    let evidence = evidence_lines(state, row, &cards, inner);
     // Zugeklappt nur so viele Zeilen, dass SESSIONS (eine Karte) und
     // EVIDENCE darunter sichtbar bleiben — der Prompt drängt die
-    // Trust-Achsen nie aus dem Bild; mindestens PROMPT_MIN Zeilen. Rahmen,
-    // das Bisherige, PROMPT-Kopf und -Hinweis, Leerzeile, SESSIONS-Kopf,
-    // eine Karte, Leerzeile, EVIDENCE.
-    let fixed = 2 + lines.len() + 1 + 1 + 1 + 1 + 2 + any_contradiction + 1 + EVIDENCE_RESERVE;
+    // Trust-Achsen nie aus dem Bild, notfalls bleibt nur sein Kopf. Rahmen,
+    // das Bisherige, PROMPT-Kopf und -Hinweis, eine Zeile Abstand (bei
+    // einer Session die Leerzeile nach PROMPT, bei mehreren `… N more`),
+    // SESSIONS-Kopf, eine Karte, Leerzeile, EVIDENCE.
+    let fixed = 2 + lines.len() + 1 + 1 + 1 + 1 + 2 + any_contradiction + 1 + evidence.len();
     let cap = prompt_cap(
         row.sessions.len(),
         state.prompt_open,
         height.saturating_sub(fixed),
     );
+    // Ob dieser Draw einen Prompt kürzt — für Space und die Fußzeile.
+    state.prompt_clipped.set(false);
     let indent = if single { 0 } else { 4 };
     let prompts: Vec<Vec<String>> = row
         .sessions
@@ -971,8 +978,12 @@ fn commit_detail(
             lines.push(Line::raw(format!("{pad}{part}")));
         }
         if text.len() > shown {
+            // Der Hinweis steht, wo gekürzt wird — unabhängig davon, ob die
+            // Fußzeile gerade Platz für `Space prompt` hat.
+            state.prompt_clipped.set(true);
+            let word = if shown == 0 { "lines" } else { "more lines" };
             lines.push(Line::from(Span::styled(
-                format!("{pad}… {} more lines", text.len() - shown),
+                format!("{pad}… {} {word} · Space shows all", text.len() - shown),
                 theme::dim(),
             )));
         }
@@ -1004,16 +1015,20 @@ fn commit_detail(
         + if single {
             0
         } else {
+            // Kopf, gezeigte Zeilen (oder „no prompt recorded"), Hinweis.
             1 + prompts
                 .iter()
-                .map(|t| t.len().min(cap).max(1) + usize::from(t.len() > cap))
+                .map(|t| {
+                    let shown = t.len().min(cap);
+                    let body = if t.is_empty() { 1 } else { shown };
+                    body + usize::from(t.len() > shown)
+                })
                 .max()
                 .unwrap_or(1)
         };
-    // Platz für EVIDENCE (Kopf, fünf Achsen, Folgezeilen) bleibt frei.
-    let reserve = EVIDENCE_RESERVE;
+    // Platz für EVIDENCE bleibt frei — seine echte Höhe.
     let room = height
-        .saturating_sub(2 + lines.len() + reserve)
+        .saturating_sub(2 + lines.len() + evidence.len())
         .checked_div(per)
         .unwrap_or(0)
         .max(1);
@@ -1140,8 +1155,19 @@ fn commit_detail(
         )));
     }
     lines.push(Line::raw(""));
+    lines.extend(evidence);
+}
 
-    // EVIDENCE — eine Zeile je Achse, nie zusammengefasst, kein Gesamtwert.
+/// EVIDENCE — eine Zeile je Achse, nie zusammengefasst, kein Gesamtwert.
+/// Als eigener Block gebaut, damit die Platzrechnung des Prompts seine
+/// echte Höhe kennt.
+fn evidence_lines(
+    state: &crate::overview::OverviewState,
+    row: &CommitRow,
+    cards: &[Option<minds_reader::model::SessionCard>],
+    inner: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
     let check = state.checks.get(&row.id);
     let mut heading = vec![Span::styled("EVIDENCE", theme::title())];
     if let Some(at) = state.checked_at.get(&row.id) {
@@ -1154,19 +1180,19 @@ fn commit_detail(
     }
     lines.push(Line::from(heading));
     lines.extend(integrity_lines(row, check));
-    // Die Dateiclaims aller gelesenen Sessions — `0` erklärt die Lücke mit
-    // (C3.6); ohne lesbare Karte wird nichts behauptet.
+    // Die Dateiclaims der Sessions — `0` erklärt die Lücke mit (C3.6).
+    // Nur, wenn jede Karte gelesen ist: Eine ungelesene Session könnte
+    // Dateien beanspruchen, über sie wird nichts behauptet.
     let claimed = cards
         .iter()
-        .flatten()
-        .map(|card| card.summary.files)
-        .reduce(|a, b| a + b);
+        .all(Option::is_some)
+        .then(|| cards.iter().flatten().map(|c| c.summary.files).sum());
     lines.extend(coverage_lines_with(
         state.lines.get(&row.id),
         claimed,
         inner,
     ));
-    lines.extend(interpretation_lines(row, &cards));
+    lines.extend(interpretation_lines(row, cards));
     lines.extend(requirement_lines(row, state, check));
     let review = if row.review == Verdict::Open {
         let (glyph, _, style) = theme::open();
@@ -1176,6 +1202,7 @@ fn commit_detail(
         mark(glyph, word, style)
     };
     lines.push(axis("REVIEW", vec![review]));
+    lines
 }
 
 /// INTEGRITY: das Urteil von `minds verify`, in seinen Wörtern. Vor dem
@@ -1514,15 +1541,11 @@ fn requirement_lines(
 pub(crate) const PROMPT_LINES: usize = 12;
 /// … und bei mehr als zwei Sessions je Session.
 pub(crate) const PROMPT_LINES_MANY: usize = 4;
-/// Weniger als so viele Zeilen zeigt PROMPT nie, auch im engen Detail.
-pub(crate) const PROMPT_MIN: usize = 3;
-/// So viele Zeilen bleiben für EVIDENCE frei (Kopf, fünf Achsen,
-/// Folgezeilen).
-const EVIDENCE_RESERVE: usize = 12;
-
 /// Wie viele Prompt-Zeilen das Detail zeigt: aufgeklappt alle; zugeklappt
 /// die Vorgabe nach Session-Zahl, gekappt auf den Platz `avail`, der
-/// SESSIONS und EVIDENCE übrig lässt, mindestens [`PROMPT_MIN`].
+/// SESSIONS und EVIDENCE übrig lässt — notfalls null (dann steht nur der
+/// PROMPT-Kopf mit dem Hinweis). Der Vertrauenszustand hat Vorrang vor
+/// dem Prompt, nie umgekehrt.
 pub(crate) fn prompt_cap(sessions: usize, open: bool, avail: usize) -> usize {
     if open {
         return usize::MAX;
@@ -1532,32 +1555,15 @@ pub(crate) fn prompt_cap(sessions: usize, open: bool, avail: usize) -> usize {
     } else {
         PROMPT_LINES_MANY
     };
-    base.min(avail).max(PROMPT_MIN)
-}
-
-/// Ob der Prompt einer Session des gewählten Agent-Commits zugeklappt
-/// gekürzt wäre — für den Fußzeilen-Hinweis `Space prompt`, gerechnet mit
-/// derselben Umbruchlogik wie das Detail bei seiner Mindestbreite.
-pub(crate) fn prompt_truncated(app: &App) -> bool {
-    let Some(state) = app.overview.as_ref() else {
-        return false;
-    };
-    let Some(row) = state.agent_commit() else {
-        return false;
-    };
-    let cap = prompt_cap(row.sessions.len(), false, usize::MAX);
-    let indent = if row.sessions.len() == 1 { 0 } else { 4 };
-    let width = usize::from(DETAIL_MIN).saturating_sub(2 + indent).max(1);
-    let index = app.inspection.index();
-    row.sessions
-        .iter()
-        .filter_map(|sid| index.session(*sid))
-        .any(|s| prompt_lines(&s.intent.request, width).len() > cap)
+    base.min(avail)
 }
 
 /// Der Auftrag als Anzeigezeilen (C3.6): je Quellzeile entschärft und an
 /// Wortgrenzen auf `width` umgebrochen; Leerzeilen innen bleiben, Leerraum
 /// am Anfang und Ende des Textes fällt weg. Leer, wenn nichts erfasst ist.
+/// Leerzeichenfolgen im Zeileninneren fallen zu einem zusammen — nur die
+/// Einrückung einer Zeile bleibt; Spaltenausrichtung in Code-Blöcken
+/// überlebt den Umbruch nicht (bewusst: die Anzeige ist kein Editor).
 fn prompt_lines(request: &str, width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for raw in request.lines() {
@@ -1667,6 +1673,20 @@ mod tests {
         assert_eq!(wrap_words("  indented words", 12), ["  indented", "words"]);
         // Zeichen, nicht Bytes: Umlaute zählen einfach.
         assert_eq!(wrap_words("äöü ßß ñ", 4), ["äöü", "ßß ñ"]);
+    }
+
+    /// Review: der Cap zugeklappt — Vorgabe nach Session-Zahl, auf den
+    /// Platz gekappt, notfalls null (Vertrauen vor Prompt); aufgeklappt
+    /// alles.
+    #[test]
+    fn the_prompt_cap_respects_the_room() {
+        use super::{PROMPT_LINES, PROMPT_LINES_MANY, prompt_cap};
+        assert_eq!(prompt_cap(1, false, 0), 0);
+        assert_eq!(prompt_cap(1, false, 5), 5);
+        assert_eq!(prompt_cap(1, false, 100), PROMPT_LINES);
+        assert_eq!(prompt_cap(2, false, 100), PROMPT_LINES);
+        assert_eq!(prompt_cap(3, false, 100), PROMPT_LINES_MANY);
+        assert_eq!(prompt_cap(3, true, 0), usize::MAX);
         assert_eq!(wrap_words(&"x".repeat(25), 10).len(), 3);
         assert_eq!(wrap_words("", 10), [""]);
         let lines = prompt_lines("\n\nfirst\n\n\nsecond line\n\n", 80);

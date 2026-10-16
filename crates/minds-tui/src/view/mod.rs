@@ -706,7 +706,8 @@ fn space_hint(app: &App) -> Option<&'static str> {
     if state.has_requirement_text() {
         return Some("Space requirement");
     }
-    overview::prompt_truncated(app).then_some("Space prompt")
+    // Gekürzt hat der letzte Draw — dort ist die Höhe bekannt.
+    (state.agent_commit().is_some() && state.prompt_clipped.get()).then_some("Space prompt")
 }
 
 /// Der Filterzustand der Übersicht für Zeile 1 der Fußzeile (C3.5).
