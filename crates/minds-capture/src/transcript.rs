@@ -50,8 +50,16 @@ pub struct Transcript {
 /// Liest ein Transkript aus rohen JSONL-Bytes. Schlägt nie fehl: Was sich nicht
 /// deuten lässt, wird übersprungen.
 pub fn parse(bytes: &[u8]) -> Transcript {
+    parse_counted(bytes).0
+}
+
+/// Wie [`parse`], zählt zusätzlich die Zeilen, die sich als Eintrag deuten
+/// ließen — `0` bei Bytes, die kein Transkript sind (K1: `ParseFailed`
+/// statt `Empty`).
+pub(crate) fn parse_counted(bytes: &[u8]) -> (Transcript, usize) {
     let text = String::from_utf8_lossy(bytes);
     let mut out = Transcript::default();
+    let mut entries = 0usize;
 
     for line in text.lines() {
         let line = line.trim();
@@ -61,6 +69,7 @@ pub fn parse(bytes: &[u8]) -> Transcript {
         let Ok(entry) = serde_json::from_str::<Entry>(line) else {
             continue;
         };
+        entries += 1;
 
         if let Some(version) = entry.version {
             out.agent_version = Some(version);
@@ -94,7 +103,7 @@ pub fn parse(bytes: &[u8]) -> Transcript {
         }
     }
 
-    out
+    (out, entries)
 }
 
 /// Rät den Anbieter aus der Modell-ID. Bewusst grob — die ID ist die Wahrheit,

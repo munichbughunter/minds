@@ -37,6 +37,67 @@ fn template(name: &str) -> String {
     .unwrap()
 }
 
+/// Startet ein eben erst kopiertes Binary. Zwischen `fs::copy` und `exec`
+/// kann ein parallel laufender Test gerade `fork` ausgeführt haben: Das Kind
+/// erbt den noch offenen Schreib-Deskriptor der Kopie, bis sein eigenes
+/// `exec` ihn schließt (CLOEXEC). Linux lehnt den Start in diesem Fenster mit
+/// ETXTBSY („Text file busy") ab. Der Fehler ist vorübergehend: wiederholen
+/// bis zur Frist — danach ist er ein echter Fehler und wird nie übergangen.
+fn output_of_fresh_binary(command: &mut Command) -> Output {
+    until_executable(std::time::Duration::from_secs(10), || command.output()).unwrap()
+}
+
+/// Wiederholt `attempt`, solange es mit `ExecutableFileBusy` scheitert, bis
+/// zur Frist; jeder andere Fehler und der erste Erfolg enden sofort.
+fn until_executable<T>(
+    deadline: std::time::Duration,
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let start = std::time::Instant::now();
+    loop {
+        match attempt() {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && start.elapsed() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            result => return result,
+        }
+    }
+}
+
+/// ETXTBSY wird wiederholt und endet mit dem Erfolg; nach der Frist bleibt
+/// der Fehler sichtbar; andere Fehler werden nicht wiederholt.
+#[test]
+fn until_executable_retries_text_file_busy_then_gives_up() {
+    use std::io::{Error, ErrorKind};
+    use std::time::Duration;
+    let mut calls = 0;
+    let ok = until_executable(Duration::from_secs(5), || {
+        calls += 1;
+        if calls < 3 {
+            Err(Error::from(ErrorKind::ExecutableFileBusy))
+        } else {
+            Ok(calls)
+        }
+    });
+    assert_eq!(ok.unwrap(), 3);
+    let busy = until_executable(Duration::from_millis(50), || {
+        Err::<(), _>(Error::from(ErrorKind::ExecutableFileBusy))
+    })
+    .unwrap_err();
+    assert_eq!(busy.kind(), ErrorKind::ExecutableFileBusy);
+    let mut other_calls = 0;
+    let other = until_executable(Duration::from_secs(5), || {
+        other_calls += 1;
+        Err::<(), _>(Error::from(ErrorKind::NotFound))
+    })
+    .unwrap_err();
+    assert_eq!(other.kind(), ErrorKind::NotFound);
+    assert_eq!(other_calls, 1);
+}
+
 fn text(out: &Output) -> String {
     format!(
         "{}{}",
@@ -406,25 +467,25 @@ fn enable_witness_refuses_a_binary_inside_the_repository() {
     let inside = f.root.join("target/release/minds");
     fs::create_dir_all(inside.parent().unwrap()).unwrap();
     fs::copy(MINDS, &inside).unwrap();
-    let out = {
-        let mut minds = Command::new(&inside);
-        minds
-            .env("MINDS_WITNESS", "off")
-            .env_remove("MINDS_WITNESS_HOME")
-            .env_remove("MINDS_WITNESS_SOCKET");
-        minds
-    }
-    .current_dir(&f.root)
-    .args(["enable", "--agent", "claude-code", "--witness", "container"])
-    .env("HOME", f.path("user-home"))
-    .env("XDG_STATE_HOME", f.path("state"))
-    .env("XDG_CONFIG_HOME", f.path("config"))
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("GIT_CONFIG_SYSTEM", "/dev/null")
-    .env_remove("MINDS_WITNESS_HOME")
-    .env_remove("MINDS_WITNESS_SOCKET")
-    .output()
-    .unwrap();
+    let out = output_of_fresh_binary(
+        {
+            let mut minds = Command::new(&inside);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        }
+        .current_dir(&f.root)
+        .args(["enable", "--agent", "claude-code", "--witness", "container"])
+        .env("HOME", f.path("user-home"))
+        .env("XDG_STATE_HOME", f.path("state"))
+        .env("XDG_CONFIG_HOME", f.path("config"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env_remove("MINDS_WITNESS_HOME")
+        .env_remove("MINDS_WITNESS_SOCKET"),
+    );
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("lies inside the repository"),
@@ -617,25 +678,25 @@ fn enable_witness_refuses_a_hard_linked_binary() {
     let copy = bin.join("minds");
     fs::copy(MINDS, &copy).unwrap();
     fs::hard_link(&copy, bin.join("other-name")).unwrap();
-    let out = {
-        let mut minds = Command::new(&copy);
-        minds
-            .env("MINDS_WITNESS", "off")
-            .env_remove("MINDS_WITNESS_HOME")
-            .env_remove("MINDS_WITNESS_SOCKET");
-        minds
-    }
-    .current_dir(&f.root)
-    .args(["enable", "--agent", "claude-code", "--witness", "container"])
-    .env("HOME", f.path("user-home"))
-    .env("XDG_STATE_HOME", f.path("state"))
-    .env("XDG_CONFIG_HOME", f.path("config"))
-    .env("GIT_CONFIG_GLOBAL", "/dev/null")
-    .env("GIT_CONFIG_SYSTEM", "/dev/null")
-    .env_remove("MINDS_WITNESS_HOME")
-    .env_remove("MINDS_WITNESS_SOCKET")
-    .output()
-    .unwrap();
+    let out = output_of_fresh_binary(
+        {
+            let mut minds = Command::new(&copy);
+            minds
+                .env("MINDS_WITNESS", "off")
+                .env_remove("MINDS_WITNESS_HOME")
+                .env_remove("MINDS_WITNESS_SOCKET");
+            minds
+        }
+        .current_dir(&f.root)
+        .args(["enable", "--agent", "claude-code", "--witness", "container"])
+        .env("HOME", f.path("user-home"))
+        .env("XDG_STATE_HOME", f.path("state"))
+        .env("XDG_CONFIG_HOME", f.path("config"))
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env_remove("MINDS_WITNESS_HOME")
+        .env_remove("MINDS_WITNESS_SOCKET"),
+    );
     assert!(!out.status.success(), "{}", text(&out));
     assert!(
         text(&out).contains("more than one hard link"),

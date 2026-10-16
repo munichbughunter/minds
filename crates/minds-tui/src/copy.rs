@@ -107,8 +107,8 @@ pub const GLOSSARY: &[Term] = &[
         "Unchecked: nobody has recomputed this yet — it may still be right.",
     ),
     term(
-        "stated",
-        "Stated: declared by a human or reported by a tool, without a witness.",
+        "reported",
+        "Reported: declared by a human or claimed by a tool, without a witness.",
     ),
     term(
         "inferred",

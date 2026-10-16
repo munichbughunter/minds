@@ -284,14 +284,13 @@ fn changes_footer(frame: &mut Frame, app: &App, area: Rect) {
     };
     let status = match &state.set {
         Ok(set) => {
-            let (glyph, word, style) = theme::verdict(set.review.verdict);
             let mut spans = vec![
                 Span::styled(
                     set.commit.to_string()[..7].to_string(),
                     Style::default().fg(theme::CHANGE),
                 ),
                 Span::raw(format!(" {}  ", set.subject.clone().unwrap_or_default())),
-                Span::styled(format!("{glyph} {word}"), style),
+                review_span(set.review.verdict),
             ];
             if let Some(why) = &set.unassessed {
                 spans.push(Span::styled(
@@ -553,7 +552,50 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Die häufigsten Aktionen des Fokus, nach Priorität — 4 bis 6 (C2); alles
 /// Weitere steht in der Hilfe. `? help  q quit` hängt [`pinned`] rechts an.
-pub(crate) fn actions(app: &App) -> Vec<&'static str> {
+pub(crate) fn actions(app: &App) -> Vec<String> {
+    if app.tab == Tab::Changes {
+        return changes_actions(app);
+    }
+    fixed_actions(app).into_iter().map(String::from).collect()
+}
+
+/// Die Tasten des Changes-Tabs (C9.1): `n` nennt den Zustand und die Zahl
+/// (`n next not-observed (29)`) — ohne solche Zeilen fällt die Taste weg.
+/// Intern heißt der Zustand weiter „unexplained"; nur das Wort folgt ihm.
+fn changes_actions(app: &App) -> Vec<String> {
+    let state = app.changes.as_ref();
+    let open = state.map_or(0, |s| s.not_observed());
+    let next = (open > 0).then(|| format!("n next not-observed ({open})"));
+    let (head, tail): (&[&str], &[&str]) = match state.map(|c| c.focus) {
+        Some(Focus::Diff) => (&["↑↓ line", "] [ hunk"], &["s split", "w why chain"]),
+        _ => (
+            &["↑↓ file", "Enter diff", "[ ] commit"],
+            &["c why column", "/ filter"],
+        ),
+    };
+    // In der Dateizeile (unter 160 Spalten) wechselt `Tab` die Datei (C9.2).
+    let tab_file = (app.width > 0 && app.width < crate::view::changes::FILES_PANE_MIN)
+        .then(|| "Tab file".to_string());
+    // Esc geht den genommenen Weg zurück: nach einem Sprung in den Diff zum
+    // Ursprung (`Esc back`), sonst in die Dateiliste (`Esc files`).
+    let esc = matches!(state.map(|c| c.focus), Some(Focus::Diff)).then(|| {
+        if app.at_jump_base() {
+            "Esc back".to_string()
+        } else {
+            "Esc files".to_string()
+        }
+    });
+    head.iter()
+        .map(|k| k.to_string())
+        .chain(tab_file)
+        .chain(next)
+        .chain(tail.iter().map(|k| k.to_string()))
+        .chain(esc)
+        .collect()
+}
+
+/// Die Tasten der übrigen Tabs — fest, ohne Zahlen.
+fn fixed_actions(app: &App) -> Vec<&'static str> {
     match app.tab {
         Tab::Overview => {
             if app
@@ -614,24 +656,7 @@ pub(crate) fn actions(app: &App) -> Vec<&'static str> {
             Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "w why", "Esc back"],
         },
         Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "w why"],
-        Tab::Changes => match app.changes.as_ref().map(|c| c.focus) {
-            Some(Focus::Diff) => vec![
-                "↑↓ line",
-                "] [ hunk",
-                "n N unexplained",
-                "s split",
-                "w why chain",
-                "Esc files",
-            ],
-            _ => vec![
-                "↑↓ file",
-                "Enter diff",
-                "[ ] commit",
-                "n next unexplained",
-                "c why column",
-                "/ filter",
-            ],
-        },
+        Tab::Changes => Vec::new(),
         Tab::Intent => vec!["↑↓ anchor", "Enter graph", "PgUp PgDn scroll", "/ filter"],
     }
 }
@@ -870,6 +895,26 @@ pub fn when(ts: Option<&str>) -> String {
             _ => ts.to_string(),
         },
         None => "—".into(),
+    }
+}
+
+/// `HH:MM:SSZ` aus dem RFC-3339-Zeitstempel (C9.3) — die Uhrzeit, nicht
+/// der volle Stempel mit Millisekunden; `None` für Unlesbares.
+pub fn clock_z(ts: Option<&str>) -> Option<String> {
+    let ts = ts?;
+    minds_metrics::epoch_seconds(ts)?;
+    ts.get(11..19).map(|hms| format!("{hms}Z"))
+}
+
+/// Das Urteil als Span: offen heißt `◦ not reviewed yet` — gedimmt, nie in
+/// der Warnfarbe (C9.3); die übrigen Urteile wie [`theme::verdict`].
+pub(crate) fn review_span(verdict: minds_reader::model::Verdict) -> Span<'static> {
+    if verdict == minds_reader::model::Verdict::Open {
+        let (glyph, _, style) = theme::open();
+        Span::styled(format!("{glyph} not reviewed yet"), style)
+    } else {
+        let (glyph, word, style) = theme::verdict(verdict);
+        Span::styled(format!("{glyph} {word}"), style)
     }
 }
 

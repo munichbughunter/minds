@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Paragraph};
 
 use minds_reader::model::Verdict;
 use minds_reader::overview::{CommitRow, OverviewCounts, RefLabel, SealMark, WipSession, WipState};
+use minds_reader::reconcile::ReconClass;
 
 use crate::overview::MAX_SESSION_LINES;
 
@@ -737,8 +738,9 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// Die Kurzform eines Ankers: acht Hex-Zeichen ohne Präfix.
-fn anchor_short(id: &minds_core::ContentHash) -> String {
+/// Die Kurzform eines Ankers: acht Hex-Zeichen ohne Präfix — dieselbe in
+/// der Übersicht und in „Warum diese Zeile?".
+pub(crate) fn anchor_short(id: &minds_core::ContentHash) -> String {
     let text = id.to_string();
     // `b3-<hex>` (oder `<algo>:<hex>`): nur die Hex-Ziffern.
     let hex = text.rsplit(['-', ':']).next().unwrap_or(&text);
@@ -1100,6 +1102,7 @@ fn commit_detail(
                         }
                         head.push(Span::raw(text));
                     }
+                    // K1: der Grund aus der Lineage folgt in der nächsten Zeile.
                     None => head.push(Span::styled("model not recorded", theme::dim())),
                 }
                 let short = sid.to_string();
@@ -1125,6 +1128,20 @@ fn commit_detail(
         } else {
             line
         });
+        // K1: Fehlt das Modell und kennt der Record den Grund, steht er in
+        // einer eigenen gedimmten Zeile — der Kopf behält Id und Zeit.
+        if let Some(reason) = session
+            .map(minds_reader::Actor::of)
+            .filter(|actor| actor.model.is_none())
+            .and_then(|actor| actor.transcript)
+            .filter(|status| *status != minds_core::TranscriptStatus::Read)
+            .map(minds_reader::summary::transcript_reason)
+        {
+            lines.push(Line::from(Span::styled(
+                crate::view::clip(&format!("    — {reason}"), inner),
+                theme::dim(),
+            )));
+        }
         if let Some(card) = &cards[i] {
             let claimed = card.summary.files;
             let plural = |n: usize| if n == 1 { "" } else { "s" };
@@ -1358,38 +1375,65 @@ pub(crate) fn coverage_lines_with(
             )],
         )];
     }
+    // Der Kopf nennt den offensten Zustand mit seinem Wort (C9.4): nicht
+    // beobachtete Zeilen, sonst berichtete (`◇ 95 of 95 added lines
+    // reported, not observed`), sonst nur im Dateisystem gesehene, sonst
+    // nicht bewertete; die Zeile `· N added lines` gibt es nicht mehr.
     let (open_glyph, _, open_style) = theme::open();
-    let head = if c.unexplained > 0 {
-        mark(
-            open_glyph,
-            format!("{} of {} added lines unexplained", c.unexplained, c.added),
-            open_style,
+    let (reported_glyph, reported_word, reported_style) = theme::state(ReconClass::ReportedOnly);
+    let (fs_glyph, fs_word, fs_style) = theme::state(ReconClass::ExplainedFsOnly);
+    let of = |n: usize, what: &str| format!("{n} of {} added lines {what}", c.added);
+    let (head, lead) = if c.unexplained > 0 {
+        (
+            mark(open_glyph, of(c.unexplained, "unexplained"), open_style),
+            None,
         )
-    } else if c.added == 0 && c.skipped_files == 0 {
-        mark("·", "no added lines", theme::dim())
+    } else if c.stated > 0 {
+        (
+            mark(
+                reported_glyph,
+                of(c.stated, &format!("{reported_word}, not observed")),
+                reported_style,
+            ),
+            Some(ReconClass::ReportedOnly),
+        )
+    } else if c.fs_only > 0 {
+        (
+            mark(fs_glyph, of(c.fs_only, fs_word), fs_style),
+            Some(ReconClass::ExplainedFsOnly),
+        )
+    } else if c.not_assessed > 0 {
+        (
+            mark(
+                "?",
+                of(c.not_assessed, "not assessed"),
+                Style::default().fg(theme::REVIEW),
+            ),
+            None,
+        )
+    } else if c.skipped_files > 0 {
+        // Nur Dateien ohne Zeilenansicht: das steht im Kopf, nicht darunter.
+        (mark("·", not_diffed(c.skipped_files), theme::dim()), None)
     } else {
-        mark("·", format!("{} added lines", c.added), theme::dim())
+        (mark("·", "no added lines", theme::dim()), None)
     };
+    let skipped_in_head = c.added == 0 && c.skipped_files > 0 && c.not_assessed == 0;
     let mut out = vec![axis("COVERAGE", vec![head])];
     let mut parts: Vec<String> = Vec::new();
     if c.explained > 0 && c.explained < c.added {
         parts.push(format!("● {} observed", c.explained));
     }
-    if c.stated > 0 {
-        parts.push(format!("◇ {} stated", c.stated));
+    if c.stated > 0 && lead != Some(ReconClass::ReportedOnly) {
+        parts.push(format!("{reported_glyph} {} {reported_word}", c.stated));
     }
-    if c.fs_only > 0 {
-        parts.push(format!("◍ {} fs only", c.fs_only));
+    if c.fs_only > 0 && lead != Some(ReconClass::ExplainedFsOnly) {
+        parts.push(format!("{fs_glyph} {} {fs_word}", c.fs_only));
     }
-    if c.not_assessed > 0 {
+    if c.not_assessed > 0 && (c.unexplained > 0 || c.stated > 0 || c.fs_only > 0) {
         parts.push(format!("? {} not assessed", c.not_assessed));
     }
-    if c.skipped_files > 0 {
-        parts.push(format!(
-            "{} file{} not diffed",
-            c.skipped_files,
-            if c.skipped_files == 1 { "" } else { "s" }
-        ));
+    if c.skipped_files > 0 && !skipped_in_head {
+        parts.push(not_diffed(c.skipped_files));
     }
     if !parts.is_empty() {
         out.push(under(parts.join(" · "), theme::dim()));
@@ -1432,6 +1476,14 @@ pub(crate) fn coverage_lines_with(
         out.push(under("→ d, then n".into(), theme::dim()));
     }
     out
+}
+
+/// `N file(s) not diffed` — Dateien ohne Zeilenansicht (binär, zu groß, …).
+fn not_diffed(files: usize) -> String {
+    format!(
+        "{files} file{} not diffed",
+        if files == 1 { "" } else { "s" }
+    )
 }
 
 /// INTERPRETATION: gedeutete Tool-Aufrufe — je Session, wenn sie sich

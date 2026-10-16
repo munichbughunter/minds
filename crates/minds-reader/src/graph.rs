@@ -148,15 +148,29 @@ impl SessionGraph {
             None,
         );
 
+        // Agent und Modell, wie der Reader sie erfasst sieht (C3.6/K1): ein
+        // Platzhalter aus `minds-capture` wird nie gedruckt; ein fehlendes
+        // Modell nennt den Grund aus der Lineage.
+        let actor = crate::summary::Actor::of(session);
+        let not_recorded = || "not recorded".to_string();
         let agent = graph.push(
             Some(intent),
             NodeKind::Agent,
-            sanitize(&format!("{} · {}", session.agent.name, session.model.id)),
+            crate::summary::actor_line(session),
             vec![
-                ("Agent".into(), sanitize(&session.agent.name)),
-                ("Version".into(), sanitize(&session.agent.version)),
-                ("Provider".into(), sanitize(&session.model.provider)),
-                ("Model".into(), sanitize(&session.model.id)),
+                (
+                    "Agent".into(),
+                    actor.agent.clone().unwrap_or_else(not_recorded),
+                ),
+                (
+                    "Version".into(),
+                    actor.version.clone().unwrap_or_else(not_recorded),
+                ),
+                (
+                    "Provider".into(),
+                    actor.provider.clone().unwrap_or_else(not_recorded),
+                ),
+                ("Model".into(), actor.model_word()),
                 (
                     "Tokens".into(),
                     format!(

@@ -108,9 +108,13 @@ const fn glyph(
 /// mit genau einer Bedeutung. Die Theme-Funktionen unten zeichnen nur, was
 /// hier steht; die Legende der Hilfe wird daraus erzeugt.
 ///
-/// `◇` heißt „ausgesagt, nicht bezeugt" — für eine von Hand erklärte
-/// Verbindung (declared) wie für einen Tool-Claim ohne Zeugen (reported
-/// only); `·` heißt „nichts belegt" (unverbunden, Legacy, unversiegelt).
+/// Die vier Zustandswörter der Evidenz (C9.4) — `● observed`, `◍ fs
+/// only`, `◇ reported`, `◦ not observed` — stehen hier und nur hier; die
+/// Tabs holen sie über [`state`]. `◇` heißt „berichtet, nicht bezeugt" —
+/// für eine von Hand erklärte Verbindung (declared) wie für einen
+/// Tool-Claim ohne Zeugen; `◦` heißt „nicht beobachtet" — offen, noch
+/// nicht da, nie ein Fehler; `·` heißt „nichts belegt" (unverbunden,
+/// Legacy, unversiegelt).
 pub const REGISTER: &[Glyph] = &[
     // Evidence-Quelle
     glyph("●", GlyphClass::Epistemic, "observed", "observed"),
@@ -118,8 +122,8 @@ pub const REGISTER: &[Glyph] = &[
     glyph(
         "◇",
         GlyphClass::Epistemic,
-        "stated",
-        "stated (declared / reported only)",
+        "reported",
+        "reported (declared or claimed, not witnessed)",
     ),
     glyph("○", GlyphClass::Epistemic, "inferred", "inferred"),
     glyph(
@@ -158,13 +162,13 @@ pub const REGISTER: &[Glyph] = &[
         "◍",
         GlyphClass::Epistemic,
         "fs only",
-        "explained by the file system only",
+        "fs only (seen in the file system, no tool claim)",
     ),
     glyph(
         "◦",
         GlyphClass::Epistemic,
-        "open",
-        "open — not observed / not yet; no error",
+        "not observed",
+        "not observed (open / not yet; no error)",
     ),
     glyph(
         "◐",
@@ -315,6 +319,22 @@ pub fn recon(class: ReconClass) -> (&'static str, &'static str, Style) {
 /// Stil. Gedimmt wie alles Sekundäre, nie in einer Warn- oder Fehlerfarbe.
 pub fn not_observed() -> (&'static str, &'static str, Style) {
     ("◦", "not observed", Style::default().fg(DIM))
+}
+
+/// Glyph, **Zustandswort** und Stil einer Reconciliation-Klasse (C9.4):
+/// `● observed`, `◍ fs only`, `◇ reported`, `◦ not observed` — ein Wort je
+/// Zustand, in jedem Tab dasselbe; die Wörter sind die `meaning`s des
+/// Registers. [`recon`] trägt dagegen das Wort des Readers (`reported
+/// only`, `unexplained`), wo die Oberfläche seine Begriffe zitiert.
+pub fn state(class: ReconClass) -> (&'static str, &'static str, Style) {
+    let (glyph, _, style) = recon(class);
+    let word = match class {
+        ReconClass::Explained => "observed",
+        ReconClass::ExplainedFsOnly => "fs only",
+        ReconClass::ReportedOnly => "reported",
+        ReconClass::Unexplained => not_observed().1,
+    };
+    (glyph, word, style)
 }
 
 /// Glyph, Wort und Stil eines Verdicts.

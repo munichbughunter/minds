@@ -2411,11 +2411,20 @@ mod changes_tab {
         assert_eq!(app.tab, Tab::Intent);
     }
 
+    /// Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landete in der Dateiliste;
+    /// jetzt liegt der Fokus beim Öffnen im Diff, auf der ersten Codezeile —
+    /// die Dateiliste ist über `Esc` erreichbar.
     #[test]
     fn opening_starts_on_the_first_file_with_unexplained_lines() {
         let state = ChangesState::new(vec![commit('1')], 0, Ok(set()));
         assert_eq!(state.file, 0);
-        assert_eq!(state.focus, Focus::Files);
+        assert_eq!(state.focus, Focus::Diff);
+        assert_ne!(
+            state.focus,
+            Focus::Files,
+            "no longer lands in the file list"
+        );
+        assert_eq!(state.row, 1, "the first code line, not the hunk header");
     }
 
     /// Wie `git diff`: Hunk-Kopf, alte und neue Nummer, `+`/`-` vor dem Text.
@@ -2429,7 +2438,10 @@ mod changes_tab {
         assert!(out.contains("1     1   fn order() {"), "{out}");
         assert!(out.contains("2       -     old();"), "{out}");
         assert!(out.contains("     2 +     sort_by_key();"), "{out}");
-        assert!(out.contains("FILES · 1111111 · 1/1"), "{out}");
+        // Klasse 2 (Batch 2, Paket 4 / C9.2): Der FILES-Titel zählt Dateien
+        // und Zeilen des Commits statt Commit-Id und Position.
+        assert!(out.contains("FILES · 2 files · +3 −1"), "{out}");
+        assert!(!out.contains("FILES · 1111111 · 1/1"), "{out}");
         assert!(out.contains("+2 −1"), "{out}");
         assert!(
             out.contains("◦1"),
@@ -2437,14 +2449,19 @@ mod changes_tab {
         );
     }
 
-    /// Grün und Rot liegen als Hintergrund auf genau den `+`- und
-    /// `-`-Zeilen; die unerklärte Zeile ist fett und invertiert markiert.
+    /// Grün und Rot liegen auf Marker und Zeilennummer der `+`- und
+    /// `-`-Zeilen — als Vordergrund, nie als Zeilen-Hintergrund; die
+    /// unerklärte Zeile ist fett markiert.
+    ///
+    /// Klasse 2 (Batch 2, Paket 4 / C9.2): Vorher lag die Farbe als Grund
+    /// auf der ganzen Zeile (`ADD_BG`/`DEL_BG`) und der ◦-Glyph war
+    /// invertiert; der Hintergrund ist jetzt dem Cursor vorbehalten.
     #[test]
     fn added_lines_are_green_removed_red_and_unexplained_bold() {
-        use ratatui::style::Modifier;
+        use crate::theme;
+        use ratatui::style::{Color, Modifier};
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
-        app.reduce(Action::Enter);
         let mut terminal = Terminal::new(TestBackend::new(WIDE, 30)).unwrap();
         terminal
             .draw(|frame| super::super::draw(frame, &mut app))
@@ -2463,12 +2480,24 @@ mod changes_tab {
                 })
                 .unwrap_or_else(|| panic!("{needle} not drawn"))
         };
+        let sign_left_of = |x: u16, y: u16| {
+            (0..x)
+                .rev()
+                .find(|&mx| matches!(buffer[(mx, y)].symbol(), "+" | "-"))
+                .expect("a marker left of the text")
+        };
         let (x, y) = find("sort_by_key");
-        assert_eq!(buffer[(x, y)].bg, super::super::changes::ADD_BG);
+        assert_eq!(buffer[(x, y)].bg, Color::Reset, "no line background");
+        let sign = sign_left_of(x, y);
+        assert_eq!(buffer[(sign, y)].symbol(), "+");
+        assert_eq!(buffer[(sign, y)].fg, theme::OK);
         let (x, y) = find("old();");
-        assert_eq!(buffer[(x, y)].bg, super::super::changes::DEL_BG);
+        assert_eq!(buffer[(x, y)].bg, Color::Reset, "no line background");
+        let sign = sign_left_of(x, y);
+        assert_eq!(buffer[(sign, y)].symbol(), "-");
+        assert_eq!(buffer[(sign, y)].fg, theme::DELETE);
         let (x, y) = find("fn order");
-        assert_ne!(buffer[(x, y)].bg, super::super::changes::ADD_BG);
+        assert_ne!(buffer[(x, y)].fg, theme::OK);
         let (x, y) = find("// manuell");
         // Der Rand-Glyph der Zeile: drei Zeichen vor den Zeilennummern.
         let marker = (0..x)
@@ -2476,7 +2505,11 @@ mod changes_tab {
             .find(|mx| buffer[(*mx, y)].symbol() == "◦")
             .unwrap();
         let cell = &buffer[(marker, y)];
-        assert!(cell.modifier.contains(Modifier::BOLD | Modifier::REVERSED));
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "reversed is the cursor, not a marker"
+        );
     }
 
     #[test]
@@ -2502,12 +2535,14 @@ mod changes_tab {
     fn brackets_jump_hunks_in_the_diff() {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
-        app.reduce(Action::Enter);
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Kein `Enter` mehr nötig — der
+        // Tab landet selbst im Diff auf der ersten Codezeile.
         assert_eq!(
             app.changes.as_ref().unwrap().row,
             1,
-            "Enter lands on the first change"
+            "opening lands on the first change"
         );
+        assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Diff);
         app.reduce(Action::Bracket(false));
         assert_eq!(
             app.changes.as_ref().unwrap().row,
@@ -2539,11 +2574,19 @@ mod changes_tab {
         app.reduce(Action::Down);
         let out = render(&mut app);
         assert!(out.contains("WHY THIS LINE?"), "{out}");
-        assert!(out.contains("REPORTED ONLY"), "{out}");
-        assert!(out.contains("turn 1 · Edit (call 2)"), "{out}");
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): Kopf `◇ REPORTED` mit Satz
+        // statt `REPORTED ONLY`; der Schritt steht unter WRITTEN BY als
+        // Turn und Werkzeug mit Datei, nicht als `Step … (call N)`.
+        assert!(out.contains("◇ REPORTED"), "{out}");
+        assert!(!out.contains("REPORTED ONLY"), "{out}");
+        assert!(out.contains("claude-code · turn 1 ·"), "{out}");
+        assert!(out.contains("Edit src/sort/mod.rs (1 line)"), "{out}");
+        assert!(!out.contains("turn 1 · Edit (call 2)"), "{out}");
         assert!(out.contains("Ich lese und ändere."), "{out}");
         assert!(out.contains("Fix retry handling"), "{out}");
-        assert!(out.contains("Review"), "{out}");
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): das Label heißt REVIEW.
+        assert!(out.contains("REVIEW"), "{out}");
+        assert!(!out.contains("Review   "), "{out}");
 
         app.reduce(Action::Down);
         let out = render(&mut app);
@@ -2585,9 +2628,16 @@ mod changes_tab {
             out.contains("No tool claim for this file. A shell"),
             "{out}"
         );
-        assert!(out.contains("Shell    turn 1 · Bash (call 3)"), "{out}");
-        assert!(out.contains("Agent said (turn 1, unverified)"), "{out}");
-        assert!(out.contains("Session  b3-aaaaaaaaa"), "{out}");
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): die Labels der Why-Box sind
+        // die festen Abschnittsnamen (SHELL, SESSION, AGENT SAID), die
+        // Session-Id steht in der Kurzform der Übersicht; die Wörter
+        // „heuristic, not evidence" und „unverified" bleiben.
+        assert!(out.contains("SHELL        turn 1 · Bash (call 3)"), "{out}");
+        assert!(!out.contains("Shell    turn 1"), "{out}");
+        assert!(out.contains("AGENT SAID   ◌ (turn 1, unverified)"), "{out}");
+        assert!(!out.contains("Agent said (turn 1, unverified)"), "{out}");
+        assert!(out.contains("SESSION      b3-aaaaaaaa"), "{out}");
+        assert!(!out.contains("Session  b3-aaaaaaaaa"), "{out}");
 
         set_gap(&mut app, Gap::AfterAgent { later_shell: None });
         let out = render_at(&mut app, 260);
@@ -2595,7 +2645,7 @@ mod changes_tab {
             out.contains("The last tool claim on this file (write or"),
             "{out}"
         );
-        assert!(!out.contains("Shell    turn"), "{out}");
+        assert!(!out.contains("SHELL        turn"), "{out}");
 
         set_gap(&mut app, Gap::Untouched { complete: true });
         let out = render_at(&mut app, 260);
@@ -2652,12 +2702,16 @@ mod changes_tab {
     fn the_footer_names_the_commit_and_the_keys_of_the_focus() {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff, und das
+        // Wort in der Fußzeile folgt dem Zustand (`not-observed` mit Zahl)
+        // statt der internen Bezeichnung `unexplained`.
         let out = render(&mut app);
         assert!(out.contains("1111111 feat(sort): chronologisch"), "{out}");
-        assert!(out.contains("Enter diff"), "{out}");
-        app.reduce(Action::Enter);
+        assert!(out.contains("n next not-observed (2)"), "{out}");
+        assert!(!out.contains("n N unexplained"), "{out}");
+        app.reduce(Action::Back);
         let out = render(&mut app);
-        assert!(out.contains("n N unexplained"), "{out}");
+        assert!(out.contains("Enter diff"), "{out}");
     }
 
     /// Von Evidence → ARTIFACT mit Enter in den Diff des Commits.
@@ -2697,6 +2751,10 @@ mod changes_tab {
         app.stamp = Some("1".into());
         app.changes = Some(ChangesState::new(vec![commit('1')], 0, Ok(set())));
         app.tab = Tab::Changes;
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff — erst
+        // `Esc` in die Dateiliste, dann die zweite Datei wählen.
+        app.reduce(Action::Back);
+        assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
         app.reload(
@@ -2755,10 +2813,12 @@ mod changes_tab {
         app.reduce(Action::Up);
         assert_eq!(app.changes.as_ref().unwrap().row, 3);
         let out = render_at(&mut app, 200);
+        // Klasse 2 (Batch 2, Paket 5 / C9.3): der Kopf heißt `◇ REPORTED`.
         assert!(
-            out.contains("REPORTED ONLY"),
+            out.contains("◇ REPORTED"),
             "the why column means the new side: {out}"
         );
+        assert!(!out.contains("REPORTED ONLY"), "{out}");
     }
 
     /// Ein Commit außerhalb der HEAD-Historie (über ARTIFACT geöffnet) bleibt
@@ -2806,6 +2866,10 @@ mod changes_tab {
     fn w_toggles_the_why_column_from_the_file_list_too() {
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff; die
+        // Dateiliste erreicht `Esc`.
+        assert_ne!(app.changes.as_ref().unwrap().focus, Focus::Files);
+        app.reduce(Action::Back);
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
         app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(!app.changes.as_ref().unwrap().why);
@@ -2813,6 +2877,10 @@ mod changes_tab {
 
     mod b4;
     mod b4b;
+    mod c91;
+    mod c92;
+    mod c93;
+    mod c94;
 }
 
 // --- Verify-Tab -------------------------------------------------------------
@@ -4253,6 +4321,8 @@ mod overview_tab {
     mod c3;
     mod c36;
     mod c3v2;
+    mod k1;
+    mod nav;
 }
 
 mod tamper;

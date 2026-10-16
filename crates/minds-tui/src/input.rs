@@ -57,6 +57,10 @@ pub enum Action {
     Reload,
     /// Zum nächsten Tab (`true`) oder vorigen.
     CycleTab(bool),
+    /// `Tab` (`true`) / `Shift-Tab` in der Dateizeile des Changes-Tabs
+    /// (unter 160 Spalten, C9.2): die nächste/vorige Datei, umlaufend. Wird
+    /// aus [`Action::CycleTab`] abgeleitet, nie direkt aus einer Taste.
+    CycleFile(bool),
     /// Direkt zu einem Tab (F1, F2, …), nullbasiert.
     TabTo(u8),
     /// `]` (`true`) oder `[` — im Diff der nächste/vorige Hunk, in der

@@ -24,7 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
-use minds_core::{Agent, EffectKind, Intent, Lineage, Model, Produced, Session, ToolCall, Turn};
+use minds_core::{
+    Agent, EffectKind, Intent, Lineage, Model, Produced, Session, ToolCall, TranscriptStatus, Turn,
+};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
@@ -341,6 +343,8 @@ impl Segment {
                 ended_at: self.last_ts,
                 cwd: cwd.map(str::to_string),
                 closed: false,
+                // Der Import *ist* das Transkript: gelesen, per Definition.
+                transcript: Some(TranscriptStatus::Read),
             }),
             edges: Vec::new(),
         }
@@ -550,6 +554,16 @@ mod tests {
         "\n",
         r#"{"type":"assistant","timestamp":"2026-07-23T09:00:20.000Z","sessionId":"s-1","message":{"role":"assistant","model":"claude-opus-4","content":[{"type":"tool_use","name":"Write","input":{"file_path":"/home/anna/projekt/src/retry.rs"}},{"type":"text","text":"Fertig."}],"usage":{"input_tokens":950,"output_tokens":15}}}"#,
     );
+
+    /// K1: Eine importierte Session *ist* das Transkript — `Read`.
+    #[test]
+    fn an_imported_session_records_the_transcript_as_read() {
+        let sessions = parse_claude_code(SAMPLE.as_bytes(), "fallback");
+        assert_eq!(
+            sessions[0].lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::Read)
+        );
+    }
 
     #[test]
     fn an_imported_runner_call_says_its_result_was_not_captured() {

@@ -17,8 +17,75 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **The reason for an unread transcript is recorded and shown (K1).** A
+  session record now says why its model, response texts and token counts
+  are missing: `lineage.transcript` carries one of `read`,
+  `no_path_in_events`, `not_found`, `not_readable`, `empty`, `parse_failed`
+  or `not_read_by_witness` — a fixed word, never the path (it holds the
+  user name). Additive like `closed`: absent is not written, stored sessions
+  keep their bytes and id; imported sessions are `read` by definition; a
+  session the witness builds says `not_read_by_witness` (the witness does not
+  load transcripts from agent paths) when the events carried a path, and
+  otherwise the same `no_path_in_events` as the hook path. The reader
+  (`minds_reader::Actor::transcript`, `model_label`, `actor_line`,
+  `summary::transcript_reason`) turns the word into a sentence, and the TUI
+  shows it wherever a model is named — Overview detail (own dimmed line under
+  the session), Changes why-box (`Agent  claude-code · model not recorded —
+  the witness does not read transcripts from agent paths`), graph head,
+  sessions list and why chain; with `read` the model stands in full
+  (`claude-opus-4-1 (Anthropic)`). The placeholder `unknown` is printed in no
+  view. `docs/commands.md` (show, inspect) and `docs/verification-guide.md`
+  explain the status.
+
 ### Changed
 
+- **Why this line? in a fixed order, with a sentence and the witness
+  bridge.** The panel opens with the place and the state
+  (`src/sort.py:28  ◇ REPORTED`) and one sentence per state: observed,
+  fs only, reported, not observed (the reasons of an unexplained line
+  keep their wording); for `reported` and `fs only` it adds the bridge
+  "With a witness this line would be ● observed." Then, in this order and
+  only when there is something to say: **WRITTEN BY** (`◉CC claude-code ·
+  turn 2 · 10:39:09Z · 3d ago`, then `Write src/sort.py (29 lines)`),
+  **SESSION** (`b3-75f030fa · ◈ record sealed`), **REQUIREMENT**
+  (`⚑ ac8f1bb7 · witness event` — the short form of the Overview),
+  **ASKED FOR** and **AGENT SAID** as quoted claims (`◌ "…"`; a missing
+  answer says why — `— (transcript not read: <reason>)`, with the reason
+  the session record carries), **REVIEW** (`◦ not reviewed
+  yet`, never yellow — also in footer line 1). Commit and change id only
+  as a dimmed last line (`commit 609aca8 · change I8d166b6d5e7…`); no key
+  hints in the panel. `Enter` on a code line opens the session's graph
+  with the cursor on that tool call (`Esc` returns); `w` still opens the
+  why chain.
+- **Changes layout by width, diff without line background.** At 160
+  columns and more, FILES is a pane of 28 columns, the diff takes the rest
+  and WHY THIS LINE? 56; from 120 to 159 the files become one line above
+  the diff (`◇ src/sort.py +29 · ◦ src/test_sort.py +66`, `Esc` focuses it,
+  `↑↓` switch, `Tab`/`Shift-Tab` pick the next/previous file) and WHY is 48
+  wide; below 120 the files line stays and WHY
+  is a layer: `Enter` on a line opens it, `Esc` closes it. `+` and `-` are
+  foreground colours on the marker and the line number only — no line has
+  a background any more, that is the cursor's. The gutter glyph is dimmed
+  while it matches the file's state and stands bold in full colour where it
+  deviates. The FILES title counts the commit: `FILES · 2 files · +95 −0`
+  (the commit id is in the footer).
+- **Changes lands on the first line, cursor visible.** Opening the Changes
+  tab (`d`, Enter on ARTIFACT, `F4`) puts the focus into the diff on the
+  first code line of the first hunk — never on the hunk header, never in
+  the file list; `d` from the Overview (`→ d, then n`) lands on the first
+  `◦ not observed` line (else the first `◇ reported` one). The cursor is the
+  one selection style of the interface over the whole diff line, from the
+  gutter to the end; the focused pane carries the bright frame and the `▸`
+  mark, the other is dimmed. `Esc` in the diff goes to FILES, a second `Esc`
+  back to the origin of a jump. Footer: `n next not-observed (29)` names
+  the state and the count; with no such line the key leaves the footer
+  (internally the class is still "unexplained"). On a hunk header the
+  why panel shows the file summary (`src/sort.py · 29 added lines`,
+  `29 reported by one Write (turn 2)`, `0 observed`) instead of a key hint.
+  Below 120 columns, `Enter` on a line opens the why panel as a layer,
+  `Esc` closes it.
 - **Overview detail: prompt as its own section, reasons for "unexplained",
   no `unknown`.** The request of the human is no longer a dimmed footnote
   under the session numbers: **PROMPT** shows the full text as recorded
@@ -239,6 +306,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
   Esc dismisses it; a reload without new tampering does not bring it back.
 
 ### Fixed
+
+- **Changes: `Esc` goes back the way you came.** After `d` from the Overview
+  the diff is the first thing seen, so `Esc` ends the jump and returns there
+  (the footer says `Esc back`); after FILES › `Enter` it focuses the files
+  (`Esc files`) as before.
+
+- **One word per evidence state across tabs.** The four states read the
+  same everywhere: `● observed` · `◍ fs only` · `◇ reported` · `◦ not
+  observed`. They live in the glyph register (`◇` means reported — declared
+  or claimed, not witnessed; `◦` means not observed — open, never an
+  error), the help legend is generated from it, and the glossary says
+  "reported" where it said "stated". Overview COVERAGE reads `◇ 95 of 95
+  added lines reported, not observed` instead of "stated"; the line
+  `· 95 added lines` is gone (`·` means "does not apply"); the reason
+  sentence under an unexplained count is unchanged. Overview detail, the
+  FILES title and the diff legend take their numbers from one reader
+  function (`FileDiff::line_classes`, summed by `ChangeSet::line_classes`),
+  so the same commit shows the same counts in all three places.
+
+- **Navigation history never stacks the same origin.** A tab key (F1–F5,
+  `1–5`, Tab) back to a tab that lies in the history as an origin ends that
+  jump: every entry from it on is dropped, so `d`, F1, `d`, F1, `d` reads
+  `Overview › 609aca8 › Changes › 609aca8` — not the origin three times. An
+  origin equal to the last entry (same tab, same place) is not pushed again,
+  the breadcrumb never shows the same place twice in a row, and the history
+  keeps at most eight entries (the oldest fall away).
 
 - **Managed settings without `Write(…)` rules.** Claude Code checks file
   access only against `Read(…)`/`Edit(…)` and warned at every start about the

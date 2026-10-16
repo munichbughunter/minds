@@ -347,7 +347,12 @@ fn describe(step: &WhyStep, width: usize) -> (&'static str, Style, Vec<String>) 
         } => (
             "AGENT",
             Style::default().fg(theme::AGENT),
-            vec![format!("{name} {version} · {model}")],
+            // Eine nicht erfasste Version ist leer (K1) — dann ohne Lücke.
+            vec![if version.is_empty() {
+                format!("{name} · {model}")
+            } else {
+                format!("{name} {version} · {model}")
+            }],
         ),
         WhyStep::Intent {
             request,

@@ -143,6 +143,10 @@ fn single_session_with_transcript() {
     let lineage = s.lineage.as_ref().unwrap();
     assert_eq!(lineage.local_id, "s-single");
     assert_eq!(lineage.cwd.as_deref(), Some("/home/anna/minds"));
+    // K1: Das Transkript wurde gelesen — und der Record sagt es; der Pfad
+    // steht nirgends im Record.
+    assert_eq!(lineage.transcript, Some(minds_core::TranscriptStatus::Read));
+    assert!(!minds_core::to_canonical_string(s).unwrap().contains(tp));
     assert_eq!(s.produced.files, vec!["src/retry.rs"]);
 
     // Vollständig reproduzierbar: derselbe Journal-Inhalt, dieselbe SessionId.

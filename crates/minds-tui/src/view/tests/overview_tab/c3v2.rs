@@ -828,15 +828,19 @@ fn c34_the_detail_gets_sixty_columns_and_is_a_level_when_narrow() {
     assert!(out.contains("OVERVIEW"), "{out}");
 }
 
-/// `◦` heißt im Register „open" — offen, kein Fehler (C3.4).
+/// `◦` heißt im Register „not observed" — offen, kein Fehler (C3.4; das
+/// Wort seit C9.4). [`theme::open`] bleibt das Wort für „noch nicht
+/// signiert / reviewt".
+///
+/// Klasse 2 (Batch 2, Paket 6 / C9.4): vorher `open` im Register.
 #[test]
 fn c34_the_open_glyph_is_registered_as_open() {
     let entry = crate::theme::REGISTER
         .iter()
         .find(|e| e.symbol == "◦")
         .unwrap();
-    assert_eq!(entry.meaning, "open");
-    assert_ne!(entry.meaning, "not observed");
+    assert_eq!(entry.meaning, "not observed");
+    assert_ne!(entry.meaning, "open");
     let (glyph, word, style) = crate::theme::open();
     assert_eq!((glyph, word), ("◦", "open"));
     assert_ne!(style.fg, crate::theme::tampered().2.fg, "open is never red");
@@ -944,7 +948,14 @@ fn review_coverage_never_counts_a_claim_as_explained() {
         ..LineClasses::default()
     });
     assert!(!stated.contains('✓'), "{stated}");
-    assert!(stated.contains("◇ 40 stated"), "{stated}");
+    // Klasse 2 (Batch 2, Paket 6 / C9.4): ein Wort je Zustand — `reported,
+    // not observed` statt `stated`, und keine Zeile `· 40 added lines`.
+    assert!(
+        stated.contains("◇ 40 of 40 added lines reported, not observed"),
+        "{stated}"
+    );
+    assert!(!stated.contains("stated"), "{stated}");
+    assert!(!stated.contains("· 40 added lines"), "{stated}");
     let skipped = text(LineClasses {
         added: 0,
         skipped_files: 2,

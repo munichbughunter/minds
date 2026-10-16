@@ -120,6 +120,45 @@ pub struct Lineage {
     /// gespeicherten Bytes) bleibt die maßgebliche.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closed: bool,
+
+    /// Ob und warum das Transkript des Agenten beim Bau der Session gelesen
+    /// wurde (K1). Ohne Transkript fehlen Modell, Antworttexte und Token —
+    /// bis hierher stumm: Der Record zeigte `unknown`, ohne zu sagen, woran
+    /// es lag. Jetzt steht der Grund daneben, als festes Wort, nie als
+    /// Freitext und **nie als Pfad** — der Transkript-Pfad trägt den
+    /// Benutzernamen und ist PII wie `cwd`.
+    ///
+    /// Additiv wie `closed`: `None` wird nicht geschrieben — alte Sessions
+    /// behalten Bytes und Id, alte Binaries lesen neue tolerant. `None`
+    /// heißt „von einem Binary ohne dieses Feld gebaut", nicht „gelesen".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<TranscriptStatus>,
+}
+
+/// Warum ein Transkript (nicht) gelesen wurde — der Grund hinter einem
+/// fehlenden Modell (K1). Ein geschlossenes Vokabular, damit der Reader jeden
+/// Wert in einen Satz übersetzen kann und kein Freitext in den Record gerät.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptStatus {
+    /// Gelesen; Modell und Texte stammen aus dem Transkript.
+    Read,
+    /// Kein Hook-Event der Session trug einen `transcript_path`.
+    NoPathInEvents,
+    /// Der Pfad zeigte auf keine Datei.
+    NotFound,
+    /// Die Datei existierte, ließ sich aber nicht lesen (Rechte, I/O).
+    NotReadable,
+    /// Gelesen, aber ohne Assistant-Eintrag mit `message.model` — etwa
+    /// noch leer zum Bauzeitpunkt.
+    Empty,
+    /// Gelesen, aber keine Zeile war ein Transkript-Eintrag.
+    ParseFailed,
+    /// Der Witness baut die Session und liest grundsätzlich kein Transkript
+    /// aus dem Namensraum des Agenten (`adapter::checkpoint_witness`): Ein
+    /// fremder Hook-Pfad ist für ihn kein Leseauftrag. Kein Fehler — eine
+    /// Entscheidung, die der Record benennt.
+    NotReadByWitness,
 }
 
 impl Lineage {
@@ -132,6 +171,7 @@ impl Lineage {
             ended_at: None,
             cwd: None,
             closed: false,
+            transcript: None,
         }
     }
 }
@@ -974,5 +1014,44 @@ mod tests {
 
         let old: Lineage = serde_json::from_str(&open).unwrap();
         assert!(!old.closed);
+    }
+
+    /// K1: `transcript` ist additiv wie `closed` — `None` fehlt in den
+    /// Bytes, jede bestehende Session behält ihre kanonische Form und Id;
+    /// ein Status steht als festes Wort da und liest sich zurück; ein
+    /// Envelope ohne das Feld liest `None`. Nie ein Pfad, nie Freitext.
+    #[test]
+    fn transcript_status_is_additive_and_round_trips() {
+        let mut lineage = Lineage::new("31f3f224");
+        lineage.ended_at = Some("2026-07-23T09:31:57Z".into());
+        let before = crate::to_canonical_string(&lineage).unwrap();
+        assert_eq!(
+            before,
+            r#"{"ended_at":"2026-07-23T09:31:57Z","local_id":"31f3f224"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Lineage>(&before).unwrap().transcript,
+            None
+        );
+
+        for (status, word) in [
+            (TranscriptStatus::Read, "read"),
+            (TranscriptStatus::NoPathInEvents, "no_path_in_events"),
+            (TranscriptStatus::NotFound, "not_found"),
+            (TranscriptStatus::NotReadable, "not_readable"),
+            (TranscriptStatus::Empty, "empty"),
+            (TranscriptStatus::ParseFailed, "parse_failed"),
+            (TranscriptStatus::NotReadByWitness, "not_read_by_witness"),
+        ] {
+            lineage.transcript = Some(status);
+            let text = crate::to_canonical_string(&lineage).unwrap();
+            assert_eq!(
+                text,
+                format!(
+                    r#"{{"ended_at":"2026-07-23T09:31:57Z","local_id":"31f3f224","transcript":"{word}"}}"#
+                )
+            );
+            assert_eq!(serde_json::from_str::<Lineage>(&text).unwrap(), lineage);
+        }
     }
 }

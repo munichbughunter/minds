@@ -69,7 +69,11 @@ pub fn why(out: &mut impl Write, chain: &WhyChain) -> std::io::Result<()> {
                 name,
                 version,
                 model,
-            } => writeln!(out, "agent\t{name} {version}\t{model}")?,
+            } => {
+                // Eine nicht erfasste Version ist leer (K1) — kein Leerzeichen.
+                let who = format!("{name} {version}");
+                writeln!(out, "agent\t{}\t{model}", who.trim())?;
+            }
             WhyStep::Intent { request, .. } => writeln!(out, "intent\t{request}")?,
             WhyStep::Evidence { links } => {
                 for link in links {

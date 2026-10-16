@@ -261,10 +261,13 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
     let mut add = |glyph: &str, class, meaning, at: String| {
         uses.push((glyph.to_string(), class, meaning, at));
     };
+    // Klasse 2 (Batch 2, Paket 6 / C9.4): `◇` heißt im Register `reported`
+    // (vorher `stated`), `◦` heißt `not observed` (vorher `open`, C3.4) —
+    // ein Wort je Evidenz-Zustand, tabübergreifend.
     for (source, meaning) in [
         (S::Observed, "observed"),
         (S::ContentDerived, "content"),
-        (S::HumanDeclared, "stated"),
+        (S::HumanDeclared, "reported"),
         (S::Heuristic, "inferred"),
     ] {
         for (status, check) in [
@@ -322,20 +325,18 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
     }
     add(theme::tampered().0, Epistemic, "failed", "tampered".into());
     add(theme::claim().0, Epistemic, "claim", "claim".into());
-    // C3.4 (freigegeben): ◦ heißt „open".
+    // C9.4: ◦ heißt „not observed" — offen, noch nicht da; nie ein Fehler.
     add(
         theme::not_observed().0,
         Epistemic,
-        "open",
+        "not observed",
         "not_observed".into(),
     );
     for (class, meaning) in [
         (ReconClass::Explained, "observed"),
         (ReconClass::ExplainedFsOnly, "fs only"),
-        (ReconClass::ReportedOnly, "stated"),
-        // C3.4 (freigegeben): ◦ heißt „open" — nicht beobachtet, noch
-        // nicht da; nie ein Fehler.
-        (ReconClass::Unexplained, "open"),
+        (ReconClass::ReportedOnly, "reported"),
+        (ReconClass::Unexplained, "not observed"),
     ] {
         add(
             theme::recon(class).0,
@@ -442,7 +443,9 @@ fn a1_the_help_overlay_shows_the_whole_legend() {
     assert!(out.contains("State:"), "{out}");
     assert!(out.contains("Kinds:"), "{out}");
     assert!(out.contains("■ change / commit"), "{out}");
-    assert!(out.contains("◇ stated (declared / reported only)"), "{out}");
+    // Klasse 2 (Batch 2, Paket 6 / C9.4): das Zustandswort heißt `reported`.
+    assert!(out.contains("◇ reported"), "{out}");
+    assert!(!out.contains("◇ stated"), "{out}");
 }
 
 // ---------------------------------------------------------------------

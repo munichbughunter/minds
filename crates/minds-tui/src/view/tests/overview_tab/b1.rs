@@ -74,20 +74,26 @@ fn cases() -> Vec<Case> {
             |app| app.reduce(Action::TabTo(2)),
             |app| app.tab == Tab::Verify,
         ),
+        // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff, nicht
+        // in der Dateiliste — `Esc` führt aus dem Diff in die Liste, ohne
+        // vorheriges `Enter`.
         (
             "changes diff: back to the files",
-            |app| {
-                app.reduce(Action::TabTo(3));
-                app.reduce(Action::Enter);
-            },
+            |app| app.reduce(Action::TabTo(3)),
             |app| {
                 app.tab == Tab::Changes
-                    && app.changes.as_ref().is_none_or(|c| c.focus == Focus::Files)
+                    && app
+                        .changes
+                        .as_ref()
+                        .is_none_or(|c| c.focus == Focus::Files && c.focus != Focus::Diff)
             },
         ),
         (
             "changes files: nothing",
-            |app| app.reduce(Action::TabTo(3)),
+            |app| {
+                app.reduce(Action::TabTo(3));
+                app.reduce(Action::Back);
+            },
             |app| app.tab == Tab::Changes,
         ),
         (

@@ -87,6 +87,31 @@ impl FileDiff {
             .filter(|r| r.kind == DiffKind::Added && r.class == Some(ReconClass::Unexplained))
             .count()
     }
+
+    /// Die `+`-Zeilen dieser Datei nach Klasse (C9.4) — **die** Zählung, aus
+    /// der auch [`ChangeSet::line_classes`] summiert: Diff-Legende,
+    /// FILES-Titel und Overview-Detail rechnen damit dieselben Zahlen.
+    /// `reasons` bleibt leer; die Gründe gruppiert der Commit.
+    pub fn line_classes(&self) -> LineClasses {
+        let mut c = LineClasses {
+            added: self.added,
+            files: 1,
+            skipped_files: usize::from(self.note.is_some()),
+            ..LineClasses::default()
+        };
+        for row in self.rows.iter().filter(|r| r.kind == DiffKind::Added) {
+            match row.class {
+                Some(ReconClass::Explained) => c.explained += 1,
+                Some(ReconClass::ExplainedFsOnly) => c.fs_only += 1,
+                Some(ReconClass::ReportedOnly) => c.stated += 1,
+                Some(ReconClass::Unexplained) => c.unexplained += 1,
+                None => {}
+            }
+        }
+        let classified = c.explained + c.fs_only + c.stated + c.unexplained;
+        c.not_assessed = c.added.saturating_sub(classified);
+        c
+    }
 }
 
 /// Die Änderungen eines Commits.
@@ -166,28 +191,22 @@ impl ChangeSet {
     /// als erklärt; ausgesagte, nur im Dateisystem gesehene, unerklärte und
     /// nicht bewertete (ohne Klasse oder in Dateien ohne Diff) getrennt.
     pub fn line_classes(&self) -> LineClasses {
+        // Die Summe der Dateien ([`FileDiff::line_classes`]) — eine Zählung
+        // für Overview-Detail, FILES-Titel und Diff-Legende (C9.4).
         let mut c = LineClasses {
-            added: self.added(),
-            unexplained: self.unexplained(),
-            files: self.files.len(),
             reasons: self.unexplained_reasons(),
             ..LineClasses::default()
         };
-        for file in &self.files {
-            if file.note.is_some() {
-                c.skipped_files += 1;
-            }
-            for row in file.rows.iter().filter(|r| r.kind == DiffKind::Added) {
-                match row.class {
-                    Some(ReconClass::Explained) => c.explained += 1,
-                    Some(ReconClass::ExplainedFsOnly) => c.fs_only += 1,
-                    Some(ReconClass::ReportedOnly) => c.stated += 1,
-                    Some(ReconClass::Unexplained) | None => {}
-                }
-            }
+        for file in self.files.iter().map(FileDiff::line_classes) {
+            c.added += file.added;
+            c.explained += file.explained;
+            c.fs_only += file.fs_only;
+            c.stated += file.stated;
+            c.unexplained += file.unexplained;
+            c.not_assessed += file.not_assessed;
+            c.skipped_files += file.skipped_files;
+            c.files += file.files;
         }
-        let classified = c.explained + c.fs_only + c.stated + c.unexplained;
-        c.not_assessed = c.added.saturating_sub(classified);
         c
     }
 
@@ -218,6 +237,12 @@ impl ChangeSet {
     pub fn added(&self) -> usize {
         self.files.iter().map(|f| f.added).sum()
     }
+
+    /// Alle entfernten Zeilen des Commits — die Summe über
+    /// [`FileDiff::removed`], für den FILES-Titel (`+95 −0`).
+    pub fn removed(&self) -> usize {
+        self.files.iter().map(|f| f.removed).sum()
+    }
 }
 
 /// Warum eine Zeile existiert — aus der Session, die sie schrieb.
@@ -227,6 +252,12 @@ pub struct LineReason {
     pub session: SessionId,
     /// Agent und Modell, entschärft.
     pub agent: String,
+    /// Das Modell vollständig (`claude-opus-4-1 (Anthropic)`), wenn es
+    /// erfasst ist — sonst `None`, nie der Platzhalter (K1).
+    pub model: Option<String>,
+    /// Ob und warum das Transkript beim Checkpoint (nicht) gelesen wurde —
+    /// aus der Lineage, fehlt bei Records älterer Binaries (K1).
+    pub transcript: Option<minds_core::TranscriptStatus>,
     /// Der Auftrag der Session (erfasster Prompt), entschärft, einzeilig.
     pub request: String,
     /// Der Turn und der Aufruf.
@@ -428,10 +459,17 @@ impl crate::Inspection {
         };
         Some(LineReason {
             session: source.session,
-            agent: one_line(
-                &format!("{} · {}", session.agent.name, session.model.id),
-                80,
-            ),
+            // `agent · modell`, Platzhalter nie (C3.6/K1): ein fehlendes
+            // Modell nennt den Grund aus der Lineage.
+            agent: one_line(&crate::summary::actor_line(session), 120),
+            model: {
+                let actor = crate::summary::Actor::of(session);
+                actor
+                    .model
+                    .is_some()
+                    .then(|| one_line(&actor.model_label(), 80))
+            },
+            transcript: session.lineage.as_ref().and_then(|l| l.transcript),
             request: one_line(&session.intent.request, SAID_LIMIT),
             turn: source.turn,
             call: source.call,

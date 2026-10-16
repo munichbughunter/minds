@@ -322,6 +322,21 @@ pub struct NavEntry {
     pub base: usize,
 }
 
+impl NavEntry {
+    /// Der Ort des Ursprungs für den Breadcrumb (siehe [`place`]).
+    pub(crate) fn place(&self) -> Vec<String> {
+        place(
+            self.tab,
+            &self.views,
+            self.verify
+                .as_ref()
+                .and_then(|s| s.commit())
+                .or(self.changes.as_ref().and_then(|s| s.commit()))
+                .or(self.active_commit),
+        )
+    }
+}
+
 /// Was das Tamper-Banner meldet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TamperAlert {
@@ -556,6 +571,20 @@ impl<'a> App<'a> {
     }
 
     /// Öffnet den Overview-Tab (beim ersten Mal gelesen).
+    /// Der erklärte Bereich eines gelesenen Ankers — so, wie die Übersicht
+    /// ihn nach `fill_overview` hält. `None`, solange er dort nicht gelesen
+    /// ist oder er keinen Bereich erklärt: die Why-Box liest nichts nach.
+    pub fn requirement_scope(&self, id: &minds_core::ContentHash) -> Option<&[String]> {
+        let detail = self
+            .overview
+            .as_ref()?
+            .requirements
+            .get(id)?
+            .as_ref()
+            .ok()?;
+        (!detail.scope.is_empty()).then_some(detail.scope.as_slice())
+    }
+
     pub fn open_overview(&mut self) {
         match self.overview.as_mut() {
             None => self.overview = Some(OverviewState::build(&self.inspection, self.repo)),
@@ -1175,15 +1204,29 @@ impl<'a> App<'a> {
         self.changes = Some(next);
     }
 
+    /// Ob `Tab` gerade die Datei wechselt: im Changes-Tab, solange FILES eine
+    /// Zeile über dem Diff ist (die letzte gezeichnete Breite unter 160
+    /// Spalten) und es Dateien gibt. Vor dem ersten Zeichnen (Breite 0) und
+    /// mit dem FILES-Pane bleibt `Tab` der Tab-Wechsel.
+    fn files_line_takes_tab(&self) -> bool {
+        self.tab == Tab::Changes
+            && self.width > 0
+            && self.width < crate::view::changes::FILES_PANE_MIN
+            && self.changes.as_ref().is_some_and(|c| !c.files().is_empty())
+    }
+
     /// Die Tasten im Changes-Tab.
     fn reduce_changes(&mut self, action: Action) {
         let page = self.page.max(1) as isize;
         let split_shown = self.width >= crate::view::changes::SPLIT_MIN;
+        // Unter 120 Spalten ist „Warum diese Zeile?" eine Ebene (C9.2).
+        let why_as_layer = self.width < crate::view::changes::WHY_LAYER_MAX;
         let Some(state) = self.changes.as_mut() else {
             return;
         };
         match (state.focus, action) {
             (_, Action::Split) => state.split = !state.split,
+            (_, Action::CycleFile(forward)) => state.cycle_file(forward),
             (_, Action::Context) => state.why = !state.why,
             (_, Action::Unexplained(forward)) => {
                 if state.jump_unexplained(forward) {
@@ -1226,13 +1269,67 @@ impl<'a> App<'a> {
             (Focus::Diff, Action::Home) => state.row_to(false),
             (Focus::Diff, Action::End) => state.row_to(true),
             (Focus::Diff, Action::Bracket(forward)) => state.jump_hunk(forward),
-            (Focus::Diff, Action::Back) => state.focus = Focus::Files,
-            (Focus::Diff, Action::Enter) => self.why_of_row(),
+            // Esc (B1): erst die Ebene zu, dann in die Dateiliste.
+            (Focus::Diff, Action::Back) if state.why_layer => state.why_layer = false,
+            (Focus::Diff, Action::Back) => {
+                state.focus = Focus::Files;
+                state.landed = false;
+            }
+            (Focus::Diff, Action::Enter) if why_as_layer => state.why_layer = !state.why_layer,
+            (Focus::Diff, Action::Enter) => self.goto_tool_call(),
             _ => {}
         }
     }
 
-    /// Enter auf einer Diff-Zeile: die Herkunftskette dieser Zeile — im
+    /// Enter auf einer Codezeile (C9.3): der Graph der Session, die sie
+    /// schrieb, mit dem Cursor auf genau diesem Tool-Aufruf — der Rückweg
+    /// führt per Esc über den Verlauf (Paket 2). Die Zuordnung Zeile →
+    /// (Session, Turn, Aufruf) ist [`minds_reader::reconcile::LineSource`];
+    /// ohne sie sagt die Fußzeile es (B4).
+    fn goto_tool_call(&mut self) {
+        let source = self.changes.as_ref().and_then(|state| {
+            state
+                .current()
+                .and_then(|f| f.rows.get(state.row))
+                .and_then(|r| r.source)
+        });
+        let Some(source) = source else {
+            self.closed = Some(
+                "Enter: no tool call is recorded for this line — w opens the why chain".into(),
+            );
+            return;
+        };
+        let Some(graph) = self.inspection.graph(source.session) else {
+            self.closed = Some("that session is not readable".into());
+            return;
+        };
+        // Der Knoten des Aufrufs: der `call`-te Tool-Knoten unter dem
+        // `turn`-ten Zug — so baut `SessionGraph::build` den Graphen.
+        let turn = graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.kind, NodeKind::Turn(_)))
+            .nth(source.turn)
+            .map(|n| n.id);
+        let node = turn.and_then(|turn| {
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.parent == Some(turn) && matches!(n.kind, NodeKind::Tool(_)))
+                .nth(source.call)
+                .map(|n| n.id)
+        });
+        self.goto_session(source.session);
+        if let (Some(node), Some(View::Graph { rows, cursor, .. })) = (node, self.views.last_mut())
+            && let Some(at) = rows
+                .iter()
+                .position(|r| r.node <= node && node < r.node + r.count)
+        {
+            *cursor = at;
+        }
+    }
+
+    /// `w` auf einer Diff-Zeile: die Herkunftskette dieser Zeile — im
     /// Sessions-Tab, `Esc` führt zurück in die Liste. Auf HEAD die Kette der
     /// Zeile (Blame), auf älteren Commits die des Commits.
     fn why_of_row(&mut self) {
@@ -1545,6 +1642,13 @@ impl<'a> App<'a> {
         // Auch vorher: Die Startauswahl (HEAD) ist schon aktiv, bevor die
         // erste Taste fällt.
         self.sync_active();
+        // In der Dateizeile des Changes-Tabs (unter 160 Spalten) wechselt
+        // `Tab` die Datei, nicht den Tab (C9.2) — kein Tab-Wechsel für den
+        // Verlauf (Paket 2, Regel 1).
+        let action = match action {
+            Action::CycleTab(forward) if self.files_line_takes_tab() => Action::CycleFile(forward),
+            other => other,
+        };
         // Esc, Schritt 4 (B1/B2): auf der Ebene eines Sprungs zurück zum
         // Ursprung — mit Ebenen und Cursor.
         if action == Action::Back && self.at_jump_base() {
@@ -1562,6 +1666,7 @@ impl<'a> App<'a> {
                     | Action::Intent
             )
             .then(|| self.snapshot());
+            let tab_key = matches!(action, Action::TabTo(_) | Action::CycleTab(_));
             self.reduce_action(action);
             if let Some(mut entry) = origin
                 && entry.tab != self.tab
@@ -1573,7 +1678,19 @@ impl<'a> App<'a> {
                 } else {
                     0
                 };
-                self.history.push(entry);
+                self.remember(entry);
+                // Landet der Sprung im Diff, führt Esc von dort zum Ursprung.
+                if self.tab == Tab::Changes
+                    && let Some(changes) = &mut self.changes
+                {
+                    changes.landed = changes.focus == Focus::Diff;
+                }
+            }
+            // Ein Tab-Wechsel per Taste (F1–F5, 1–5, Tab) auf einen Tab, der
+            // im Verlauf als Ursprung liegt, beendet dessen Sprung: der Nutzer
+            // ist zurück am Ursprung, alles ab diesem Eintrag fällt weg.
+            if tab_key && let Some(at) = self.history.iter().position(|e| e.tab == self.tab) {
+                self.history.truncate(at);
             }
         }
         self.sync_active();
@@ -1683,7 +1800,15 @@ impl<'a> App<'a> {
                 None => self.closed = Some("v: no commit here to verify".into()),
             },
             Action::Diff => match commit {
-                Some(commit) => self.open_changes(Some(commit)),
+                Some(commit) => {
+                    let from_overview = self.tab == Tab::Overview;
+                    self.open_changes(Some(commit));
+                    // Aus der Übersicht (`→ d, then n`, C9.1): auf die erste
+                    // Zeile im offenen Zustand, nicht auf die erste Codezeile.
+                    if from_overview && let Some(state) = self.changes.as_mut() {
+                        state.land_on_open();
+                    }
+                }
                 None => self.closed = Some("d: no commit here to diff".into()),
             },
             Action::Intent => {
@@ -1809,8 +1934,30 @@ impl<'a> App<'a> {
         }
     }
 
+    /// Höchstens so viele Ursprünge merkt sich der Verlauf; die ältesten
+    /// fallen weg.
+    pub(crate) const HISTORY_CAP: usize = 8;
+
+    /// Legt einen Ursprung ab — außer er gleicht dem letzten Eintrag (Tab und
+    /// Ort): dann ist der Sprung derselbe, der Breadcrumb zeigt den Ort nicht
+    /// zweimal. Über [`Self::HISTORY_CAP`] hinaus fällt der älteste Eintrag.
+    pub(crate) fn remember(&mut self, entry: NavEntry) {
+        if self
+            .history
+            .last()
+            .is_some_and(|last| last.tab == entry.tab && last.place() == entry.place())
+        {
+            return;
+        }
+        self.history.push(entry);
+        if self.history.len() > Self::HISTORY_CAP {
+            let excess = self.history.len() - Self::HISTORY_CAP;
+            self.history.drain(..excess);
+        }
+    }
+
     /// Der Ursprung, wie er gerade ist.
-    fn snapshot(&self) -> NavEntry {
+    pub(crate) fn snapshot(&self) -> NavEntry {
         NavEntry {
             tab: self.tab,
             views: self.views.clone(),
@@ -1836,7 +1983,7 @@ impl<'a> App<'a> {
 
     /// Ob Esc jetzt zum Ursprung des letzten Sprungs führt: nichts davor zu
     /// schließen oder zu leeren, noch im Ziel des Sprungs, auf seiner Ebene.
-    fn at_jump_base(&self) -> bool {
+    pub(crate) fn at_jump_base(&self) -> bool {
         let Some(entry) = self.history.last() else {
             return false;
         };
@@ -1855,10 +2002,13 @@ impl<'a> App<'a> {
                 .overview
                 .as_ref()
                 .is_none_or(|s| s.focus == crate::overview::OverviewFocus::Graph),
+            // Die Dateiliste ist die oberste Ebene; ein Diff, der direkt durch
+            // den Sprung erreicht wurde, ebenso (`landed`) — eine offene
+            // Why-Ebene schließt Esc zuerst.
             Tab::Changes => self
                 .changes
                 .as_ref()
-                .is_none_or(|s| s.focus == Focus::Files),
+                .is_none_or(|s| s.focus == Focus::Files || (s.landed && !s.why_layer)),
             Tab::Verify | Tab::Intent => true,
         }
     }
@@ -1901,27 +2051,26 @@ impl<'a> App<'a> {
     }
 
     /// Der Pfad für den Breadcrumb: je Sprung der Ursprung, dann der
-    /// aktuelle Ort.
+    /// aktuelle Ort — derselbe Ort nie zweimal hintereinander.
     pub fn breadcrumb(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for entry in &self.history {
-            out.extend(place(
-                entry.tab,
-                &entry.views,
-                entry
-                    .verify
-                    .as_ref()
-                    .and_then(|s| s.commit())
-                    .or(entry.changes.as_ref().and_then(|s| s.commit()))
-                    .or(entry.active_commit),
-            ));
-        }
         let shown = match self.tab {
             Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
             Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
             _ => self.active_commit,
         };
-        out.extend(place(self.tab, &self.views, shown));
+        let mut out: Vec<String> = Vec::new();
+        let mut last: Option<Vec<String>> = None;
+        for next in self
+            .history
+            .iter()
+            .map(NavEntry::place)
+            .chain(std::iter::once(place(self.tab, &self.views, shown)))
+        {
+            if last.as_ref() != Some(&next) {
+                out.extend(next.iter().cloned());
+                last = Some(next);
+            }
+        }
         out
     }
 
