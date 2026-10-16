@@ -41,6 +41,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Changes layout by width, diff without line background.** At 160
+  columns and more, FILES is a pane of 28 columns, the diff takes the rest
+  and WHY THIS LINE? 56; from 120 to 159 the files become one line above
+  the diff (`◇ src/sort.py +29 · ◦ src/test_sort.py +66`, `Esc` focuses it,
+  `↑↓` switch) and WHY is 48 wide; below 120 the files line stays and WHY
+  is a layer: `Enter` on a line opens it, `Esc` closes it. `+` and `-` are
+  foreground colours on the marker and the line number only — no line has
+  a background any more, that is the cursor's. The gutter glyph is dimmed
+  while it matches the file's state and stands bold in full colour where it
+  deviates. The FILES title counts the commit: `FILES · 2 files · +95 −0`
+  (the commit id is in the footer).
 - **Changes lands on the first line, cursor visible.** Opening the Changes
   tab (`d`, Enter on ARTIFACT, `F4`) puts the focus into the diff on the
   first code line of the first hunk — never on the hunk header, never in

@@ -2438,7 +2438,10 @@ mod changes_tab {
         assert!(out.contains("1     1   fn order() {"), "{out}");
         assert!(out.contains("2       -     old();"), "{out}");
         assert!(out.contains("     2 +     sort_by_key();"), "{out}");
-        assert!(out.contains("FILES · 1111111 · 1/1"), "{out}");
+        // Klasse 2 (Batch 2, Paket 4 / C9.2): Der FILES-Titel zählt Dateien
+        // und Zeilen des Commits statt Commit-Id und Position.
+        assert!(out.contains("FILES · 2 files · +3 −1"), "{out}");
+        assert!(!out.contains("FILES · 1111111 · 1/1"), "{out}");
         assert!(out.contains("+2 −1"), "{out}");
         assert!(
             out.contains("◦1"),
@@ -2446,14 +2449,19 @@ mod changes_tab {
         );
     }
 
-    /// Grün und Rot liegen als Hintergrund auf genau den `+`- und
-    /// `-`-Zeilen; die unerklärte Zeile ist fett und invertiert markiert.
+    /// Grün und Rot liegen auf Marker und Zeilennummer der `+`- und
+    /// `-`-Zeilen — als Vordergrund, nie als Zeilen-Hintergrund; die
+    /// unerklärte Zeile ist fett markiert.
+    ///
+    /// Klasse 2 (Batch 2, Paket 4 / C9.2): Vorher lag die Farbe als Grund
+    /// auf der ganzen Zeile (`ADD_BG`/`DEL_BG`) und der ◦-Glyph war
+    /// invertiert; der Hintergrund ist jetzt dem Cursor vorbehalten.
     #[test]
     fn added_lines_are_green_removed_red_and_unexplained_bold() {
-        use ratatui::style::Modifier;
+        use crate::theme;
+        use ratatui::style::{Color, Modifier};
         let (_dir, repo) = repo();
         let mut app = app_with_changes(&repo);
-        app.reduce(Action::Enter);
         let mut terminal = Terminal::new(TestBackend::new(WIDE, 30)).unwrap();
         terminal
             .draw(|frame| super::super::draw(frame, &mut app))
@@ -2472,12 +2480,24 @@ mod changes_tab {
                 })
                 .unwrap_or_else(|| panic!("{needle} not drawn"))
         };
+        let sign_left_of = |x: u16, y: u16| {
+            (0..x)
+                .rev()
+                .find(|&mx| matches!(buffer[(mx, y)].symbol(), "+" | "-"))
+                .expect("a marker left of the text")
+        };
         let (x, y) = find("sort_by_key");
-        assert_eq!(buffer[(x, y)].bg, super::super::changes::ADD_BG);
+        assert_eq!(buffer[(x, y)].bg, Color::Reset, "no line background");
+        let sign = sign_left_of(x, y);
+        assert_eq!(buffer[(sign, y)].symbol(), "+");
+        assert_eq!(buffer[(sign, y)].fg, theme::OK);
         let (x, y) = find("old();");
-        assert_eq!(buffer[(x, y)].bg, super::super::changes::DEL_BG);
+        assert_eq!(buffer[(x, y)].bg, Color::Reset, "no line background");
+        let sign = sign_left_of(x, y);
+        assert_eq!(buffer[(sign, y)].symbol(), "-");
+        assert_eq!(buffer[(sign, y)].fg, theme::DELETE);
         let (x, y) = find("fn order");
-        assert_ne!(buffer[(x, y)].bg, super::super::changes::ADD_BG);
+        assert_ne!(buffer[(x, y)].fg, theme::OK);
         let (x, y) = find("// manuell");
         // Der Rand-Glyph der Zeile: drei Zeichen vor den Zeilennummern.
         let marker = (0..x)
@@ -2485,7 +2505,11 @@ mod changes_tab {
             .find(|mx| buffer[(*mx, y)].symbol() == "◦")
             .unwrap();
         let cell = &buffer[(marker, y)];
-        assert!(cell.modifier.contains(Modifier::BOLD | Modifier::REVERSED));
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert!(
+            !cell.modifier.contains(Modifier::REVERSED),
+            "reversed is the cursor, not a marker"
+        );
     }
 
     #[test]
@@ -2837,6 +2861,7 @@ mod changes_tab {
     mod b4;
     mod b4b;
     mod c91;
+    mod c92;
 }
 
 // --- Verify-Tab -------------------------------------------------------------

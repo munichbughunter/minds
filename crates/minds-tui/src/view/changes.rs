@@ -1,19 +1,24 @@
-//! Der Changes-Tab: links die Dateien des Commits, rechts der Diff wie in
-//! `git diff`, GitHub oder GitLab — Unified mit Hunk-Köpfen, alten und
-//! neuen Zeilennummern, `+` auf grünem und `-` auf rotem Grund, oder Split
+//! Der Changes-Tab: die Dateien des Commits, der Diff wie in `git diff`,
+//! GitHub oder GitLab — Unified mit Hunk-Köpfen, alten und neuen
+//! Zeilennummern, `+` grün und `-` rot auf Marker und Nummer, oder Split
 //! nebeneinander. Daneben, für die Zeile unter dem Cursor: warum sie
 //! existiert.
 //!
+//! Layout nach Breite (C9.2): ab 160 Spalten FILES als Bereich (28), Diff
+//! und WHY (56) daneben; von 120 bis 159 FILES als Zeile über dem Diff,
+//! WHY 48; darunter FILES-Zeile und Diff, WHY als Ebene per `Enter`.
+//!
 //! Farbe trägt nie allein: `+`/`-` stehen immer da, die Klasse einer Zeile
-//! als Glyph am Rand. Unerklärt ist kein Fehler (kein Rot, siehe
-//! [`theme::recon`]) — aber kräftig markiert, fett und invertiert, damit es
-//! im Grün nicht untergeht.
+//! als Glyph am Rand. Kein Zeilen-Hintergrund — der ist dem Cursor
+//! vorbehalten. Unerklärt ist kein Fehler (kein Rot, siehe
+//! [`theme::recon`]); der Rand-Glyph ist gedimmt, solange er dem Zustand
+//! der Datei entspricht, und steht fett in voller Farbe, wo er abweicht.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use minds_git::DiffKind;
 use minds_reader::changes::{DiffRow, FileDiff};
@@ -24,20 +29,23 @@ use crate::changes::{ChangesState, Focus};
 use crate::theme;
 use crate::view::{clip, offset};
 
-/// Grund einer hinzugefügten Zeile — gedämpft, damit Text und Glyph lesbar
-/// bleiben (wie `delta` oder GitHubs Dark Mode).
-pub const ADD_BG: Color = Color::Indexed(22);
-/// Grund einer entfernten Zeile.
-pub const DEL_BG: Color = Color::Indexed(52);
 /// Ab dieser Breite des Diffs gibt es Split.
 pub const SPLIT_MIN: u16 = 160;
-/// Ab dieser Breite rechts steht „Warum diese Zeile?" neben dem Diff.
-const WHY_BESIDE_MIN: u16 = 110;
+/// Ab dieser Terminalbreite ist FILES ein Bereich links (C9.2); darunter
+/// eine Zeile über dem Diff.
+pub const FILES_PANE_MIN: u16 = 160;
+/// Breite des FILES-Bereichs (mit Rahmen).
+const FILES_WIDTH: u16 = 28;
 /// Unter dieser Terminalbreite ist „Warum diese Zeile?" keine Spalte,
 /// sondern eine Ebene über dem Diff (`Enter` auf der Zeile, `Esc` zurück).
 pub const WHY_LAYER_MAX: u16 = 120;
-/// Breite der Spalte „Warum diese Zeile?".
-const WHY_WIDTH: u16 = 46;
+/// Breite der Spalte „Warum diese Zeile?" (mit Rahmen) ab 160 Spalten …
+const WHY_WIDTH_WIDE: u16 = 56;
+/// … und von 120 bis 159 Spalten.
+const WHY_WIDTH: u16 = 48;
+/// Die Ebene „Warum diese Zeile?" unter 120 Spalten: höchstens so breit und
+/// so hoch, sonst das Terminal minus Rand.
+const WHY_LAYER_SIZE: (u16, u16) = (60, 16);
 
 /// Zeichnet den Tab in `area`; setzt `app.page` auf die Höhe des Diffs und
 /// `app.width` auf die Breite (ob Split passt).
@@ -83,10 +91,18 @@ fn draw_state(frame: &mut Frame, app: &App, state: &ChangesState, area: Rect) ->
         );
         return None;
     }
-    let list_w = (area.width * 28 / 100).clamp(24, 44);
-    let [files, right] =
-        Layout::horizontal([Constraint::Length(list_w), Constraint::Min(1)]).areas(area);
-    draw_files(frame, state, files);
+    // Breakpoints (C9.2): ab 160 Spalten FILES als Bereich, sonst als Zeile.
+    let right = if area.width >= FILES_PANE_MIN {
+        let [files, right] =
+            Layout::horizontal([Constraint::Length(FILES_WIDTH), Constraint::Min(1)]).areas(area);
+        draw_files(frame, state, files);
+        right
+    } else {
+        let [line, right] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        draw_files_line(frame, state, line);
+        right
+    };
 
     let file = state.current()?;
     let split = split_shown(state, area.width);
@@ -100,13 +116,20 @@ fn draw_state(frame: &mut Frame, app: &App, state: &ChangesState, area: Rect) ->
     frame.render_widget(block, right);
     let [head, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
     draw_file_head(frame, file, head);
-    // Im Split braucht der Diff die ganze Breite: Die Begründung steht dann
-    // darunter.
-    let (diff, why) = if !state.why {
+    // Die Spalte „Warum diese Zeile?": 56 ab 160 Spalten, 48 darunter, nie
+    // weniger — der Diff bekommt den Rest. Unter 120 Spalten ist sie keine
+    // Spalte, sondern eine Ebene. Im Split braucht der Diff die ganze
+    // Breite: Die Begründung steht dann darunter.
+    let why_w = if area.width >= FILES_PANE_MIN {
+        WHY_WIDTH_WIDE
+    } else {
+        WHY_WIDTH
+    };
+    let (diff, why) = if !state.why || area.width < WHY_LAYER_MAX {
         (rest, None)
-    } else if !split && rest.width >= WHY_BESIDE_MIN {
+    } else if !split {
         let [d, w] =
-            Layout::horizontal([Constraint::Min(1), Constraint::Length(WHY_WIDTH)]).areas(rest);
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(why_w)]).areas(rest);
         (d, Some(w))
     } else {
         let [d, w] = Layout::vertical([Constraint::Min(3), Constraint::Length(9)]).areas(rest);
@@ -125,14 +148,90 @@ fn draw_state(frame: &mut Frame, app: &App, state: &ChangesState, area: Rect) ->
     if let Some(why) = why {
         draw_why(frame, app, state, file, why);
     }
+    if area.width < WHY_LAYER_MAX && state.why_layer {
+        // Die Ebene liegt mittig über dem Diff; `Esc` schließt sie.
+        let (w, h) = WHY_LAYER_SIZE;
+        let w = w.min(area.width.saturating_sub(2));
+        let h = h.min(area.height.saturating_sub(2));
+        let layer = Rect {
+            x: area.x + (area.width.saturating_sub(w)) / 2,
+            y: area.y + (area.height.saturating_sub(h)) / 2,
+            width: w,
+            height: h,
+        };
+        frame.render_widget(Clear, layer);
+        draw_why(frame, app, state, file, layer);
+    }
     Some((diff.height as usize).max(1))
 }
 
+/// Der FILES-Titel: Zahl der Dateien, hinzugefügte und entfernte Zeilen des
+/// Commits — aus den Zählern des Readers, denselben wie in der Übersicht.
+fn files_title(state: &ChangesState) -> String {
+    let (files, added, removed) = match &state.set {
+        Ok(set) => (set.files.len(), set.added(), set.removed()),
+        Err(_) => (0, 0, 0),
+    };
+    let (_, mark) = theme::pane(state.focus == Focus::Files);
+    let mut title = format!(
+        "{mark}FILES · {files} file{} · +{added} −{removed}",
+        if files == 1 { "" } else { "s" }
+    );
+    if !state.filter.is_empty() {
+        title.push_str(&format!(
+            " · filter: {} ({} of {})",
+            state.filter,
+            state.shown().len(),
+            files
+        ));
+    }
+    title
+}
+
+/// Die Dateien als eine Zeile über dem Diff (unter 160 Spalten): Titel,
+/// dann je Datei Glyph, Pfad, `+n` und `◦n`, durch ` · ` getrennt; die
+/// gewählte trägt den Cursor, wenn die Liste den Fokus hat.
+fn draw_files_line(frame: &mut Frame, state: &ChangesState, area: Rect) {
+    let files = state.files();
+    let mut spans = vec![
+        Span::styled(format!(" {}", files_title(state)), theme::title()),
+        Span::styled("   ", theme::dim()),
+    ];
+    for (n, &i) in state.shown().iter().enumerate() {
+        let file = &files[i];
+        if n > 0 {
+            spans.push(Span::styled(" · ", theme::dim()));
+        }
+        let (glyph, _, style) = match file.class {
+            Some(class) => theme::recon(class),
+            None => ("·", "", theme::dim()),
+        };
+        let unexplained = file.unexplained();
+        let mut item = vec![
+            Span::styled(format!("{glyph} "), style),
+            Span::raw(file.path.clone()),
+            Span::styled(format!(" +{}", file.added), theme::dim()),
+        ];
+        if unexplained > 0 {
+            item.push(Span::styled(
+                format!(" ◦{unexplained}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+        }
+        if i == state.file {
+            let style = if state.focus == Focus::Files {
+                theme::cursor()
+            } else {
+                Style::default().add_modifier(Modifier::UNDERLINED)
+            };
+            item = item.into_iter().map(|s| s.patch_style(style)).collect();
+        }
+        spans.extend(item);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
-    let short = state
-        .commit()
-        .map(|c| c.to_string()[..7].to_string())
-        .unwrap_or_default();
     let inner_w = area.width.saturating_sub(2) as usize;
     let height = area.height.saturating_sub(2) as usize;
     let files = state.files();
@@ -187,20 +286,7 @@ fn draw_files(frame: &mut Frame, state: &ChangesState, area: Rect) {
             }
         })
         .collect();
-    let (_, mark) = theme::pane(state.focus == Focus::Files);
-    let mut title = format!(
-        " {mark}FILES · {short} · {}/{} ",
-        state.at + 1,
-        state.commits.len()
-    );
-    if !state.filter.is_empty() {
-        title.push_str(&format!(
-            "· filter: {} ({} of {}) ",
-            state.filter,
-            shown.len(),
-            files.len()
-        ));
-    }
+    let title = format!(" {} ", files_title(state));
     frame.render_widget(
         Paragraph::new(lines).block({
             let (border, _) = theme::pane(state.focus == Focus::Files);
@@ -324,21 +410,26 @@ fn file_summary(app: &App, file: &FileDiff) -> Vec<String> {
     parts
 }
 
-/// Der Rand einer Zeile: Cursor und Klasse. Unerklärte `+`-Zeilen fett und
-/// invertiert — kräftig, aber ohne Warnfarbe.
-fn margin(row: &DiffRow, cursor: bool) -> Vec<Span<'static>> {
+/// Der Rand einer Zeile: Cursor und Klasse. Der Glyph ist gedimmt, solange
+/// er dem Zustand der Datei (`file_class`) entspricht; eine Abweichung steht
+/// fett in voller Farbe — nie invertiert (das ist der Cursor), nie in einer
+/// Warnfarbe.
+fn margin(row: &DiffRow, cursor: bool, file_class: Option<ReconClass>) -> Vec<Span<'static>> {
     let pointer = Span::styled(
         if cursor { "▸" } else { " " },
         Style::default().add_modifier(Modifier::BOLD),
     );
     let glyph = match (row.kind, row.class) {
+        (DiffKind::Added, Some(class)) if Some(class) == file_class => {
+            Span::styled(theme::recon(class).0, theme::dim())
+        }
         (DiffKind::Added, Some(ReconClass::Unexplained)) => Span::styled(
-            "◦",
-            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED),
+            theme::recon(ReconClass::Unexplained).0,
+            Style::default().add_modifier(Modifier::BOLD),
         ),
         (DiffKind::Added, Some(class)) => {
             let (glyph, _, style) = theme::recon(class);
-            Span::styled(glyph, style)
+            Span::styled(glyph, style.add_modifier(Modifier::BOLD))
         }
         _ => Span::raw(" "),
     };
@@ -376,13 +467,31 @@ fn padded(text: &str, width: usize) -> String {
     out
 }
 
+/// Marker und Farbe einer Zeilenart — nur als Vordergrund auf Marker und
+/// Zeilennummer; der Text bleibt ungefärbt, der Hintergrund dem Cursor
+/// vorbehalten (C9.2).
 fn row_style(kind: DiffKind) -> (char, Style) {
     match kind {
-        DiffKind::Added => ('+', Style::default().bg(ADD_BG)),
-        DiffKind::Removed => ('-', Style::default().bg(DEL_BG)),
+        DiffKind::Added => ('+', Style::default().fg(theme::OK)),
+        DiffKind::Removed => ('-', Style::default().fg(theme::DELETE)),
         DiffKind::Context => (' ', Style::default()),
         DiffKind::Hunk => (' ', theme::dim()),
     }
+}
+
+/// Die Zeilennummer in der Farbe ihrer Art, wenn die Art sie betrifft (alt
+/// bei `-`, neu bei `+`), sonst gedimmt.
+fn number_span(n: Option<u32>, kind: DiffKind, new_side: bool) -> Span<'static> {
+    let coloured = matches!(
+        (kind, new_side),
+        (DiffKind::Added, true) | (DiffKind::Removed, false)
+    );
+    let style = if coloured {
+        row_style(kind).1
+    } else {
+        theme::dim()
+    };
+    Span::styled(number(n), style)
 }
 
 fn draw_unified(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Rect) {
@@ -398,7 +507,7 @@ fn draw_unified(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: 
         .take(height)
         .map(|(i, row)| {
             let cursor = i == state.row && state.focus == Focus::Diff;
-            let mut spans = margin(row, cursor);
+            let mut spans = margin(row, cursor, file.class);
             if row.kind == DiffKind::Hunk {
                 spans.push(Span::styled(
                     padded(&row.text, width.saturating_sub(3)),
@@ -406,14 +515,12 @@ fn draw_unified(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: 
                 ));
             } else {
                 let (sign, style) = row_style(row.kind);
-                spans.push(Span::styled(
-                    format!("{} {} ", number(row.old), number(row.new)),
-                    theme::dim(),
-                ));
-                spans.push(Span::styled(
-                    format!("{sign} {}", padded(&row.text, text_w)),
-                    style,
-                ));
+                spans.push(number_span(row.old, row.kind, false));
+                spans.push(Span::raw(" "));
+                spans.push(number_span(row.new, row.kind, true));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(sign.to_string(), style));
+                spans.push(Span::raw(format!(" {}", padded(&row.text, text_w))));
             }
             let line = Line::from(spans);
             if cursor {
@@ -444,8 +551,10 @@ fn draw_split(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Re
                 let (sign, style) = row_style(row.kind);
                 let n = if new_side { row.new } else { row.old };
                 vec![
-                    Span::styled(format!("{} ", number(n)), theme::dim()),
-                    Span::styled(format!("{sign} {} ", padded(&row.text, text_w)), style),
+                    number_span(n, row.kind, new_side),
+                    Span::raw(" "),
+                    Span::styled(sign.to_string(), style),
+                    Span::raw(format!(" {} ", padded(&row.text, text_w))),
                 ]
             }
             None => vec![Span::raw(format!("{:width$}", "", width = half))],
@@ -462,7 +571,7 @@ fn draw_split(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Re
                 .or(*left)
                 .map(|i| &file.rows[i])
                 .expect("a pair has one side");
-            let mut spans = margin(marker_row, cursor);
+            let mut spans = margin(marker_row, cursor, file.class);
             if marker_row.kind == DiffKind::Hunk {
                 spans.push(Span::styled(
                     marker_row.text.clone(),

@@ -218,6 +218,12 @@ impl ChangeSet {
     pub fn added(&self) -> usize {
         self.files.iter().map(|f| f.added).sum()
     }
+
+    /// Alle entfernten Zeilen des Commits — die Summe über
+    /// [`FileDiff::removed`], für den FILES-Titel (`+95 −0`).
+    pub fn removed(&self) -> usize {
+        self.files.iter().map(|f| f.removed).sum()
+    }
 }
 
 /// Warum eine Zeile existiert — aus der Session, die sie schrieb.
