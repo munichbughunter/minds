@@ -1430,6 +1430,40 @@ mod tests {
         );
     }
 
+    /// Batch 2, Paket 0.6 (K1): Ein Transkript, das nicht gelesen wurde —
+    /// weil kein Event einen Pfad trägt oder weil die Datei fehlt — ergibt
+    /// stumm den Platzhalter `unknown` für Modell und Anbieter. Kein Fehler,
+    /// kein Hinweis: genau die Lücke, die K1 sichtbar macht.
+    #[test]
+    fn an_unread_transcript_silently_yields_unknown() {
+        let prompt = |seq| {
+            ev(
+                seq,
+                EventKind::Prompt,
+                "UserPromptSubmit",
+                "t0",
+                r#"{"prompt":"x"}"#,
+            )
+        };
+        // (i) Kein Event trägt `transcript_path`.
+        let without = vec![prompt(0)];
+        let s = build_one(&key(), &without);
+        assert_eq!(s.model.id, "unknown");
+        assert_eq!(s.model.provider, "unknown");
+
+        // (ii) Ein Pfad, hinter dem keine Datei liegt.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jsonl");
+        let with_missing = vec![JournalEvent {
+            transcript_path: Some(missing.to_string_lossy().into_owned()),
+            ..prompt(0)
+        }];
+        let s = build_one(&key(), &with_missing);
+        assert_eq!(s.model.id, "unknown");
+        assert_eq!(s.model.provider, "unknown");
+        assert_eq!(s.agent.version, "unknown");
+    }
+
     #[test]
     fn a_trailing_tool_burst_without_stop_is_still_flushed() {
         let events = vec![
