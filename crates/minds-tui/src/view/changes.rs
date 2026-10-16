@@ -20,6 +20,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
+use minds_core::TranscriptStatus;
 use minds_git::DiffKind;
 use minds_reader::changes::{DiffRow, FileDiff};
 use minds_reader::reconcile::{Gap, ReconClass};
@@ -654,10 +655,40 @@ fn agent_said_line(reason: &minds_reader::changes::LineReason) -> Vec<Span<'stat
                 Span::raw(format!("{turn}\"{said}\"")),
             ]
         }
-        None => vec![Span::styled(
-            "— (transcript not read)".to_string(),
-            theme::dim(),
-        )],
+        None => {
+            let why = match reason.transcript {
+                Some(TranscriptStatus::Read) => {
+                    "— (no assistant text in the transcript)".to_string()
+                }
+                Some(status) => format!(
+                    "— (transcript not read: {})",
+                    minds_reader::summary::transcript_reason(status)
+                ),
+                None => "— (transcript not read)".to_string(),
+            };
+            vec![Span::styled(why, theme::dim())]
+        }
+    }
+}
+
+/// Die dritte WRITTEN-BY-Zeile: das Modell vollständig (`claude-opus-4-1
+/// (Anthropic)`) oder, gedimmt, `model not recorded — <Grund>` mit dem
+/// Glossar-Satz zum Transkript-Status (K1 in der Reihenfolge von C9.3); ohne
+/// bekannten Grund nur `model not recorded`. Nie der Platzhalter `unknown`.
+fn model_line(reason: &minds_reader::changes::LineReason) -> Span<'static> {
+    match &reason.model {
+        Some(model) => Span::raw(model.clone()),
+        None => {
+            let missing = minds_reader::summary::MODEL_NOT_RECORDED;
+            let text = match reason.transcript {
+                Some(TranscriptStatus::Read) | None => missing.to_string(),
+                Some(status) => format!(
+                    "{missing} — {}",
+                    minds_reader::summary::transcript_reason(status)
+                ),
+            };
+            Span::styled(text, theme::dim())
+        }
     }
 }
 
@@ -827,6 +858,7 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                         if attributed == 1 { "" } else { "s" }
                     )),
                 ]));
+                lines.push(Line::from(vec![indent(), model_line(reason)]));
                 let mut session = vec![label("SESSION"), Span::raw(short_session(&id))];
                 if let Some(card) = app.inspection.card(reason.session) {
                     let (glyph, word, style) = theme::provenance(&card.provenance);

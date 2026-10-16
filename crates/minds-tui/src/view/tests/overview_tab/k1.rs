@@ -198,7 +198,7 @@ fn k1_the_placeholder_unknown_is_printed_in_no_view() {
 }
 
 /// Überall, wo das Modell stünde, steht der Grund: Overview-Detail, Why-Box
-/// (`Agent  claude-code · …`), Graph-Kopf, Sessions-Liste, Why-Kette.
+/// (WRITTEN BY / AGENT SAID), Graph-Kopf, Sessions-Liste, Why-Kette.
 #[test]
 fn k1_every_model_site_names_why_the_transcript_was_not_read() {
     let reason = "model not recorded — the witness does not read transcripts from agent paths";
@@ -221,16 +221,14 @@ fn k1_every_model_site_names_why_the_transcript_was_not_read() {
         overview.contains("    — the witness does not read transcripts from agent paths"),
         "{overview}"
     );
-    // Why-Box: der Satz bricht in der Spalte um — Anfang und Rest stehen.
+    // Why-Box in der Reihenfolge von C9.3: die Modell-Zeile unter WRITTEN BY
+    // nennt den Grund; der Satz bricht in der Spalte um — der Anfang steht.
     let changes = text("changes");
     assert!(
-        changes.contains("Agent    claude-code · model not recorded —"),
+        changes.contains("model not recorded — the witness"),
         "{changes}"
     );
-    assert!(
-        changes.contains("the witness does not read transcripts from"),
-        "{changes}"
-    );
+    assert!(!changes.contains("Agent    "), "{changes}");
     // Graph-Knoten und Why-Kette kürzen am Spaltenrand mit `…` — der Satz
     // beginnt, und `unknown` steht nirgends (siehe den Test davor).
     let starts = "model not recorded — the witness does not read";
@@ -280,4 +278,27 @@ fn k1_a_read_transcript_shows_the_model_in_full() {
         "{out}"
     );
     assert!(!out.contains("not recorded"), "{out}");
+}
+
+/// Fehlt der Text des Agenten, nennt AGENT SAID den Grund aus dem Record
+/// (`— (transcript not read: <Grund>)`, C9.3) statt einer leeren Aussage.
+#[test]
+fn k1_agent_said_names_the_reason_when_the_transcript_was_not_read() {
+    let mut s = placeholder_session(Some(TranscriptStatus::NotFound));
+    for turn in &mut s.turns {
+        if turn.role == minds_core::Role::Assistant {
+            turn.text.clear();
+        }
+    }
+    let (_dir, repo, head, inspection) = linked(s);
+    let mut app = App::new(inspection, &repo, None);
+    app.changes = Some(changes_of(head));
+    app.tab = Tab::Changes;
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("(transcript not read: the transcript"),
+        "{out}"
+    );
+    assert!(!out.contains("AGENT SAID   ◌"), "{out}");
+    assert!(!out.contains("unknown"), "{out}");
 }

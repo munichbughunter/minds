@@ -252,6 +252,12 @@ pub struct LineReason {
     pub session: SessionId,
     /// Agent und Modell, entschärft.
     pub agent: String,
+    /// Das Modell vollständig (`claude-opus-4-1 (Anthropic)`), wenn es
+    /// erfasst ist — sonst `None`, nie der Platzhalter (K1).
+    pub model: Option<String>,
+    /// Ob und warum das Transkript beim Checkpoint (nicht) gelesen wurde —
+    /// aus der Lineage, fehlt bei Records älterer Binaries (K1).
+    pub transcript: Option<minds_core::TranscriptStatus>,
     /// Der Auftrag der Session (erfasster Prompt), entschärft, einzeilig.
     pub request: String,
     /// Der Turn und der Aufruf.
@@ -456,6 +462,14 @@ impl crate::Inspection {
             // `agent · modell`, Platzhalter nie (C3.6/K1): ein fehlendes
             // Modell nennt den Grund aus der Lineage.
             agent: one_line(&crate::summary::actor_line(session), 120),
+            model: {
+                let actor = crate::summary::Actor::of(session);
+                actor
+                    .model
+                    .is_some()
+                    .then(|| one_line(&actor.model_label(), 80))
+            },
+            transcript: session.lineage.as_ref().and_then(|l| l.transcript),
             request: one_line(&session.intent.request, SAID_LIMIT),
             turn: source.turn,
             call: source.call,

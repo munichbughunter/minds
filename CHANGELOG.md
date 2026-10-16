@@ -52,7 +52,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   **SESSION** (`b3-75f030fa · ◈ record sealed`), **REQUIREMENT**
   (`⚑ ac8f1bb7 · witness event` — the short form of the Overview),
   **ASKED FOR** and **AGENT SAID** as quoted claims (`◌ "…"`; a missing
-  answer says `— (transcript not read)`), **REVIEW** (`◦ not reviewed
+  answer says why — `— (transcript not read: <reason>)`, with the reason
+  the session record carries), **REVIEW** (`◦ not reviewed
   yet`, never yellow — also in footer line 1). Commit and change id only
   as a dimmed last line (`commit 609aca8 · change I8d166b6d5e7…`); no key
   hints in the panel. `Enter` on a code line opens the session's graph
