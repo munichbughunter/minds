@@ -394,6 +394,37 @@ fn c11_enter_on_result_opens_the_diff_and_on_a_command_says_so() {
     assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
 }
 
+/// C8: Der Antworttext des Modells steht im Schritt-Detail in jeder
+/// Zoomstufe — als Aussage (`◌`), nicht nur in Zoom 3.
+#[test]
+fn c8_the_agents_text_is_in_the_step_detail_in_every_zoom() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(demo(), &repo, None);
+    open_parent(&mut app);
+    for zoom in [1u8, 2, 3] {
+        app.reduce(Action::Zoom(zoom));
+        app.reduce(Action::Home);
+        // Zoom 3 beginnt mit der Zugzeile — auf den ersten Schritt.
+        while !matches!(
+            app.top(),
+            Some(View::Story { rows, cursor, .. })
+                if matches!(rows[*cursor].kind, RowKind::Step(_))
+        ) {
+            app.reduce(Action::Down);
+        }
+        let out = render_sized(&mut app, 160, 40);
+        let said = out
+            .lines()
+            .find(|l| l.contains("Agent said"))
+            .unwrap_or_else(|| panic!("zoom {zoom}\n{out}"));
+        assert!(
+            said.contains("◌ Ich lese zuerst, dann schreibe ich."),
+            "zoom {zoom}\n{out}"
+        );
+        assert!(!said.contains('✓'), "a claim is never a check\n{out}");
+    }
+}
+
 /// `t` ist frei (C11): keine Zeitleiste mehr — die Story ist sie.
 #[test]
 fn c11_t_is_free_and_there_is_no_timeline() {

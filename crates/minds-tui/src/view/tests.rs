@@ -384,14 +384,16 @@ fn enter_opens_the_story_and_the_zoom_levels_fold_the_steps() {
     assert!(!out.contains("┗━"), "{out}");
     assert!(!out.contains("TURN"), "{out}");
     assert!(out.contains("RESULT"), "{out}");
-    // Der Antworttext des Modells nur in der ausführlichen Stufe — als ◌.
-    assert!(!out.contains("Ich lese und ändere."), "{out}");
+    // Der Antworttext des Modells als Zeile nur in der ausführlichen Stufe
+    // (als ◌); im Detail des Schritts steht er in jeder Stufe (C8).
+    assert!(!out.contains("◌ agent · Ich lese und ändere."), "{out}");
+    assert!(out.contains("Agent said ◌ Ich lese und ändere."), "{out}");
     app.reduce(Action::Zoom(3));
     let out = render(&mut app);
     assert!(out.contains("◌ agent · Ich lese und ändere."), "{out}");
     app.reduce(Action::Zoom(1));
     let out = render(&mut app);
-    assert!(!out.contains("Ich lese und ändere."), "{out}");
+    assert!(!out.contains("◌ agent · Ich lese und ändere."), "{out}");
     assert!(out.contains("Zoom 1"), "{out}");
     // Der Cursor auf einem Schritt zeigt dessen Details.
     app.reduce(Action::Zoom(2));

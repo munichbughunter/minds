@@ -32,6 +32,8 @@ const LABEL_W: usize = 13;
 const RIGHT_W: usize = 16;
 /// Die Breite der Zeitspalte (`+12:34`).
 const TIME_W: usize = 7;
+/// So viele Zeilen Antworttext des Modells zeigt das Schritt-Detail (C8).
+const AGENT_SAID_MAX: usize = 40;
 
 /// Zeichnet die Story. `cursor` ist `None` für die Vorschau neben der
 /// Liste: kein Fokus, keine hervorgehobene Zeile, keine Detailbox.
@@ -593,6 +595,28 @@ fn detail(
                     text.push_str(&format!(" · {} after start", plus(secs)));
                 }
                 lines.push(Line::from(vec![key("Time"), Span::raw(text)]));
+            }
+            // Der Antworttext des Modells zu diesem Zug (C8): im Detail in
+            // jeder Zoomstufe — als Aussage, bis 40 Zeilen.
+            if let Some(turn) = story
+                .turns
+                .get(step.turn)
+                .filter(|t| t.role == minds_core::Role::Assistant && !t.text.is_empty())
+            {
+                let (glyph, _, claim_style) = theme::claim();
+                let text: Vec<&str> = turn.text.lines().filter(|l| !l.trim().is_empty()).collect();
+                for (n, line) in text.iter().take(AGENT_SAID_MAX).enumerate() {
+                    lines.push(Line::from(vec![
+                        key(if n == 0 { "Agent said" } else { "" }),
+                        Span::styled(format!("{glyph} {line}"), claim_style),
+                    ]));
+                }
+                if text.len() > AGENT_SAID_MAX {
+                    lines.push(Line::from(Span::styled(
+                        format!("{:<10} … {} more lines", "", text.len() - AGENT_SAID_MAX),
+                        theme::dim(),
+                    )));
+                }
             }
             // Der Evidenzzustand einer Schreibung mit seinem Satz (C9.3).
             if let Some(claim) = step.claim {
