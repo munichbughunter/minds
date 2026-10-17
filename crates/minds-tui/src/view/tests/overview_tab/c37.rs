@@ -211,6 +211,98 @@ fn c37_while_counting_next_waits() {
     assert!(!out.contains("nothing is open"), "{out}");
 }
 
+/// Der Anker ist noch nicht gelesen (`… checking`): NEXT wartet — nichts
+/// darunter wird empfohlen.
+#[test]
+fn c37_while_the_requirement_loads_next_waits() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = App::new(inspection, &repo, None);
+    on_agent_commit(&mut app, commits[1], classes(2, 0));
+    // Ein Urteil mit belegter Bindung — nur der Anker fehlt noch.
+    struct Bound;
+    impl crate::Source for Bound {
+        fn load(&self) -> minds_reader::Result<Inspection> {
+            unreachable!()
+        }
+        fn stamp(&self) -> Option<crate::Stamp> {
+            None
+        }
+        fn verify(&self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
+            Ok(crate::CommitVerify {
+                verdict: Ok(crate::VerifyVerdict::Verified),
+                sessions: vec![crate::SessionAssurance {
+                    session: sid('a'),
+                    level: minds_reader::assurance::Assurance::A0Claimed,
+                    reason: None,
+                    intent: minds_reader::assurance::IntentState::Bound {
+                        anchor_id: minds_core::ContentHash::from_bytes([1; 32]),
+                        chained: true,
+                        signature: minds_reader::assurance::IntentSignature::Unsigned,
+                        snapshot_matches: true,
+                        from_session_start: true,
+                        changed_mid_session: false,
+                    },
+                    tampered: false,
+                }],
+                out_of_scope: None,
+                out_of_scope_paths: Vec::new(),
+                scope_note: None,
+                conformance: None,
+            })
+        }
+    }
+    assert!(app.fill_overview_verify(&Bound));
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("→ wait — the requirement is still being read"),
+        "{out}"
+    );
+    assert!(!out.contains("nothing is open"), "{out}");
+    assert!(!out.contains("→ minds review"), "{out}");
+}
+
+/// Berichtete Zeilen ohne Hash: `d:` mit dem Spec-Wortlaut.
+#[test]
+fn c37_reported_lines_point_to_the_diff_too() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = App::new(inspection, &repo, None);
+    let mut stated = classes(0, 0);
+    stated.added = 95;
+    stated.stated = 95;
+    on_agent_commit(&mut app, commits[1], stated);
+    assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("→ d: inspect the 95 lines the agent claims without a hash"),
+        "{out}"
+    );
+}
+
+/// Ein Review mit Befund ist kein „nichts offen“: Enter, mit dem Befund.
+#[test]
+fn c37_a_review_with_findings_is_named_with_enter() {
+    let (_dir, repo, commits, inspection) = history();
+    let inspection = without_anchor(
+        &inspection,
+        vec![Review::new(
+            Subject::Session(sid('a').to_string()),
+            Decision::NeedsWork,
+            "pd",
+            "Retry bei 5xx fehlt",
+            Some("2026-10-17T10:00:00Z".into()),
+        )],
+    );
+    let mut app = App::new(inspection, &repo, None);
+    on_agent_commit(&mut app, commits[1], classes(2, 0));
+    assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("→ Enter: how it was made — the review says needs work"),
+        "{out}"
+    );
+    assert!(!out.contains("nothing is open"), "{out}");
+}
+
 /// Manipuliert: `e:` — vor allem anderen, auch vor unerklärten Zeilen.
 #[test]
 fn c37_tampered_points_to_the_evidence_first() {

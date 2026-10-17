@@ -646,7 +646,7 @@ fn detail(
                 if text.len() > AGENT_SAID_MAX {
                     lines.push(Line::from(Span::styled(
                         format!(
-                            "{:<10} … {} more lines — z 3 shows the turn",
+                            "{:<10} … {} more lines — z 3, then the turn row",
                             "",
                             text.len() - AGENT_SAID_MAX
                         ),

@@ -112,7 +112,9 @@ fn c10_a_gap_in_evidence_is_named_not_hidden() {
         out.contains("— no tool claim or shell mention found: all 1"),
         "{out}"
     );
-    assert!(out.contains("→ d, then n"), "{out}");
+    // Die Aktion steht in NEXT (C3.7) — nicht mehr als Unterzeile der Achse.
+    assert!(out.contains("NEXT"), "{out}");
+    assert!(!out.contains("→ d, then n"), "{out}");
 }
 
 /// Ein fehlender Review ist **nie** ein Gap: `◦ not reviewed yet`, kein `⚠`

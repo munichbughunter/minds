@@ -29,19 +29,23 @@ versioning follows [Semantic Versioning](https://semver.org/).
   evidence — a session is not readable`, `e: evidence — N uninterpreted
   calls`, `i: Intent tab — the binding is
   not proven` (or the anchor not readable, the requirement not proven, the
-  signature invalid), `minds intent sign <anchor>`, `minds review <commit>
+  signature invalid), `wait — the requirement is still being read` while
+  the anchor loads, `minds intent sign <anchor>`, `minds review <commit>
   …` while nobody has decided, and `Enter: how it was made — nothing is
-  open` when everything is `✓`. Never more than one; footer line 1 carries
-  the same text (`NEXT → …`). The TUI does not write: the `minds …` lines
-  are text.
+  open` when everything is `✓` (with `— the review says needs work` /
+  `— the review rejected it` when a review found something). Never more
+  than one: the earlier per-axis hints `→ d, then n` and `→ minds intent
+  sign <id> (Intent tab, i)` are gone. Footer line 1 carries the same text
+  (`NEXT → …`). The TUI does not write: the `minds …` lines are text.
 
 ### Changed
 
 - **Tool contents are shown in full where they are read (C8).** The
   story's step detail carries the agent's answer text of the step's turn
-  (`Agent said ◌ …`, a few lines, then `… N more lines — z 3 shows the
-  turn`) in every zoom, below the write's evidence line; the turn row in
-  zoom 3 shows it whole. The session graph of the reader
+  (`Agent said ◌ …`, a few lines, then `… N more lines — z 3, then the
+  turn row`) in every zoom, below the write's evidence line; the turn
+  row's detail in zoom 3 shows the rest. Arguments stay a JSON string (the
+  structured `key: value` view of C8.1 is not part of this). The session graph of the reader
   (`Inspection::graph`, `SessionGraph::of_with`) carries arguments and turn
   texts up to 4 000 characters (`minds_reader::graph::ARGUMENTS_MAX`) with
   the session's working directory and home paths hidden as in the story;

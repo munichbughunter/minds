@@ -738,7 +738,7 @@ fn overview_state(app: &App) -> String {
     }
     // Die nächste Aktion (C3.7) — dieselbe wie die NEXT-Zeile im Detail.
     if let Some(next) = overview::next_action_of(app) {
-        text.push_str(&format!("  ·  NEXT → {next}"));
+        text.push_str(&format!(" · NEXT → {next}"));
     }
     text
 }

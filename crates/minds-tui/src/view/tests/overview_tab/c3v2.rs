@@ -688,11 +688,10 @@ fn c34_evidence_waits_for_the_verdict_and_never_alarms_wrongly() {
     assert!(requirement.contains("✓ proven"), "{detail}");
     assert!(requirement.contains("◦ not signed"), "{detail}");
     assert!(!requirement.contains('✗'), "{detail}");
-    // Die CLI nimmt nur die volle Id — kein Kurz-Befehl, den es nicht gibt.
-    assert!(
-        detail.contains("→ minds intent sign <id> (Intent tab, i)"),
-        "{detail}"
-    );
+    // Die Aktion steht seit C3.7 nur in NEXT — die Unterzeile mit dem
+    // Platzhalter `<id>` (kein Kurz-Befehl, den es gibt) ist weg.
+    assert!(!detail.contains("(Intent tab, i)"), "{detail}");
+    assert!(detail.contains("NEXT"), "{detail}");
     // „not signed" nie rot.
     let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
     terminal
@@ -779,7 +778,9 @@ fn c34_unexplained_lines_match_the_changes_tab() {
         )),
         "{detail}"
     );
-    assert!(detail.contains("→ d, then n"), "{detail}");
+    // Die Aktion steht in NEXT (C3.7), nicht als Unterzeile der Achse.
+    assert!(!detail.contains("→ d, then n"), "{detail}");
+    assert!(detail.contains("NEXT"), "{detail}");
     // Der Changes-Tab zeigt dieselbe Zahl je Datei.
     app.open_changes(Some(commit));
     let out = lines_at(&mut app, 160, 40).join("\n");

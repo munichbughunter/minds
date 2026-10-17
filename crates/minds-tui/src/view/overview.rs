@@ -1257,9 +1257,12 @@ fn evidence_lines(
 
 /// Die nächste Aktion (C3.7): die oberste Zeile in EVIDENCE, die nicht ✓
 /// ist, bestimmt sie — INTEGRITY vor COVERAGE vor INTERPRETATION vor
-/// REQUIREMENT vor REVIEW. Nur Aktionen, die es gibt; die TUI schreibt
-/// nicht, also stehen `minds intent sign` und `minds review` als Text.
-/// Alles ✓: nur noch nachvollziehen (`Enter`).
+/// REQUIREMENT vor REVIEW. Eine Zeile mit `·` („trifft nicht zu“: kein
+/// Anker, keine Zeilen, nur nicht gediffte Dateien) zählt nicht; eine mit
+/// `…` (noch zählend, noch lesend) heißt warten — nichts darunter wird
+/// empfohlen. Nur Aktionen, die es gibt; die TUI schreibt nicht, also
+/// stehen `minds intent sign` und `minds review` als Text. Alles ✓: nur
+/// noch nachvollziehen (`Enter`) — ein Review mit Befund sagt ihn dazu.
 pub(crate) fn next_action(
     state: &crate::overview::OverviewState,
     row: &CommitRow,
@@ -1319,7 +1322,7 @@ pub(crate) fn next_action(
                     plural(c.not_assessed)
                 );
             }
-            return "d: open the diff".into();
+            // Nur nicht gediffte Dateien: die Achse zeigt `·` — trifft nicht zu.
         }
     }
     // Eine ungelesene Session: über ihre Deutung ist nichts gesagt — die
@@ -1346,7 +1349,8 @@ pub(crate) fn next_action(
             return "i: Intent tab — the binding is not proven".into();
         }
         match state.requirements.get(anchor) {
-            None => {}
+            // Noch nicht gelesen: die Achse zeigt `… checking`.
+            None => return "wait — the requirement is still being read".into(),
             Some(Err(_)) => return "i: Intent tab — the anchor could not be read".into(),
             Some(Ok(d)) => {
                 if d.proof.is_err() {
@@ -1365,11 +1369,16 @@ pub(crate) fn next_action(
             }
         }
     }
-    if row.review == Verdict::Open {
-        let short: String = row.id.to_string().chars().take(7).collect();
-        return format!("minds review {short} … — nobody has decided yet");
+    let short: String = row.id.to_string().chars().take(7).collect();
+    match row.review {
+        Verdict::Open => format!("minds review {short} … — nobody has decided yet"),
+        // Ein Befund ist kein offener Schritt der Oberfläche — aber auch
+        // nicht „nichts offen“: Enter zeigt die Entstehung, der Befund steht
+        // dabei.
+        Verdict::NeedsWork => "Enter: how it was made — the review says needs work".into(),
+        Verdict::Rejected => "Enter: how it was made — the review rejected it".into(),
+        Verdict::Approved => "Enter: how it was made — nothing is open".into(),
     }
-    "Enter: how it was made — nothing is open".into()
 }
 
 /// Die nächste Aktion des gewählten Commits der Übersicht — für Fußzeile 1;
@@ -1624,9 +1633,7 @@ pub(crate) fn coverage_lines_with(
             out.push(under(part, theme::dim()));
         }
     }
-    if c.unexplained > 0 {
-        out.push(under("→ d, then n".into(), theme::dim()));
-    }
+    // Die Aktion steht in NEXT (C3.7) — eine Aktionszeile, nicht zwei.
     out
 }
 
@@ -1718,7 +1725,6 @@ fn requirement_lines(
         }
     };
     let mut spans = vec![bound, dot()];
-    let mut next = None;
     match state.requirements.get(anchor) {
         None => spans.push(mark("…", "checking", theme::dim())),
         Some(Err(_)) => spans.push(mark(
@@ -1734,10 +1740,8 @@ fn requirement_lines(
             spans.push(dot());
             spans.push(match &d.signature {
                 IntentSignature::Valid(_) => mark("✓", "signed", ok()),
-                IntentSignature::Unsigned => {
-                    next = Some("→ minds intent sign <id> (Intent tab, i)".to_string());
-                    mark(open_glyph, "not signed", open_style)
-                }
+                // Die Aktion (`minds intent sign <anchor>`) steht in NEXT (C3.7).
+                IntentSignature::Unsigned => mark(open_glyph, "not signed", open_style),
                 IntentSignature::NotChecked => mark(
                     "?",
                     "signature not checked",
@@ -1759,9 +1763,6 @@ fn requirement_lines(
             ),
             theme::dim(),
         ));
-    }
-    if let Some(next) = next {
-        out.push(under(next, theme::dim()));
     }
     out
 }

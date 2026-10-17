@@ -145,13 +145,7 @@ fn c36_the_prompt_is_its_own_section_not_a_footnote() {
             detail.contains("◌ as recorded by the agent · session b3-aaaaaaaa"),
             "{w}: {detail}"
         );
-        // Der Text selbst ab 160×40; bei 120×30 lässt die NEXT-Zeile (C3.7)
-        // dem Prompt nur seinen Kopf — die Achsen haben Vorrang.
-        if w >= 160 {
-            assert!(detail.contains("line 01 of the request"), "{w}: {detail}");
-        } else {
-            assert!(detail.contains("Space shows all"), "{w}: {detail}");
-        }
+        assert!(detail.contains("line 01 of the request"), "{w}: {detail}");
         assert!(
             detail.find("PROMPT").unwrap() < detail.find("SESSIONS (").unwrap(),
             "{w}: {detail}"
@@ -224,7 +218,9 @@ fn c36_coverage_names_its_reason_and_the_missing_claims() {
     );
     assert!(detail.contains("all 4"), "{detail}");
     assert!(detail.contains("session records 0 files"), "{detail}");
-    assert!(detail.contains("→ d, then n"), "{detail}");
+    // Die Aktion steht in NEXT (C3.7), nicht als Unterzeile der Achse.
+    assert!(!detail.contains("→ d, then n"), "{detail}");
+    assert!(detail.contains("NEXT"), "{detail}");
     // Eine Quelle: die Gründe summieren sich zu `◦n` des Changes-Tabs.
     let set = app.inspection.changes(&repo, commit).unwrap();
     let classes = set.line_classes();
@@ -289,12 +285,7 @@ fn c36_the_collapsed_prompt_never_hides_the_evidence_axes() {
     for (w, h) in [(120u16, 30u16), (160, 40)] {
         let detail = detail_text(&mut app, w, h);
         assert!(detail.contains("PROMPT"), "{w}: {detail}");
-        // Gekürzt — bei 120×30 bleibt seit C3.7 (NEXT-Zeile) nur der
-        // PROMPT-Kopf mit dem Hinweis, bei 160×40 der Anfang des Texts.
-        assert!(detail.contains("Space shows all"), "{w}: {detail}");
-        if w >= 160 {
-            assert!(detail.contains("more lines"), "{w}: {detail}");
-        }
+        assert!(detail.contains("more lines"), "{w}: {detail}");
         for axis in AXES {
             assert!(detail.contains(axis), "{w}: {axis} missing: {detail}");
         }
@@ -335,12 +326,7 @@ fn c36_several_long_prompts_keep_the_axes_at_120_columns() {
         let detail = detail_text(&mut app, w, h);
         assert!(detail.contains("SESSIONS (2)"), "{w}: {detail}");
         assert!(detail.contains("PROMPT"), "{w}: {detail}");
-        // Gekürzt — bei 120×30 bleibt seit C3.7 (NEXT-Zeile) nur der
-        // PROMPT-Kopf mit dem Hinweis, bei 160×40 der Anfang des Texts.
-        assert!(detail.contains("Space shows all"), "{w}: {detail}");
-        if w >= 160 {
-            assert!(detail.contains("more lines"), "{w}: {detail}");
-        }
+        assert!(detail.contains("more lines"), "{w}: {detail}");
         for axis in AXES {
             assert!(detail.contains(axis), "{w}: {axis} missing: {detail}");
         }
