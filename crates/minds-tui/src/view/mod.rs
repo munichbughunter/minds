@@ -736,6 +736,10 @@ fn overview_state(app: &App) -> String {
     if !state.filter.is_empty() {
         text.push_str(&format!(" · filter: {}", state.filter));
     }
+    // Die nächste Aktion (C3.7) — dieselbe wie die NEXT-Zeile im Detail.
+    if let Some(next) = overview::next_action_of(app) {
+        text.push_str(&format!("  ·  NEXT → {next}"));
+    }
     text
 }
 

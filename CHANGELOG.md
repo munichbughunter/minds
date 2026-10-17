@@ -17,7 +17,31 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **The Overview detail names the next action (C3.7).** EVIDENCE ends with
+  one `NEXT → …` line — the topmost axis that is not `✓` decides it:
+  `v: run verify` before the verdict, `e: evidence of the session — what
+  was altered` when tampered (or where the record ends, or nothing sealed
+  to verify), `d: inspect the N lines not observed (n jumps on)` (or
+  claimed without a hash, seen in the file system only, not assessed),
+  `e: evidence — N uninterpreted calls`, `i: Intent tab — the binding is
+  not proven` (or the anchor not readable, the requirement not proven, the
+  signature invalid), `minds intent sign <anchor>`, `minds review <commit>
+  …` while nobody has decided, and `Enter: how it was made — nothing is
+  open` when everything is `✓`. Never more than one; footer line 1 carries
+  the same text (`NEXT → …`). The TUI does not write: the `minds …` lines
+  are text.
+
 ### Changed
+
+- **Tool contents are shown in full where they are read (C8).** The
+  story's step detail carries the agent's answer text of the step's turn
+  (`Agent said ◌ …`, up to 40 lines) in every zoom, not only in zoom 3.
+  `minds show` and the HTML page get the full arguments and turn texts of
+  the session graph up to 4 000 characters (`minds_reader::graph::ARGUMENTS_MAX`,
+  `SessionGraph::of_with`); labels stay at 120. The limit is a parameter —
+  truncation itself stays, and the sanitizing of foreign text with it.
 
 - **The session view of `minds inspect` is a story, not a tree (C11).**
   `Enter` on a session shows a numbered list of steps — one per tool call,
