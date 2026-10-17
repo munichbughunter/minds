@@ -21,9 +21,11 @@ use crate::text::{sanitize, sanitize_lines, sanitize_path};
 /// nicht Bytes, damit kein Umlaut zerschnitten wird.
 pub const DETAIL_MAX: usize = 120;
 
-/// Die Grenze für Argumente und Zugtexte im Detail, wenn eine Oberfläche sie
-/// vollständig zeigen will (C8): `minds show` und die HTML-Seite über
-/// [`SessionGraph::of_with`]. Danach steht `…`.
+/// Die Grenze für Argumente und Zugtexte im Detail, wenn ein Leser sie
+/// vollständig will (C8): [`crate::Inspection::graph`] baut den Graphen
+/// damit über [`SessionGraph::of_with`]. Danach steht `…`. (Die TUI zeigt
+/// Kommandos über [`crate::story`]; `minds show` und die HTML-Seite
+/// rendern keine Tool-Argumente.)
 pub const ARGUMENTS_MAX: usize = 4_000;
 
 /// Was ein Tool in der Welt getan hat, in der Sprache der Oberfläche.
@@ -172,6 +174,10 @@ impl SessionGraph {
         // Platzhalter aus `minds-capture` wird nie gedruckt; ein fehlendes
         // Modell nennt den Grund aus der Lineage.
         let actor = crate::summary::Actor::of(session);
+        // Das Arbeitsverzeichnis (es trägt den Benutzernamen) fällt aus
+        // Argumenten und Zugtexten heraus wie in der Story — bei 4 000
+        // Zeichen stünde es sonst da.
+        let cwd = session.lineage.as_ref().and_then(|l| l.cwd.as_deref());
         let not_recorded = || "not recorded".to_string();
         let agent = graph.push(
             Some(intent),
@@ -229,7 +235,10 @@ impl SessionGraph {
                 Some(parent),
                 NodeKind::Turn(turn.role.clone()),
                 label,
-                vec![("Text".into(), truncate(&sanitize(text), detail_max))],
+                vec![(
+                    "Text".into(),
+                    truncate(&sanitize(&crate::story::hide_paths(text, cwd)), detail_max),
+                )],
                 turn.at.clone(),
                 None,
             );
@@ -259,7 +268,10 @@ impl SessionGraph {
                     ("Tool".into(), sanitize(&call.name)),
                     (
                         "Arguments".into(),
-                        truncate(&sanitize(&call.arguments), detail_max),
+                        truncate(
+                            &sanitize(&crate::story::hide_paths(&call.arguments, cwd)),
+                            detail_max,
+                        ),
                     ),
                 ];
                 if let Some(capture) = &call.capture {
@@ -873,5 +885,28 @@ mod tests {
             .1;
         assert!(args.ends_with('…'));
         assert!(args.chars().count() <= ARGUMENTS_MAX + 1);
+        // Und ein Home-Pfad in den Argumenten wird `~` — wie in der Story.
+        let mut s = session("x");
+        s.lineage = Some(Lineage::new("p"));
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            None,
+            vec![call(
+                "Write",
+                "{\"file_path\":\"/Users/alice/dev/repo/x.rs\"}",
+                Some(EffectKind::Write),
+                Some("/Users/alice/dev/repo/x.rs"),
+            )],
+        ));
+        let g = SessionGraph::of_with(sid('a'), &s, &index, &ReviewState::open(), ARGUMENTS_MAX);
+        let args = &g.nodes[3]
+            .detail
+            .iter()
+            .find(|(k, _)| k == "Arguments")
+            .unwrap()
+            .1;
+        assert!(args.contains("~/dev/repo/x.rs"), "{args}");
+        assert!(!args.contains("/Users/"), "{args}");
     }
 }

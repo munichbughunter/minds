@@ -23,9 +23,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
   one `NEXT → …` line — the topmost axis that is not `✓` decides it:
   `v: run verify` before the verdict, `e: evidence of the session — what
   was altered` when tampered (or where the record ends, or nothing sealed
-  to verify), `d: inspect the N lines not observed (n jumps on)` (or
-  claimed without a hash, seen in the file system only, not assessed),
-  `e: evidence — N uninterpreted calls`, `i: Intent tab — the binding is
+  to verify), `wait — the lines are still being counted` while COVERAGE
+  counts, `d: inspect the N lines not observed (n jumps on)` (or claimed
+  without a hash, seen in the file system only, not assessed), `e:
+  evidence — a session is not readable`, `e: evidence — N uninterpreted
+  calls`, `i: Intent tab — the binding is
   not proven` (or the anchor not readable, the requirement not proven, the
   signature invalid), `minds intent sign <anchor>`, `minds review <commit>
   …` while nobody has decided, and `Enter: how it was made — nothing is
@@ -37,11 +39,16 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 - **Tool contents are shown in full where they are read (C8).** The
   story's step detail carries the agent's answer text of the step's turn
-  (`Agent said ◌ …`, up to 40 lines) in every zoom, not only in zoom 3.
-  `minds show` and the HTML page get the full arguments and turn texts of
-  the session graph up to 4 000 characters (`minds_reader::graph::ARGUMENTS_MAX`,
-  `SessionGraph::of_with`); labels stay at 120. The limit is a parameter —
+  (`Agent said ◌ …`, a few lines, then `… N more lines — z 3 shows the
+  turn`) in every zoom, below the write's evidence line; the turn row in
+  zoom 3 shows it whole. The session graph of the reader
+  (`Inspection::graph`, `SessionGraph::of_with`) carries arguments and turn
+  texts up to 4 000 characters (`minds_reader::graph::ARGUMENTS_MAX`) with
+  the session's working directory and home paths hidden as in the story;
+  `SessionGraph::of` and labels stay at 120. The limit is a parameter —
   truncation itself stays, and the sanitizing of foreign text with it.
+  `minds show` and the HTML page do not render tool arguments; that is
+  unchanged.
 
 - **The session view of `minds inspect` is a story, not a tree (C11).**
   `Enter` on a session shows a numbered list of steps — one per tool call,

@@ -1285,8 +1285,9 @@ pub(crate) fn next_action(
     }
     let plural = |n: usize| if n == 1 { "line" } else { "lines" };
     match state.lines.get(&row.id) {
-        // Zählt noch: kein Urteil, also auch keine Empfehlung daraus.
-        None => {}
+        // Zählt noch: die Achse ist nicht ✓ — also auch nichts weiter unten
+        // empfehlen, bis die Zahl steht.
+        None => return "wait — the lines are still being counted".into(),
         Some(Err(_)) => return "d: open the diff — the lines could not be assessed".into(),
         Some(Ok(c)) if c.all_explained() || c.added == 0 => {}
         Some(Ok(c)) => {
@@ -1321,6 +1322,11 @@ pub(crate) fn next_action(
             return "d: open the diff".into();
         }
     }
+    // Eine ungelesene Session: über ihre Deutung ist nichts gesagt — die
+    // Achse zeigt `no session readable`, NEXT führt zur Evidenz.
+    if cards.iter().any(Option::is_none) {
+        return "e: evidence — a session is not readable".into();
+    }
     let uninterpreted: usize = cards.iter().flatten().map(|c| c.uninterpreted_calls).sum();
     if uninterpreted > 0 {
         return format!(
@@ -1350,7 +1356,7 @@ pub(crate) fn next_action(
                     IntentSignature::Valid(_) => {}
                     IntentSignature::Unsigned => return format!("minds intent sign {anchor}"),
                     IntentSignature::NotChecked => {
-                        return "v: run verify — the signature is not checked".into();
+                        return "i: Intent tab — why the signature is not checked".into();
                     }
                     IntentSignature::Invalid => {
                         return "i: Intent tab — the signature is invalid".into();

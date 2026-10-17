@@ -192,6 +192,25 @@ fn c37_all_checked_leaves_only_enter() {
     assert!(footer.contains("NEXT → Enter: how it was made"), "{out}");
 }
 
+/// Solange die Übersicht die Zeilen noch zählt, ist COVERAGE nicht ✓ — NEXT
+/// sagt das und empfiehlt nichts weiter unten.
+#[test]
+fn c37_while_counting_next_waits() {
+    let (_dir, repo, commits, inspection) = history();
+    let inspection = without_anchor(&inspection, Vec::new());
+    let mut app = App::new(inspection, &repo, None);
+    app.open_overview();
+    app.overview.as_mut().unwrap().select_commit(commits[1]);
+    assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("→ wait — the lines are still being counted"),
+        "{out}"
+    );
+    assert!(!out.contains("→ minds review"), "{out}");
+    assert!(!out.contains("nothing is open"), "{out}");
+}
+
 /// Manipuliert: `e:` — vor allem anderen, auch vor unerklärten Zeilen.
 #[test]
 fn c37_tampered_points_to_the_evidence_first() {

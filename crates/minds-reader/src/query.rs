@@ -352,8 +352,8 @@ impl Inspection {
     }
 
     /// Der Graph einer Session — Argumente und Zugtexte im Detail bis
-    /// [`crate::graph::ARGUMENTS_MAX`] (C8), damit `minds show` und die
-    /// HTML-Seite ein Kommando ganz zeigen.
+    /// [`crate::graph::ARGUMENTS_MAX`] (C8), damit ein Leser des Graphen ein
+    /// Kommando ganz sieht; Beschriftungen bleiben kurz.
     pub fn graph(&self, id: SessionId) -> Option<SessionGraph> {
         let session = self.index.session(id)?;
         Some(SessionGraph::of_with(

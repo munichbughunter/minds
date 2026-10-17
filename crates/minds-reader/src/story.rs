@@ -540,7 +540,7 @@ fn has_drive(path: &str) -> bool {
 /// Home-Verzeichnis (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`)
 /// wird `~` — auch ohne bekanntes cwd. Andere absolute Pfade
 /// (`/usr/bin/env`) tragen keinen Namen und bleiben.
-fn hide_paths(text: &str, cwd: Option<&str>) -> String {
+pub(crate) fn hide_paths(text: &str, cwd: Option<&str>) -> String {
     let mut out = text.to_string();
     if let Some(cwd) = cwd
         .map(|c| c.trim_end_matches(['/', '\\']))
