@@ -22,7 +22,10 @@ use crate::verify::Overall;
 /// Wie dicht die Komponente zeichnet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Density {
-    /// Drei Glyphen, je Slot eines (`◈ ● ◐`) — Übersichten.
+    /// Drei Glyphen, je Slot eines (`◈ ● ◐`) — Übersichten. Seit C10 ohne
+    /// Nutzer in der Oberfläche (das SESSION-Glied der Kette ist weg); die
+    /// Story (C11) braucht die Dichte wieder.
+    #[allow(dead_code)]
     Glyphs,
     /// Das Integritätswort, dahinter Coverage und Deutung als Glyph
     /// (`◈ sealed ● ◐`) — die Sessions-Liste: Legacy bleibt dort als Wort

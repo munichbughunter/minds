@@ -29,7 +29,6 @@ mod intent;
 mod overview;
 pub mod trust;
 pub mod verify;
-pub mod why;
 
 #[cfg(test)]
 mod tests;
@@ -174,13 +173,6 @@ fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
             timeline,
             ..
         } => graph::draw(frame, app, area, *id, rows, Some(*cursor), *timeline),
-        View::Why {
-            chain,
-            cursor,
-            edge,
-            inspector,
-            ..
-        } => why::draw(frame, area, chain, *cursor, *edge, inspector.as_deref()),
         View::Evidence {
             id,
             report,
@@ -450,24 +442,6 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 sentence
             }
         }
-        Some(View::Why { chain, .. }) => {
-            let gaps = chain.gaps();
-            if gaps.is_empty() {
-                Line::from(Span::styled(
-                    "✓ no gap in the evidence links · intent is a recorded claim",
-                    Style::default().fg(theme::OK),
-                ))
-            } else {
-                Line::from(Span::styled(
-                    format!(
-                        "⚠ {} {} in the chain — see the block below",
-                        gaps.len(),
-                        if gaps.len() == 1 { "gap" } else { "gaps" }
-                    ),
-                    Style::default().fg(theme::REVIEW),
-                ))
-            }
-        }
         // Evidence: der Satz des Reports, dahinter der Glossar-Satz der
         // fokussierten Achse (C1).
         Some(View::Evidence {
@@ -567,7 +541,7 @@ fn changes_actions(app: &App) -> Vec<String> {
     let open = state.map_or(0, |s| s.not_observed());
     let next = (open > 0).then(|| format!("n next not-observed ({open})"));
     let (head, tail): (&[&str], &[&str]) = match state.map(|c| c.focus) {
-        Some(Focus::Diff) => (&["↑↓ line", "] [ hunk"], &["s split", "w why chain"]),
+        Some(Focus::Diff) => (&["↑↓ line", "] [ hunk", "Enter graph"], &["s split"]),
         _ => (
             &["↑↓ file", "Enter diff", "[ ] commit"],
             &["c why column", "/ filter"],
@@ -628,7 +602,7 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
                 if let Some(hint) = space_hint(app) {
                     keys.push(hint);
                 }
-                keys.extend(["w why", "v verify", "d diff"]);
+                keys.extend(["v verify", "d diff", "e evidence"]);
                 keys.truncate(6);
                 keys
             }
@@ -637,8 +611,8 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
             None => vec![
                 "↑↓ select",
                 "Enter descend",
-                "w why",
                 "e evidence",
+                "d diff",
                 "/ search",
                 "z Z zoom",
             ],
@@ -646,16 +620,15 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
                 vec![
                     "↑↓ select",
                     "Enter descend",
-                    "w why",
                     "e evidence",
+                    "d diff",
                     "z Z zoom",
                     "Esc back",
                 ]
             }
-            Some(View::Why { .. }) => vec!["↑↓ select", "Enter open", "e evidence", "Esc back"],
-            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "w why", "Esc back"],
+            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "d diff", "Esc back"],
         },
-        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "w why"],
+        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "e evidence"],
         Tab::Changes => Vec::new(),
         Tab::Intent => vec!["↑↓ anchor", "Enter graph", "PgUp PgDn scroll", "/ filter"],
     }
@@ -669,7 +642,6 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
         Tab::Sessions => match app.top() {
             None => app.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
             Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
-            Some(View::Why { .. }) => None,
         },
         _ => None,
     };
@@ -948,6 +920,50 @@ pub fn ago_secs(at: i64, now: i64) -> String {
         s if s < 3_600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3_600),
         s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// Warum eine Kante Commit ↔ Session im Index steht — der Satz zur
+/// [`EvidenceExplanation`] des Readers, für das Detail einer Änderung.
+pub(crate) fn explanation(why: &minds_reader::model::EvidenceExplanation) -> String {
+    use minds_reader::model::EvidenceExplanation;
+    match why {
+        EvidenceExplanation::Trailer { commit } => format!(
+            "Commit {} carries the Minds-Session-Id trailer — observed, no guessing.",
+            commit.to_string().chars().take(10).collect::<String>()
+        ),
+        EvidenceExplanation::Declared => "A human declared the connection (--after).".into(),
+        EvidenceExplanation::Content => {
+            "Recomputable from content: the bytes read are the bytes written.".into()
+        }
+        EvidenceExplanation::Heuristic {
+            shared_files,
+            seconds_apart,
+            in_window,
+        } => {
+            let files = if shared_files.is_empty() {
+                "no shared file".to_string()
+            } else {
+                format!(
+                    "{} shared file(s): {}",
+                    shared_files.len(),
+                    shared_files.join(", ")
+                )
+            };
+            let time = match (seconds_apart, in_window) {
+                (Some(s), Some(true)) => {
+                    format!("commit {s} s after session end, within the window")
+                }
+                (Some(s), Some(false)) => {
+                    format!("commit {s} s after session end, outside the window")
+                }
+                _ => "time distance not determinable".to_string(),
+            };
+            format!("Recomputed, not recorded: {files}; {time}.")
+        }
+        EvidenceExplanation::Unknown { reason } => {
+            format!("Reasons not reconstructable: {reason}.")
+        }
     }
 }
 

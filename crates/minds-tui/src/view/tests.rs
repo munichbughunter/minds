@@ -1,7 +1,8 @@
 //! Render-Proben über `TestBackend`: Jede Ebene wird in einen Puffer
 //! gezeichnet und auf die Zeilen geprüft, die ihre Aussage tragen — Leerzustand,
-//! gefüllte Liste, degradierte Zeile, Suche, Graph in zwei Stufen, Why-Kette
-//! mit fehlendem Glied, Inspector für eine Vermutung.
+//! gefüllte Liste, degradierte Zeile, Suche, Graph in zwei Stufen,
+//! Evidence-Report. Die Versprechen der früheren Why-Kette (C10) stehen in
+//! `changes_tab::c10` und `overview_tab::c10`.
 //!
 //! Geprüft wird auf Teilstrings, nicht auf den ganzen Puffer: Das Layout darf
 //! sich bewegen, die Aussage nicht.
@@ -407,67 +408,6 @@ fn the_timeline_is_the_same_rows_without_the_tree() {
 }
 
 #[test]
-fn why_shows_the_chain_and_a_missing_link_is_named_not_hidden() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Down); // „Add exponential backoff" — ohne Commit
-    app.reduce(Action::Why);
-    assert!(matches!(app.top(), Some(View::Why { .. })));
-    let out = render(&mut app);
-    // Session b ist is not sealed — das Glied traegt seit ADR-0011 eine
-    // ehrliche Luecke (UnsealedRange), zusaetzlich zur fehlenden Bewertung.
-    assert!(out.contains("⚠ SESSION"), "{out}");
-    assert!(out.contains("✓ AGENT"), "{out}");
-    // Der Intent ist eine Aussage, kein Beleg: Claim-Marker, nie ✓ (A2).
-    assert!(out.contains("◌ INTENT"), "{out}");
-    assert!(!out.contains("✓ INTENT"), "{out}");
-    // Aussage != Beweis (ADR-0011): der Intent-Text traegt das CLAIM-Label,
-    // die observed-Kanten daneben bleiben das einzige Beweismittel.
-    assert!(
-        out.contains("◌ CLAIM — as recorded, not verified evidence"),
-        "{out}"
-    );
-    assert!(out.contains("Add exponential backoff"), "{out}");
-    assert!(out.contains("✓ EVIDENCE"), "{out}");
-    assert!(out.contains("no edge"), "{out}");
-    assert!(out.contains("open"), "{out}");
-    // Lücken sind First-Class: je Glied ✓/⚠, unten der Block mit Begründung.
-    assert!(out.contains("⚠ REVIEW"), "{out}");
-    assert!(out.contains(" 2 GAPS "), "{out}");
-    assert!(out.contains("is not sealed"), "{out}");
-    assert!(
-        out.contains("No review — nobody has decided on this change."),
-        "{out}"
-    );
-    assert!(out.contains("⚠ 2 gaps in the chain"), "{out}");
-}
-
-#[test]
-fn a_fully_backed_chain_says_so_and_focus_explains_the_evidence_without_enter() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Why); // „Fix retry handling" — Trailer, Change-Id, Review
-    let out = render(&mut app);
-    // Lückenlos sagt die Fußzeile (`✓ no gap`, unten); der Gap-Block steht
-    // nur bei Lücken (A6).
-    assert!(!out.contains(" NO GAP "), "{out}");
-    assert!(out.contains("✓ EVIDENCE"), "{out}");
-    assert!(out.contains("✓ no gap"), "{out}");
-    assert!(!out.contains("WHY IS THIS LINKED?"), "{out}");
-    // Cursor auf das Evidence-Glied: Session, Agent, Intent, Evidence.
-    for _ in 0..3 {
-        app.reduce(Action::Down);
-    }
-    let out = render(&mut app);
-    assert!(out.contains("WHY IS THIS LINKED?"), "{out}");
-    assert!(out.contains("explicit provenance record"), "{out}");
-    assert!(
-        out.contains("carries the Minds-Session-Id trailer"),
-        "{out}"
-    );
-}
-
-#[test]
 fn the_list_footer_says_what_the_focused_evidence_means() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
@@ -495,121 +435,6 @@ fn a_change_node_in_the_graph_explains_its_proof() {
     assert!(out.contains(" CHANGE "), "{out}");
     assert!(out.contains("Evidence   ● ? observed [unchecked]"), "{out}");
     assert!(out.contains("explicit provenance record"), "{out}");
-}
-
-#[test]
-fn the_inspector_explains_the_focused_edge() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Why);
-    // Zum Evidence-Glied: Session, Agent, Intent, Evidence — der Inspector
-    // folgt dem Fokus, kein Enter nötig (#131).
-    for _ in 0..3 {
-        app.reduce(Action::Down);
-    }
-    let out = render(&mut app);
-    assert!(out.contains("WHY IS THIS LINKED?"), "{out}");
-    assert!(out.contains("● ? observed [unchecked]"), "{out}");
-    assert!(
-        out.contains("carries the Minds-Session-Id trailer"),
-        "{out}"
-    );
-    // Der Satz kann am Zeilenumbruch brechen — kurzer, stabiler Anker.
-    assert!(out.contains("Status: never"), "{out}");
-    // Der Hinweis steht an der Kante und verspricht die echte Aktion.
-    assert!(out.contains("Enter ↵ Commit"), "{out}");
-    // Esc schließt den Inspector; weg vom Evidence-Glied bleibt er zu.
-    app.reduce(Action::Back);
-    app.reduce(Action::Up);
-    let out = render(&mut app);
-    assert!(!out.contains("WHY IS THIS LINKED?"), "{out}");
-    assert!(matches!(app.top(), Some(View::Why { .. })));
-}
-
-#[test]
-fn evidence_edges_are_focusable_and_enter_opens_the_commit() {
-    // #132: ↑/↓ wandern erst über die Kanten des Evidence-Glieds, Enter auf
-    // einer Kante springt in die Why-Kette genau dieses Commits.
-    let mut sessions = BTreeMap::new();
-    sessions.insert(
-        sid('a'),
-        session("Fix retry handling", "2026-07-25T14:10:00Z"),
-    );
-    let mut commits = BTreeMap::new();
-    commits.insert(commit('1'), vec![sid('a')]);
-    commits.insert(commit('2'), vec![sid('a')]);
-    let inspection = Inspection::from_index(Index::from_parts(sessions, commits), vec![], "repo");
-
-    let (_dir, repo) = repo();
-    let mut app = App::new(inspection, &repo, None);
-    app.reduce(Action::Why);
-    // Session, Agent, Intent → Evidence, Kante 0.
-    for _ in 0..3 {
-        app.reduce(Action::Down);
-    }
-    assert!(matches!(
-        app.top(),
-        Some(View::Why {
-            cursor: 3,
-            edge: 0,
-            ..
-        })
-    ));
-    // Down bleibt im Glied und rückt zur zweiten Kante vor …
-    app.reduce(Action::Down);
-    assert!(matches!(
-        app.top(),
-        Some(View::Why {
-            cursor: 3,
-            edge: 1,
-            ..
-        })
-    ));
-    // … erst das nächste Down verlässt es; Up kommt auf der letzten Kante an.
-    app.reduce(Action::Down);
-    assert!(matches!(
-        app.top(),
-        Some(View::Why {
-            cursor: 4,
-            edge: 0,
-            ..
-        })
-    ));
-    app.reduce(Action::Up);
-    assert!(matches!(
-        app.top(),
-        Some(View::Why {
-            cursor: 3,
-            edge: 1,
-            ..
-        })
-    ));
-
-    // Enter auf Kante 1 → Why-Kette des zweiten Commits.
-    app.reduce(Action::Enter);
-    match app.top() {
-        Some(View::Why { chain, .. }) => {
-            assert!(
-                matches!(
-                    chain.steps.first(),
-                    Some(minds_reader::model::WhyStep::Commit { id: Some(c), .. }) if *c == commit('2')
-                ),
-                "{:?}",
-                chain.steps.first()
-            );
-        }
-        other => panic!("{other:?}"),
-    }
-    // Esc trägt über den View-Stack zurück auf die fokussierte Kante.
-    app.reduce(Action::Back);
-    assert!(matches!(
-        app.top(),
-        Some(View::Why {
-            cursor: 3,
-            edge: 1,
-            ..
-        })
-    ));
 }
 
 #[test]
@@ -813,17 +638,6 @@ fn the_help_overlays_and_closes() {
 }
 
 #[test]
-fn why_line_in_an_empty_repo_ends_at_the_commit_not_in_an_error() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.open_why_line("src/http/retry.rs", 42).unwrap();
-    let out = render(&mut app);
-    assert!(out.contains("✓ LINE"), "{out}");
-    assert!(out.contains("src/http/retry.rs:42"), "{out}");
-    assert!(out.contains("Blame does not know this line"), "{out}");
-}
-
-#[test]
 fn the_pipe_prints_tab_separated_lines_without_ansi() {
     let cards = filled().cards();
     let mut out = Vec::new();
@@ -974,12 +788,6 @@ fn the_footer_badge_tracks_the_focused_session_and_view() {
     let out = render(&mut app);
     assert!(footer_of(&out).contains("· legacy"), "{out}");
     assert!(!footer_of(&out).contains("◈ sealed"), "{out}");
-    // Why: bewusst kein Badge (die Kette traegt mehrere Sessions).
-    app.reduce(Action::Why);
-    let out = render(&mut app);
-    assert!(!footer_of(&out).contains("· legacy"), "{out}");
-    assert!(!footer_of(&out).contains("◈ sealed"), "{out}");
-    app.reduce(Action::Back);
     // Evidence: der Badge gehoert zur Karte hinter `id`, nicht zum Cursor.
     app.reduce(Action::Up);
     app.reduce(Action::Evidence);
@@ -1026,29 +834,6 @@ fn a_tampered_session_shows_the_red_badge_and_card() {
     let out = render(&mut app);
     assert!(out.contains(" SESSION TAMPERED "), "{out}");
     assert!(footer_of(&out).contains("✗ TAMPERED"), "{out}");
-}
-
-/// Das CLAIM-Label ist GESTYLT (theme::claim: HUMAN + DIM) — nie Default:
-/// Eine Aussage, die aussieht wie der Text daneben, waere kein Label.
-#[test]
-fn the_claim_label_carries_its_theme_style() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Why);
-    let mut terminal = Terminal::new(TestBackend::new(124, 30)).unwrap();
-    terminal.draw(|frame| super::draw(frame, &mut app)).unwrap();
-    let buffer = terminal.backend().buffer().clone();
-    let cell = buffer
-        .content()
-        .iter()
-        .find(|cell| cell.symbol() == "◌")
-        .expect("CLAIM-Label sichtbar");
-    let style = cell.style();
-    assert_eq!(style.fg, Some(ratatui::style::Color::Cyan), "{style:?}");
-    assert!(
-        style.add_modifier.contains(ratatui::style::Modifier::DIM),
-        "{style:?}"
-    );
 }
 
 /// Unter der Teilung, aber ueber 97 Spalten: eine Flaeche, ohne SIZE — die
@@ -1121,8 +906,8 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     assert!(app.top().is_none());
 }
 
-/// Gelegte Ebenen — Graph, Why, Evidence — verdraengen die Liste nicht
-/// mehr; sie bekommen die rechte Spalte.
+/// Gelegte Ebenen — Graph, Evidence — verdraengen die Liste nicht mehr;
+/// sie bekommen die rechte Spalte.
 #[test]
 fn a_pushed_view_keeps_the_list_beside_it() {
     let (_dir, repo) = repo();
@@ -1138,12 +923,6 @@ fn a_pushed_view_keeps_the_list_beside_it() {
     app.reduce(Action::Down);
     let out = render_at(&mut app, SPLIT);
     assert!(detail_of(&out).contains("Tool       Read"), "{out}");
-    app.reduce(Action::Why);
-    assert!(matches!(app.top(), Some(View::Why { .. })));
-    let out = render_at(&mut app, SPLIT);
-    assert!(list_of(&out).contains(" SESSIONS "), "{out}");
-    assert!(detail_of(&out).contains("✓ EVIDENCE"), "{out}");
-    app.reduce(Action::Back);
     app.reduce(Action::Evidence);
     assert!(matches!(app.top(), Some(View::Evidence { .. })));
     let out = render_at(&mut app, SPLIT);
@@ -1657,15 +1436,12 @@ fn reload_rebuilds_the_open_stack_from_its_origins() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Enter);
-    app.reduce(Action::Why);
+    app.reduce(Action::Evidence);
     assert_eq!(app.views.len(), 2);
     app.reload(Ok(grown()), None, now());
     assert_eq!(app.views.len(), 2);
     assert!(matches!(&app.views[0], View::Graph { id, .. } if *id == sid('a')));
-    assert!(matches!(
-        &app.views[1],
-        View::Why { origin: crate::app::WhyOrigin::Session(id), .. } if *id == sid('a')
-    ));
+    assert!(matches!(&app.views[1], View::Evidence { id, .. } if *id == sid('a')));
 }
 
 #[test]
@@ -1934,56 +1710,6 @@ fn reload_recomputes_the_content_of_an_open_view() {
 }
 
 #[test]
-fn reload_rebuilds_a_commit_chain_from_the_new_model() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    let chain = app.inspection.why_commit(commit('1'));
-    app.views.push(View::Why {
-        origin: crate::app::WhyOrigin::Commit(commit('1')),
-        chain,
-        cursor: 0,
-        edge: 0,
-        inspector: None,
-    });
-    // In `grown` trägt Commit 1 keine Session mehr.
-    let next = grown();
-    let expected = format!("{:?}", next.why_commit(commit('1')));
-    app.reload(Ok(next), None, now());
-    match &app.views[..] {
-        [View::Why { origin, chain, .. }] => {
-            assert_eq!(*origin, crate::app::WhyOrigin::Commit(commit('1')));
-            assert_eq!(format!("{chain:?}"), expected);
-        }
-        other => panic!("{}", other.len()),
-    }
-}
-
-/// Lässt sich eine Zeilen-Kette nicht mehr rechnen (HEAD mitten in einem
-/// Checkout unlesbar), schließt sie — und die Fußzeile sagt, was und warum.
-#[test]
-fn a_line_chain_that_cannot_be_recomputed_closes_with_a_reason() {
-    let (dir, repo) = repo();
-    std::fs::write(dir.path().join(".git/HEAD"), "kein ref\n").unwrap();
-    let mut app = App::new(filled(), &repo, None);
-    app.views.push(View::Why {
-        origin: crate::app::WhyOrigin::Line {
-            path: "src/http/retry.rs".into(),
-            line: 3,
-        },
-        chain: app.inspection.why_commit(commit('1')),
-        cursor: 0,
-        edge: 0,
-        inspector: None,
-    });
-    app.reload(Ok(filled()), None, now());
-    assert!(app.views.is_empty());
-    let closed = app.closed.clone().expect("Grund vermerkt");
-    assert!(closed.contains("why src/http/retry.rs:3"), "{closed}");
-    let out = render(&mut app);
-    assert!(out.contains("⚠ closed why src/http/retry.rs:3"), "{out}");
-}
-
-#[test]
 fn the_footer_says_how_fresh_the_view_is_and_help_lists_r() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
@@ -2049,20 +1775,12 @@ fn a_failure_and_live_off_are_shown_together() {
 
 #[test]
 fn the_closed_note_goes_away_with_the_next_key() {
-    let (dir, repo) = repo();
-    std::fs::write(dir.path().join(".git/HEAD"), "kein ref\n").unwrap();
+    let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    app.views.push(View::Why {
-        origin: crate::app::WhyOrigin::Line {
-            path: "a.rs".into(),
-            line: 1,
-        },
-        chain: app.inspection.why_commit(commit('1')),
-        cursor: 0,
-        edge: 0,
-        inspector: None,
-    });
-    app.reload(Ok(filled()), None, now());
+    // Der Graph einer Session, die das nächste Neuladen nicht mehr kennt.
+    app.reduce(Action::Down);
+    app.reduce(Action::Enter);
+    app.reload(Ok(without_b()), None, now());
     assert!(app.closed.is_some());
     app.reduce(Action::Reload);
     assert!(app.closed.is_some(), "r allein liest den Hinweis nicht");
@@ -2182,43 +1900,6 @@ fn a_failed_r_keeps_the_full_reload_for_the_next_success() {
     assert!(!has_marker(&app), "voll neu gerechnet");
 }
 
-/// Ohne HEAD-Bewegung läuft für eine Zeilen-Kette kein Blame: Selbst ein
-/// gerade unlesbares HEAD schließt sie nicht.
-#[test]
-fn a_line_chain_is_not_blamed_again_while_head_stands() {
-    let (dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.stamp = Some("1".into());
-    let mut chain = app.inspection.why_commit(commit('1'));
-    chain.steps.insert(
-        0,
-        minds_reader::model::WhyStep::Line {
-            path: "src/http/retry.rs".into(),
-            line: 3,
-        },
-    );
-    app.views.push(View::Why {
-        origin: crate::app::WhyOrigin::Line {
-            path: "src/http/retry.rs".into(),
-            line: 3,
-        },
-        chain,
-        cursor: 0,
-        edge: 0,
-        inspector: None,
-    });
-    std::fs::write(dir.path().join(".git/HEAD"), "kein ref\n").unwrap();
-    app.reload(Ok(filled()), Some("2".into()), now());
-    assert!(app.closed.is_none(), "{:?}", app.closed);
-    assert!(matches!(&app.views[..], [View::Why { chain, .. }]
-        if matches!(chain.steps.first(), Some(minds_reader::model::WhyStep::Line { .. }))));
-    // `r` blamt neu — und scheitert jetzt sichtbar.
-    app.full_next = true;
-    app.reload(Ok(filled()), Some("2".into()), now());
-    assert!(app.views.is_empty());
-    assert!(app.closed.is_some());
-}
-
 #[test]
 fn a_vanished_selection_moves_to_its_neighbour() {
     let (_dir, repo) = repo();
@@ -2252,23 +1933,6 @@ fn the_search_footer_does_not_promise_r() {
     let out = render(&mut app);
     assert!(out.contains("⚠ live off"), "{out}");
     assert!(!out.contains("r reloads"), "{out}");
-}
-
-#[test]
-fn a_degraded_session_closes_its_chain_with_the_right_reason() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.views.push(View::Why {
-        origin: crate::app::WhyOrigin::Session(sid('d')),
-        chain: app.inspection.why_commit(commit('1')),
-        cursor: 0,
-        edge: 0,
-        inspector: None,
-    });
-    app.reload(Ok(filled()), None, now());
-    assert!(app.views.is_empty());
-    let closed = app.closed.clone().unwrap_or_default();
-    assert!(closed.contains("has no why chain"), "{closed}");
 }
 
 // --- Changes-Tab ------------------------------------------------------------
@@ -2877,6 +2541,7 @@ mod changes_tab {
 
     mod b4;
     mod b4b;
+    mod c10;
     mod c91;
     mod c92;
     mod c93;
@@ -3423,7 +3088,6 @@ mod intent_tab {
     use minds_core::ContentHash;
     use minds_core::intent_anchor::IntentEvent;
     use minds_reader::assurance::{IntentSignature, SignerKind};
-    use minds_reader::model::WhyStep;
 
     use super::*;
     use crate::app::{Tab, View};
@@ -3675,45 +3339,6 @@ mod intent_tab {
         assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
     }
 
-    /// In der Why-Kette ist der Anker ein Glied: Enter öffnet ihn im
-    /// Intent-Tab, auf genau diesem Anker — hier dem zweiten der Liste.
-    #[test]
-    fn the_why_chain_links_to_the_anchor() {
-        let (_dir, repo) = repo();
-        let source = source();
-        let mut app = App::new(anchored_to(2), &repo, Some("Fix retry".into()));
-        app.reduce(Action::Why);
-        let out = render(&mut app);
-        assert!(out.contains("Anchor b3-02020202020"), "{out}");
-        assert!(out.contains("(witness event, as recorded)"), "{out}");
-        let at_intent = |app: &App| {
-            matches!(
-                app.top(),
-                Some(View::Why { chain, cursor, .. })
-                    if matches!(chain.steps.get(*cursor), Some(WhyStep::Intent { .. }))
-            )
-        };
-        for _ in 0..10 {
-            if at_intent(&app) {
-                break;
-            }
-            app.reduce(Action::Down);
-        }
-        assert!(at_intent(&app), "the cursor reaches the INTENT step");
-        app.reduce(Action::Enter);
-        assert_eq!(app.tab, Tab::Intent);
-        app.fill_intents(&source);
-        let state = app.intent.as_ref().unwrap();
-        assert_eq!(state.selected().map(|i| i.id.clone()), Some(anchor(2)));
-        // Der Stapel bleibt: zurück im Sessions-Tab steht die Kette noch.
-        app.reduce(Action::TabTo(1));
-        assert!(matches!(app.top(), Some(View::Why { .. })));
-        // Ein zweites Öffnen bei bestehendem Tab wählt sofort.
-        app.open_intent(Some(anchor(1)));
-        let state = app.intent.as_ref().unwrap();
-        assert_eq!(state.selected().map(|i| i.id.clone()), Some(anchor(1)));
-    }
-
     /// Viele Anker: Das Fenster folgt dem Cursor, ▸ bleibt sichtbar.
     #[test]
     fn the_list_scrolls_with_the_cursor() {
@@ -3764,7 +3389,6 @@ mod overview_tab {
 
     use minds_core::ContentHash;
     use minds_core::intent_anchor::IntentEvent;
-    use minds_reader::model::WhyStep;
 
     use super::*;
     use crate::app::{Tab, View};
@@ -3981,26 +3605,6 @@ mod overview_tab {
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Changes);
         assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commits[0]));
-    }
-
-    /// `w`: die Why-Kette des Commits.
-    #[test]
-    fn w_opens_the_why_chain_of_the_commit() {
-        let (_dir, repo, commits, inspection) = history();
-        let mut app = opened(&repo, inspection);
-        // Start auf HEAD (C3) — kein Schritt vom WIP nötig.
-        assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
-        app.reduce(Action::Why);
-        assert_eq!(app.tab, Tab::Sessions);
-        let Some(View::Why { chain, .. }) = app.top() else {
-            panic!("why chain");
-        };
-        assert!(
-            chain
-                .steps
-                .iter()
-                .any(|s| matches!(s, WhyStep::Commit { id: Some(id), .. } if *id == commits[2]))
-        );
     }
 
     /// Ein Neuladen behält den gewählten Commit — auch wenn eine neue
@@ -4318,6 +3922,7 @@ mod overview_tab {
     mod b3;
     mod b4b;
     mod b7;
+    mod c10;
     mod c3;
     mod c36;
     mod c3v2;

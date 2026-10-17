@@ -19,7 +19,7 @@ fn at(out: &str, needle: &str) -> usize {
 }
 
 /// Die App mit dem Cursor auf der `◇ reported`-Zeile (`sort_by_key`).
-fn on_the_reported_line(repo: &Repo) -> App<'_> {
+pub(super) fn on_the_reported_line(repo: &Repo) -> App<'_> {
     let mut app = app_with_changes(repo);
     app.reduce(Action::Down);
     app.reduce(Action::Down);

@@ -17,7 +17,6 @@ Enter / l          open, descend
 Esc / h            back: close, clear the search, return — never quits
 
 /                  filter in every tab: sessions, commits, files, anchors (AND)
-w                  why — the provenance chain (on any session, commit or line)
 e                  evidence of the session — verdict, coverage, epochs, signature
 v / d / i          verify · diff · intent of the commit or session in focus
 t                  graph ↔ timeline
@@ -31,17 +30,15 @@ q / Ctrl-C         quit";
 fn section(tab: Tab) -> &'static str {
     match tab {
         Tab::Overview => {
-            "Overview: ↑↓ commit · Enter its session(s) / graph · a agent sessions only/all · Space requirement / full prompt · w why chain · / filter · Esc back\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ requirement · ◉N sessions · ┆ hidden commits"
+            "Overview: ↑↓ commit · Enter its session(s) / graph · a agent sessions only/all · Space requirement / full prompt · / filter · Esc back\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ requirement · ◉N sessions · ┆ hidden commits"
         }
-        Tab::Sessions => {
-            "Sessions: ↑↓ session · Enter graph · w why · e evidence · t timeline · / search"
-        }
+        Tab::Sessions => "Sessions: ↑↓ session · Enter graph · e evidence · t timeline · / search",
         Tab::Verify => "Verify:   ↑↓ row · Enter open (session, diff) · [ ] commit",
         Tab::Changes => {
-            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · w why chain of the line · Esc back\n          Tab / Shift-Tab next / previous file in the files line (below 160 columns)"
+            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · Enter graph of the line's tool call · Esc back\n          Tab / Shift-Tab next / previous file in the files line (below 160 columns)"
         }
         Tab::Intent => {
-            "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it\n          in why: Enter on the anchor"
+            "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it"
         }
     }
 }

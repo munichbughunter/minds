@@ -16,8 +16,9 @@ fn session_row(app: &App) -> Option<usize> {
     (!state.sessions.is_empty()).then_some(0)
 }
 
-/// Das AC der Spec: Verify → Enter (Session) → `w` → Esc → Esc landet wieder
-/// in Verify auf derselben Zeile.
+/// Das AC der Spec: Verify → Enter (Session) → `e` → Esc → Esc landet wieder
+/// in Verify auf derselben Zeile. (Bis C10 war die zweite Ebene die
+/// Why-Kette; jetzt der Evidence-Report — der Rückweg ist derselbe.)
 #[test]
 fn b2_esc_returns_across_tabs_to_the_same_row() {
     let (_dir, repo, _, inspection) = history();
@@ -30,20 +31,20 @@ fn b2_esc_returns_across_tabs_to_the_same_row() {
     let commit = app.verify.as_ref().unwrap().commit();
     app.reduce(Action::Enter);
     assert_eq!(app.tab, Tab::Sessions);
-    app.reduce(Action::Why);
-    assert!(matches!(app.top(), Some(View::Why { .. })));
+    app.reduce(Action::Evidence);
+    assert!(matches!(app.top(), Some(View::Evidence { .. })));
     let out = render_sized(&mut app, 160, 40);
     let crumb = out.lines().nth(1).unwrap();
     assert!(crumb.contains("Verify"), "{out}");
     assert!(crumb.contains("› Session b3-"), "{out}");
-    // Der Pfad endet am Ziel: … › Session … › Why (die Statistik rechts
-    // daneben ist kein Teil des Pfads).
-    assert!(crumb.contains("› Why"), "{crumb}");
+    // Der Pfad endet am Ziel: … › Session … › Evidence (die Statistik
+    // rechts daneben ist kein Teil des Pfads).
+    assert!(crumb.contains("› Evidence"), "{crumb}");
     assert!(
-        crumb.find("Verify").unwrap() < crumb.find("› Why").unwrap(),
+        crumb.find("Verify").unwrap() < crumb.find("› Evidence").unwrap(),
         "{crumb}"
     );
-    app.reduce(Action::Back); // Why schließt
+    app.reduce(Action::Back); // Evidence schließt
     assert!(matches!(app.top(), Some(View::Graph { .. })));
     app.reduce(Action::Back); // die Ebene des Sprungs: zurück zum Ursprung
     assert_eq!(app.tab, Tab::Verify);
@@ -80,11 +81,11 @@ fn b2_the_breadcrumb_is_shortened_from_the_left() {
         app.reduce(Action::Enter);
     }
     assert_eq!(app.tab, Tab::Sessions);
-    app.reduce(Action::Why);
+    app.reduce(Action::Evidence);
     let out = render_sized(&mut app, 30, 24);
     let crumb = out.lines().nth(1).unwrap().trim_matches('"').trim_end();
     assert!(crumb.starts_with('…'), "{crumb}");
-    assert!(crumb.ends_with("› Why"), "{crumb}");
+    assert!(crumb.ends_with("› Evidence"), "{crumb}");
     let out = render_sized(&mut app, 160, 40);
     let crumb = out.lines().nth(1).unwrap();
     assert!(crumb.contains("Overview ›"), "{crumb}");

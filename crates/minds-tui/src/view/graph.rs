@@ -267,9 +267,19 @@ fn graph_detail(app: &App, id: SessionId, row: &Row) -> Option<Vec<Line<'static>
         let values: Vec<&str> = v.lines().filter(|l| !l.trim().is_empty()).collect();
         for (i, value) in values.iter().take(VALUE_MAX).enumerate() {
             let key = if i == 0 { k.as_str() } else { "" };
+            // Eine unsignierte Review-Notiz ist nur aufgezeichnet (A2, seit
+            // C10 hier statt in der Kette): Claim-Marker und -Stil, nie der
+            // Stil eines Belegs.
+            let (prefix, style) = match (&node.kind, value.contains("(signed)")) {
+                (NodeKind::Review(_), false) => {
+                    let (glyph, _, style) = theme::claim();
+                    (format!("{glyph} "), style)
+                }
+                _ => (String::new(), value_style),
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!("{key:<10} "), theme::dim()),
-                Span::styled(value.to_string(), value_style),
+                Span::styled(format!("{prefix}{value}"), style),
             ]));
         }
         if values.len() > VALUE_MAX {
@@ -311,7 +321,7 @@ fn graph_detail(app: &App, id: SessionId, row: &Row) -> Option<Vec<Line<'static>
         lines.push(Line::from(Span::raw(format!(
             "{:<10} {}",
             "",
-            crate::view::why::explanation(&link.why)
+            crate::view::explanation(&link.why)
         ))));
     }
     if row.count > 1 {

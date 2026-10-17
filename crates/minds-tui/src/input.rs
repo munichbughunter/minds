@@ -29,8 +29,6 @@ pub enum Action {
     Back,
     /// Graph ↔ Zeitleiste.
     ToggleTimeline,
-    /// Die Herkunftskette.
-    Why,
     /// Der Evidence-Report der Session.
     Evidence,
     /// Die Detailstufe 1–3 (direkt; die Tasten sind `z` / `Z`).
@@ -111,7 +109,9 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Enter | KeyCode::Char('l') => Action::Enter,
         KeyCode::Esc | KeyCode::Char('h') => Action::Back,
         KeyCode::Char('t') => Action::ToggleTimeline,
-        KeyCode::Char('w') => Action::Why,
+        // `w` ist seit C10 frei: Die Herkunftskette gibt es nicht mehr, ihre
+        // Glieder stehen in der Why-Box (Changes) und im Overview-Detail.
+        KeyCode::Char('w') => Action::None,
         KeyCode::Char('e') => Action::Evidence,
         // B4: Ziffern wählen den Tab, `z` / `Z` zoomen, die Objekt-Verben
         // sind in jedem Tab dieselben.
@@ -161,7 +161,9 @@ mod tests {
     #[test]
     fn every_command_key_has_its_action() {
         for (c, action) in [
-            ('w', Action::Why),
+            // C10: `w` bleibt in der Tabelle — jetzt ohne Aktion; die Kette
+            // ist weg, nichts verschwindet stillschweigend.
+            ('w', Action::None),
             ('e', Action::Evidence),
             ('t', Action::ToggleTimeline),
             // B4: Ziffern sind Tabs, Zoom liegt auf z / Z.

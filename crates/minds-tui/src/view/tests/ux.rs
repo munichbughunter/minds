@@ -74,33 +74,6 @@ fn deliberate() -> Inspection {
 }
 
 #[test]
-fn a3_why_lists_every_discarded_approach_as_a_claim() {
-    for (w, h) in SIZES {
-        let (_dir, repo) = repo();
-        let mut app = App::new(deliberate(), &repo, None);
-        app.reduce(Action::Why);
-        // Auf das INTENT-Glied: Session, Agent, Intent.
-        app.reduce(Action::Down);
-        app.reduce(Action::Down);
-        let out = render_sized(&mut app, w, h);
-        assert!(out.contains("Considered & discarded"), "{w}x{h}\n{out}");
-        assert!(out.contains("Constraints"), "{w}x{h}\n{out}");
-        assert!(out.contains("no new dependency"), "{w}x{h}\n{out}");
-        for d in DISCARDED {
-            // Bei 80 Spalten darf die Zeile mit … gekappt sein, der Anfang
-            // muss lesbar bleiben.
-            let head: String = d.chars().take(18).collect();
-            assert!(out.contains(&head), "{w}x{h} {d}\n{out}");
-        }
-        assert!(!out.contains("Discarded: "), "{w}x{h}\n{out}");
-        let buffer = buffer_sized(&mut app, w, h);
-        for color in colors_of(&buffer, "Circuit breaker") {
-            assert_ne!(color, theme::OK, "{w}x{h}: a claim is never OK-green");
-        }
-    }
-}
-
-#[test]
 fn a3_graph_detail_shows_all_lines_of_the_intent() {
     for (w, h) in SIZES {
         let (_dir, repo) = repo();
@@ -137,95 +110,40 @@ fn a3_the_you_box_shows_the_request_and_counts_the_claims() {
 fn a3_empty_is_empty() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Why);
+    app.reduce(Action::Enter);
     let out = render_sized(&mut app, 160, 40);
     assert!(!out.contains("Considered & discarded"), "{out}");
     assert!(!out.contains("Discarded: 0"), "{out}");
-    app.reduce(Action::Back);
-    app.reduce(Action::Enter);
-    let out = render_sized(&mut app, 160, 40);
     assert!(!out.contains("discarded ·"), "{out}");
 }
 
-// ---------------------------------------------------------------------
-// A2 · Claim und Evidence in der Why-Kette trennen
-// ---------------------------------------------------------------------
-
-/// Die Zelle des Glied-Markers vor `word` (`"INTENT"` …) — Symbol und Farbe.
-fn marker_of(buffer: &ratatui::buffer::Buffer, word: &str) -> Option<(String, Color)> {
-    let area = buffer.area;
-    for y in 0..area.height {
-        let line: String = (0..area.width)
-            .map(|x| buffer[(x, y)].symbol().to_string())
-            .collect();
-        let chars: Vec<char> = line.chars().collect();
-        let text: String = chars.iter().collect();
-        if let Some(byte) = text.find(&format!(" {word}")) {
-            let at = text[..byte].chars().count();
-            // Ein Glied-Kopf: Marker, Leerzeichen, Wort — am Zeilenanfang
-            // der Kette (Rahmen und Liste davor sind erlaubt).
-            if at >= 1 && !chars[at - 1].is_whitespace() {
-                let x = (at - 1) as u16;
-                return Some((buffer[(x, y)].symbol().to_string(), buffer[(x, y)].fg));
-            }
-        }
-    }
-    None
-}
-
-#[test]
-fn a2_the_intent_link_is_a_claim_never_a_check() {
-    for (w, h) in SIZES {
-        let (_dir, repo) = repo();
-        let mut app = App::new(filled(), &repo, None);
-        app.reduce(Action::Why); // Session a: Trailer, belegt
-        let out = render_sized(&mut app, w, h);
-        assert!(out.contains("◌ INTENT"), "{w}x{h}\n{out}");
-        assert!(!out.contains("✓ INTENT"), "{w}x{h}\n{out}");
-        let buffer = buffer_sized(&mut app, w, h);
-        let (glyph, color) = marker_of(&buffer, "INTENT").expect("INTENT link");
-        assert_eq!(glyph, "◌", "{w}x{h}");
-        assert_ne!(color, theme::OK, "{w}x{h}: a claim is never OK-green");
-        assert_eq!(color, theme::claim().2.fg.unwrap(), "{w}x{h}");
-        // Ein belegtes Glied bleibt ✓ in OK.
-        let (glyph, color) = marker_of(&buffer, "EVIDENCE").expect("EVIDENCE link");
-        assert_eq!((glyph.as_str(), color), ("✓", theme::OK), "{w}x{h}");
-    }
-}
-
-#[test]
-fn a2_no_gap_never_includes_the_claims() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Why);
-    let out = render_sized(&mut app, 160, 40);
-    assert!(out.contains("✓ no gap in the evidence links"), "{out}");
-    assert!(out.contains("intent is a recorded claim"), "{out}");
-    assert!(!out.contains("every link is attested"), "{out}");
-    assert!(!out.contains("Every link is attested"), "{out}");
-}
-
+/// Ein Urteil nur aus unsignierten Notizen ist aufgezeichnet, nicht belegt:
+/// Die Notiz trägt den Claim-Marker, nie `(signed)` — seit C10 im Detail
+/// des REVIEW-Knotens, wo die Notizen stehen (vorher: das REVIEW-Glied
+/// der Why-Kette, `a2_an_unsigned_review_note_reads_as_a_claim`).
 #[test]
 fn a2_an_unsigned_review_note_reads_as_a_claim() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Why);
+    app.reduce(Action::Enter);
+    app.reduce(Action::End); // der REVIEW-Knoten
     let out = render_sized(&mut app, 160, 40);
     let note = out
         .lines()
         .find(|l| l.contains("Retry bei 5xx fehlt"))
         .unwrap_or_else(|| panic!("{out}"));
-    assert!(note.contains("◌ pd"), "{out}");
+    assert!(note.contains("◌ needs-work"), "{out}");
     assert!(!note.contains("(signed)"), "{out}");
-    // Ein Urteil nur aus unsignierten Notizen ist aufgezeichnet, nicht
-    // belegt: Der REVIEW-Kopf trägt den Claim-Marker, nie das grüne ✓.
-    assert!(out.contains("◌ REVIEW"), "{out}");
-    assert!(!out.contains("✓ REVIEW"), "{out}");
     let buffer = buffer_sized(&mut app, 160, 40);
-    let (glyph, color) = marker_of(&buffer, "REVIEW").expect("REVIEW link");
-    assert_eq!(glyph, "◌");
-    assert_ne!(color, theme::OK);
+    for color in colors_of(&buffer, "◌ needs-work") {
+        assert_ne!(color, theme::OK, "a claim is never OK-green");
+        assert_eq!(color, theme::claim().2.fg.unwrap());
+    }
 }
+
+// ---------------------------------------------------------------------
+// A2 · Claim und Evidence in der Why-Kette trennen
+// ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
 // A1 · Glyph-Register: eine Bedeutung pro Glyph
@@ -607,7 +525,6 @@ fn a4_no_own_trust_strings_outside_the_component() {
         ("mod.rs", include_str!("../mod.rs")),
         ("overview.rs", include_str!("../overview.rs")),
         ("verify.rs", include_str!("../verify.rs")),
-        ("why.rs", include_str!("../why.rs")),
         ("intent.rs", include_str!("../intent.rs")),
         ("changes.rs", include_str!("../changes.rs")),
     ];
@@ -764,25 +681,18 @@ fn b4_the_object_verbs_work_on_a_session() {
     assert!(out.contains("no commit"), "{out}");
 }
 
-/// Auch in Randfällen nie still nichts: `w` ohne erklärbaren Gegenstand und
-/// `c` außerhalb von Changes sagen, warum nicht.
+/// Auch in Randfällen nie still nichts: `c` außerhalb von Changes und `e`
+/// ohne Session sagen, warum nicht. (`w` gibt es seit C10 nicht mehr.)
 #[test]
 fn b4_verbs_without_an_object_say_why() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::TabTo(4)); // Intent: kein Anker, keine Session
-    app.reduce(Action::Why);
-    assert!(app.closed.is_some(), "w in an empty Intent tab");
+    app.reduce(Action::Evidence);
+    assert!(app.closed.is_some(), "e in an empty Intent tab");
     app.reduce(Action::TabTo(1));
     app.reduce(Action::Context);
     assert!(app.closed.is_some(), "c outside Changes");
-    // Changes ohne Zeile: w sagt es.
-    app.reduce(Action::TabTo(3));
-    app.reduce(Action::Why);
-    assert!(
-        app.closed.is_some() || matches!(app.top(), Some(View::Why { .. })),
-        "w in Changes"
-    );
 }
 
 // ---------------------------------------------------------------------

@@ -150,10 +150,6 @@ fn every_view(status: Option<TranscriptStatus>) -> Vec<(&'static str, String)> {
     app.open_overview();
     while app.fill_overview(&Plain) {}
     out.push(("overview", text_at(&mut app, 160, 40)));
-    // Die Why-Kette des Commits (`w`).
-    app.reduce(Action::Why);
-    assert!(matches!(app.top(), Some(View::Why { .. })), "why chain");
-    out.push(("why", text_at(&mut app, 160, 40)));
 
     // Sessions: Liste und Graph.
     let mut app = App::new(inspection.clone(), &repo, None);
@@ -198,7 +194,7 @@ fn k1_the_placeholder_unknown_is_printed_in_no_view() {
 }
 
 /// Überall, wo das Modell stünde, steht der Grund: Overview-Detail, Why-Box
-/// (WRITTEN BY / AGENT SAID), Graph-Kopf, Sessions-Liste, Why-Kette.
+/// (WRITTEN BY / AGENT SAID), Graph-Kopf, Sessions-Liste.
 #[test]
 fn k1_every_model_site_names_why_the_transcript_was_not_read() {
     let reason = "model not recorded — the witness does not read transcripts from agent paths";
@@ -229,11 +225,10 @@ fn k1_every_model_site_names_why_the_transcript_was_not_read() {
         "{changes}"
     );
     assert!(!changes.contains("Agent    "), "{changes}");
-    // Graph-Knoten und Why-Kette kürzen am Spaltenrand mit `…` — der Satz
-    // beginnt, und `unknown` steht nirgends (siehe den Test davor).
+    // Der Graph-Knoten kürzt am Spaltenrand mit `…` — der Satz beginnt, und
+    // `unknown` steht nirgends (siehe den Test davor).
     let starts = "model not recorded — the witness does not read";
     assert!(text("graph").contains(starts), "{}", text("graph"));
-    assert!(text("why").contains(starts), "{}", text("why"));
     let _ = reason;
     // Die Liste kürzt auf die Spalte — der Anfang steht.
     assert!(

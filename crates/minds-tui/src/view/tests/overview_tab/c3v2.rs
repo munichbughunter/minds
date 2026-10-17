@@ -888,9 +888,9 @@ fn c35_the_footer_says_where_you_are_and_what_you_can_do() {
         let all = [
             "Enter how it was made",
             "a agent only/all",
-            "w why",
             "v verify",
             "d diff",
+            "e evidence",
         ];
         let want = if w >= 160 { &all[..] } else { &all[..1] };
         for key in want {

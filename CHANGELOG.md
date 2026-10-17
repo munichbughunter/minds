@@ -17,6 +17,26 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed
+
+- **The why chain view of `minds inspect` (C10).** The `w` key, the
+  `Why` level in the Sessions tab and its inspector are gone: every link of
+  the chain (LINE, COMMIT, CHANGE, SESSION, AGENT, INTENT, EVIDENCE, REVIEW)
+  has been shown since Batch 2 in *Why this line?* of the Changes tab (per
+  line: WRITTEN BY, SESSION, REQUIREMENT, ASKED FOR, AGENT SAID, REVIEW) and
+  in the EVIDENCE block of the Overview detail (per commit: INTEGRITY,
+  COVERAGE, INTERPRETATION, REQUIREMENT, REVIEW). The chain framed a missing
+  review as a gap, which it is not (`◦ not reviewed yet`), and showed code
+  jargon (`● ? observed [unchecked]`). `minds inspect <file>:<line>` now
+  opens the Changes tab on that line; `minds why <file>:<line>` on the
+  command line and the pipe output of `minds inspect` keep the chain.
+  `Enter` on a CHANGE or COMMIT node of the graph opens the commit's diff.
+  The promises of the chain's tests moved with their content: a recorded
+  claim is never marked ✓ (ASKED FOR / AGENT SAID carry `◌`), a gap is named
+  with its reason, a fully backed commit says so (`✓ VERIFIED`, `✓ all N
+  added lines observed`), and an unsigned review note reads as a claim
+  (`◌` in the REVIEW detail).
+
 ### Added
 
 - **The reader tells a session as a numbered list of steps (C11, data

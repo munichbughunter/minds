@@ -190,7 +190,8 @@ Usage:
   minds inspect [<search> | <file>:<line>] [--nerd-font]
         How a change came to be, in the terminal: session list, a
         session's graph (intent → agent → effects → change → review) and
-        a line's why chain. Tabs (Tab, F1–F5): Overview (the history as a
+        a session's evidence; <file>:<line> opens the Changes tab on that
+        line (the why chain itself: minds why). Tabs (Tab, F1–F5): Overview (the history as a
         commit graph with what Minds knows about each commit: agent or
         human, branch and tag, seal, review, intent, sessions; Enter leads
         to the commit's sessions), Sessions, Verify (the verdict of minds
