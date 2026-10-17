@@ -155,7 +155,7 @@ fn every_view(status: Option<TranscriptStatus>) -> Vec<(&'static str, String)> {
     let mut app = App::new(inspection.clone(), &repo, None);
     out.push(("sessions", text_at(&mut app, 160, 40)));
     app.reduce(Action::Enter);
-    assert!(matches!(app.top(), Some(View::Graph { .. })), "graph");
+    assert!(matches!(app.top(), Some(View::Story { .. })), "graph");
     out.push(("graph", text_at(&mut app, 160, 40)));
 
     // Verify, Changes (Why-Box), Intent, Hilfe.

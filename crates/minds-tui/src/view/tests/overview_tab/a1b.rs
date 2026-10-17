@@ -53,16 +53,10 @@ fn a1b_seal_pills_come_from_the_register() {
 #[test]
 fn a1b_badges_refs_and_graph_nodes_are_structural() {
     for (symbol, meaning) in [
-        (
-            theme::node(&minds_reader::graph::NodeKind::Agent).0,
-            "agent",
-        ),
+        (theme::AGENT_GLYPH, "agent"),
         (theme::HEAD, "head"),
         (theme::PENDING, "pending"),
-        (
-            theme::node(&minds_reader::graph::NodeKind::Commit(commit('1'))).0,
-            "change",
-        ),
+        (theme::COMMIT_GLYPH, "change"),
     ] {
         let e = entry(symbol);
         assert_eq!((e.class, e.meaning), (Structural, meaning), "{symbol}");
@@ -83,6 +77,6 @@ fn a1b_the_overview_draws_no_epistemic_glyph_as_structure() {
             out.contains(&format!("{} HEAD", theme::HEAD)),
             "{w}x{h}\n{out}"
         );
-        assert!(out.contains(theme::node(&minds_reader::graph::NodeKind::Commit(commit('1'))).0));
+        assert!(out.contains(theme::COMMIT_GLYPH));
     }
 }

@@ -589,7 +589,7 @@ const BRIDGE: &str = "With a witness this line would be ● observed.";
 
 /// Der Satz zu einem Zustand mit Beleg (nicht für `not observed`, dessen
 /// Gründe eigene Sätze haben). `tool` ist das Werkzeug des Claims.
-fn state_sentence(class: ReconClass, tool: &str) -> Vec<String> {
+pub(crate) fn state_sentence(class: ReconClass, tool: &str) -> Vec<String> {
     match class {
         ReconClass::Explained => vec![
             "A witness observed this content on disk after the agent's write — the hash matched."

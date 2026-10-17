@@ -73,19 +73,23 @@ fn deliberate() -> Inspection {
     )
 }
 
+/// Verworfene Ansätze und Constraints stehen im PROMPT-Abschnitt der Story
+/// (C11) — jeder Eintrag als Aussage, nie OK-grün. (Vorher im Graph-Detail
+/// des Intent-Knotens: `a3_graph_detail_shows_all_lines_of_the_intent`.)
 #[test]
-fn a3_graph_detail_shows_all_lines_of_the_intent() {
+fn a3_the_story_prompt_shows_constraints_and_discarded_as_claims() {
     for (w, h) in SIZES {
         let (_dir, repo) = repo();
         let mut app = App::new(deliberate(), &repo, None);
         app.reduce(Action::Enter);
         let out = render_sized(&mut app, w, h);
+        assert!(out.contains("CONSTRAINTS"), "{w}x{h}\n{out}");
+        assert!(out.contains("DISCARDED"), "{w}x{h}\n{out}");
         for d in DISCARDED {
             let head: String = d.chars().take(18).collect();
             assert!(out.contains(&head), "{w}x{h} {d}\n{out}");
         }
         assert!(out.contains("max 3 retries"), "{w}x{h}\n{out}");
-        assert!(out.contains("Keep the public API"), "{w}x{h}\n{out}");
         let buffer = buffer_sized(&mut app, w, h);
         for color in colors_of(&buffer, "Circuit breaker") {
             assert_ne!(color, theme::OK, "{w}x{h}: a claim is never OK-green");
@@ -93,17 +97,19 @@ fn a3_graph_detail_shows_all_lines_of_the_intent() {
     }
 }
 
+/// Der Prompt steht ganz, umgebrochen — nicht einzeilig geclippt, nicht
+/// als Zähler mit Verweis (vorher die YOU-Box:
+/// `a3_the_you_box_shows_the_request_and_counts_the_claims`).
 #[test]
-fn a3_the_you_box_shows_the_request_and_counts_the_claims() {
+fn a3_the_story_prompt_shows_every_line_of_the_request() {
     let (_dir, repo) = repo();
     let mut app = App::new(deliberate(), &repo, None);
     app.reduce(Action::Enter);
     let out = render_sized(&mut app, 160, 40);
     assert!(out.contains("Only retry idempotent requests"), "{out}");
-    assert!(
-        out.contains("◌ 3 discarded · 2 constraints — select YOU for details"),
-        "{out}"
-    );
+    assert!(out.contains("Keep the public API"), "{out}");
+    assert!(!out.contains("select YOU for details"), "{out}");
+    assert!(!out.contains(" YOU "), "{out}");
 }
 
 #[test]
@@ -158,9 +164,9 @@ fn a2_an_unsigned_review_note_reads_as_a_claim() {
 #[test]
 fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
     use minds_core::{EvidenceMark as M, EvidenceSource as S, EvidenceStatus as St};
-    use minds_reader::graph::{NodeKind, ToolKind};
     use minds_reader::model::{EvidenceState, EvidenceVerdict, Provenance, Verdict};
     use minds_reader::reconcile::ReconClass;
+    use minds_reader::story::Verb;
     use theme::GlyphClass::{Epistemic, Structural};
 
     let mut symbols = std::collections::BTreeSet::new();
@@ -271,40 +277,48 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
     ] {
         add(theme::verdict(v).0, Epistemic, meaning, format!("{v:?}"));
     }
-    for (kind, class, meaning) in [
-        (ToolKind::Read, Structural, "read"),
-        (ToolKind::Edit, Structural, "edit"),
-        (ToolKind::Exec, Structural, "exec"),
-        (ToolKind::Delete, Structural, "delete"),
-        (ToolKind::Other, Structural, "tool"),
-        (ToolKind::Uninterpreted, Epistemic, "uninterpreted"),
+    // Die Verben der Story (C11) tragen Strukturglyphen: Kommandos,
+    // Schreibungen, Löschungen, Lesen, Delegation, unbekannte Tools.
+    for (verb, meaning) in [
+        (Verb::Ran, "exec"),
+        (Verb::Tests, "exec"),
+        (Verb::Bench, "exec"),
+        (Verb::Lint, "exec"),
+        (Verb::Build, "exec"),
+        (Verb::Wrote, "edit"),
+        (Verb::Edited, "edit"),
+        (Verb::Deleted, "delete"),
+        (Verb::Read, "read"),
+        (Verb::Searched, "read"),
+        (Verb::Fetched, "read"),
+        (Verb::Delegated, "agent"),
+        (Verb::Tool, "tool"),
     ] {
-        add(theme::tool(kind).0, class, meaning, format!("{kind:?}"));
-    }
-    let change: minds_core::ChangeId = format!("I{}", "c".repeat(40)).parse().unwrap();
-    for (kind, class, meaning) in [
-        (NodeKind::Intent, Epistemic, "claim"),
-        (NodeKind::Agent, Structural, "agent"),
-        (
-            NodeKind::Turn(minds_core::Role::Assistant),
+        add(
+            theme::verb(verb).0,
             Structural,
-            "turn",
-        ),
-        (NodeKind::Subagent(sid('f')), Structural, "agent"),
-        (
-            NodeKind::Handover {
-                other: sid('e'),
-                incoming: true,
-            },
-            Structural,
-            "handover",
-        ),
-        (NodeKind::Change(change), Structural, "change"),
-        (NodeKind::Commit(commit('1')), Structural, "change"),
-        (NodeKind::Review(Verdict::Rejected), Epistemic, "rejected"),
-    ] {
-        add(theme::node(&kind).0, class, meaning, format!("{kind:?}"));
+            meaning,
+            format!("{verb:?}"),
+        );
     }
+    add(
+        theme::handover().0,
+        Structural,
+        "handover",
+        "handover".into(),
+    );
+    add(
+        theme::AGENT_GLYPH,
+        Structural,
+        "agent",
+        "agent badge".into(),
+    );
+    add(
+        theme::COMMIT_GLYPH,
+        Structural,
+        "change",
+        "commit node".into(),
+    );
 
     for (glyph, class, meaning, at) in uses {
         let entry = theme::REGISTER
@@ -521,7 +535,7 @@ fn a4_no_own_trust_strings_outside_the_component() {
     let sources = [
         ("activity.rs", include_str!("../activity.rs")),
         ("evidence.rs", include_str!("../evidence.rs")),
-        ("graph.rs", include_str!("../graph.rs")),
+        ("story.rs", include_str!("../story.rs")),
         ("mod.rs", include_str!("../mod.rs")),
         ("overview.rs", include_str!("../overview.rs")),
         ("verify.rs", include_str!("../verify.rs")),
@@ -562,65 +576,75 @@ fn a4_no_own_trust_strings_outside_the_component() {
 // B5 · Fokus beim Zoom- und Ansichtswechsel erhalten
 // ---------------------------------------------------------------------
 
+/// Der Schritt unter dem Cursor der Story: Verb und Ziel.
 fn focused_kind(app: &App) -> Option<String> {
     match app.top() {
-        Some(View::Graph { rows, cursor, .. }) => rows
+        Some(View::Story {
+            story,
+            rows,
+            cursor,
+            ..
+        }) => rows
             .get(*cursor)
-            .map(|r| format!("{:?} {}", r.kind, r.label)),
+            .and_then(|r| r.step)
+            .and_then(|s| story.steps.get(s))
+            .map(|s| format!("{:?} {}", s.verb, s.target)),
         _ => None,
     }
 }
 
+/// Der Cursor folgt dem Schritt über die Zoomstufen (B5) — in der
+/// Zusammenfassung der Zeile, die ihn enthält. (Vorher mit Baum und
+/// Zeitleiste: `b5_zoom_and_timeline_keep_the_focused_node`; die
+/// Zeitleiste gibt es seit C11 nicht mehr — die Story ist sie.)
 #[test]
-fn b5_zoom_and_timeline_keep_the_focused_node() {
+fn b5_zoom_keeps_the_focused_step() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Enter);
-    // YOU, AGENT, READ, EDIT: der Cursor auf EDIT.
-    for _ in 0..3 {
-        app.reduce(Action::Down);
-    }
+    // read, edited, ran: der Cursor auf `edited`.
+    app.reduce(Action::Down);
     let edit = focused_kind(&app).unwrap();
-    assert!(edit.contains("Edit"), "{edit}");
-    // Verbose fügt Züge davor ein — der Cursor folgt dem Knoten, nicht dem Index.
+    assert!(edit.contains("Edited"), "{edit}");
+    // Verbose fügt den Zugtext davor ein — der Cursor folgt dem Schritt,
+    // nicht dem Index.
     app.reduce(Action::Zoom(3));
     assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
     app.reduce(Action::Zoom(1));
     assert!(
-        focused_kind(&app).unwrap().contains("Edit"),
+        focused_kind(&app).unwrap().contains("Edited"),
         "{:?}",
         focused_kind(&app)
     );
     app.reduce(Action::Zoom(2));
     assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
-    // Baum ↔ Zeitleiste: derselbe Knoten.
-    app.reduce(Action::ToggleTimeline);
-    assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
-    app.reduce(Action::ToggleTimeline);
+    // `t` ist frei: keine Zeitleiste, der Schritt bleibt.
+    app.reduce(Action::None);
     assert_eq!(focused_kind(&app).as_deref(), Some(edit.as_str()));
 }
 
-/// Ein ausgeblendeter Zug (Zoom 3 → 2) landet auf der Zeile, die ihn
-/// enthält — seinem sichtbaren Vorfahren.
+/// Eine ausgeblendete Zugzeile (Zoom 3 → 2) landet auf dem ersten Schritt
+/// des Zugs — der Zeile, die ihn enthält.
 #[test]
-fn b5_a_hidden_node_lands_on_the_row_that_contains_it() {
+fn b5_a_hidden_turn_lands_on_its_first_step() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Enter);
     app.reduce(Action::Zoom(3));
     let turn = match app.top() {
-        Some(View::Graph { rows, .. }) => rows
+        Some(View::Story { rows, .. }) => rows
             .iter()
-            .position(|r| matches!(r.kind, minds_reader::graph::NodeKind::Turn(_)))
+            .position(|r| matches!(r.kind, crate::layout::RowKind::Turn(_)))
             .expect("a turn row"),
         _ => unreachable!(),
     };
+    app.reduce(Action::Home);
     for _ in 0..turn {
         app.reduce(Action::Down);
     }
     app.reduce(Action::Zoom(2));
     assert!(
-        focused_kind(&app).unwrap().contains("Agent"),
+        focused_kind(&app).unwrap().contains("Read"),
         "{:?}",
         focused_kind(&app)
     );
@@ -776,10 +800,16 @@ fn c1_footer_line_one_explains_the_focused_state() {
         "{out}"
     );
     assert!(footer(&out).contains(sentence("sealed").unwrap()), "{out}");
-    // Graph auf YOU: der Auftrag ist eine Aussage.
+    // Story auf einer Zugzeile (Zoom 3): der Text des Agenten ist eine
+    // Aussage; auf einem Schritt steht der Schritt.
     app.reduce(Action::Enter);
+    app.reduce(Action::Zoom(3));
+    app.reduce(Action::Home);
     let out = render_sized(&mut app, 300, 30);
     assert!(footer(&out).contains(sentence("claim").unwrap()), "{out}");
+    app.reduce(Action::Zoom(2));
+    let out = render_sized(&mut app, 300, 30);
+    assert!(footer(&out).contains("step 1 · read"), "{out}");
     app.reduce(Action::Back);
     // Verify: das Urteilswort mit seinem Satz.
     app.reduce(Action::TabTo(2));
@@ -900,15 +930,30 @@ fn c7_a_large_graph_starts_in_summary_and_says_more_is_there() {
 
 #[test]
 fn c7_labels_use_the_actual_width() {
-    // 80 Zeichen: Der pauschale Abzug ließ bei 100 Spalten 70 frei (kürzte
-    // ihn), die tatsächliche Breite lässt 87 (zeigt ihn ganz).
+    // 80 Zeichen bei 100 Spalten: In der Liste bleibt dem Ziel die
+    // tatsächliche Breite (abzüglich Nummer, Verb, Zeit), gekürzt mit `…`
+    // am Zeilenende — und die Detailbox zeigt den Pfad ganz (C11).
     let long = format!("src/{}.rs", "x".repeat(73));
     assert_eq!(long.chars().count(), 80);
     let (_dir, repo) = repo();
     let mut app = App::new(busy(1, &long), &repo, None);
     app.reduce(Action::Enter);
+    // Der lange Pfad ist der vierte Schritt.
+    for _ in 0..3 {
+        app.reduce(Action::Down);
+    }
     let out = render_sized(&mut app, 100, 30);
-    assert!(out.contains(&long), "{long} clipped too early\n{out}");
+    assert!(out.contains(&long), "{long} not in the detail\n{out}");
+    let row = out
+        .lines()
+        .find(|l| l.contains("  4  → read"))
+        .unwrap_or_else(|| panic!("{out}"));
+    let shown = row.chars().filter(|c| *c == 'x').count();
+    assert!(
+        shown >= 60,
+        "the list keeps the actual width: {shown} x\n{out}"
+    );
+    assert!(row.contains('…'), "clipped at the end, never hard\n{row}");
 }
 
 /// A6: Neben der Vorschau bekommt die Überschrift bei 120 Spalten mindestens
@@ -945,7 +990,7 @@ fn a6_the_list_headline_gets_thirty_columns_at_120() {
 /// Wort). Die Zeilen behalten daher in jeder Stufe Glyph und Wort, auch
 /// monochrom.
 #[test]
-fn c7_graph_rows_keep_glyph_and_word_in_every_zoom_even_without_color() {
+fn c7_story_rows_keep_glyph_and_word_in_every_zoom_even_without_color() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.no_color = true;
@@ -953,19 +998,16 @@ fn c7_graph_rows_keep_glyph_and_word_in_every_zoom_even_without_color() {
     for zoom in [1u8, 2] {
         app.reduce(Action::Zoom(zoom));
         let out = render_sized(&mut app, 160, 40);
-        for (kind, label) in [
-            (minds_reader::graph::ToolKind::Read, "src/http/retry.rs"),
-            (minds_reader::graph::ToolKind::Edit, "src/http/retry.rs"),
-            (minds_reader::graph::ToolKind::Exec, "cargo test"),
+        for (verb, label) in [
+            (minds_reader::story::Verb::Read, "src/http/retry.rs"),
+            (minds_reader::story::Verb::Edited, "src/http/retry.rs"),
+            (minds_reader::story::Verb::Tests, "cargo test"),
         ] {
-            let (glyph, word, _) = theme::tool(kind);
-            let row = format!("{glyph} {word} {label}");
-            // In der Übersicht trägt eine zusammengefasste Zeile `×N`.
-            let merged = format!("{glyph} {word} {label} ×");
-            assert!(
-                out.contains(&row) || out.contains(&merged),
-                "zoom {zoom}: {row}\n{out}"
-            );
+            let (glyph, word, _) = theme::verb(verb);
+            let row = out
+                .lines()
+                .find(|l| l.contains(&format!("{glyph} {word}")) && l.contains(label));
+            assert!(row.is_some(), "zoom {zoom}: {glyph} {word} {label}\n{out}");
         }
     }
 }
@@ -976,10 +1018,10 @@ fn c7_graph_rows_keep_glyph_and_word_in_every_zoom_even_without_color() {
 #[test]
 fn c6_every_state_differs_by_glyph_and_word_alone() {
     use minds_core::{EvidenceMark as M, EvidenceSource as S, EvidenceStatus as St};
-    use minds_reader::graph::ToolKind;
     use minds_reader::model::{EvidenceState, EvidenceVerdict, Provenance, Verdict};
     use minds_reader::overview::SealMark;
     use minds_reader::reconcile::ReconClass;
+    use minds_reader::story::Verb;
     let mut seen: std::collections::BTreeMap<String, String> = Default::default();
     let mut add = |state: String, glyph: &str, word: &str| {
         let text = format!("{glyph} {word}");
@@ -1057,17 +1099,26 @@ fn c6_every_state_differs_by_glyph_and_word_alone() {
         let (g, w, _) = theme::verdict(v);
         add(format!("verdict {v:?}"), g, w);
     }
-    for kind in [
-        ToolKind::Read,
-        ToolKind::Edit,
-        ToolKind::Exec,
-        ToolKind::Delete,
-        ToolKind::Other,
-        ToolKind::Uninterpreted,
+    for verb in [
+        Verb::Ran,
+        Verb::Tests,
+        Verb::Bench,
+        Verb::Lint,
+        Verb::Build,
+        Verb::Wrote,
+        Verb::Edited,
+        Verb::Deleted,
+        Verb::Read,
+        Verb::Searched,
+        Verb::Fetched,
+        Verb::Delegated,
+        Verb::Tool,
     ] {
-        let (g, w, _) = theme::tool(kind);
-        add(format!("tool {kind:?}"), g, w);
+        let (g, w, _) = theme::verb(verb);
+        add(format!("verb {verb:?}"), g, w);
     }
+    let (g, w, _) = theme::handover();
+    add("handover".into(), g, w);
     let (g, w, _) = theme::claim();
     add("claim".into(), g, w);
     let (g, w, _) = theme::tampered();

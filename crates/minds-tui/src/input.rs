@@ -27,8 +27,6 @@ pub enum Action {
     Enter,
     /// Zurück / Filter löschen / beenden.
     Back,
-    /// Graph ↔ Zeitleiste.
-    ToggleTimeline,
     /// Der Evidence-Report der Session.
     Evidence,
     /// Die Detailstufe 1–3 (direkt; die Tasten sind `z` / `Z`).
@@ -108,7 +106,8 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::End | KeyCode::Char('G') => Action::End,
         KeyCode::Enter | KeyCode::Char('l') => Action::Enter,
         KeyCode::Esc | KeyCode::Char('h') => Action::Back,
-        KeyCode::Char('t') => Action::ToggleTimeline,
+        // `t` ist seit C11 frei: Die Story ist die Zeitleiste.
+        KeyCode::Char('t') => Action::None,
         // `w` ist seit C10 frei: Die Herkunftskette gibt es nicht mehr, ihre
         // Glieder stehen in der Why-Box (Changes) und im Overview-Detail.
         KeyCode::Char('w') => Action::None,
@@ -165,7 +164,8 @@ mod tests {
             // ist weg, nichts verschwindet stillschweigend.
             ('w', Action::None),
             ('e', Action::Evidence),
-            ('t', Action::ToggleTimeline),
+            // C11: `t` bleibt in der Tabelle — die Zeitleiste ist die Story.
+            ('t', Action::None),
             // B4: Ziffern sind Tabs, Zoom liegt auf z / Z.
             ('1', Action::TabTo(0)),
             ('2', Action::TabTo(1)),

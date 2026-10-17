@@ -3,9 +3,10 @@
 //! Git beantwortet „was ist passiert?"; Minds beantwortet „warum, durch wen,
 //! mit welchen Schritten, mit welchem Beleg, mit welcher Bewertung?". Diese
 //! Oberfläche macht die Kette navigierbar: eine **Activity**-Liste der
-//! Sessions, der **Graph** einer Session (Absicht → Agent → Effekte →
-//! Änderung → Review), der **Evidence**-Report einer Session und der
-//! **Changes**-Tab, dessen Why-Box jede Zeile ihrer Herkunft zuordnet. Die
+//! Sessions, die **Story** einer Session (die Schritte des Agenten in
+//! Reihenfolge, mit Ergebnis, C11), der **Evidence**-Report einer Session
+//! und der **Changes**-Tab, dessen Why-Box jede Zeile ihrer Herkunft
+//! zuordnet. Die
 //! Herkunftskette als eigene Ebene gibt es seit C10 nicht mehr; `minds why`
 //! (CLI) und der Pipe-Modus liefern sie weiter.
 //!

@@ -45,7 +45,7 @@ fn b2_esc_returns_across_tabs_to_the_same_row() {
         "{crumb}"
     );
     app.reduce(Action::Back); // Evidence schließt
-    assert!(matches!(app.top(), Some(View::Graph { .. })));
+    assert!(matches!(app.top(), Some(View::Story { .. })));
     app.reduce(Action::Back); // die Ebene des Sprungs: zurück zum Ursprung
     assert_eq!(app.tab, Tab::Verify);
     assert_eq!(app.verify.as_ref().unwrap().cursor, row);

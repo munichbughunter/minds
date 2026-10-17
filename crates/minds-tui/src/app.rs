@@ -2,8 +2,8 @@
 //! Zustandsänderung und ohne Terminal prüfbar; nur `run` hält die Schleife.
 //!
 //! Projektionen desselben Modells liegen als Stapel übereinander: unten die
-//! Activity-Liste, darüber Graphen und Evidence-Reports, so tief, wie der
-//! Nutzer hineingeht. `Esc` nimmt die oberste Ebene weg; auf der Liste
+//! Activity-Liste, darüber Stories (C11) und Evidence-Reports, so tief, wie
+//! der Nutzer hineingeht. `Esc` nimmt die oberste Ebene weg; auf der Liste
 //! löscht es die Suche und beendet nie (B1). Die Herkunftskette (`w`) gibt
 //! es seit C10 nicht mehr: Ihre Glieder stehen in der Why-Box des
 //! Changes-Tabs und im Detail der Übersicht.
@@ -21,14 +21,14 @@ use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::artifact::CommitArtifact;
 use minds_reader::changes::ChangeSet;
-use minds_reader::graph::{NodeKind, SessionGraph};
 use minds_reader::model::{EvidenceReport, SessionCard};
+use minds_reader::story::Story;
 
 use crate::changes::{ChangesState, Focus};
 use crate::filter;
 use crate::input::{self, Action};
 use crate::intent::{IntentTab, bound_sessions, named_anchors};
-use crate::layout::{self, Row, Zoom};
+use crate::layout::{self, Handover, Row, RowKind, Zoom};
 use crate::overview::{OverviewFocus, OverviewState, Selected};
 use crate::term::Guard;
 use crate::verify::VerifyState;
@@ -39,9 +39,9 @@ use crate::{Background, CommitVerify, Source, Stamp};
 /// (Größenänderung des Terminals).
 const TICK: Duration = Duration::from_millis(250);
 
-/// Ab so vielen Zeilen in der Normalstufe startet ein Graph in der
-/// Übersicht (C7).
-pub const LARGE_GRAPH: usize = 40;
+/// Ab so vielen Zeilen in der Normalstufe startet eine Story in der
+/// Zusammenfassung (C7).
+pub const LARGE_STORY: usize = 40;
 
 /// Wie oft die Quelle nach ihrem Fingerabdruck gefragt wird.
 const CHECK: Duration = Duration::from_secs(1);
@@ -55,18 +55,16 @@ const REPEAT: Duration = Duration::from_millis(250);
 /// Eine Ebene über der Liste.
 #[derive(Debug, Clone)]
 pub enum View {
-    /// Der Graph einer Session.
-    Graph {
+    /// Die Story einer Session (C11): ihre Schritte in Reihenfolge.
+    Story {
         /// Die Session.
         id: SessionId,
-        /// Der Graph.
-        graph: SessionGraph,
-        /// Die gezeichneten Zeilen (Baum oder Zeitleiste).
+        /// Die Story, wie der Reader sie erzählt.
+        story: Story,
+        /// Die gezeichneten Zeilen in der aktuellen Stufe.
         rows: Vec<Row>,
         /// Die Cursorzeile.
         cursor: usize,
-        /// Zeitleiste statt Baum.
-        timeline: bool,
     },
     /// Der Evidence-Report einer Session: Verdikt, Erklärung, Kryptographie
     /// — drei Ebenen über demselben, fertig gerechneten Read-Model. Die TUI
@@ -567,12 +565,12 @@ impl<'a> App<'a> {
     /// Suche wird geleert — sie filterte die Session sonst womöglich aus der
     /// Liste.
     fn goto_session(&mut self, id: SessionId) {
-        if self.inspection.graph(id).is_some() {
+        if self.inspection.story(id).is_some() {
             self.tab = Tab::Sessions;
             self.query.clear();
             self.refilter_keeping(Some(id));
             self.views.clear();
-            self.push_graph(id);
+            self.push_story(id);
         } else {
             self.closed = Some("that session is not readable".into());
         }
@@ -734,11 +732,11 @@ impl<'a> App<'a> {
                     .selected()
                     .and_then(|info| bound_sessions(&self.inspection, &info.id).first().copied());
                 match first {
-                    Some((id, _)) if self.inspection.graph(id).is_some() => {
+                    Some((id, _)) if self.inspection.story(id).is_some() => {
                         self.tab = Tab::Sessions;
                         self.query.clear();
                         self.refilter_keeping(Some(id));
-                        self.push_graph(id);
+                        self.push_story(id);
                     }
                     Some(_) => self.closed = Some("that session is not readable".into()),
                     None => self.closed = Some("no session names this anchor".into()),
@@ -1009,11 +1007,11 @@ impl<'a> App<'a> {
                 if cursor < state.sessions.len() {
                     // Eine Session: ihr Graph im Sessions-Tab.
                     let id = state.sessions[cursor].id;
-                    if self.inspection.graph(id).is_some() {
+                    if self.inspection.story(id).is_some() {
                         self.tab = Tab::Sessions;
                         self.query.clear();
                         self.refilter_keeping(Some(id));
-                        self.push_graph(id);
+                        self.push_story(id);
                     } else {
                         // Nicht still in eine leere Liste springen.
                         self.closed = Some("that session is not readable".into());
@@ -1256,31 +1254,23 @@ impl<'a> App<'a> {
             );
             return;
         };
-        let Some(graph) = self.inspection.graph(source.session) else {
+        if self.inspection.story(source.session).is_none() {
             self.closed = Some("that session is not readable".into());
             return;
-        };
-        // Der Knoten des Aufrufs: der `call`-te Tool-Knoten unter dem
-        // `turn`-ten Zug — so baut `SessionGraph::build` den Graphen.
-        let turn = graph
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Turn(_)))
-            .nth(source.turn)
-            .map(|n| n.id);
-        let node = turn.and_then(|turn| {
-            graph
-                .nodes
-                .iter()
-                .filter(|n| n.parent == Some(turn) && matches!(n.kind, NodeKind::Tool(_)))
-                .nth(source.call)
-                .map(|n| n.id)
-        });
+        }
         self.goto_session(source.session);
-        if let (Some(node), Some(View::Graph { rows, cursor, .. })) = (node, self.views.last_mut())
-            && let Some(at) = rows
+        // Der Schritt des Aufrufs: Turn- und Aufruf-Index wie `LineSource`.
+        if let Some(View::Story {
+            story,
+            rows,
+            cursor,
+            ..
+        }) = self.views.last_mut()
+            && let Some(step) = story
+                .steps
                 .iter()
-                .position(|r| r.node <= node && node < r.node + r.count)
+                .position(|s| s.turn == source.turn && s.call == source.call)
+            && let Some(at) = layout::locate(rows, step)
         {
             *cursor = at;
         }
@@ -1295,25 +1285,15 @@ impl<'a> App<'a> {
     /// sind wie jetzt.
     fn rebuild(&self, view: View, before: &Inspection, full: bool) -> Result<View, String> {
         match view {
-            View::Graph {
-                id,
-                cursor,
-                timeline,
-                ..
-            } => {
-                let graph = self.inspection.graph(id).ok_or_else(|| gone(id))?;
-                let rows = if timeline {
-                    layout::timeline(&graph, self.zoom)
-                } else {
-                    layout::rows(&graph, self.zoom)
-                };
+            View::Story { id, cursor, .. } => {
+                let story = self.inspection.story(id).ok_or_else(|| gone(id))?;
+                let rows = layout::rows(&story, self.zoom, &self.handovers_of(id));
                 let cursor = cursor.min(rows.len().saturating_sub(1));
-                Ok(View::Graph {
+                Ok(View::Story {
                     id,
-                    graph,
+                    story,
                     rows,
                     cursor,
-                    timeline,
                 })
             }
             View::Evidence {
@@ -1401,33 +1381,53 @@ impl<'a> App<'a> {
             .unwrap_or(0);
     }
 
-    /// Die Zeilen des Graphen einer Session, wie `Enter` sie zeigen würde —
+    /// Die Story einer Session samt Zeilen, wie `Enter` sie zeigen würde —
     /// aber ohne den Stapel zu berühren. Die Vorschau neben der Liste
     /// zeichnet daraus; sie darf keinen `Esc` kosten und folgt dem Zoom wie
-    /// eine gelegte Ebene. `None`, wenn der Reader keinen Graphen hat.
-    pub fn preview_graph(&self, id: SessionId) -> Option<Vec<Row>> {
-        self.inspection
-            .graph(id)
-            .map(|graph| layout::rows(&graph, self.zoom))
+    /// eine gelegte Ebene. `None`, wenn der Reader keine Story hat.
+    pub fn preview_story(&self, id: SessionId) -> Option<(Story, Vec<Row>)> {
+        let story = self.inspection.story(id)?;
+        let rows = layout::rows(&story, self.zoom, &self.handovers_of(id));
+        Some((story, rows))
     }
 
-    fn push_graph(&mut self, id: SessionId) {
-        let Some(graph) = self.inspection.graph(id) else {
+    /// Die Content-Übergaben einer Session (Evidence-DAG), wie der Index sie
+    /// kennt — Zeilen vor RESULT.
+    fn handovers_of(&self, id: SessionId) -> Vec<Handover> {
+        self.inspection
+            .index()
+            .content_links_of(id)
+            .into_iter()
+            .map(|link| {
+                let incoming = link.to == id;
+                Handover {
+                    other: if incoming { link.from } else { link.to },
+                    incoming,
+                    path: link.path.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn push_story(&mut self, id: SessionId) {
+        let Some(story) = self.inspection.story(id) else {
             return;
         };
-        // Ein großer Graph startet in der Übersicht (C7) — die Fußzeile
-        // sagt, dass mehr da ist.
-        if self.zoom == Zoom::Normal && layout::rows(&graph, Zoom::Normal).len() > LARGE_GRAPH {
+        let handovers = self.handovers_of(id);
+        // Eine lange Story startet in der Zusammenfassung (C7) — die
+        // Fußzeile sagt, dass mehr da ist.
+        if self.zoom == Zoom::Normal
+            && layout::rows(&story, Zoom::Normal, &handovers).len() > LARGE_STORY
+        {
             self.zoom = Zoom::Summary;
             self.relayout();
         }
-        let rows = layout::rows(&graph, self.zoom);
-        self.views.push(View::Graph {
+        let rows = layout::rows(&story, self.zoom, &handovers);
+        self.views.push(View::Story {
             id,
-            graph,
+            story,
             rows,
             cursor: 0,
-            timeline: false,
         });
     }
 
@@ -1475,25 +1475,35 @@ impl<'a> App<'a> {
 
     fn relayout(&mut self) {
         let zoom = self.zoom;
+        let handovers: Vec<Vec<Handover>> = self
+            .views
+            .iter()
+            .filter_map(|view| match view {
+                View::Story { id, .. } => Some(self.handovers_of(*id)),
+                _ => None,
+            })
+            .collect();
+        let mut n = 0;
         for view in &mut self.views {
-            if let View::Graph {
-                graph,
+            if let View::Story {
+                story,
                 rows,
                 cursor,
-                timeline,
                 ..
             } = view
             {
-                // Der Cursor folgt dem Knoten, nicht dem Index (B5).
-                let node = rows.get(*cursor).map(|r| r.node);
-                *rows = if *timeline {
-                    layout::timeline(graph, zoom)
+                // Der Cursor folgt dem Schritt, nicht dem Index (B5); auf
+                // RESULT bleibt er auf RESULT.
+                let step = rows.get(*cursor).and_then(|r| r.step);
+                let on_result = rows.get(*cursor).is_some_and(|r| r.kind == RowKind::Result);
+                *rows = layout::rows(story, zoom, &handovers[n]);
+                n += 1;
+                *cursor = if on_result {
+                    rows.len().saturating_sub(1)
                 } else {
-                    layout::rows(graph, zoom)
+                    step.and_then(|s| layout::locate(rows, s))
+                        .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)))
                 };
-                *cursor = node
-                    .and_then(|n| layout::locate(graph, zoom, rows, n))
-                    .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)));
             }
         }
     }
@@ -1587,7 +1597,7 @@ impl<'a> App<'a> {
         match self.tab {
             Tab::Sessions => {
                 let session = match self.top() {
-                    Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
+                    Some(View::Story { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
                     None => self.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
                 };
                 (session, session.and_then(commit_of))
@@ -2126,12 +2136,11 @@ impl<'a> App<'a> {
         let page = self.page.max(1);
         match self.views.pop() {
             None => self.reduce_activity(action, page),
-            Some(View::Graph {
+            Some(View::Story {
                 id,
-                graph,
+                story,
                 rows,
                 mut cursor,
-                mut timeline,
             }) => {
                 let mut keep = true;
                 match action {
@@ -2142,66 +2151,39 @@ impl<'a> App<'a> {
                     Action::Home => cursor = 0,
                     Action::End => cursor = rows.len().saturating_sub(1),
                     Action::Back => keep = false,
-                    Action::ToggleTimeline => timeline = !timeline,
                     Action::Evidence => {
-                        self.views.push(View::Graph {
+                        self.views.push(View::Story {
                             id,
-                            graph,
+                            story,
                             rows,
                             cursor,
-                            timeline,
                         });
                         self.push_evidence(id);
                         return;
                     }
                     Action::Enter => {
                         let target = rows.get(cursor).map(|r| r.kind.clone());
-                        self.views.push(View::Graph {
+                        let step = match &target {
+                            Some(RowKind::Step(i)) => story.steps.get(*i).cloned(),
+                            _ => None,
+                        };
+                        self.views.push(View::Story {
                             id,
-                            graph,
+                            story,
                             rows,
                             cursor,
-                            timeline,
                         });
-                        match target {
-                            Some(NodeKind::Subagent(child)) => self.push_graph(child),
-                            // Eine Änderung: ihr Diff im Changes-Tab (C10) —
-                            // die Kette, die hier einmal aufging, gibt es
-                            // nicht mehr; ihre Glieder stehen dort.
-                            Some(NodeKind::Commit(commit)) => self.open_changes(Some(commit)),
-                            Some(NodeKind::Change(change)) => {
-                                let commit = self.inspection.card(id).and_then(|card| {
-                                    card.commits.iter().copied().find(|c| {
-                                        self.inspection.index().change_of(*c) == Some(&change)
-                                    })
-                                });
-                                if let Some(commit) = commit {
-                                    self.open_changes(Some(commit));
-                                }
-                            }
-                            _ => {}
-                        }
+                        self.enter_story_row(id, target, step);
                         return;
                     }
                     _ => {}
                 }
                 if keep {
-                    // Baum ↔ Zeitleiste: derselbe Knoten bleibt fokussiert (B5).
-                    let node = rows.get(cursor).map(|r| r.node);
-                    let rows = if timeline {
-                        layout::timeline(&graph, self.zoom)
-                    } else {
-                        layout::rows(&graph, self.zoom)
-                    };
-                    let cursor = node
-                        .and_then(|n| layout::locate(&graph, self.zoom, &rows, n))
-                        .unwrap_or_else(|| cursor.min(rows.len().saturating_sub(1)));
-                    self.views.push(View::Graph {
+                    self.views.push(View::Story {
                         id,
-                        graph,
+                        story,
                         rows,
                         cursor,
-                        timeline,
                     });
                 }
             }
@@ -2248,6 +2230,75 @@ impl<'a> App<'a> {
         }
     }
 
+    /// `Enter` auf einer Zeile der Story (C11): ein Schreibschritt öffnet den
+    /// Changes-Tab auf seiner Datei, ein delegierter Schritt und die
+    /// Kind-Zeile die Story des Sub-Agents, eine Übergabe die Story der
+    /// anderen Session, RESULT den Diff des Commits — alles andere sagt,
+    /// dass es nichts zu öffnen gibt (B4).
+    fn enter_story_row(
+        &mut self,
+        id: SessionId,
+        target: Option<RowKind>,
+        step: Option<minds_reader::story::Step>,
+    ) {
+        let commit = self
+            .inspection
+            .card(id)
+            .and_then(|card| card.commits.first().copied());
+        match (target, step) {
+            (Some(RowKind::Step(_)), Some(step)) if step.verb.writes() => match commit {
+                Some(commit) => {
+                    let path = step.target.clone();
+                    self.open_changes(Some(commit));
+                    if let Some(state) = self.changes.as_mut()
+                        && !state.select_path(&path)
+                    {
+                        self.closed = Some(minds_reader::sanitize(&format!(
+                            "{path} is not in the diff of the commit"
+                        )));
+                    }
+                }
+                None => self.closed = Some("Enter: no commit linked yet".into()),
+            },
+            (Some(RowKind::Step(_)), Some(step))
+                if step.verb == minds_reader::story::Verb::Delegated =>
+            {
+                match step.child {
+                    Some(child) if self.inspection.story(child).is_some() => self.push_story(child),
+                    _ => {
+                        self.closed =
+                            Some("Enter: the subagent's session is not in this store".into())
+                    }
+                }
+            }
+            (Some(RowKind::Step(_)), Some(step)) => {
+                self.closed = Some(format!(
+                    "Enter: nothing to open for a {} step — the detail below says it all",
+                    step.verb.word()
+                ));
+            }
+            (Some(RowKind::Child { child, .. }), _) => {
+                if self.inspection.story(child).is_some() {
+                    self.push_story(child);
+                } else {
+                    self.closed = Some("that session is not readable".into());
+                }
+            }
+            (Some(RowKind::Handover(h)), _) => {
+                if self.inspection.story(h.other).is_some() {
+                    self.push_story(h.other);
+                } else {
+                    self.closed = Some("that session is not readable".into());
+                }
+            }
+            (Some(RowKind::Result), _) => match commit {
+                Some(commit) => self.open_changes(Some(commit)),
+                None => self.closed = Some("Enter: no commit linked yet".into()),
+            },
+            _ => self.closed = Some("Enter: nothing to open here".into()),
+        }
+    }
+
     fn move_list(&mut self, by: usize) {
         self.cursor = (self.cursor + by).min(self.visible.len().saturating_sub(1));
     }
@@ -2262,7 +2313,7 @@ impl<'a> App<'a> {
             Action::End => self.cursor = self.visible.len().saturating_sub(1),
             Action::Enter => {
                 if let Some(card) = self.selected().filter(|c| !c.is_degraded()) {
-                    self.push_graph(card.id);
+                    self.push_story(card.id);
                 }
             }
             Action::Evidence => {
@@ -2469,7 +2520,7 @@ fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
         Tab::Sessions if !views.is_empty() => views
             .iter()
             .map(|view| match view {
-                View::Graph { id, .. } => format!("Session {}…", short(*id)),
+                View::Story { id, .. } => format!("Session {}…", short(*id)),
                 View::Evidence { .. } => "Evidence".to_string(),
             })
             .collect(),

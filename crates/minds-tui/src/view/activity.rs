@@ -24,6 +24,9 @@ pub const COMPACT_WIDTH: u16 = 59;
 pub const FULL_WIDTH: u16 = 92;
 /// Ab hier kommt der Umfang (Dateien, Tokens) dazu.
 pub const WIDE_WIDTH: u16 = 120;
+/// Die schmale Liste neben einer geöffneten Story (C11): Zeit und
+/// Kurz-Überschrift.
+pub const NARROW_WIDTH: u16 = 32;
 
 /// Die Zeit relativ (`just now`, `82d ago`, C4) — schmaler als das alte
 /// `25.07. 14:10Z`; die Überschrift bekommt den Platz (A6).
@@ -46,6 +49,9 @@ const GLYPH_W: u16 = 0;
 /// Verdict; die Seal-Spalte — der Manipulationsbefund — bleibt immer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Columns {
+    /// Zeit · Session — neben einer geöffneten Story (C11), nie nach
+    /// Breite gewählt.
+    Narrow,
     /// Zeit · Session · Agent (gekürzt) · Seal.
     Compact,
     /// Zeit · Session · Agent · Seal · Verdict.
@@ -67,9 +73,16 @@ impl Columns {
 
     fn agent_w(self) -> u16 {
         match self {
+            Self::Narrow => 0,
             Self::Compact => AGENT_COMPACT_W,
             Self::Full | Self::Wide => AGENT_W,
         }
+    }
+
+    /// Ob Agent und Seal stehen — die schmale Liste trägt nur Zeit und
+    /// Überschrift; die Story daneben sagt den Rest.
+    fn show_agent(self) -> bool {
+        self != Self::Narrow
     }
 
     fn show_size(self) -> bool {
@@ -84,12 +97,16 @@ impl Columns {
     /// hart, ohne „…".
     fn headline_min(self) -> u16 {
         match self {
+            Self::Narrow => 12,
             Self::Compact => 16,
             Self::Full | Self::Wide => 24,
         }
     }
 
     fn header(self) -> Vec<&'static str> {
+        if !self.show_agent() {
+            return vec!["TIME", "SESSION"];
+        }
         let mut header = vec!["TIME", "SESSION", "AGENT"];
         if self.show_size() {
             header.push("SIZE");
@@ -104,6 +121,9 @@ impl Columns {
     /// Die Breiten der Fixspalten rechts der Überschrift, in
     /// Tabellenreihenfolge.
     fn trailing(self) -> Vec<u16> {
+        if !self.show_agent() {
+            return Vec::new();
+        }
         let mut trailing = vec![self.agent_w()];
         if self.show_size() {
             trailing.push(SIZE_W);
@@ -150,6 +170,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let [table_area, notice_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(notice_h)]).areas(area);
 
+    // Neben einer geöffneten Story bleibt die schmale Spalte (C11): Zeit
+    // und Überschrift, ein kurzer Titel.
+    let narrow = app.top().is_some() && table_area.width < COMPACT_WIDTH;
     let cards = app.visible_cards();
     if cards.is_empty() {
         let text = if app.cards.is_empty() {
@@ -160,7 +183,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(text)
                 .style(theme::dim())
-                .block(sessions_block(app)),
+                .block(sessions_block(app, narrow)),
             table_area,
         );
         draw_notice(frame, notice_area, rejected.len());
@@ -170,7 +193,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // Rahmen (2) + Kopfzeile (1) gehen von der Höhe ab.
     let height = (table_area.height as usize).saturating_sub(3).max(1);
     let first = offset(app.cursor, cards.len(), height);
-    let columns = Columns::for_width(table_area.width);
+    let columns = if narrow {
+        Columns::Narrow
+    } else {
+        Columns::for_width(table_area.width)
+    };
     let headline_w = columns.headline_w(table_area.width);
 
     let header = Row::new(
@@ -197,7 +224,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Table::new(rows, columns.widths())
             .header(header)
             .column_spacing(1)
-            .block(sessions_block(app)),
+            .block(sessions_block(app, narrow)),
         table_area,
     );
     draw_notice(frame, notice_area, rejected.len());
@@ -205,12 +232,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Der Rahmen der Liste — fokussiert, solange keine Ebene über ihr liegt
 /// (B7). Der Titel trägt die Zahl der Sessions (aus dem Kopf hierher, C3.1).
-fn sessions_block(app: &App) -> Block<'static> {
+fn sessions_block(app: &App, narrow: bool) -> Block<'static> {
     let (border, mark) = theme::pane(app.top().is_none());
     let h = app.inspection.header();
-    let mut title = format!(" {mark}SESSIONS · {} captured", h.sessions);
-    if h.degraded > 0 {
-        title.push_str(&format!(" · {} degraded", h.degraded));
+    let mut title = format!(" {mark}SESSIONS");
+    if !narrow {
+        title.push_str(&format!(" · {} captured", h.sessions));
+        if h.degraded > 0 {
+            title.push_str(&format!(" · {} degraded", h.degraded));
+        }
     }
     title.push(' ');
     Block::bordered()
@@ -243,17 +273,20 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize, now: i
             base,
         )),
         Cell::from(session),
-        // Je Agent eine feste Farbe — das Wort steht daneben. Eine
-        // degradierte Zeile bleibt ganz grau: Ihr Akteur ist „—", kein Agent.
-        Cell::from(Span::styled(
-            clip(&card.summary.actor, columns.agent_w() as usize),
-            if degraded {
-                base
-            } else {
-                base.fg(theme::agent_color(&card.summary.actor))
-            },
-        )),
     ];
+    if !columns.show_agent() {
+        return Row::new(cells);
+    }
+    // Je Agent eine feste Farbe — das Wort steht daneben. Eine
+    // degradierte Zeile bleibt ganz grau: Ihr Akteur ist „—", kein Agent.
+    cells.push(Cell::from(Span::styled(
+        clip(&card.summary.actor, columns.agent_w() as usize),
+        if degraded {
+            base
+        } else {
+            base.fg(theme::agent_color(&card.summary.actor))
+        },
+    )));
     if columns.show_size() {
         cells.push(Cell::from(Span::styled(
             // Der Umfang in Wörtern (C5): „3 files · 5.7k tok", nicht „D/T".

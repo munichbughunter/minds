@@ -348,63 +348,61 @@ fn the_search_filters_live_and_shows_its_chip() {
     assert!(out.contains("No match"), "{out}");
 }
 
+/// Enter öffnet die Story (C11): die Schritte in Session-Reihenfolge mit
+/// Verb, Ziel und Zeit — kein Baum, keine YOU-Box; Zoom 3 zeigt den Text
+/// des Agenten als Aussage, Zoom 1 die Zusammenfassung. (Vorher:
+/// `enter_opens_the_graph_and_the_zoom_levels_fold_the_lane`, Klasse 2 —
+/// Baumzeichen, `YOU`, `TURN`, `EDIT` für Write.)
 #[test]
-fn enter_opens_the_graph_and_the_zoom_levels_fold_the_lane() {
+fn enter_opens_the_story_and_the_zoom_levels_fold_the_steps() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Enter);
-    assert!(matches!(app.top(), Some(View::Graph { .. })));
+    assert!(matches!(app.top(), Some(View::Story { .. })));
     let out = render(&mut app);
     assert!(out.contains("SESSION b3-aaaaaaaa…"), "{out}");
-    assert!(out.contains(" YOU "), "{out}");
-    assert!(out.contains("Fix retry handling"), "{out}");
-    assert!(out.contains("◉ AGENT claude-code · opus"), "{out}");
-    // READ ist eine Art, kein Beweiszustand: nicht das ◇ der Evidenz (A1).
-    assert!(out.contains("→ READ src/http/retry.rs"), "{out}");
+    assert!(out.contains("claude-code · opus"), "{out}");
+    // Der Prompt genau einmal, als Aussage (die Liste daneben zählt nicht).
+    let detail = detail_of(&out);
+    assert!(detail.contains("PROMPT"), "{out}");
+    assert_eq!(detail.matches("Fix retry handling").count(), 1, "{out}");
+    assert!(!out.contains(" YOU "), "{out}");
+    // Die Schritte: Verb aus Tool und Effekt — `edited` für Edit, nicht
+    // `EDIT` für jede Schreibung; READ ist eine Art, kein Beweiszustand (A1).
+    assert!(out.contains("STEPS (3)"), "{out}");
+    assert!(out.contains("→ read"), "{out}");
+    assert!(out.contains("✎ edited"), "{out}");
+    // `cargo test` ist ein Testlauf — das Verb sagt es, ein Ergebnis steht
+    // nur, wenn der Record eines kennt (hier keines).
+    assert!(out.contains("▶ tests"), "{out}");
+    assert!(out.contains("cargo test"), "{out}");
+    assert!(!out.contains("passed"), "{out}");
     assert!(!out.contains("◇ READ"), "{out}");
-    assert!(out.contains("✎ EDIT src/http/retry.rs"), "{out}");
-    assert!(out.contains("▶ EXEC cargo test"), "{out}");
-    // CHANGE ist eine Art, nicht das ◆ der content-Evidenz (A1).
-    assert!(out.contains("■ CHANGE I"), "{out}");
-    assert!(!out.contains("◆ CHANGE"), "{out}");
-    assert!(out.contains("↻ REVIEW needs work"), "{out}");
-    assert!(out.contains("┣━"), "{out}");
-    assert!(out.contains("┗━"), "{out}");
-    // Keine Züge in der Normalstufe, in der ausführlichen schon.
-    assert!(!out.contains("ASSISTANT"), "{out}");
+    assert!(!out.contains("✎ EDIT "), "{out}");
+    // Kein Baum mehr (C11), keine Zeitleiste.
+    assert!(!out.contains("┣━"), "{out}");
+    assert!(!out.contains("┗━"), "{out}");
+    assert!(!out.contains("TURN"), "{out}");
+    assert!(out.contains("RESULT"), "{out}");
+    // Der Antworttext des Modells nur in der ausführlichen Stufe — als ◌.
+    assert!(!out.contains("Ich lese und ändere."), "{out}");
     app.reduce(Action::Zoom(3));
     let out = render(&mut app);
-    assert!(
-        out.contains("› TURN ASSISTANT · Ich lese und ändere."),
-        "{out}"
-    );
-    // `·` heißt „nichts belegt" — ein Zug ist eine Art (A1).
-    assert!(!out.contains("· TURN"), "{out}");
+    assert!(out.contains("◌ agent · Ich lese und ändere."), "{out}");
     app.reduce(Action::Zoom(1));
     let out = render(&mut app);
-    assert!(!out.contains("ASSISTANT"), "{out}");
+    assert!(!out.contains("Ich lese und ändere."), "{out}");
     assert!(out.contains("Zoom 1"), "{out}");
-    // Der Cursor auf einem Knoten zeigt dessen Details.
-    app.reduce(Action::Down);
-    app.reduce(Action::Down);
+    // Der Cursor auf einem Schritt zeigt dessen Details.
+    app.reduce(Action::Zoom(2));
     let out = render(&mut app);
     assert!(out.contains("Tool       Read"), "{out}");
+    app.reduce(Action::Down);
+    let out = render(&mut app);
+    assert!(out.contains("Tool       Edit"), "{out}");
+    assert!(out.contains("◇ reported"), "{out}");
     app.reduce(Action::Back);
     assert!(app.top().is_none());
-}
-
-#[test]
-fn the_timeline_is_the_same_rows_without_the_tree() {
-    let (_dir, repo) = repo();
-    let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::Enter);
-    app.reduce(Action::ToggleTimeline);
-    let out = render(&mut app);
-    assert!(out.contains("TIMELINE"), "{out}");
-    assert!(!out.contains("┣━"), "{out}");
-    // Zeitleiste und Detail: absolute Zeit in UTC (C4).
-    assert!(out.contains("2026-07-25 14:10 UTC"), "{out}");
-    assert!(!out.contains("25.07. 14:10Z"), "{out}");
 }
 
 #[test]
@@ -424,17 +422,20 @@ fn the_list_footer_says_what_the_focused_evidence_means() {
     assert!(out.contains("Degraded:"), "{out}");
 }
 
+/// Die RESULT-Zeile erklärt den Beleg des Commits — Satz und Nachrechnung
+/// (vorher der CHANGE-Knoten: `a_change_node_in_the_graph_explains_its_proof`).
 #[test]
-fn a_change_node_in_the_graph_explains_its_proof() {
+fn the_result_row_of_the_story_explains_its_proof() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Enter);
-    app.reduce(Action::End);
-    app.reduce(Action::Up); // Review → Change
+    app.reduce(Action::End); // RESULT
     let out = render(&mut app);
-    assert!(out.contains(" CHANGE "), "{out}");
+    assert!(out.contains(" RESULT "), "{out}");
     assert!(out.contains("Evidence   ● ? observed [unchecked]"), "{out}");
     assert!(out.contains("explicit provenance record"), "{out}");
+    assert!(out.contains("commit 1111111"), "{out}");
+    assert!(!out.contains(" CHANGE "), "{out}");
 }
 
 #[test]
@@ -620,7 +621,7 @@ fn evidence_mode_opens_from_the_graph_too() {
     assert!(matches!(app.top(), Some(View::Evidence { .. })));
     // Esc führt in den Graphen zurück, nicht auf die Liste.
     app.reduce(Action::Back);
-    assert!(matches!(app.top(), Some(View::Graph { .. })));
+    assert!(matches!(app.top(), Some(View::Story { .. })));
 }
 
 #[test]
@@ -732,11 +733,8 @@ fn every_epistemic_state_differs_in_glyph_or_word_never_only_in_color() {
         check(g.to_string(), w.to_string());
     }
 
-    // Und die Uebergabe-Kante aus dem Evidence-DAG (ueber den Graph-Knoten).
-    let (g, w, _) = crate::theme::node(&minds_reader::graph::NodeKind::Handover {
-        other: sid('e'),
-        incoming: true,
-    });
+    // Und die Uebergabe-Kante aus dem Evidence-DAG (die Story-Zeile).
+    let (g, w, _) = crate::theme::handover();
     check(g.to_string(), w.to_string());
 }
 
@@ -767,7 +765,10 @@ fn an_uninterpreted_tool_call_shows_as_half_seen_not_as_a_plain_tool() {
     app.reduce(Action::Enter);
     let out = render(&mut app);
     assert!(out.contains("◐"), "{out}");
-    assert!(out.contains("OBSERVED"), "{out}");
+    // Klasse 2 (C11/A4): das Wort der Deutungs-Achse, `uninterpreted` —
+    // nicht mehr das Knotenwort `OBSERVED`.
+    assert!(out.contains("◐ uninterpreted"), "{out}");
+    assert!(!out.contains("OBSERVED"), "{out}");
 }
 
 /// Die Fußzeile isoliert — Badge-Assertions dürfen nicht versehentlich die
@@ -865,9 +866,10 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     assert!(list.contains(" SESSIONS "), "{out}");
     assert!(list.contains("Fix retry han"), "{out}");
     assert!(detail.contains("SESSION b3-aaaaaaaa…"), "{out}");
-    assert!(detail.contains(" YOU "), "{out}");
+    assert!(detail.contains("PROMPT"), "{out}");
     assert!(detail.contains("Fix retry handling"), "{out}");
-    assert!(detail.contains("→ READ src/http/retry.rs"), "{out}");
+    assert!(detail.contains("→ read"), "{out}");
+    assert!(detail.contains("src/http/retry.rs"), "{out}");
     assert!(!detail.contains("◇ READ"), "{out}");
     // Die Vorschau ist nicht navigierbar: kein Detailkasten unter einem
     // Cursor, den es nicht gibt — und keine zweite invertierte Zeile neben
@@ -898,7 +900,7 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     // Zoom auf der Liste wirkt auf die Vorschau wie auf eine Ebene.
     app.reduce(Action::Zoom(3));
     let out = render_at(&mut app, SPLIT);
-    assert!(out.contains("TURN ASSISTANT"), "{out}");
+    assert!(out.contains("◌ agent · Ich lese"), "{out}");
     // Esc auf der Liste ist „Suche loeschen, sonst nichts" — Esc beendet nie
     // (B1); die Vorschau kostet keinen Tastendruck.
     app.reduce(Action::Back);
@@ -906,26 +908,35 @@ fn the_list_and_the_graph_preview_share_the_screen() {
     assert!(app.top().is_none());
 }
 
-/// Gelegte Ebenen — Graph, Evidence — verdraengen die Liste nicht mehr;
-/// sie bekommen die rechte Spalte.
+/// Gelegte Ebenen — Story, Evidence — verdraengen die Liste nicht: Ab 140
+/// Spalten bleibt ihr die schmale Spalte (Zeit, Überschrift; C11), darunter
+/// bekommt die Ebene den Bildschirm.
 #[test]
 fn a_pushed_view_keeps_the_list_beside_it() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
     app.reduce(Action::Enter);
-    assert!(matches!(app.top(), Some(View::Graph { .. })));
-    let out = render_at(&mut app, SPLIT);
-    assert!(list_of(&out).contains(" SESSIONS "), "{out}");
+    assert!(matches!(app.top(), Some(View::Story { .. })));
+    let out = render_at(&mut app, 160);
+    let list = list_of(&out);
+    assert!(list.contains(" SESSIONS "), "{out}");
+    assert!(list.contains("Fix retry"), "{out}");
+    assert!(
+        !list.contains("AGENT"),
+        "narrow: time and headline only\n{out}"
+    );
+    assert!(list_edge(&out) < 40, "narrow list\n{out}");
     let detail = detail_of(&out);
-    assert!(detail.contains("◉ AGENT claude-code · opus"), "{out}");
+    assert!(detail.contains("claude-code · opus"), "{out}");
     // Jetzt navigierbar: der Cursor traegt seinen Detailkasten.
-    app.reduce(Action::Down);
-    app.reduce(Action::Down);
+    assert!(detail.contains("Tool       Read"), "{out}");
+    // Unter 140 Spalten: die Story allein.
     let out = render_at(&mut app, SPLIT);
-    assert!(detail_of(&out).contains("Tool       Read"), "{out}");
+    assert!(!out.contains(" SESSIONS "), "{out}");
+    assert!(out.contains("SESSION b3-aaaaaaaa…"), "{out}");
     app.reduce(Action::Evidence);
     assert!(matches!(app.top(), Some(View::Evidence { .. })));
-    let out = render_at(&mut app, SPLIT);
+    let out = render_at(&mut app, 160);
     assert!(list_of(&out).contains(" SESSIONS "), "{out}");
     assert!(detail_of(&out).contains("INTEGRITY"), "{out}");
     // Zurueck bis zur Liste: der Stapel leert sich wie vor der Teilung.
@@ -944,7 +955,7 @@ fn a_narrow_terminal_shows_one_pane_at_a_time() {
         let out = render_at(&mut app, width);
         assert!(out.contains(" SESSIONS "), "{width}: {out}");
         assert!(!out.contains("SESSION b3-"), "{width}: {out}");
-        assert!(!out.contains(" YOU "), "{width}: {out}");
+        assert!(!out.contains("PROMPT"), "{width}: {out}");
     }
     // Unter 97 Spalten nimmt auch die Einzelflaeche die kompakte Stufe —
     // frueher schnitt die Tabelle dort hart ab; der Seal-Befund bleibt.
@@ -977,7 +988,7 @@ fn a_degraded_card_previews_its_state_not_a_graph() {
     );
     // Der Satz bricht um, statt am Spaltenrand abgeschnitten zu werden.
     assert!(detail.contains("the reference stays resolvable."), "{out}");
-    assert!(!detail.contains(" YOU "), "{out}");
+    assert!(!detail.contains("PROMPT"), "{out}");
     assert!(footer_of(&out).contains("Degraded:"), "{out}");
     // Enter auf einer degradierten Karte legt weiterhin nichts.
     app.reduce(Action::Enter);
@@ -992,7 +1003,7 @@ fn an_empty_list_leaves_the_preview_blank() {
     let mut app = App::new(Inspection::default(), &repo, None);
     let out = render_at(&mut app, SPLIT);
     assert!(out.contains("No sessions captured yet."), "{out}");
-    assert!(!out.contains(" YOU "), "{out}");
+    assert!(!out.contains("PROMPT"), "{out}");
     assert!(!out.contains("SESSION b3-"), "{out}");
     assert_eq!(out.matches("minds enable").count(), 1, "{out}");
 
@@ -1003,7 +1014,7 @@ fn an_empty_list_leaves_the_preview_blank() {
     }
     let out = render_at(&mut app, SPLIT);
     assert!(out.contains("No match"), "{out}");
-    assert!(!out.contains(" YOU "), "{out}");
+    assert!(!out.contains("PROMPT"), "{out}");
     assert!(!out.contains("SESSION b3-"), "{out}");
 }
 
@@ -1440,7 +1451,7 @@ fn reload_rebuilds_the_open_stack_from_its_origins() {
     assert_eq!(app.views.len(), 2);
     app.reload(Ok(grown()), None, now());
     assert_eq!(app.views.len(), 2);
-    assert!(matches!(&app.views[0], View::Graph { id, .. } if *id == sid('a')));
+    assert!(matches!(&app.views[0], View::Story { id, .. } if *id == sid('a')));
     assert!(matches!(&app.views[1], View::Evidence { id, .. } if *id == sid('a')));
 }
 
@@ -2821,7 +2832,7 @@ mod verify_tab {
         // Zeile 0: Session a → ihr Graph im Sessions-Tab.
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Sessions);
-        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
+        assert!(matches!(app.top(), Some(View::Story { id, .. }) if *id == sid('a')));
         // Artefakt → der Diff des Commits.
         app.reduce(Action::TabTo(2));
         app.reduce(Action::Down);
@@ -3336,7 +3347,7 @@ mod intent_tab {
         let mut app = opened(&repo, &source);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Sessions);
-        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
+        assert!(matches!(app.top(), Some(View::Story { id, .. }) if *id == sid('a')));
     }
 
     /// Viele Anker: Das Fenster folgt dem Cursor, ▸ bleibt sichtbar.
@@ -3562,7 +3573,7 @@ mod overview_tab {
         app.reduce(Action::Home);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Sessions);
-        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('b')));
+        assert!(matches!(app.top(), Some(View::Story { id, .. }) if *id == sid('b')));
     }
 
     /// Zwei Sessions an einem Commit: Enter wählt rechts, Enter öffnet.
@@ -3586,7 +3597,7 @@ mod overview_tab {
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Sessions);
-        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('c')));
+        assert!(matches!(app.top(), Some(View::Story { id, .. }) if *id == sid('c')));
     }
 
     /// Ein Commit mit einer Session: direkt deren Graph. Ohne Session: der
@@ -3599,7 +3610,7 @@ mod overview_tab {
         assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
         app.reduce(Action::Enter);
-        assert!(matches!(app.top(), Some(View::Graph { id, .. }) if *id == sid('a')));
+        assert!(matches!(app.top(), Some(View::Story { id, .. }) if *id == sid('a')));
         app.reduce(Action::TabTo(0));
         app.reduce(Action::End);
         app.reduce(Action::Enter);
@@ -3930,5 +3941,6 @@ mod overview_tab {
     mod nav;
 }
 
+mod c11;
 mod tamper;
 mod ux;

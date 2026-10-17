@@ -19,8 +19,7 @@ Esc / h            back: close, clear the search, return — never quits
 /                  filter in every tab: sessions, commits, files, anchors (AND)
 e                  evidence of the session — verdict, coverage, epochs, signature
 v / d / i          verify · diff · intent of the commit or session in focus
-t                  graph ↔ timeline
-z / Z              zoom: finer / coarser
+z / Z              zoom: summary (runs) · steps · steps with the agent's text
 r                  reload now (it also reloads by itself when the store changes)
 1 … 5 / Tab / F1   switch tab: Overview · Sessions · Verify · Changes · Intent
 ?                  this help (↑↓ PgUp PgDn scroll it)
@@ -30,15 +29,17 @@ q / Ctrl-C         quit";
 fn section(tab: Tab) -> &'static str {
     match tab {
         Tab::Overview => {
-            "Overview: ↑↓ commit · Enter its session(s) / graph · a agent sessions only/all · Space requirement / full prompt · / filter · Esc back\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ requirement · ◉N sessions · ┆ hidden commits"
+            "Overview: ↑↓ commit · Enter its session(s) / story · a agent sessions only/all · Space requirement / full prompt · / filter · Esc back\n          ◉CC agent session · PD author initials · @branch #tag · ⚑ requirement · ◉N sessions · ┆ hidden commits"
         }
-        Tab::Sessions => "Sessions: ↑↓ session · Enter graph · e evidence · t timeline · / search",
+        Tab::Sessions => {
+            "Sessions: ↑↓ session · Enter story (the agent's steps in order) · e evidence · / search\n          in a story: Enter opens a written file in Changes, a subagent's story, the commit's diff"
+        }
         Tab::Verify => "Verify:   ↑↓ row · Enter open (session, diff) · [ ] commit",
         Tab::Changes => {
-            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · Enter graph of the line's tool call · Esc back\n          Tab / Shift-Tab next / previous file in the files line (below 160 columns)"
+            "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · Enter story of the line's tool call · Esc back\n          Tab / Shift-Tab next / previous file in the files line (below 160 columns)"
         }
         Tab::Intent => {
-            "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter graph of a session naming it"
+            "Intent:   ↑↓ anchor · PgUp PgDn scroll · Enter story of a session naming it"
         }
     }
 }
