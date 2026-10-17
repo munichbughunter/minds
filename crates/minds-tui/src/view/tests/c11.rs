@@ -468,7 +468,7 @@ fn c8_a_long_answer_never_hides_the_write_evidence() {
         // Die Box zeigt vom Text, was nach der Evidenz noch Platz hat — der
         // ganze Text steht auf der Zugzeile (Zoom 3), nie hier.
         assert!(
-            !out.contains("line 40 of the answer"),
+            !out.contains("line 40 of the answer") && !out.contains("line 07 of the answer"),
             "{w}x{h}: capped\n{out}"
         );
     }

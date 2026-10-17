@@ -153,16 +153,106 @@ fn c37_an_open_review_is_the_last_open_decision() {
     let mut app = App::new(inspection, &repo, None);
     on_agent_commit(&mut app, commits[1], classes(2, 0));
     assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
-    let out = text_at(&mut app, 160, 40);
-    let short = &commits[1].to_string()[..7];
+    // Das Subjekt ist die Session (kein Change-Id-Trailer in der Fixture).
+    let out = text_at(&mut app, 300, 40);
     assert!(
-        out.contains(&format!(
-            "→ minds review {short} … — nobody has decided yet"
-        )),
+        out.contains(&format!("→ minds review {} …", sid('a'))),
         "{out}"
     );
+    assert!(out.contains("nobody has decided yet"), "{out}");
     let (next, _) = next_of(&out);
     assert_eq!(next.len(), 2, "{out}");
+}
+
+/// Das Subjekt von `minds review` ist eine Session- oder Change-Id — ein
+/// Kommando, das es gibt, nie der Commit (den nimmt `minds review` nicht).
+#[test]
+fn c37_the_review_command_names_a_subject_minds_review_accepts() {
+    use minds_core::{ChangeId, SessionId};
+    let (_dir, repo, commits, inspection) = history();
+    let inspection = without_anchor(&inspection, Vec::new());
+    let mut app = App::new(inspection, &repo, None);
+    on_agent_commit(&mut app, commits[1], classes(2, 0));
+    assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
+    let out = text_at(&mut app, 300, 40);
+    let line = out
+        .lines()
+        .find(|l| l.contains("NEXT") && l.contains("→ minds review "))
+        .unwrap_or_else(|| panic!("{out}"));
+    let after = &line[line.find("→ minds review ").unwrap() + "→ minds review ".len()..];
+    let subject = after.split(" …").next().unwrap_or("").trim();
+    assert!(
+        subject.parse::<SessionId>().is_ok() || subject.parse::<ChangeId>().is_ok(),
+        "{subject:?} is neither a session nor a change id\n{out}"
+    );
+    let short = &commits[1].to_string()[..7];
+    assert!(!line.contains(&format!("review {short}")), "{line}");
+}
+
+/// Ein abgelehnter Review ist kein „nichts offen“.
+#[test]
+fn c37_a_rejected_review_is_named() {
+    let (_dir, repo, commits, inspection) = history();
+    let inspection = without_anchor(
+        &inspection,
+        vec![Review::new(
+            Subject::Session(sid('a').to_string()),
+            Decision::Reject,
+            "pd",
+            "falscher Ansatz",
+            Some("2026-10-17T10:00:00Z".into()),
+        )],
+    );
+    let mut app = App::new(inspection, &repo, None);
+    on_agent_commit(&mut app, commits[1], classes(2, 0));
+    assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("→ Enter: how it was made — the review rejected it"),
+        "{out}"
+    );
+}
+
+/// Ungedeutete Aufrufe: `e:` mit der Zahl — vor REQUIREMENT und REVIEW.
+#[test]
+fn c37_uninterpreted_calls_point_to_the_evidence() {
+    let (_dir, repo, commits, inspection) = history();
+    // Session a bekommt einen beobachteten, nicht gedeuteten Aufruf.
+    let index = inspection.index().clone();
+    let mut sessions = BTreeMap::new();
+    let mut links = BTreeMap::new();
+    for (id, session) in index.sessions() {
+        let mut session = session.clone();
+        session.intent_events.clear();
+        if *id == sid('a') {
+            session.turns[0].tool_calls.push(ToolCall {
+                outcome: None,
+                capture: Some(minds_core::Capture {
+                    status: minds_core::CaptureStatus::Uninterpreted,
+                    adapter: "generic".into(),
+                    adapter_version: 1,
+                    note: None,
+                }),
+                name: "apply_patch".into(),
+                arguments: "{}".into(),
+                effect: None,
+            });
+        }
+        sessions.insert(*id, session);
+        for commit in index.commits_of(*id) {
+            links.entry(commit).or_insert_with(Vec::new).push(*id);
+        }
+    }
+    let inspection = Inspection::from_index(Index::from_parts(sessions, links), Vec::new(), "demo");
+    let mut app = App::new(inspection, &repo, None);
+    on_agent_commit(&mut app, commits[1], classes(2, 0));
+    assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("→ e: evidence — 1 uninterpreted call"),
+        "{out}"
+    );
+    assert!(!out.contains("→ minds review"), "{out}");
 }
 
 /// Alles ✓: nur noch nachvollziehen — `Enter`.

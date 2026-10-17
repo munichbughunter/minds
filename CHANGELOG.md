@@ -30,8 +30,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   calls`, `i: Intent tab — the binding is
   not proven` (or the anchor not readable, the requirement not proven, the
   signature invalid), `wait — the requirement is still being read` while
-  the anchor loads, `minds intent sign <anchor>`, `minds review <commit>
-  …` while nobody has decided, and `Enter: how it was made — nothing is
+  the anchor loads, `minds intent sign <anchor>`, `minds review <change or
+  session id> …` while nobody has decided, and `Enter: how it was made — nothing is
   open` when everything is `✓` (with `— the review says needs work` /
   `— the review rejected it` when a review found something). Never more
   than one: the earlier per-axis hints `→ d, then n` and `→ minds intent
@@ -51,7 +51,8 @@ versioning follows [Semantic Versioning](https://semver.org/).
   the session's working directory and home paths hidden as in the story;
   `SessionGraph::of` and labels stay at 120. The limit is a parameter —
   truncation itself stays, and the sanitizing of foreign text with it.
-  `minds show` and the HTML page do not render tool arguments; that is
+  No view reads that graph yet; `minds show` and the HTML page render
+  only the extracted command, never the arguments; that is
   unchanged.
 
 - **The session view of `minds inspect` is a story, not a tree (C11).**

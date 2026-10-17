@@ -1258,9 +1258,10 @@ fn evidence_lines(
 /// Die nächste Aktion (C3.7): die oberste Zeile in EVIDENCE, die nicht ✓
 /// ist, bestimmt sie — INTEGRITY vor COVERAGE vor INTERPRETATION vor
 /// REQUIREMENT vor REVIEW. Eine Zeile mit `·` („trifft nicht zu“: kein
-/// Anker, keine Zeilen, nur nicht gediffte Dateien) zählt nicht; eine mit
-/// `…` (noch zählend, noch lesend) heißt warten — nichts darunter wird
-/// empfohlen. Nur Aktionen, die es gibt; die TUI schreibt nicht, also
+/// Anker, keine Zeilen, nur nicht gediffte Dateien) zählt nicht — außer
+/// `· no session readable`: eine unlesbare Session ist offen, NEXT führt zur
+/// Evidenz; eine Zeile mit `…` (noch zählend, noch lesend) heißt warten —
+/// nichts darunter wird empfohlen. Nur Aktionen, die es gibt; die TUI schreibt nicht, also
 /// stehen `minds intent sign` und `minds review` als Text. Alles ✓: nur
 /// noch nachvollziehen (`Enter`) — ein Review mit Befund sagt ihn dazu.
 pub(crate) fn next_action(
@@ -1369,9 +1370,16 @@ pub(crate) fn next_action(
             }
         }
     }
-    let short: String = row.id.to_string().chars().take(7).collect();
+    // `minds review` nimmt eine Change-Id oder eine Session-Id — dasselbe
+    // Subjekt, aus dem das Urteil der Zeile stammt; nie den Commit.
+    let subject = match (&row.change, row.sessions.first()) {
+        (Some(change), _) => change.to_string(),
+        (None, Some(session)) => session.to_string(),
+        (None, None) => String::new(),
+    };
     match row.review {
-        Verdict::Open => format!("minds review {short} … — nobody has decided yet"),
+        Verdict::Open if subject.is_empty() => "minds review … — nobody has decided yet".into(),
+        Verdict::Open => format!("minds review {subject} … — nobody has decided yet"),
         // Ein Befund ist kein offener Schritt der Oberfläche — aber auch
         // nicht „nichts offen“: Enter zeigt die Entstehung, der Befund steht
         // dabei.
