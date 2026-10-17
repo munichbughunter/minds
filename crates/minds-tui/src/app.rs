@@ -1394,8 +1394,14 @@ impl<'a> App<'a> {
     /// Die Content-Übergaben einer Session (Evidence-DAG), wie der Index sie
     /// kennt — Zeilen vor RESULT.
     fn handovers_of(&self, id: SessionId) -> Vec<Handover> {
-        self.inspection
-            .index()
+        // Der Pfad der Übergabe ist, wie der Agent ihn nannte — oft absolut,
+        // mit Benutzername: repo-relativ wie jeder Schritt (PII).
+        let index = self.inspection.index();
+        let cwd = index
+            .session(id)
+            .and_then(|s| s.lineage.as_ref())
+            .and_then(|l| l.cwd.as_deref());
+        index
             .content_links_of(id)
             .into_iter()
             .map(|link| {
@@ -1403,10 +1409,19 @@ impl<'a> App<'a> {
                 Handover {
                     other: if incoming { link.from } else { link.to },
                     incoming,
-                    path: link.path.clone(),
+                    path: minds_reader::story::relative_path(&link.path, cwd),
                 }
             })
             .collect()
+    }
+
+    /// Wie viele Zeilen die Story von `id` in der Normalstufe hätte — mit
+    /// Übergaben, wie `push_story` sie zählt (C7); die Fußzeile fragt hier.
+    pub fn story_rows_normal(&self, id: SessionId) -> usize {
+        self.inspection
+            .story(id)
+            .map(|s| layout::rows(&s, Zoom::Normal, &self.handovers_of(id)).len())
+            .unwrap_or(0)
     }
 
     fn push_story(&mut self, id: SessionId) {
@@ -1416,9 +1431,7 @@ impl<'a> App<'a> {
         let handovers = self.handovers_of(id);
         // Eine lange Story startet in der Zusammenfassung (C7) — die
         // Fußzeile sagt, dass mehr da ist.
-        if self.zoom == Zoom::Normal
-            && layout::rows(&story, Zoom::Normal, &handovers).len() > LARGE_STORY
-        {
+        if self.zoom == Zoom::Normal && self.story_rows_normal(id) > LARGE_STORY {
             self.zoom = Zoom::Summary;
             self.relayout();
         }
@@ -1492,18 +1505,20 @@ impl<'a> App<'a> {
                 ..
             } = view
             {
-                // Der Cursor folgt dem Schritt, nicht dem Index (B5); auf
-                // RESULT bleibt er auf RESULT.
+                // Der Cursor folgt dem Schritt, nicht dem Index (B5); eine
+                // Zeile ohne Schritt (Übergabe, RESULT) findet sich über
+                // ihre Art wieder.
                 let step = rows.get(*cursor).and_then(|r| r.step);
-                let on_result = rows.get(*cursor).is_some_and(|r| r.kind == RowKind::Result);
+                let kind = rows.get(*cursor).map(|r| r.kind.clone());
                 *rows = layout::rows(story, zoom, &handovers[n]);
                 n += 1;
-                *cursor = if on_result {
-                    rows.len().saturating_sub(1)
-                } else {
-                    step.and_then(|s| layout::locate(rows, s))
-                        .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)))
-                };
+                *cursor = step
+                    .and_then(|s| layout::locate(rows, s))
+                    .or_else(|| {
+                        kind.as_ref()
+                            .and_then(|k| rows.iter().position(|r| &r.kind == k))
+                    })
+                    .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)));
             }
         }
     }
@@ -2241,25 +2256,37 @@ impl<'a> App<'a> {
         target: Option<RowKind>,
         step: Option<minds_reader::story::Step>,
     ) {
-        let commit = self
+        let commits = self
             .inspection
             .card(id)
-            .and_then(|card| card.commits.first().copied());
+            .map(|card| card.commits.clone())
+            .unwrap_or_default();
+        let commit = commits.first().copied();
         match (target, step) {
-            (Some(RowKind::Step(_)), Some(step)) if step.verb.writes() => match commit {
-                Some(commit) => {
-                    let path = step.target.clone();
-                    self.open_changes(Some(commit));
-                    if let Some(state) = self.changes.as_mut()
-                        && !state.select_path(&path)
-                    {
-                        self.closed = Some(minds_reader::sanitize(&format!(
-                            "{path} is not in the diff of the commit"
-                        )));
+            (Some(RowKind::Step(_)), Some(step)) if step.verb.writes() => {
+                if commits.is_empty() {
+                    self.closed = Some("Enter: no commit linked yet".into());
+                    return;
+                }
+                // Der volle Pfad aus dem Detail — das Ziel der Zeile ist gekürzt.
+                let path = step
+                    .detail
+                    .iter()
+                    .find(|(k, _)| k == "Path")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| step.target.clone());
+                // Der erste Commit der Session, dessen Diff die Datei trägt.
+                for commit in &commits {
+                    self.open_changes(Some(*commit));
+                    if self.changes.as_mut().is_some_and(|s| s.select_path(&path)) {
+                        return;
                     }
                 }
-                None => self.closed = Some("Enter: no commit linked yet".into()),
-            },
+                self.open_changes(commit);
+                self.closed = Some(minds_reader::sanitize(&format!(
+                    "{path} is not in the diff of the session's commit"
+                )));
+            }
             (Some(RowKind::Step(_)), Some(step))
                 if step.verb == minds_reader::story::Verb::Delegated =>
             {
@@ -2295,6 +2322,17 @@ impl<'a> App<'a> {
                 Some(commit) => self.open_changes(Some(commit)),
                 None => self.closed = Some("Enter: no commit linked yet".into()),
             },
+            // Eine Zusammenfassung: Enter zeigt ihre Schritte (Zoom 2) und
+            // stellt den Cursor auf den ersten — was die Fußzeile verspricht.
+            (Some(RowKind::Run { first, .. }), _) => {
+                self.zoom = Zoom::Normal;
+                self.relayout();
+                if let Some(View::Story { rows, cursor, .. }) = self.views.last_mut()
+                    && let Some(at) = layout::locate(rows, first)
+                {
+                    *cursor = at;
+                }
+            }
             _ => self.closed = Some("Enter: nothing to open here".into()),
         }
     }

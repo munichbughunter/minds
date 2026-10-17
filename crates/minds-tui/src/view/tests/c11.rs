@@ -10,7 +10,7 @@ use minds_core::{
     Capture, CaptureStatus, Edge, EdgeKind, Endpoint, ExecClass, ExecOutcome, TestCounts,
 };
 
-const CWD: &str = "/Users/pd/dev/minds-demo";
+const CWD: &str = "/Users/alice/dev/minds-demo";
 
 fn call(name: &str, args: &str, effect: Option<Effect>) -> ToolCall {
     ToolCall {
@@ -195,6 +195,123 @@ fn c11_the_story_renders_steps_with_verbs_outcomes_and_no_absolute_path() {
     // Zeit seit Start.
     assert!(detail.contains("+1:28"), "{out}");
     assert!(detail.contains("started 10:37:12Z"), "{out}");
+    // Absolute Zeit in UTC, nicht im deutschen Datumsformat (C4 — vorher
+    // in `the_timeline_is_the_same_rows_without_the_tree`).
+    assert!(
+        detail.contains("2026-10-16 10:37–10:40 UTC (3 min)"),
+        "{out}"
+    );
+    assert!(!out.contains("16.10."), "{out}");
+}
+
+/// Auch bei 80×24 bleiben die Schritte sichtbar: Das Detail nimmt der
+/// Liste nicht die Zeilen (Test-Konvention: drei Größen).
+#[test]
+fn c11_at_80_by_24_every_step_stays_visible() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(demo(), &repo, None);
+    open_parent(&mut app);
+    for (w, h) in [(80u16, 24u16), (120, 30), (160, 40)] {
+        let out = render_sized(&mut app, w, h);
+        for n in 1..=4 {
+            assert!(
+                out.lines().any(|l| l.contains(&format!("  {n}  "))),
+                "{w}x{h}: step {n}\n{out}"
+            );
+        }
+        assert!(out.contains("RESULT"), "{w}x{h}\n{out}");
+        assert!(out.contains("? help"), "{w}x{h}\n{out}");
+        assert!(!out.contains("/Users/"), "{w}x{h}\n{out}");
+    }
+}
+
+/// Eine Übergabe zeigt den Pfad repo-relativ — der Agent nannte ihn
+/// absolut, mit Benutzername.
+#[test]
+fn c11_a_handover_row_shows_a_relative_path() {
+    let hash = minds_core::ContentHash::from_bytes([3u8; 32]);
+    let path = format!("{CWD}/notes.md");
+    let effect = |kind| Effect {
+        kind,
+        path: Some(path.clone()),
+        content: Some(hash.clone()),
+        written: None,
+        written_unavailable: None,
+    };
+    let mut reader = session("Read the notes", "2026-10-16T10:37:12Z");
+    reader.redaction.applied = true;
+    let mut lineage = Lineage::new("r");
+    lineage.cwd = Some(CWD.into());
+    reader.lineage = Some(lineage);
+    reader.turns[0].tool_calls = vec![call("Read", "{}", Some(effect(EffectKind::Read)))];
+    let mut writer = session("Write the notes", "2026-10-16T10:30:00Z");
+    writer.redaction.applied = true;
+    writer.turns[0].tool_calls = vec![call("Write", "{}", Some(effect(EffectKind::Write)))];
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), reader);
+    sessions.insert(sid('b'), writer);
+    let inspection = Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new()),
+        Vec::new(),
+        "demo",
+    );
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    while app.selected().map(|c| c.id) != Some(sid('a')) {
+        app.reduce(Action::Down);
+    }
+    app.reduce(Action::Enter);
+    let out = render_sized(&mut app, 160, 40);
+    let row = out
+        .lines()
+        .find(|l| l.contains("⇄ HANDOVER"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(row.contains("reads from notes.md"), "{out}");
+    assert!(!out.contains("/Users/"), "{out}");
+    // Die Detailbox der Übergabe ebenso.
+    app.reduce(Action::End);
+    app.reduce(Action::Up);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains(" HANDOVER "), "{out}");
+    assert!(!out.contains("/Users/"), "{out}");
+}
+
+/// Benchmark-Werte sind kein Bestehen: Zahl ohne Haken.
+#[test]
+fn c11_benches_carry_no_check_mark() {
+    let mut s = session("Bench", "2026-10-16T10:37:12Z");
+    let mut bench = exec("cargo bench");
+    bench.outcome = Some(ExecOutcome {
+        class: ExecClass::Bench,
+        runner: "cargo-bench-criterion".into(),
+        command: vec!["cargo".into(), "bench".into()],
+        cwd: None,
+        exit_code: None,
+        tests: None,
+        benches: vec![minds_core::BenchValue {
+            name: "sort".into(),
+            value: 1200,
+            unit: "ns".into(),
+        }],
+    });
+    s.turns[0].tool_calls = vec![bench];
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), s);
+    let inspection = Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new()),
+        Vec::new(),
+        "demo",
+    );
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Enter);
+    let out = render_sized(&mut app, 160, 40);
+    let row = out
+        .lines()
+        .find(|l| l.contains("▶ bench"))
+        .unwrap_or_else(|| panic!("{out}"));
+    assert!(row.contains("1 benches"), "{out}");
+    assert!(!row.contains('✓'), "{out}");
 }
 
 /// Die Sub-Agent-Zeile hängt eingerückt unter dem delegierenden Schritt;

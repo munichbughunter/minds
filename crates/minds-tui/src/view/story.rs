@@ -54,11 +54,18 @@ pub fn draw(
     let width = area.width as usize;
     let focused = cursor.and_then(|c| rows.get(c));
     let detail_lines = focused.and_then(|row| detail(app, id, story, row, width.saturating_sub(2)));
+    let intro = intro_lines(app, id, story, width, area.height);
+    // Die Schrittliste behält mindestens sechs Zeilen: Das Detail bekommt,
+    // was danach bleibt — höchstens die halbe Höhe (mindestens 12).
+    let room = area
+        .height
+        .saturating_sub(2 + intro.len() as u16 + 6)
+        .min((area.height / 2).max(12));
     let detail_h = detail_lines
         .as_ref()
-        .map(|l| (l.len() as u16 + 2).min((area.height / 2).max(12)))
+        .map(|l| (l.len() as u16 + 2).min(room))
+        .filter(|h| *h >= 3)
         .unwrap_or(0);
-    let intro = intro_lines(app, id, story, width, area.height);
     let [head, intro_area, body, detail_area] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(intro.len() as u16),
@@ -80,7 +87,11 @@ pub fn draw(
             format!("SESSION {short}… "),
             theme::title().fg(theme::AGENT),
         ),
-        Span::styled(format!("· {actor}"), Style::default().fg(theme::AGENT)),
+        // Begrenzt: ein langer K1-Grund schöbe sonst den Zeitraum aus der Zeile.
+        Span::styled(
+            format!("· {}", clip(&actor, 64)),
+            Style::default().fg(theme::AGENT),
+        ),
     ];
     if let Some(span) = span_of(story) {
         identity.push(Span::styled(format!(" · {span}"), theme::dim()));
@@ -143,10 +154,20 @@ pub fn draw(
 /// `2026-10-16 10:37–10:40 UTC (3 min)` aus Beginn, Ende und Dauer.
 fn span_of(story: &Story) -> Option<String> {
     let start = story.started_at.as_deref()?;
+    // Nur ein lesbarer UTC-Stempel (`…Z`) heißt „UTC“ — ein Offset würde
+    // sonst falsch beschriftet.
+    if !start.ends_with('Z') || minds_metrics::epoch_seconds(start).is_none() {
+        return None;
+    }
     let date = start.get(0..10)?;
     let from = start.get(11..16)?;
     let mut text = format!("{date} {from}");
-    if let Some(to) = story.ended_at.as_deref().and_then(|e| e.get(11..16)) {
+    if let Some(to) = story
+        .ended_at
+        .as_deref()
+        .filter(|e| e.ends_with('Z') && minds_metrics::epoch_seconds(e).is_some())
+        .and_then(|e| e.get(11..16))
+    {
         text.push_str(&format!("–{to}"));
     }
     text.push_str(" UTC");
@@ -500,22 +521,14 @@ pub(crate) fn right_of(step: &Step) -> (String, Style) {
     outcome_span(step.outcome)
 }
 
-/// Das Ergebnis als Glyph und Wort — nur, was der Record kennt.
+/// Das Ergebnis als Glyph und Wort — nur, was der Record kennt; Glyphen
+/// aus dem Register über [`theme::outcome`].
 fn outcome_span(outcome: Option<Outcome>) -> (String, Style) {
     match outcome {
         None => (String::new(), Style::default()),
-        Some(Outcome::Tests { failed, .. }) if failed > 0 => (
-            format!("✗ {failed} failed"),
-            Style::default().fg(theme::DELETE),
-        ),
-        Some(Outcome::Tests { passed, .. }) => {
-            (format!("✓ {passed} passed"), Style::default().fg(theme::OK))
-        }
-        Some(Outcome::Benches(n)) => (format!("✓ {n} benches"), Style::default().fg(theme::OK)),
-        Some(Outcome::Exit(0)) => ("✓ exit 0".into(), Style::default().fg(theme::OK)),
-        Some(Outcome::Exit(code)) => (format!("✗ exit {code}"), Style::default().fg(theme::DELETE)),
-        Some(Outcome::NotCaptured(_)) => {
-            ("? not captured".into(), Style::default().fg(theme::REVIEW))
+        Some(outcome) => {
+            let (glyph, word, style) = theme::outcome(outcome);
+            (format!("{glyph} {word}").trim_start().to_string(), style)
         }
     }
 }

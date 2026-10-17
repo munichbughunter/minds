@@ -39,7 +39,7 @@ fn card() -> serde_json::Value {
             {"name": "brief", "usage": "minds brief [<file>...]", "summary": "Size-bounded context block for the start of a session."},
             {"name": "recap", "usage": "minds recap [--limit <n>] [--all]", "summary": "The most recent sessions at a glance."},
             {"name": "search", "usage": "minds search <query>", "summary": "Search prompts and sessions."},
-            {"name": "inspect", "usage": "minds inspect [<search> | <file>:<line>]", "summary": "Terminal UI: sessions, a session's graph, a commit's changes with why-this-line, evidence. In a pipe: tab-separated lines."},
+            {"name": "inspect", "usage": "minds inspect [<search> | <file>:<line>]", "summary": "Terminal UI: sessions, a session's story, a commit's changes with why-this-line, evidence. In a pipe: tab-separated lines."},
             {"name": "agent-help", "usage": "minds agent-help", "summary": "This machine-readable command card."},
             {"name": "metrics", "usage": "minds metrics [--format prometheus|openmetrics|json]", "summary": "Metrics from the store — Prometheus, OpenMetrics, or JSON."},
             {"name": "fsck", "usage": "minds fsck [--require-review] [--require-seal] [--require-assurance <A0|A1|A2|A3>] [--signers <file>]", "summary": "Is every trailer resolvable? Journal gaps? With --require-review: policy gate. --require-assurance: every session of an agent-authored commit must reach the level (exit 2 when not; findings stay exit 1)."},

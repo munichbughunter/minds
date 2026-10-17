@@ -22,7 +22,11 @@
 //!   [`crate::observations::corroborate`] gegen den Store — nicht hier.
 //! - **Pfade** sind repo-relativ: Das Arbeitsverzeichnis der Session
 //!   (`Lineage::cwd`, es trägt den Benutzernamen) erscheint weder in Zielen
-//!   noch in Kommandos; außerhalb des Repos bleibt `…/<dateiname>`.
+//!   noch in Kommandos; außerhalb des Repos bleibt `…/<dateiname>`. In
+//!   Kommandos, Argumenten, Prompts und Zugtexten wird jedes
+//!   Home-Verzeichnis (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`)
+//!   zu `~` — auch ohne bekanntes cwd. Windows-Trenner und Laufwerke werden
+//!   vor dem Vergleich vereinheitlicht.
 //! - Alle Texte sind entschärft ([`crate::text`]); Kommandos und Zugtexte
 //!   sind auf [`COMMAND_MAX`] Zeichen gekappt und sagen, wie viel fehlt.
 
@@ -254,21 +258,26 @@ impl Story {
     pub fn of(id: SessionId, session: &Session, index: &Index) -> Self {
         let lineage = session.lineage.as_ref();
         let cwd = lineage.and_then(|l| l.cwd.as_deref());
-        let dated = |picker: fn(&[&str]) -> Option<String>| {
-            let times: Vec<&str> = session
-                .turns
+        // Ohne Lineage: der früheste und der späteste datierte Zug — richtig
+        // geparst, nie nach Reihenfolge oder String-Vergleich.
+        let dated: Vec<(Timestamp, &str)> = session
+            .turns
+            .iter()
+            .filter_map(|t| t.at.as_deref())
+            .filter_map(|at| timestamp(at).map(|ts| (ts, at)))
+            .collect();
+        let started_at = lineage.and_then(|l| l.started_at.clone()).or_else(|| {
+            dated
                 .iter()
-                .filter_map(|t| t.at.as_deref())
-                .filter(|at| timestamp(at).is_some())
-                .collect();
-            picker(&times)
-        };
-        let started_at = lineage
-            .and_then(|l| l.started_at.clone())
-            .or_else(|| dated(|t| t.first().map(|s| s.to_string())));
-        let ended_at = lineage
-            .and_then(|l| l.ended_at.clone())
-            .or_else(|| dated(|t| t.last().map(|s| s.to_string())));
+                .min_by_key(|(ts, _)| *ts)
+                .map(|(_, at)| at.to_string())
+        });
+        let ended_at = lineage.and_then(|l| l.ended_at.clone()).or_else(|| {
+            dated
+                .iter()
+                .max_by_key(|(ts, _)| *ts)
+                .map(|(_, at)| at.to_string())
+        });
         let start = started_at.as_deref().and_then(timestamp);
         let end = ended_at.as_deref().and_then(timestamp);
         let duration_secs = match (start, end) {
@@ -302,7 +311,9 @@ impl Story {
             turns.push(StoryTurn {
                 index: turn_index,
                 role: turn.role.clone(),
-                text: cap(&sanitize(turn.text.trim())),
+                text: cap(&sanitize_lines(
+                    hide_paths(turn.text.trim(), cwd).split('\n'),
+                )),
                 at: at.clone(),
                 offset_secs,
                 first_step,
@@ -320,7 +331,7 @@ impl Story {
                 };
                 let name = sanitize(&call.name);
                 let command = (kind == Some(EffectKind::Exec))
-                    .then(|| raw_command(&call.arguments).map(|c| strip_cwd(&c, cwd)))
+                    .then(|| raw_command(&call.arguments).map(|c| hide_paths(&c, cwd)))
                     .flatten();
                 let verb = verb_of(&call.name, kind, command.as_deref(), call.outcome.as_ref());
                 let path = effect
@@ -330,7 +341,10 @@ impl Story {
                     _ if verb.executes() => {
                         let full = command.clone().unwrap_or_else(|| name.clone());
                         let line = first_line(&full);
-                        let mut detail = vec![("Command".to_string(), cap(&sanitize(&full)))];
+                        let mut detail = vec![(
+                            "Command".to_string(),
+                            cap(&sanitize_lines(full.split('\n'))),
+                        )];
                         if let Some(outcome) = &call.outcome {
                             detail.push(("Runner".into(), sanitize(&outcome.runner)));
                             if let Some(cwd) = &outcome.cwd {
@@ -344,11 +358,12 @@ impl Story {
                         (clip(&sanitize(line), TARGET_MAX), detail)
                     }
                     Verb::Delegated => {
-                        let brief = delegation_brief(&call.arguments).map(|b| strip_cwd(&b, cwd));
+                        let brief = delegation_brief(&call.arguments).map(|b| hide_paths(&b, cwd));
                         let mut detail = Vec::new();
                         if let Some(prompt) = prompt_of(&call.arguments) {
+                            let prompt = hide_paths(&prompt, cwd);
                             detail
-                                .push(("Prompt".into(), cap(&sanitize(&strip_cwd(&prompt, cwd)))));
+                                .push(("Prompt".into(), cap(&sanitize_lines(prompt.split('\n')))));
                         }
                         let target = brief
                             .map(|b| clip(&sanitize(first_line(&b)), TARGET_MAX))
@@ -369,9 +384,10 @@ impl Story {
                 };
                 detail.insert(0, ("Tool".into(), name.clone()));
                 if !call.arguments.trim().is_empty() && !verb.executes() {
+                    let arguments = hide_paths(&call.arguments, cwd);
                     detail.push((
                         "Arguments".into(),
-                        cap(&sanitize(&strip_cwd(&call.arguments, cwd))),
+                        cap(&sanitize_lines(arguments.split('\n'))),
                     ));
                 }
                 if let Some(capture) = &call.capture {
@@ -435,7 +451,7 @@ impl Story {
 
         Self {
             id,
-            prompt: sanitize_lines(session.intent.request.split('\n')),
+            prompt: sanitize_lines(hide_paths(&session.intent.request, cwd).split('\n')),
             started_at,
             ended_at,
             duration_secs,
@@ -473,38 +489,163 @@ pub fn summarize(steps: &[Step]) -> Vec<Run> {
 
 /// Ein Pfad ohne das Arbeitsverzeichnis der Session: `cwd/src/a.rs` →
 /// `src/a.rs`; ein absoluter Pfad außerhalb → `…/<dateiname>`; relative
-/// Pfade bleiben. Entschärft wie ein Pfad.
+/// Pfade bleiben. Trenner werden vor dem Vergleich vereinheitlicht (`\` →
+/// `/`); Laufwerk (`C:/…`), UNC (`//server/…`) und `~` gelten als absolut.
+/// Entschärft wie ein Pfad.
 pub fn relative_path(path: &str, cwd: Option<&str>) -> String {
-    let stripped = cwd.filter(|cwd| !cwd.is_empty()).and_then(|cwd| {
-        let cwd = cwd.trim_end_matches('/');
-        path.strip_prefix(cwd)
-            .and_then(|rest| rest.strip_prefix('/'))
-            .filter(|rest| !rest.is_empty())
-    });
+    let normalized = path.replace('\\', "/");
+    let stripped = cwd
+        .map(|c| c.replace('\\', "/"))
+        .filter(|c| !c.trim_end_matches('/').is_empty())
+        .and_then(|cwd| {
+            let cwd = cwd.trim_end_matches('/').to_string();
+            normalized
+                .strip_prefix(cwd.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .filter(|rest| !rest.is_empty())
+                .map(str::to_string)
+        });
     let shown = match stripped {
-        Some(rest) => rest.to_string(),
-        None if path.starts_with('/') || path.starts_with('~') || path.get(1..3) == Some(":\\") => {
-            let base = path
-                .rsplit(['/', '\\'])
+        Some(rest) => rest,
+        None if is_absolute(&normalized) => {
+            let base = normalized
+                .rsplit('/')
                 .find(|part| !part.is_empty())
-                .unwrap_or(path);
+                .unwrap_or(&normalized);
             format!("…/{base}")
         }
-        None => path.to_string(),
+        None => normalized,
     };
     sanitize_path(&shown)
 }
 
-/// Nimmt das Arbeitsverzeichnis aus einem Text (Kommando, Argumente):
-/// `cwd/` fällt weg, ein alleinstehendes `cwd` wird `.`.
-fn strip_cwd(text: &str, cwd: Option<&str>) -> String {
-    let Some(cwd) = cwd
-        .map(|c| c.trim_end_matches('/'))
+/// Ob ein (vereinheitlichter) Pfad absolut ist: `/…` (auch UNC `//…`),
+/// `~…` oder ein Laufwerk `C:/…`.
+fn is_absolute(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('~') || has_drive(path)
+}
+
+/// Ob `path` mit einem Laufwerk `X:/` beginnt (Trenner schon vereinheitlicht).
+fn has_drive(path: &str) -> bool {
+    let mut chars = path.chars();
+    matches!(
+        (chars.next(), chars.next(), chars.next()),
+        (Some(d), Some(':'), Some('/')) if d.is_ascii_alphabetic()
+    )
+}
+
+/// Nimmt Benutzer-Pfade aus einem Text (Kommando, Argumente, Prompt): das
+/// Arbeitsverzeichnis der Session fällt weg (`cwd/` → ``, ein
+/// alleinstehendes `cwd` → `.`, nur an Pfadgrenzen — `cwd-2/x` bleibt), ein
+/// Home-Verzeichnis (`/Users/<name>`, `/home/<name>`, `C:\Users\<name>`)
+/// wird `~` — auch ohne bekanntes cwd. Andere absolute Pfade
+/// (`/usr/bin/env`) tragen keinen Namen und bleiben.
+fn hide_paths(text: &str, cwd: Option<&str>) -> String {
+    let mut out = text.to_string();
+    if let Some(cwd) = cwd
+        .map(|c| c.trim_end_matches(['/', '\\']))
         .filter(|c| !c.is_empty())
-    else {
-        return text.to_string();
-    };
-    text.replace(&format!("{cwd}/"), "").replace(cwd, ".")
+    {
+        out = replace_at_boundaries(&out, cwd, ".");
+        // Auch die andere Trenner-Schreibweise desselben Verzeichnisses.
+        let alt = if cwd.contains('\\') {
+            cwd.replace('\\', "/")
+        } else {
+            cwd.replace('/', "\\")
+        };
+        if alt != cwd {
+            out = replace_at_boundaries(&out, &alt, ".");
+        }
+    }
+    hide_home(&out)
+}
+
+/// Zeichen, die einen Pfad in einem Text beenden.
+fn ends_path(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ',' | ';' | ')' | ']' | '}' | ':')
+}
+
+/// Ersetzt `needle` durch `with` nur dort, wo danach das Ende oder ein
+/// Pfad-Ende folgt; `needle/` (oder `needle\`) fällt ganz weg.
+fn replace_at_boundaries(text: &str, needle: &str, with: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(needle) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + needle.len()..];
+        match after.chars().next() {
+            Some('/') | Some('\\') => rest = &after[1..],
+            Some(c) if ends_path(c) => {
+                out.push_str(with);
+                rest = after;
+            }
+            None => {
+                out.push_str(with);
+                rest = after;
+            }
+            Some(_) => {
+                out.push_str(needle);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Ersetzt Home-Verzeichnisse durch `~`: `/Users/<name>`, `/home/<name>`,
+/// `X:/Users/<name>` und `X:\Users\<name>` — der Name ist genau eine
+/// Pfadkomponente. Ohne Laufwerk zählt das Präfix nur am Textanfang oder
+/// nach Leerraum, Trenner oder Anführungszeichen (`foo/Users/x` ist keins).
+fn hide_home(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some((at, prefix_len)) = find_home(rest) else {
+            out.push_str(rest);
+            return out;
+        };
+        out.push_str(&rest[..at]);
+        let after = &rest[at + prefix_len..];
+        let name_len = after
+            .find(|c: char| matches!(c, '/' | '\\') || ends_path(c))
+            .unwrap_or(after.len());
+        if name_len == 0 {
+            out.push_str(&rest[at..at + prefix_len]);
+            rest = after;
+            continue;
+        }
+        out.push('~');
+        rest = &after[name_len..];
+    }
+}
+
+/// Anfang und Länge des ersten Home-Präfixes in `text` (ohne den Namen).
+fn find_home(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut best: Option<(usize, usize)> = None;
+    for marker in ["/Users/", "/home/", "\\Users\\"] {
+        let mut from = 0;
+        while let Some(i) = text[from..].find(marker) {
+            let at = from + i;
+            let drive = at >= 2 && bytes[at - 1] == b':' && bytes[at - 2].is_ascii_alphabetic();
+            let (start, len) = if drive {
+                (at - 2, marker.len() + 2)
+            } else {
+                (at, marker.len())
+            };
+            let bounded = start == 0
+                || text[..start].chars().last().is_some_and(|c| {
+                    c.is_whitespace()
+                        || matches!(c, '"' | '\'' | '`' | '=' | ':' | '(' | '[' | '{' | ',')
+                });
+            if bounded && best.is_none_or(|(b, _)| start < b) {
+                best = Some((start, len));
+            }
+            from = at + 1;
+        }
+    }
+    best
 }
 
 /// Das Verb aus Tool-Name, Effekt, Kommando und gedeutetem Lauf.
@@ -539,7 +680,9 @@ fn verb_of(
                 }
             } else if lower.contains("fetch") || lower.contains("web") {
                 Verb::Fetched
-            } else if lower == "task" || lower.contains("agent") || lower.contains("delegat") {
+            } else if matches!(lower.as_str(), "task" | "agent" | "subagent" | "delegate") {
+                // Genau diese Namen — `mcp__x__agent_status` ist keine
+                // Delegation; eine falsche zählte in die Kind-Zuordnung.
                 Verb::Delegated
             } else {
                 Verb::Tool
@@ -753,7 +896,7 @@ mod tests {
 
     use crate::Index;
 
-    const CWD: &str = "/Users/pd/dev/minds-demo";
+    const CWD: &str = "/Users/alice/dev/minds-demo";
 
     fn sid(c: char) -> SessionId {
         format!("b3-{}", c.to_string().repeat(64)).parse().unwrap()
@@ -1008,6 +1151,146 @@ mod tests {
             relative_path("/Users/pd/dev/minds-demo-2/a.rs", Some(CWD)),
             "…/a.rs"
         );
+    }
+
+    /// Benutzer-Pfade außerhalb des cwd — und ohne cwd — werden `~/…`:
+    /// in Kommandos, Prompts an Sub-Agents und Argumenten; ein Nachbar-Repo
+    /// (`minds-demo-2`) wird nicht zum cwd gekürzt.
+    #[test]
+    fn home_paths_become_tilde_in_commands_prompts_and_arguments() {
+        let mut s = base("x");
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            "2026-10-16T10:37:12Z",
+            vec![
+                exec("/Users/alice/.cargo/bin/cargo test"),
+                exec(&format!("cat {CWD}-2/x.rs {CWD}/y.rs")),
+                call(
+                    "Task",
+                    "{\"description\":\"Notes\",\"prompt\":\"Lies /Users/alice/notes.md und /home/bob/a.txt\"}",
+                    None,
+                ),
+                call("Foo", "{\"file_path\":\"/Users/alice/other/x\"}", None),
+            ],
+        ));
+        for lineage in [s.lineage.clone(), None] {
+            let mut s = s.clone();
+            s.lineage = lineage;
+            let story = Story::of(
+                sid('a'),
+                &s,
+                &Index::from_parts(BTreeMap::new(), BTreeMap::new()),
+            );
+            assert_eq!(story.steps[0].target, "~/.cargo/bin/cargo test");
+            let detail = |i: usize, key: &str| {
+                story.steps[i]
+                    .detail
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            assert!(
+                detail(2, "Prompt").contains("~/notes.md und ~/a.txt"),
+                "{}",
+                detail(2, "Prompt")
+            );
+            assert!(
+                detail(3, "Arguments").contains("~/other/x"),
+                "{}",
+                detail(3, "Arguments")
+            );
+            for step in &story.steps {
+                assert!(
+                    !step.target.contains("/Users/") && !step.target.contains("/home/"),
+                    "{}",
+                    step.target
+                );
+                for (k, v) in &step.detail {
+                    assert!(!v.contains("/Users/") && !v.contains("/home/"), "{k}: {v}");
+                }
+            }
+        }
+        // Mit cwd: das Repo selbst wird `.`, der Nachbar bleibt erkennbar.
+        let story = Story::of(
+            sid('a'),
+            &s,
+            &Index::from_parts(BTreeMap::new(), BTreeMap::new()),
+        );
+        assert_eq!(story.steps[1].target, "cat ~/dev/minds-demo-2/x.rs y.rs");
+        assert!(
+            !story.steps[1].target.contains(".-2"),
+            "{}",
+            story.steps[1].target
+        );
+    }
+
+    /// Windows-Schreibweisen: Laufwerk mit `/` oder `\\`, cwd mit `\\` —
+    /// beides wird relativ; ein anderes Laufwerk bleibt `…/<datei>`.
+    #[test]
+    fn windows_paths_are_relative_in_both_spellings() {
+        let cwd = Some("C:\\Users\\alice\\repo");
+        assert_eq!(
+            relative_path("C:/Users/alice/repo/src/a.rs", cwd),
+            "src/a.rs"
+        );
+        assert_eq!(
+            relative_path("C:\\Users\\alice\\repo\\src\\a.rs", cwd),
+            "src/a.rs"
+        );
+        assert_eq!(relative_path("D:\\data\\x.csv", cwd), "…/x.csv");
+        assert_eq!(
+            relative_path("\\\\server\\share\\Users\\alice\\f.txt", cwd),
+            "…/f.txt"
+        );
+        assert_eq!(relative_path("src\\a.rs", cwd), "src/a.rs");
+        // In Texten: das cwd in beiden Schreibweisen, Home mit Laufwerk.
+        assert_eq!(
+            hide_paths("type C:/Users/alice/repo/a.rs", cwd),
+            "type a.rs"
+        );
+        assert_eq!(
+            hide_paths("type C:\\Users\\alice\\repo\\a.rs", cwd),
+            "type a.rs"
+        );
+        assert_eq!(
+            hide_paths("cd C:\\Users\\alice\\other", None),
+            "cd ~\\other"
+        );
+        assert_eq!(
+            hide_paths("cat /usr/bin/env foo/Users/x", None),
+            "cat /usr/bin/env foo/Users/x"
+        );
+    }
+
+    /// Ein Tool mit „agent“ im Namen ist keine Delegation — sonst hinge das
+    /// Kind am falschen Schritt.
+    #[test]
+    fn only_task_like_tools_are_delegations() {
+        let mut s = base("x");
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            "2026-10-16T10:37:12Z",
+            vec![
+                call("mcp__x__agent_status", "{}", None),
+                call("Task", "{\"description\":\"Review\"}", None),
+            ],
+        ));
+        s.edges.push(Edge {
+            kind: EdgeKind::Spawned,
+            to: Endpoint::Session {
+                agent: "claude-code".into(),
+                local_id: "child".into(),
+            },
+            evidence: EvidenceMark::of(EvidenceSource::Observed),
+        });
+        let story = Story::of(sid('a'), &s, &index_with_child(&s));
+        assert_eq!(story.steps[0].verb, Verb::Tool);
+        assert_eq!(story.steps[0].child, None);
+        assert_eq!(story.steps[1].verb, Verb::Delegated);
+        assert_eq!(story.steps[1].child, Some(sid('b')));
     }
 
     #[test]

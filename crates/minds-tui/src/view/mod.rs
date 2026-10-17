@@ -441,11 +441,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 },
             };
             // Eine lange Story in der Zusammenfassung sagt, dass mehr da ist (C7).
-            let full = app
-                .inspection
-                .story(*id)
-                .map(|s| crate::layout::rows(&s, crate::Zoom::Normal, &[]).len())
-                .unwrap_or(0);
+            let full = app.story_rows_normal(*id);
             if app.zoom == crate::Zoom::Summary && full > crate::app::LARGE_STORY {
                 let mut spans = vec![Span::styled(
                     format!("Summary of a long story: {full} rows at zoom 2 — z shows more  ·  "),

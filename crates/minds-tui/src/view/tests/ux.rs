@@ -166,7 +166,7 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
     use minds_core::{EvidenceMark as M, EvidenceSource as S, EvidenceStatus as St};
     use minds_reader::model::{EvidenceState, EvidenceVerdict, Provenance, Verdict};
     use minds_reader::reconcile::ReconClass;
-    use minds_reader::story::Verb;
+    use minds_reader::story::{Outcome, Verb};
     use theme::GlyphClass::{Epistemic, Structural};
 
     let mut symbols = std::collections::BTreeSet::new();
@@ -307,6 +307,45 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
         "handover",
         "handover".into(),
     );
+    // Die Schrittzeile der Story: ein ungedeuteter Aufruf trägt das Glyph
+    // der Deutungs-Achse; Ergebnisse die Prüf-Glyphen bzw. `◦` (offen).
+    add(
+        crate::view::trust::uninterpreted_one().0,
+        Epistemic,
+        "uninterpreted",
+        "story step".into(),
+    );
+    for (outcome, meaning) in [
+        (
+            Outcome::Tests {
+                passed: 1,
+                failed: 0,
+                ignored: 0,
+            },
+            "passed",
+        ),
+        (
+            Outcome::Tests {
+                passed: 0,
+                failed: 1,
+                ignored: 0,
+            },
+            "failed",
+        ),
+        (Outcome::Exit(0), "passed"),
+        (Outcome::Exit(1), "failed"),
+        (
+            Outcome::NotCaptured(minds_core::CaptureNote::ResultNotCaptured),
+            "not observed",
+        ),
+    ] {
+        add(
+            theme::outcome(outcome).0,
+            Epistemic,
+            meaning,
+            format!("{outcome:?}"),
+        );
+    }
     add(
         theme::AGENT_GLYPH,
         Structural,
@@ -1021,7 +1060,7 @@ fn c6_every_state_differs_by_glyph_and_word_alone() {
     use minds_reader::model::{EvidenceState, EvidenceVerdict, Provenance, Verdict};
     use minds_reader::overview::SealMark;
     use minds_reader::reconcile::ReconClass;
-    use minds_reader::story::Verb;
+    use minds_reader::story::{Outcome, Verb};
     let mut seen: std::collections::BTreeMap<String, String> = Default::default();
     let mut add = |state: String, glyph: &str, word: &str| {
         let text = format!("{glyph} {word}");
@@ -1119,6 +1158,25 @@ fn c6_every_state_differs_by_glyph_and_word_alone() {
     }
     let (g, w, _) = theme::handover();
     add("handover".into(), g, w);
+    for outcome in [
+        Outcome::Tests {
+            passed: 2,
+            failed: 0,
+            ignored: 0,
+        },
+        Outcome::Tests {
+            passed: 0,
+            failed: 2,
+            ignored: 0,
+        },
+        Outcome::Benches(2),
+        Outcome::Exit(0),
+        Outcome::Exit(2),
+        Outcome::NotCaptured(minds_core::CaptureNote::ResultNotCaptured),
+    ] {
+        let (g, w, _) = theme::outcome(outcome);
+        add(format!("outcome {outcome:?}"), g, &w);
+    }
     let (g, w, _) = theme::claim();
     add("claim".into(), g, w);
     let (g, w, _) = theme::tampered();

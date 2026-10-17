@@ -12,7 +12,7 @@ use minds_core::{EvidenceMark, EvidenceSource, EvidenceStatus};
 use minds_reader::model::Verdict;
 use minds_reader::model::{EvidenceVerdict, Provenance};
 use minds_reader::reconcile::ReconClass;
-use minds_reader::story::Verb;
+use minds_reader::story::{Outcome, Verb};
 use ratatui::style::{Color, Modifier, Style};
 
 /// Mensch und Absicht.
@@ -375,6 +375,26 @@ pub fn verb(verb: Verb) -> (&'static str, &'static str, Style) {
 /// Bytes, von der anderen Session geschrieben bzw. gelesen — nachgerechnet.
 pub fn handover() -> (&'static str, &'static str, Style) {
     ("⇄", "HANDOVER", Style::default().fg(OK))
+}
+
+/// Glyph, Wort und Stil eines Kommando-Ergebnisses der Story (C11) — nur,
+/// was der Record kennt: Testzähler und Exit-Code als `✓`/`✗` (Prüfung
+/// bestanden / gescheitert), ein nicht gelesenes Ergebnis als `◦` (offen,
+/// kein Fehler). Benchmark-Werte sind kein Bestehen: Zahl ohne Glyph.
+pub fn outcome(outcome: Outcome) -> (&'static str, String, Style) {
+    match outcome {
+        Outcome::Tests { failed, .. } if failed > 0 => {
+            ("✗", format!("{failed} failed"), Style::default().fg(DELETE))
+        }
+        Outcome::Tests { passed, .. } => ("✓", format!("{passed} passed"), Style::default().fg(OK)),
+        Outcome::Benches(n) => ("", format!("{n} benches"), dim()),
+        Outcome::Exit(0) => ("✓", "exit 0".into(), Style::default().fg(OK)),
+        Outcome::Exit(code) => ("✗", format!("exit {code}"), Style::default().fg(DELETE)),
+        Outcome::NotCaptured(_) => {
+            let (glyph, _, style) = not_observed();
+            (glyph, "not captured".into(), style)
+        }
+    }
 }
 
 /// „Offen" (C3.4): fehlt noch, ist aber kein Fehler — nicht beobachtet,
