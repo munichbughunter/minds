@@ -19,6 +19,23 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The reader tells a session as a numbered list of steps (C11, data
+  part).** `minds_reader::story::Story` (via `Inspection::story`) turns a
+  session into one step per tool call, in session order: a verb from tool
+  and effect (`ran`, `tests`, `lint`, `build`, `wrote`, `edited`, `read`,
+  `searched`, `fetched`, `delegated`, `tool`), the target (path, command,
+  brief to the subagent), the outcome **only where the record knows one**
+  (`ExecOutcome` counters, exit code, or the capture note that a result was
+  not read — never guessed), the write claim (hash recorded or not, with the
+  reason), the interpretation status, and the time since the session
+  started. Paths are repo-relative: the session's working directory (it
+  carries the user name) appears neither in targets nor in commands, paths
+  outside the repository show as `…/<name>`. Turns stay available as
+  separators with their text; `summarize` folds consecutive steps of the
+  same kind for the summary zoom; a `delegated` step names its child
+  session only when the mapping is unambiguous. Commands and texts are
+  sanitized and capped at 4 000 characters with `… N more`. The TUI does
+  not use it yet — the story view follows.
 - **The reason for an unread transcript is recorded and shown (K1).** A
   session record now says why its model, response texts and token counts
   are missing: `lineage.transcript` carries one of `read`,

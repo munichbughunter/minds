@@ -344,6 +344,13 @@ impl Inspection {
         ReviewState { verdict, notes }
     }
 
+    /// Die Story einer Session (C11): ihre Schritte mit Verb, Ziel, Ergebnis
+    /// und Zeit seit Start — `None`, wenn die Session nicht lesbar ist.
+    pub fn story(&self, id: SessionId) -> Option<crate::story::Story> {
+        let session = self.index.session(id)?;
+        Some(crate::story::Story::of(id, session, &self.index))
+    }
+
     /// Der Graph einer Session.
     pub fn graph(&self, id: SessionId) -> Option<SessionGraph> {
         let session = self.index.session(id)?;
