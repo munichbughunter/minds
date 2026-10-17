@@ -1,8 +1,6 @@
 //! C9.3 · Why-Box in fester Reihenfolge, mit Satz und Brücke
 //! (docs/spikes/auftrag-batch-2.md, Paket 5).
 
-use minds_reader::graph::{NodeKind, ToolKind};
-
 use super::*;
 use crate::theme;
 
@@ -19,7 +17,7 @@ fn at(out: &str, needle: &str) -> usize {
 }
 
 /// Die App mit dem Cursor auf der `◇ reported`-Zeile (`sort_by_key`).
-fn on_the_reported_line(repo: &Repo) -> App<'_> {
+pub(super) fn on_the_reported_line(repo: &Repo) -> App<'_> {
     let mut app = app_with_changes(repo);
     app.reduce(Action::Down);
     app.reduce(Action::Down);
@@ -177,28 +175,31 @@ fn c93_the_last_line_names_commit_and_change_dimmed() {
     assert_eq!(buffer[(x, y)].fg, theme::DIM);
 }
 
-/// `Enter` auf einer Codezeile öffnet den Graph der Session mit dem Cursor
-/// auf diesem Tool-Aufruf; `Esc` führt über den Verlauf zurück.
+/// `Enter` auf einer Codezeile öffnet die Story der Session mit dem Cursor
+/// auf diesem Schritt; `Esc` führt über den Verlauf zurück.
 #[test]
-fn c93_enter_opens_the_graph_on_the_tool_call_and_esc_returns() {
+fn c93_enter_opens_the_story_on_the_tool_call_and_esc_returns() {
     let (_dir, repo) = repo();
     let mut app = on_the_reported_line(&repo);
     render_at(&mut app, 200);
     app.reduce(Action::Enter);
     assert_eq!(app.tab, Tab::Sessions);
-    let Some(View::Graph {
-        id, rows, cursor, ..
+    let Some(View::Story {
+        id,
+        story,
+        rows,
+        cursor,
     }) = app.top()
     else {
-        panic!("a graph is open");
+        panic!("a story is open");
     };
     assert_eq!(*id, sid('a'));
-    assert_eq!(
-        rows[*cursor].kind,
-        NodeKind::Tool(ToolKind::Edit),
-        "{rows:?}"
-    );
-    assert!(rows[*cursor].label.contains("src/http/retry.rs"));
+    let step = rows[*cursor]
+        .step
+        .and_then(|s| story.steps.get(s))
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(step.verb, minds_reader::story::Verb::Edited, "{rows:?}");
+    assert!(step.target.contains("src/http/retry.rs"));
     app.reduce(Action::Back);
     assert_eq!(app.tab, Tab::Changes);
     assert_eq!(app.changes.as_ref().unwrap().row, 3);

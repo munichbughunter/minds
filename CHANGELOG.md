@@ -17,8 +17,72 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The session view of `minds inspect` is a story, not a tree (C11).**
+  `Enter` on a session shows a numbered list of steps — one per tool call,
+  in session order — instead of the graph intent → agent → turns → tools →
+  change → review, whose shape was always the same. Each step carries a
+  verb from tool and effect (`ran`, `tests`, `lint`, `build`, `wrote`,
+  `edited`, `read`, `searched`, `fetched`, `delegated`, `tool`), its target
+  (repo-relative path, command, the brief to a subagent), on the right the
+  outcome only where the record knows one (`✓ 8 passed`, `✗ exit 1`, `? not
+  captured` — never guessed) or the evidence state of a write (`◇ reported`)
+  or `◐ uninterpreted`, and the time since the session started. The prompt
+  stands once, as a claim (`PROMPT ◌ …`), with CONSTRAINTS and DISCARDED
+  from the record; REQUIREMENT names the anchor; RESULT names files, commit
+  and review. Zoom 1 folds runs of the same kind, 2 shows every step with
+  later human prompts as separators, 3 adds the agent's text as `◌` lines.
+  Subagents hang as indented lines under the delegating step and open with
+  `Enter`; handovers stand before RESULT. The detail box below shows the
+  full command (up to 4 000 characters), arguments, time, write claim and
+  sentence, `stdout/stderr not recorded (by design)`; on RESULT the link
+  evidence and the review notes. `Enter` on a written file opens it in
+  Changes, on RESULT the commit's diff. Paths never carry the session's
+  working directory. Beside an open story the session list shrinks to a
+  narrow column (time and headline) from 140 columns and disappears below.
+  The timeline (`t`) is gone — the story is the timeline. The cursor keeps
+  its step across zoom levels.
+
+### Removed
+
+- **The why chain view of `minds inspect` (C10).** The `w` key, the
+  `Why` level in the Sessions tab and its inspector are gone: every link of
+  the chain (LINE, COMMIT, CHANGE, SESSION, AGENT, INTENT, EVIDENCE, REVIEW)
+  has been shown since Batch 2 in *Why this line?* of the Changes tab (per
+  line: WRITTEN BY, SESSION, REQUIREMENT, ASKED FOR, AGENT SAID, REVIEW) and
+  in the EVIDENCE block of the Overview detail (per commit: INTEGRITY,
+  COVERAGE, INTERPRETATION, REQUIREMENT, REVIEW). The chain framed a missing
+  review as a gap, which it is not (`◦ not reviewed yet`), and showed code
+  jargon (`● ? observed [unchecked]`). `minds inspect <file>:<line>` now
+  opens the Changes tab on that line; `minds why <file>:<line>` on the
+  command line and the pipe output of `minds inspect` keep the chain.
+  `Enter` on a CHANGE or COMMIT node of the graph opens the commit's diff.
+  The promises of the chain's tests moved with their content: a recorded
+  claim is never marked ✓ (ASKED FOR / AGENT SAID carry `◌`), a gap is named
+  with its reason, a fully backed commit says so (`✓ VERIFIED`, `✓ all N
+  added lines observed`), and an unsigned review note reads as a claim
+  (`◌` in the REVIEW detail).
+
 ### Added
 
+- **The reader tells a session as a numbered list of steps (C11, data
+  part).** `minds_reader::story::Story` (via `Inspection::story`) turns a
+  session into one step per tool call, in session order: a verb from tool
+  and effect (`ran`, `tests`, `lint`, `build`, `wrote`, `edited`, `read`,
+  `searched`, `fetched`, `delegated`, `tool`), the target (path, command,
+  brief to the subagent), the outcome **only where the record knows one**
+  (`ExecOutcome` counters, exit code, or the capture note that a result was
+  not read — never guessed), the write claim (hash recorded or not, with the
+  reason), the interpretation status, and the time since the session
+  started. Paths are repo-relative: the session's working directory (it
+  carries the user name) appears neither in targets nor in commands, paths
+  outside the repository show as `…/<name>`. Turns stay available as
+  separators with their text; `summarize` folds consecutive steps of the
+  same kind for the summary zoom; a `delegated` step names its child
+  session only when the mapping is unambiguous. Commands and texts are
+  sanitized and capped at 4 000 characters with `… N more`. The TUI does
+  not use it yet — the story view follows.
 - **The reason for an unread transcript is recorded and shown (K1).** A
   session record now says why its model, response texts and token counts
   are missing: `lineage.transcript` carries one of `read`,

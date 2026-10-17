@@ -129,29 +129,6 @@ fn a6_the_help_scrolls_and_starts_with_the_current_tab() {
     assert!(!app.help);
 }
 
-/// Die Why-Kette: ein einzeiliger Verbinder; der Gap-Block nur bei Lücken.
-#[test]
-fn a6_the_why_chain_is_compact() {
-    let (_dir, repo) = super::super::repo();
-    let mut app = App::new(super::super::filled(), &repo, None);
-    app.reduce(Action::Why); // lückenlos
-    let out = render_sized(&mut app, 120, 30);
-    assert!(!out.contains(" NO GAP "), "{out}");
-    assert!(out.contains("✓ no gap"), "{out}");
-    let lines: Vec<&str> = out.lines().collect();
-    for pair in lines.windows(2) {
-        assert!(
-            !(pair[0].trim() == "│" && pair[1].trim() == "▼"),
-            "two-line connector\n{out}"
-        );
-    }
-    app.reduce(Action::Back);
-    app.reduce(Action::Down);
-    app.reduce(Action::Why); // mit Lücken
-    let out = render_sized(&mut app, 120, 30);
-    assert!(out.contains(" 2 GAPS "), "{out}");
-}
-
 /// Beim Tippen einer Suche sind `?` und `q` Zeichen der Suche: Die Fußzeile
 /// verspricht sie dort nicht, sondern die Suchaktionen.
 #[test]

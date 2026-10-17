@@ -27,10 +27,6 @@ pub enum Action {
     Enter,
     /// Zurück / Filter löschen / beenden.
     Back,
-    /// Graph ↔ Zeitleiste.
-    ToggleTimeline,
-    /// Die Herkunftskette.
-    Why,
     /// Der Evidence-Report der Session.
     Evidence,
     /// Die Detailstufe 1–3 (direkt; die Tasten sind `z` / `Z`).
@@ -110,8 +106,11 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::End | KeyCode::Char('G') => Action::End,
         KeyCode::Enter | KeyCode::Char('l') => Action::Enter,
         KeyCode::Esc | KeyCode::Char('h') => Action::Back,
-        KeyCode::Char('t') => Action::ToggleTimeline,
-        KeyCode::Char('w') => Action::Why,
+        // `t` ist seit C11 frei: Die Story ist die Zeitleiste.
+        KeyCode::Char('t') => Action::None,
+        // `w` ist seit C10 frei: Die Herkunftskette gibt es nicht mehr, ihre
+        // Glieder stehen in der Why-Box (Changes) und im Overview-Detail.
+        KeyCode::Char('w') => Action::None,
         KeyCode::Char('e') => Action::Evidence,
         // B4: Ziffern wählen den Tab, `z` / `Z` zoomen, die Objekt-Verben
         // sind in jedem Tab dieselben.
@@ -161,9 +160,12 @@ mod tests {
     #[test]
     fn every_command_key_has_its_action() {
         for (c, action) in [
-            ('w', Action::Why),
+            // C10: `w` bleibt in der Tabelle — jetzt ohne Aktion; die Kette
+            // ist weg, nichts verschwindet stillschweigend.
+            ('w', Action::None),
             ('e', Action::Evidence),
-            ('t', Action::ToggleTimeline),
+            // C11: `t` bleibt in der Tabelle — die Zeitleiste ist die Story.
+            ('t', Action::None),
             // B4: Ziffern sind Tabs, Zoom liegt auf z / Z.
             ('1', Action::TabTo(0)),
             ('2', Action::TabTo(1)),

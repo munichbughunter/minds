@@ -1,9 +1,10 @@
-//! B4 im Changes-Tab: `w` öffnet die Why-Kette, `c` schaltet die Spalte.
+//! B4 im Changes-Tab: `c` schaltet die Spalte; `w` ist seit C10 frei und
+//! tut nichts — still, aber ohne Nebenwirkung auf die Spalte.
 
 use super::*;
 
 #[test]
-fn b4_w_opens_the_why_chain_and_c_toggles_the_column() {
+fn b4_c_toggles_the_column_and_w_does_nothing() {
     let (_dir, repo) = repo();
     let mut app = app_with_changes(&repo);
     app.reduce(Action::Enter); // in den Diff
@@ -15,16 +16,22 @@ fn b4_w_opens_the_why_chain_and_c_toggles_the_column() {
         "c toggles the column"
     );
     let toggled = app.changes.as_ref().unwrap().why;
-    app.reduce(Action::Why);
-    // w schaltet die Spalte nicht mehr um (alter Zustand) …
+    // `w` ist keine Aktion mehr (C10): die Spalte bleibt, keine Ebene
+    // öffnet sich, der Tab bleibt.
+    let w = crate::input::map(
+        crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::NONE,
+        ),
+        false,
+    );
+    assert_eq!(w, Action::None);
+    app.reduce(w);
     assert_eq!(
         app.changes.as_ref().unwrap().why,
         toggled,
-        "w no longer toggles"
+        "w leaves the column"
     );
-    // … sondern öffnet die Why-Kette der Zeile — oder sagt, warum nicht.
-    assert!(
-        matches!(app.top(), Some(View::Why { .. })) || app.closed.is_some(),
-        "w opens the why chain or names why not"
-    );
+    assert_eq!(app.tab, Tab::Changes);
+    assert!(app.top().is_none());
 }

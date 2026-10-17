@@ -1,10 +1,12 @@
 //! Der Zustand der Oberfläche und seine Übergänge — `reduce` ist reine
 //! Zustandsänderung und ohne Terminal prüfbar; nur `run` hält die Schleife.
 //!
-//! Drei Projektionen desselben Modells liegen als Stapel übereinander:
-//! unten die Activity-Liste, darüber Graphen und Herkunftsketten, so tief,
-//! wie der Nutzer hineingeht. `Esc` nimmt die oberste Ebene weg; auf der
-//! Liste löscht es erst die Suche und beendet dann.
+//! Projektionen desselben Modells liegen als Stapel übereinander: unten die
+//! Activity-Liste, darüber Stories (C11) und Evidence-Reports, so tief, wie
+//! der Nutzer hineingeht. `Esc` nimmt die oberste Ebene weg; auf der Liste
+//! löscht es die Suche und beendet nie (B1). Die Herkunftskette (`w`) gibt
+//! es seit C10 nicht mehr: Ihre Glieder stehen in der Why-Box des
+//! Changes-Tabs und im Detail der Übersicht.
 //!
 //! Neu laden ersetzt das Modell, nicht den Ort: Cursor (über die
 //! Session-Id), Suche und Stapel bleiben, jede Ebene wird aus ihrem
@@ -19,14 +21,14 @@ use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::artifact::CommitArtifact;
 use minds_reader::changes::ChangeSet;
-use minds_reader::graph::{NodeKind, SessionGraph};
-use minds_reader::model::{EvidenceReport, LinkEvidence, SessionCard, WhyChain, WhyStep};
+use minds_reader::model::{EvidenceReport, SessionCard};
+use minds_reader::story::Story;
 
 use crate::changes::{ChangesState, Focus};
 use crate::filter;
 use crate::input::{self, Action};
 use crate::intent::{IntentTab, bound_sessions, named_anchors};
-use crate::layout::{self, Row, Zoom};
+use crate::layout::{self, Handover, Row, RowKind, Zoom};
 use crate::overview::{OverviewFocus, OverviewState, Selected};
 use crate::term::Guard;
 use crate::verify::VerifyState;
@@ -37,9 +39,9 @@ use crate::{Background, CommitVerify, Source, Stamp};
 /// (Größenänderung des Terminals).
 const TICK: Duration = Duration::from_millis(250);
 
-/// Ab so vielen Zeilen in der Normalstufe startet ein Graph in der
-/// Übersicht (C7).
-pub const LARGE_GRAPH: usize = 40;
+/// Ab so vielen Zeilen in der Normalstufe startet eine Story in der
+/// Zusammenfassung (C7).
+pub const LARGE_STORY: usize = 40;
 
 /// Wie oft die Quelle nach ihrem Fingerabdruck gefragt wird.
 const CHECK: Duration = Duration::from_secs(1);
@@ -50,54 +52,19 @@ pub(crate) const VERIFY_EVERY: Duration = Duration::from_secs(5);
 /// Wie oft `r` höchstens lädt, auch wenn die Taste gehalten wird.
 const REPEAT: Duration = Duration::from_millis(250);
 
-/// Woraus eine Herkunftskette entstand — damit Neuladen sie aus derselben
-/// Frage neu rechnen kann.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WhyOrigin {
-    /// Die Kette einer Session.
-    Session(SessionId),
-    /// Die Kette eines Commits.
-    Commit(CommitId),
-    /// Die Kette einer Zeile.
-    Line {
-        /// Der Pfad.
-        path: String,
-        /// Die Zeile, 1-basiert.
-        line: u32,
-    },
-}
-
 /// Eine Ebene über der Liste.
 #[derive(Debug, Clone)]
 pub enum View {
-    /// Der Graph einer Session.
-    Graph {
+    /// Die Story einer Session (C11): ihre Schritte in Reihenfolge.
+    Story {
         /// Die Session.
         id: SessionId,
-        /// Der Graph.
-        graph: SessionGraph,
-        /// Die gezeichneten Zeilen (Baum oder Zeitleiste).
+        /// Die Story, wie der Reader sie erzählt.
+        story: Story,
+        /// Die gezeichneten Zeilen in der aktuellen Stufe.
         rows: Vec<Row>,
         /// Die Cursorzeile.
         cursor: usize,
-        /// Zeitleiste statt Baum.
-        timeline: bool,
-    },
-    /// Eine Herkunftskette.
-    Why {
-        /// Woraus die Kette entstand.
-        origin: WhyOrigin,
-        /// Die Kette.
-        chain: WhyChain,
-        /// Das Glied unter dem Cursor.
-        cursor: usize,
-        /// Die Kante unter dem Cursor, wenn das Glied das Evidence-Glied
-        /// ist: ↑/↓ wandern erst über die Kanten, bevor sie das Glied
-        /// verlassen (#132). Auf allen anderen Gliedern ist das `0`.
-        edge: usize,
-        /// Der geöffnete Evidence-Inspector — er folgt der fokussierten
-        /// Kante und erklärt genau sie, nicht alle.
-        inspector: Option<Vec<LinkEvidence>>,
     },
     /// Der Evidence-Report einer Session: Verdikt, Erklärung, Kryptographie
     /// — drei Ebenen über demselben, fertig gerechneten Read-Model. Die TUI
@@ -130,7 +97,7 @@ pub const ARTIFACT_SECTION: usize = 2;
 pub enum Tab {
     /// Die Historie als Commit-Graph, an jedem Commit seine Sessions.
     Overview,
-    /// Die Sessions: Liste, Graph, Why, Evidence.
+    /// Die Sessions: Liste, Graph, Evidence.
     Sessions,
     /// Das Urteil über einen Commit auf einen Blick.
     Verify,
@@ -598,12 +565,12 @@ impl<'a> App<'a> {
     /// Suche wird geleert — sie filterte die Session sonst womöglich aus der
     /// Liste.
     fn goto_session(&mut self, id: SessionId) {
-        if self.inspection.graph(id).is_some() {
+        if self.inspection.story(id).is_some() {
             self.tab = Tab::Sessions;
             self.query.clear();
             self.refilter_keeping(Some(id));
             self.views.clear();
-            self.push_graph(id);
+            self.push_story(id);
         } else {
             self.closed = Some("that session is not readable".into());
         }
@@ -695,19 +662,6 @@ impl<'a> App<'a> {
                 }
                 None => {}
             },
-            Action::Why => {
-                if let Some(Selected::Commit(row)) = state.selected() {
-                    let commit = row.id;
-                    let chain = self.inspection.why_commit(commit);
-                    self.tab = Tab::Sessions;
-                    self.views.clear();
-                    self.push_why(WhyOrigin::Commit(commit), chain);
-                } else {
-                    // Eine Session ohne Commit hat keine Kette (B4: sagen).
-                    self.closed = Some("w: no commit here — Enter opens the session".into());
-                }
-                return;
-            }
             _ => {}
         }
         if state.cursor != at {
@@ -778,11 +732,11 @@ impl<'a> App<'a> {
                     .selected()
                     .and_then(|info| bound_sessions(&self.inspection, &info.id).first().copied());
                 match first {
-                    Some((id, _)) if self.inspection.graph(id).is_some() => {
+                    Some((id, _)) if self.inspection.story(id).is_some() => {
                         self.tab = Tab::Sessions;
                         self.query.clear();
                         self.refilter_keeping(Some(id));
-                        self.push_graph(id);
+                        self.push_story(id);
                     }
                     Some(_) => self.closed = Some("that session is not readable".into()),
                     None => self.closed = Some("no session names this anchor".into()),
@@ -1053,11 +1007,11 @@ impl<'a> App<'a> {
                 if cursor < state.sessions.len() {
                     // Eine Session: ihr Graph im Sessions-Tab.
                     let id = state.sessions[cursor].id;
-                    if self.inspection.graph(id).is_some() {
+                    if self.inspection.story(id).is_some() {
                         self.tab = Tab::Sessions;
                         self.query.clear();
                         self.refilter_keeping(Some(id));
-                        self.push_graph(id);
+                        self.push_story(id);
                     } else {
                         // Nicht still in eine leere Liste springen.
                         self.closed = Some("that session is not readable".into());
@@ -1295,75 +1249,31 @@ impl<'a> App<'a> {
         });
         let Some(source) = source else {
             self.closed = Some(
-                "Enter: no tool call is recorded for this line — w opens the why chain".into(),
+                "Enter: no tool call is recorded for this line — the why box says what is known"
+                    .into(),
             );
             return;
         };
-        let Some(graph) = self.inspection.graph(source.session) else {
+        if self.inspection.story(source.session).is_none() {
             self.closed = Some("that session is not readable".into());
             return;
-        };
-        // Der Knoten des Aufrufs: der `call`-te Tool-Knoten unter dem
-        // `turn`-ten Zug — so baut `SessionGraph::build` den Graphen.
-        let turn = graph
-            .nodes
-            .iter()
-            .filter(|n| matches!(n.kind, NodeKind::Turn(_)))
-            .nth(source.turn)
-            .map(|n| n.id);
-        let node = turn.and_then(|turn| {
-            graph
-                .nodes
-                .iter()
-                .filter(|n| n.parent == Some(turn) && matches!(n.kind, NodeKind::Tool(_)))
-                .nth(source.call)
-                .map(|n| n.id)
-        });
+        }
         self.goto_session(source.session);
-        if let (Some(node), Some(View::Graph { rows, cursor, .. })) = (node, self.views.last_mut())
-            && let Some(at) = rows
+        // Der Schritt des Aufrufs: Turn- und Aufruf-Index wie `LineSource`.
+        if let Some(View::Story {
+            story,
+            rows,
+            cursor,
+            ..
+        }) = self.views.last_mut()
+            && let Some(step) = story
+                .steps
                 .iter()
-                .position(|r| r.node <= node && node < r.node + r.count)
+                .position(|s| s.turn == source.turn && s.call == source.call)
+            && let Some(at) = layout::locate(rows, step)
         {
             *cursor = at;
         }
-    }
-
-    /// `w` auf einer Diff-Zeile: die Herkunftskette dieser Zeile — im
-    /// Sessions-Tab, `Esc` führt zurück in die Liste. Auf HEAD die Kette der
-    /// Zeile (Blame), auf älteren Commits die des Commits.
-    fn why_of_row(&mut self) {
-        // Nie still nichts (B4): Fehlt Commit oder Zeile, sagt die Fußzeile es.
-        let Some(commit) = self.changes.as_ref().and_then(|s| s.commit()) else {
-            self.closed = Some("w: no commit here to explain".into());
-            return;
-        };
-        let target = self.changes.as_ref().and_then(|state| {
-            state
-                .current()
-                .and_then(|f| f.rows.get(state.row).map(|r| (f.identity.clone(), r.new)))
-        });
-        let Some((path, line)) = target else {
-            self.closed = Some("w: no line here — open a file's diff first".into());
-            return;
-        };
-        match line {
-            Some(line) if self.inspection.head() == Some(commit) => {
-                match self.inspection.why_line(self.repo, &path, line) {
-                    Ok(chain) => self.push_why(WhyOrigin::Line { path, line }, chain),
-                    Err(err) => {
-                        self.closed =
-                            Some(minds_reader::sanitize(&format!("why {path}:{line}: {err}")));
-                        return;
-                    }
-                }
-            }
-            _ => {
-                let chain = self.inspection.why_commit(commit);
-                self.push_why(WhyOrigin::Commit(commit), chain);
-            }
-        }
-        self.tab = Tab::Sessions;
     }
 
     /// Rechnet eine Ebene gegen das aktuelle Modell neu. `Err(grund)`, wenn
@@ -1375,25 +1285,15 @@ impl<'a> App<'a> {
     /// sind wie jetzt.
     fn rebuild(&self, view: View, before: &Inspection, full: bool) -> Result<View, String> {
         match view {
-            View::Graph {
-                id,
-                cursor,
-                timeline,
-                ..
-            } => {
-                let graph = self.inspection.graph(id).ok_or_else(|| gone(id))?;
-                let rows = if timeline {
-                    layout::timeline(&graph, self.zoom)
-                } else {
-                    layout::rows(&graph, self.zoom)
-                };
+            View::Story { id, cursor, .. } => {
+                let story = self.inspection.story(id).ok_or_else(|| gone(id))?;
+                let rows = layout::rows(&story, self.zoom, &self.handovers_of(id));
                 let cursor = cursor.min(rows.len().saturating_sub(1));
-                Ok(View::Graph {
+                Ok(View::Story {
                     id,
-                    graph,
+                    story,
                     rows,
                     cursor,
-                    timeline,
                 })
             }
             View::Evidence {
@@ -1406,76 +1306,6 @@ impl<'a> App<'a> {
                 let unchanged =
                     !full && artifact_inputs(before, id) == artifact_inputs(&self.inspection, id);
                 Ok(self.evidence_view_with(id, cursor, unchanged.then_some(artifacts)))
-            }
-            View::Why {
-                origin,
-                chain: old_chain,
-                cursor,
-                edge,
-                inspector,
-            } => {
-                let chain = match &origin {
-                    WhyOrigin::Session(id) => {
-                        self.inspection.why_session(*id).ok_or_else(|| {
-                            // `cards` kennt auch degradierte Sessions, `card` nicht.
-                            if self.cards.iter().any(|card| card.id == *id) {
-                                no_chain(*id)
-                            } else {
-                                gone(*id)
-                            }
-                        })?
-                    }
-                    WhyOrigin::Commit(commit) => self.inspection.why_commit(*commit),
-                    WhyOrigin::Line { path, line } => match (full, blamed(&old_chain)) {
-                        // HEAD steht: Blame gäbe denselben Commit — nur der
-                        // Rest der Kette wird gegen das neue Modell gerechnet.
-                        (false, Some((head, Some(commit)))) => {
-                            let mut chain = self.inspection.why_commit(commit);
-                            chain.steps.insert(0, head);
-                            chain
-                        }
-                        (false, Some((_, None))) => old_chain,
-                        _ => self
-                            .inspection
-                            .why_line(self.repo, path, *line)
-                            .map_err(|err| format!("why {path}:{line}: {err}"))?,
-                    },
-                };
-                let cursor = cursor.min(chain.steps.len().saturating_sub(1));
-                let links = match chain.steps.get(cursor) {
-                    Some(WhyStep::Evidence { links }) => links.as_slice(),
-                    _ => &[],
-                };
-                let edge = edge.min(links.len().saturating_sub(1));
-                // Ein offener Inspector erklärt nach dem Neuladen dieselbe
-                // fokussierte Kante — dieselbe Auswahl wie beim Navigieren in
-                // `reduce`. Neu gerechnet wird er (mit Diff) nur, wenn sich die
-                // Kante selbst geändert hat oder `r` es verlangt.
-                let inspector = match (inspector, chain.steps.get(cursor)) {
-                    (Some(old), Some(WhyStep::Evidence { .. })) => {
-                        let focused = links.get(edge).map(std::slice::from_ref).unwrap_or(&[]);
-                        let same = |a: &[LinkEvidence], b: &[LinkEvidence]| {
-                            a.len() == b.len()
-                                && a.iter().zip(b).all(|(a, b)| {
-                                    (a.commit, a.session, a.evidence)
-                                        == (b.commit, b.session, b.evidence)
-                                })
-                        };
-                        if !full && same(&old, focused) {
-                            Some(old)
-                        } else {
-                            Some(self.inspection.explain_links(self.repo, focused))
-                        }
-                    }
-                    _ => None,
-                };
-                Ok(View::Why {
-                    origin,
-                    chain,
-                    cursor,
-                    edge,
-                    inspector,
-                })
             }
         }
     }
@@ -1495,18 +1325,40 @@ impl<'a> App<'a> {
         self.views.last()
     }
 
-    /// Öffnet die Herkunftskette einer Zeile — der Einstieg über
-    /// `minds inspect <datei>:<zeile>`.
-    pub fn open_why_line(&mut self, path: &str, line: u32) -> minds_reader::Result<()> {
-        let chain = self.inspection.why_line(self.repo, path, line)?;
-        self.push_why(
-            WhyOrigin::Line {
-                path: path.to_string(),
-                line,
-            },
-            chain,
-        );
-        Ok(())
+    /// Der Einstieg über `minds inspect <datei>:<zeile>` (C10): der
+    /// Changes-Tab auf HEAD, der Cursor auf dieser Zeile — die Why-Box
+    /// daneben sagt, woher sie stammt. Ändert HEAD die Datei nicht, sagt die
+    /// Fußzeile das; die Kette von `minds why` bleibt der CLI.
+    pub fn open_line(&mut self, path: &str, line: u32) {
+        self.open_changes(None);
+        self.place_line(path, line);
+    }
+
+    /// Stellt den Cursor des geöffneten Changes-Tabs auf `path:line` — oder
+    /// sagt in der Fußzeile, warum das nicht geht.
+    pub fn place_line(&mut self, path: &str, line: u32) {
+        let Some(state) = self.changes.as_mut() else {
+            return;
+        };
+        if !state.select_path(path) {
+            self.closed = Some(minds_reader::sanitize(&format!(
+                "{path}:{line}: HEAD does not change this file — minds why {path}:{line} follows the line"
+            )));
+            return;
+        }
+        if let Some(row) = state
+            .current()
+            .and_then(|f| f.rows.iter().position(|r| r.new == Some(line)))
+        {
+            state.row = row;
+        } else {
+            self.closed = Some(minds_reader::sanitize(&format!(
+                "{path}:{line} is not an added line of HEAD"
+            )));
+        }
+        if let Some(state) = self.changes.as_mut() {
+            state.focus = Focus::Diff;
+        }
     }
 
     fn refilter(&mut self) {
@@ -1529,43 +1381,66 @@ impl<'a> App<'a> {
             .unwrap_or(0);
     }
 
-    /// Die Zeilen des Graphen einer Session, wie `Enter` sie zeigen würde —
+    /// Die Story einer Session samt Zeilen, wie `Enter` sie zeigen würde —
     /// aber ohne den Stapel zu berühren. Die Vorschau neben der Liste
     /// zeichnet daraus; sie darf keinen `Esc` kosten und folgt dem Zoom wie
-    /// eine gelegte Ebene. `None`, wenn der Reader keinen Graphen hat.
-    pub fn preview_graph(&self, id: SessionId) -> Option<Vec<Row>> {
-        self.inspection
-            .graph(id)
-            .map(|graph| layout::rows(&graph, self.zoom))
+    /// eine gelegte Ebene. `None`, wenn der Reader keine Story hat.
+    pub fn preview_story(&self, id: SessionId) -> Option<(Story, Vec<Row>)> {
+        let story = self.inspection.story(id)?;
+        let rows = layout::rows(&story, self.zoom, &self.handovers_of(id));
+        Some((story, rows))
     }
 
-    fn push_graph(&mut self, id: SessionId) {
-        let Some(graph) = self.inspection.graph(id) else {
+    /// Die Content-Übergaben einer Session (Evidence-DAG), wie der Index sie
+    /// kennt — Zeilen vor RESULT.
+    fn handovers_of(&self, id: SessionId) -> Vec<Handover> {
+        // Der Pfad der Übergabe ist, wie der Agent ihn nannte — oft absolut,
+        // mit Benutzername: repo-relativ wie jeder Schritt (PII).
+        let index = self.inspection.index();
+        let cwd = index
+            .session(id)
+            .and_then(|s| s.lineage.as_ref())
+            .and_then(|l| l.cwd.as_deref());
+        index
+            .content_links_of(id)
+            .into_iter()
+            .map(|link| {
+                let incoming = link.to == id;
+                Handover {
+                    other: if incoming { link.from } else { link.to },
+                    incoming,
+                    path: minds_reader::story::relative_path(&link.path, cwd),
+                }
+            })
+            .collect()
+    }
+
+    /// Wie viele Zeilen die Story von `id` in der Normalstufe hätte — mit
+    /// Übergaben, wie `push_story` sie zählt (C7); die Fußzeile fragt hier.
+    pub fn story_rows_normal(&self, id: SessionId) -> usize {
+        self.inspection
+            .story(id)
+            .map(|s| layout::rows(&s, Zoom::Normal, &self.handovers_of(id)).len())
+            .unwrap_or(0)
+    }
+
+    fn push_story(&mut self, id: SessionId) {
+        let Some(story) = self.inspection.story(id) else {
             return;
         };
-        // Ein großer Graph startet in der Übersicht (C7) — die Fußzeile
-        // sagt, dass mehr da ist.
-        if self.zoom == Zoom::Normal && layout::rows(&graph, Zoom::Normal).len() > LARGE_GRAPH {
+        let handovers = self.handovers_of(id);
+        // Eine lange Story startet in der Zusammenfassung (C7) — die
+        // Fußzeile sagt, dass mehr da ist.
+        if self.zoom == Zoom::Normal && self.story_rows_normal(id) > LARGE_STORY {
             self.zoom = Zoom::Summary;
             self.relayout();
         }
-        let rows = layout::rows(&graph, self.zoom);
-        self.views.push(View::Graph {
+        let rows = layout::rows(&story, self.zoom, &handovers);
+        self.views.push(View::Story {
             id,
-            graph,
+            story,
             rows,
             cursor: 0,
-            timeline: false,
-        });
-    }
-
-    fn push_why(&mut self, origin: WhyOrigin, chain: WhyChain) {
-        self.views.push(View::Why {
-            origin,
-            chain,
-            cursor: 0,
-            edge: 0,
-            inspector: None,
         });
     }
 
@@ -1613,24 +1488,36 @@ impl<'a> App<'a> {
 
     fn relayout(&mut self) {
         let zoom = self.zoom;
+        let handovers: Vec<Vec<Handover>> = self
+            .views
+            .iter()
+            .filter_map(|view| match view {
+                View::Story { id, .. } => Some(self.handovers_of(*id)),
+                _ => None,
+            })
+            .collect();
+        let mut n = 0;
         for view in &mut self.views {
-            if let View::Graph {
-                graph,
+            if let View::Story {
+                story,
                 rows,
                 cursor,
-                timeline,
                 ..
             } = view
             {
-                // Der Cursor folgt dem Knoten, nicht dem Index (B5).
-                let node = rows.get(*cursor).map(|r| r.node);
-                *rows = if *timeline {
-                    layout::timeline(graph, zoom)
-                } else {
-                    layout::rows(graph, zoom)
-                };
-                *cursor = node
-                    .and_then(|n| layout::locate(graph, zoom, rows, n))
+                // Der Cursor folgt dem Schritt, nicht dem Index (B5); eine
+                // Zeile ohne Schritt (Übergabe, RESULT) findet sich über
+                // ihre Art wieder.
+                let step = rows.get(*cursor).and_then(|r| r.step);
+                let kind = rows.get(*cursor).map(|r| r.kind.clone());
+                *rows = layout::rows(story, zoom, &handovers[n]);
+                n += 1;
+                *cursor = step
+                    .and_then(|s| layout::locate(rows, s))
+                    .or_else(|| {
+                        kind.as_ref()
+                            .and_then(|k| rows.iter().position(|r| &r.kind == k))
+                    })
                     .unwrap_or_else(|| (*cursor).min(rows.len().saturating_sub(1)));
             }
         }
@@ -1658,12 +1545,7 @@ impl<'a> App<'a> {
             // dann lohnt der Schnappschuss.
             let origin = matches!(
                 action,
-                Action::Enter
-                    | Action::Why
-                    | Action::Evidence
-                    | Action::Verify
-                    | Action::Diff
-                    | Action::Intent
+                Action::Enter | Action::Evidence | Action::Verify | Action::Diff | Action::Intent
             )
             .then(|| self.snapshot());
             let tab_key = matches!(action, Action::TabTo(_) | Action::CycleTab(_));
@@ -1730,21 +1612,10 @@ impl<'a> App<'a> {
         match self.tab {
             Tab::Sessions => {
                 let session = match self.top() {
-                    Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
-                    Some(View::Why { origin, .. }) => match origin {
-                        WhyOrigin::Session(id) => Some(*id),
-                        _ => None,
-                    },
+                    Some(View::Story { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
                     None => self.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
                 };
-                let commit = match self.top() {
-                    Some(View::Why {
-                        origin: WhyOrigin::Commit(commit),
-                        ..
-                    }) => Some(*commit),
-                    _ => session.and_then(commit_of),
-                };
-                (session, commit)
+                (session, session.and_then(commit_of))
             }
             Tab::Overview => match self.overview.as_ref().and_then(|s| s.selected()) {
                 Some(Selected::Commit(row)) => (
@@ -1828,24 +1699,6 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Action::Why if self.tab == Tab::Changes => self.why_of_row(),
-            Action::Why => match (commit, session) {
-                (Some(commit), _) => {
-                    let chain = self.inspection.why_commit(commit);
-                    self.tab = Tab::Sessions;
-                    self.views.clear();
-                    self.push_why(WhyOrigin::Commit(commit), chain);
-                }
-                (None, Some(id)) => match self.inspection.why_session(id) {
-                    Some(chain) => {
-                        self.tab = Tab::Sessions;
-                        self.views.clear();
-                        self.push_why(WhyOrigin::Session(id), chain);
-                    }
-                    None => self.closed = Some("w: this session is not readable".into()),
-                },
-                (None, None) => self.closed = Some("w: nothing here to explain".into()),
-            },
             Action::Evidence => match session {
                 Some(id) => {
                     self.tab = Tab::Sessions;
@@ -2234,11 +2087,10 @@ impl<'a> App<'a> {
             self.help = true;
             return;
         }
-        // Die Objekt-Verben (B4): `v d i` überall, `w e` dort, wo der Tab
-        // sie nicht selbst trägt.
+        // Die Objekt-Verben (B4): `v d i` überall, `e` dort, wo der Tab es
+        // nicht selbst trägt.
         let verb = match (action.clone(), self.tab) {
             (Action::Verify | Action::Diff | Action::Intent, _) => true,
-            (Action::Why, Tab::Verify | Tab::Changes | Tab::Intent) => true,
             (Action::Evidence, Tab::Overview | Tab::Verify | Tab::Changes | Tab::Intent) => true,
             (Action::Context, tab) => tab != Tab::Changes,
             _ => false,
@@ -2299,12 +2151,11 @@ impl<'a> App<'a> {
         let page = self.page.max(1);
         match self.views.pop() {
             None => self.reduce_activity(action, page),
-            Some(View::Graph {
+            Some(View::Story {
                 id,
-                graph,
+                story,
                 rows,
                 mut cursor,
-                mut timeline,
             }) => {
                 let mut keep = true;
                 match action {
@@ -2315,224 +2166,39 @@ impl<'a> App<'a> {
                     Action::Home => cursor = 0,
                     Action::End => cursor = rows.len().saturating_sub(1),
                     Action::Back => keep = false,
-                    Action::ToggleTimeline => timeline = !timeline,
-                    Action::Why => {
-                        self.views.push(View::Graph {
-                            id,
-                            graph,
-                            rows,
-                            cursor,
-                            timeline,
-                        });
-                        if let Some(chain) = self.inspection.why_session(id) {
-                            self.push_why(WhyOrigin::Session(id), chain);
-                        }
-                        return;
-                    }
                     Action::Evidence => {
-                        self.views.push(View::Graph {
+                        self.views.push(View::Story {
                             id,
-                            graph,
+                            story,
                             rows,
                             cursor,
-                            timeline,
                         });
                         self.push_evidence(id);
                         return;
                     }
                     Action::Enter => {
                         let target = rows.get(cursor).map(|r| r.kind.clone());
-                        self.views.push(View::Graph {
+                        let step = match &target {
+                            Some(RowKind::Step(i)) => story.steps.get(*i).cloned(),
+                            _ => None,
+                        };
+                        self.views.push(View::Story {
                             id,
-                            graph,
+                            story,
                             rows,
                             cursor,
-                            timeline,
                         });
-                        match target {
-                            Some(NodeKind::Subagent(child)) => self.push_graph(child),
-                            Some(
-                                NodeKind::Change(_) | NodeKind::Commit(_) | NodeKind::Review(_),
-                            ) => {
-                                if let Some(chain) = self.inspection.why_session(id) {
-                                    self.push_why(WhyOrigin::Session(id), chain);
-                                }
-                            }
-                            _ => {}
-                        }
+                        self.enter_story_row(id, target, step);
                         return;
                     }
                     _ => {}
                 }
                 if keep {
-                    // Baum ↔ Zeitleiste: derselbe Knoten bleibt fokussiert (B5).
-                    let node = rows.get(cursor).map(|r| r.node);
-                    let rows = if timeline {
-                        layout::timeline(&graph, self.zoom)
-                    } else {
-                        layout::rows(&graph, self.zoom)
-                    };
-                    let cursor = node
-                        .and_then(|n| layout::locate(&graph, self.zoom, &rows, n))
-                        .unwrap_or_else(|| cursor.min(rows.len().saturating_sub(1)));
-                    self.views.push(View::Graph {
+                    self.views.push(View::Story {
                         id,
-                        graph,
+                        story,
                         rows,
                         cursor,
-                        timeline,
-                    });
-                }
-            }
-            Some(View::Why {
-                origin,
-                chain,
-                mut cursor,
-                mut edge,
-                mut inspector,
-            }) => {
-                let last = chain.steps.len().saturating_sub(1);
-                // Wie viele Kanten das Glied unter `at` trägt — nur das
-                // Evidence-Glied hat welche; überall sonst ist der
-                // Sub-Cursor bedeutungslos (und bleibt 0).
-                let links_of = |at: usize| match chain.steps.get(at) {
-                    Some(WhyStep::Evidence { links }) => links.len(),
-                    _ => 0,
-                };
-                let mut keep = true;
-                // Der Inspector folgt dem Fokus: Bewegung schließt ihn und
-                // öffnet ihn nur auf dem Evidence-Glied neu; Esc schließt
-                // ihn, ohne dass er sofort wiederkommt.
-                let mut follow = true;
-                match action {
-                    Action::Up => {
-                        inspector = None;
-                        // Erst über die Kanten des Evidence-Glieds, dann
-                        // hinaus (#132) — von unten kommend landet der
-                        // Fokus auf der letzten Kante.
-                        if edge > 0 {
-                            edge -= 1;
-                        } else if cursor > 0 {
-                            cursor -= 1;
-                            edge = links_of(cursor).saturating_sub(1);
-                        }
-                    }
-                    Action::Down => {
-                        inspector = None;
-                        if edge + 1 < links_of(cursor) {
-                            edge += 1;
-                        } else if cursor < last {
-                            cursor += 1;
-                            edge = 0;
-                        }
-                    }
-                    Action::Home | Action::PageUp => {
-                        inspector = None;
-                        cursor = 0;
-                        edge = 0;
-                    }
-                    Action::End | Action::PageDown => {
-                        inspector = None;
-                        cursor = last;
-                        edge = 0;
-                    }
-                    Action::Back => {
-                        follow = false;
-                        if inspector.is_some() {
-                            inspector = None;
-                        } else {
-                            keep = false;
-                        }
-                    }
-                    Action::Enter => match chain.steps.get(cursor) {
-                        // Enter auf einer Kante springt in die Why-Kette
-                        // ihres Commits — dieselbe Bewegung wie auf dem
-                        // COMMIT-Glied; Esc trägt über den View-Stack
-                        // zurück (#132).
-                        Some(WhyStep::Evidence { links }) if !links.is_empty() => {
-                            let commit = links[edge.min(links.len() - 1)].commit;
-                            self.views.push(View::Why {
-                                origin,
-                                chain,
-                                cursor,
-                                edge,
-                                inspector,
-                            });
-                            let chain = self.inspection.why_commit(commit);
-                            self.push_why(WhyOrigin::Commit(commit), chain);
-                            return;
-                        }
-                        Some(WhyStep::Sessions { cards }) => {
-                            if let Some(card) = cards.first() {
-                                let id = card.id;
-                                self.views.push(View::Why {
-                                    origin,
-                                    chain,
-                                    cursor,
-                                    edge,
-                                    inspector,
-                                });
-                                self.push_graph(id);
-                                return;
-                            }
-                        }
-                        // Der Anker der Absicht: im Intent-Tab — der Stapel
-                        // bleibt, Tab führt zurück.
-                        Some(WhyStep::Intent {
-                            anchor: Some(anchor),
-                            ..
-                        }) => {
-                            let id = anchor.id.clone();
-                            self.views.push(View::Why {
-                                origin,
-                                chain,
-                                cursor,
-                                edge,
-                                inspector,
-                            });
-                            self.open_intent(Some(id));
-                            return;
-                        }
-                        Some(WhyStep::Commit {
-                            id: Some(commit), ..
-                        }) => {
-                            let commit = *commit;
-                            self.views.push(View::Why {
-                                origin,
-                                chain,
-                                cursor,
-                                edge,
-                                inspector,
-                            });
-                            let chain = self.inspection.why_commit(commit);
-                            self.push_why(WhyOrigin::Commit(commit), chain);
-                            return;
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
-                if keep {
-                    // Die Erklärung gehört zum Fokus, nicht zum Enter: Steht
-                    // der Cursor auf dem Evidence-Glied, wird die
-                    // **fokussierte** Kante erklärt — bei vielen Commits
-                    // bliebe das Panel sonst endlos (#132).
-                    if follow
-                        && inspector.is_none()
-                        && let Some(WhyStep::Evidence { links }) = chain.steps.get(cursor)
-                    {
-                        let focused = links
-                            .get(edge.min(links.len().saturating_sub(1)))
-                            .map(std::slice::from_ref)
-                            .unwrap_or(&[]);
-                        inspector = Some(self.inspection.explain_links(self.repo, focused));
-                    }
-                    self.views.push(View::Why {
-                        origin,
-                        chain,
-                        cursor,
-                        edge,
-                        inspector,
                     });
                 }
             }
@@ -2579,6 +2245,98 @@ impl<'a> App<'a> {
         }
     }
 
+    /// `Enter` auf einer Zeile der Story (C11): ein Schreibschritt öffnet den
+    /// Changes-Tab auf seiner Datei, ein delegierter Schritt und die
+    /// Kind-Zeile die Story des Sub-Agents, eine Übergabe die Story der
+    /// anderen Session, RESULT den Diff des Commits — alles andere sagt,
+    /// dass es nichts zu öffnen gibt (B4).
+    fn enter_story_row(
+        &mut self,
+        id: SessionId,
+        target: Option<RowKind>,
+        step: Option<minds_reader::story::Step>,
+    ) {
+        let commits = self
+            .inspection
+            .card(id)
+            .map(|card| card.commits.clone())
+            .unwrap_or_default();
+        let commit = commits.first().copied();
+        match (target, step) {
+            (Some(RowKind::Step(_)), Some(step)) if step.verb.writes() => {
+                if commits.is_empty() {
+                    self.closed = Some("Enter: no commit linked yet".into());
+                    return;
+                }
+                // Der volle Pfad aus dem Detail — das Ziel der Zeile ist gekürzt.
+                let path = step
+                    .detail
+                    .iter()
+                    .find(|(k, _)| k == "Path")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| step.target.clone());
+                // Der erste Commit der Session, dessen Diff die Datei trägt.
+                for commit in &commits {
+                    self.open_changes(Some(*commit));
+                    if self.changes.as_mut().is_some_and(|s| s.select_path(&path)) {
+                        return;
+                    }
+                }
+                self.open_changes(commit);
+                self.closed = Some(minds_reader::sanitize(&format!(
+                    "{path} is not in the diff of the session's commit"
+                )));
+            }
+            (Some(RowKind::Step(_)), Some(step))
+                if step.verb == minds_reader::story::Verb::Delegated =>
+            {
+                match step.child {
+                    Some(child) if self.inspection.story(child).is_some() => self.push_story(child),
+                    _ => {
+                        self.closed =
+                            Some("Enter: the subagent's session is not in this store".into())
+                    }
+                }
+            }
+            (Some(RowKind::Step(_)), Some(step)) => {
+                self.closed = Some(format!(
+                    "Enter: nothing to open for a {} step — the detail below says it all",
+                    step.verb.word()
+                ));
+            }
+            (Some(RowKind::Child { child, .. }), _) => {
+                if self.inspection.story(child).is_some() {
+                    self.push_story(child);
+                } else {
+                    self.closed = Some("that session is not readable".into());
+                }
+            }
+            (Some(RowKind::Handover(h)), _) => {
+                if self.inspection.story(h.other).is_some() {
+                    self.push_story(h.other);
+                } else {
+                    self.closed = Some("that session is not readable".into());
+                }
+            }
+            (Some(RowKind::Result), _) => match commit {
+                Some(commit) => self.open_changes(Some(commit)),
+                None => self.closed = Some("Enter: no commit linked yet".into()),
+            },
+            // Eine Zusammenfassung: Enter zeigt ihre Schritte (Zoom 2) und
+            // stellt den Cursor auf den ersten — was die Fußzeile verspricht.
+            (Some(RowKind::Run { first, .. }), _) => {
+                self.zoom = Zoom::Normal;
+                self.relayout();
+                if let Some(View::Story { rows, cursor, .. }) = self.views.last_mut()
+                    && let Some(at) = layout::locate(rows, first)
+                {
+                    *cursor = at;
+                }
+            }
+            _ => self.closed = Some("Enter: nothing to open here".into()),
+        }
+    }
+
     fn move_list(&mut self, by: usize) {
         self.cursor = (self.cursor + by).min(self.visible.len().saturating_sub(1));
     }
@@ -2593,14 +2351,7 @@ impl<'a> App<'a> {
             Action::End => self.cursor = self.visible.len().saturating_sub(1),
             Action::Enter => {
                 if let Some(card) = self.selected().filter(|c| !c.is_degraded()) {
-                    self.push_graph(card.id);
-                }
-            }
-            Action::Why => {
-                if let Some(id) = self.selected().filter(|c| !c.is_degraded()).map(|c| c.id)
-                    && let Some(chain) = self.inspection.why_session(id)
-                {
-                    self.push_why(WhyOrigin::Session(id), chain);
+                    self.push_story(card.id);
                 }
             }
             Action::Evidence => {
@@ -2761,11 +2512,6 @@ fn gone(id: SessionId) -> String {
     format!("session {}… is gone", short(id))
 }
 
-/// Die Session gibt es noch, aber ohne Herkunftskette (degradiert).
-fn no_chain(id: SessionId) -> String {
-    format!("session {}… has no why chain", short(id))
-}
-
 fn short(id: SessionId) -> String {
     let id = id.to_string();
     id.get(..12).unwrap_or(&id).to_string()
@@ -2793,15 +2539,6 @@ fn commit_inputs(inspection: &Inspection, commit: CommitId) -> (Vec<SessionId>, 
     )
 }
 
-/// Kopf und Blame-Ergebnis einer Zeilen-Kette — `None`, wenn sie nicht die
-/// Form hat, die `why_line` baut (dann wird voll neu gerechnet).
-fn blamed(chain: &WhyChain) -> Option<(WhyStep, Option<CommitId>)> {
-    match chain.steps.as_slice() {
-        [head @ WhyStep::Line { .. }, WhyStep::Commit { id, .. }, ..] => Some((head.clone(), *id)),
-        _ => None,
-    }
-}
-
 /// `HH:MM:SSZ` — UTC, wie die übrigen Zeiten der Oberfläche; ohne
 /// Datums-Crate keine Ortszeit.
 pub(crate) fn clock(now: SystemTime) -> String {
@@ -2821,8 +2558,7 @@ fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
         Tab::Sessions if !views.is_empty() => views
             .iter()
             .map(|view| match view {
-                View::Graph { id, .. } => format!("Session {}…", short(*id)),
-                View::Why { .. } => "Why".to_string(),
+                View::Story { id, .. } => format!("Session {}…", short(*id)),
                 View::Evidence { .. } => "Evidence".to_string(),
             })
             .collect(),

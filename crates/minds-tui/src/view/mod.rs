@@ -3,8 +3,9 @@
 //!
 //! Ist das Terminal breit genug, liegt die Liste dauerhaft links und rechts
 //! daneben das Detail: die oberste Ebene des Stapels — oder, solange der
-//! Stapel leer ist, der Graph der Karte unter dem Cursor als Vorschau, die
-//! mit dem Cursor wandert. Der Stapel selbst weiß davon nichts: Was `Enter`,
+//! Stapel leer ist, die Story der Karte unter dem Cursor als Vorschau, die
+//! mit dem Cursor wandert. Liegt eine Ebene, schrumpft die Liste auf eine
+//! schmale Spalte (C11) oder verschwindet unter 140 Spalten. Der Stapel selbst weiß davon nichts: Was `Enter`,
 //! `Esc` und die Suche tun, ändert sich nicht, nur wie viel Platz es bekommt.
 
 use ratatui::Frame;
@@ -23,13 +24,12 @@ pub mod activity;
 mod banner;
 pub mod changes;
 pub mod evidence;
-pub mod graph;
 pub mod help;
 mod intent;
 mod overview;
+pub mod story;
 pub mod trust;
 pub mod verify;
-pub mod why;
 
 #[cfg(test)]
 mod tests;
@@ -49,6 +49,9 @@ pub const SPLIT_MIN_WIDTH: u16 = LIST_MIN_WIDTH + GUTTER_WIDTH + DETAIL_MIN_WIDT
 /// Der Anteil der Liste an der Breite — begrenzt auf das, was ihre Spalten
 /// brauchen, und auf das, was ihnen noch etwas bringt.
 const LIST_SHARE_PERCENT: u32 = 40;
+/// Ab dieser Breite bleibt neben einer geöffneten Story die schmale Liste
+/// (C11); darunter bekommt die Story den ganzen Bildschirm.
+pub const STORY_SPLIT_MIN: u16 = 140;
 
 /// Die Meldung zu einer degradierten Karte — Fußzeile und Vorschau sagen
 /// dasselbe.
@@ -131,7 +134,7 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
     app.page = (body.height as usize)
         .saturating_sub(if app.top().is_none() { 3 } else { 2 })
         .max(1);
-    match split(body) {
+    match split(body, app.top().is_some()) {
         Some((list, detail)) => {
             activity::draw(frame, app, list);
             match app.top() {
@@ -151,8 +154,22 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
 }
 
 /// Liste links, Detail rechts — oder `None`, wenn beides nebeneinander
-/// keinen Platz hat.
-fn split(body: Rect) -> Option<(Rect, Rect)> {
+/// keinen Platz hat. Liegt eine Ebene (`open`), bleibt der Liste nur die
+/// schmale Spalte aus Zeit und Kurz-Überschrift (C11) — unter 140 Spalten
+/// keine.
+fn split(body: Rect, open: bool) -> Option<(Rect, Rect)> {
+    if open {
+        if body.width < STORY_SPLIT_MIN {
+            return None;
+        }
+        let [list, detail] = Layout::horizontal([
+            Constraint::Length(activity::NARROW_WIDTH),
+            Constraint::Min(1),
+        ])
+        .spacing(GUTTER_WIDTH)
+        .areas(body);
+        return Some((list, detail));
+    }
     if body.width < SPLIT_MIN_WIDTH {
         return None;
     }
@@ -167,20 +184,12 @@ fn split(body: Rect) -> Option<(Rect, Rect)> {
 /// Zeichnet eine gelegte Ebene in `area`.
 fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
     match view {
-        View::Graph {
+        View::Story {
             id,
+            story,
             rows,
             cursor,
-            timeline,
-            ..
-        } => graph::draw(frame, app, area, *id, rows, Some(*cursor), *timeline),
-        View::Why {
-            chain,
-            cursor,
-            edge,
-            inspector,
-            ..
-        } => why::draw(frame, area, chain, *cursor, *edge, inspector.as_deref()),
+        } => story::draw(frame, app, area, *id, story, rows, Some(*cursor)),
         View::Evidence {
             id,
             report,
@@ -199,7 +208,7 @@ fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
     }
 }
 
-/// Die Vorschau: der Graph der Karte unter dem Cursor, gezeichnet wie eine
+/// Die Vorschau: die Story der Karte unter dem Cursor, gezeichnet wie eine
 /// gelegte Ebene, aber ohne Cursor und ohne Stapel. Eine leere Liste lässt
 /// die Fläche leer — ihren Leerzustand sagt die Liste selbst.
 fn preview(frame: &mut Frame, app: &App, area: Rect) {
@@ -215,8 +224,8 @@ fn preview(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if let Some(rows) = app.preview_graph(card.id) {
-        graph::draw(frame, app, area, card.id, &rows, None, false);
+    if let Some((story, rows)) = app.preview_story(card.id) {
+        story::draw(frame, app, area, card.id, &story, &rows, None);
     }
 }
 
@@ -408,64 +417,40 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 }
             })
             .unwrap_or_default(),
-        // Graph (C1): der Satz zum Knoten unter dem Cursor — der Auftrag ist
-        // eine Aussage, ein ungedeuteter Aufruf beobachtet, sonst der
+        // Story (C11): der gewählte Schritt mit Verb und Ergebnis (`step 5 ·
+        // tests · ✓ 8 passed`); ein Zug ist eine Aussage; sonst der
         // Seal-Zustand der Session.
-        Some(View::Graph {
-            id, rows, cursor, ..
+        Some(View::Story {
+            id,
+            story,
+            rows,
+            cursor,
         }) => {
-            let word = match rows.get(*cursor).map(|r| &r.kind) {
-                Some(minds_reader::graph::NodeKind::Intent) => Some("claim"),
-                Some(minds_reader::graph::NodeKind::Tool(
-                    minds_reader::graph::ToolKind::Uninterpreted,
-                )) => Some(crate::copy::interpretation(
-                    minds_reader::model::InterpretationAxis::Uninterpreted(1),
-                )),
-                _ => None,
+            let row = rows.get(*cursor);
+            let sentence = match row.and_then(|row| story::footer_sentence(story, row)) {
+                Some((text, style)) => Line::from(Span::styled(text, style)),
+                None => match row.map(|r| &r.kind) {
+                    Some(crate::layout::RowKind::Turn(_)) => explain("claim"),
+                    _ => Line::from(Span::styled(
+                        app.inspection
+                            .card(*id)
+                            .map(|c| integrity_sentence(c.axes()))
+                            .unwrap_or_default(),
+                        theme::dim(),
+                    )),
+                },
             };
-            let sentence = match word {
-                Some(word) => explain(word),
-                None => Line::from(Span::styled(
-                    app.inspection
-                        .card(*id)
-                        .map(|c| integrity_sentence(c.axes()))
-                        .unwrap_or_default(),
-                    theme::dim(),
-                )),
-            };
-            // Ein großer Graph in der Übersicht sagt, dass mehr da ist (C7).
-            let full = app
-                .inspection
-                .graph(*id)
-                .map(|g| crate::layout::rows(&g, crate::Zoom::Normal).len())
-                .unwrap_or(0);
-            if app.zoom == crate::Zoom::Summary && full > crate::app::LARGE_GRAPH {
+            // Eine lange Story in der Zusammenfassung sagt, dass mehr da ist (C7).
+            let full = app.story_rows_normal(*id);
+            if app.zoom == crate::Zoom::Summary && full > crate::app::LARGE_STORY {
                 let mut spans = vec![Span::styled(
-                    format!("Summary of a large graph: {full} rows at zoom 2 — z shows more  ·  "),
+                    format!("Summary of a long story: {full} rows at zoom 2 — z shows more  ·  "),
                     theme::title(),
                 )];
                 spans.extend(sentence.spans);
                 Line::from(spans)
             } else {
                 sentence
-            }
-        }
-        Some(View::Why { chain, .. }) => {
-            let gaps = chain.gaps();
-            if gaps.is_empty() {
-                Line::from(Span::styled(
-                    "✓ no gap in the evidence links · intent is a recorded claim",
-                    Style::default().fg(theme::OK),
-                ))
-            } else {
-                Line::from(Span::styled(
-                    format!(
-                        "⚠ {} {} in the chain — see the block below",
-                        gaps.len(),
-                        if gaps.len() == 1 { "gap" } else { "gaps" }
-                    ),
-                    Style::default().fg(theme::REVIEW),
-                ))
             }
         }
         // Evidence: der Satz des Reports, dahinter der Glossar-Satz der
@@ -567,7 +552,7 @@ fn changes_actions(app: &App) -> Vec<String> {
     let open = state.map_or(0, |s| s.not_observed());
     let next = (open > 0).then(|| format!("n next not-observed ({open})"));
     let (head, tail): (&[&str], &[&str]) = match state.map(|c| c.focus) {
-        Some(Focus::Diff) => (&["↑↓ line", "] [ hunk"], &["s split", "w why chain"]),
+        Some(Focus::Diff) => (&["↑↓ line", "] [ hunk", "Enter story"], &["s split"]),
         _ => (
             &["↑↓ file", "Enter diff", "[ ] commit"],
             &["c why column", "/ filter"],
@@ -613,7 +598,7 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
                     if none {
                         "Enter its diff"
                     } else {
-                        "Enter its graph"
+                        "Enter its story"
                     },
                 ];
                 if let Some(hint) = space_hint(app) {
@@ -628,7 +613,7 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
                 if let Some(hint) = space_hint(app) {
                     keys.push(hint);
                 }
-                keys.extend(["w why", "v verify", "d diff"]);
+                keys.extend(["v verify", "d diff", "e evidence"]);
                 keys.truncate(6);
                 keys
             }
@@ -637,27 +622,26 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
             None => vec![
                 "↑↓ select",
                 "Enter descend",
-                "w why",
                 "e evidence",
+                "d diff",
                 "/ search",
                 "z Z zoom",
             ],
-            Some(View::Graph { .. }) => {
+            Some(View::Story { .. }) => {
                 vec![
-                    "↑↓ select",
-                    "Enter descend",
-                    "w why",
+                    "↑↓ step",
+                    "Enter open",
                     "e evidence",
+                    "d diff",
                     "z Z zoom",
                     "Esc back",
                 ]
             }
-            Some(View::Why { .. }) => vec!["↑↓ select", "Enter open", "e evidence", "Esc back"],
-            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "w why", "Esc back"],
+            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "d diff", "Esc back"],
         },
-        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "w why"],
+        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "e evidence"],
         Tab::Changes => Vec::new(),
-        Tab::Intent => vec!["↑↓ anchor", "Enter graph", "PgUp PgDn scroll", "/ filter"],
+        Tab::Intent => vec!["↑↓ anchor", "Enter story", "PgUp PgDn scroll", "/ filter"],
     }
 }
 
@@ -668,8 +652,7 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
     let session = match app.tab {
         Tab::Sessions => match app.top() {
             None => app.selected().filter(|c| !c.is_degraded()).map(|c| c.id),
-            Some(View::Graph { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
-            Some(View::Why { .. }) => None,
+            Some(View::Story { id, .. }) | Some(View::Evidence { id, .. }) => Some(*id),
         },
         _ => None,
     };
@@ -948,6 +931,50 @@ pub fn ago_secs(at: i64, now: i64) -> String {
         s if s < 3_600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3_600),
         s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// Warum eine Kante Commit ↔ Session im Index steht — der Satz zur
+/// [`EvidenceExplanation`] des Readers, für das Detail einer Änderung.
+pub(crate) fn explanation(why: &minds_reader::model::EvidenceExplanation) -> String {
+    use minds_reader::model::EvidenceExplanation;
+    match why {
+        EvidenceExplanation::Trailer { commit } => format!(
+            "Commit {} carries the Minds-Session-Id trailer — observed, no guessing.",
+            commit.to_string().chars().take(10).collect::<String>()
+        ),
+        EvidenceExplanation::Declared => "A human declared the connection (--after).".into(),
+        EvidenceExplanation::Content => {
+            "Recomputable from content: the bytes read are the bytes written.".into()
+        }
+        EvidenceExplanation::Heuristic {
+            shared_files,
+            seconds_apart,
+            in_window,
+        } => {
+            let files = if shared_files.is_empty() {
+                "no shared file".to_string()
+            } else {
+                format!(
+                    "{} shared file(s): {}",
+                    shared_files.len(),
+                    shared_files.join(", ")
+                )
+            };
+            let time = match (seconds_apart, in_window) {
+                (Some(s), Some(true)) => {
+                    format!("commit {s} s after session end, within the window")
+                }
+                (Some(s), Some(false)) => {
+                    format!("commit {s} s after session end, outside the window")
+                }
+                _ => "time distance not determinable".to_string(),
+            };
+            format!("Recomputed, not recorded: {files}; {time}.")
+        }
+        EvidenceExplanation::Unknown { reason } => {
+            format!("Reasons not reconstructable: {reason}.")
+        }
     }
 }
 

@@ -22,7 +22,8 @@ use crate::verify::Overall;
 /// Wie dicht die Komponente zeichnet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Density {
-    /// Drei Glyphen, je Slot eines (`◈ ● ◐`) — Übersichten.
+    /// Drei Glyphen, je Slot eines (`◈ ● ◐`) — Übersichten, die Kind-Zeile
+    /// der Story.
     Glyphs,
     /// Das Integritätswort, dahinter Coverage und Deutung als Glyph
     /// (`◈ sealed ● ◐`) — die Sessions-Liste: Legacy bleibt dort als Wort
@@ -152,6 +153,14 @@ pub fn interpretation(axis: InterpretationAxis) -> Slot {
             Style::default().fg(theme::REVIEW),
         ),
     }
+}
+
+/// Glyph, Wort und Stil der Deutungs-Achse für **einen** ungedeuteten
+/// Aufruf — ohne Zahl, für die Schrittzeile der Story (C11): dasselbe
+/// Vokabular wie [`interpretation`], nur ohne den Zähler.
+pub fn uninterpreted_one() -> (&'static str, &'static str, Style) {
+    let slot = interpretation(InterpretationAxis::Uninterpreted(1));
+    (slot.glyph, "uninterpreted", slot.style)
 }
 
 /// Die drei Slots in fester Reihenfolge.

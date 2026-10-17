@@ -56,7 +56,7 @@ fn badge(spans: &mut Vec<Span<'static>>, name: &str, agent: bool, nerd: bool) {
         let mark = if nerd {
             "\u{f06a9} "
         } else {
-            theme::node(&minds_reader::graph::NodeKind::Agent).0
+            theme::AGENT_GLYPH
         };
         pill(
             spans,
@@ -156,7 +156,7 @@ fn badge_text(name: &str, agent: bool, nerd: bool) -> Span<'static> {
         let mark = if nerd {
             "\u{f06a9}"
         } else {
-            theme::node(&minds_reader::graph::NodeKind::Agent).0
+            theme::AGENT_GLYPH
         };
         format!("{mark}{}", initials(name))
     } else {
@@ -203,8 +203,7 @@ fn graph_spans(row: &CommitRow, width: usize) -> Vec<Span<'static>> {
         // zeigt ihn mit dem Register-Glyph für „Commit" (A1) — `●` heißt
         // dort „beobachtet".
         let glyph = if cell.glyph == '●' {
-            let (commit, _, _) = theme::node(&minds_reader::graph::NodeKind::Commit(row.id));
-            Span::styled(commit, style.add_modifier(Modifier::BOLD))
+            Span::styled(theme::COMMIT_GLYPH, style.add_modifier(Modifier::BOLD))
         } else {
             Span::styled(cell.glyph.to_string(), style)
         };

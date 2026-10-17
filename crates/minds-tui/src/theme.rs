@@ -1,5 +1,5 @@
 //! Die visuelle Sprache: eine Farbe und ein Glyph je Bedeutung — an genau
-//! einer Stelle, damit Activity, Graph und Why dasselbe sagen.
+//! einer Stelle, damit Liste, Story, Changes und Übersicht dasselbe sagen.
 //!
 //! Farbe trägt nie allein: Jede Bedeutung hat auch ein Glyph **und** ein
 //! Wort, damit die Anzeige in einem monochromen Terminal dasselbe aussagt.
@@ -9,10 +9,10 @@
 //! Nur Unicode, das in gängigen Monospace-Fonts sicher ist; keine Emoji.
 
 use minds_core::{EvidenceMark, EvidenceSource, EvidenceStatus};
-use minds_reader::graph::{NodeKind, ToolKind};
 use minds_reader::model::Verdict;
 use minds_reader::model::{EvidenceVerdict, Provenance};
 use minds_reader::reconcile::ReconClass;
+use minds_reader::story::{Outcome, Verb};
 use ratatui::style::{Color, Modifier, Style};
 
 /// Mensch und Absicht.
@@ -256,6 +256,12 @@ pub fn provenance(provenance: &Provenance) -> (&'static str, &'static str, Style
 /// Die HEAD-Pille der Übersicht — eine Ref, kein Zustand.
 pub const HEAD: &str = "▲";
 
+/// Der Agent-Badge (Übersicht, Story) — eine Art, kein Zustand (A1).
+pub const AGENT_GLYPH: &str = "◉";
+
+/// Ein Commit im Graphen der Übersicht — eine Art, kein Zustand (A1).
+pub const COMMIT_GLYPH: &str = "■";
+
 /// Eine Session ohne Commit im Graphen der Übersicht — ein Platzhalter-
 /// Knoten, kein Claim.
 pub const PENDING: &str = "□";
@@ -347,46 +353,47 @@ pub fn verdict(verdict: Verdict) -> (&'static str, &'static str, Style) {
     }
 }
 
-/// Glyph, Wort und Stil eines Tool-Effekts.
-pub fn tool(kind: ToolKind) -> (&'static str, &'static str, Style) {
-    match kind {
-        ToolKind::Read => ("→", "READ", Style::default().fg(READ)),
-        ToolKind::Edit => ("✎", "EDIT", Style::default().fg(EDIT)),
-        ToolKind::Exec => ("▶", "EXEC", Style::default().fg(EXEC)),
-        ToolKind::Delete => ("✕", "DELETE", Style::default().fg(DELETE)),
-        ToolKind::Other => ("+", "TOOL", Style::default().fg(DIM)),
-        // Beobachtet, nicht gedeutet (ADR-0011): halb sichtbar — Wirkung
-        // unbekannt, und das darf man sehen.
-        ToolKind::Uninterpreted => ("◐", "OBSERVED", Style::default().fg(REVIEW)),
-    }
-}
-
-/// Glyph, Wort und Stil eines Graph-Knotens.
-pub fn node(kind: &NodeKind) -> (&'static str, &'static str, Style) {
-    match kind {
-        // Der Auftrag *ist* eine Aussage: dasselbe Glyph wie `claim`.
-        NodeKind::Intent => ("◌", "YOU", Style::default().fg(HUMAN)),
-        NodeKind::Agent => ("◉", "AGENT", Style::default().fg(AGENT)),
-        NodeKind::Turn(_) => ("›", "TURN", Style::default().fg(DIM)),
-        NodeKind::Tool(kind) => tool(*kind),
-        NodeKind::Subagent(_) => ("◉", "SUBAGENT", Style::default().fg(AGENT)),
-        NodeKind::Handover { .. } => ("⇄", "HANDOVER", Style::default().fg(OK)),
-        NodeKind::Change(_) => ("■", "CHANGE", Style::default().fg(CHANGE)),
-        NodeKind::Commit(_) => ("■", "COMMIT", Style::default().fg(CHANGE)),
-        NodeKind::Review(v) => {
-            let (glyph, _, style) = verdict(*v);
-            (glyph, "REVIEW", style)
+/// Glyph, Wort und Stil eines Schritt-Verbs der Story (C11): Kommandos
+/// `▶`, Schreibungen `✎`, Löschungen `✕`, Lesen/Suchen/Holen `→`,
+/// Delegation `◉` (der Sub-Agent), unbekannte Tools `+` — Strukturglyphen
+/// aus dem Register; das Wort ist das Verb.
+pub fn verb(verb: Verb) -> (&'static str, &'static str, Style) {
+    let word = verb.word();
+    match verb {
+        Verb::Ran | Verb::Tests | Verb::Bench | Verb::Lint | Verb::Build => {
+            ("▶", word, Style::default().fg(EXEC))
         }
+        Verb::Wrote | Verb::Edited => ("✎", word, Style::default().fg(EDIT)),
+        Verb::Deleted => ("✕", word, Style::default().fg(DELETE)),
+        Verb::Read | Verb::Searched | Verb::Fetched => ("→", word, Style::default().fg(READ)),
+        Verb::Delegated => ("◉", word, Style::default().fg(AGENT)),
+        Verb::Tool => ("+", word, Style::default().fg(DIM)),
     }
 }
 
-/// Der Stil einer Spur (Box-Zeichen) — menschlich bis zum Agenten, danach
-/// der Agent.
-pub fn lane(depth: usize) -> Style {
-    if depth == 0 {
-        Style::default().fg(HUMAN)
-    } else {
-        Style::default().fg(AGENT)
+/// Glyph, Wort und Stil einer Content-Übergabe (Evidence-DAG): dieselben
+/// Bytes, von der anderen Session geschrieben bzw. gelesen — nachgerechnet.
+pub fn handover() -> (&'static str, &'static str, Style) {
+    ("⇄", "HANDOVER", Style::default().fg(OK))
+}
+
+/// Glyph, Wort und Stil eines Kommando-Ergebnisses der Story (C11) — nur,
+/// was der Record kennt: Testzähler und Exit-Code als `✓`/`✗` (Prüfung
+/// bestanden / gescheitert), ein nicht gelesenes Ergebnis als `◦` (offen,
+/// kein Fehler). Benchmark-Werte sind kein Bestehen: Zahl ohne Glyph.
+pub fn outcome(outcome: Outcome) -> (&'static str, String, Style) {
+    match outcome {
+        Outcome::Tests { failed, .. } if failed > 0 => {
+            ("✗", format!("{failed} failed"), Style::default().fg(DELETE))
+        }
+        Outcome::Tests { passed, .. } => ("✓", format!("{passed} passed"), Style::default().fg(OK)),
+        Outcome::Benches(n) => ("", format!("{n} benches"), dim()),
+        Outcome::Exit(0) => ("✓", "exit 0".into(), Style::default().fg(OK)),
+        Outcome::Exit(code) => ("✗", format!("exit {code}"), Style::default().fg(DELETE)),
+        Outcome::NotCaptured(_) => {
+            let (glyph, _, style) = not_observed();
+            (glyph, "not captured".into(), style)
+        }
     }
 }
 

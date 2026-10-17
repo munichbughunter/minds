@@ -42,7 +42,7 @@ where a change came from:
 minds show                  # the session behind the last commit
 minds why src/retry.rs:42   # the session behind a single line
 minds recap                 # the latest sessions at a glance
-minds inspect               # the same as a TUI: sessions, graph, why chain, evidence (e)
+minds inspect               # the same as a TUI: sessions, story, changes with why-this-line, evidence (e)
 ```
 
 That is the daily loop. Two more become useful as soon as an agent starts the

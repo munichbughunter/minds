@@ -3,9 +3,12 @@
 //! Git beantwortet „was ist passiert?"; Minds beantwortet „warum, durch wen,
 //! mit welchen Schritten, mit welchem Beleg, mit welcher Bewertung?". Diese
 //! Oberfläche macht die Kette navigierbar: eine **Activity**-Liste der
-//! Sessions, der **Graph** einer Session (Absicht → Agent → Effekte →
-//! Änderung → Review) und die **Why**-Kette einer Zeile oder eines Commits
-//! samt Inspector, der jede Kante erklärt.
+//! Sessions, die **Story** einer Session (die Schritte des Agenten in
+//! Reihenfolge, mit Ergebnis, C11), der **Evidence**-Report einer Session
+//! und der **Changes**-Tab, dessen Why-Box jede Zeile ihrer Herkunft
+//! zuordnet. Die
+//! Herkunftskette als eigene Ebene gibt es seit C10 nicht mehr; `minds why`
+//! (CLI) und der Pipe-Modus liefern sie weiter.
 //!
 //! # Leitplanken
 //!
@@ -49,7 +52,9 @@ pub use layout::Zoom;
 pub enum Start {
     /// Die Liste.
     Activity,
-    /// Die Herkunftskette einer Zeile.
+    /// Eine Zeile: im Terminal der Changes-Tab auf HEAD mit dem Cursor auf
+    /// ihr (die Why-Box sagt, woher sie stammt); in der Pipe die
+    /// Herkunftskette von `minds why`.
     Why {
         /// Der Pfad.
         path: String,
@@ -295,7 +300,7 @@ pub fn run(source: &dyn Source, repo: &Repo, opts: Options) -> Result<(), TuiErr
     // Wie die CLI: `NO_COLOR` (nicht leer) schaltet alle Farben ab (C6).
     app.no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     if let Start::Why { path, line } = &opts.start {
-        app.open_why_line(path, *line)?;
+        app.open_line(path, *line);
     } else if start_overview {
         // Ohne Suche beginnt die Oberfläche mit der Übersicht.
         app.open_overview();
