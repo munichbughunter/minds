@@ -218,7 +218,9 @@ fn c36_coverage_names_its_reason_and_the_missing_claims() {
     );
     assert!(detail.contains("all 4"), "{detail}");
     assert!(detail.contains("session records 0 files"), "{detail}");
-    assert!(detail.contains("→ d, then n"), "{detail}");
+    // Die Aktion steht in NEXT (C3.7), nicht als Unterzeile der Achse.
+    assert!(!detail.contains("→ d, then n"), "{detail}");
+    assert!(detail.contains("NEXT"), "{detail}");
     // Eine Quelle: die Gründe summieren sich zu `◦n` des Changes-Tabs.
     let set = app.inspection.changes(&repo, commit).unwrap();
     let classes = set.line_classes();

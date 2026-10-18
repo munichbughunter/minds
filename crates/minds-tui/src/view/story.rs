@@ -32,6 +32,10 @@ const LABEL_W: usize = 13;
 const RIGHT_W: usize = 16;
 /// Die Breite der Zeitspalte (`+12:34`).
 const TIME_W: usize = 7;
+/// So viele Zeilen Antworttext des Modells zeigt das Schritt-Detail (C8) —
+/// wenige, damit die Evidenzzeile darüber nie aus der Box fällt; die
+/// Zugzeile (Zoom 3) zeigt den Text ganz.
+const AGENT_SAID_MAX: usize = 6;
 
 /// Zeichnet die Story. `cursor` ist `None` für die Vorschau neben der
 /// Liste: kein Fokus, keine hervorgehobene Zeile, keine Detailbox.
@@ -594,7 +598,9 @@ fn detail(
                 }
                 lines.push(Line::from(vec![key("Time"), Span::raw(text)]));
             }
-            // Der Evidenzzustand einer Schreibung mit seinem Satz (C9.3).
+            // Der Evidenzzustand einer Schreibung mit seinem Satz (C9.3) —
+            // vor dem Text des Agenten: Evidenz vor Aussage, auch im Platz.
+
             if let Some(claim) = step.claim {
                 let (glyph, word, style) =
                     theme::state(minds_reader::reconcile::ReconClass::ReportedOnly);
@@ -618,6 +624,32 @@ fn detail(
                 ) {
                     lines.push(Line::from(Span::styled(
                         format!("{:<10} {sentence}", ""),
+                        theme::dim(),
+                    )));
+                }
+            }
+            // Der Antworttext des Modells zu diesem Zug (C8): im Detail in
+            // jeder Zoomstufe — als Aussage, wenige Zeilen, der Rest gezählt.
+            if let Some(turn) = story
+                .turns
+                .get(step.turn)
+                .filter(|t| t.role == minds_core::Role::Assistant && !t.text.is_empty())
+            {
+                let (glyph, _, claim_style) = theme::claim();
+                let text: Vec<&str> = turn.text.lines().filter(|l| !l.trim().is_empty()).collect();
+                for (n, line) in text.iter().take(AGENT_SAID_MAX).enumerate() {
+                    lines.push(Line::from(vec![
+                        key(if n == 0 { "Agent said" } else { "" }),
+                        Span::styled(format!("{glyph} {line}"), claim_style),
+                    ]));
+                }
+                if text.len() > AGENT_SAID_MAX {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{:<10} … {} more lines — z 3, then the turn row",
+                            "",
+                            text.len() - AGENT_SAID_MAX
+                        ),
                         theme::dim(),
                     )));
                 }

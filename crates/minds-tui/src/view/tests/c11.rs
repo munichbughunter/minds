@@ -394,6 +394,86 @@ fn c11_enter_on_result_opens_the_diff_and_on_a_command_says_so() {
     assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
 }
 
+/// C8: Der Antworttext des Modells steht im Schritt-Detail in jeder
+/// Zoomstufe — als Aussage (`◌`), nicht nur in Zoom 3.
+#[test]
+fn c8_the_agents_text_is_in_the_step_detail_in_every_zoom() {
+    let (_dir, repo) = repo();
+    let mut app = App::new(demo(), &repo, None);
+    open_parent(&mut app);
+    for zoom in [1u8, 2, 3] {
+        app.reduce(Action::Zoom(zoom));
+        app.reduce(Action::Home);
+        // Zoom 3 beginnt mit der Zugzeile — auf den ersten Schritt.
+        while !matches!(
+            app.top(),
+            Some(View::Story { rows, cursor, .. })
+                if matches!(rows[*cursor].kind, RowKind::Step(_))
+        ) {
+            app.reduce(Action::Down);
+        }
+        let out = render_sized(&mut app, 160, 40);
+        let said = out
+            .lines()
+            .find(|l| l.contains("Agent said"))
+            .unwrap_or_else(|| panic!("zoom {zoom}\n{out}"));
+        assert!(
+            said.contains("◌ Ich lese zuerst, dann schreibe ich."),
+            "zoom {zoom}\n{out}"
+        );
+        assert!(!said.contains('✓'), "a claim is never a check\n{out}");
+    }
+}
+
+/// C8: Ein langer Antworttext verdrängt die Evidenzzeile einer Schreibung
+/// nicht aus der Detailbox — Evidenz steht vor der Aussage, der Text ist
+/// gekappt und zählt den Rest.
+#[test]
+fn c8_a_long_answer_never_hides_the_write_evidence() {
+    let mut s = session("Write a lot", "2026-10-16T10:37:12Z");
+    s.turns[0].text = (1..=40)
+        .map(|n| format!("line {n:02} of the answer"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    s.turns[0].tool_calls = vec![call(
+        "Write",
+        "{\"file_path\":\"src/a.rs\"}",
+        Some(Effect {
+            kind: EffectKind::Write,
+            path: Some("src/a.rs".into()),
+            content: None,
+            written: Some(minds_core::ContentHash::from_bytes([1u8; 32])),
+            written_unavailable: None,
+        }),
+    )];
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), s);
+    let inspection = Inspection::from_index(
+        Index::from_parts(sessions, BTreeMap::new()),
+        Vec::new(),
+        "demo",
+    );
+    let (_dir, repo) = repo();
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Enter);
+    for (w, h) in [(120u16, 30u16), (160, 40)] {
+        let out = render_sized(&mut app, w, h);
+        let evidence = out
+            .lines()
+            .position(|l| l.contains("Evidence") && l.contains("◇ reported"));
+        let said = out.lines().position(|l| l.contains("Agent said"));
+        assert!(evidence.is_some(), "{w}x{h}: evidence line\n{out}");
+        assert!(said.is_some(), "{w}x{h}: agent said\n{out}");
+        assert!(evidence < said, "{w}x{h}: evidence before the claim\n{out}");
+        // Die Box zeigt vom Text, was nach der Evidenz noch Platz hat — der
+        // ganze Text steht auf der Zugzeile (Zoom 3), nie hier.
+        assert!(
+            !out.contains("line 40 of the answer") && !out.contains("line 07 of the answer"),
+            "{w}x{h}: capped\n{out}"
+        );
+    }
+}
+
 /// `t` ist frei (C11): keine Zeitleiste mehr — die Story ist sie.
 #[test]
 fn c11_t_is_free_and_there_is_no_timeline() {

@@ -16,9 +16,17 @@ use crate::index::Index;
 use crate::model::{ReviewState, Verdict};
 use crate::text::{sanitize, sanitize_lines, sanitize_path};
 
-/// Auf so viele Zeichen werden Argumente und Zugtexte im Detail gekürzt —
-/// Zeichen, nicht Bytes, damit kein Umlaut zerschnitten wird.
+/// Auf so viele Zeichen werden Beschriftungen gekürzt — und, mit
+/// [`SessionGraph::of`], auch Argumente und Zugtexte im Detail — Zeichen,
+/// nicht Bytes, damit kein Umlaut zerschnitten wird.
 pub const DETAIL_MAX: usize = 120;
+
+/// Die Grenze für Argumente und Zugtexte im Detail, wenn ein Leser sie
+/// vollständig will (C8): [`crate::Inspection::graph`] baut den Graphen
+/// damit über [`SessionGraph::of_with`]. Danach steht `…`. (Die TUI zeigt
+/// Kommandos über [`crate::story`]; `minds show` und die HTML-Seite
+/// rendern keine Tool-Argumente.)
+pub const ARGUMENTS_MAX: usize = 4_000;
 
 /// Was ein Tool in der Welt getan hat, in der Sprache der Oberfläche.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,8 +130,22 @@ pub struct SessionGraph {
 
 impl SessionGraph {
     /// Baut den Graphen einer Session. `review` ist der Stand, den die
-    /// Oberfläche am Ende zeigt.
+    /// Oberfläche am Ende zeigt. Argumente und Zugtexte im Detail sind auf
+    /// [`DETAIL_MAX`] gekürzt — [`Self::of_with`] nimmt eine eigene Grenze.
     pub fn of(id: SessionId, session: &Session, index: &Index, review: &ReviewState) -> Self {
+        Self::of_with(id, session, index, review, DETAIL_MAX)
+    }
+
+    /// Wie [`Self::of`], mit `detail_max` als Grenze für Argumente und
+    /// Zugtexte im Detail (C8: [`ARGUMENTS_MAX`] zeigt ein Kommando ganz).
+    /// Gekürzt wird immer — die Grenze ist ein Parameter, kein Schalter.
+    pub fn of_with(
+        id: SessionId,
+        session: &Session,
+        index: &Index,
+        review: &ReviewState,
+        detail_max: usize,
+    ) -> Self {
         let mut graph = Self::default();
 
         let intent = graph.push(
@@ -152,6 +174,10 @@ impl SessionGraph {
         // Platzhalter aus `minds-capture` wird nie gedruckt; ein fehlendes
         // Modell nennt den Grund aus der Lineage.
         let actor = crate::summary::Actor::of(session);
+        // Das Arbeitsverzeichnis (es trägt den Benutzernamen) fällt aus
+        // Argumenten und Zugtexten heraus wie in der Story — bei 4 000
+        // Zeichen stünde es sonst da.
+        let cwd = session.lineage.as_ref().and_then(|l| l.cwd.as_deref());
         let not_recorded = || "not recorded".to_string();
         let agent = graph.push(
             Some(intent),
@@ -209,7 +235,10 @@ impl SessionGraph {
                 Some(parent),
                 NodeKind::Turn(turn.role.clone()),
                 label,
-                vec![("Text".into(), truncate(&sanitize(text)))],
+                vec![(
+                    "Text".into(),
+                    truncate(&sanitize(&crate::story::hide_paths(text, cwd)), detail_max),
+                )],
                 turn.at.clone(),
                 None,
             );
@@ -237,7 +266,13 @@ impl SessionGraph {
                 };
                 let mut detail = vec![
                     ("Tool".into(), sanitize(&call.name)),
-                    ("Arguments".into(), truncate(&sanitize(&call.arguments))),
+                    (
+                        "Arguments".into(),
+                        truncate(
+                            &sanitize(&crate::story::hide_paths(&call.arguments, cwd)),
+                            detail_max,
+                        ),
+                    ),
                 ];
                 if let Some(capture) = &call.capture {
                     let status = match capture.status {
@@ -453,12 +488,12 @@ fn role_word(role: &Role) -> &'static str {
     }
 }
 
-/// Kürzt auf [`DETAIL_MAX`] Zeichen.
-fn truncate(text: &str) -> String {
-    if text.chars().count() <= DETAIL_MAX {
+/// Kürzt auf `max` Zeichen.
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
         return text.to_string();
     }
-    let cut: String = text.chars().take(DETAIL_MAX).collect();
+    let cut: String = text.chars().take(max).collect();
     format!("{cut}…")
 }
 
@@ -798,5 +833,80 @@ mod tests {
         assert!(args.ends_with('…'));
         assert!(args.chars().count() <= DETAIL_MAX + 1);
         assert_eq!(g.nodes[2].label, "ASSISTANT");
+    }
+
+    /// C8: Mit der vollen Grenze steht ein Kommando von 300 Zeichen ganz im
+    /// Detail — entschärft bleibt es; gekürzt wird weiter, nur später.
+    #[test]
+    fn a_long_command_stays_whole_with_the_full_limit() {
+        let mut s = session("x");
+        let long = "a".repeat(300);
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            None,
+            vec![call(
+                "Bash",
+                &format!("\u{1b}[2K{long}"),
+                Some(EffectKind::Other),
+                None,
+            )],
+        ));
+        let index = Index::from_parts(BTreeMap::new(), BTreeMap::new());
+        let g = SessionGraph::of_with(sid('a'), &s, &index, &ReviewState::open(), ARGUMENTS_MAX);
+        let args = &g.nodes[3]
+            .detail
+            .iter()
+            .find(|(k, _)| k == "Arguments")
+            .unwrap()
+            .1;
+        assert!(!args.contains('\u{1b}'));
+        assert!(!args.ends_with('…'), "{args}");
+        assert!(args.ends_with(&long));
+        // Über der Grenze wird weiter gekürzt.
+        let mut s = session("x");
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            None,
+            vec![call(
+                "Bash",
+                &"b".repeat(ARGUMENTS_MAX + 5),
+                Some(EffectKind::Other),
+                None,
+            )],
+        ));
+        let g = SessionGraph::of_with(sid('a'), &s, &index, &ReviewState::open(), ARGUMENTS_MAX);
+        let args = &g.nodes[3]
+            .detail
+            .iter()
+            .find(|(k, _)| k == "Arguments")
+            .unwrap()
+            .1;
+        assert!(args.ends_with('…'));
+        assert!(args.chars().count() <= ARGUMENTS_MAX + 1);
+        // Und ein Home-Pfad in den Argumenten wird `~` — wie in der Story.
+        let mut s = session("x");
+        s.lineage = Some(Lineage::new("p"));
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            None,
+            vec![call(
+                "Write",
+                "{\"file_path\":\"/Users/alice/dev/repo/x.rs\"}",
+                Some(EffectKind::Write),
+                Some("/Users/alice/dev/repo/x.rs"),
+            )],
+        ));
+        let g = SessionGraph::of_with(sid('a'), &s, &index, &ReviewState::open(), ARGUMENTS_MAX);
+        let args = &g.nodes[3]
+            .detail
+            .iter()
+            .find(|(k, _)| k == "Arguments")
+            .unwrap()
+            .1;
+        assert!(args.contains("~/dev/repo/x.rs"), "{args}");
+        assert!(!args.contains("/Users/"), "{args}");
     }
 }

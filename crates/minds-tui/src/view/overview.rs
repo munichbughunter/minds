@@ -1243,7 +1243,192 @@ fn evidence_lines(
         mark(glyph, word, style)
     };
     lines.push(axis("REVIEW", vec![review]));
+    // NEXT (C3.7): die oberste Zeile, die nicht ✓ ist, bestimmt die nächste
+    // Aktion — eine Zeile, nie mehr; dieselbe steht in Fußzeile 1.
+    lines.push(axis(
+        "NEXT",
+        vec![Span::styled(
+            format!("→ {}", next_action(state, row, cards)),
+            Style::default().add_modifier(Modifier::BOLD),
+        )],
+    ));
     lines
+}
+
+/// Die nächste Aktion (C3.7): die oberste Zeile in EVIDENCE, die nicht ✓
+/// ist, bestimmt sie — INTEGRITY vor COVERAGE vor INTERPRETATION vor
+/// REQUIREMENT vor REVIEW. Eine Zeile mit `·` („trifft nicht zu“: kein
+/// Anker, keine Zeilen, nur nicht gediffte Dateien) zählt nicht — außer
+/// `· no session readable`: eine unlesbare Session ist offen, NEXT führt zur
+/// Evidenz; eine Zeile mit `…` (noch zählend, noch lesend) heißt warten —
+/// nichts darunter wird empfohlen. Nur Aktionen, die es gibt; die TUI schreibt nicht, also
+/// stehen `minds intent sign` und `minds review` als Text. Alles ✓: nur
+/// noch nachvollziehen (`Enter`) — ein Review mit Befund sagt ihn dazu.
+pub(crate) fn next_action(
+    state: &crate::overview::OverviewState,
+    row: &CommitRow,
+    cards: &[Option<minds_reader::model::SessionCard>],
+) -> String {
+    use crate::verify::Overall;
+    use minds_reader::assurance::{IntentSignature, IntentState};
+    let check = state.checks.get(&row.id);
+    match overall_of(row, check) {
+        Some(Overall::Tampered) => {
+            return "e: evidence of the session — what was altered".into();
+        }
+        Some(Overall::Incomplete) => {
+            return "e: evidence of the session — where the record ends".into();
+        }
+        Some(Overall::NotVerifiable) => {
+            return "e: evidence of the session — nothing sealed to verify".into();
+        }
+        Some(Overall::Checking) | Some(Overall::NotChecked) | None => {
+            return "v: run verify".into();
+        }
+        Some(Overall::Verified) | Some(Overall::NoSession) => {}
+    }
+    let plural = |n: usize| if n == 1 { "line" } else { "lines" };
+    match state.lines.get(&row.id) {
+        // Zählt noch: die Achse ist nicht ✓ — also auch nichts weiter unten
+        // empfehlen, bis die Zahl steht.
+        None => return "wait — the lines are still being counted".into(),
+        Some(Err(_)) => return "d: open the diff — the lines could not be assessed".into(),
+        Some(Ok(c)) if c.all_explained() || c.added == 0 => {}
+        Some(Ok(c)) => {
+            if c.unexplained > 0 {
+                return format!(
+                    "d: inspect the {} {} not observed (n jumps on)",
+                    c.unexplained,
+                    plural(c.unexplained)
+                );
+            }
+            if c.stated > 0 {
+                return format!(
+                    "d: inspect the {} {} the agent claims without a hash",
+                    c.stated,
+                    plural(c.stated)
+                );
+            }
+            if c.fs_only > 0 {
+                return format!(
+                    "d: inspect the {} {} seen in the file system only",
+                    c.fs_only,
+                    plural(c.fs_only)
+                );
+            }
+            if c.not_assessed > 0 {
+                return format!(
+                    "d: open the diff — {} {} not assessed",
+                    c.not_assessed,
+                    plural(c.not_assessed)
+                );
+            }
+            // Nur nicht gediffte Dateien: die Achse zeigt `·` — trifft nicht zu.
+        }
+    }
+    // Eine ungelesene Session: über ihre Deutung ist nichts gesagt — die
+    // Achse zeigt `no session readable`, NEXT führt zur Evidenz.
+    if cards.iter().any(Option::is_none) {
+        return "e: evidence — a session is not readable".into();
+    }
+    let uninterpreted: usize = cards.iter().flatten().map(|c| c.uninterpreted_calls).sum();
+    if uninterpreted > 0 {
+        return format!(
+            "e: evidence — {uninterpreted} uninterpreted call{}",
+            if uninterpreted == 1 { "" } else { "s" }
+        );
+    }
+    if let Some(anchor) = row.anchors.first() {
+        let bound = match check {
+            Some(Ok(c)) => c.sessions.iter().find_map(|s| match &s.intent {
+                IntentState::Bound { chained, .. } => Some(*chained),
+                _ => None,
+            }),
+            _ => None,
+        };
+        if bound != Some(true) {
+            return "i: Intent tab — the binding is not proven".into();
+        }
+        match state.requirements.get(anchor) {
+            // Noch nicht gelesen: die Achse zeigt `… checking`.
+            None => return "wait — the requirement is still being read".into(),
+            Some(Err(_)) => return "i: Intent tab — the anchor could not be read".into(),
+            Some(Ok(d)) => {
+                if d.proof.is_err() {
+                    return "i: Intent tab — the requirement is not proven".into();
+                }
+                match d.signature {
+                    IntentSignature::Valid(_) => {}
+                    IntentSignature::Unsigned => return format!("minds intent sign {anchor}"),
+                    IntentSignature::NotChecked => {
+                        return "i: Intent tab — why the signature is not checked".into();
+                    }
+                    IntentSignature::Invalid => {
+                        return "i: Intent tab — the signature is invalid".into();
+                    }
+                }
+            }
+        }
+    }
+    // `minds review` nimmt eine Change-Id oder eine Session-Id — dasselbe
+    // Subjekt, aus dem das Urteil der Zeile stammt; nie den Commit.
+    let subject = match (&row.change, row.sessions.first()) {
+        (Some(change), _) => change.to_string(),
+        (None, Some(session)) => session.to_string(),
+        (None, None) => String::new(),
+    };
+    match row.review {
+        Verdict::Open if subject.is_empty() => "minds review … — nobody has decided yet".into(),
+        Verdict::Open => format!("minds review {subject} … — nobody has decided yet"),
+        // Ein Befund ist kein offener Schritt der Oberfläche — aber auch
+        // nicht „nichts offen“: Enter zeigt die Entstehung, der Befund steht
+        // dabei.
+        Verdict::NeedsWork => "Enter: how it was made — the review says needs work".into(),
+        Verdict::Rejected => "Enter: how it was made — the review rejected it".into(),
+        Verdict::Approved => "Enter: how it was made — nothing is open".into(),
+    }
+}
+
+/// Die nächste Aktion des gewählten Commits der Übersicht — für Fußzeile 1;
+/// `None` ohne Commit mit Session.
+pub(crate) fn next_action_of(app: &App) -> Option<String> {
+    let state = app.overview.as_ref()?;
+    let Some(Selected::Commit(row)) = state.selected() else {
+        return None;
+    };
+    if row.sessions.is_empty() {
+        return None;
+    }
+    let cards: Vec<Option<minds_reader::model::SessionCard>> = row
+        .sessions
+        .iter()
+        .map(|sid| app.inspection.card(*sid))
+        .collect();
+    Some(next_action(state, row, &cards))
+}
+
+/// Das Gesamturteil der INTEGRITY-Zeile aus Seal-Zustand und Prüfung —
+/// `None`, wenn die Prüfung selbst scheiterte.
+fn overall_of(
+    row: &CommitRow,
+    check: Option<&Result<crate::CommitVerify, String>>,
+) -> Option<crate::verify::Overall> {
+    use crate::verify::Overall;
+    let tampered_cli = matches!(check, Some(Ok(c)) if c.sessions.iter().any(|s| s.tampered));
+    if row.seal == Some(SealMark::Tampered) || tampered_cli {
+        return Some(Overall::Tampered);
+    }
+    match check {
+        None => Some(Overall::Checking),
+        Some(Err(_)) => None,
+        Some(Ok(c)) => Some(match &c.verdict {
+            Ok(crate::VerifyVerdict::Verified) => Overall::Verified,
+            Ok(crate::VerifyVerdict::Incomplete) => Overall::Incomplete,
+            Ok(crate::VerifyVerdict::Tampered) => Overall::Tampered,
+            Ok(crate::VerifyVerdict::NotVerifiable) => Overall::NotVerifiable,
+            Err(_) => Overall::NotChecked,
+        }),
+    }
 }
 
 /// INTEGRITY: das Urteil von `minds verify`, in seinen Wörtern. Vor dem
@@ -1253,22 +1438,7 @@ fn integrity_lines(
     check: Option<&Result<crate::CommitVerify, String>>,
 ) -> Vec<Line<'static>> {
     use crate::verify::Overall;
-    let tampered_cli = matches!(check, Some(Ok(c)) if c.sessions.iter().any(|s| s.tampered));
-    let overall = if row.seal == Some(SealMark::Tampered) || tampered_cli {
-        Some(Overall::Tampered)
-    } else {
-        match check {
-            None => Some(Overall::Checking),
-            Some(Err(_)) => None,
-            Some(Ok(c)) => Some(match &c.verdict {
-                Ok(crate::VerifyVerdict::Verified) => Overall::Verified,
-                Ok(crate::VerifyVerdict::Incomplete) => Overall::Incomplete,
-                Ok(crate::VerifyVerdict::Tampered) => Overall::Tampered,
-                Ok(crate::VerifyVerdict::NotVerifiable) => Overall::NotVerifiable,
-                Err(_) => Overall::NotChecked,
-            }),
-        }
-    };
+    let overall = overall_of(row, check);
     let mut out = Vec::new();
     match overall {
         Some(Overall::Checking) => {
@@ -1471,9 +1641,7 @@ pub(crate) fn coverage_lines_with(
             out.push(under(part, theme::dim()));
         }
     }
-    if c.unexplained > 0 {
-        out.push(under("→ d, then n".into(), theme::dim()));
-    }
+    // Die Aktion steht in NEXT (C3.7) — eine Aktionszeile, nicht zwei.
     out
 }
 
@@ -1565,7 +1733,6 @@ fn requirement_lines(
         }
     };
     let mut spans = vec![bound, dot()];
-    let mut next = None;
     match state.requirements.get(anchor) {
         None => spans.push(mark("…", "checking", theme::dim())),
         Some(Err(_)) => spans.push(mark(
@@ -1581,10 +1748,8 @@ fn requirement_lines(
             spans.push(dot());
             spans.push(match &d.signature {
                 IntentSignature::Valid(_) => mark("✓", "signed", ok()),
-                IntentSignature::Unsigned => {
-                    next = Some("→ minds intent sign <id> (Intent tab, i)".to_string());
-                    mark(open_glyph, "not signed", open_style)
-                }
+                // Die Aktion (`minds intent sign <anchor>`) steht in NEXT (C3.7).
+                IntentSignature::Unsigned => mark(open_glyph, "not signed", open_style),
                 IntentSignature::NotChecked => mark(
                     "?",
                     "signature not checked",
@@ -1606,9 +1771,6 @@ fn requirement_lines(
             ),
             theme::dim(),
         ));
-    }
-    if let Some(next) = next {
-        out.push(under(next, theme::dim()));
     }
     out
 }

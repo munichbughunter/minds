@@ -351,14 +351,17 @@ impl Inspection {
         Some(crate::story::Story::of(id, session, &self.index))
     }
 
-    /// Der Graph einer Session.
+    /// Der Graph einer Session — Argumente und Zugtexte im Detail bis
+    /// [`crate::graph::ARGUMENTS_MAX`] (C8), damit ein Leser des Graphen ein
+    /// Kommando ganz sieht; Beschriftungen bleiben kurz.
     pub fn graph(&self, id: SessionId) -> Option<SessionGraph> {
         let session = self.index.session(id)?;
-        Some(SessionGraph::of(
+        Some(SessionGraph::of_with(
             id,
             session,
             &self.index,
             &self.review_state(id),
+            crate::graph::ARGUMENTS_MAX,
         ))
     }
 
