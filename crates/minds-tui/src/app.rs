@@ -199,6 +199,11 @@ pub struct App<'a> {
     /// Was beim letzten Neuladen geschlossen wurde und warum — etwa eine
     /// Zeilen-Kette, deren Datei gerade fehlt.
     pub closed: Option<String>,
+    /// `v` in der Evidence-Ebene (C12.1): der Commit, dessen Prüfung der
+    /// Nutzer dort verlangt hat — die Ebene zeigt `… checking`, bis das
+    /// Urteil da ist. Nur die ausdrückliche Bitte zählt, nicht eine
+    /// ausstehende Prüfung der Übersicht.
+    pub verify_asked: Option<CommitId>,
     /// Der sichtbare Tab.
     pub tab: Tab,
     /// Der Changes-Tab — erst beim ersten Öffnen geladen (er liest Blobs).
@@ -358,6 +363,7 @@ impl<'a> App<'a> {
             failed_stamp: None,
             live: true,
             closed: None,
+            verify_asked: None,
             tab: Tab::Sessions,
             changes: None,
             intent: None,
@@ -558,6 +564,62 @@ impl<'a> App<'a> {
         }
         state.recheck();
         self.tab = Tab::Overview;
+    }
+
+    /// `v` in der Evidence-Ebene (C12.1): prüft den Commit, dessen Abgleich
+    /// die Ebene zeigt — über die Übersicht, die das Urteil hält (derselbe
+    /// Worker, dieselbe Drossel: sofort, weil vom Nutzer verlangt) —, ohne
+    /// die Ebene zu verlassen. Liegt der Commit nicht in der gelesenen
+    /// Historie, bleibt `minds verify` als Hinweis.
+    fn verify_in_evidence(&mut self, commit: CommitId) {
+        let was = self.tab;
+        self.open_overview();
+        self.tab = was;
+        let Some(state) = self.overview.as_mut() else {
+            return;
+        };
+        if !state.select_commit(commit) {
+            let id = commit.to_string();
+            let short = id.get(..7).unwrap_or(&id);
+            self.closed = Some(format!(
+                "v: run minds verify {short} — not in the history read"
+            ));
+            return;
+        }
+        state.recheck();
+        self.verify_asked = Some(commit);
+    }
+
+    /// Der Commit, dessen Urteil die offene Evidence-Ebene zeigt — der
+    /// erste abgeglichene; `None` ohne Ebene oder ohne Commit.
+    fn evidence_commit(&self) -> Option<CommitId> {
+        match self.top() {
+            Some(View::Evidence { artifacts, .. }) => artifacts.first().map(|a| a.commit),
+            _ => None,
+        }
+    }
+
+    /// Ob eine ausstehende Prüfung jetzt laufen soll: in der Übersicht
+    /// (ihr Detail zeigt das Urteil) oder in einer Evidence-Ebene (C12.1,
+    /// sie zeigt dasselbe Urteil).
+    pub fn check_wanted(&self) -> bool {
+        self.tab == Tab::Overview
+            || self
+                .evidence_commit()
+                .is_some_and(|commit| self.verify_asked == Some(commit))
+    }
+
+    /// Ob die Prüfung eines Commits, der die Session trägt, gerade läuft
+    /// oder gleich läuft (`v`, C12.1) — dann zeigt die Ebene `… checking`
+    /// statt „not yet verified", nie ein Urteil davor.
+    pub fn evidence_checking(&self, artifacts: &[CommitArtifact]) -> bool {
+        let Some(state) = self.overview.as_ref() else {
+            return false;
+        };
+        artifacts.iter().any(|a| {
+            !state.checks.contains_key(&a.commit)
+                && (state.asked == Some(a.commit) || self.verify_asked == Some(a.commit))
+        })
     }
 
     pub fn open_overview(&mut self) {
@@ -832,7 +894,7 @@ impl<'a> App<'a> {
     /// Prüft den gewählten Commit der Übersicht synchron (ohne Worker) —
     /// `true`, wenn geprüft wurde.
     pub fn fill_overview_verify(&mut self, source: &dyn Source) -> bool {
-        if self.tab != Tab::Overview {
+        if !self.check_wanted() {
             return false;
         }
         let now = self.now_secs();
@@ -845,13 +907,16 @@ impl<'a> App<'a> {
         state.urgent = false;
         state.checks.insert(commit, source.verify(commit));
         state.checked_at.insert(commit, now);
+        if self.verify_asked == Some(commit) {
+            self.verify_asked = None;
+        }
         true
     }
 
     /// Gibt die ausstehende Prüfung des gewählten Commits der Übersicht an
     /// den Worker (B6) — `true`, wenn sie unterwegs ist.
     pub fn send_overview_check(&mut self, worker: &mut Worker) -> bool {
-        if worker.busy.is_some() || self.tab != Tab::Overview {
+        if worker.busy.is_some() || !self.check_wanted() {
             return false;
         }
         let Some(state) = self.overview.as_mut() else {
@@ -886,6 +951,9 @@ impl<'a> App<'a> {
             state.asked = None;
             state.checks.insert(commit, answer);
             state.checked_at.insert(commit, now);
+            if self.verify_asked == Some(commit) {
+                self.verify_asked = None;
+            }
         }
         true
     }
@@ -1554,9 +1622,12 @@ impl<'a> App<'a> {
             // Übersicht, wo ihr Urteil steht (EVIDENCE). Anderswo öffnet
             // `v` die Übersicht auf dem Commit; liegt er nicht in der
             // gelesenen Historie, bleibt die Kommandozeile.
-            Action::Verify => match commit {
-                Some(commit) => self.verify_commit(commit),
-                None => self.closed = Some("v: no commit here to verify".into()),
+            Action::Verify => match (self.evidence_commit(), commit) {
+                // In der Evidence-Ebene (C12.1): die Prüfung des tragenden
+                // Commits, die Ebene bleibt offen und zeigt `… checking`.
+                (Some(commit), _) => self.verify_in_evidence(commit),
+                (None, Some(commit)) => self.verify_commit(commit),
+                (None, None) => self.closed = Some("v: no commit here to verify".into()),
             },
             Action::Diff => match commit {
                 Some(commit) => {
@@ -2301,7 +2372,7 @@ impl<'a> App<'a> {
             // sofort neu zeichnen. Vom Nutzer verlangt (`v`, Tab gezeigt):
             // sofort; nach einem Neuladen gedrosselt — jede Prüfung startet
             // ssh-keygen je Seal und `minds verify`.
-            let due = self.tab == Tab::Overview
+            let due = self.check_wanted()
                 && self
                     .overview
                     .as_ref()

@@ -103,7 +103,7 @@ pub fn draw(
     }
     let mut head_lines = vec![Line::from(first)];
     head_lines.extend(story.into_iter().map(|l| Line::from(Span::raw(l))));
-    let (words, style) = verdict_words(report, check, true);
+    let (words, style) = verdict_words(report, check, app.evidence_checking(artifacts), true);
     head_lines.push(Line::from(vec![
         Span::styled("Verdict of minds verify: ", theme::dim()),
         Span::styled(words, style),
@@ -180,15 +180,18 @@ fn intact(check: &Option<(CommitId, Result<&crate::CommitVerify, String>, Option
 
 /// Die Wörter des Urteils (C12.1): **die von `minds verify`**, wörtlich,
 /// mit der Prüfzeit — oder „sealed, not yet verified", solange keine
-/// Signaturprüfung lief. Nie VERIFIED davor.
+/// Signaturprüfung lief. Nie VERIFIED davor. `checking`: die Prüfung
+/// läuft gerade (`v`) — dann `… checking`, kein Urteil.
 /// `with_time` hängt die Prüfzeit an (Kopf); die Fußzeile lässt sie weg.
 pub(crate) fn verdict_words(
     report: &EvidenceReport,
     check: Option<(CommitId, Result<&crate::CommitVerify, String>, Option<i64>)>,
+    checking: bool,
     with_time: bool,
 ) -> (String, Style) {
     use crate::verify::Overall;
     match check {
+        None if checking => ("… checking".into(), theme::dim()),
         None => {
             if report.state.verdict == EvidenceVerdict::Tampered {
                 let (glyph, word, style) = theme::tampered();

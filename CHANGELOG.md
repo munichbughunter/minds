@@ -42,6 +42,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   (`Inspection::line_classes_of`, `Inspection::changes_of`); the numbers
   are the ones of `changes(commit).line_classes()`, so Overview, Changes
   tab and evidence view still count from one function (C3.1).
+- **`v` in the evidence view runs the check there.** It used to open the
+  Overview on the commit; now the view stays open, asks the same check
+  (the B6 worker, or synchronously without one) for the commit it shows,
+  reads `… checking` in the head and in footer line 1 until the verdict
+  arrives, and then names it in the words of `minds verify` — never a
+  verdict before the check, never one over other sessions. Footer line 2
+  carries `v verify`. A commit outside the history read still points to
+  `minds verify <id>`.
 
 ### Added
 

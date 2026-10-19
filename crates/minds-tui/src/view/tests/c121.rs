@@ -551,3 +551,97 @@ fn c121_evidence_counts_lines_from_the_reconciliation_it_holds() {
     );
     assert_eq!((counted.added, counted.unexplained), (4, 1));
 }
+
+/// Eine Quelle, deren Prüfung ein festes Urteil über Session a liefert.
+struct Verdict(Option<crate::CommitVerify>);
+
+impl crate::Source for Verdict {
+    fn load(&self) -> minds_reader::Result<Inspection> {
+        unreachable!("the tests reload with an explicit inspection")
+    }
+    fn stamp(&self) -> Option<crate::Stamp> {
+        Some("1".into())
+    }
+    fn verify(&self, _commit: minds_git::CommitId) -> Result<crate::CommitVerify, String> {
+        self.0
+            .clone()
+            .ok_or_else(|| "verify binary not found".to_string())
+    }
+}
+
+/// Eine Prüfung, die Zeit braucht — nur eigene Daten (Send), für den
+/// Worker-Pfad (B6).
+struct Slow(crate::CommitVerify);
+
+impl crate::Background for Slow {
+    fn verify(&mut self, _commit: minds_git::CommitId) -> Result<crate::CommitVerify, String> {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        Ok(self.0.clone())
+    }
+}
+
+/// `v` in der Evidence-Ebene startet die Prüfung des tragenden Commits —
+/// über denselben Weg wie die Übersicht (B6-Worker oder synchron) — und
+/// bleibt in der Ebene: währenddessen `… checking` statt des Urteils (nie
+/// VERIFIED), dann kommt das Urteil in der Ebene an. Die Fußzeile nennt
+/// `v verify`.
+#[test]
+fn c121_v_runs_the_check_and_the_verdict_arrives_in_the_layer() {
+    let (_dir, mut app) = evidence_from_overview(None);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(
+        out.contains("sealed, not yet verified — v: run verify"),
+        "{out}"
+    );
+    assert!(out.lines().last().unwrap().contains("v verify"), "{out}");
+
+    app.reduce(Action::Verify);
+    // In der Ebene geblieben — der Tab wechselt nicht.
+    assert_eq!(app.tab, Tab::Sessions);
+    assert!(matches!(app.top(), Some(View::Evidence { .. })));
+    let head = app.inspection.index().commits_of(sid('a'))[0];
+    let state = app.overview.as_ref().unwrap();
+    assert_eq!(state.check_due(), Some(head), "the check is pending");
+    assert!(state.urgent, "at once, not throttled");
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("Verdict of minds verify: … checking"), "{out}");
+    assert!(!out.contains("VERIFIED"), "{out}");
+    assert!(!out.contains("not yet verified"), "{out}");
+    assert!(footer_line(&out).contains("… checking"), "{out}");
+
+    // Synchroner Pfad (ohne Worker): das Urteil kommt in der Ebene an.
+    let source = Verdict(Some(check(Ok(crate::VerifyVerdict::Verified))));
+    assert!(app.fill_overview_verify(&source), "the layer's check runs");
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("✓ VERIFIED (signatures checked"), "{out}");
+    assert!(!out.contains("checking"), "{out}");
+    assert!(matches!(app.top(), Some(View::Evidence { .. })));
+    assert!(
+        row_of(&out, "INTEGRITY").contains("✓ record intact"),
+        "{out}"
+    );
+
+    // Worker-Pfad (B6): `v` noch einmal, die Antwort kommt vom Thread.
+    app.reduce(Action::Verify);
+    let mut worker =
+        crate::app::Worker::spawn(Box::new(Slow(check(Ok(crate::VerifyVerdict::Incomplete)))));
+    assert!(app.send_overview_check(&mut worker), "sent from the layer");
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("… checking"), "{out}");
+    assert!(!out.contains("VERIFIED"), "{out}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !app.take_checks(&mut worker) {
+        assert!(std::time::Instant::now() < deadline, "the worker answers");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("! VERIFIED, INCOMPLETE"), "{out}");
+    assert!(!out.contains("checking"), "{out}");
+}
+
+fn row_of(out: &str, label: &str) -> String {
+    out.lines()
+        .find(|l| l.contains(label))
+        .unwrap_or_else(|| panic!("{label} row in {out}"))
+        .to_string()
+}

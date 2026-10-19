@@ -440,8 +440,12 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
             ..
         }) => match report.as_ref() {
             Some(report) => {
-                let (words, style) =
-                    evidence::verdict_words(report, app.evidence_check(*id, artifacts), false);
+                let (words, style) = evidence::verdict_words(
+                    report,
+                    app.evidence_check(*id, artifacts),
+                    app.evidence_checking(artifacts),
+                    false,
+                );
                 Line::from(Span::styled(words, style))
             }
             None => {
@@ -607,6 +611,7 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
             Some(View::Evidence { .. }) => vec![
                 "↑↓ section",
                 "Space technical",
+                "v verify",
                 "Enter open",
                 "d diff",
                 "Esc back",
