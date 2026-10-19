@@ -2739,14 +2739,24 @@ mod intent_tab {
         assert_eq!(source.asked.get(), 1);
         let out = render(&mut app);
         assert!(out.contains("F4 Requirements"), "{out}");
-        assert!(out.contains("✓ b3-01010101010"), "{out}");
-        assert!(out.contains("◉1"), "{out}");
+        // C12.3: Kurz-Id wie die Overview, Sessions als Zahl, der Status
+        // als Satz — die Rohzeilen stehen nur noch unter TECHNICAL.
+        assert!(out.contains("✓ 01010101"), "{out}");
+        assert!(!out.contains("✓ b3-01010101010"), "{out}");
+        assert!(out.contains("1 session"), "{out}");
+        assert!(!out.contains("◉1"), "{out}");
         assert!(out.contains("(local file)"), "{out}");
-        assert!(out.contains("valid (software key)"), "{out}");
+        assert!(out.contains("✓ signed — software key"), "{out}");
+        assert!(!out.contains("valid (software key)"), "{out}");
         assert!(out.contains("src/sort/**, tests/**"), "{out}");
-        assert!(out.contains("the version in HEAD"), "{out}");
-        assert!(out.contains("proof     ok"), "{out}");
-        assert!(out.contains("Sessions naming this anchor (1)"), "{out}");
+        assert!(out.contains("docs/req.md (HEAD)"), "{out}");
+        assert!(
+            out.contains("✓ proven — the stored snapshot matches"),
+            "{out}"
+        );
+        assert!(!out.contains("proof     ok"), "{out}");
+        assert!(out.contains("SESSIONS (1)"), "{out}");
+        assert!(!out.contains("Sessions naming this anchor (1)"), "{out}");
         assert!(out.contains("(witness event)"), "{out}");
         assert!(out.contains("AC1: sort by date"), "{out}");
         assert!(out.contains("… cut here — minds intent show"), "{out}");
@@ -2765,18 +2775,26 @@ mod intent_tab {
         let mut app = opened(&repo, &source);
         app.reduce(Action::Down);
         let out = render(&mut app);
+        // C12.3: der Grund als Satz unter STATUS, der Text bleibt verborgen.
         assert!(
-            out.contains("NOT PROVEN — intent snapshot does not match its anchor"),
+            out.contains("✗ not proven — intent snapshot does not match its anchor"),
             "{out}"
         );
+        assert!(!out.contains("NOT PROVEN —"), "{out}");
         assert!(
-            out.contains("Snapshot (11 bytes) not shown — the anchor is not proven"),
+            out.contains("text hidden — the anchor is not proven"),
             "{out}"
         );
+        assert!(!out.contains("Snapshot (11 bytes) not shown"), "{out}");
         assert!(!out.contains("PLANTED_SECRET"), "{out}");
-        assert!(out.contains("scope     none declared"), "{out}");
-        assert!(out.contains("signature none"), "{out}");
-        assert!(out.contains("not the local file binding (A1)"), "{out}");
+        assert!(out.contains("no scope declared"), "{out}");
+        assert!(out.contains("◦ not signed"), "{out}");
+        assert!(!out.contains("signature none"), "{out}");
+        assert!(
+            out.contains("binding A1 — no local file binding points to it"),
+            "{out}"
+        );
+        assert!(!out.contains("not the local file binding (A1)"), "{out}");
     }
 
     /// Ein Anker, den eine Session nennt, der Store aber nicht hat: gezeigt,
@@ -2789,10 +2807,9 @@ mod intent_tab {
         app.reduce(Action::End);
         let out = render(&mut app);
         assert!(out.contains("not in this store"), "{out}");
-        assert!(
-            out.contains("(local file)  Add exponential backoff"),
-            "{out}"
-        );
+        // C12.3: die Session mit Art der Bindung, der Auftrag darunter als Claim.
+        assert!(out.contains("(local file)"), "{out}");
+        assert!(out.contains("◌ Add exponential backoff"), "{out}");
     }
 
     /// Gekappt: Der Tab sagt, wie viele er las.
@@ -2828,7 +2845,7 @@ mod intent_tab {
         assert!(!out.contains("valid (software key)"), "{out}");
         assert!(!out.contains("AC1: sort by date"), "{out}");
         assert!(!out.contains("the version in HEAD"), "{out}");
-        assert!(!out.contains("✓ b3-"), "{out}");
+        assert!(!out.contains("✓ 0101"), "{out}");
         assert!(out.contains("rechecking…"), "{out}");
         // Von selbst gedrosselt, dann wieder geprüft.
         let state = app.intent.as_ref().unwrap();
@@ -2836,7 +2853,7 @@ mod intent_tab {
         assert!(!state.due(std::time::Duration::from_secs(1), every));
         assert!(state.due(every, every));
         app.fill_intents(&source);
-        assert!(render(&mut app).contains("valid (software key)"));
+        assert!(render(&mut app).contains("✓ signed — software key"));
     }
 
     /// Ein verdeckter Tab fragt die Quelle nicht.
@@ -2870,8 +2887,8 @@ mod intent_tab {
         app.reduce(Action::End);
         let out = render(&mut app);
         // Das Fenster folgt: der letzte Anker zu sehen, der erste nicht.
-        assert!(out.contains("b3-5959595959"), "{out}");
-        assert!(!out.contains("b3-0a0a0a0a0a"), "{out}");
+        assert!(out.contains("59595959"), "{out}");
+        assert!(!out.contains("0a0a0a0a"), "{out}");
     }
 
     /// Lange, umbrochene Snapshot-Zeilen: PgDn erreicht das Ende — die
@@ -2903,6 +2920,7 @@ mod intent_tab {
     }
 
     mod b4b;
+    mod c123;
 }
 
 mod overview_tab {

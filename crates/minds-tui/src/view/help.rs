@@ -38,7 +38,7 @@ fn section(tab: Tab) -> &'static str {
             "Changes:  Enter diff · ] [ hunk (commit in the file list) · n N next not-observed\n          s unified ↔ split · c why column · Enter story of the line's tool call · Esc back\n          Tab / Shift-Tab next / previous file in the files line (below 160 columns)"
         }
         Tab::Requirements => {
-            "Requirements: ↑↓ anchor · PgUp PgDn scroll · Enter story of a session naming it"
+            "Requirements: ↑↓ requirement · Enter story of a session naming it · Space technical details · PgUp PgDn scroll\n          ✓ proven and signed · ◦ proven, not signed · ✗ snapshot does not match · ? not checked · ! not readable"
         }
     }
 }

@@ -151,7 +151,7 @@ fn status(row: &CommitRow, conformance: Option<ConformanceMark>) -> Vec<Span<'st
 /// Das Badge in der Liste als Text, ohne eigenen Hintergrund (C3.2):
 /// Initialen des Agenten mit `◉` (bzw. Roboter-Icon) oder des Autors —
 /// nicht nur die Farbe unterscheidet. Vier Spalten breit.
-fn badge_text(name: &str, agent: bool, nerd: bool) -> Span<'static> {
+pub(crate) fn badge_text(name: &str, agent: bool, nerd: bool) -> Span<'static> {
     let text = if agent {
         let mark = if nerd {
             "\u{f06a9}"

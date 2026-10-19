@@ -90,6 +90,28 @@ versioning follows [Semantic Versioning](https://semver.org/).
   five sections; `Enter` on COVERAGE opens the diff. Footer line 1
   names only the session, its trust strip and the verdict — no
   sentences.
+- **The Requirements tab shows the requirement first, then its status,
+  technical details last (C12.3).** The list reads as one line per anchor
+  — `✓ ac8f1bb7 · anforderung.md (HEAD) · src/** · 1 session`: the short
+  id of the Overview, the source with `(HEAD)` or `(working tree)` for
+  file anchors, the declared scope, the sessions naming it as a number
+  (`◉1` is gone). The status glyph is `✓` proven and signed, `◦` proven
+  but not signed (open, not an error), `✗` snapshot mismatch or invalid
+  signature, `?` not checked or rechecking, `!` not readable. The detail
+  has a fixed order: **REQUIREMENT** — the stored text on top, in full,
+  only when the anchor is proven (otherwise `text hidden — the anchor is
+  not proven`, never the text); **STATUS** — three sentences, `✓ proven —
+  the stored snapshot matches the file at 996395ef`, `✓ signed — software
+  key, checked against your allowed_signers (as minds verify does)` (or
+  `◦ not signed — minds intent sign <anchor> adds a signature`, `✗ not
+  proven — <reason>`), `· binding A1 — the agent named this anchor in a
+  witness event, not a local file`; **SESSIONS (n)** — agent, model, id,
+  time and how the anchor was named, the request below as a claim (`◌`),
+  `Enter` opens the story; **TECHNICAL (for auditors)** — anchor, content
+  hash, source, version, proof and signature in full, folded, `Space`
+  unfolds. No keys in the detail; footer line 1 names the anchor and its
+  status (`ac8f1bb7 · ✓ proven · ✓ signed`). The tab's own name and
+  position change with C12.2.
 
 - **Tool contents are shown in full where they are read (C8).** The
   story's step detail carries the agent's answer text of the step's turn

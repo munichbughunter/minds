@@ -729,6 +729,8 @@ impl<'a> App<'a> {
             // Esc (B1): keine Ebene zu schließen — der Rückweg zum Ursprung
             // kommt mit dem Navigationsverlauf (B2), sonst nichts.
             Action::Back => {}
+            // Space klappt TECHNICAL auf (C12.3).
+            Action::Space => state.toggle_technical(),
             Action::Enter => {
                 // Eine Session, die sich an den Anker gebunden nennt (die
                 // kleinste Id): ihr Graph im Sessions-Tab.
@@ -751,6 +753,7 @@ impl<'a> App<'a> {
         }
         if state.cursor != at {
             state.scroll = 0;
+            state.technical_open = false;
         }
     }
 

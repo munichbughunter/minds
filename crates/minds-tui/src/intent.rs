@@ -43,6 +43,8 @@ pub struct IntentTab {
     pub want: Option<ContentHash>,
     /// Der Filter aus `/` (B4) — leer: alle Anker.
     pub filter: String,
+    /// Ob der TECHNICAL-Block aufgeklappt ist (C12.3, Space).
+    pub technical_open: bool,
 }
 
 impl IntentTab {
@@ -60,6 +62,7 @@ impl IntentTab {
             stale: false,
             want,
             filter: String::new(),
+            technical_open: false,
         }
     }
 
@@ -106,6 +109,11 @@ impl IntentTab {
         }
     }
 
+    /// Space klappt den TECHNICAL-Block auf oder zu.
+    pub fn toggle_technical(&mut self) {
+        self.technical_open = !self.technical_open;
+    }
+
     /// Nach einem Neuladen: neu fragen, bis dahin nichts als geprüft zeigen.
     pub fn invalidate(&mut self, urgent: bool) {
         self.urgent = urgent || (self.pending && self.urgent);
@@ -138,6 +146,7 @@ impl IntentTab {
         self.cursor = self.cursor.min(self.list().len().saturating_sub(1));
         if self.cursor != before {
             self.scroll = 0;
+            self.technical_open = false;
         }
     }
 }

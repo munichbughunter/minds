@@ -610,7 +610,13 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
             ],
         },
         Tab::Changes => Vec::new(),
-        Tab::Requirements => vec!["↑↓ anchor", "Enter story", "PgUp PgDn scroll", "/ filter"],
+        Tab::Requirements => vec![
+            "↑↓ requirement",
+            "Enter story",
+            "Space technical",
+            "PgUp PgDn scroll",
+            "/ filter",
+        ],
     }
 }
 
@@ -665,11 +671,16 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
     if app.tab == Tab::Requirements
         && let Some(anchor) = app.intent.as_ref().and_then(|i| i.selected())
     {
-        let id = anchor.id.to_string();
+        // Kurz-Id wie überall, dann der Status in Wörtern (C12.3).
+        let stale = app.intent.as_ref().is_some_and(|i| i.stale);
         spans.push(Span::styled(
-            format!("{}… ", id.get(..14).unwrap_or(&id)),
+            format!("{} · ", overview::anchor_short(&anchor.id)),
             theme::title(),
         ));
+        spans.push(Span::raw(format!(
+            "{}  ",
+            intent::status_words(anchor, stale)
+        )));
     }
     spans
 }
