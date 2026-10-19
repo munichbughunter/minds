@@ -14,7 +14,7 @@ fn cases() -> Vec<Case> {
         (
             "help closes first",
             |app| {
-                app.reduce(Action::TabTo(1));
+                app.reduce(Action::TabTo(2));
                 app.reduce(Action::Help);
             },
             |app| !app.help && app.tab == Tab::Sessions,
@@ -22,7 +22,7 @@ fn cases() -> Vec<Case> {
         (
             "typing a search: clear it",
             |app| {
-                app.reduce(Action::TabTo(1));
+                app.reduce(Action::TabTo(2));
                 app.reduce(Action::SearchStart);
                 app.reduce(Action::SearchInput('x'));
             },
@@ -31,7 +31,7 @@ fn cases() -> Vec<Case> {
         (
             "a kept search: clear it",
             |app| {
-                app.reduce(Action::TabTo(1));
+                app.reduce(Action::TabTo(2));
                 app.reduce(Action::SearchStart);
                 app.reduce(Action::SearchInput('x'));
                 app.reduce(Action::SearchCommit);
@@ -41,14 +41,14 @@ fn cases() -> Vec<Case> {
         (
             "a layer closes",
             |app| {
-                app.reduce(Action::TabTo(1));
+                app.reduce(Action::TabTo(2));
                 app.reduce(Action::Enter);
             },
             |app| app.top().is_none() && app.tab == Tab::Sessions,
         ),
         (
             "sessions list: nothing",
-            |app| app.reduce(Action::TabTo(1)),
+            |app| app.reduce(Action::TabTo(2)),
             |app| app.tab == Tab::Sessions && app.top().is_none(),
         ),
         (
@@ -69,17 +69,12 @@ fn cases() -> Vec<Case> {
                     && app.overview.as_ref().unwrap().focus == OverviewFocus::Graph
             },
         ),
-        (
-            "verify: nothing",
-            |app| app.reduce(Action::TabTo(2)),
-            |app| app.tab == Tab::Verify,
-        ),
         // Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landet im Diff, nicht
         // in der Dateiliste — `Esc` führt aus dem Diff in die Liste, ohne
         // vorheriges `Enter`.
         (
             "changes diff: back to the files",
-            |app| app.reduce(Action::TabTo(3)),
+            |app| app.reduce(Action::TabTo(1)),
             |app| {
                 app.tab == Tab::Changes
                     && app
@@ -91,15 +86,15 @@ fn cases() -> Vec<Case> {
         (
             "changes files: nothing",
             |app| {
-                app.reduce(Action::TabTo(3));
+                app.reduce(Action::TabTo(1));
                 app.reduce(Action::Back);
             },
             |app| app.tab == Tab::Changes,
         ),
         (
-            "intent: nothing",
-            |app| app.reduce(Action::TabTo(4)),
-            |app| app.tab == Tab::Intent,
+            "requirements: nothing",
+            |app| app.reduce(Action::TabTo(3)),
+            |app| app.tab == Tab::Requirements,
         ),
     ]
 }

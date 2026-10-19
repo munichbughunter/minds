@@ -577,7 +577,6 @@ fn a4_no_own_trust_strings_outside_the_component() {
         ("story.rs", include_str!("../story.rs")),
         ("mod.rs", include_str!("../mod.rs")),
         ("overview.rs", include_str!("../overview.rs")),
-        ("verify.rs", include_str!("../verify.rs")),
         ("intent.rs", include_str!("../intent.rs")),
         ("changes.rs", include_str!("../changes.rs")),
     ];
@@ -720,12 +719,13 @@ fn b4_z_and_shift_z_step_the_zoom() {
 fn b4_the_object_verbs_work_on_a_session() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    // Session a trägt Commit 1.
+    // Session a trägt Commit 1 — der liegt nicht in der (leeren) Historie
+    // dieses Repos: `v` sagt das und nennt die Kommandozeile (C12.2; bis
+    // dahin öffnete `v` den Verify-Tab, der in der Übersicht aufgegangen ist).
     app.reduce(Action::Verify);
-    assert_eq!(app.tab, crate::app::Tab::Verify);
-    assert_eq!(app.verify.as_ref().unwrap().commit(), Some(commit('1')));
-    app.reduce(Action::Back); // B2: zurück
     assert_eq!(app.tab, crate::app::Tab::Sessions);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains("run minds verify"), "{out}");
     app.reduce(Action::Diff);
     assert_eq!(app.tab, crate::app::Tab::Changes);
     assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
@@ -750,10 +750,10 @@ fn b4_the_object_verbs_work_on_a_session() {
 fn b4_verbs_without_an_object_say_why() {
     let (_dir, repo) = repo();
     let mut app = App::new(filled(), &repo, None);
-    app.reduce(Action::TabTo(4)); // Intent: kein Anker, keine Session
+    app.reduce(Action::TabTo(3)); // Requirements: kein Anker, keine Session
     app.reduce(Action::Evidence);
-    assert!(app.closed.is_some(), "e in an empty Intent tab");
-    app.reduce(Action::TabTo(1));
+    assert!(app.closed.is_some(), "e in an empty Requirements tab");
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::Context);
     assert!(app.closed.is_some(), "c outside Changes");
 }
@@ -850,19 +850,12 @@ fn c1_footer_line_one_explains_the_focused_state() {
     let out = render_sized(&mut app, 300, 30);
     assert!(footer(&out).contains("step 1 · read"), "{out}");
     app.reduce(Action::Back);
-    // Verify: das Urteilswort mit seinem Satz.
-    app.reduce(Action::TabTo(2));
+    // Requirements (C12.2, vormals Intent): Bindungen an einen Anker sind
+    // Aussagen — der Satz zu „claim", kein statischer Erklärsatz.
+    app.reduce(Action::TabTo(3));
     let out = render_sized(&mut app, 300, 30);
-    assert!(
-        !footer(&out).contains("at a glance"),
-        "static sentence gone\n{out}"
-    );
-    assert!(
-        crate::copy::GLOSSARY
-            .iter()
-            .any(|t| footer(&out).contains(t.sentence)),
-        "{out}"
-    );
+    assert!(footer(&out).contains(sentence("claim").unwrap()), "{out}");
+    assert!(!footer(&out).contains("at a glance"), "{out}");
 }
 
 // ---------------------------------------------------------------------

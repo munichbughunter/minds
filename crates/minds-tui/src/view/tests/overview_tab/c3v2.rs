@@ -443,12 +443,12 @@ fn c33_the_filter_survives_tabs_and_reloads() {
     let (_dir, repo, _, inspection) = human_on_top();
     let mut app = opened(&repo, inspection);
     app.reduce(Action::AgentFilter);
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::TabTo(0));
     assert!(agent_only(&app));
     let again = app.inspection.clone();
     app.reload(Ok(again), None, now());
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::TabTo(0));
     assert!(agent_only(&app));
     let out = lines_at(&mut app, 160, 40).join("\n");
@@ -480,7 +480,7 @@ fn c33_no_agent_session_says_so() {
 fn c33_a_elsewhere_says_where_it_works() {
     let (_dir, repo, _, inspection) = human_on_top();
     let mut app = opened(&repo, inspection);
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::AgentFilter);
     assert!(!agent_only(&app));
     assert!(

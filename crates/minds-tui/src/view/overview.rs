@@ -933,7 +933,7 @@ fn commit_detail(
     // EVIDENCE wird zuerst gebaut (es hängt nicht vom Prompt ab) und am
     // Ende gezeigt — so rechnet der Platz für den Prompt mit seiner echten
     // Höhe, nicht mit einer Schätzung.
-    let evidence = evidence_lines(state, row, &cards, inner);
+    let evidence = evidence_lines(state, row, &cards, inner, app.spin);
     // Die Markerzeilen des Session-Fensters: `… N above` und `… N more`
     // — bei zwei Sessions höchstens eine davon, ab drei beide.
     let markers = match listed {
@@ -1207,17 +1207,24 @@ fn evidence_lines(
     row: &CommitRow,
     cards: &[Option<minds_reader::model::SessionCard>],
     inner: usize,
+    spin: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let check = state.checks.get(&row.id);
     let mut heading = vec![Span::styled("EVIDENCE", theme::title())];
-    if let Some(at) = state.checked_at.get(&row.id) {
-        let pad = inner.saturating_sub("EVIDENCE".len() + 15);
+    let right = if state.asked == Some(row.id) {
+        // Die Prüfung liegt beim Worker (B6): der Spinner dreht sich je Tick.
+        Some(format!("checking {}", crate::app::spinner(spin)))
+    } else {
+        state
+            .checked_at
+            .get(&row.id)
+            .map(|at| format!("checked {}Z", clock(*at)))
+    };
+    if let Some(right) = right {
+        let pad = inner.saturating_sub("EVIDENCE".len() + right.chars().count());
         heading.push(Span::raw(" ".repeat(pad)));
-        heading.push(Span::styled(
-            format!("checked {}Z", clock(*at)),
-            theme::dim(),
-        ));
+        heading.push(Span::styled(right, theme::dim()));
     }
     lines.push(Line::from(heading));
     lines.extend(integrity_lines(row, check));
@@ -1235,6 +1242,9 @@ fn evidence_lines(
     ));
     lines.extend(interpretation_lines(row, cards));
     lines.extend(requirement_lines(row, state, check));
+    // SCOPE und CONFORMANCE (C12.2): aus dem Verify-Tab hierher.
+    lines.extend(scope_lines(row, state, check));
+    lines.extend(conformance_lines(check));
     let review = if row.review == Verdict::Open {
         let (glyph, _, style) = theme::open();
         mark(glyph, "not reviewed yet", style)
@@ -1257,7 +1267,7 @@ fn evidence_lines(
 
 /// Die nächste Aktion (C3.7): die oberste Zeile in EVIDENCE, die nicht ✓
 /// ist, bestimmt sie — INTEGRITY vor COVERAGE vor INTERPRETATION vor
-/// REQUIREMENT vor REVIEW. Eine Zeile mit `·` („trifft nicht zu“: kein
+/// REQUIREMENT vor SCOPE vor CONFORMANCE vor REVIEW. Eine Zeile mit `·` („trifft nicht zu“: kein
 /// Anker, keine Zeilen, nur nicht gediffte Dateien) zählt nicht — außer
 /// `· no session readable`: eine unlesbare Session ist offen, NEXT führt zur
 /// Evidenz; eine Zeile mit `…` (noch zählend, noch lesend) heißt warten —
@@ -1285,7 +1295,7 @@ pub(crate) fn next_action(
         Some(Overall::Checking) | Some(Overall::NotChecked) | None => {
             return "v: run verify".into();
         }
-        Some(Overall::Verified) | Some(Overall::NoSession) => {}
+        Some(Overall::Verified) => {}
     }
     let plural = |n: usize| if n == 1 { "line" } else { "lines" };
     match state.lines.get(&row.id) {
@@ -1347,26 +1357,49 @@ pub(crate) fn next_action(
             _ => None,
         };
         if bound != Some(true) {
-            return "i: Intent tab — the binding is not proven".into();
+            return "i: Requirements tab — the binding is not proven".into();
         }
         match state.requirements.get(anchor) {
             // Noch nicht gelesen: die Achse zeigt `… checking`.
             None => return "wait — the requirement is still being read".into(),
-            Some(Err(_)) => return "i: Intent tab — the anchor could not be read".into(),
+            Some(Err(_)) => return "i: Requirements tab — the anchor could not be read".into(),
             Some(Ok(d)) => {
                 if d.proof.is_err() {
-                    return "i: Intent tab — the requirement is not proven".into();
+                    return "i: Requirements tab — the requirement is not proven".into();
                 }
                 match d.signature {
                     IntentSignature::Valid(_) => {}
                     IntentSignature::Unsigned => return format!("minds intent sign {anchor}"),
                     IntentSignature::NotChecked => {
-                        return "i: Intent tab — why the signature is not checked".into();
+                        return "i: Requirements tab — why the signature is not checked".into();
                     }
                     IntentSignature::Invalid => {
-                        return "i: Intent tab — the signature is invalid".into();
+                        return "i: Requirements tab — the signature is invalid".into();
                     }
                 }
+            }
+        }
+    }
+    // SCOPE und CONFORMANCE (C12.2): Dateien außerhalb des Bereichs und
+    // Befunde gegen das Soll sieht man im Diff.
+    if let Some(Ok(c)) = check {
+        if let Some(paths) = &c.out_of_scope
+            && !paths.is_empty()
+        {
+            return format!(
+                "d: inspect the {} {} outside the scope",
+                paths.len(),
+                if paths.len() == 1 { "file" } else { "files" }
+            );
+        }
+        if let Some(report) = &c.conformance {
+            let (_, drift, unknown) = report.counts();
+            let findings = drift + unknown;
+            if findings > 0 {
+                return format!(
+                    "d: inspect the diff — {findings} finding{} against the signed spec",
+                    if findings == 1 { "" } else { "s" }
+                );
             }
         }
     }
@@ -1461,7 +1494,20 @@ fn integrity_lines(
         }
         Some(other) => {
             let (text, style) = super::trust::verify_headline(other);
-            out.push(axis("INTEGRITY", vec![Span::styled(text, style)]));
+            let mut spans = vec![Span::styled(text, style)];
+            // Die Assurance-Stufe (C12.2): bei einer Session hier, bei
+            // mehreren je Unterzeile — nie neben TAMPERED (`verify` zeigt sie
+            // dann auch nicht).
+            if other != Overall::Tampered
+                && let Some(Ok(c)) = check
+                && let [only] = c.sessions.as_slice()
+            {
+                spans.push(Span::styled(
+                    format!(" · {}", only.level.word()),
+                    theme::dim(),
+                ));
+            }
+            out.push(axis("INTEGRITY", spans));
         }
     }
     // „sealed" ist nicht „verified" — gesagt, wo es zählt (C3.5).
@@ -1482,12 +1528,155 @@ fn integrity_lines(
         for s in &c.sessions {
             let (glyph, word, style) = super::trust::verify_session_mark(s.tampered);
             let id = s.session.to_string();
-            out.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(" ".repeat(16)),
                 Span::styled(format!("{} ", id.get(..11).unwrap_or(&id)), theme::dim()),
                 Span::styled(format!("{glyph} {word}"), style),
-            ]));
+            ];
+            if !s.tampered && overall != Some(Overall::Tampered) {
+                spans.push(Span::styled(format!(" · {}", s.level.word()), theme::dim()));
+            }
+            out.push(Line::from(spans));
         }
+    }
+    out
+}
+
+/// SCOPE (C12.2): die geänderten Pfade gegen den erklärten Bereich, wie
+/// `minds verify` ihn prüft (eigener Anker, Claims, Beobachtungen). `✓`
+/// nennt die Globs des gelesenen Ankers; `◦` die Dateien außerhalb; `·`
+/// heißt nicht geprüft oder trifft nicht zu — kein Fehler. Bei TAMPERED
+/// nichts: `verify` zeigt den Bereich dann auch nicht.
+fn scope_lines(
+    row: &CommitRow,
+    state: &crate::overview::OverviewState,
+    check: Option<&Result<crate::CommitVerify, String>>,
+) -> Vec<Line<'static>> {
+    use crate::verify::Overall;
+    // Ohne genannte Anforderung gibt es keinen erklärten Bereich — die
+    // Zeile entfällt (REQUIREMENT sagt schon „no requirement named").
+    if row.anchors.is_empty() {
+        return Vec::new();
+    }
+    let spans = match (overall_of(row, check), check) {
+        (Some(Overall::Tampered), _) => {
+            vec![mark("·", "not assessed (integrity violated)", theme::dim())]
+        }
+        (_, None) => vec![mark("…", "checking", theme::dim())],
+        (_, Some(Err(why))) => vec![mark("·", format!("not checked ({why})"), theme::dim())],
+        (_, Some(Ok(c))) => match (&c.out_of_scope, &c.scope_note) {
+            (Some(paths), _) if paths.is_empty() => {
+                let globs = row
+                    .anchors
+                    .first()
+                    .and_then(|a| state.requirements.get(a))
+                    .and_then(|r| r.as_ref().ok())
+                    .filter(|d| !d.scope.is_empty())
+                    .map(|d| d.scope.join(", "));
+                vec![mark(
+                    "✓",
+                    format!(
+                        "all changes inside {}",
+                        globs.as_deref().unwrap_or("the declared scope")
+                    ),
+                    ok(),
+                )]
+            }
+            (Some(paths), _) => {
+                let (glyph, _, style) = theme::open();
+                let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
+                let more = if paths.len() > 3 { " …" } else { "" };
+                vec![mark(
+                    glyph,
+                    format!(
+                        "{} {} outside the scope: {}{more}",
+                        paths.len(),
+                        if paths.len() == 1 { "file" } else { "files" },
+                        shown.join(", ")
+                    ),
+                    style,
+                )]
+            }
+            (None, note) => vec![mark(
+                "·",
+                format!("not assessed ({})", note.as_deref().unwrap_or("no scope")),
+                theme::dim(),
+            )],
+        },
+    };
+    vec![axis("SCOPE", spans)]
+}
+
+/// CONFORMANCE (C12.2): nur, wenn ein Soll gebunden ist — eine Anzeige
+/// neben dem Urteil, nie ein Teil davon (wie `minds verify` ohne
+/// `--conformance`). Bestandene Regeln stehen nicht einzeln, nur Befunde
+/// (Drift und Unbekanntes), höchstens drei.
+fn conformance_lines(check: Option<&Result<crate::CommitVerify, String>>) -> Vec<Line<'static>> {
+    use minds_reader::conformance::Outcome;
+    let Some(Ok(c)) = check else {
+        return Vec::new();
+    };
+    let Some(report) = &c.conformance else {
+        return Vec::new();
+    };
+    let (pass, drift, unknown) = report.counts();
+    let findings = drift + unknown;
+    let source = match (&report.active, &report.signer) {
+        (Some((id, _)), Some(signer)) => format!(
+            "spec b3-{} signed by {}",
+            &id.hex()[..12],
+            minds_reader::sanitize(signer)
+        ),
+        (Some((id, _)), None) => format!("spec b3-{} (not signed)", &id.hex()[..12]),
+        (None, _) => "no signed spec".to_owned(),
+    };
+    let head = if findings == 0 {
+        mark("✓", "conforms", ok())
+    } else {
+        let (glyph, _, style) = theme::open();
+        mark(
+            glyph,
+            format!("{findings} finding{}", if findings == 1 { "" } else { "s" }),
+            style,
+        )
+    };
+    let mut out = vec![
+        axis(
+            "CONFORMANCE",
+            vec![
+                head,
+                Span::styled(
+                    format!(" · {pass} pass · {drift} drift · {unknown} unknown"),
+                    theme::dim(),
+                ),
+            ],
+        ),
+        under(format!("{:>16}{source}", ""), theme::dim()),
+    ];
+    let shown = report.rows().filter(|r| r.outcome != Outcome::Pass).take(3);
+    for rule in shown {
+        let (glyph, style) = match rule.outcome {
+            Outcome::Drift => ("✗", Style::default().fg(theme::DELETE)),
+            Outcome::Unknown | Outcome::Pass => ("?", Style::default().fg(theme::REVIEW)),
+        };
+        out.push(Line::from(vec![
+            Span::raw(" ".repeat(16)),
+            Span::styled(
+                format!("{glyph} {:<6}", rule.outcome.label().to_lowercase()),
+                style,
+            ),
+            Span::raw(format!(" {}  {}", rule.id, rule.observed)),
+        ]));
+        out.push(under(
+            format!("{:>16}  expected {}", "", rule.expected),
+            theme::dim(),
+        ));
+    }
+    if findings > 3 {
+        out.push(under(
+            format!("{:>16}… {} more", "", findings - 3),
+            theme::dim(),
+        ));
     }
     out
 }

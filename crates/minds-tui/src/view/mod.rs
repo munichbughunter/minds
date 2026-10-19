@@ -29,7 +29,6 @@ mod intent;
 mod overview;
 pub mod story;
 pub mod trust;
-pub mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -104,14 +103,6 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
-    if app.tab == Tab::Verify {
-        verify::draw(frame, app, body);
-        footer(frame, app, foot);
-        if app.help {
-            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
-        }
-        return;
-    }
     if app.tab == Tab::Overview {
         overview::draw(frame, app, body);
         footer(frame, app, foot);
@@ -120,7 +111,7 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
-    if app.tab == Tab::Intent {
+    if app.tab == Tab::Requirements {
         intent::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
@@ -331,24 +322,6 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         changes_footer(frame, app, area);
         return;
     }
-    if app.tab == Tab::Verify {
-        // Zeile 1: der Satz zum Urteil (C1) — kein statischer Erklärsatz.
-        let word = crate::copy::overall(app.verify.as_ref().map(|v| v.overall()));
-        let status = explain(word);
-        let keys = Line::from(vec![
-            freshness(app),
-            Span::raw("  "),
-            Span::styled(actions(app).join("  "), theme::dim()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(vec![
-                status_line(with_context(app, status, area.width), area.width),
-                pinned(keys, area.width, app.searching),
-            ]),
-            area,
-        );
-        return;
-    }
     if app.tab == Tab::Overview {
         // Zeile 1 (C3.5): die Kurz-Id (aus `context`) und der Filterzustand —
         // kein Erklärsatz; „sealed is not verified" steht im Detail und in
@@ -371,7 +344,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if app.tab == Tab::Intent {
+    if app.tab == Tab::Requirements {
         // Zeile 1 (C1): Bindungen an einen Anker sind aufgezeichnet — Aussagen.
         let status = explain("claim");
         let mut keys = vec![
@@ -639,9 +612,8 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
             }
             Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "d diff", "Esc back"],
         },
-        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "e evidence"],
         Tab::Changes => Vec::new(),
-        Tab::Intent => vec!["↑↓ anchor", "Enter story", "PgUp PgDn scroll", "/ filter"],
+        Tab::Requirements => vec!["↑↓ anchor", "Enter story", "PgUp PgDn scroll", "/ filter"],
     }
 }
 
@@ -685,7 +657,6 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
             Some(crate::overview::Selected::Commit(row)) => Some(row.id),
             _ => None,
         },
-        Tab::Verify => app.verify.as_ref().and_then(|v| v.commit()),
         _ => None,
     };
     if let Some(commit) = commit {
@@ -694,7 +665,7 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
             Style::default().fg(theme::CHANGE),
         ));
     }
-    if app.tab == Tab::Intent
+    if app.tab == Tab::Requirements
         && let Some(anchor) = app.intent.as_ref().and_then(|i| i.selected())
     {
         let id = anchor.id.to_string();

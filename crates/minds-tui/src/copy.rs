@@ -187,17 +187,3 @@ pub fn interpretation(axis: minds_reader::model::InterpretationAxis) -> &'static
         InterpretationAxis::Uninterpreted(_) => "uninterpreted",
     }
 }
-
-/// Das Glossar-Wort zum Urteil des Verify-Tabs.
-pub fn overall(overall: Option<crate::verify::Overall>) -> &'static str {
-    use crate::verify::Overall;
-    match overall {
-        Some(Overall::Verified) => "verified",
-        Some(Overall::Incomplete) => "incomplete",
-        Some(Overall::Tampered) => "TAMPERED",
-        Some(Overall::NotVerifiable) => "not verifiable",
-        Some(Overall::Checking) => "checking",
-        Some(Overall::NotChecked) => "not checked",
-        Some(Overall::NoSession) | None => "no session",
-    }
-}

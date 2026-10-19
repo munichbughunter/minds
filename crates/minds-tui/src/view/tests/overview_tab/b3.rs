@@ -1,4 +1,5 @@
-//! B3 · Ein aktiver Commit für Overview, Verify und Changes.
+//! B3 · Ein aktiver Commit für Overview und Changes (seit C12.2 ohne
+//! Verify-Tab — sein Urteil steht in der Übersicht).
 
 use super::*;
 use crate::overview::Selected;
@@ -11,7 +12,7 @@ fn overview_commit(app: &App) -> Option<CommitId> {
 }
 
 #[test]
-fn b3_one_active_commit_across_overview_verify_and_changes() {
+fn b3_one_active_commit_across_overview_and_changes() {
     let (_dir, repo, commits, inspection) = history();
     let mut app = opened(&repo, inspection);
     // Eine Commit-Zeile wählen, die nicht die erste ist.
@@ -21,11 +22,8 @@ fn b3_one_active_commit_across_overview_verify_and_changes() {
     app.reduce(Action::Down);
     let chosen = overview_commit(&app).expect("a commit row");
     assert_eq!(app.active_commit, Some(chosen));
-    // F3 öffnet ihn.
-    app.reduce(Action::TabTo(2));
-    assert_eq!(app.verify.as_ref().unwrap().commit(), Some(chosen));
-    // F4 ebenso.
-    app.reduce(Action::TabTo(3));
+    // F2 öffnet ihn.
+    app.reduce(Action::TabTo(1));
     assert_eq!(app.changes.as_ref().unwrap().commit(), Some(chosen));
     // `[ ]` verschiebt ihn tabübergreifend.
     app.reduce(Action::Bracket(true));
@@ -34,8 +32,6 @@ fn b3_one_active_commit_across_overview_verify_and_changes() {
     }
     assert_eq!(app.active_commit, app.changes.as_ref().unwrap().commit());
     let active = app.active_commit.unwrap();
-    app.reduce(Action::TabTo(2));
-    assert_eq!(app.verify.as_ref().unwrap().commit(), Some(active));
     app.reduce(Action::TabTo(0));
     if commits.contains(&active) {
         assert_eq!(overview_commit(&app), Some(active));

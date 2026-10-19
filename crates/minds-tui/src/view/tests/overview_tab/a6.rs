@@ -20,21 +20,14 @@ fn render_sized(app: &mut App, width: u16, height: u16) -> String {
 }
 
 /// Was den Vertrauenszustand des fokussierten Objekts trägt, je Tab — der
-/// Changes- und der Intent-Tab fokussieren eine Datei bzw. einen Anker,
-/// keinen Gegenstand mit Seal-Zustand.
+/// Changes- und der Requirements-Tab fokussieren eine Datei bzw. einen
+/// Anker, keinen Gegenstand mit Seal-Zustand. (Die Urteilswörter des
+/// früheren Verify-Tabs stehen seit C12.2 in EVIDENCE der Übersicht.)
 fn trust_words(tab: Tab) -> &'static [&'static str] {
     match tab {
         Tab::Overview => &["sealed", "unsealed", "incomplete", "TAMPERED", "legacy"],
         Tab::Sessions => &["sealed", "legacy", "TAMPERED"],
-        Tab::Verify => &[
-            "VERIFIED",
-            "TAMPERED",
-            "NOT VERIFIABLE",
-            "NOT CHECKED",
-            "CHECKING",
-            "NO SESSION",
-        ],
-        Tab::Changes | Tab::Intent => &[],
+        Tab::Changes | Tab::Requirements => &[],
     }
 }
 
@@ -90,7 +83,7 @@ fn a6_narrow_headers_use_short_labels() {
     let mut app = opened(&repo, inspection);
     let out = render_sized(&mut app, 80, 24);
     let head = out.lines().next().unwrap();
-    for label in ["F1 Ovw", "F2 Ses", "F3 Ver", "F4 Chg", "F5 Int"] {
+    for label in ["F1 Ovw", "F2 Chg", "F3 Ses", "F4 Req"] {
         assert!(head.contains(label), "{head}");
     }
     let out = render_sized(&mut app, 160, 40);
@@ -102,7 +95,7 @@ fn a6_narrow_headers_use_short_labels() {
 fn a6_the_help_scrolls_and_starts_with_the_current_tab() {
     let (_dir, repo, _, inspection) = history();
     let mut app = opened(&repo, inspection);
-    app.reduce(Action::TabTo(3)); // Changes
+    app.reduce(Action::TabTo(1)); // Changes
     app.reduce(Action::Help);
     let out = render_sized(&mut app, 80, 24);
     let changes = out.find("Changes:").unwrap_or_else(|| panic!("{out}"));

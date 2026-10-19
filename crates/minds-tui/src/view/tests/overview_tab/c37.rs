@@ -131,16 +131,18 @@ fn c37_unexplained_lines_point_to_the_diff() {
 /// Geprüft, alles beobachtet, aber der Anker ist nicht belegt gebunden:
 /// `i:` — REQUIREMENT kommt vor REVIEW.
 #[test]
-fn c37_an_unproven_binding_points_to_the_intent_tab() {
+fn c37_an_unproven_binding_points_to_the_requirements_tab() {
     let (_dir, repo, commits, inspection) = history();
     let mut app = App::new(inspection, &repo, None);
     on_agent_commit(&mut app, commits[1], classes(2, 0));
     assert!(app.fill_overview_verify(&Judged(crate::VerifyVerdict::Verified)));
     let out = text_at(&mut app, 160, 40);
+    // C12.2 (Klasse 2): der Tab heißt Requirements, nicht mehr Intent.
     assert!(
-        out.contains("→ i: Intent tab — the binding is not proven"),
+        out.contains("→ i: Requirements tab — the binding is not proven"),
         "{out}"
     );
+    assert!(!out.contains("Intent tab"), "{out}");
     assert!(!out.contains("→ minds review"), "{out}");
 }
 

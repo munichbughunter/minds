@@ -2068,24 +2068,28 @@ mod changes_tab {
         let (_dir, repo) = repo();
         let mut app = App::new(filled(), &repo, None);
         let out = render(&mut app);
+        // C12.2 (Klasse 2): vier Tabs in Workflow-Reihenfolge — der
+        // Verify-Tab ist in der Übersicht aufgegangen, Intent heißt
+        // Requirements.
         assert!(out.contains("F1 Overview"), "{out}");
-        assert!(out.contains("F2 Sessions"), "{out}");
-        assert!(out.contains("F3 Verify"), "{out}");
-        assert!(out.contains("F4 Changes"), "{out}");
-        assert!(out.contains("F5 Intent"), "{out}");
+        assert!(out.contains("F2 Changes"), "{out}");
+        assert!(out.contains("F3 Sessions"), "{out}");
+        assert!(out.contains("F4 Requirements"), "{out}");
+        assert!(!out.contains("Verify"), "{out}");
+        assert!(!out.contains("F5"), "{out}");
         app.reduce(Action::CycleTab(true));
-        assert_eq!(app.tab, Tab::Verify);
+        assert_eq!(app.tab, Tab::Requirements);
         // Ohne lesbaren Commit (leeres Repo) öffnet der Tab trotzdem — mit
         // einer ehrlichen Meldung statt eines Absturzes.
-        app.reduce(Action::TabTo(3));
+        app.reduce(Action::TabTo(1));
         assert_eq!(app.tab, Tab::Changes);
         assert!(render(&mut app).contains("Changes unavailable") || app.changes.is_some());
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         assert_eq!(app.tab, Tab::Sessions);
         app.reduce(Action::CycleTab(false));
-        assert_eq!(app.tab, Tab::Overview);
+        assert_eq!(app.tab, Tab::Changes);
         app.reduce(Action::CycleTab(false));
-        assert_eq!(app.tab, Tab::Intent);
+        assert_eq!(app.tab, Tab::Overview);
     }
 
     /// Klasse 2 (Batch 2, Paket 3 / C9.1): Der Tab landete in der Dateiliste;
@@ -2563,538 +2567,6 @@ mod changes_tab {
 
 // --- Verify-Tab -------------------------------------------------------------
 
-mod verify_tab {
-    use std::cell::{Cell, RefCell};
-
-    use minds_reader::assurance::{Assurance, IntentSignature, IntentState, SignerKind};
-    use minds_reader::reconcile::{FileRecon, LineLevel, LineRecon, ReconClass, Reconciliation};
-
-    use super::*;
-    use crate::app::Tab;
-    use crate::verify::{ClassCounts, Overall};
-    use crate::{CommitVerify, SessionAssurance, VerifyVerdict};
-
-    /// Eine Quelle, die das signaturabhängige Urteil vorgibt und zählt, wie
-    /// oft es angefragt wurde.
-    struct Signers {
-        answer: RefCell<Option<CommitVerify>>,
-        asked: Cell<usize>,
-    }
-
-    impl crate::Source for Signers {
-        fn load(&self) -> minds_reader::Result<Inspection> {
-            Ok(filled().with_head(Some(commit('1'))))
-        }
-        fn stamp(&self) -> Option<crate::Stamp> {
-            Some("1".into())
-        }
-        fn verify(&self, _commit: CommitId) -> Result<CommitVerify, String> {
-            self.asked.set(self.asked.get() + 1);
-            self.answer
-                .borrow()
-                .clone()
-                .ok_or_else(|| "store unreadable".to_string())
-        }
-    }
-
-    fn witnessed(tampered: bool) -> CommitVerify {
-        verdict(
-            tampered,
-            if tampered {
-                VerifyVerdict::Tampered
-            } else {
-                VerifyVerdict::Verified
-            },
-        )
-    }
-
-    /// Wie [`witnessed`], mit dem Urteil, das `minds verify` fällt.
-    fn verdict(tampered: bool, verdict: VerifyVerdict) -> CommitVerify {
-        CommitVerify {
-            verdict: Ok(verdict),
-            sessions: vec![SessionAssurance {
-                session: sid('a'),
-                level: Assurance::A2Witnessed,
-                reason: Some("not reproduced in CI".into()),
-                intent: IntentState::Bound {
-                    anchor_id: minds_core::ContentHash::from_bytes([7u8; 32]),
-                    chained: true,
-                    signature: IntentSignature::Valid(SignerKind::SoftwareKey),
-                    snapshot_matches: true,
-                    from_session_start: true,
-                    changed_mid_session: false,
-                },
-                tampered,
-            }],
-            out_of_scope: Some(vec!["Cargo.lock".into()]),
-            out_of_scope_paths: vec!["Cargo.lock".into()],
-            scope_note: None,
-            conformance: None,
-        }
-    }
-
-    fn signers(answer: Option<CommitVerify>) -> Signers {
-        Signers {
-            answer: RefCell::new(answer),
-            asked: Cell::new(0),
-        }
-    }
-
-    fn app(repo: &Repo) -> App<'_> {
-        let mut app = App::new(filled().with_head(Some(commit('1'))), repo, None);
-        app.reduce(Action::TabTo(2));
-        app
-    }
-
-    /// Sofort da: Urteil und Achsen aus dem Reader; die Signaturen werden
-    /// noch geprüft — und das steht da, statt zu raten.
-    #[test]
-    fn the_verdict_comes_first_and_says_what_is_still_being_checked() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        assert_eq!(app.tab, Tab::Verify);
-        let out = render(&mut app);
-        // Ohne Signaturprüfung kein VERIFIED — der Reader allein sieht keine
-        // ungültige Witness-Signatur.
-        assert!(out.contains("… CHECKING"), "{out}");
-        assert!(!out.contains("VERIFIED"), "{out}");
-        assert!(out.contains("A1 observed (checking signatures…)"), "{out}");
-        // Die Zeile nennt Fakten, kein eigenes Verdikt — das sagt die
-        // Kopfzeile, von `verify` selbst.
-        assert!(out.contains("· hash-valid"), "{out}");
-        assert!(!out.contains("◈ sealed"), "{out}");
-        // Vor der Prüfung neutral: hash-valid ja, Urteil noch nicht.
-        assert!(
-            out.contains("Integrity   · 1 seal(s) hash-valid · signatures checking…"),
-            "{out}"
-        );
-        assert!(
-            out.contains("Coverage    · signatures checking… · boundary agent-hooks/v1"),
-            "{out}"
-        );
-        assert!(out.contains("Artifact    · not assessed"), "{out}");
-        assert!(out.contains("Scope       … checking"), "{out}");
-        assert!(out.contains("Not proven"), "{out}");
-        assert!(out.contains("model identity"), "{out}");
-    }
-
-    /// Mit den Signern: Stufe, Intent und Scope aus der Quelle — einmal
-    /// geholt, nicht je Frame.
-    #[test]
-    fn the_signed_parts_come_from_the_source_once() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let source = signers(Some(witnessed(false)));
-        app.fill_verify(&source);
-        app.fill_verify(&source);
-        assert_eq!(source.asked.get(), 1);
-        let out = render(&mut app);
-        assert!(out.contains("✓ VERIFIED"), "{out}");
-        assert!(out.contains("A2 witnessed"), "{out}");
-        assert!(!out.contains("checking signatures"), "{out}");
-        assert!(out.contains("intent signed (software key)"), "{out}");
-        assert!(out.contains("chained"), "{out}");
-        assert!(out.contains("⚠ 1 path(s) outside: Cargo.lock"), "{out}");
-        assert!(out.contains("not reproduced in CI"), "{out}");
-    }
-
-    #[test]
-    fn an_invalid_witness_signature_is_tampered() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.fill_verify(&signers(Some(witnessed(true))));
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Tampered);
-        let out = render(&mut app);
-        assert!(out.contains("✗ TAMPERED"), "{out}");
-    }
-
-    #[test]
-    fn a_failed_check_is_never_verified_and_says_why() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.fill_verify(&signers(None));
-        let out = render(&mut app);
-        assert!(out.contains("NOT CHECKED — run minds verify"), "{out}");
-        assert!(!out.contains("✓ VERIFIED"), "{out}");
-        assert!(
-            out.contains("Signatures could not be checked: store unreadable"),
-            "{out}"
-        );
-        assert!(out.contains("(signatures not checked)"), "{out}");
-        assert!(
-            out.contains("Scope       · not checked (store unreadable)"),
-            "{out}"
-        );
-    }
-
-    /// Eine Session ohne Seal: nichts zu verifizieren — wie `verify`.
-    #[test]
-    fn a_session_without_a_seal_is_not_verifiable() {
-        let (_dir, repo) = repo();
-        let mut sessions = BTreeMap::new();
-        sessions.insert(sid('b'), session("legacy", "2026-07-25T13:41:00Z"));
-        let mut commits = BTreeMap::new();
-        commits.insert(commit('1'), vec![sid('b')]);
-        let inspection =
-            Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t")
-                .with_head(Some(commit('1')));
-        let mut app = App::new(inspection, &repo, None);
-        app.reduce(Action::TabTo(2));
-        let mut legacy = verdict(false, VerifyVerdict::NotVerifiable);
-        legacy.sessions[0].session = sid('b');
-        app.fill_verify(&signers(Some(legacy)));
-        let out = render(&mut app);
-        assert!(out.contains("? NOT VERIFIABLE"), "{out}");
-        assert!(out.contains("· no seal"), "{out}");
-    }
-
-    /// Ein verdeckter Tab startet kein ssh-keygen; sichtbar wird geprüft.
-    #[test]
-    fn a_hidden_tab_does_not_check() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.reduce(Action::TabTo(1));
-        let source = signers(Some(witnessed(false)));
-        app.fill_verify(&source);
-        assert_eq!(source.asked.get(), 0);
-        app.reduce(Action::TabTo(2));
-        app.fill_verify(&source);
-        assert_eq!(source.asked.get(), 1);
-    }
-
-    /// Enter auf Scope führt in den Diff des Commits.
-    #[test]
-    fn enter_on_scope_opens_the_diff() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.fill_verify(&signers(Some(witnessed(false))));
-        app.reduce(Action::End);
-        app.reduce(Action::Enter);
-        assert_eq!(app.tab, Tab::Changes);
-        assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
-    }
-
-    #[test]
-    fn class_counts_follow_lines_and_file_level_classes() {
-        let line = |line, class| LineRecon {
-            line,
-            class,
-            source: None,
-        };
-        let file = |level, class, changed| FileRecon {
-            path: "a".into(),
-            class,
-            line_level: level,
-            committed: minds_core::ContentHash::from_bytes([0u8; 32]),
-            deleted: false,
-            changed_lines: changed,
-            removes: false,
-            last_observed: None,
-            gap: None,
-        };
-        let recon = Reconciliation {
-            commit: commit('1'),
-            base: None,
-            files: vec![
-                file(
-                    LineLevel::Available(vec![
-                        line(1, ReconClass::ReportedOnly),
-                        line(2, ReconClass::Unexplained),
-                        line(3, ReconClass::Explained),
-                    ]),
-                    ReconClass::ReportedOnly,
-                    3,
-                ),
-                file(
-                    LineLevel::Unavailable(minds_reader::reconcile::Reason::Binary),
-                    ReconClass::ExplainedFsOnly,
-                    1,
-                ),
-            ],
-            explained_lines: 2,
-            total_changed_lines: 4,
-        };
-        let counts = ClassCounts::of(&recon);
-        assert_eq!(
-            (
-                counts.explained,
-                counts.fs_only,
-                counts.reported,
-                counts.unexplained
-            ),
-            (1, 1, 1, 1)
-        );
-        assert_eq!((counts.backed(), counts.total()), (3, 4));
-    }
-
-    #[test]
-    fn enter_jumps_to_the_session_the_diff_and_back() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        // Zeile 0: Session a → ihr Graph im Sessions-Tab.
-        app.reduce(Action::Enter);
-        assert_eq!(app.tab, Tab::Sessions);
-        assert!(matches!(app.top(), Some(View::Story { id, .. }) if *id == sid('a')));
-        // Artefakt → der Diff des Commits.
-        app.reduce(Action::TabTo(2));
-        app.reduce(Action::Down);
-        app.reduce(Action::Enter);
-        assert_eq!(app.tab, Tab::Changes);
-        assert_eq!(app.changes.as_ref().unwrap().commit(), Some(commit('1')));
-        // Esc im Verify-Tab, per Tab-Taste geöffnet (kein Ursprung): nichts
-        // (B1) — den Rückweg trägt der Navigationsverlauf (B2).
-        app.reduce(Action::TabTo(2));
-        app.reduce(Action::Back);
-        assert_eq!(app.tab, Tab::Verify);
-        assert_ne!(app.tab, Tab::Sessions);
-    }
-
-    /// Neu laden prüft die Signer immer neu: Eine ausgetauschte `seal.sig`
-    /// ändert keine Session-Id — ein übernommenes Urteil könnte VERIFIED
-    /// zeigen, wo `verify` TAMPERED sagt.
-    #[test]
-    fn reload_always_checks_the_signers_again() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.stamp = Some("1".into());
-        app.fill_verify(&signers(Some(witnessed(false))));
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Verified);
-        let tampered = signers(Some(witnessed(true)));
-        app.reload(
-            Ok(filled().with_head(Some(commit('1')))),
-            Some("2".into()),
-            now(),
-        );
-        assert!(app.verify.as_ref().unwrap().pending);
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Checking);
-        app.fill_verify(&tampered);
-        assert_eq!(tampered.asked.get(), 1);
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Tampered);
-    }
-
-    /// Das Urteil ist das von `minds verify`: Sieht `verify` eine Lücke, die
-    /// der Reader nicht kennt (ein Seal nur im Namensraum), gilt INCOMPLETE.
-    #[test]
-    fn the_verdict_is_the_one_of_minds_verify() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.fill_verify(&signers(Some(verdict(false, VerifyVerdict::Incomplete))));
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Incomplete);
-        let out = render(&mut app);
-        assert!(out.contains("! VERIFIED, INCOMPLETE"), "{out}");
-        assert!(out.contains("Coverage    ! incomplete"), "{out}");
-    }
-
-    /// Die Conformance steht je Regel neben dem Urteil — und ändert es nicht
-    /// (wie `verify` ohne `--conformance`).
-    #[test]
-    fn conformance_lists_each_rule_beside_the_verdict() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let mut cli = verdict(false, VerifyVerdict::Verified);
-        cli.conformance = Some(sample_conformance(commit('1')));
-        app.fill_verify(&signers(Some(cli)));
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::Verified);
-        let out = render(&mut app);
-        assert!(out.contains("Conformance ✗ DRIFT"), "{out}");
-        assert!(out.contains("2 pass · 1 drift · 0 unknown"), "{out}");
-        assert!(out.contains("signed by human@example"), "{out}");
-        assert!(
-            out.contains("✗ DRIFT   app-not-db  app → core → db"),
-            "{out}"
-        );
-        assert!(out.contains("expected app does not depend on db"), "{out}");
-        assert!(out.contains("✓ PASS    config"), "{out}");
-    }
-
-    /// Ohne Soll sagt der Tab das — kein leerer Platz, kein PASS.
-    #[test]
-    fn without_a_spec_the_verify_tab_says_so() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.fill_verify(&signers(Some(verdict(false, VerifyVerdict::Verified))));
-        let out = render(&mut app);
-        assert!(out.contains("Conformance · no spec"), "{out}");
-    }
-
-    /// Ohne geprüftes Urteil nie VERIFIED und nie INCOMPLETE — beides
-    /// behauptet intakte Integrität.
-    #[test]
-    fn without_a_checked_verdict_neither_verified_nor_incomplete() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let mut failed = witnessed(false);
-        failed.verdict = Err("minds verify failed".into());
-        app.fill_verify(&signers(Some(failed)));
-        let out = render(&mut app);
-        assert!(out.contains("NOT CHECKED"), "{out}");
-        assert!(!out.contains("VERIFIED"), "{out}");
-        assert!(out.contains("Integrity   · 1 seal(s) hash-valid"), "{out}");
-        assert!(!out.contains("✓ intact"), "{out}");
-        assert!(out.contains("minds verify failed"), "{out}");
-    }
-
-    /// Prüfte die CLI andere Sessions als gezeigt, gilt das Urteil nicht.
-    #[test]
-    fn a_different_session_set_is_not_checked() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let mut other = witnessed(false);
-        other.sessions[0].session = sid('e');
-        app.fill_verify(&signers(Some(other)));
-        assert_eq!(app.verify.as_ref().unwrap().overall(), Overall::NotChecked);
-        let out = render(&mut app);
-        assert!(out.contains("checked sessions differ"), "{out}");
-    }
-
-    /// Die Drossel: Vom Nutzer verlangt sofort, nach einem Neuladen erst
-    /// wieder nach `every` — und ohne ausstehende Prüfung nie.
-    #[test]
-    fn checks_after_a_reload_are_throttled_but_user_requests_are_not() {
-        use std::time::Duration;
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let every = Duration::from_secs(5);
-        let state = app.verify.as_ref().unwrap();
-        assert!(state.due(Duration::ZERO, every), "opened: at once");
-        app.fill_verify(&signers(Some(witnessed(false))));
-        assert!(
-            !app.verify.as_ref().unwrap().due(every, every),
-            "nothing pending"
-        );
-        app.stamp = Some("1".into());
-        app.reload(
-            Ok(filled().with_head(Some(commit('1')))),
-            Some("2".into()),
-            now(),
-        );
-        let state = app.verify.as_ref().unwrap();
-        assert!(
-            !state.due(Duration::from_secs(1), every),
-            "after a reload: throttled"
-        );
-        assert!(state.due(every, every));
-        // `r` (voll) prüft sofort.
-        app.full_next = true;
-        app.reload(
-            Ok(filled().with_head(Some(commit('1')))),
-            Some("3".into()),
-            now(),
-        );
-        assert!(app.verify.as_ref().unwrap().due(Duration::ZERO, every));
-    }
-
-    /// TAMPERED von `verify` selbst: kein ✓-Scope und keine Stufe aus einer
-    /// älteren Momentaufnahme daneben — `verify` zeigt dann beides nicht.
-    #[test]
-    fn a_tampered_verdict_shows_neither_scope_nor_level() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let mut cli = verdict(false, VerifyVerdict::Tampered);
-        cli.out_of_scope = Some(Vec::new());
-        cli.out_of_scope_paths = Vec::new();
-        app.fill_verify(&signers(Some(cli)));
-        let out = render(&mut app);
-        assert!(out.contains("✗ TAMPERED"), "{out}");
-        assert!(
-            out.contains("Scope       · not assessed (integrity violated)"),
-            "{out}"
-        );
-        assert!(!out.contains("✓ every path"), "{out}");
-        assert!(!out.contains("A2 witnessed"), "{out}");
-    }
-
-    /// Kein ✓ „intact" neben NOT VERIFIABLE.
-    #[test]
-    fn not_verifiable_shows_no_intact_check() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.fill_verify(&signers(Some(verdict(false, VerifyVerdict::NotVerifiable))));
-        let out = render(&mut app);
-        assert!(out.contains("? NOT VERIFIABLE"), "{out}");
-        assert!(out.contains("Integrity   · 1 seal(s) hash-valid"), "{out}");
-        assert!(!out.contains("✓ intact"), "{out}");
-    }
-
-    /// Lücken und Events kommen aus dem Store: sättigend summiert, kein
-    /// Überlauf-Panic.
-    #[test]
-    fn huge_gap_counts_saturate() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let state = app.verify.as_mut().unwrap();
-        let mut row = state.sessions[0].clone();
-        row.report.as_mut().unwrap().state.gaps = u64::MAX;
-        state.sessions = vec![row.clone(), row];
-        let out = render(&mut app);
-        assert!(out.contains(&format!("{} gap(s)", u64::MAX)), "{out}");
-    }
-
-    /// Der Balken rundet ab: 999 von 1000 ist nicht voll.
-    #[test]
-    fn the_artifact_bar_is_never_full_with_an_unexplained_line() {
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.verify.as_mut().unwrap().artifact = Ok(ClassCounts {
-            explained: 999,
-            unexplained: 1,
-            ..ClassCounts::default()
-        });
-        let out = render(&mut app);
-        assert!(out.contains("99 %"), "{out}");
-        assert!(!out.contains(&"█".repeat(24)), "{out}");
-    }
-
-    /// Zurück im Tab mit ausstehender Prüfung: sofort prüfen, nicht drosseln.
-    #[test]
-    fn returning_to_the_tab_checks_a_pending_reload_at_once() {
-        use std::time::Duration;
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        let every = Duration::from_secs(5);
-        app.fill_verify(&signers(Some(witnessed(false))));
-        app.reduce(Action::TabTo(1));
-        app.stamp = Some("1".into());
-        app.reload(
-            Ok(filled().with_head(Some(commit('1')))),
-            Some("2".into()),
-            now(),
-        );
-        assert!(!app.verify.as_ref().unwrap().due(Duration::ZERO, every));
-        app.reduce(Action::TabTo(2));
-        assert!(app.verify.as_ref().unwrap().due(Duration::ZERO, every));
-    }
-
-    /// Warum nicht 100 %: die unerklärten Zeilen nach ihrem Grund.
-    #[test]
-    fn the_artifact_says_why_lines_are_unexplained() {
-        use minds_reader::reconcile::GapCounts;
-        let (_dir, repo) = repo();
-        let mut app = app(&repo);
-        app.verify.as_mut().unwrap().artifact = Ok(ClassCounts {
-            explained: 6,
-            unexplained: 4,
-            gaps: GapCounts {
-                after_agent: 1,
-                untouched: 3,
-                ..GapCounts::default()
-            },
-            ..ClassCounts::default()
-        });
-        let out = render_at(&mut app, 200);
-        assert!(
-            out.contains(
-                "◦ 1 whose last agent claim is another version or a deletion · 3 with no tool claim or shell mention found"
-            ),
-            "{out}"
-        );
-    }
-
-    mod b4;
-    mod b6;
-    mod c5;
-}
-
 mod intent_tab {
     use std::cell::{Cell, RefCell};
 
@@ -3215,7 +2687,7 @@ mod intent_tab {
 
     fn opened<'r>(repo: &'r Repo, source: &Anchors) -> App<'r> {
         let mut app = App::new(anchored(), repo, None);
-        app.reduce(Action::TabTo(4));
+        app.reduce(Action::TabTo(3));
         app.fill_intents(source);
         app
     }
@@ -3227,10 +2699,10 @@ mod intent_tab {
         let (_dir, repo) = repo();
         let source = source();
         let mut app = opened(&repo, &source);
-        assert_eq!(app.tab, Tab::Intent);
+        assert_eq!(app.tab, Tab::Requirements);
         assert_eq!(source.asked.get(), 1);
         let out = render(&mut app);
-        assert!(out.contains("F5 Intent"), "{out}");
+        assert!(out.contains("F4 Requirements"), "{out}");
         assert!(out.contains("✓ b3-01010101010"), "{out}");
         assert!(out.contains("◉1"), "{out}");
         assert!(out.contains("(local file)"), "{out}");
@@ -3775,7 +3247,7 @@ mod overview_tab {
         // Start auf HEAD (C3): ein Schritt weniger, nicht vom WIP aus.
         assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Down);
-        app.reduce(Action::TabTo(1));
+        app.reduce(Action::TabTo(2));
         let mut sessions = BTreeMap::new();
         for (id, session) in app.inspection.index().sessions() {
             sessions.insert(*id, session.clone());
@@ -3936,6 +3408,7 @@ mod overview_tab {
     mod b4b;
     mod b7;
     mod c10;
+    mod c122;
     mod c3;
     mod c36;
     mod c37;

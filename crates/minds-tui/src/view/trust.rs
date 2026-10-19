@@ -282,8 +282,9 @@ pub fn evidence_rows(
     ]
 }
 
-/// Das Kopf-Urteil des Verify-Tabs — **die Wörter von `minds verify`**,
-/// wörtlich (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT VERIFIABLE).
+/// Das Urteil in INTEGRITY der Übersicht — **die Wörter von `minds
+/// verify`**, wörtlich (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT
+/// VERIFIABLE).
 pub fn verify_headline(overall: Overall) -> (String, Style) {
     match overall {
         Overall::Verified => ("✓ VERIFIED".to_string(), Style::default().fg(theme::OK)),
@@ -304,72 +305,15 @@ pub fn verify_headline(overall: Overall) -> (String, Style) {
             "? NOT CHECKED — run minds verify, or press v".to_string(),
             Style::default().fg(theme::REVIEW),
         ),
-        Overall::NoSession => ("· NO SESSION".to_string(), theme::dim()),
     }
 }
 
-/// Die Seal-Marke einer Session-Zeile im Verify-Tab: kein eigenes Verdikt,
-/// nur Fakten — ✗ nur bei Manipulation.
+/// Die Seal-Marke einer Session-Unterzeile in INTEGRITY: kein eigenes
+/// Verdikt, nur Fakten — ✗ nur bei Manipulation.
 pub fn verify_session_mark(tampered: bool) -> (&'static str, &'static str, Style) {
     if tampered {
         theme::tampered()
     } else {
         ("·", "hash-valid", theme::dim())
-    }
-}
-
-/// Die Integritätszeile des Verify-Tabs, wörtlich wie `minds verify` sie
-/// sagt — ohne geprüftes Urteil weder ✓ noch „intact".
-pub fn verify_integrity(
-    overall: Overall,
-    seals: usize,
-    signed: usize,
-    without: &str,
-    pending_word: &str,
-) -> (&'static str, Style, String) {
-    let unchecked = matches!(overall, Overall::Checking | Overall::NotChecked);
-    if overall == Overall::Tampered {
-        let (glyph, word, style) = theme::tampered();
-        (
-            glyph,
-            style,
-            format!("{word} — seal material altered or a witness signature invalid"),
-        )
-    } else if unchecked {
-        (
-            "·",
-            theme::dim(),
-            format!("{seals} seal(s) hash-valid · {pending_word}{without}"),
-        )
-    } else if overall == Overall::NotVerifiable {
-        // Kein ✓ neben „nichts prüfbar".
-        (
-            "·",
-            theme::dim(),
-            format!("{seals} seal(s) hash-valid{without}"),
-        )
-    } else {
-        // „trägt eine Signatur", nicht „gültig signiert": Gültigkeit steht in
-        // der Stufe (gegen die vertrauenswürdigen Signer).
-        (
-            "✓",
-            Style::default().fg(theme::OK),
-            format!(
-                "intact · {seals} seal(s) hash-valid · {signed}/{seals} carry a signature{without}"
-            ),
-        )
-    }
-}
-
-/// Die Coverage-Zeile des Verify-Tabs: Das Wort folgt dem Urteil von
-/// `verify`, nicht den Lücken des Readers — nur `verify` sieht alle Seals
-/// des Namensraums.
-pub fn verify_coverage(overall: Overall, pending_word: &str) -> (&'static str, Style, &str) {
-    match overall {
-        Overall::Tampered => ("·", theme::dim(), "not assessable"),
-        Overall::Verified => ("✓", Style::default().fg(theme::OK), "complete"),
-        Overall::Incomplete => ("!", Style::default().fg(theme::REVIEW), "incomplete"),
-        Overall::NotVerifiable => ("·", theme::dim(), "not verifiable (no seal)"),
-        _ => ("·", theme::dim(), pending_word),
     }
 }

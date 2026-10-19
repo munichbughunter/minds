@@ -40,6 +40,29 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Tabs in the order of an investigation (C12.2).** `minds inspect` has
+  four tabs: `1 Overview · 2 Changes · 3 Sessions · 4 Requirements` —
+  what and why → what exactly → how → under which requirement. `F1`–`F4`,
+  `1`–`4` and `Tab`/`Shift-Tab` switch; `5` and `F5` do nothing (they are
+  not reassigned). The Intent tab is called **Requirements** (the UI word
+  of C3; the CLI stays `minds intent …`), also in the breadcrumb and in the
+  next action (`→ i: Requirements tab — the binding is not proven`).
+  The EVIDENCE block of the Overview detail took over what only the Verify
+  tab showed: **SCOPE** (`✓ all changes inside src/**` with the globs of
+  the anchor, `◦ 2 files outside the scope: …`, `· not assessed (…)`; only
+  when a session names a requirement), **CONFORMANCE** (only with a signed
+  spec: `✓ conforms` / `◦ N findings`, the counts, the spec and signer, and
+  each finding with what was expected), and the assurance level next to
+  the verdict (`✓ VERIFIED · A2 witnessed`, one sub-line per session with
+  several — never next to TAMPERED). NEXT knows the new lines: `→ d:
+  inspect the 2 files outside the scope`, `→ d: inspect the diff — 1
+  finding against the signed spec`. `v` runs the check again in the
+  Overview at once (the B6 worker does it; the heading shows `checking`
+  with a spinner while it runs); from another tab `v` opens the Overview
+  on the commit, or names `minds verify <id>` when the commit is not in
+  the history read. Returning to the Overview after a reload checks at
+  once, not throttled; `r` too.
+
 - **Tool contents are shown in full where they are read (C8).** The
   story's step detail carries the agent's answer text of the step's turn
   (`Agent said ◌ …`, a few lines, then `… N more lines — z 3, then the
@@ -81,6 +104,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
   its step across zoom levels.
 
 ### Removed
+
+- **The Verify tab of `minds inspect` (C12.2, breaking).** Its verdict
+  line, scope, conformance, assurance level and the per-session facts
+  live in the EVIDENCE block of the Overview detail (INTEGRITY, COVERAGE,
+  INTERPRETATION, REQUIREMENT, SCOPE, CONFORMANCE, REVIEW, NEXT); `v`
+  checks there. Gone with the tab: the artifact bar (the counts per line
+  state stand in COVERAGE, from the same reader function as the Changes
+  tab), the `Not proven` list (the LIMITS sentence of the Evidence view
+  names the assurance level) and `Enter` on Scope (NEXT → `d` opens the
+  diff). The promises of its tests moved to the Overview with their
+  comments: the verdict is the one of `minds verify` (`! VERIFIED,
+  INCOMPLETE` stays literal), never VERIFIED or INCOMPLETE without a
+  checked verdict, a failed check says why, a reload checks the signers
+  again, a tampered verdict shows neither scope nor level, a hidden tab
+  does not check, the throttle and the worker stay.
 
 - **The why chain view of `minds inspect` (C10).** The `w` key, the
   `Why` level in the Sessions tab and its inspector are gone: every link of

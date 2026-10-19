@@ -158,17 +158,14 @@ fn every_view(status: Option<TranscriptStatus>) -> Vec<(&'static str, String)> {
     assert!(matches!(app.top(), Some(View::Story { .. })), "graph");
     out.push(("graph", text_at(&mut app, 160, 40)));
 
-    // Verify, Changes (Why-Box), Intent, Hilfe.
-    let mut app = App::new(inspection.clone(), &repo, None);
-    app.reduce(Action::TabTo(2));
-    out.push(("verify", text_at(&mut app, 160, 40)));
+    // Changes (Why-Box), Requirements, Hilfe.
     let mut app = App::new(inspection.clone(), &repo, None);
     app.changes = Some(changes_of(head));
     app.tab = Tab::Changes;
     out.push(("changes", text_at(&mut app, 160, 40)));
     let mut app = App::new(inspection.clone(), &repo, None);
-    app.reduce(Action::TabTo(4));
-    out.push(("intent", text_at(&mut app, 160, 40)));
+    app.reduce(Action::TabTo(3));
+    out.push(("requirements", text_at(&mut app, 160, 40)));
     let mut app = App::new(inspection, &repo, None);
     app.reduce(Action::Help);
     out.push(("help", text_at(&mut app, 160, 40)));

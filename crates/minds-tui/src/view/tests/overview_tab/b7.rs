@@ -36,7 +36,7 @@ fn reversed_at(buffer: &ratatui::buffer::Buffer, needle: &str) -> bool {
 }
 
 #[test]
-fn b7_one_cursor_style_in_overview_verify_and_intent() {
+fn b7_one_cursor_style_in_overview_and_requirements() {
     let (_dir, repo, _, inspection) = history();
     let mut app = opened(&repo, inspection);
     let selected = match app.overview.as_ref().and_then(|s| s.selected()) {
@@ -50,14 +50,14 @@ fn b7_one_cursor_style_in_overview_verify_and_intent() {
         reversed_at(&buffer, &needle),
         "overview cursor uses theme::cursor()"
     );
-    app.reduce(Action::TabTo(2));
+    app.reduce(Action::TabTo(3));
     let buffer = buffer_sized(&mut app, 160, 40);
     let lines = text(&buffer);
     if let Some((y, line)) = lines.iter().enumerate().find(|(_, l)| l.contains("▸ ")) {
         let x = line[..line.find("▸ ").unwrap()].chars().count() as u16;
         assert!(
             buffer[(x, y as u16)].modifier.contains(Modifier::REVERSED),
-            "verify cursor uses theme::cursor()"
+            "requirements cursor uses theme::cursor()"
         );
     }
 }
@@ -76,7 +76,7 @@ fn b7_the_focused_pane_is_marked_without_color() {
     assert!(lines[2].contains("▸ DETAIL"), "{}", lines[2]);
     assert!(!lines[2].contains("▸ OVERVIEW"), "{}", lines[2]);
     // Sessions: die Liste fokussiert, bis eine Ebene liegt.
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     let lines = text(&buffer_sized(&mut app, 160, 40));
     assert!(
         lines.iter().any(|l| l.contains("▸ SESSIONS")),
@@ -123,7 +123,7 @@ fn c2_two_footer_lines_with_fixed_roles() {
         assert!(line2.ends_with("? help  q quit"), "{tab:?}: {line2}");
     }
     // Sessions: Zeile 1 nennt die Session und ihren Trust Strip (Short).
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     let lines = text(&buffer_sized(&mut app, 300, 30));
     let line1 = &lines[lines.len() - 2];
     let id = app.selected().unwrap().id.to_string();
@@ -155,7 +155,7 @@ fn c6_monochrome_keeps_every_state_cursor_and_focus() {
     let (_dir, repo, _, inspection) = history();
     let mut app = opened(&repo, inspection);
     app.no_color = true;
-    for tab in 0..5u8 {
+    for tab in 0..4u8 {
         app.reduce(Action::TabTo(tab));
         let buffer = buffer_sized(&mut app, 160, 40);
         let area = buffer.area;
@@ -169,7 +169,7 @@ fn c6_monochrome_keeps_every_state_cursor_and_focus() {
             }
         }
         let lines = text(&buffer);
-        if tab == 0 || tab == 1 {
+        if tab == 0 || tab == 2 {
             assert!(reversed, "tab {tab}: the cursor stays visible");
             assert!(
                 lines.iter().any(|l| l.contains("▸ ")),
@@ -178,7 +178,7 @@ fn c6_monochrome_keeps_every_state_cursor_and_focus() {
         }
     }
     // Die Zustände tragen Glyph und Wort — dieselben wie in Farbe.
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     let lines = text(&buffer_sized(&mut app, 160, 40)).join("\n");
     assert!(
         lines.contains("· legacy") || lines.contains("◈ sealed"),
