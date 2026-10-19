@@ -869,6 +869,78 @@ pub fn when(ts: Option<&str>) -> String {
 
 /// `HH:MM` (UTC) eines Zeitpunkts in Sekunden seit Epoch — die Prüfzeit
 /// in Overview-EVIDENCE und Evidence-Ebene.
+/// Die hinzugefügten Zeilen eines Commits nach Zustand, in **einem**
+/// Wortlaut für Übersicht und Evidence-Ebene (C9.4/C12.1): das offenste
+/// Wort vorn, die übrigen Zahlen dahinter — `◦ 6 of 10 added lines not
+/// observed · 4 reported`, `◇ 95 of 95 added lines reported, 0 observed`,
+/// `◍ 2 of 3 added lines fs only, 1 observed`, `✓ all 3 added lines
+/// observed`; nie „explained", nie „unexplained". ✓ nur, wenn jede Zeile
+/// beobachtet ist (C3.7 liest ✓ als „nichts offen"). Glyph, Text, Stil.
+pub(crate) fn class_words(c: &minds_reader::changes::LineClasses) -> (&'static str, String, Style) {
+    use minds_reader::reconcile::ReconClass;
+    let observed = c.explained + c.fs_only;
+    if c.all_explained() {
+        return (
+            "✓",
+            format!("all {} added lines observed", c.added),
+            Style::default().fg(theme::OK),
+        );
+    }
+    let (reported_glyph, reported_word, reported_style) = theme::state(ReconClass::ReportedOnly);
+    let (fs_glyph, fs_word, fs_style) = theme::state(ReconClass::ExplainedFsOnly);
+    if c.unexplained > 0 {
+        let (glyph, word, style) = theme::not_observed();
+        let mut text = format!("{} of {} added lines {word}", c.unexplained, c.added);
+        if c.stated > 0 {
+            text.push_str(&format!(" · {} {reported_word}", c.stated));
+        }
+        if observed > 0 {
+            text.push_str(&format!(" · {observed} observed"));
+        }
+        return (glyph, text, style);
+    }
+    if c.stated > 0 {
+        return (
+            reported_glyph,
+            format!(
+                "{} of {} added lines {reported_word}, {observed} observed",
+                c.stated, c.added
+            ),
+            reported_style,
+        );
+    }
+    if c.fs_only > 0 {
+        return (
+            fs_glyph,
+            format!(
+                "{} of {} added lines {fs_word}, {} observed",
+                c.fs_only, c.added, c.explained
+            ),
+            fs_style,
+        );
+    }
+    if c.not_assessed > 0 {
+        return (
+            "?",
+            format!("{} of {} added lines not assessed", c.not_assessed, c.added),
+            Style::default().fg(theme::REVIEW),
+        );
+    }
+    if c.skipped_files > 0 {
+        // Nur Dateien ohne Zeilenansicht: das steht im Kopf.
+        return ("·", not_diffed(c.skipped_files), theme::dim());
+    }
+    ("·", "no added lines".into(), theme::dim())
+}
+
+/// `N files not diffed` — Dateien ohne Zeilenansicht (binär, zu groß, …).
+pub(crate) fn not_diffed(files: usize) -> String {
+    format!(
+        "{files} file{} not diffed",
+        if files == 1 { "" } else { "s" }
+    )
+}
+
 pub(crate) fn clock(secs: i64) -> String {
     let day = secs.rem_euclid(86_400);
     format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)

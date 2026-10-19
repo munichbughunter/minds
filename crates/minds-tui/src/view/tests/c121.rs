@@ -429,3 +429,94 @@ fn c121_integrity_is_sealed_not_intact_before_the_check() {
     assert!(!out.contains("record sealed"), "{out}");
     assert!(!out.contains("record intact"), "{out}");
 }
+
+/// Ein Wortlaut für die Zeilen-Klassen (C9.4/C12.1): Übersicht und
+/// Evidence-Ebene nennen dieselbe Fixture mit demselben Satz aus **einer**
+/// Funktion (`view::class_words`) — `◦ 6 of 10 added lines not observed ·
+/// 4 reported`, `◇ 95 of 95 added lines reported, 0 observed`, `✓ all 3
+/// added lines observed`; „unexplained" und „reported, not observed" sind
+/// weg.
+#[test]
+fn c121_evidence_and_overview_say_the_lines_in_the_same_words() {
+    use minds_reader::changes::LineClasses;
+    let overview = |c: &LineClasses| {
+        crate::view::overview::coverage_lines(Some(&Ok(c.clone())))
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let cases = [
+        (
+            LineClasses {
+                added: 10,
+                stated: 4,
+                unexplained: 6,
+                files: 1,
+                ..LineClasses::default()
+            },
+            "◦ 6 of 10 added lines not observed · 4 reported",
+        ),
+        (
+            LineClasses {
+                added: 95,
+                stated: 95,
+                ..LineClasses::default()
+            },
+            "◇ 95 of 95 added lines reported, 0 observed",
+        ),
+        (
+            LineClasses {
+                added: 4,
+                explained: 3,
+                unexplained: 1,
+                ..LineClasses::default()
+            },
+            "◦ 1 of 4 added lines not observed · 3 observed",
+        ),
+        (
+            LineClasses {
+                added: 3,
+                explained: 3,
+                ..LineClasses::default()
+            },
+            "✓ all 3 added lines observed",
+        ),
+        (
+            LineClasses {
+                added: 3,
+                fs_only: 2,
+                explained: 1,
+                ..LineClasses::default()
+            },
+            "◍ 2 of 3 added lines fs only, 1 observed",
+        ),
+    ];
+    for (c, want) in &cases {
+        let (glyph, text, _) = crate::view::class_words(c);
+        assert_eq!(format!("{glyph} {text}"), *want);
+        let out = overview(c);
+        assert!(out.contains(want), "overview: {want}\n{out}");
+        assert!(!out.contains("unexplained"), "{out}");
+        assert!(!out.contains("reported, not observed"), "{out}");
+    }
+
+    // Die Evidence-Ebene schreibt die gezählten Zeilen des Fixtures mit
+    // derselben Funktion.
+    let (_dir, mut app) = evidence_from_overview(None);
+    let Some(View::Evidence { lines, .. }) = app.top() else {
+        panic!("evidence");
+    };
+    let (_, Ok(counted)) = &lines[0] else {
+        panic!("counted");
+    };
+    let (glyph, text, _) = crate::view::class_words(counted);
+    let out = render_sized(&mut app, 160, 40);
+    assert!(out.contains(&format!("{glyph} {text}")), "{out}");
+    assert!(!out.contains("unexplained"), "{out}");
+}

@@ -52,9 +52,11 @@ fn c94_the_state_words_live_in_the_register_and_the_legend() {
     assert!(!legend.contains("◦ open"), "{legend}");
 }
 
-/// Overview COVERAGE: `◇ 95 of 95 added lines reported, not observed`
+/// Overview COVERAGE: `◇ 95 of 95 added lines reported, 0 observed`
 /// statt „stated"; die Zeile `· 95 added lines` entfällt; der Grund-Satz
-/// einer unerklärten Zeile bleibt.
+/// einer unerklärten Zeile bleibt. (Klasse 2, Review Batch 5: `reported,
+/// not observed` → `reported, 0 observed` und `unexplained` → `not
+/// observed` — ein Wortlaut mit der Evidence-Ebene, C9.4.)
 #[test]
 fn c94_overview_coverage_says_reported_not_observed() {
     let text = |c: LineClasses| text_of(&crate::view::overview::coverage_lines(Some(&Ok(c))));
@@ -64,9 +66,10 @@ fn c94_overview_coverage_says_reported_not_observed() {
         ..LineClasses::default()
     });
     assert!(
-        reported.contains("◇ 95 of 95 added lines reported, not observed"),
+        reported.contains("◇ 95 of 95 added lines reported, 0 observed"),
         "{reported}"
     );
+    assert!(!reported.contains("reported, not observed"), "{reported}");
     assert!(!reported.contains("stated"), "{reported}");
     assert!(!reported.contains("· 95 added lines"), "{reported}");
     assert!(!reported.contains('✓'), "{reported}");
@@ -83,10 +86,10 @@ fn c94_overview_coverage_says_reported_not_observed() {
         ..LineClasses::default()
     });
     assert!(
-        mixed.contains("◦ 6 of 10 added lines unexplained"),
+        mixed.contains("◦ 6 of 10 added lines not observed · 4 reported"),
         "{mixed}"
     );
-    assert!(mixed.contains("◇ 4 reported"), "{mixed}");
+    assert!(!mixed.contains("unexplained"), "{mixed}");
     assert!(!mixed.contains("stated"), "{mixed}");
     assert!(
         mixed.contains("— a tool claim writes the file without a hash: all 6"),
@@ -148,17 +151,16 @@ fn c94_the_numbers_come_from_one_reader_function() {
     let coverage = text_of(&crate::view::overview::coverage_lines(Some(&Ok(
         total.clone()
     ))));
+    // Klasse 2 (Review Batch 5): `unexplained` → `not observed`, die
+    // berichteten Zeilen stehen im selben Satz (ein Wortlaut, C9.4).
     assert!(
         coverage.contains(&format!(
-            "◦ {} of {} added lines unexplained",
-            total.unexplained, total.added
+            "◦ {} of {} added lines not observed · {} reported",
+            total.unexplained, total.added, total.stated
         )),
         "{coverage}"
     );
-    assert!(
-        coverage.contains(&format!("◇ {} reported", total.stated)),
-        "{coverage}"
-    );
+    assert!(!coverage.contains("unexplained"), "{coverage}");
 }
 
 /// Das Glossar kennt `reported`, nicht mehr `stated`; `not observed` bleibt.

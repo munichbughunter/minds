@@ -1743,75 +1743,30 @@ pub(crate) fn coverage_lines_with(
         }
         Some(Ok(c)) => c,
     };
-    if c.all_explained() {
-        return vec![axis(
-            "COVERAGE",
-            vec![mark(
-                "✓",
-                format!("all {} added lines observed", c.added),
-                ok(),
-            )],
-        )];
-    }
-    // Der Kopf nennt den offensten Zustand mit seinem Wort (C9.4): nicht
-    // beobachtete Zeilen, sonst berichtete (`◇ 95 of 95 added lines
-    // reported, not observed`), sonst nur im Dateisystem gesehene, sonst
-    // nicht bewertete; die Zeile `· N added lines` gibt es nicht mehr.
-    let (open_glyph, _, open_style) = theme::open();
-    let (reported_glyph, reported_word, reported_style) = theme::state(ReconClass::ReportedOnly);
-    let (fs_glyph, fs_word, fs_style) = theme::state(ReconClass::ExplainedFsOnly);
-    let of = |n: usize, what: &str| format!("{n} of {} added lines {what}", c.added);
-    let (head, lead) = if c.unexplained > 0 {
-        (
-            mark(open_glyph, of(c.unexplained, "unexplained"), open_style),
-            None,
-        )
-    } else if c.stated > 0 {
-        (
-            mark(
-                reported_glyph,
-                of(c.stated, &format!("{reported_word}, not observed")),
-                reported_style,
-            ),
-            Some(ReconClass::ReportedOnly),
-        )
-    } else if c.fs_only > 0 {
-        (
-            mark(fs_glyph, of(c.fs_only, fs_word), fs_style),
-            Some(ReconClass::ExplainedFsOnly),
-        )
-    } else if c.not_assessed > 0 {
-        (
-            mark(
-                "?",
-                of(c.not_assessed, "not assessed"),
-                Style::default().fg(theme::REVIEW),
-            ),
-            None,
-        )
-    } else if c.skipped_files > 0 {
-        // Nur Dateien ohne Zeilenansicht: das steht im Kopf, nicht darunter.
-        (mark("·", not_diffed(c.skipped_files), theme::dim()), None)
-    } else {
-        (mark("·", "no added lines", theme::dim()), None)
-    };
+    // Der Kopf nennt den offensten Zustand mit seinem Wort — aus **einer**
+    // Funktion mit der Evidence-Ebene (C9.4/C12.1, `view::class_words`):
+    // `◦ 6 of 10 added lines not observed · 4 reported`, `◇ 95 of 95 added
+    // lines reported, 0 observed`, `✓ all 3 added lines observed`; die
+    // Zeile `· N added lines` gibt es nicht mehr.
+    let (glyph, text, style) = super::class_words(c);
+    let (fs_glyph, fs_word, _) = theme::state(ReconClass::ExplainedFsOnly);
+    let head_is_fs = c.unexplained == 0 && c.stated == 0 && c.fs_only > 0;
     let skipped_in_head = c.added == 0 && c.skipped_files > 0 && c.not_assessed == 0;
-    let mut out = vec![axis("COVERAGE", vec![head])];
+    let mut out = vec![axis("COVERAGE", vec![mark(glyph, text, style)])];
+    if c.all_explained() {
+        return out;
+    }
+    // Darunter nur, was der Kopf nicht schon nennt: beobachtete,
+    // berichtete und nicht beobachtete Zeilen stehen oben.
     let mut parts: Vec<String> = Vec::new();
-    if c.explained > 0 && c.explained < c.added {
-        parts.push(format!("● {} observed", c.explained));
-    }
-    if c.stated > 0 && lead != Some(ReconClass::ReportedOnly) {
-        parts.push(format!("{reported_glyph} {} {reported_word}", c.stated));
-    }
-    if c.fs_only > 0 && lead != Some(ReconClass::ExplainedFsOnly) {
+    if c.fs_only > 0 && !head_is_fs {
         parts.push(format!("{fs_glyph} {} {fs_word}", c.fs_only));
     }
     if c.not_assessed > 0 && (c.unexplained > 0 || c.stated > 0 || c.fs_only > 0) {
         parts.push(format!("? {} not assessed", c.not_assessed));
     }
     if c.skipped_files > 0 && !skipped_in_head {
-        parts.push(not_diffed(c.skipped_files));
+        parts.push(super::not_diffed(c.skipped_files));
     }
     if !parts.is_empty() {
         out.push(under(parts.join(" · "), theme::dim()));
@@ -1852,14 +1807,6 @@ pub(crate) fn coverage_lines_with(
     }
     // Die Aktion steht in NEXT (C3.7) — eine Aktionszeile, nicht zwei.
     out
-}
-
-/// `N file(s) not diffed` — Dateien ohne Zeilenansicht (binär, zu groß, …).
-fn not_diffed(files: usize) -> String {
-    format!(
-        "{files} file{} not diffed",
-        if files == 1 { "" } else { "s" }
-    )
 }
 
 /// INTERPRETATION: gedeutete Tool-Aufrufe — je Session, wenn sie sich

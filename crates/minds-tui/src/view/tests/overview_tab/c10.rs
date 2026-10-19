@@ -107,7 +107,9 @@ fn c10_a_gap_in_evidence_is_named_not_hidden() {
         ),
     );
     let out = text_at(&mut app, 160, 40);
-    assert!(out.contains("◦ 1 of 2 added lines unexplained"), "{out}");
+    // Klasse 2 (Review Batch 5): `unexplained` → `not observed` (C9.4).
+    assert!(out.contains("◦ 1 of 2 added lines not observed"), "{out}");
+    assert!(!out.contains("lines unexplained"), "{out}");
     assert!(
         out.contains("— no tool claim or shell mention found: all 1"),
         "{out}"

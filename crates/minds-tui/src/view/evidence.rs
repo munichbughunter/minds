@@ -565,60 +565,6 @@ fn level_word(level: minds_reader::assurance::Assurance) -> &'static str {
         .unwrap_or(level.word())
 }
 
-/// Die Zeilen des Commits nach Zustand (C9.4): das offenste Wort vorn,
-/// die übrigen Zahlen dahinter — nie „explained".
-fn class_words(c: &LineClasses) -> (&'static str, String, Style) {
-    let observed = c.explained + c.fs_only;
-    if c.added == 0 {
-        return ("·", "no added lines".into(), theme::dim());
-    }
-    if c.all_explained() {
-        return (
-            "✓",
-            format!("all {} added lines observed", c.added),
-            Style::default().fg(theme::OK),
-        );
-    }
-    let (reported_glyph, reported_word, reported_style) = theme::state(ReconClass::ReportedOnly);
-    let (fs_glyph, fs_word, fs_style) = theme::state(ReconClass::ExplainedFsOnly);
-    if c.unexplained > 0 {
-        let (glyph, word, style) = theme::not_observed();
-        let mut text = format!("{} of {} added lines {word}", c.unexplained, c.added);
-        if c.stated > 0 {
-            text.push_str(&format!(" · {} {reported_word}", c.stated));
-        }
-        if observed > 0 {
-            text.push_str(&format!(" · {observed} observed"));
-        }
-        return (glyph, text, style);
-    }
-    if c.stated > 0 {
-        return (
-            reported_glyph,
-            format!(
-                "{} of {} added lines {reported_word}, {observed} observed",
-                c.stated, c.added
-            ),
-            reported_style,
-        );
-    }
-    if c.fs_only > 0 {
-        return (
-            fs_glyph,
-            format!(
-                "{} of {} added lines {fs_word}, {} observed",
-                c.fs_only, c.added, c.explained
-            ),
-            fs_style,
-        );
-    }
-    (
-        "?",
-        format!("{} of {} added lines not assessed", c.not_assessed, c.added),
-        Style::default().fg(theme::REVIEW),
-    )
-}
-
 /// Die Abgleich-Zeilen unter COVERAGE: je abgeglichenem Commit eine.
 fn artifact_rows(
     artifacts: &[CommitArtifact],
@@ -641,7 +587,7 @@ fn artifact_rows(
             .map(|(_, l)| l);
         match (&artifact.state, counted) {
             (ArtifactState::Assessed(_), Some(Ok(classes))) => {
-                let (glyph, mut text, style) = class_words(classes);
+                let (glyph, mut text, style) = super::class_words(classes);
                 if many {
                     text = format!("{} · {text}", short_commit(artifact));
                 }
@@ -853,7 +799,7 @@ fn artifact(artifacts: &[CommitArtifact], lines: &[CommitLines]) -> Vec<Line<'st
             .find(|(c, _)| *c == artifact.commit)
             .map(|(_, l)| l);
         let (glyph, text, style) = match counted {
-            Some(Ok(classes)) => class_words(classes),
+            Some(Ok(classes)) => super::class_words(classes),
             Some(Err(why)) => ("·", format!("lines not counted — {why}"), theme::dim()),
             None => ("·", "lines not counted".into(), theme::dim()),
         };

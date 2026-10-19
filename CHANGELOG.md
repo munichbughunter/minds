@@ -27,6 +27,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
   signed`; `✓ record intact` appears only with the verdict VERIFIED or
   VERIFIED, INCOMPLETE of this session, `✗ TAMPERED` stays loud. A failed or
   missing check never reads as intact (sealed is not verified).
+- **One wording for the added lines of a commit.** The Overview's COVERAGE
+  line and the evidence view's reconciliation line come from one function
+  and say the same thing for the same count: `◦ 6 of 10 added lines not
+  observed · 4 reported`, `◇ 95 of 95 added lines reported, 0 observed`,
+  `◍ 2 of 3 added lines fs only, 1 observed`, `✓ all 3 added lines
+  observed`. `unexplained` and `reported, not observed` are gone from the
+  Overview (C9.4: one word per state across tabs); the reason sentence
+  below (`— no tool claim or shell mention found: all 46`) stays.
 
 ### Added
 

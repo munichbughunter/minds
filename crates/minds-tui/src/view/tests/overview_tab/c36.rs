@@ -208,10 +208,12 @@ fn c36_coverage_names_its_reason_and_the_missing_claims() {
     let mut app = on_head(&repo, inspection);
     let commit = app.overview.as_ref().unwrap().agent_commit().unwrap().id;
     let detail = detail_text(&mut app, 160, 40);
+    // Klasse 2 (Review Batch 5): `unexplained` → `not observed` (C9.4).
     assert!(
-        detail.contains("◦ 4 of 4 added lines unexplained"),
+        detail.contains("◦ 4 of 4 added lines not observed"),
         "{detail}"
     );
+    assert!(!detail.contains("lines unexplained"), "{detail}");
     assert!(
         detail.contains("no tool claim or shell mention found"),
         "{detail}"

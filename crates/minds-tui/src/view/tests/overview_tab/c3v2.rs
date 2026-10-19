@@ -771,13 +771,15 @@ fn c34_unexplained_lines_match_the_changes_tab() {
     let set = app.inspection.changes(&repo, commit).unwrap();
     let per_file: usize = set.files.iter().map(|f| f.unexplained()).sum();
     assert!(per_file > 0);
+    // Klasse 2 (Review Batch 5): `unexplained` → `not observed` (C9.4).
     assert!(
         detail.contains(&format!(
-            "◦ {per_file} of {} added lines unexplained",
+            "◦ {per_file} of {} added lines not observed",
             set.added()
         )),
         "{detail}"
     );
+    assert!(!detail.contains("lines unexplained"), "{detail}");
     // Die Aktion steht in NEXT (C3.7), nicht als Unterzeile der Achse.
     assert!(!detail.contains("→ d, then n"), "{detail}");
     assert!(detail.contains("NEXT"), "{detail}");
@@ -949,12 +951,15 @@ fn review_coverage_never_counts_a_claim_as_explained() {
         ..LineClasses::default()
     });
     assert!(!stated.contains('✓'), "{stated}");
-    // Klasse 2 (Batch 2, Paket 6 / C9.4): ein Wort je Zustand — `reported,
-    // not observed` statt `stated`, und keine Zeile `· 40 added lines`.
+    // Klasse 2 (Batch 2, Paket 6 / C9.4): ein Wort je Zustand — `reported`
+    // statt `stated`, und keine Zeile `· 40 added lines`; Review Batch 5:
+    // `reported, not observed` → `reported, 0 observed` (ein Wortlaut mit
+    // der Evidence-Ebene).
     assert!(
-        stated.contains("◇ 40 of 40 added lines reported, not observed"),
+        stated.contains("◇ 40 of 40 added lines reported, 0 observed"),
         "{stated}"
     );
+    assert!(!stated.contains("reported, not observed"), "{stated}");
     assert!(!stated.contains("stated"), "{stated}");
     assert!(!stated.contains("· 40 added lines"), "{stated}");
     let skipped = text(LineClasses {
