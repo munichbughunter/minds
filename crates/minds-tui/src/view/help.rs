@@ -17,7 +17,7 @@ Enter / l          open, descend
 Esc / h            back: close, clear the search, return — never quits
 
 /                  filter in every tab: sessions, commits, files, anchors (AND)
-e                  evidence of the session — verdict, coverage, epochs, signature
+e                  evidence of the session — one sentence per axis, the verdict of minds verify, Space: technical
 v / d / i          verify · diff · requirement of the commit or session in focus
 z / Z              zoom: summary (runs) · steps · steps with the agent's text
 r                  reload now (it also reloads by itself when the store changes)

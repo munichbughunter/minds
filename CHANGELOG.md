@@ -62,6 +62,34 @@ versioning follows [Semantic Versioning](https://semver.org/).
   on the commit, or names `minds verify <id>` when the commit is not in
   the history read. Returning to the Overview after a reload checks at
   once, not throttled; `r` too.
+- **The evidence view of a session reads as one sentence (C12.1).** `e`
+  opens with a sentence for humans — one clause per axis, never an
+  overall verdict: `This session's record is intact and signed, and all
+  24 events lie inside the witness boundary. The 95 added lines are
+  reported by the agent; none were observed by a witness. Every tool
+  call was interpreted.` — followed by the verdict of `minds verify` in
+  its own words and with its time (`Verdict of minds verify: ✓ VERIFIED
+  (signatures checked 10:42Z)`, the same check the Overview shows) or,
+  before any check, `sealed, not yet verified — v: run verify`; the
+  sentence `Cryptographically verified within the recorded observation
+  boundary` is gone (sealed is not verified). The seven VERDICT rows
+  (INTEGRITY, COVERAGE, ARTIFACT, EPOCHS, SIGNATURE, INTERPRETATION,
+  LIMITS) are the three axes: INTEGRITY carries seals, signature, chain
+  and assurance level in one line (`✓ record intact · 1 seal, signed ·
+  chain closed (1 epoch) · A1`), COVERAGE the events and gaps with the
+  commit's reconciliation as a second line in the words of every other
+  tab (`◇ 95 of 95 added lines reported, 0 observed` — from the same
+  count as the Overview and the Changes tab; `artifact X/Y lines
+  explained` and `hash-valid` no longer appear here), INTERPRETATION as
+  before. LIMITS is a sentence for the level (`observed at A1 — no
+  witness ran; the agent's own reports are the only source for file
+  contents.`), not `17 named limits`. The
+  technical part — seal ids, chain roots, algorithm and contexts, what
+  is verifiable outside this host — stands unchanged behind `TECHNICAL
+  (for auditors) ▸ Space`. The detail box follows the cursor over the
+  five sections; `Enter` on COVERAGE opens the diff. Footer line 1
+  names only the session, its trust strip and the verdict — no
+  sentences.
 
 - **Tool contents are shown in full where they are read (C8).** The
   story's step detail carries the agent's answer text of the step's turn

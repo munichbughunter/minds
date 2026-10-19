@@ -12,9 +12,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use minds_reader::model::{
-    CoverageAxis, EvidenceReport, IntegrityAxis, InterpretationAxis, TrustAxes,
-};
+use minds_reader::model::{CoverageAxis, IntegrityAxis, InterpretationAxis, TrustAxes};
 
 use crate::theme;
 use crate::verify::Overall;
@@ -224,67 +222,8 @@ pub fn lines(axes: &TrustAxes) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Die drei Achsenzeilen des Evidence-Verdikts (Glyph, Text mit den
-/// Kennzahlen, Stil) — dieselben Glyphen und Wörter wie überall, ergänzt
-/// um das, was die Aussage begrenzt.
-pub fn evidence_rows(
-    report: &EvidenceReport,
-    uninterpreted: usize,
-) -> [(String, String, Style); 3] {
-    let state = &report.state;
-    let scope = report.scope.as_deref().unwrap_or("?");
-    let axes = TrustAxes::of(
-        &minds_reader::model::Provenance::Chained(*state),
-        uninterpreted,
-    );
-    let [i, c, d] = slots(&axes);
-    let integrity = match axes.integrity {
-        IntegrityAxis::Tampered => format!("{} — seal material altered", i.word.to_uppercase()),
-        _ => format!(
-            "{} · {} seal(s) hash-valid",
-            i.word.to_uppercase(),
-            state.seals
-        ),
-    };
-    let coverage = match axes.coverage {
-        CoverageAxis::Complete => format!(
-            "{} · {} event(s) · within {scope}",
-            c.word.to_uppercase(),
-            state.events
-        ),
-        // Keine Zahlen aus verändertem Material: Die Coverage-Aussage trägt
-        // nicht, also nennt die Zeile auch keine.
-        CoverageAxis::NotAssessable => {
-            format!("{} — the seal material is altered", c.word.to_uppercase())
-        }
-        _ => format!(
-            "{} · {} gap(s) · {} pre-chain · {} event(s) · within {scope}",
-            c.word.to_uppercase(),
-            state.gaps,
-            state.pre_chain,
-            state.events
-        ),
-    };
-
-    let interpretation = match axes.interpretation {
-        InterpretationAxis::Interpreted => format!("{} — all tool calls", d.word.to_uppercase()),
-        InterpretationAxis::Uninterpreted(_) => {
-            format!(
-                "{} — call(s) observed, not interpreted",
-                d.word.to_uppercase()
-            )
-        }
-    };
-    [
-        (i.glyph.to_string(), integrity, i.style),
-        (c.glyph.to_string(), coverage, c.style),
-        (d.glyph.to_string(), interpretation, d.style),
-    ]
-}
-
-/// Das Urteil in INTEGRITY der Übersicht — **die Wörter von `minds
-/// verify`**, wörtlich (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT
-/// VERIFIABLE).
+/// Das Kopf-Urteil des Verify-Tabs — **die Wörter von `minds verify`**,
+/// wörtlich (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT VERIFIABLE).
 pub fn verify_headline(overall: Overall) -> (String, Style) {
     match overall {
         Overall::Verified => ("✓ VERIFIED".to_string(), Style::default().fg(theme::OK)),

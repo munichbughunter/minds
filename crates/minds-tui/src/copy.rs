@@ -168,22 +168,22 @@ pub fn integrity(axis: minds_reader::model::IntegrityAxis) -> &'static str {
     }
 }
 
-/// Das Glossar-Wort der Coverage-Achse.
-pub fn coverage(axis: minds_reader::model::CoverageAxis) -> &'static str {
-    use minds_reader::model::CoverageAxis;
-    match axis {
-        CoverageAxis::Complete => "complete",
-        CoverageAxis::Incomplete => "incomplete",
-        CoverageAxis::NotAssessable => "not assessable",
-        CoverageAxis::NotRecorded => "not recorded",
-    }
-}
-
-/// Das Glossar-Wort der Deutungsachse.
-pub fn interpretation(axis: minds_reader::model::InterpretationAxis) -> &'static str {
-    use minds_reader::model::InterpretationAxis;
-    match axis {
-        InterpretationAxis::Interpreted => "interpreted",
-        InterpretationAxis::Uninterpreted(_) => "uninterpreted",
+/// Der Satz zur Grenze einer Assurance-Stufe (C12.1, LIMITS): wer auf
+/// dieser Stufe zusah — und was deshalb nur Aussage des Agenten bleibt.
+pub fn assurance_limit(level: minds_reader::assurance::Assurance) -> &'static str {
+    use minds_reader::assurance::Assurance;
+    match level {
+        Assurance::A0Claimed => {
+            "nothing independent observed this session; every fact here is what the agent recorded."
+        }
+        Assurance::A1Observed => {
+            "no witness ran; the agent's own reports are the only source for file contents."
+        }
+        Assurance::A2Witnessed => {
+            "a separated witness observed and signed the record; file contents it did not read are still the agent's reports."
+        }
+        Assurance::A3Reproduced => {
+            "the result was reproduced independently; what was not reproduced remains observed, not proven."
+        }
     }
 }

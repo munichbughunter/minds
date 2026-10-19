@@ -186,15 +186,20 @@ fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
             report,
             uninterpreted,
             artifacts,
+            lines,
             cursor,
+            technical,
         } => evidence::draw(
             frame,
             area,
+            app,
             *id,
             report.as_ref(),
             *uninterpreted,
             artifacts,
+            lines,
             *cursor,
+            *technical,
         ),
     }
 }
@@ -426,38 +431,24 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 sentence
             }
         }
-        // Evidence: der Satz des Reports, dahinter der Glossar-Satz der
-        // fokussierten Achse (C1).
+        // Evidence (C12.1): nur Id, Trust Strip (aus `context`) und das
+        // Urteil von `minds verify` — keine Sätze; Legacy sagt sein Wort.
         Some(View::Evidence {
-            report,
-            uninterpreted,
-            cursor,
-            ..
-        }) => {
-            let axes = report.as_ref().map(|r| {
-                minds_reader::model::TrustAxes::of(
-                    &minds_reader::model::Provenance::Chained(r.state),
-                    *uninterpreted,
-                )
-            });
-            let word = axes.and_then(|axes| match cursor {
-                0 => Some(crate::copy::integrity(axes.integrity)),
-                1 => Some(crate::copy::coverage(axes.coverage)),
-                5 => Some(crate::copy::interpretation(axes.interpretation)),
-                _ => None,
-            });
-            let mut spans = vec![Span::styled(
-                report
-                    .as_ref()
-                    .map(|r| r.sentence())
-                    .unwrap_or(minds_reader::model::LEGACY_SENTENCE),
-                theme::dim(),
-            )];
-            if let Some(sentence) = word.and_then(crate::copy::sentence) {
-                spans.push(Span::styled(format!("  ·  {sentence}"), theme::dim()));
+            report, artifacts, ..
+        }) => match report.as_ref() {
+            Some(report) => {
+                let (words, style) =
+                    evidence::verdict_words(report, app.evidence_check(artifacts), false);
+                Line::from(Span::styled(words, style))
             }
-            Line::from(spans)
-        }
+            None => {
+                let slot = trust::integrity(minds_reader::model::IntegrityAxis::Legacy);
+                Line::from(Span::styled(
+                    format!("{} {}", slot.glyph, slot.word),
+                    slot.style,
+                ))
+            }
+        },
     };
     let keys = if app.searching {
         Line::from(vec![
@@ -610,7 +601,13 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
                     "Esc back",
                 ]
             }
-            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "d diff", "Esc back"],
+            Some(View::Evidence { .. }) => vec![
+                "↑↓ section",
+                "Space technical",
+                "Enter open",
+                "d diff",
+                "Esc back",
+            ],
         },
         Tab::Changes => Vec::new(),
         Tab::Requirements => vec!["↑↓ anchor", "Enter story", "PgUp PgDn scroll", "/ filter"],

@@ -471,35 +471,45 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
     assert!(matches!(app.top(), Some(View::Evidence { cursor: 0, .. })));
     let out = render(&mut app);
     // Ebene 1: das Verdikt — und der Leitsatz, der die Grenze mitspricht.
-    assert!(out.contains("EVIDENCE b3-aaaaaaaa…"), "{out}");
+    assert!(out.contains("EVIDENCE · session b3-aaaaaaaa…"), "{out}");
+    assert!(!out.contains("EVIDENCE b3-aaaaaaaa…"), "{out}");
     // Die Seal-Karte: derselbe Wort-Stamm wie der CLI-Block aus
     // `minds checkpoint` — SESSION SEALED.
     assert!(out.contains(" SESSION SEALED "), "{out}");
+    // C12.1: der Satz für Menschen statt „Cryptographically verified" —
+    // sealed ist nicht verified; das Urteil hat `minds verify`, oder es
+    // fehlt und die Ebene sagt das.
     assert!(
-        out.contains("4 event(s) · 0 gap(s) · 1 epoch(s) · 0/1 signed"),
+        out.contains("This session's record is intact and unsigned"),
+        "{out}"
+    );
+    assert!(out.contains("sealed, not yet verified"), "{out}");
+    assert!(
+        !out.contains("Cryptographically verified within the recorded"),
         "{out}"
     );
     assert!(out.contains("◈ sealed"), "{out}");
-    assert!(
-        out.contains("Cryptographically verified within the recorded"),
-        "{out}"
-    );
     assert!(out.contains("INTEGRITY"), "{out}");
     assert!(
-        out.contains("COMPLETE · 4 event(s) · within agent-hooks/v1"),
+        out.contains("✓ record intact · 1 seal, unsigned · chain closed (1 epoch)"),
         "{out}"
     );
-    assert!(out.contains("chain closed · 1 epoch(s)"), "{out}");
-    // Verified ≠ signed: unsigniert ist ein eigener Zustand, kein ✗.
-    assert!(out.contains("○"), "{out}");
-    assert!(out.contains("NOT SIGNED — unsigned ≠ invalid"), "{out}");
-    // Ebene 3 unter dem Fokus (INTEGRITY): die Kryptographie — samt der
+    assert!(out.contains("complete · 4 events · 0 gaps"), "{out}");
+    assert!(!out.contains("COMPLETE · 4 event(s)"), "{out}");
+    // Verified ≠ signed: unsigniert ist ein eigener Zustand, kein ✗ — im
+    // Detail der Integrität.
+    assert!(out.contains("○ NOT SIGNED"), "{out}");
+    // Die Kryptographie steht hinter Space (TECHNICAL) — samt der
     // ehrlichen Grenze des Proof-Modells.
+    assert!(!out.contains("blake3 · derive_key"), "{out}");
+    app.reduce(Action::Space);
+    let out = render(&mut app);
     assert!(out.contains("blake3 · derive_key"), "{out}");
     assert!(
         out.contains("Chain root: reproducible only locally with journal + session salt"),
         "{out}"
     );
+    app.reduce(Action::Space);
 
     // COVERAGE: Die Boundary ist prominent — „nicht erfasst" ist keine Lücke.
     app.reduce(Action::Down);
@@ -513,30 +523,31 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
         "{out}"
     );
 
-    // ARTIFACT: Der Fixture-Commit existiert im leeren Repo nicht — der
-    // Abgleich ist ein ehrlicher Zustand, kein Absturz und kein Fehlerrot.
-    app.reduce(Action::Down);
-    let out = render(&mut app);
-    assert!(out.contains("ARTIFACT"), "{out}");
+    // Der Abgleich steht unter COVERAGE (C12.1): Der Fixture-Commit
+    // existiert im leeren Repo nicht — ein ehrlicher Zustand, kein Absturz
+    // und kein Fehlerrot. Eine eigene Sektion ARTIFACT gibt es nicht mehr.
     assert!(out.contains("not assessed (error"), "{out}");
+    assert!(!out.contains("ARTIFACT"), "{out}");
 
-    // EPOCHEN: die Kette als Zeitleiste, nicht abstrakt.
-    app.reduce(Action::Down);
+    // EPOCHEN und SIGNATUR sind Satzteile der Integrität (C12.1): die Kette
+    // als Zeitleiste und die Erklärung, dass unsigniert nicht rot ist,
+    // stehen im Detail von INTEGRITY — keine eigenen Sektionen.
+    app.reduce(Action::Home);
     let out = render(&mut app);
     assert!(out.contains("Epoch 1/1"), "{out}");
     assert!(out.contains("#0–#3"), "{out}");
     assert!(out.contains("chain start"), "{out}");
-
-    // SIGNATUR: unsigniert wird erklärt, nicht rot markiert.
-    app.reduce(Action::Down);
-    let out = render(&mut app);
     assert!(out.contains("○ NOT SIGNED"), "{out}");
     assert!(out.contains("nobody vouches for them with a key"), "{out}");
     assert!(out.contains("minds sign --seal"), "{out}");
+    assert!(!out.contains("EPOCHS"), "{out}");
+    assert!(!out.contains("SIGNATURE"), "{out}");
 
     // GRENZEN: does_not_prove gehört in die Oberfläche, nicht nur in die Doku
-    // — und zwar die der Stufe, die das Material trägt (EA-13).
+    // — und zwar die der Stufe, die das Material trägt (EA-13). LIMITS ist
+    // die vorletzte Sektion, TECHNICAL die letzte.
     app.reduce(Action::End);
+    app.reduce(Action::Up);
     let out = render(&mut app);
     assert!(
         out.contains("At A1 observed, Minds does NOT prove:"),
@@ -593,7 +604,9 @@ Level from the repository alone.
     let mut app = app;
     app.reduce(Action::Evidence);
     let out = render(&mut app);
-    assert!(out.contains("17 named limits at A1 observed"), "{out}");
+    // C12.1: die Grenze als Satz je Stufe, nicht als Zahl benannter Grenzen.
+    assert!(out.contains("observed at A1 — no witness ran"), "{out}");
+    assert!(!out.contains("17 named limits"), "{out}");
 }
 
 #[test]
@@ -1159,21 +1172,28 @@ fn evidence_mode_reconciles_a_human_line_as_not_observed() {
     let mut app = App::new(inspection, &repo, None);
     app.reduce(Action::Evidence);
     let out = render(&mut app);
-    // Die Verdikt-Zeile: Zusammenfassung und Commit.
+    // Die Abgleich-Zeile (C12.1): unter COVERAGE, mit den Wörtern aus C9.4
+    // — nie „explained".
     let row = out
         .lines()
-        .find(|l| l.contains("ARTIFACT"))
-        .expect("ARTIFACT row");
-    assert!(row.contains("◦ ARTIFACT"), "{out}");
-    assert!(row.contains("artifact 3/4 lines explained · "), "{out}");
+        .find(|l| l.contains("added lines not observed"))
+        .expect("reconciliation row");
+    assert!(
+        row.contains("◦ 1 of 4 added lines not observed · 3 reported"),
+        "{out}"
+    );
+    assert!(!out.contains("ARTIFACT"), "{out}");
+    assert!(!out.contains("lines explained"), "{out}");
 
-    // Das Detail folgt dem Fokus: INTEGRITY → COVERAGE → ARTIFACT.
-    app.reduce(Action::Down);
+    // Das Detail folgt dem Fokus: INTEGRITY → COVERAGE (mit dem Abgleich).
     app.reduce(Action::Down);
     let out = render(&mut app);
     let detail = detail_of(&out);
-    assert!(detail.contains(" ARTIFACT "), "{detail}");
-    assert!(detail.contains("artifact 3/4 lines explained"), "{detail}");
+    assert!(detail.contains(" COVERAGE "), "{detail}");
+    assert!(
+        detail.contains("◦ 1 of 4 added lines not observed · 3 reported"),
+        "{detail}"
+    );
     // Die Dateiliste, nach Pfad: a mit der menschlichen Zeile, b belegt.
     let file_lines: Vec<&str> = detail
         .lines()
@@ -1230,12 +1250,16 @@ fn evidence_mode_shows_an_agent_only_commit_as_fully_explained() {
     let out = render(&mut app);
     let row = out
         .lines()
-        .find(|l| l.contains("ARTIFACT"))
-        .expect("ARTIFACT row");
-    // Belegt, aber nur berichtet: `◇`, nicht das grüne `✓` eines Zeugen.
-    assert!(row.contains("◇ ARTIFACT"), "{out}");
-    assert!(row.contains("artifact 4/4 lines explained"), "{out}");
-    app.reduce(Action::Down);
+        .find(|l| l.contains("added lines reported"))
+        .expect("reconciliation row");
+    // Belegt, aber nur berichtet: `◇`, nicht das grüne `✓` eines Zeugen —
+    // und nie „explained" (C12.1).
+    assert!(
+        row.contains("◇ 4 of 4 added lines reported, 0 observed"),
+        "{out}"
+    );
+    assert!(!out.contains("ARTIFACT"), "{out}");
+    assert!(!out.contains("lines explained"), "{out}");
     app.reduce(Action::Down);
     let detail = detail_of(&render(&mut app));
     assert!(detail.contains("◇ reported only       a"), "{detail}");
@@ -1274,7 +1298,11 @@ fn a_legacy_session_still_shows_its_reconciliation() {
     app.reduce(Action::Evidence);
     let out = render(&mut app);
     assert!(out.contains(" SESSION · LEGACY "), "{out}");
-    assert!(out.contains("artifact 3/4 lines explained"), "{out}");
+    assert!(
+        out.contains("◦ 1 of 4 added lines not observed · 3 reported"),
+        "{out}"
+    );
+    assert!(!out.contains("lines explained"), "{out}");
     assert!(out.contains("line 2 not observed in the session"), "{out}");
 }
 
@@ -1321,7 +1349,9 @@ fn hostile_and_overlong_paths_are_sanitized_and_capped() {
         report,
         uninterpreted: 0,
         artifacts,
-        cursor: 2,
+        cursor: crate::app::ARTIFACT_SECTION,
+        lines: Vec::new(),
+        technical: false,
     });
     let out = render(&mut app);
     assert!(!out.contains(['\u{1b}', '\u{202e}']), "{out}");
@@ -1357,14 +1387,16 @@ fn skipped_commits_are_not_shown_as_not_observed() {
         uninterpreted: 0,
         artifacts: vec![skipped('1'), skipped('2')],
         cursor: 0,
+        lines: Vec::new(),
+        technical: false,
     });
     let out = render(&mut app);
     let row = out
         .lines()
-        .find(|l| l.contains("ARTIFACT"))
-        .expect("ARTIFACT row");
-    assert!(row.contains("· ARTIFACT"), "{row}");
-    assert!(row.contains("2 commits · 2 not assessed"), "{row}");
+        .find(|l| l.contains("2 commits"))
+        .expect("reconciliation row");
+    assert!(row.contains("· 2 commits · 2 not assessed"), "{row}");
+    assert!(!row.contains("◦"), "{row}");
 }
 
 // --- Live neu laden -------------------------------------------------------
@@ -1830,6 +1862,8 @@ fn evidence_with_marker(app: &mut App) {
         uninterpreted: 0,
         artifacts: vec![marker()],
         cursor: 0,
+        lines: Vec::new(),
+        technical: false,
     });
 }
 
@@ -2414,6 +2448,8 @@ mod changes_tab {
                 state: ArtifactState::Unavailable("test"),
             }],
             cursor: crate::app::ARTIFACT_SECTION,
+            lines: Vec::new(),
+            technical: false,
         });
         app.reduce(Action::Enter);
         assert_eq!(app.tab, Tab::Changes);
@@ -3418,5 +3454,6 @@ mod overview_tab {
 }
 
 mod c11;
+mod c121;
 mod tamper;
 mod ux;

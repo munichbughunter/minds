@@ -79,17 +79,23 @@ pub enum View {
         /// Der Abgleich der Commits, die die Session tragen (EA-03) —
         /// beim Öffnen einmal gerechnet, vom Reader.
         artifacts: Vec<CommitArtifact>,
+        /// Die Zeilenklassen je abgeglichenem Commit (C12.1) — aus derselben
+        /// Rechnung wie `◦n` im Changes-Tab und COVERAGE in der Übersicht.
+        lines: Vec<crate::view::evidence::CommitLines>,
         /// Die Sektion unter dem Cursor; das Detail folgt dem Fokus.
         cursor: usize,
+        /// Ob die Technik für Auditoren aufgeklappt ist (Space, C12.1).
+        technical: bool,
     },
 }
 
-/// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge.
-pub const EVIDENCE_SECTIONS: usize = 7;
+/// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge (C12.1):
+/// INTEGRITY · COVERAGE · INTERPRETATION · LIMITS · TECHNICAL.
+pub const EVIDENCE_SECTIONS: usize = 5;
 
-/// Die Sektion ARTIFACT im Evidence-Report — Enter springt von dort in den
-/// Changes-Tab.
-pub const ARTIFACT_SECTION: usize = 2;
+/// Die Sektion COVERAGE im Evidence-Report — sie trägt den Abgleich des
+/// Commits; Enter springt von dort in den Changes-Tab.
+pub const ARTIFACT_SECTION: usize = 1;
 
 /// Die Tabs der Oberfläche, in Anzeige-Reihenfolge — der Weg einer
 /// Untersuchung (C12.2): was und warum → was genau → wie → unter welcher
@@ -810,14 +816,7 @@ impl<'a> App<'a> {
             return true;
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = state.lines.entry(commit) {
-            let count = match self.inspection.changes(self.repo, commit) {
-                Ok(set) => match &set.unassessed {
-                    Some(why) => Err(why.clone()),
-                    None => Ok(set.line_classes()),
-                },
-                Err(err) => Err(minds_reader::sanitize(&err.to_string())),
-            };
-            slot.insert(count);
+            slot.insert(count_lines(&self.inspection, self.repo, commit));
             return true;
         }
         false
@@ -1139,12 +1138,19 @@ impl<'a> App<'a> {
                 id,
                 cursor,
                 artifacts,
+                lines,
+                technical,
                 ..
             } => {
                 self.inspection.card(id).ok_or_else(|| gone(id))?;
                 let unchanged =
                     !full && artifact_inputs(before, id) == artifact_inputs(&self.inspection, id);
-                Ok(self.evidence_view_with(id, cursor, unchanged.then_some(artifacts)))
+                Ok(self.evidence_view_with(
+                    id,
+                    cursor,
+                    unchanged.then_some((artifacts, lines)),
+                    technical,
+                ))
             }
         }
     }
@@ -1291,16 +1297,18 @@ impl<'a> App<'a> {
     /// Die Evidence-Ebene einer Session, mit dem Cursor auf `cursor`
     /// (begrenzt auf die vorhandenen Sektionen).
     fn evidence_view(&self, id: SessionId, cursor: usize) -> View {
-        self.evidence_view_with(id, cursor, None)
+        self.evidence_view_with(id, cursor, None, false)
     }
 
     /// Wie [`evidence_view`](Self::evidence_view), mit schon gerechneten
-    /// Abgleichen, wenn `artifacts` sie trägt — dann läuft kein `git`.
+    /// Abgleichen und Zeilenklassen, wenn `cached` sie trägt — dann läuft
+    /// kein `git`.
     fn evidence_view_with(
         &self,
         id: SessionId,
         cursor: usize,
-        artifacts: Option<Vec<CommitArtifact>>,
+        cached: Option<(Vec<CommitArtifact>, Vec<crate::view::evidence::CommitLines>)>,
+        technical: bool,
     ) -> View {
         let report = self.inspection.evidence_report(id);
         let uninterpreted = self
@@ -1309,7 +1317,26 @@ impl<'a> App<'a> {
             .map(|card| card.uninterpreted_calls)
             .unwrap_or(0);
         // Strikt lesend: Der Reader liest nur Blobs der verknüpften Commits.
-        let artifacts = artifacts.unwrap_or_else(|| self.inspection.artifacts(self.repo, id));
+        let (artifacts, lines) = cached.unwrap_or_else(|| {
+            let artifacts = self.inspection.artifacts(self.repo, id);
+            // Die Zeilen aus derselben Rechnung wie die Übersicht (C3.1) —
+            // ihr Zwischenstand zuerst, sonst neu gezählt.
+            let lines = artifacts
+                .iter()
+                .map(|a| {
+                    let counted = match &a.state {
+                        minds_reader::artifact::ArtifactState::Assessed(_) => self
+                            .overview
+                            .as_ref()
+                            .and_then(|o| o.lines.get(&a.commit).cloned())
+                            .unwrap_or_else(|| count_lines(&self.inspection, self.repo, a.commit)),
+                        _ => Err("not assessed".into()),
+                    };
+                    (a.commit, counted)
+                })
+                .collect();
+            (artifacts, lines)
+        });
         // Legacy hat keine Sektionen — nur den einen ehrlichen Satz.
         let last = if report.is_some() {
             EVIDENCE_SECTIONS - 1
@@ -1321,8 +1348,26 @@ impl<'a> App<'a> {
             report,
             uninterpreted,
             artifacts,
+            lines,
             cursor: cursor.min(last),
+            technical,
         }
+    }
+
+    /// Das Urteil von `minds verify` zu einem Commit, der die Session trägt
+    /// (C12.1) — dieselbe Quelle wie EVIDENCE in der Übersicht, samt
+    /// Prüfzeit; `None`, solange keiner geprüft ist.
+    pub fn evidence_check(
+        &self,
+        artifacts: &[CommitArtifact],
+    ) -> Option<(CommitId, &Result<CommitVerify, String>, Option<i64>)> {
+        let overview = self.overview.as_ref()?;
+        artifacts.iter().find_map(|a| {
+            overview
+                .checks
+                .get(&a.commit)
+                .map(|check| (a.commit, check, overview.checked_at.get(&a.commit).copied()))
+        })
     }
 
     fn relayout(&mut self) {
@@ -2022,7 +2067,9 @@ impl<'a> App<'a> {
                 report,
                 uninterpreted,
                 artifacts,
+                lines,
                 mut cursor,
+                mut technical,
             }) => {
                 // Legacy hat keine Sektionen — nur den einen ehrlichen Satz.
                 let last = if report.is_some() {
@@ -2038,7 +2085,9 @@ impl<'a> App<'a> {
                     Action::Home | Action::PageUp => cursor = 0,
                     Action::End | Action::PageDown => cursor = last,
                     Action::Back => keep = false,
-                    // Enter auf ARTIFACT: der Diff des abgeglichenen Commits.
+                    // Space (C12.1): die Technik für Auditoren auf-/zuklappen.
+                    Action::Space if report.is_some() => technical = !technical,
+                    // Enter auf COVERAGE: der Diff des abgeglichenen Commits.
                     Action::Enter if report.is_some() && cursor == ARTIFACT_SECTION => {
                         jump = artifacts.first().map(|a| a.commit);
                     }
@@ -2050,7 +2099,9 @@ impl<'a> App<'a> {
                         report,
                         uninterpreted,
                         artifacts,
+                        lines,
                         cursor,
+                        technical,
                     });
                 }
                 if let Some(commit) = jump {
@@ -2363,5 +2414,21 @@ fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
             out
         }
         _ => vec![tab.title().to_string()],
+    }
+}
+
+/// Die Zeilenklassen eines Commits (C3.1): **die** eine Rechnung für
+/// Übersicht, Changes-Tab und Evidence-Ebene — oder warum nicht.
+pub(crate) fn count_lines(
+    inspection: &Inspection,
+    repo: &Repo,
+    commit: CommitId,
+) -> Result<minds_reader::changes::LineClasses, String> {
+    match inspection.changes(repo, commit) {
+        Ok(set) => match &set.unassessed {
+            Some(why) => Err(why.clone()),
+            None => Ok(set.line_classes()),
+        },
+        Err(err) => Err(minds_reader::sanitize(&err.to_string())),
     }
 }
