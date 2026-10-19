@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
 use minds_reader::model::Verdict;
-use minds_reader::overview::{CommitRow, OverviewCounts, RefLabel, SealMark, WipSession, WipState};
+use minds_reader::overview::{
+    CommitRow, Origin, OverviewCounts, RefLabel, SealMark, WipSession, WipState,
+};
 use minds_reader::reconcile::ReconClass;
 
 use crate::overview::MAX_SESSION_LINES;
@@ -234,7 +236,11 @@ fn graph_through(next: Option<&CommitRow>, width: usize) -> Vec<Span<'static>> {
     spans
 }
 
-fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
+/// Die Zeile einer Session ohne Commit: Zustand, Herkunft, Alter (K2,
+/// C3.7) — `open · imported · 3d ago · no commit linked`. Nur, was der
+/// Record sagt; Herkunft und Alter gedimmt, nie in einer Evidence-Farbe:
+/// eine fremde Session ist eine Lücke, kein Manipulationsbefund.
+fn wip_spans(wip: &WipSession, width: usize, nerd: bool, now: i64) -> Vec<Span<'static>> {
     let mut spans = vec![
         Span::styled(theme::PENDING, Style::default().fg(theme::AGENT)),
         Span::styled("┄", theme::dim()),
@@ -245,18 +251,30 @@ fn wip_spans(wip: &WipSession, width: usize, nerd: bool) -> Vec<Span<'static>> {
     spans.push(Span::raw(" "));
     spans.push(badge_text(&wip.agent, true, nerd));
     spans.push(Span::raw(" "));
-    // Nur, was bekannt ist: `SessionEnd` gesehen oder nicht.
-    let (word, style) = match wip.state {
-        WipState::Ended => ("ended · no commit linked  ", theme::dim()),
-        WipState::Open => (
-            "open · no commit linked yet  ",
+    // Nur, was bekannt ist: `SessionEnd` gesehen oder nicht, die Herkunft,
+    // wenn der Record sie trägt, das Alter, wenn ein Start erfasst ist.
+    match wip.state {
+        WipState::Ended => spans.push(Span::styled("ended · ", theme::dim())),
+        WipState::Open => spans.push(Span::styled(
+            "open · ",
             Style::default()
                 .fg(theme::AGENT)
                 .add_modifier(Modifier::ITALIC),
-        ),
-        WipState::Unknown => ("no commit linked  ", theme::dim()),
-    };
-    spans.push(Span::styled(word, style));
+        )),
+        WipState::Unknown => {}
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if wip.origin != Origin::Unknown {
+        parts.push(wip.origin.word().to_string());
+    }
+    if let Some(started) = wip.started_epoch {
+        parts.push(format!("{} ago", ago_short(started, now)));
+    }
+    parts.push("no commit linked".into());
+    spans.push(Span::styled(
+        format!("{}  ", parts.join(" · ")),
+        theme::dim(),
+    ));
     spans.push(Span::styled(wip.request.clone(), theme::dim()));
     spans
 }
@@ -546,7 +564,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let mut lines = match i.checked_sub(overview.wip.len()) {
             None => {
                 let mut spans = vec![Span::raw(" ")];
-                spans.extend(wip_spans(&overview.wip[i], width, nerd));
+                spans.extend(wip_spans(&overview.wip[i], width, nerd, now));
                 vec![Line::from(spans)]
             }
             Some(at) => {
@@ -714,6 +732,25 @@ fn draw_detail(frame: &mut Frame, app: &App, area: Rect) {
                     WipState::Unknown => "unknown (no lineage recorded)",
                 }),
             ]));
+            // Woher sie stammt (K2) — und, wenn sie nicht hierher gehört,
+            // der Befehl, der sie entfernt. Die TUI führt ihn nicht aus.
+            let mut origin = wrap_words(wip.origin.sentence(), inner.saturating_sub(8)).into_iter();
+            lines.push(Line::from(vec![
+                label("Origin"),
+                Span::raw(origin.next().unwrap_or_default()),
+            ]));
+            for part in origin {
+                lines.push(Line::from(vec![Span::raw("        "), Span::raw(part)]));
+            }
+            if wip.origin == Origin::Imported {
+                lines.push(Line::from(Span::styled(
+                    "To remove it from this repository's store:",
+                    theme::dim(),
+                )));
+                for part in wrapped(&minds_reader::overview::forget_command(&wip.id), inner, 2) {
+                    lines.push(Line::from(Span::styled(part, theme::dim())));
+                }
+            }
             lines.push(Line::raw(""));
             for part in wrapped(&wip.request, inner, 6) {
                 lines.push(Line::raw(part));

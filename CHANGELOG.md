@@ -74,6 +74,24 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A session without a commit says where it came from and how old it is
+  (K2, C3.7).** The Overview row reads `open · imported · 3d ago · no
+  commit linked` instead of `open · no commit linked yet`: the state only
+  when a `SessionEnd` was or was not seen, the origin only when the record
+  carries it — `imported` (no seal material, a read transcript: only
+  `minds import` builds a session that way, and `minds enable` imports the
+  transcripts under `~/.claude/projects/<slug>/` in the background, so a
+  repository re-created at the same path inherits foreign sessions),
+  `captured` (a hook seal), `witnessed` (a witness seal) —, the age from
+  the recorded start, never from the clock of the reader. The detail says
+  it in a sentence (`not from this repository's hooks — imported from the
+  agent's transcript store`) and, for an imported session, names the full
+  `minds forget <session>` that removes it; the TUI does not run it. The
+  reader derives the origin (`minds_reader::overview::Origin`, `WipSession::
+  origin`, `started_epoch`) and provides the command (`forget_command`) so
+  that TUI and CLI use one wording. Nothing is red: a foreign session is a
+  gap, not a tamper finding.
+
 - **Tabs in the order of an investigation (C12.2).** `minds inspect` has
   four tabs: `1 Overview · 2 Changes · 3 Sessions · 4 Requirements` —
   what and why → what exactly → how → under which requirement. `F1`–`F4`,

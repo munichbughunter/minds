@@ -3015,8 +3015,16 @@ mod overview_tab {
         let out = render(&mut app);
         assert!(out.contains("F1 Overview"), "{out}");
         assert!(out.contains("OVERVIEW · 3 commits"), "{out}");
-        assert!(out.contains("open · no commit linked yet"), "{out}");
-        assert!(out.contains("Add exponential backoff"), "{out}");
+        // K2: Die Session ohne Commit sagt, was der Record über ihre
+        // Herkunft weiß — hier nichts — und dass kein Commit hängt; das alte
+        // `… yet` ohne Herkunft und Alter gibt es nicht mehr.
+        assert!(
+            out.contains("ago · no commit linked  Add exponential backoff"),
+            "{out}"
+        );
+        assert!(out.contains("open · "), "{out}");
+        assert!(!out.contains("no commit linked yet"), "{out}");
+        assert!(!out.contains("origin unknown"), "{out}");
         // Das Badge trägt das Agenten-Glyph, nicht das ◆ der content-Evidenz (A1).
         assert!(out.contains(" ◉CC "), "agent badge: {out}");
         assert!(!out.contains(" ◆CC "), "agent badge: {out}");
@@ -3258,12 +3266,19 @@ mod overview_tab {
         assert_ne!(app.overview.as_ref().unwrap().cursor, 0);
         app.reduce(Action::Home);
         let out = render(&mut app);
+        // K2/C3.7: dazu das Alter aus dem erfassten Start; das `… yet` ohne
+        // Alter gibt es nicht mehr. Ohne Seal und ohne Transkript-Status
+        // sagt der Record nichts über die Herkunft — die Zeile auch nicht.
+        assert!(out.contains("open · "), "{out}");
         assert!(
-            out.contains("open · no commit linked yet  Still working"),
+            out.contains("ago · no commit linked  Still working"),
             "{out}"
         );
+        assert!(!out.contains("no commit linked yet"), "{out}");
+        assert!(!out.contains("origin unknown"), "{out}");
+        assert!(out.contains("ended · "), "{out}");
         assert!(
-            out.contains("ended · no commit linked  Just a question"),
+            out.contains("ago · no commit linked  Just a question"),
             "{out}"
         );
         assert!(!out.contains("in progress"), "{out}");
@@ -3474,6 +3489,7 @@ mod overview_tab {
     mod c37;
     mod c3v2;
     mod k1;
+    mod k2;
     mod nav;
 }
 
