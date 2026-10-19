@@ -64,10 +64,31 @@ pub fn parse(bytes: &[u8]) -> Transcript {
 /// übersprungen. Gelesen wird nur die Kennung — kein Text, keine Token
 /// (Redaction-Grenze). Jeder Fehler ist `None`: ein fehlendes Modell, kein
 /// fehlgeschlagener Hook.
+///
+/// Der Pfad kommt aus dem Hook-Payload, also von außen: Nur ein absoluter
+/// Pfad auf eine **reguläre Datei** wird geöffnet — eine FIFO ohne Schreiber
+/// oder `/dev/tty` hielte den Hook sonst fest, bis der Agent ihn abschießt.
+/// Geprüft wird vor dem Öffnen (`metadata`), geöffnet unter Unix ohne zu
+/// blockieren (`O_NONBLOCK`), und nach dem Öffnen noch einmal am offenen
+/// Deskriptor (TOCTOU).
 pub fn model_in_tail(path: &Path, limit: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    if !path.is_absolute() || !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let len = meta.len();
     let cut = len > limit;
     if cut {
         file.seek(SeekFrom::Start(len - limit)).ok()?;
@@ -298,5 +319,24 @@ mod tests {
         );
         assert_eq!(model_in_tail(&path, 8), None, "zu kurz für eine Zeile");
         assert_eq!(model_in_tail(&dir.path().join("missing.jsonl"), 512), None);
+    }
+
+    /// M3: Was keine reguläre Datei ist, wird nicht geöffnet — eine FIFO ohne
+    /// Schreiber würde sonst blockieren; ein relativer Pfad zählt nicht.
+    #[test]
+    fn only_an_absolute_regular_file_is_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(model_in_tail(dir.path(), 512), None, "Verzeichnis");
+        assert_eq!(model_in_tail(Path::new("t.jsonl"), 512), None, "relativ");
+        #[cfg(unix)]
+        {
+            let fifo = dir.path().join("t.jsonl");
+            let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: gültiger, NUL-terminierter Pfad.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let started = std::time::Instant::now();
+            assert_eq!(model_in_tail(&fifo, 512), None, "FIFO ohne Schreiber");
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        }
     }
 }

@@ -296,6 +296,31 @@ fn hook_falls_back_when_witness_hangs() {
     assert!(log.contains("witness unreachable: timeout"), "{log}");
 }
 
+/// K1/M3: Ein `transcript_path`, der eine FIFO ohne Schreiber ist, hält den
+/// Hook nicht fest — Exit 0, Event im Journal, nur ohne Modell.
+#[test]
+fn hook_survives_a_transcript_path_that_is_a_fifo() {
+    let f = Fixture::repo_only();
+    let fifo = f.dir.path().join("t.jsonl");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: gültiger, NUL-terminierter Pfad.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let stdin = f.payload(
+        "fifo",
+        "Stop",
+        &format!(r#","transcript_path":"{}""#, fifo.display()),
+    );
+
+    let (out, took) = f.hook(None, stdin.as_bytes());
+
+    assert_silent_success(&out);
+    assert!(took < Duration::from_secs(3), "der Hook hing: {took:?}");
+    let events = events(&f.local_journal(), "fifo");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].raw_kind, "Stop");
+    assert_eq!(events[0].model, None);
+}
+
 #[test]
 fn hook_secret_wall_runs_before_forwarding() {
     let f = Fixture::new();

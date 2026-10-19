@@ -165,6 +165,13 @@ pub enum TranscriptStatus {
     /// Witness, der kein Transkript aus dem Namensraum des Agenten liest, das
     /// Modell — als Angabe des Hooks, nicht als eigene Beobachtung.
     ModelFromHook,
+    /// Gelesen wie `Read` — aber der Pfad stand in keinem Event: Der
+    /// Checkpoint fand die Datei in der Ablage des Agenten unter dem Home
+    /// des Nutzers (`~/.claude/projects/<slug>/<local_id>.jsonl`, K1
+    /// Fallback). Der Record nennt das, weil die Zuordnung Datei ↔ Session
+    /// hier eine Ableitung aus Pfadkonvention und Kennung ist, keine
+    /// Angabe des Hooks.
+    ReadFromSlug,
 }
 
 impl Lineage {

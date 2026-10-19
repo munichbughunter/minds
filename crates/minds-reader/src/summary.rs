@@ -131,7 +131,9 @@ impl Actor {
         match self.transcript {
             // `Read` ohne Modell: das Transkript trug keines — ohne weiteren
             // Grund, den der Record kennt.
-            Some(TranscriptStatus::Read) | None => MODEL_NOT_RECORDED.to_string(),
+            Some(TranscriptStatus::Read | TranscriptStatus::ReadFromSlug) | None => {
+                MODEL_NOT_RECORDED.to_string()
+            }
             Some(status) => format!("{MODEL_NOT_RECORDED} — {}", transcript_reason(status)),
         }
     }
@@ -152,6 +154,9 @@ pub fn transcript_reason(status: TranscriptStatus) -> &'static str {
         }
         TranscriptStatus::ModelFromHook => {
             "the hook reported the model; texts and token counts were not read"
+        }
+        TranscriptStatus::ReadFromSlug => {
+            "the transcript was read from the agent's project folder — no event named its path"
         }
     }
 }

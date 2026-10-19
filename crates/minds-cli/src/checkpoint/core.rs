@@ -920,7 +920,12 @@ fn report(log_dir: &Path, guard: Option<&dyn CheckpointGuard>, message: &str) {
 }
 
 /// Das Home des Nutzers, wie `minds import` es nimmt (`HOME`, auf Windows
-/// `USERPROFILE`) — für den Transkript-Fallback des Checkpoints (K1).
+/// `USERPROFILE`) — für den Transkript-Fallback des Checkpoints (K1). Die
+/// einzige Stelle, an der der Fallback Umgebung liest: Ohne `HOME` gibt es
+/// keinen Fallback (und keinen Fehler); im Git-Hook und im Witness ist das
+/// das Home des Prozesses, der den Checkpoint baut — beim geschützten
+/// Witness also `_minds`, wo kein Transkript liegt (dort meldet der Hook
+/// das Modell, Punkt 2).
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))

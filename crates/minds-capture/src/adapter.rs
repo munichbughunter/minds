@@ -69,7 +69,10 @@ pub struct Checkpoint<'a> {
     /// Das Home des Nutzers — für den Transkript-Fallback (K1): Nennt kein
     /// Event einen `transcript_path`, sucht der Checkpoint die Datei unter
     /// `~/.claude/projects/<slug(root)>/<local_id>.jsonl` (nur lesen, nie
-    /// importieren). `None` heißt: kein Fallback.
+    /// importieren); der Status sagt dann `ReadFromSlug`. `None` heißt: kein
+    /// Fallback. Der Wert kommt vom Aufrufer (die CLI liest `HOME`, auf
+    /// Windows `USERPROFILE`) — der Adapter selbst liest keine Umgebung,
+    /// damit Fixture-Tests ihr Home mitgeben und deterministisch bleiben.
     pub home: Option<&'a Path>,
 
     /// Die von git **getrackten**, repo-relativen Pfade — die Grenze für
@@ -152,12 +155,20 @@ fn build_indexed(
 ) -> (Session, Vec<usize>) {
     let (mut transcript, mut status) = read_transcript(events, fallback);
     // K1: Blieb das Modell leer, zählt die Kennung, die der Hook gemeldet
-    // hat — ohne Texte und Token, und der Status sagt das.
+    // hat. Der Status sagt das nur, wenn es keine Datei zu lesen gab — ein
+    // Lesefehler (`NotReadable`, `ParseFailed`) oder ein gelesenes, aber
+    // modell-loses Transkript (`Empty`: Texte und Token sind da) bleibt
+    // benannt; das Modell steht trotzdem in der Session.
     if transcript.model.is_none()
         && let Some(id) = hook_model(events)
     {
         transcript.model = Some(model_of(id));
-        status = TranscriptStatus::ModelFromHook;
+        if matches!(
+            status,
+            TranscriptStatus::NotFound | TranscriptStatus::NoPathInEvents
+        ) {
+            status = TranscriptStatus::ModelFromHook;
+        }
     }
     build_with_transcript(key, events, transcript, status)
 }
@@ -972,9 +983,9 @@ fn read_transcript(
         .rev()
         .find_map(|e| e.transcript_path.as_deref())
         .map(Path::new);
-    let path = match (from_events, fallback) {
-        (Some(path), _) => path,
-        (None, Some(candidate)) if candidate.is_file() => candidate,
+    let (path, by_slug) = match (from_events, fallback) {
+        (Some(path), _) => (path, false),
+        (None, Some(candidate)) if candidate.is_file() => (candidate, true),
         (None, _) => return (Transcript::default(), TranscriptStatus::NoPathInEvents),
     };
 
@@ -982,7 +993,13 @@ fn read_transcript(
         Ok(bytes) => {
             let (parsed, entries) = transcript::parse_counted(&bytes);
             let status = if parsed.model.is_some() {
-                TranscriptStatus::Read
+                // Der Record sagt, woher der Pfad kam: aus den Events oder
+                // aus der Ablage des Agenten (m2).
+                if by_slug {
+                    TranscriptStatus::ReadFromSlug
+                } else {
+                    TranscriptStatus::Read
+                }
             } else if entries == 0 && !bytes.iter().all(u8::is_ascii_whitespace) {
                 TranscriptStatus::ParseFailed
             } else {
@@ -1642,6 +1659,39 @@ mod tests {
             s.lineage.as_ref().unwrap().transcript,
             Some(TranscriptStatus::Read)
         );
+
+        // m1: Ein gelesenes Transkript ohne Modell (`Empty`) oder ein
+        // Lesefehler bleibt benannt — das Modell kommt trotzdem vom Hook.
+        let empty = dir.path().join("empty.jsonl");
+        fs::write(
+            &empty,
+            b"{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let mut events = pointing_at(Some(&empty));
+        events.push(JournalEvent {
+            model: Some("gpt-5".into()),
+            ..ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+        });
+        let s = build_one(&key(), &events);
+        assert_eq!(s.model.id, "gpt-5");
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::Empty)
+        );
+        let broken = dir.path().join("broken.jsonl");
+        fs::write(&broken, b"not json at all\n").unwrap();
+        let mut events = pointing_at(Some(&broken));
+        events.push(JournalEvent {
+            model: Some("gpt-5".into()),
+            ..ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+        });
+        let s = build_one(&key(), &events);
+        assert_eq!(s.model.id, "gpt-5");
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::ParseFailed)
+        );
     }
 
     /// K1, Punkt 3: Ohne Pfad in den Events findet der Checkpoint das
@@ -1672,9 +1722,10 @@ mod tests {
         .unwrap();
         let s = checkpoint(&key(), &pointing_at(None), &ctx);
         assert_eq!(s.model.id, "claude-opus-4-1");
+        // m2: Der Record sagt, dass der Pfad nicht aus den Events kam.
         assert_eq!(
             s.lineage.as_ref().unwrap().transcript,
-            Some(TranscriptStatus::Read)
+            Some(TranscriptStatus::ReadFromSlug)
         );
 
         // Ein Pfad in den Events hat Vorrang vor dem Fallback.

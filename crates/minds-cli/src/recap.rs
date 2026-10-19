@@ -71,7 +71,7 @@ fn recap(limit: usize) -> Fallible<()> {
         println!(
             "                       {} · {} · {} file(s) · {}/{} tokens",
             session.agent.name,
-            session.model.id,
+            minds_reader::text::sanitize(&session.model.id),
             session.produced.files.len(),
             session.usage.input_tokens,
             session.usage.output_tokens,

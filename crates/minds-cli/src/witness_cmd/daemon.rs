@@ -1492,6 +1492,9 @@ impl Writer {
         Ok(event)
     }
 
+    /// Parsen und schreiben in einem Zug — der Weg der Tests; der Eventloop
+    /// nimmt die zwei Hälften ([`Self::prepare_hook`], [`Self::commit_hook`]).
+    #[cfg(test)]
     fn hook(
         &mut self,
         agent: &str,
@@ -1499,30 +1502,33 @@ impl Writer {
         stdin: Vec<u8>,
         at: (String, u64),
     ) -> Fallible<()> {
-        self.hook_with_model(agent, event_override, stdin, None, at)
+        if let Some((key, event)) = self.prepare_hook(agent, event_override, stdin, at)? {
+            self.commit_hook(&key, event)?;
+        }
+        Ok(())
     }
 
-    /// Wie [`Self::hook`]; `model` ist die Modell-Kennung, die der Hook vom
-    /// Ende des Transkripts gemeldet hat (K1). Der Decoder hat sie geprüft,
-    /// der Schreiber prüft noch einmal — er ist die Vertrauensgrenze: eine
-    /// kurze, druckbare Zeile, sonst kein Modell.
-    fn hook_with_model(
+    /// Die erste Hälfte von [`Self::hook`]: parsen, prüfen, Mauer — ohne zu
+    /// schreiben. Der Eventloop hält ein `Stop`/`SessionEnd` so lange zurück,
+    /// bis der `Model`-Frame derselben Verbindung da ist oder sie endet
+    /// (K1); alles andere schreibt er sofort mit [`Self::commit_hook`].
+    /// `None`: abgewiesen und geloggt, nichts zu schreiben.
+    pub(super) fn prepare_hook(
         &mut self,
         agent: &str,
         event_override: Option<&str>,
         stdin: Vec<u8>,
-        model: Option<String>,
         at: (String, u64),
-    ) -> Fallible<()> {
+    ) -> Fallible<Option<(SessionKey, NewEvent)>> {
         if agent.eq_ignore_ascii_case("witness") {
             log(&self.home, "reserved agent rejected");
-            return Ok(());
+            return Ok(None);
         }
         let mut parsed = match hook_event::parse(stdin, agent, event_override, at) {
             Ok(parsed) => parsed,
             Err(_) => {
                 log(&self.home, "invalid hook dropped");
-                return Ok(());
+                return Ok(None);
             }
         };
         // Synthetische Witness-Events (`minds.intent`, EA-14) schreibt nur
@@ -1534,18 +1540,18 @@ impl Writer {
             .starts_with(intent::RESERVED_KIND_PREFIX)
         {
             log(&self.home, "reserved event rejected");
-            return Ok(());
+            return Ok(None);
         }
         secretwall::guard(&mut parsed.event);
-        parsed.event.model = model.filter(|m| {
-            !m.is_empty()
-                && m.len() <= minds_capture::witness_proto::MAX_MODEL
-                && !m.chars().any(char::is_control)
-        });
-        let stamp = (parsed.event.at.clone(), parsed.event.at_nanos);
-        let starts = intent::starts_session(&parsed.event);
-        self.bind_intent(&parsed.key, &stamp, starts)?;
-        self.append(&parsed.key, parsed.event)?;
+        Ok(Some((parsed.key, parsed.event)))
+    }
+
+    /// Die zweite Hälfte von [`Self::hook`]: Intent binden, anhängen.
+    pub(super) fn commit_hook(&mut self, key: &SessionKey, event: NewEvent) -> Fallible<()> {
+        let stamp = (event.at.clone(), event.at_nanos);
+        let starts = intent::starts_session(&event);
+        self.bind_intent(key, &stamp, starts)?;
+        self.append(key, event)?;
         Ok(())
     }
 

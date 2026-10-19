@@ -52,7 +52,7 @@ fn search(query: &str) -> Fallible<()> {
         println!(
             "  {} · {} · {} file(s)",
             session.agent.name,
-            session.model.id,
+            minds_reader::text::sanitize(&session.model.id),
             session.produced.files.len()
         );
     }

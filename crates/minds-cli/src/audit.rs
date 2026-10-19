@@ -517,7 +517,11 @@ fn session_record(
             Ok(SessionRecord {
                 id: id.to_string(),
                 agent: format!("{} {}", session.agent.name, session.agent.version),
-                model: format!("{}/{}", session.model.provider, session.model.id),
+                model: format!(
+                    "{}/{}",
+                    minds_reader::text::sanitize(&session.model.provider),
+                    minds_reader::text::sanitize(&session.model.id)
+                ),
                 intent: session.intent.request.clone(),
                 attestation_payload: payload_text,
                 payload,

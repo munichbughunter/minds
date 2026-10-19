@@ -271,35 +271,58 @@ pub(super) fn forward(
     forward_with_model(socket, peer, agent, event_override, stdin, None)
 }
 
-/// Wie [`forward`]; mit `model` geht das Event als `HookModel`-Frame (K1),
-/// damit der Witness die Modell-Kennung kennt, ohne das Transkript zu lesen.
+/// Wie [`forward`]; `model` = (Session-Kennung, Modell-Kennung) folgt dem
+/// `Hook`-Frame als eigener `Model`-Frame auf derselben Verbindung (K1).
+/// Das Event geht **immer** als `Hook` (0x01): Ein Witness, der den
+/// `Model`-Frame nicht kennt, hat das Event dann schon, verwirft nur die
+/// Kennung und schließt die Verbindung. Lässt sich der `Model`-Frame nicht
+/// bauen (die Kennung verletzt die Regel), geht das Event allein.
 pub(super) fn forward_with_model(
     socket: &Path,
     peer: Option<u32>,
     agent: &str,
     event_override: Option<&str>,
     stdin: Vec<u8>,
-    model: Option<String>,
+    model: Option<(String, String)>,
 ) -> Result<(), &'static str> {
     admissible(agent, event_override, stdin.len())?;
-    let frame = match model {
-        Some(model) => Frame::HookModel {
-            agent: agent.to_owned(),
-            event_override: event_override.map(str::to_owned),
-            model,
-            stdin,
-        },
-        None => Frame::Hook {
-            agent: agent.to_owned(),
-            event_override: event_override.map(str::to_owned),
-            stdin,
-        },
-    };
-    let frame = witness_proto::encode(&frame).map_err(|err| match err {
+    let mut frame = witness_proto::encode(&Frame::Hook {
+        agent: agent.to_owned(),
+        event_override: event_override.map(str::to_owned),
+        stdin,
+    })
+    .map_err(|err| match err {
         ProtoError::TooLarge(_) => "frame too large",
         _ => "invalid frame",
     })?;
+    if let Some((session, model)) = model
+        && let Ok(extra) = witness_proto::encode(&Frame::Model {
+            agent: agent.to_owned(),
+            session,
+            model,
+        })
+    {
+        frame.extend_from_slice(&extra);
+    }
     send(socket, peer, &frame).map_err(|err| kind(&err))
+}
+
+/// Der `Hook`-Frame allein — nur noch in Tests gebraucht.
+#[cfg(test)]
+fn encode_hook_only(
+    agent: &str,
+    event_override: Option<&str>,
+    stdin: Vec<u8>,
+) -> Result<Vec<u8>, &'static str> {
+    witness_proto::encode(&Frame::Hook {
+        agent: agent.to_owned(),
+        event_override: event_override.map(str::to_owned),
+        stdin,
+    })
+    .map_err(|err| match err {
+        ProtoError::TooLarge(_) => "frame too large",
+        _ => "invalid frame",
+    })
 }
 
 /// Obergrenze für eine Antwort des Witness: Kopf plus `request_id` plus eine
@@ -800,6 +823,70 @@ mod tests {
                 event_override: Some("Stop".into()),
                 stdin: b"{\"a\":1}".to_vec(),
             }
+        );
+    }
+
+    /// M1: Die Kennung folgt dem Event als eigener Frame — das Event selbst
+    /// ist immer der unveränderte `Hook`-Frame; ohne Kennung kommt nur er.
+    #[test]
+    fn the_model_follows_the_event_as_its_own_frame() {
+        let dir = short_dir();
+        let path = dir.path().join("w.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut all = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = Vec::new();
+                stream.read_to_end(&mut bytes).unwrap();
+                all.push(bytes);
+            }
+            all
+        });
+        forward_with_model(
+            &path,
+            None,
+            "claude-code",
+            Some("Stop"),
+            b"{\"a\":1}".to_vec(),
+            Some(("s-1".into(), "claude-opus-4-1".into())),
+        )
+        .unwrap();
+        forward_with_model(
+            &path,
+            None,
+            "claude-code",
+            Some("Stop"),
+            b"{}".to_vec(),
+            None,
+        )
+        .unwrap();
+
+        let all = reader.join().unwrap();
+        let (hook, used) = witness_proto::decode(&all[0]).unwrap();
+        assert_eq!(
+            hook,
+            Frame::Hook {
+                agent: "claude-code".into(),
+                event_override: Some("Stop".into()),
+                stdin: b"{\"a\":1}".to_vec(),
+            }
+        );
+        let (model, rest) = witness_proto::decode(&all[0][used..]).unwrap();
+        assert_eq!(used + rest, all[0].len(), "genau zwei Frames");
+        assert_eq!(
+            model,
+            Frame::Model {
+                agent: "claude-code".into(),
+                session: "s-1".into(),
+                model: "claude-opus-4-1".into(),
+            }
+        );
+        let (_, used) = witness_proto::decode(&all[1]).unwrap();
+        assert_eq!(used, all[1].len(), "ohne Kennung genau ein Frame");
+        assert_eq!(
+            encode_hook_only("claude-code", Some("Stop"), b"{}".to_vec()).unwrap(),
+            all[1]
         );
     }
 

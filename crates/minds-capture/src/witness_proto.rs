@@ -40,15 +40,16 @@ pub enum Frame {
         event_override: Option<String>,
         stdin: Vec<u8>,
     },
-    /// A hook event plus the model id the hook read from the tail of the
-    /// transcript (K1). Only the id travels, never text or token counts; raw
-    /// stdin stays byte for byte. A witness that does not read transcripts
-    /// learns the model this way.
-    HookModel {
+    /// The model id the hook read from the tail of the transcript at
+    /// `Stop`/`SessionEnd` (K1), sent on the same connection **right after**
+    /// the `Hook` frame of that event. Only the id travels, never text or
+    /// token counts. A witness that does not know this kind drops it and
+    /// closes the connection — the event before it has already landed, so
+    /// an old witness loses the model, never the event.
+    Model {
         agent: String,
-        event_override: Option<String>,
+        session: String,
         model: String,
-        stdin: Vec<u8>,
     },
     CheckpointRequest {
         commit: Option<String>,
@@ -115,17 +116,15 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             put_short(&mut out, event_override.as_deref().unwrap_or_default());
             out.extend_from_slice(stdin);
         }
-        Frame::HookModel {
+        Frame::Model {
             agent,
-            event_override,
+            session,
             model,
-            stdin,
         } => {
             out.push(0x07);
             put_short(&mut out, agent);
-            put_short(&mut out, event_override.as_deref().unwrap_or_default());
+            put_short(&mut out, session);
             put_short(&mut out, model);
-            out.extend_from_slice(stdin);
         }
         Frame::CheckpointRequest { commit, request_id } => {
             out.push(0x02);
@@ -219,15 +218,15 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
         0x07 => {
             let agent = cursor.short_text("agent")?;
             check_agent(agent)?;
-            let event_override = cursor.short_text("event_override")?;
-            check_line(event_override, u16::MAX as usize, "event_override")?;
+            let session = cursor.short_text("session")?;
+            check_session(session)?;
             let model = cursor.short_text("model")?;
             check_model(model)?;
-            Frame::HookModel {
+            cursor.finish()?;
+            Frame::Model {
                 agent: agent.to_owned(),
-                event_override: optional(event_override),
+                session: session.to_owned(),
                 model: model.to_owned(),
-                stdin: cursor.0.to_vec(),
             }
         }
         0x02 => {
@@ -315,17 +314,15 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_line(event, u16::MAX as usize, "event_override")?;
             (5 + agent.len() + event.len()).saturating_add(stdin.len())
         }
-        Frame::HookModel {
+        Frame::Model {
             agent,
-            event_override,
+            session,
             model,
-            stdin,
         } => {
             check_agent(agent)?;
-            let event = event_override.as_deref().unwrap_or_default();
-            check_line(event, u16::MAX as usize, "event_override")?;
+            check_session(session)?;
             check_model(model)?;
-            (7 + agent.len() + event.len() + model.len()).saturating_add(stdin.len())
+            7 + agent.len() + session.len() + model.len()
         }
         Frame::CheckpointRequest { commit, .. } => {
             let commit = commit.as_deref().unwrap_or_default();
@@ -384,12 +381,29 @@ fn check_line(value: &str, max: usize, field: &'static str) -> Result<(), ProtoE
     Ok(())
 }
 
-/// A model id is one short, non-empty, printable line (K1).
-fn check_model(value: &str) -> Result<(), ProtoError> {
-    if value.is_empty() {
+/// A model id is one short, non-empty word of printable ASCII (K1) — the
+/// same rule on every side: the hook before it sends, the decoder, and the
+/// witness before it writes. `pub`, so the hook applies it before encoding
+/// and never trades the event for a bad id.
+pub fn check_model(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty() || value.len() > MAX_MODEL || !value.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(ProtoError::BadField("model"));
     }
-    check_line(value, MAX_MODEL, "model")
+    Ok(())
+}
+
+/// The session id a [`Frame::Model`] names: what a journal session key
+/// accepts (`[A-Za-z0-9._-]`, 1–128 bytes); the writer checks it again.
+fn check_session(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(ProtoError::BadField("session"));
+    }
+    Ok(())
 }
 
 fn check_commit(value: &str) -> Result<(), ProtoError> {
