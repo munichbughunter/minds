@@ -81,10 +81,11 @@ pub fn draw(
 
     let inner = area.width.saturating_sub(4) as usize;
     let check = app.evidence_check(id, artifacts);
+    let intact = intact(&check);
 
     // Kopf: Identität, Trust Strip, Prüfzeit — dann der Satz für Menschen
     // und das Urteil von `minds verify`.
-    let story = wrap(&sentence(report, uninterpreted, lines), inner);
+    let story = wrap(&sentence(report, uninterpreted, lines, intact), inner);
     let head_h = 2 + 1 + story.len() as u16 + 1;
     let (_, v_word, v_style) = theme::provenance(&Provenance::Chained(report.state));
     let axes = TrustAxes::of(&Provenance::Chained(report.state), uninterpreted);
@@ -118,6 +119,7 @@ pub fn draw(
         inner,
         technical,
         cursor,
+        intact,
     );
     let rows_h = rows.len() as u16 + 2;
 
@@ -157,6 +159,23 @@ pub fn draw(
         ),
         detail_area,
     );
+}
+
+/// Ob `minds verify` den Record geprüft und für intakt befunden hat:
+/// nur dann heißt INTEGRITY `✓ record intact`. Ohne Urteil, nach einem
+/// Fehler der Prüfung oder bei NOT VERIFIABLE ist der Record **sealed** —
+/// sealed ist nicht verified (Design-Regel 2: dieselbe Darstellung wie
+/// `… checking` in der Übersicht, nie ✓ davor).
+fn intact(check: &Option<(CommitId, Result<&crate::CommitVerify, String>, Option<i64>)>) -> bool {
+    match check {
+        Some((_, Ok(c), _)) => {
+            matches!(
+                c.verdict,
+                Ok(crate::VerifyVerdict::Verified | crate::VerifyVerdict::Incomplete)
+            ) && !c.sessions.iter().any(|s| s.tampered)
+        }
+        _ => false,
+    }
 }
 
 /// Die Wörter des Urteils (C12.1): **die von `minds verify`**, wörtlich,
@@ -218,14 +237,22 @@ pub(crate) fn verdict_words(
 
 /// Der Satz für Menschen: je Achse ein Satzteil — Integrität, Coverage,
 /// Abgleich, Deutung —, nie ein Gesamturteil.
-fn sentence(report: &EvidenceReport, uninterpreted: usize, lines: &[CommitLines]) -> String {
+/// `intact` sagt, ob `minds verify` das Siegel schon bestätigt hat — davor
+/// ist der Record sealed, nicht intact.
+fn sentence(
+    report: &EvidenceReport,
+    uninterpreted: usize,
+    lines: &[CommitLines],
+    intact: bool,
+) -> String {
     let state = &report.state;
     let axes = TrustAxes::of(&Provenance::Chained(*state), uninterpreted);
     let mut out = if state.verdict == EvidenceVerdict::Tampered {
         "This session's seal material was altered — the record is not intact".to_string()
     } else {
         format!(
-            "This session's record is intact and {}",
+            "This session's record is {} and {}",
+            if intact { "intact" } else { "sealed" },
             signed_words(state.signed, state.seals)
         )
     };
@@ -371,7 +398,9 @@ fn sub(glyph: &str, text: String, style: Style) -> Line<'static> {
     ])
 }
 
-/// Die Achsenzeilen — mit dem Cursor auf `cursor`.
+/// Die Achsenzeilen — mit dem Cursor auf `cursor`. `intact`: ob `minds
+/// verify` das Siegel bestätigt hat — erst dann `✓ record intact`, davor
+/// `◈ record sealed` (der Trust-Glyph der Achse).
 #[allow(clippy::too_many_arguments)]
 fn rows(
     report: &EvidenceReport,
@@ -381,10 +410,11 @@ fn rows(
     width: usize,
     technical: bool,
     cursor: usize,
+    intact: bool,
 ) -> Vec<Line<'static>> {
     let state = &report.state;
     let axes = TrustAxes::of(&Provenance::Chained(*state), uninterpreted);
-    let [_, c, d] = trust::slots(&axes);
+    let [i, c, d] = trust::slots(&axes);
     let ok = Style::default().fg(theme::OK);
     let warn = Style::default().fg(theme::REVIEW);
     let mut out: Vec<(usize, Line<'static>)> = Vec::new();
@@ -404,7 +434,8 @@ fn rows(
         ));
     } else {
         let mut text = format!(
-            "record intact · {} {}, {} · chain {} ({} {})",
+            "record {} · {} {}, {} · chain {} ({} {})",
+            if intact { "intact" } else { "sealed" },
             state.seals,
             plural(state.seals, "seal", "seals"),
             signed_words(state.signed, state.seals),
@@ -412,8 +443,14 @@ fn rows(
             state.seals,
             plural(state.seals, "epoch", "epochs")
         );
-        let mut glyph = "✓";
-        let mut style = ok;
+        // Sealed ist nicht verified: ✓ erst mit dem Urteil, davor der
+        // Trust-Glyph der Achse (`◈`) — wie die Übersicht nie ✓ vor dem
+        // Urteil zeigt.
+        let (mut glyph, mut style) = if intact {
+            ("✓", ok)
+        } else {
+            (i.glyph, i.style)
+        };
         if !state.chain_closed {
             glyph = "!";
             style = warn;

@@ -17,6 +17,17 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The evidence view says `sealed` until `minds verify` has checked.** Before
+  a check, INTEGRITY read `✓ record intact …` while the Overview showed `…
+  checking` for the same state. Now the line carries the trust glyph of the
+  axis — `◈ record sealed · 1 seal, signed · chain closed (1 epoch) · A1` —
+  and the sentence for humans says `This session's record is sealed and
+  signed`; `✓ record intact` appears only with the verdict VERIFIED or
+  VERIFIED, INCOMPLETE of this session, `✗ TAMPERED` stays loud. A failed or
+  missing check never reads as intact (sealed is not verified).
+
 ### Added
 
 - **The Overview detail names the next action (C3.7).** EVIDENCE ends with

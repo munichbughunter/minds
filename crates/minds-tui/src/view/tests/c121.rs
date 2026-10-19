@@ -146,10 +146,14 @@ fn c121_the_head_is_one_sentence_per_axis_and_no_overall_verdict() {
     let out = render_sized(&mut app, 160, 40);
     assert!(out.contains("EVIDENCE · session b3-aaaaaaaa"), "{out}");
     // Je Achse ein Satzteil: Integrität, Coverage, Abgleich, Deutung.
+    // Vor der Prüfung „sealed", nicht „intact" (Klasse 2: alt
+    // `is intact and unsigned` → neu `is sealed and unsigned`; intact erst
+    // mit dem Urteil von `minds verify`).
     assert!(
-        out.contains("This session's record is intact and unsigned"),
+        out.contains("This session's record is sealed and unsigned"),
         "{out}"
     );
+    assert!(!out.contains("record is intact"), "{out}");
     assert!(out.contains("events lie inside the hook boundary"), "{out}");
     assert!(out.contains("The 4 added lines are reported"), "{out}");
     assert!(out.contains("none were observed by a witness."), "{out}");
@@ -213,12 +217,15 @@ fn c121_exactly_three_axes_with_the_old_sections_folded_in() {
             .unwrap_or_else(|| panic!("{label} row in {out}"))
             .to_string()
     };
-    // INTEGRITY trägt Seals, Signatur, Kette und Stufe in einem.
+    // INTEGRITY trägt Seals, Signatur, Kette und Stufe in einem — vor der
+    // Prüfung als `◈ record sealed` (Klasse 2: alt `✓ record intact` ohne
+    // Urteil → neu `◈ record sealed`; ✓ erst mit VERIFIED).
     let integrity = row("INTEGRITY");
     assert!(
-        integrity.contains("✓ record intact · 1 seal, unsigned · chain closed (1 epoch) · A1"),
+        integrity.contains("◈ record sealed · 1 seal, unsigned · chain closed (1 epoch) · A1"),
         "{integrity}"
     );
+    assert!(!integrity.contains("✓ record intact"), "{integrity}");
     // COVERAGE: die Zahlen, darunter der Abgleich mit den Wörtern aus C9.4.
     let coverage = row("COVERAGE");
     assert!(
@@ -366,4 +373,59 @@ fn c121_the_detail_follows_the_cursor_over_the_five_sections() {
     assert!(matches!(app.top(), Some(View::Evidence { cursor: 4, .. })));
     app.reduce(Action::Down);
     assert!(matches!(app.top(), Some(View::Evidence { cursor: 4, .. })));
+}
+
+/// Vor der Signaturprüfung ist der Record **sealed**, nicht intact: die
+/// INTEGRITY-Zeile trägt den Trust-Glyph `◈` und das Wort, kein `✓` — wie
+/// die Übersicht für denselben Zustand `… checking` zeigt, nie ✓ davor
+/// (Design-Regel 2: ein Zustand, eine Darstellung). Erst das Urteil
+/// VERIFIED macht daraus `✓ record intact`; TAMPERED bleibt `✗`.
+#[test]
+fn c121_integrity_is_sealed_not_intact_before_the_check() {
+    let (_dir, mut app) = evidence_from_overview(None);
+    let out = render_sized(&mut app, 160, 40);
+    let row = |out: &str, label: &str| {
+        out.lines()
+            .find(|l| l.contains(label))
+            .unwrap_or_else(|| panic!("{label} row in {out}"))
+            .to_string()
+    };
+    let integrity = row(&out, "INTEGRITY");
+    assert!(
+        integrity.contains("◈ record sealed · 1 seal, unsigned · chain closed (1 epoch) · A1"),
+        "{integrity}"
+    );
+    assert!(!integrity.contains("✓"), "{integrity}");
+    assert!(!out.contains("record intact"), "{out}");
+    assert!(
+        out.contains("This session's record is sealed and unsigned"),
+        "{out}"
+    );
+    assert!(!out.contains("record is intact"), "{out}");
+
+    let (_dir, mut app) = evidence_from_overview(Some(Ok(crate::VerifyVerdict::Verified)));
+    let out = render_sized(&mut app, 160, 40);
+    let integrity = row(&out, "INTEGRITY");
+    assert!(
+        integrity.contains("✓ record intact · 1 seal, unsigned · chain closed (1 epoch) · A1"),
+        "{integrity}"
+    );
+    assert!(!integrity.contains("◈ record sealed"), "{integrity}");
+    assert!(
+        out.contains("This session's record is intact and unsigned"),
+        "{out}"
+    );
+
+    // Ein Fehler der Prüfung ist kein Urteil: sealed, nicht intact.
+    let (_dir, mut app) = evidence_from_overview(Some(Err("verify binary not found".into())));
+    let out = render_sized(&mut app, 160, 40);
+    assert!(row(&out, "INTEGRITY").contains("◈ record sealed"), "{out}");
+    assert!(!out.contains("record intact"), "{out}");
+
+    // Manipuliert: ✗, nie sealed, nie intact.
+    let (_dir, mut app) = tampered_without_a_check();
+    let out = render_sized(&mut app, 160, 40);
+    assert!(row(&out, "INTEGRITY").contains("✗ TAMPERED"), "{out}");
+    assert!(!out.contains("record sealed"), "{out}");
+    assert!(!out.contains("record intact"), "{out}");
 }

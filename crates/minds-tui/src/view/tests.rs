@@ -479,10 +479,13 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
     // C12.1: der Satz für Menschen statt „Cryptographically verified" —
     // sealed ist nicht verified; das Urteil hat `minds verify`, oder es
     // fehlt und die Ebene sagt das.
+    // Vor der Prüfung ist der Record sealed, nicht intact (Klasse 2: alt
+    // `is intact and unsigned` → neu `is sealed and unsigned`).
     assert!(
-        out.contains("This session's record is intact and unsigned"),
+        out.contains("This session's record is sealed and unsigned"),
         "{out}"
     );
+    assert!(!out.contains("record is intact"), "{out}");
     assert!(out.contains("sealed, not yet verified"), "{out}");
     assert!(
         !out.contains("Cryptographically verified within the recorded"),
@@ -490,10 +493,13 @@ fn evidence_mode_shows_the_verdict_and_the_detail_follows_focus() {
     );
     assert!(out.contains("◈ sealed"), "{out}");
     assert!(out.contains("INTEGRITY"), "{out}");
+    // Klasse 2: alt `✓ record intact` ohne Urteil → neu `◈ record sealed`;
+    // ✓ gibt es erst mit dem Urteil von `minds verify`.
     assert!(
-        out.contains("✓ record intact · 1 seal, unsigned · chain closed (1 epoch)"),
+        out.contains("◈ record sealed · 1 seal, unsigned · chain closed (1 epoch)"),
         "{out}"
     );
+    assert!(!out.contains("✓ record intact"), "{out}");
     assert!(out.contains("complete · 4 events · 0 gaps"), "{out}");
     assert!(!out.contains("COMPLETE · 4 event(s)"), "{out}");
     // Verified ≠ signed: unsigniert ist ein eigener Zustand, kein ✗ — im
