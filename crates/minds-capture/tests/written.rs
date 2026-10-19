@@ -59,6 +59,7 @@ fn checkpoint_with(
     let ctx = Checkpoint {
         root,
         commit: None,
+        home: None,
         tracked: None,
         redaction,
     };

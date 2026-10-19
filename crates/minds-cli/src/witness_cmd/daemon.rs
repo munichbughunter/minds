@@ -1499,6 +1499,21 @@ impl Writer {
         stdin: Vec<u8>,
         at: (String, u64),
     ) -> Fallible<()> {
+        self.hook_with_model(agent, event_override, stdin, None, at)
+    }
+
+    /// Wie [`Self::hook`]; `model` ist die Modell-Kennung, die der Hook vom
+    /// Ende des Transkripts gemeldet hat (K1). Der Decoder hat sie geprüft,
+    /// der Schreiber prüft noch einmal — er ist die Vertrauensgrenze: eine
+    /// kurze, druckbare Zeile, sonst kein Modell.
+    fn hook_with_model(
+        &mut self,
+        agent: &str,
+        event_override: Option<&str>,
+        stdin: Vec<u8>,
+        model: Option<String>,
+        at: (String, u64),
+    ) -> Fallible<()> {
         if agent.eq_ignore_ascii_case("witness") {
             log(&self.home, "reserved agent rejected");
             return Ok(());
@@ -1522,6 +1537,11 @@ impl Writer {
             return Ok(());
         }
         secretwall::guard(&mut parsed.event);
+        parsed.event.model = model.filter(|m| {
+            !m.is_empty()
+                && m.len() <= minds_capture::witness_proto::MAX_MODEL
+                && !m.chars().any(char::is_control)
+        });
         let stamp = (parsed.event.at.clone(), parsed.event.at_nanos);
         let starts = intent::starts_session(&parsed.event);
         self.bind_intent(&parsed.key, &stamp, starts)?;
@@ -1545,6 +1565,7 @@ impl Writer {
                 raw_kind: kind.into(),
                 cwd: None,
                 transcript_path: None,
+                model: None,
                 payload: serde_json::value::RawValue::from_string(payload.to_string())?,
             },
         )?;
@@ -1659,6 +1680,7 @@ impl Writer {
                     raw_kind: crate::checkpoint::core::FS_OBSERVED.into(),
                     cwd: None,
                     transcript_path: None,
+                    model: None,
                     payload,
                 },
             )?;
@@ -1945,6 +1967,7 @@ impl Writer {
                     raw_kind: "fs.checkpoint".into(),
                     cwd: None,
                     transcript_path: None,
+                    model: None,
                     payload: serde_json::value::RawValue::from_string("{}".into())?,
                 },
             )?;
@@ -2640,6 +2663,7 @@ fn verify_events(events: &[JournalEvent]) -> Fallible<()> {
             raw_kind: &event.raw_kind,
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
+            model: event.model.as_deref(),
             payload_hash: &payload_hash,
         });
         if event.payload_hash.as_ref() != Some(&payload_hash)

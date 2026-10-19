@@ -22,6 +22,8 @@
 //! wäre genauer, aber auch zerbrechlicher; er kann später additiv dazukommen,
 //! ohne dass sich der Vertrag dieses Moduls ändert.
 
+use std::path::Path;
+
 use minds_core::{Model, Usage};
 use serde::Deserialize;
 
@@ -51,6 +53,38 @@ pub struct Transcript {
 /// deuten lässt, wird übersprungen.
 pub fn parse(bytes: &[u8]) -> Transcript {
     parse_counted(bytes).0
+}
+
+/// Liest nur das **Ende** eines Transkripts (höchstens `limit` Bytes) und
+/// liefert die Modell-Kennung des letzten Eintrags, der eine trägt (K1).
+///
+/// Für den Hook-Pfad: Beim `Stop`/`SessionEnd` kennt der Hook das Transkript,
+/// darf den heißen Pfad aber nicht mit einer vollständigen Lektüre belasten.
+/// Die erste Zeile des Ausschnitts kann angeschnitten sein und wird
+/// übersprungen. Gelesen wird nur die Kennung — kein Text, keine Token
+/// (Redaction-Grenze). Jeder Fehler ist `None`: ein fehlendes Modell, kein
+/// fehlgeschlagener Hook.
+pub fn model_in_tail(path: &Path, limit: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let cut = len > limit;
+    if cut {
+        file.seek(SeekFrom::Start(len - limit)).ok()?;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let mut model = None;
+    for line in text.lines().skip(usize::from(cut)) {
+        let Ok(entry) = serde_json::from_str::<Entry>(line.trim()) else {
+            continue;
+        };
+        if let Some(id) = entry.message.and_then(|m| m.model) {
+            model = Some(id);
+        }
+    }
+    model
 }
 
 /// Wie [`parse`], zählt zusätzlich die Zeilen, die sich als Eintrag deuten
@@ -235,5 +269,34 @@ mod tests {
         assert_eq!(provider_of("o1-preview"), "openai");
         assert_eq!(provider_of("gemini-2.0"), "google");
         assert_eq!(provider_of("llama-3"), "unknown");
+    }
+
+    #[test]
+    fn the_tail_yields_the_last_model_without_reading_the_whole_file() {
+        // K1: Ein langes Transkript, das Modell steht in der letzten
+        // Assistant-Zeile; ein Ausschnitt, der die erste Zeile anschneidet,
+        // findet es trotzdem — und eine fehlende Datei ist `None`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let filler = format!(
+            "{{\"type\":\"user\",\"message\":{{\"content\":\"{}\"}}}}\n",
+            "x".repeat(4000)
+        );
+        let last = r#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[]}}"#;
+        let first = r#"{"type":"assistant","message":{"model":"claude-haiku-4","content":[]}}"#;
+        std::fs::write(&path, format!("{first}\n{filler}{last}\n")).unwrap();
+
+        assert_eq!(
+            model_in_tail(&path, 512).as_deref(),
+            Some("claude-opus-4-1"),
+            "Ausschnitt kleiner als die Datei"
+        );
+        assert_eq!(
+            model_in_tail(&path, 1 << 20).as_deref(),
+            Some("claude-opus-4-1"),
+            "ganze Datei: der letzte Eintrag gewinnt"
+        );
+        assert_eq!(model_in_tail(&path, 8), None, "zu kurz für eine Zeile");
+        assert_eq!(model_in_tail(&dir.path().join("missing.jsonl"), 512), None);
     }
 }

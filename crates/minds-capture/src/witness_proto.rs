@@ -29,12 +29,25 @@ const HEADER_LEN: usize = 12;
 const MAX_AGENT: usize = 64;
 const MAX_TEXT: usize = 4 * 1024;
 
+/// Longest model id a [`Frame::HookModel`] may carry (K1): one short line.
+pub const MAX_MODEL: usize = 128;
+
 /// A single request or response. Raw hook stdin is preserved byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     Hook {
         agent: String,
         event_override: Option<String>,
+        stdin: Vec<u8>,
+    },
+    /// A hook event plus the model id the hook read from the tail of the
+    /// transcript (K1). Only the id travels, never text or token counts; raw
+    /// stdin stays byte for byte. A witness that does not read transcripts
+    /// learns the model this way.
+    HookModel {
+        agent: String,
+        event_override: Option<String>,
+        model: String,
         stdin: Vec<u8>,
     },
     CheckpointRequest {
@@ -100,6 +113,18 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             out.push(0x01);
             put_short(&mut out, agent);
             put_short(&mut out, event_override.as_deref().unwrap_or_default());
+            out.extend_from_slice(stdin);
+        }
+        Frame::HookModel {
+            agent,
+            event_override,
+            model,
+            stdin,
+        } => {
+            out.push(0x07);
+            put_short(&mut out, agent);
+            put_short(&mut out, event_override.as_deref().unwrap_or_default());
+            put_short(&mut out, model);
             out.extend_from_slice(stdin);
         }
         Frame::CheckpointRequest { commit, request_id } => {
@@ -191,6 +216,20 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
                 stdin: cursor.0.to_vec(),
             }
         }
+        0x07 => {
+            let agent = cursor.short_text("agent")?;
+            check_agent(agent)?;
+            let event_override = cursor.short_text("event_override")?;
+            check_line(event_override, u16::MAX as usize, "event_override")?;
+            let model = cursor.short_text("model")?;
+            check_model(model)?;
+            Frame::HookModel {
+                agent: agent.to_owned(),
+                event_override: optional(event_override),
+                model: model.to_owned(),
+                stdin: cursor.0.to_vec(),
+            }
+        }
         0x02 => {
             let commit = cursor.short_text("commit")?;
             check_commit(commit)?;
@@ -276,6 +315,18 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_line(event, u16::MAX as usize, "event_override")?;
             (5 + agent.len() + event.len()).saturating_add(stdin.len())
         }
+        Frame::HookModel {
+            agent,
+            event_override,
+            model,
+            stdin,
+        } => {
+            check_agent(agent)?;
+            let event = event_override.as_deref().unwrap_or_default();
+            check_line(event, u16::MAX as usize, "event_override")?;
+            check_model(model)?;
+            (7 + agent.len() + event.len() + model.len()).saturating_add(stdin.len())
+        }
         Frame::CheckpointRequest { commit, .. } => {
             let commit = commit.as_deref().unwrap_or_default();
             check_commit(commit)?;
@@ -331,6 +382,14 @@ fn check_line(value: &str, max: usize, field: &'static str) -> Result<(), ProtoE
         return Err(ProtoError::BadField(field));
     }
     Ok(())
+}
+
+/// A model id is one short, non-empty, printable line (K1).
+fn check_model(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty() {
+        return Err(ProtoError::BadField("model"));
+    }
+    check_line(value, MAX_MODEL, "model")
 }
 
 fn check_commit(value: &str) -> Result<(), ProtoError> {

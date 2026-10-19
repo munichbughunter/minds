@@ -824,6 +824,7 @@ impl Writer {
                 raw_kind: INTENT_EVENT_KIND.into(),
                 cwd: None,
                 transcript_path: None,
+                model: None,
                 payload: serde_json::value::RawValue::from_string(serde_json::to_string(payload)?)?,
             },
         )?;

@@ -1,7 +1,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-use minds_capture::witness_proto::{Frame, MAGIC, MAX_FRAME, ProtoError, decode, encode};
+use minds_capture::witness_proto::{
+    Frame, MAGIC, MAX_FRAME, MAX_MODEL, ProtoError, decode, encode,
+};
 
 // Count requested heap bytes only on the current test thread and only while
 // decoding. Fixtures, assertions, and parallel tests do not affect the budget.
@@ -78,6 +80,14 @@ fn examples() -> Vec<Frame> {
             request_id: ID,
             reason: "no".into(),
         },
+        // K1: Hook mit Modell-Kennung — zwischen den sechs Golden-Beispielen
+        // und den drei am Ende, damit deren Indizes stehen bleiben.
+        Frame::HookModel {
+            agent: "claude-code".into(),
+            event_override: Some("Stop".into()),
+            model: "claude-opus-4-1".into(),
+            stdin: b"{\"session_id\":\"s\"}".to_vec(),
+        },
         Frame::Hook {
             agent: "claude-code".into(),
             event_override: None,
@@ -151,6 +161,38 @@ fn measured_decode(bytes: &[u8]) -> Result<(Frame, usize), ProtoError> {
         assert_eq!(allocated, 0, "invalid/incomplete frames must not allocate");
     }
     result
+}
+
+/// K1: Die Modell-Kennung ist eine kurze, druckbare, nicht leere Zeile —
+/// alles andere weist der Encoder wie der Decoder zurück.
+#[test]
+fn a_model_id_is_one_short_printable_line() {
+    let frame = |model: &str| Frame::HookModel {
+        agent: "claude-code".into(),
+        event_override: None,
+        model: model.into(),
+        stdin: vec![],
+    };
+    assert_eq!(encode(&frame("")), Err(ProtoError::BadField("model")));
+    assert_eq!(encode(&frame("a\nb")), Err(ProtoError::BadField("model")));
+    assert_eq!(
+        encode(&frame(&"m".repeat(MAX_MODEL + 1))),
+        Err(ProtoError::BadField("model"))
+    );
+    let ok = encode(&frame(&"m".repeat(MAX_MODEL))).unwrap();
+    assert!(matches!(decode(&ok), Ok((Frame::HookModel { .. }, _))));
+
+    // Der Decoder prüft selbst: ein handgebautes Frame mit Steuerzeichen.
+    let mut payload = vec![0x07];
+    payload.extend_from_slice(&2u16.to_le_bytes());
+    payload.extend_from_slice(b"cc");
+    payload.extend_from_slice(&0u16.to_le_bytes());
+    payload.extend_from_slice(&3u16.to_le_bytes());
+    payload.extend_from_slice(b"a\tb");
+    assert_eq!(
+        measured_decode(&wire(&payload)),
+        Err(ProtoError::BadField("model"))
+    );
 }
 
 #[test]
@@ -249,7 +291,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=6 | 0x81 | 0x82) {
+        if matches!(kind, 1..=7 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(
@@ -272,6 +314,7 @@ fn complete_payload_with_missing_fields_or_trailing_bytes_is_malformed() {
         // fields are mandatory even if their string value may be empty.
         let min_len = match &frame {
             Frame::Hook { stdin, .. } => payload.len() - stdin.len(),
+            Frame::HookModel { stdin, .. } => payload.len() - stdin.len(),
             Frame::Ack { status, .. } => payload.len() - status.len(),
             Frame::Nack { reason, .. } => payload.len() - reason.len(),
             _ => payload.len(),

@@ -160,6 +160,7 @@ mod tests {
             raw_kind: format!("{kind:?}"),
             cwd: None,
             transcript_path: None,
+            model: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
             payload_hash: None,
             event_hash: None,

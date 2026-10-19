@@ -66,6 +66,12 @@ pub struct Checkpoint<'a> {
     /// Der Commit, den dieser Checkpoint begleitet (post-commit-Hook).
     pub commit: Option<&'a str>,
 
+    /// Das Home des Nutzers — für den Transkript-Fallback (K1): Nennt kein
+    /// Event einen `transcript_path`, sucht der Checkpoint die Datei unter
+    /// `~/.claude/projects/<slug(root)>/<local_id>.jsonl` (nur lesen, nie
+    /// importieren). `None` heißt: kein Fallback.
+    pub home: Option<&'a Path>,
+
     /// Die von git **getrackten**, repo-relativen Pfade — die Grenze für
     /// Read-Hashes (Phase 6). Getrackter Inhalt ist für jeden Leser des
     /// Repos ohnehin sichtbar; sein Hash verrät nichts Neues. Alles andere
@@ -132,16 +138,55 @@ pub fn build(journal: &Journal) -> crate::Result<Vec<Session>> {
 /// Öffentlich, damit `minds capture` (M6) und die Fixture-Tests eine Session
 /// gezielt bauen können, ohne den Umweg über das ganze Journal.
 pub fn build_one(key: &SessionKey, events: &[JournalEvent]) -> Session {
-    build_indexed(key, events).0
+    build_indexed(key, events, None).0
 }
 
 /// Wie [`build_one`], liefert zusätzlich je Tool-Call (in Envelope-Reihenfolge,
 /// über alle Züge flach) den Index des Journal-Events, aus dem er entstand.
 /// Der Checkpoint braucht diese Brücke zurück zu den Events, um den
 /// PostToolUse-Payload eines Aufrufs zu finden ([`written_hashes`]).
-fn build_indexed(key: &SessionKey, events: &[JournalEvent]) -> (Session, Vec<usize>) {
-    let (transcript, status) = read_transcript(events);
+fn build_indexed(
+    key: &SessionKey,
+    events: &[JournalEvent],
+    fallback: Option<&Path>,
+) -> (Session, Vec<usize>) {
+    let (mut transcript, mut status) = read_transcript(events, fallback);
+    // K1: Blieb das Modell leer, zählt die Kennung, die der Hook gemeldet
+    // hat — ohne Texte und Token, und der Status sagt das.
+    if transcript.model.is_none()
+        && let Some(id) = hook_model(events)
+    {
+        transcript.model = Some(model_of(id));
+        status = TranscriptStatus::ModelFromHook;
+    }
     build_with_transcript(key, events, transcript, status)
+}
+
+/// Die Modell-Kennung aus dem letzten Event, das eine trägt (K1).
+fn hook_model(events: &[JournalEvent]) -> Option<String> {
+    events.iter().rev().find_map(|e| e.model.clone())
+}
+
+/// Das Modell zu einer Kennung — der Anbieter wie beim Transkript geraten.
+fn model_of(id: String) -> Model {
+    Model {
+        provider: transcript::provider_of(&id),
+        id,
+    }
+}
+
+/// Wo das Transkript liegen müsste, wenn kein Event den Pfad nennt (K1,
+/// Fallback): Claude Codes Ablage unter dem Home des Nutzers, Slug der
+/// Repo-Wurzel, Dateiname die Session-Kennung. Nur ein Kandidat — gelesen
+/// wird er in [`read_transcript`], importiert nie.
+fn transcript_fallback(key: &SessionKey, ctx: &Checkpoint) -> Option<PathBuf> {
+    Some(
+        ctx.home?
+            .join(".claude")
+            .join("projects")
+            .join(crate::import::claude_slug(ctx.root?))
+            .join(format!("{}.jsonl", key.local_id())),
+    )
 }
 
 /// Baut die Session aus Events und Transkript; `status` sagt, ob und warum
@@ -199,7 +244,8 @@ fn build_with_transcript(
 /// [`build_one`]: Wer nur die Struktur will (der Reader, ein Test), zahlt den
 /// I/O nicht.
 pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -> Session {
-    let (mut session, call_events) = build_indexed(key, events);
+    let fallback = transcript_fallback(key, ctx);
+    let (mut session, call_events) = build_indexed(key, events, fallback.as_deref());
 
     written_hashes(&mut session, events, &call_events, key.agent(), ctx);
     exec_outcomes(
@@ -227,19 +273,31 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
 /// eine Entscheidung, kein Lesefehler. Trägt kein Event einen Pfad, gab es
 /// nichts zu entscheiden: dann `NoPathInEvents`, wie auf dem Hook-Pfad —
 /// Witness und Legacy bauen aus denselben Events dieselbe Session.
+///
+/// Hat der Hook die Modell-Kennung mitgegeben ([`JournalEvent::model`], K1),
+/// steht sie in der Session, mit Status `ModelFromHook`: Das Modell ist dann
+/// eine Angabe des Hooks aus dem Namensraum des Agenten, Texte und Token
+/// bleiben ungelesen.
 pub fn checkpoint_witness(
     key: &SessionKey,
     events: &[JournalEvent],
     ctx: &Checkpoint,
     path_map: &[(PathBuf, PathBuf)],
 ) -> Session {
-    let status = if events.iter().any(|e| e.transcript_path.is_some()) {
-        TranscriptStatus::NotReadByWitness
-    } else {
-        TranscriptStatus::NoPathInEvents
+    let (transcript, status) = match hook_model(events) {
+        Some(id) => (
+            Transcript {
+                model: Some(model_of(id)),
+                ..Transcript::default()
+            },
+            TranscriptStatus::ModelFromHook,
+        ),
+        None if events.iter().any(|e| e.transcript_path.is_some()) => {
+            (Transcript::default(), TranscriptStatus::NotReadByWitness)
+        }
+        None => (Transcript::default(), TranscriptStatus::NoPathInEvents),
     };
-    let (mut session, call_events) =
-        build_with_transcript(key, events, Transcript::default(), status);
+    let (mut session, call_events) = build_with_transcript(key, events, transcript, status);
     let agent_root = path_map
         .iter()
         .find(|(_, host)| Some(host.as_path()) == ctx.root)
@@ -899,20 +957,28 @@ fn unknown() -> String {
 /// Liest das Transkript, auf das die Events zeigen — best effort.
 ///
 /// Genommen wird der `transcript_path` des letzten Events, das einen trägt: Am
-/// Ende der Session ist das Transkript am vollständigsten. Fehlt die Datei oder
-/// lässt sie sich nicht lesen, ist das kein Fehler, sondern ein leeres
-/// Transkript — das Journal allein trägt die Session. Der zweite Wert sagt,
-/// *warum* es leer blieb (K1); der Pfad selbst wird nie weitergegeben.
-fn read_transcript(events: &[JournalEvent]) -> (Transcript, TranscriptStatus) {
-    let Some(path) = events
+/// Ende der Session ist das Transkript am vollständigsten. Nennt kein Event
+/// einen Pfad, zählt `fallback` ([`transcript_fallback`]) — aber nur, wenn
+/// die Datei dort wirklich liegt; sonst bleibt es `NoPathInEvents`. Fehlt die
+/// Datei oder lässt sie sich nicht lesen, ist das kein Fehler, sondern ein
+/// leeres Transkript — das Journal allein trägt die Session. Der zweite Wert
+/// sagt, *warum* es leer blieb (K1); der Pfad selbst wird nie weitergegeben.
+fn read_transcript(
+    events: &[JournalEvent],
+    fallback: Option<&Path>,
+) -> (Transcript, TranscriptStatus) {
+    let from_events = events
         .iter()
         .rev()
         .find_map(|e| e.transcript_path.as_deref())
-    else {
-        return (Transcript::default(), TranscriptStatus::NoPathInEvents);
+        .map(Path::new);
+    let path = match (from_events, fallback) {
+        (Some(path), _) => path,
+        (None, Some(candidate)) if candidate.is_file() => candidate,
+        (None, _) => return (Transcript::default(), TranscriptStatus::NoPathInEvents),
     };
 
-    match fs::read(Path::new(path)) {
+    match fs::read(path) {
         Ok(bytes) => {
             let (parsed, entries) = transcript::parse_counted(&bytes);
             let status = if parsed.model.is_some() {
@@ -1252,6 +1318,7 @@ mod tests {
             raw_kind: raw_kind.into(),
             cwd: Some("/home/anna/projects/minds".into()),
             transcript_path: None,
+            model: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
             payload_hash: None,
             event_hash: None,
@@ -1511,6 +1578,121 @@ mod tests {
         }]
     }
 
+    /// K1, Punkt 2: Der Witness nimmt die Modell-Kennung aus dem Hook-Event —
+    /// Modell gesetzt, Anbieter geraten, Status sagt, dass nur die Kennung kam.
+    #[test]
+    fn the_witness_path_takes_the_model_from_the_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("read.jsonl");
+        fs::write(
+            &read,
+            br#"{"type":"assistant","message":{"model":"claude-haiku-4","content":[{"type":"text","text":"secret text"}]}}"#,
+        )
+        .unwrap();
+        let mut events = pointing_at(Some(&read));
+        events.push(JournalEvent {
+            model: Some("claude-opus-4-1".into()),
+            ..ev(1, EventKind::TurnEnd, "Stop", "t1", "{}")
+        });
+
+        let s = checkpoint_witness(&key(), &events, &Checkpoint::default(), &[]);
+        assert_eq!(s.model.id, "claude-opus-4-1");
+        assert_eq!(s.model.provider, "anthropic");
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::ModelFromHook)
+        );
+        // Nur die Kennung: Der Witness hat die Datei nicht angefasst.
+        assert!(s.turns.iter().all(|t| !t.text.contains("secret text")));
+        assert_eq!(s.usage.output_tokens, 0);
+    }
+
+    /// K1, Punkt 2 auf dem Hook-Pfad: Ist die Datei weg, trägt die Session
+    /// trotzdem das Modell des Hooks — mit dem Status, der das sagt.
+    #[test]
+    fn the_hook_model_fills_in_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut events = pointing_at(Some(&dir.path().join("gone.jsonl")));
+        events.push(JournalEvent {
+            model: Some("gpt-5".into()),
+            ..ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+        });
+        let s = build_one(&key(), &events);
+        assert_eq!(s.model.id, "gpt-5");
+        assert_eq!(s.model.provider, "openai");
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::ModelFromHook)
+        );
+        // Ein gelesenes Transkript schlägt den Hook: dann `Read`.
+        let read = dir.path().join("read.jsonl");
+        fs::write(
+            &read,
+            br#"{"type":"assistant","message":{"model":"claude-opus-4","content":[]}}"#,
+        )
+        .unwrap();
+        let mut events = pointing_at(Some(&read));
+        events.push(JournalEvent {
+            model: Some("gpt-5".into()),
+            ..ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+        });
+        let s = build_one(&key(), &events);
+        assert_eq!(s.model.id, "claude-opus-4");
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::Read)
+        );
+    }
+
+    /// K1, Punkt 3: Ohne Pfad in den Events findet der Checkpoint das
+    /// Transkript über den Claude-Slug der Repo-Wurzel — nur lesen.
+    #[test]
+    fn without_a_path_the_transcript_is_found_by_the_claude_slug() {
+        let home = tempfile::tempdir().unwrap();
+        let root = Path::new("/home/anna/projekt");
+        let ctx = Checkpoint {
+            root: Some(root),
+            home: Some(home.path()),
+            ..Checkpoint::default()
+        };
+
+        // Keine Datei: der Status bleibt, wie er war.
+        let s = checkpoint(&key(), &pointing_at(None), &ctx);
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::NoPathInEvents)
+        );
+
+        let dir = home.path().join(".claude/projects/-home-anna-projekt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{}.jsonl", key().local_id())),
+            br#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[]}}"#,
+        )
+        .unwrap();
+        let s = checkpoint(&key(), &pointing_at(None), &ctx);
+        assert_eq!(s.model.id, "claude-opus-4-1");
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::Read)
+        );
+
+        // Ein Pfad in den Events hat Vorrang vor dem Fallback.
+        let missing = home.path().join("missing.jsonl");
+        let s = checkpoint(&key(), &pointing_at(Some(&missing)), &ctx);
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::NotFound)
+        );
+
+        // Ohne Kontext (Reader, `build_one`) gibt es keinen Fallback.
+        let s = build_one(&key(), &pointing_at(None));
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::NoPathInEvents)
+        );
+    }
+
     fn transcript_status(events: &[JournalEvent]) -> Option<TranscriptStatus> {
         build_one(&key(), events)
             .lineage
@@ -1693,6 +1875,7 @@ mod tests {
 
         let ctx = Checkpoint {
             root: Some(dir.path()),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -1720,6 +1903,7 @@ mod tests {
         )];
         let ctx = Checkpoint {
             root: None,
+            home: None,
             commit: Some("deadbeefcafe"),
             tracked: None,
             redaction: Some(policy()),
@@ -2028,6 +2212,7 @@ mod tests {
         );
         let ctx = Checkpoint {
             root: Some(Path::new("/repo")),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -2040,6 +2225,7 @@ mod tests {
         // Eine andere Wurzel: draussen. Auch `/repo2` ist nicht `/repo`.
         let ctx = Checkpoint {
             root: Some(Path::new("/repo2")),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -2104,6 +2290,7 @@ mod tests {
         ];
         let ctx = Checkpoint {
             root: Some(&link),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -2148,6 +2335,7 @@ mod tests {
         ];
         let ctx = Checkpoint {
             root: Some(&real),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -2282,6 +2470,7 @@ mod tests {
         let tracked: std::collections::BTreeSet<String> = ["read.rs".to_string()].into();
         let ctx = Checkpoint {
             root: Some(dir.path()),
+            home: None,
             commit: None,
             tracked: Some(&tracked),
             redaction: Some(policy()),
@@ -2301,6 +2490,7 @@ mod tests {
         // Hash — fail-closed in Richtung „weniger Fingerabdruck".
         let ctx_unbounded = Checkpoint {
             root: Some(dir.path()),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -2356,6 +2546,7 @@ mod tests {
         ];
         let ctx = Checkpoint {
             root: Some(&dir.path().join("repo")),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),
@@ -2393,6 +2584,7 @@ mod tests {
         let key = SessionKey::new("codex", key().local_id()).unwrap();
         let ctx = Checkpoint {
             root: Some(&dir.path().join("repo")),
+            home: None,
             commit: None,
             tracked: None,
             redaction: Some(policy()),

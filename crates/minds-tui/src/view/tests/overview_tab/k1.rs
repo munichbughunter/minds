@@ -272,6 +272,45 @@ fn k1_a_read_transcript_shows_the_model_in_full() {
     assert!(!out.contains("not recorded"), "{out}");
 }
 
+/// K1: Meldet der Hook das Modell, steht es vollständig in der Overview —
+/// und AGENT SAID sagt, dass Texte nicht gelesen wurden. Nie `unknown`.
+#[test]
+fn k1_a_model_from_the_hook_shows_in_full_and_agent_said_says_why() {
+    let mut s = placeholder_session(Some(TranscriptStatus::ModelFromHook));
+    s.model = minds_core::Model {
+        provider: "anthropic".into(),
+        id: "claude-opus-4-1".into(),
+    };
+    for turn in &mut s.turns {
+        if turn.role == minds_core::Role::Assistant {
+            turn.text.clear();
+        }
+    }
+    let (_dir, repo, head, inspection) = linked(s);
+    let mut app = App::new(inspection.clone(), &repo, None);
+    app.open_overview();
+    while app.fill_overview(&Plain) {}
+    let out = text_at(&mut app, 160, 40);
+    assert!(
+        out.contains("claude-code · claude-opus-4-1 (Anthropic)"),
+        "{out}"
+    );
+    assert!(!out.contains("not recorded"), "{out}");
+    assert!(!out.contains("unknown"), "{out}");
+
+    let mut app = App::new(inspection, &repo, None);
+    app.changes = Some(changes_of(head));
+    app.tab = Tab::Changes;
+    let out = text_at(&mut app, 160, 40);
+    // Die Why-Box ist 56 Spalten breit und kürzt den Satz — der Anfang
+    // reicht, um den Grund zu erkennen.
+    assert!(
+        out.contains("(transcript not read: the hook reported"),
+        "{out}"
+    );
+    assert!(!out.contains("unknown"), "{out}");
+}
+
 /// Fehlt der Text des Agenten, nennt AGENT SAID den Grund aus dem Record
 /// (`— (transcript not read: <Grund>)`, C9.3) statt einer leeren Aussage.
 #[test]

@@ -334,6 +334,18 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
             event_override,
             stdin,
         } => writer.hook(&agent, event_override.as_deref(), stdin, clock::now())?,
+        Frame::HookModel {
+            agent,
+            event_override,
+            model,
+            stdin,
+        } => writer.hook_with_model(
+            &agent,
+            event_override.as_deref(),
+            stdin,
+            Some(model),
+            clock::now(),
+        )?,
         Frame::Ping => {
             let bytes = witness_proto::encode(&Frame::Ack {
                 request_id: [0; 16],

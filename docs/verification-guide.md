@@ -142,9 +142,12 @@ tool cannot prove; that would require an assurance from the provider.
 
 **A missing model names its reason, not a fact.** Model, response texts and token
 counts come from the agent's transcript. When it was not read, `lineage.transcript`
-says why — `no_path_in_events`, `not_found`, `not_readable`, `empty`, `parse_failed`
-or `not_read_by_witness` (the witness never loads transcripts from agent paths) —
-and `read` when it was. The word is part of the sealed session bytes, so it is as
+says why — `no_path_in_events`, `not_found`, `not_readable`, `empty`, `parse_failed`,
+`not_read_by_witness` (the witness never loads transcripts from agent paths) or
+`model_from_hook` (the hook passed on only the model id it read from the end of
+the transcript; the witness still did not read the file) — and `read` when it was.
+`model_from_hook` is the normal case with a witness: the model is then a statement
+of the hook, running as the developer, not an observation of the witness. The word is part of the sealed session bytes, so it is as
 tamper-evident as the rest of the record; it is not a statement about which model
 ran, only about whether the transcript was consulted. A record without the field
 was built by an older binary. The path itself is never stored (it carries the user

@@ -150,6 +150,9 @@ pub fn transcript_reason(status: TranscriptStatus) -> &'static str {
         TranscriptStatus::NotReadByWitness => {
             "the witness does not read transcripts from agent paths"
         }
+        TranscriptStatus::ModelFromHook => {
+            "the hook reported the model; texts and token counts were not read"
+        }
     }
 }
 
@@ -313,6 +316,10 @@ mod tests {
             (
                 TranscriptStatus::NotReadByWitness,
                 "the witness does not read transcripts from agent paths",
+            ),
+            (
+                TranscriptStatus::ModelFromHook,
+                "the hook reported the model; texts and token counts were not read",
             ),
         ] {
             lineage.transcript = Some(status);

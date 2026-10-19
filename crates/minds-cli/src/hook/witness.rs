@@ -260,6 +260,7 @@ pub(super) fn admissible(
 /// Der Fehler ist eine kurze, feste Bezeichnung für `hook.log`
 /// (`witness unreachable: <kind>`) — nie fremder Text, nie Payload, nie der
 /// Socket-Pfad.
+#[cfg(test)]
 pub(super) fn forward(
     socket: &Path,
     peer: Option<u32>,
@@ -267,13 +268,34 @@ pub(super) fn forward(
     event_override: Option<&str>,
     stdin: Vec<u8>,
 ) -> Result<(), &'static str> {
+    forward_with_model(socket, peer, agent, event_override, stdin, None)
+}
+
+/// Wie [`forward`]; mit `model` geht das Event als `HookModel`-Frame (K1),
+/// damit der Witness die Modell-Kennung kennt, ohne das Transkript zu lesen.
+pub(super) fn forward_with_model(
+    socket: &Path,
+    peer: Option<u32>,
+    agent: &str,
+    event_override: Option<&str>,
+    stdin: Vec<u8>,
+    model: Option<String>,
+) -> Result<(), &'static str> {
     admissible(agent, event_override, stdin.len())?;
-    let frame = witness_proto::encode(&Frame::Hook {
-        agent: agent.to_owned(),
-        event_override: event_override.map(str::to_owned),
-        stdin,
-    })
-    .map_err(|err| match err {
+    let frame = match model {
+        Some(model) => Frame::HookModel {
+            agent: agent.to_owned(),
+            event_override: event_override.map(str::to_owned),
+            model,
+            stdin,
+        },
+        None => Frame::Hook {
+            agent: agent.to_owned(),
+            event_override: event_override.map(str::to_owned),
+            stdin,
+        },
+    };
+    let frame = witness_proto::encode(&frame).map_err(|err| match err {
         ProtoError::TooLarge(_) => "frame too large",
         _ => "invalid frame",
     })?;

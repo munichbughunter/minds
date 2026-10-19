@@ -107,6 +107,13 @@ pub struct EventFacts<'a> {
     /// Transkript-Pfad, falls im Event vorhanden.
     pub transcript_path: Option<&'a str>,
 
+    /// Die Modell-Kennung, die der Hook mitgab (K1), falls vorhanden.
+    ///
+    /// Additiv: Nur ein gesetzter Wert geht in den Hash ein — ein Event ohne
+    /// Modell behält den Hash, den es vor diesem Feld hatte (alte Journale
+    /// bleiben nachrechenbar).
+    pub model: Option<&'a str>,
+
     /// Der [`payload_hash`] des Events.
     pub payload_hash: &'a ContentHash,
 }
@@ -121,6 +128,10 @@ pub fn event_hash(facts: &EventFacts<'_>) -> ContentHash {
     put_opt(&mut buf, facts.cwd.map(str::as_bytes));
     put_opt(&mut buf, facts.transcript_path.map(str::as_bytes));
     put_bytes(&mut buf, facts.payload_hash.as_str().as_bytes());
+    if let Some(model) = facts.model {
+        put_bytes(&mut buf, b"model");
+        put_bytes(&mut buf, model.as_bytes());
+    }
     ContentHash::from_bytes(blake3::derive_key(CTX_EVENT, &buf))
 }
 
@@ -1290,6 +1301,7 @@ mod tests {
             raw_kind: "PostToolUse",
             cwd: Some("/work/repo"),
             transcript_path: None,
+            model: None,
             payload_hash: payload,
         }
     }
@@ -1309,6 +1321,26 @@ mod tests {
         "b3-dc14f263e5efbef2e3f598bca2d4a919dd8534c35a4789c3cf39b566fd31319c";
     const GOLDEN_CHAIN_ROOT: &str =
         "b3-1676980fced8f11c73cc9ed58294c90c9c141ad6fb0c1a8004c86c7dc666a685";
+
+    #[test]
+    fn a_model_counts_only_when_the_hook_reported_one() {
+        // K1, additiv: ohne Modell bleibt der Hash der alte (der Golden-Test
+        // friert ihn ein); mit Modell ist er ein anderer, und ein leeres
+        // Modell ist nicht dasselbe wie keines.
+        let payload = payload_hash(b"x");
+        let without = event_hash(&sample_facts(&payload));
+        let with = event_hash(&EventFacts {
+            model: Some("claude-opus-4-1"),
+            ..sample_facts(&payload)
+        });
+        let empty = event_hash(&EventFacts {
+            model: Some(""),
+            ..sample_facts(&payload)
+        });
+        assert_ne!(without, with);
+        assert_ne!(without, empty);
+        assert_ne!(with, empty);
+    }
 
     fn golden_items() -> Vec<ChainItem> {
         let payload = payload_hash(b"{\"tool_name\":\"Read\"}");

@@ -153,7 +153,7 @@ fn import_claude_code(repo_root: &Path, home: &Path) -> AgentImport {
 
 /// Claude Codes Verzeichnisname für ein Arbeitsverzeichnis: jeder `/` und `.`
 /// wird zu `-`.
-fn claude_slug(repo_root: &Path) -> String {
+pub(crate) fn claude_slug(repo_root: &Path) -> String {
     repo_root
         .to_string_lossy()
         .chars()

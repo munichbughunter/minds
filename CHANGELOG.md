@@ -53,6 +53,23 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The model is recorded even when the witness does not read the
+  transcript (K1).** At `Stop` and `SessionEnd` the hook reads only the end
+  of the transcript (at most 1 MiB) and passes the model id on — nothing
+  else: no text, no token counts. It travels as `model` on the journal
+  event (part of the event hash when present; events without it keep their
+  hash) and, to a witness, as a `HookModel` frame (kind `0x07`). A session
+  the witness builds then names the model with `lineage.transcript =
+  model_from_hook` (`minds inspect`: `claude-code · claude-opus-4-1
+  (Anthropic)`, and AGENT SAID says `transcript not read: the hook reported
+  the model; texts and token counts were not read`); the local checkpoint
+  uses the hook's id too when the file is gone. When no event names a
+  transcript path, the checkpoint looks under `~/.claude/projects/<slug of
+  the repo root>/<session id>.jsonl` and reads the file if it is there —
+  never imports it. A witness older than this release does not know the
+  new frame and drops it as malformed — update hook and witness together
+  (`minds enable` installs both from one binary).
+
 - **The Overview detail names the next action (C3.7).** EVIDENCE ends with
   one `NEXT → …` line — the topmost axis that is not `✓` decides it:
   `v: run verify` before the verdict, `e: evidence of the session — what

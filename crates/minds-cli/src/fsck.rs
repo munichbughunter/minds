@@ -502,6 +502,7 @@ fn recompute_stamps(events: &[minds_capture::JournalEvent]) -> (usize, usize) {
             raw_kind: &event.raw_kind,
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
+            model: event.model.as_deref(),
             payload_hash: &payload,
         });
         if payload != *payload_hash || facts != *event_hash {
@@ -2105,6 +2106,7 @@ mod tests {
                     raw_kind: "UserPromptSubmit".into(),
                     cwd: None,
                     transcript_path: None,
+                    model: None,
                     payload: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
                 },
             )

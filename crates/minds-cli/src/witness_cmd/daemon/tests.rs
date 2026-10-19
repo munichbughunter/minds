@@ -114,6 +114,45 @@ fn append(writer: &mut Writer) {
     writer.hook("claude-code", None, payload(), at()).unwrap();
 }
 
+/// K1: Ein `HookModel`-Frame bringt die Modell-Kennung ins Journal; der
+/// Witness-Checkpoint trägt sie als `ModelFromHook` — ohne je das Transkript
+/// zu lesen. Eine unbrauchbare Kennung (Steuerzeichen) bleibt draußen.
+#[test]
+fn a_hook_model_frame_names_the_model_without_reading_the_transcript() {
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    append(&mut writer);
+    let stop = br#"{"session_id":"test-session","hook_event_name":"Stop","transcript_path":"/home/anna/.claude/projects/p/t.jsonl","cwd":"/workspaces/demo"}"#.to_vec();
+    writer
+        .hook_with_model(
+            "claude-code",
+            None,
+            stop.clone(),
+            Some("claude-opus-4-1".into()),
+            at(),
+        )
+        .unwrap();
+    writer
+        .hook_with_model("claude-code", None, stop, Some("bad\u{7}id".into()), at())
+        .unwrap();
+    let events = writer.journal.read(&key()).unwrap().events;
+    assert_eq!(events[1].model.as_deref(), Some("claude-opus-4-1"));
+    assert_eq!(events[2].model, None, "Steuerzeichen: kein Modell");
+
+    let session = minds_capture::adapter::checkpoint_witness(
+        &key(),
+        &events,
+        &minds_capture::Checkpoint::default(),
+        &[],
+    );
+    assert_eq!(session.model.id, "claude-opus-4-1");
+    assert_eq!(session.model.provider, "anthropic");
+    assert_eq!(
+        session.lineage.as_ref().unwrap().transcript,
+        Some(minds_core::TranscriptStatus::ModelFromHook)
+    );
+}
+
 #[test]
 fn witness_chain_equals_legacy_chain() {
     let f = Fixture::new();
@@ -317,6 +356,7 @@ fn witness_ledger_is_idempotent_after_sealing_before_discard() {
                     kind: event.kind,
                     cwd: event.cwd,
                     transcript_path: event.transcript_path,
+                    model: None,
                     payload: event.payload,
                 },
             )
@@ -454,6 +494,7 @@ fn witness_path_mapping_keeps_evidence_verbatim_and_ignores_transcripts() {
     let tracked = crate::checkpoint::tracked_files(&root);
     let ctx = minds_capture::Checkpoint {
         root: Some(&root),
+        home: None,
         tracked: tracked.as_ref(),
         commit: None,
         redaction: Some(&pipeline),
@@ -653,6 +694,7 @@ fn witness_session_carries_the_commit_edge_like_legacy() {
     let head = git(&f.root, &["rev-parse", "HEAD"]);
     let ctx = minds_capture::Checkpoint {
         root: Some(&f.root),
+        home: None,
         tracked: None,
         commit: Some(head.trim()),
         redaction: None,

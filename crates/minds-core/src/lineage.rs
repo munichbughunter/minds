@@ -159,6 +159,12 @@ pub enum TranscriptStatus {
     /// fremder Hook-Pfad ist für ihn kein Leseauftrag. Kein Fehler — eine
     /// Entscheidung, die der Record benennt.
     NotReadByWitness,
+    /// Der Hook hat beim `Stop`/`SessionEnd` nur die Modell-Kennung aus dem
+    /// Ende des Transkripts gemeldet (K1): Das Modell steht in der Session,
+    /// Antworttexte und Token-Zähler wurden nicht gelesen. So kennt auch ein
+    /// Witness, der kein Transkript aus dem Namensraum des Agenten liest, das
+    /// Modell — als Angabe des Hooks, nicht als eigene Beobachtung.
+    ModelFromHook,
 }
 
 impl Lineage {
