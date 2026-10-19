@@ -191,16 +191,17 @@ Usage:
         How a change came to be, in the terminal: session list, a
         session's story (the agent's steps in order, with their outcome)
         and a session's evidence; <file>:<line> opens the Changes tab on that
-        line (the why chain itself: minds why). Tabs (Tab, F1–F5): Overview (the history as a
-        commit graph with what Minds knows about each commit: agent or
-        human, branch and tag, seal, review, intent, sessions; Enter leads
-        to the commit's sessions), Sessions, Verify (the verdict of minds
-        verify at a glance: verdict, assurance, intent, integrity, coverage,
-        artifact bar, scope), Changes (the diff of a commit as in git diff,
+        line (the chain as text: minds why). Tabs (Tab, F1–F4, 1–4), in the
+        order of an investigation: Overview (the history as a commit graph
+        with what Minds knows about each commit: agent or human, branch and
+        tag, requirement, sessions, and the EVIDENCE block with the verdict
+        of minds verify, coverage, scope and conformance; Enter leads to the
+        commit's sessions), Changes (the diff of a commit as in git diff,
         unified, s for split, with each added line's evidence class and,
-        beside it, why the line exists) and Intent (the intent anchors:
-        source, scope, proof, signature as minds verify checks it, snapshot,
-        and the sessions naming them). Read-only. Live:
+        beside it, why the line exists), Sessions and Requirements (the
+        intent anchors: the requirement text, its status — proven, signed,
+        binding — as minds verify checks it, and the sessions naming
+        them). Read-only. Live:
         reloads by itself when HEAD or a ref under refs/minds/ changes;
         r reloads at once.
         --nerd-font (or MINDS_NERD_FONT=1) draws round pills and icons;

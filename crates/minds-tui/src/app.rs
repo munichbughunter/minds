@@ -1455,7 +1455,7 @@ impl<'a> App<'a> {
                     changes.landed = changes.focus == Focus::Diff;
                 }
             }
-            // Ein Tab-Wechsel per Taste (F1–F5, 1–5, Tab) auf einen Tab, der
+            // Ein Tab-Wechsel per Taste (F1–F4, 1–4, Tab) auf einen Tab, der
             // im Verlauf als Ursprung liegt, beendet dessen Sprung: der Nutzer
             // ist zurück am Ursprung, alles ab diesem Eintrag fällt weg.
             if tab_key && let Some(at) = self.history.iter().position(|e| e.tab == self.tab) {
