@@ -79,10 +79,10 @@ fn nav_a_tab_key_removes_every_entry_from_the_origin_on() {
     let mut app = opened(&repo, inspection);
     select_a_commit(&mut app);
     app.reduce(Action::Diff); // Overview → Changes
-    app.reduce(Action::Verify); // Changes → Verify
-    assert_eq!(app.tab, Tab::Verify);
+    app.reduce(Action::Evidence); // Changes → Sessions (Evidence)
+    assert_eq!(app.tab, Tab::Sessions);
     assert_eq!(app.history.len(), 2, "{:?}", app.breadcrumb());
-    app.reduce(Action::TabTo(3)); // F4 Changes: der zweite Ursprung
+    app.reduce(Action::TabTo(1)); // F2 Changes: der zweite Ursprung
     assert_eq!(app.tab, Tab::Changes);
     assert_eq!(app.history.len(), 1, "{:?}", app.breadcrumb());
     assert_eq!(app.history[0].tab, Tab::Overview);
@@ -148,13 +148,13 @@ fn nav_the_history_keeps_at_most_eight_entries() {
     select_a_commit(&mut app);
     app.reduce(Action::Diff); // Overview → Changes
     for _ in 0..6 {
-        app.reduce(Action::Verify); // Changes → Verify
-        assert_eq!(app.tab, Tab::Verify);
-        app.reduce(Action::Diff); // Verify → Changes
+        app.reduce(Action::Evidence); // Changes → Sessions (Evidence)
+        assert_eq!(app.tab, Tab::Sessions);
+        app.reduce(Action::Diff); // Sessions → Changes
         assert_eq!(app.tab, Tab::Changes);
     }
     assert_eq!(app.history.len(), 8, "{:?}", app.breadcrumb());
     // Der älteste (die Overview) ist weg, der jüngste bleibt.
     assert!(app.history.iter().all(|e| e.tab != Tab::Overview));
-    assert_eq!(app.history.last().unwrap().tab, Tab::Verify);
+    assert_eq!(app.history.last().unwrap().tab, Tab::Sessions);
 }

@@ -31,7 +31,6 @@ use crate::intent::{IntentTab, bound_sessions, named_anchors};
 use crate::layout::{self, Handover, Row, RowKind, Zoom};
 use crate::overview::{OverviewFocus, OverviewState, Selected};
 use crate::term::Guard;
-use crate::verify::VerifyState;
 use crate::view;
 use crate::{Background, CommitVerify, Source, Stamp};
 
@@ -46,11 +45,15 @@ pub const LARGE_STORY: usize = 40;
 /// Wie oft die Quelle nach ihrem Fingerabdruck gefragt wird.
 const CHECK: Duration = Duration::from_secs(1);
 
-/// Wie oft der Verify-Tab nach einem Neuladen von selbst neu prüft.
+/// Wie oft die Übersicht nach einem Neuladen von selbst neu prüft.
 pub(crate) const VERIFY_EVERY: Duration = Duration::from_secs(5);
 
 /// Wie oft `r` höchstens lädt, auch wenn die Taste gehalten wird.
 const REPEAT: Duration = Duration::from_millis(250);
+
+/// Der Grund, wenn `minds verify` andere Sessions geprüft hat als die
+/// gezeigten (Store zwischen Laden und Lauf verändert): kein Urteil.
+pub(crate) const SESSIONS_DIFFER: &str = "the checked sessions differ from the shown ones";
 
 /// Eine Ebene über der Liste.
 #[derive(Debug, Clone)]
@@ -80,51 +83,56 @@ pub enum View {
         /// Der Abgleich der Commits, die die Session tragen (EA-03) —
         /// beim Öffnen einmal gerechnet, vom Reader.
         artifacts: Vec<CommitArtifact>,
+        /// Die Zeilenklassen je abgeglichenem Commit (C12.1) — aus derselben
+        /// Rechnung wie `◦n` im Changes-Tab und COVERAGE in der Übersicht.
+        lines: Vec<crate::view::evidence::CommitLines>,
         /// Die Sektion unter dem Cursor; das Detail folgt dem Fokus.
         cursor: usize,
+        /// Ob die Technik für Auditoren aufgeklappt ist (Space, C12.1).
+        technical: bool,
     },
 }
 
-/// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge.
-pub const EVIDENCE_SECTIONS: usize = 7;
+/// Die Sektionen des Evidence-Reports, in Anzeige-Reihenfolge (C12.1):
+/// INTEGRITY · COVERAGE · INTERPRETATION · LIMITS · TECHNICAL.
+pub const EVIDENCE_SECTIONS: usize = 5;
 
-/// Die Sektion ARTIFACT im Evidence-Report — Enter springt von dort in den
-/// Changes-Tab.
-pub const ARTIFACT_SECTION: usize = 2;
+/// Die Sektion COVERAGE im Evidence-Report — sie trägt den Abgleich des
+/// Commits; Enter springt von dort in den Changes-Tab.
+pub const ARTIFACT_SECTION: usize = 1;
 
-/// Die Tabs der Oberfläche, in Anzeige-Reihenfolge.
+/// Die Tabs der Oberfläche, in Anzeige-Reihenfolge — der Weg einer
+/// Untersuchung (C12.2): was und warum → was genau → wie → unter welcher
+/// Anforderung. Das Urteil von `minds verify` steht in der Übersicht
+/// (EVIDENCE), einen eigenen Verify-Tab gibt es nicht mehr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     /// Die Historie als Commit-Graph, an jedem Commit seine Sessions.
     Overview,
-    /// Die Sessions: Liste, Graph, Evidence.
-    Sessions,
-    /// Das Urteil über einen Commit auf einen Blick.
-    Verify,
     /// Die Änderungen eines Commits als Diff.
     Changes,
-    /// Die Intent-Anker und wer sich an sie gebunden nennt.
-    Intent,
+    /// Die Sessions: Liste, Story, Evidence.
+    Sessions,
+    /// Die Anforderungen (Intent-Anker) und wer sich an sie gebunden nennt.
+    Requirements,
 }
 
 impl Tab {
     /// Alle Tabs, in Reihenfolge.
-    pub const ALL: [Tab; 5] = [
+    pub const ALL: [Tab; 4] = [
         Tab::Overview,
-        Tab::Sessions,
-        Tab::Verify,
         Tab::Changes,
-        Tab::Intent,
+        Tab::Sessions,
+        Tab::Requirements,
     ];
 
     /// Das Kurzlabel im Kopf, wenn der Platz nicht reicht (A6).
     pub fn short(self) -> &'static str {
         match self {
             Tab::Overview => "Ovw",
-            Tab::Sessions => "Ses",
-            Tab::Verify => "Ver",
             Tab::Changes => "Chg",
-            Tab::Intent => "Int",
+            Tab::Sessions => "Ses",
+            Tab::Requirements => "Req",
         }
     }
 
@@ -132,10 +140,9 @@ impl Tab {
     pub fn title(self) -> &'static str {
         match self {
             Tab::Overview => "Overview",
-            Tab::Sessions => "Sessions",
-            Tab::Verify => "Verify",
             Tab::Changes => "Changes",
-            Tab::Intent => "Intent",
+            Tab::Sessions => "Sessions",
+            Tab::Requirements => "Requirements",
         }
     }
 }
@@ -192,13 +199,16 @@ pub struct App<'a> {
     /// Was beim letzten Neuladen geschlossen wurde und warum — etwa eine
     /// Zeilen-Kette, deren Datei gerade fehlt.
     pub closed: Option<String>,
+    /// `v` in der Evidence-Ebene (C12.1): der Commit, dessen Prüfung der
+    /// Nutzer dort verlangt hat — die Ebene zeigt `… checking`, bis das
+    /// Urteil da ist. Nur die ausdrückliche Bitte zählt, nicht eine
+    /// ausstehende Prüfung der Übersicht.
+    pub verify_asked: Option<CommitId>,
     /// Der sichtbare Tab.
     pub tab: Tab,
     /// Der Changes-Tab — erst beim ersten Öffnen geladen (er liest Blobs).
     pub changes: Option<ChangesState>,
-    /// Der Verify-Tab — erst beim ersten Öffnen gebaut.
-    pub verify: Option<VerifyState>,
-    /// Der Intent-Tab — erst beim ersten Öffnen gebaut.
+    /// Der Requirements-Tab — erst beim ersten Öffnen gebaut.
     pub intent: Option<IntentTab>,
     /// Der Overview-Tab — erst beim ersten Öffnen gebaut.
     pub overview: Option<OverviewState>,
@@ -215,7 +225,7 @@ pub struct App<'a> {
     /// Ursprung — Esc kehrt von der Ebene des Sprungs genau dorthin zurück.
     pub history: Vec<NavEntry>,
     /// Der aktive Commit (B3): die Auswahl der Übersicht, der Commit in
-    /// Verify und in Changes — einer für alle drei; `[ ]` verschiebt ihn.
+    /// Changes — einer für beide; `[ ]` verschiebt ihn.
     pub active_commit: Option<CommitId>,
     /// Das Tamper-Banner: Sessions, die beim Start manipuliert waren oder
     /// durch ein Neuladen neu manipuliert sind. Esc schließt es, Enter
@@ -275,8 +285,6 @@ pub struct NavEntry {
     /// Der Zustand des Ursprungs-Tabs (nur der eine).
     pub overview: Option<OverviewState>,
     /// …
-    pub verify: Option<VerifyState>,
-    /// …
     pub changes: Option<ChangesState>,
     /// …
     pub intent: Option<IntentTab>,
@@ -295,10 +303,9 @@ impl NavEntry {
         place(
             self.tab,
             &self.views,
-            self.verify
+            self.changes
                 .as_ref()
                 .and_then(|s| s.commit())
-                .or(self.changes.as_ref().and_then(|s| s.commit()))
                 .or(self.active_commit),
         )
     }
@@ -356,9 +363,9 @@ impl<'a> App<'a> {
             failed_stamp: None,
             live: true,
             closed: None,
+            verify_asked: None,
             tab: Tab::Sessions,
             changes: None,
-            verify: None,
             intent: None,
             overview: None,
             nerd: false,
@@ -464,14 +471,11 @@ impl<'a> App<'a> {
                 }
             }
         }
-        if self.verify.is_some() {
-            self.refresh_verify(&before, full);
-        }
         if self.changes.is_some() {
             self.refresh_changes(&before, full);
         }
-        // Die Anker neu holen (Signatur, Beleg) — gedrosselt wie Verify,
-        // außer nach `r`.
+        // Die Anker neu holen (Signatur, Beleg) — gedrosselt wie das
+        // Urteil, außer nach `r`.
         if let Some(state) = self.intent.as_mut() {
             state.invalidate(full);
         }
@@ -480,6 +484,8 @@ impl<'a> App<'a> {
         if let Some(state) = self.overview.as_mut() {
             if self.tab == Tab::Overview {
                 state.rebuild(&self.inspection, self.repo);
+                // `r` prüft sofort; von selbst gedrosselt (`VERIFY_EVERY`).
+                state.urgent |= full;
             } else {
                 state.stale = true;
             }
@@ -519,24 +525,6 @@ impl<'a> App<'a> {
         self.tab = Tab::Changes;
     }
 
-    /// Öffnet den Verify-Tab — auf `commit`, sonst auf HEAD. Der Reader-Teil
-    /// steht sofort; den signaturabhängigen holt `run` über die Quelle.
-    pub fn open_verify(&mut self, commit: Option<CommitId>) {
-        let mut commits = self.inspection.change_commits();
-        let at = match commit {
-            Some(commit) => commits
-                .iter()
-                .position(|c| *c == commit)
-                .unwrap_or_else(|| {
-                    commits.push(commit);
-                    commits.len() - 1
-                }),
-            None => 0,
-        };
-        self.verify = Some(VerifyState::build(&self.inspection, self.repo, commits, at));
-        self.tab = Tab::Verify;
-    }
-
     /// Öffnet den Overview-Tab (beim ersten Mal gelesen).
     /// Der erklärte Bereich eines gelesenen Ankers — so, wie die Übersicht
     /// ihn nach `fill_overview` hält. `None`, solange er dort nicht gelesen
@@ -550,6 +538,88 @@ impl<'a> App<'a> {
             .as_ref()
             .ok()?;
         (!detail.scope.is_empty()).then_some(detail.scope.as_slice())
+    }
+
+    /// `v` (C5, C12.2): prüft `commit` jetzt — die Übersicht zeigt ihn und
+    /// sein Urteil (EVIDENCE) und fragt sofort, nicht gedrosselt. Liegt der
+    /// Commit nicht in der gelesenen Historie, bleibt `minds verify`.
+    fn verify_commit(&mut self, commit: CommitId) {
+        let was = self.tab;
+        self.open_overview();
+        let Some(state) = self.overview.as_mut() else {
+            self.tab = was;
+            return;
+        };
+        if !state.select_commit(commit) {
+            // Nicht in der Übersicht: der Tab bleibt, der Hinweis sagt es.
+            self.tab = was;
+            let id = commit.to_string();
+            let short = id.get(..7).unwrap_or(&id);
+            // Kurz: die Fußzeile der Liste kappt den Hinweis bei 40 Zeichen —
+            // der Befehl steht vorn.
+            self.closed = Some(format!(
+                "v: run minds verify {short} — not in the history read"
+            ));
+            return;
+        }
+        state.recheck();
+        self.tab = Tab::Overview;
+    }
+
+    /// `v` in der Evidence-Ebene (C12.1): prüft den Commit, dessen Abgleich
+    /// die Ebene zeigt — über die Übersicht, die das Urteil hält (derselbe
+    /// Worker, dieselbe Drossel: sofort, weil vom Nutzer verlangt) —, ohne
+    /// die Ebene zu verlassen. Liegt der Commit nicht in der gelesenen
+    /// Historie, bleibt `minds verify` als Hinweis.
+    fn verify_in_evidence(&mut self, commit: CommitId) {
+        let was = self.tab;
+        self.open_overview();
+        self.tab = was;
+        let Some(state) = self.overview.as_mut() else {
+            return;
+        };
+        if !state.select_commit(commit) {
+            let id = commit.to_string();
+            let short = id.get(..7).unwrap_or(&id);
+            self.closed = Some(format!(
+                "v: run minds verify {short} — not in the history read"
+            ));
+            return;
+        }
+        state.recheck();
+        self.verify_asked = Some(commit);
+    }
+
+    /// Der Commit, dessen Urteil die offene Evidence-Ebene zeigt — der
+    /// erste abgeglichene; `None` ohne Ebene oder ohne Commit.
+    fn evidence_commit(&self) -> Option<CommitId> {
+        match self.top() {
+            Some(View::Evidence { artifacts, .. }) => artifacts.first().map(|a| a.commit),
+            _ => None,
+        }
+    }
+
+    /// Ob eine ausstehende Prüfung jetzt laufen soll: in der Übersicht
+    /// (ihr Detail zeigt das Urteil) oder in einer Evidence-Ebene (C12.1,
+    /// sie zeigt dasselbe Urteil).
+    pub fn check_wanted(&self) -> bool {
+        self.tab == Tab::Overview
+            || self
+                .evidence_commit()
+                .is_some_and(|commit| self.verify_asked == Some(commit))
+    }
+
+    /// Ob die Prüfung eines Commits, der die Session trägt, gerade läuft
+    /// oder gleich läuft (`v`, C12.1) — dann zeigt die Ebene `… checking`
+    /// statt „not yet verified", nie ein Urteil davor.
+    pub fn evidence_checking(&self, artifacts: &[CommitArtifact]) -> bool {
+        let Some(state) = self.overview.as_ref() else {
+            return false;
+        };
+        artifacts.iter().any(|a| {
+            !state.checks.contains_key(&a.commit)
+                && (state.asked == Some(a.commit) || self.verify_asked == Some(a.commit))
+        })
     }
 
     pub fn open_overview(&mut self) {
@@ -673,7 +743,7 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Öffnet den Intent-Tab — auf dem Anker `want`, wenn es ihn gibt.
+    /// Öffnet den Requirements-Tab — auf dem Anker `want`, wenn es ihn gibt.
     pub fn open_intent(&mut self, want: Option<ContentHash>) {
         match self.intent.as_mut() {
             Some(state) => {
@@ -686,13 +756,13 @@ impl<'a> App<'a> {
             }
             None => self.intent = Some(IntentTab::new(want)),
         }
-        self.tab = Tab::Intent;
+        self.tab = Tab::Requirements;
     }
 
     /// Holt die Anker, wenn sie ausstehen — nur bei sichtbarem Tab (die
     /// Signaturprüfung startet ssh-keygen).
     pub fn fill_intents(&mut self, source: &dyn Source) {
-        if self.tab != Tab::Intent {
+        if self.tab != Tab::Requirements {
             return;
         }
         if let Some(state) = self.intent.as_mut()
@@ -703,7 +773,7 @@ impl<'a> App<'a> {
         }
     }
 
-    /// Die Tasten im Intent-Tab.
+    /// Die Tasten im Requirements-Tab.
     fn reduce_intent(&mut self, action: Action) {
         let Some(state) = self.intent.as_mut() else {
             return;
@@ -725,6 +795,8 @@ impl<'a> App<'a> {
             // Esc (B1): keine Ebene zu schließen — der Rückweg zum Ursprung
             // kommt mit dem Navigationsverlauf (B2), sonst nichts.
             Action::Back => {}
+            // Space klappt TECHNICAL auf (C12.3).
+            Action::Space => state.toggle_technical(),
             Action::Enter => {
                 // Eine Session, die sich an den Anker gebunden nennt (die
                 // kleinste Id): ihr Graph im Sessions-Tab.
@@ -747,6 +819,7 @@ impl<'a> App<'a> {
         }
         if state.cursor != at {
             state.scroll = 0;
+            state.technical_open = false;
         }
     }
 
@@ -812,14 +885,7 @@ impl<'a> App<'a> {
             return true;
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = state.lines.entry(commit) {
-            let count = match self.inspection.changes(self.repo, commit) {
-                Ok(set) => match &set.unassessed {
-                    Some(why) => Err(why.clone()),
-                    None => Ok(set.line_classes()),
-                },
-                Err(err) => Err(minds_reader::sanitize(&err.to_string())),
-            };
-            slot.insert(count);
+            slot.insert(count_lines(&self.inspection, self.repo, commit));
             return true;
         }
         false
@@ -828,7 +894,7 @@ impl<'a> App<'a> {
     /// Prüft den gewählten Commit der Übersicht synchron (ohne Worker) —
     /// `true`, wenn geprüft wurde.
     pub fn fill_overview_verify(&mut self, source: &dyn Source) -> bool {
-        if self.tab != Tab::Overview {
+        if !self.check_wanted() {
             return false;
         }
         let now = self.now_secs();
@@ -838,15 +904,19 @@ impl<'a> App<'a> {
         let Some(commit) = state.check_due() else {
             return false;
         };
+        state.urgent = false;
         state.checks.insert(commit, source.verify(commit));
         state.checked_at.insert(commit, now);
+        if self.verify_asked == Some(commit) {
+            self.verify_asked = None;
+        }
         true
     }
 
     /// Gibt die ausstehende Prüfung des gewählten Commits der Übersicht an
     /// den Worker (B6) — `true`, wenn sie unterwegs ist.
     pub fn send_overview_check(&mut self, worker: &mut Worker) -> bool {
-        if worker.busy.is_some() || self.tab != Tab::Overview {
+        if worker.busy.is_some() || !self.check_wanted() {
             return false;
         }
         let Some(state) = self.overview.as_mut() else {
@@ -858,31 +928,8 @@ impl<'a> App<'a> {
         if worker.requests.send(commit).is_err() {
             return false;
         }
-        state.asked = Some(commit);
-        worker.busy = Some(commit);
-        true
-    }
-
-    /// Holt den signaturabhängigen Teil, wenn er aussteht — nur hier, mit
-    /// der Quelle; `reduce` merkt sich nur den Bedarf.
-    /// Nur bei sichtbarem Tab: Ein verdeckter Tab startet kein ssh-keygen.
-    /// Gibt die ausstehende Prüfung des gezeigten Commits an den Worker —
-    /// `true`, wenn sie unterwegs ist. Die Prüfung bleibt „pending": Der Tab
-    /// zeigt „checking", bis das Ergebnis da ist (B6).
-    pub fn send_check(&mut self, worker: &mut Worker) -> bool {
-        if worker.busy.is_some() {
-            return false;
-        }
-        let Some(state) = self.verify.as_mut().filter(|s| s.pending) else {
-            return false;
-        };
-        let Some(commit) = state.commit() else {
-            return false;
-        };
         state.urgent = false;
-        if worker.requests.send(commit).is_err() {
-            return false;
-        }
+        state.asked = Some(commit);
         worker.busy = Some(commit);
         true
     }
@@ -902,145 +949,16 @@ impl<'a> App<'a> {
             && state.asked == Some(commit)
         {
             state.asked = None;
-            state.checks.insert(commit, answer.clone());
+            state.checks.insert(commit, answer);
             state.checked_at.insert(commit, now);
-        }
-        if let Some(state) = self.verify.as_mut()
-            && state.commit() == Some(commit)
-        {
-            state.pending = false;
-            state.cli = Some(answer);
+            if self.verify_asked == Some(commit) {
+                self.verify_asked = None;
+            }
         }
         true
     }
 
-    pub fn fill_verify(&mut self, source: &dyn Source) {
-        if self.tab != Tab::Verify {
-            return;
-        }
-        if let Some(state) = self.verify.as_mut()
-            && state.pending
-        {
-            state.pending = false;
-            state.cli = state.commit().map(|commit| source.verify(commit));
-        }
-    }
-
-    /// Der Verify-Tab nach dem Neuladen: derselbe Commit, dieselbe Zeile.
-    /// Der signaturabhängige Teil wird **immer** neu geprüft: Er hängt an
-    /// Material, das die Session-Ids nicht abbilden (eine ausgetauschte
-    /// `seal.sig`, neue Seals, der Intent-Anker) — ein übernommenes Urteil
-    /// könnte VERIFIED zeigen, wo `verify` TAMPERED sagt. Geprüft wird erst,
-    /// wenn der Tab sichtbar ist.
-    fn refresh_verify(&mut self, before: &Inspection, full: bool) {
-        let Some(state) = self.verify.take() else {
-            return;
-        };
-        let mut commits = self.inspection.change_commits();
-        let kept = state.commit().map(|commit| {
-            commits
-                .iter()
-                .position(|c| *c == commit)
-                .unwrap_or_else(|| {
-                    commits.push(commit);
-                    commits.len() - 1
-                })
-        });
-        // Der Abgleich (git diff-tree) nur neu, wenn sich Commit oder
-        // Claimants geändert haben oder das Neuladen voll ist — wie im
-        // Changes-Tab: Wer nur Refs schreibt, startet kein `git`.
-        let reuse = match state.commit() {
-            Some(commit)
-                if !full
-                    && commit_inputs(before, commit) == commit_inputs(&self.inspection, commit) =>
-            {
-                Some(state.artifact.clone())
-            }
-            _ => None,
-        };
-        let mut next = VerifyState::build_with(
-            &self.inspection,
-            self.repo,
-            commits,
-            kept.unwrap_or(0),
-            reuse,
-        );
-        // Von selbst gedrosselt (`VERIFY_EVERY`) — außer `r` oder eine noch
-        // ausstehende Prüfung, die der Nutzer verlangt hatte.
-        next.urgent = full || (state.pending && state.urgent);
-        next.cursor = state.cursor.min(next.rows().saturating_sub(1));
-        self.verify = Some(next);
-    }
-
-    /// Die Tasten im Verify-Tab.
-    fn reduce_verify(&mut self, action: Action) {
-        let Some(state) = self.verify.as_mut() else {
-            return;
-        };
-        let page = self.page.max(1);
-        let last = state.rows().saturating_sub(1);
-        match action {
-            Action::Up => state.cursor = state.cursor.saturating_sub(1),
-            Action::Down => state.cursor = (state.cursor + 1).min(last),
-            Action::Home => state.cursor = 0,
-            Action::End => state.cursor = last,
-            // Bild hoch/runter blättern seitenweise, wie überall (B4).
-            Action::PageUp => state.cursor = state.cursor.saturating_sub(page),
-            Action::PageDown => state.cursor = (state.cursor + page).min(last),
-            Action::Bracket(forward) => {
-                let at = if forward {
-                    (state.at + 1).min(state.commits.len().saturating_sub(1))
-                } else {
-                    state.at.saturating_sub(1)
-                };
-                if at != state.at {
-                    let commits = state.commits.clone();
-                    self.verify =
-                        Some(VerifyState::build(&self.inspection, self.repo, commits, at));
-                }
-            }
-            // Esc (B1): keine Ebene zu schließen — sonst nichts.
-            Action::Back => {}
-            Action::Enter => {
-                let cursor = state.cursor;
-                let commit = state.commit();
-                if cursor < state.sessions.len() {
-                    // Eine Session: ihr Graph im Sessions-Tab.
-                    let id = state.sessions[cursor].id;
-                    if self.inspection.story(id).is_some() {
-                        self.tab = Tab::Sessions;
-                        self.query.clear();
-                        self.refilter_keeping(Some(id));
-                        self.push_story(id);
-                    } else {
-                        // Nicht still in eine leere Liste springen.
-                        self.closed = Some("that session is not readable".into());
-                    }
-                } else if cursor == state.artifact_row() {
-                    self.open_changes(commit);
-                } else {
-                    // Scope: die erste Datei außerhalb des Bereichs im Diff.
-                    // Der rohe Pfad (nur zum Wählen) — der entschärfte träfe
-                    // eine Datei mit Steuerzeichen im Namen nicht.
-                    let paths: Vec<String> = state
-                        .checked()
-                        .map(|c| c.out_of_scope_paths.clone())
-                        .unwrap_or_default();
-                    self.open_changes(commit);
-                    // Bevorzugt eine Datei, die im Commit liegt — die Liste
-                    // nennt auch nur Geschriebenes (und wieder Gelöschtes).
-                    if let Some(changes) = self.changes.as_mut()
-                        && !paths.iter().any(|path| changes.select_path(path))
-                    {
-                        changes.file = 0;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Zeigt `tab`; Changes und Verify laden beim ersten Mal.
+    /// Zeigt `tab`; Changes lädt beim ersten Mal.
     fn show_tab(&mut self, tab: Tab) {
         // Der aktive Commit gilt in jedem Tab, der einen Commit zeigt (B3).
         let active = self.active_commit;
@@ -1054,26 +972,21 @@ impl<'a> App<'a> {
                 state.split = split;
                 state.why = why;
             }
-        } else if tab == Tab::Verify
-            && (self.verify.is_none() || differs(self.verify.as_ref().and_then(|s| s.commit())))
-        {
-            self.open_verify(active);
-        } else if tab == Tab::Intent {
+        } else if tab == Tab::Requirements {
             self.open_intent(None);
         } else if tab == Tab::Overview {
             self.open_overview();
             if let (Some(commit), Some(state)) = (active, self.overview.as_mut()) {
                 state.select_commit(commit);
             }
-        } else {
-            // Zurück im Verify-Tab: Eine ausstehende Prüfung ist jetzt vom
-            // Nutzer verlangt, nicht gedrosselt.
-            if tab == Tab::Verify
-                && let Some(state) = self.verify.as_mut()
-                && state.pending
+            // Zurück in der Übersicht: Eine ausstehende Prüfung ist jetzt
+            // vom Nutzer verlangt, nicht gedrosselt.
+            if let Some(state) = self.overview.as_mut()
+                && state.check_due().is_some()
             {
                 state.urgent = true;
             }
+        } else {
             self.tab = tab;
         }
     }
@@ -1300,12 +1213,19 @@ impl<'a> App<'a> {
                 id,
                 cursor,
                 artifacts,
+                lines,
+                technical,
                 ..
             } => {
                 self.inspection.card(id).ok_or_else(|| gone(id))?;
                 let unchanged =
                     !full && artifact_inputs(before, id) == artifact_inputs(&self.inspection, id);
-                Ok(self.evidence_view_with(id, cursor, unchanged.then_some(artifacts)))
+                Ok(self.evidence_view_with(
+                    id,
+                    cursor,
+                    unchanged.then_some((artifacts, lines)),
+                    technical,
+                ))
             }
         }
     }
@@ -1452,16 +1372,18 @@ impl<'a> App<'a> {
     /// Die Evidence-Ebene einer Session, mit dem Cursor auf `cursor`
     /// (begrenzt auf die vorhandenen Sektionen).
     fn evidence_view(&self, id: SessionId, cursor: usize) -> View {
-        self.evidence_view_with(id, cursor, None)
+        self.evidence_view_with(id, cursor, None, false)
     }
 
     /// Wie [`evidence_view`](Self::evidence_view), mit schon gerechneten
-    /// Abgleichen, wenn `artifacts` sie trägt — dann läuft kein `git`.
+    /// Abgleichen und Zeilenklassen, wenn `cached` sie trägt — dann läuft
+    /// kein `git`.
     fn evidence_view_with(
         &self,
         id: SessionId,
         cursor: usize,
-        artifacts: Option<Vec<CommitArtifact>>,
+        cached: Option<(Vec<CommitArtifact>, Vec<crate::view::evidence::CommitLines>)>,
+        technical: bool,
     ) -> View {
         let report = self.inspection.evidence_report(id);
         let uninterpreted = self
@@ -1470,7 +1392,25 @@ impl<'a> App<'a> {
             .map(|card| card.uninterpreted_calls)
             .unwrap_or(0);
         // Strikt lesend: Der Reader liest nur Blobs der verknüpften Commits.
-        let artifacts = artifacts.unwrap_or_else(|| self.inspection.artifacts(self.repo, id));
+        let (artifacts, lines) = cached.unwrap_or_else(|| {
+            let artifacts = self.inspection.artifacts(self.repo, id);
+            // Die Zeilen aus derselben Rechnung wie die Übersicht (C3.1) —
+            // ihr Zwischenstand zuerst, sonst aus dem Abgleich, der schon
+            // da ist (`line_classes_of`): kein Commit wird zweimal
+            // abgeglichen, nur sein Diff gelesen.
+            let lines = artifacts
+                .iter()
+                .map(|a| {
+                    let counted = self
+                        .overview
+                        .as_ref()
+                        .and_then(|o| o.lines.get(&a.commit).cloned())
+                        .unwrap_or_else(|| self.inspection.line_classes_of(self.repo, a));
+                    (a.commit, counted)
+                })
+                .collect();
+            (artifacts, lines)
+        });
         // Legacy hat keine Sektionen — nur den einen ehrlichen Satz.
         let last = if report.is_some() {
             EVIDENCE_SECTIONS - 1
@@ -1482,8 +1422,35 @@ impl<'a> App<'a> {
             report,
             uninterpreted,
             artifacts,
+            lines,
             cursor: cursor.min(last),
+            technical,
         }
+    }
+
+    /// Das Urteil von `minds verify` zu einem Commit, der die Session trägt
+    /// (C12.1) — dieselbe Quelle wie EVIDENCE in der Übersicht, samt
+    /// Prüfzeit; `None`, solange keiner geprüft ist.
+    pub fn evidence_check(
+        &self,
+        id: SessionId,
+        artifacts: &[CommitArtifact],
+    ) -> Option<(CommitId, Result<&CommitVerify, String>, Option<i64>)> {
+        let overview = self.overview.as_ref()?;
+        artifacts.iter().find_map(|a| {
+            overview.checks.get(&a.commit).map(|check| {
+                // Ein Urteil über andere Sessions ist keins über diese: nie
+                // VERIFIED ohne Signaturprüfung **dieser** Session.
+                let check = match check {
+                    Ok(c) if !c.sessions.iter().any(|s| s.session == id) => {
+                        Err(SESSIONS_DIFFER.to_string())
+                    }
+                    Ok(c) => Ok(c),
+                    Err(why) => Err(why.clone()),
+                };
+                (a.commit, check, overview.checked_at.get(&a.commit).copied())
+            })
+        })
     }
 
     fn relayout(&mut self) {
@@ -1568,7 +1535,7 @@ impl<'a> App<'a> {
                     changes.landed = changes.focus == Focus::Diff;
                 }
             }
-            // Ein Tab-Wechsel per Taste (F1–F5, 1–5, Tab) auf einen Tab, der
+            // Ein Tab-Wechsel per Taste (F1–F4, 1–4, Tab) auf einen Tab, der
             // im Verlauf als Ursprung liegt, beendet dessen Sprung: der Nutzer
             // ist zurück am Ursprung, alles ab diesem Eintrag fällt weg.
             if tab_key && let Some(at) = self.history.iter().position(|e| e.tab == self.tab) {
@@ -1593,9 +1560,8 @@ impl<'a> App<'a> {
                 Some(crate::overview::Selected::Commit(row)) => Some(row.id),
                 _ => None,
             },
-            Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
             Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
-            Tab::Sessions | Tab::Intent => None,
+            Tab::Sessions | Tab::Requirements => None,
         };
         if shown.is_some() {
             self.active_commit = shown;
@@ -1628,20 +1594,13 @@ impl<'a> App<'a> {
                 Some(Selected::Wip(wip)) => (Some(wip.id), None),
                 None => (None, None),
             },
-            Tab::Verify => {
-                let state = self.verify.as_ref();
-                let session = state
-                    .and_then(|s| s.sessions.get(s.cursor).map(|row| row.id))
-                    .or_else(|| state.and_then(|s| s.sessions.first().map(|row| row.id)));
-                (session, state.and_then(|s| s.commit()))
-            }
             Tab::Changes => {
                 let commit = self.changes.as_ref().and_then(|s| s.commit());
                 let session =
                     commit.and_then(|c| self.inspection.index().sessions_of(c).first().copied());
                 (session, commit)
             }
-            Tab::Intent => {
+            Tab::Requirements => {
                 let session = self.intent.as_ref().and_then(|state| {
                     state.selected().and_then(|anchor| {
                         crate::intent::bound_sessions(&self.inspection, &anchor.id)
@@ -1659,16 +1618,16 @@ impl<'a> App<'a> {
     fn verb(&mut self, action: Action) {
         let (session, commit) = self.focus_object();
         match action {
-            // Im Verify-Tab selbst: dieselbe Prüfung jetzt noch einmal (C5).
-            Action::Verify if self.tab == Tab::Verify && self.verify.is_some() => {
-                if let Some(state) = self.verify.as_mut() {
-                    state.pending = true;
-                    state.urgent = true;
-                }
-            }
-            Action::Verify => match commit {
-                Some(commit) => self.open_verify(Some(commit)),
-                None => self.closed = Some("v: no commit here to verify".into()),
+            // `v` (C5, C12.2): die Prüfung des Commits jetzt — in der
+            // Übersicht, wo ihr Urteil steht (EVIDENCE). Anderswo öffnet
+            // `v` die Übersicht auf dem Commit; liegt er nicht in der
+            // gelesenen Historie, bleibt die Kommandozeile.
+            Action::Verify => match (self.evidence_commit(), commit) {
+                // In der Evidence-Ebene (C12.1): die Prüfung des tragenden
+                // Commits, die Ebene bleibt offen und zeigt `… checking`.
+                (Some(commit), _) => self.verify_in_evidence(commit),
+                (None, Some(commit)) => self.verify_commit(commit),
+                (None, None) => self.closed = Some("v: no commit here to verify".into()),
             },
             Action::Diff => match commit {
                 Some(commit) => {
@@ -1721,8 +1680,8 @@ impl<'a> App<'a> {
         match self.tab {
             Tab::Overview => self.overview.as_ref().map(|s| s.filter.as_str()),
             Tab::Changes => self.changes.as_ref().map(|s| s.filter.as_str()),
-            Tab::Intent => self.intent.as_ref().map(|s| s.filter.as_str()),
-            Tab::Sessions | Tab::Verify => None,
+            Tab::Requirements => self.intent.as_ref().map(|s| s.filter.as_str()),
+            Tab::Sessions => None,
         }
     }
 
@@ -1730,8 +1689,8 @@ impl<'a> App<'a> {
         match self.tab {
             Tab::Overview => self.overview.as_mut().map(|s| &mut s.filter),
             Tab::Changes => self.changes.as_mut().map(|s| &mut s.filter),
-            Tab::Intent => self.intent.as_mut().map(|s| &mut s.filter),
-            Tab::Sessions | Tab::Verify => None,
+            Tab::Requirements => self.intent.as_mut().map(|s| &mut s.filter),
+            Tab::Sessions => None,
         }
     }
 
@@ -1756,12 +1715,12 @@ impl<'a> App<'a> {
                     }
                 }
             }
-            Tab::Intent => {
+            Tab::Requirements => {
                 if let Some(state) = self.intent.as_mut() {
                     state.cursor = crate::filter::refit(&state.shown(), state.cursor);
                 }
             }
-            Tab::Sessions | Tab::Verify => {}
+            Tab::Sessions => {}
         }
     }
 
@@ -1778,12 +1737,12 @@ impl<'a> App<'a> {
                     state.move_file(*action == Action::Down);
                 }
             }
-            Tab::Intent => {
+            Tab::Requirements => {
                 if let Some(state) = self.intent.as_mut() {
                     state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
                 }
             }
-            Tab::Sessions | Tab::Verify => {}
+            Tab::Sessions => {}
         }
     }
 
@@ -1819,13 +1778,10 @@ impl<'a> App<'a> {
             overview: (self.tab == Tab::Overview)
                 .then(|| self.overview.clone())
                 .flatten(),
-            verify: (self.tab == Tab::Verify)
-                .then(|| self.verify.clone())
-                .flatten(),
             changes: (self.tab == Tab::Changes)
                 .then(|| self.changes.clone())
                 .flatten(),
-            intent: (self.tab == Tab::Intent)
+            intent: (self.tab == Tab::Requirements)
                 .then(|| self.intent.clone())
                 .flatten(),
             active_commit: self.active_commit,
@@ -1862,7 +1818,7 @@ impl<'a> App<'a> {
                 .changes
                 .as_ref()
                 .is_none_or(|s| s.focus == Focus::Files || (s.landed && !s.why_layer)),
-            Tab::Verify | Tab::Intent => true,
+            Tab::Requirements => true,
         }
     }
 
@@ -1884,17 +1840,12 @@ impl<'a> App<'a> {
                     self.overview = entry.overview;
                 }
             }
-            Tab::Verify => {
-                if entry.verify.is_some() {
-                    self.verify = entry.verify;
-                }
-            }
             Tab::Changes => {
                 if entry.changes.is_some() {
                     self.changes = entry.changes;
                 }
             }
-            Tab::Intent => {
+            Tab::Requirements => {
                 if entry.intent.is_some() {
                     self.intent = entry.intent;
                 }
@@ -1907,7 +1858,6 @@ impl<'a> App<'a> {
     /// aktuelle Ort — derselbe Ort nie zweimal hintereinander.
     pub fn breadcrumb(&self) -> Vec<String> {
         let shown = match self.tab {
-            Tab::Verify => self.verify.as_ref().and_then(|s| s.commit()),
             Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
             _ => self.active_commit,
         };
@@ -2091,7 +2041,7 @@ impl<'a> App<'a> {
         // nicht selbst trägt.
         let verb = match (action.clone(), self.tab) {
             (Action::Verify | Action::Diff | Action::Intent, _) => true,
-            (Action::Evidence, Tab::Overview | Tab::Verify | Tab::Changes | Tab::Intent) => true,
+            (Action::Evidence, Tab::Overview | Tab::Changes | Tab::Requirements) => true,
             (Action::Context, tab) => tab != Tab::Changes,
             _ => false,
         };
@@ -2136,11 +2086,7 @@ impl<'a> App<'a> {
             self.reduce_changes(action);
             return;
         }
-        if self.tab == Tab::Verify {
-            self.reduce_verify(action);
-            return;
-        }
-        if self.tab == Tab::Intent {
+        if self.tab == Tab::Requirements {
             self.reduce_intent(action);
             return;
         }
@@ -2207,7 +2153,9 @@ impl<'a> App<'a> {
                 report,
                 uninterpreted,
                 artifacts,
+                lines,
                 mut cursor,
+                mut technical,
             }) => {
                 // Legacy hat keine Sektionen — nur den einen ehrlichen Satz.
                 let last = if report.is_some() {
@@ -2223,7 +2171,9 @@ impl<'a> App<'a> {
                     Action::Home | Action::PageUp => cursor = 0,
                     Action::End | Action::PageDown => cursor = last,
                     Action::Back => keep = false,
-                    // Enter auf ARTIFACT: der Diff des abgeglichenen Commits.
+                    // Space (C12.1): die Technik für Auditoren auf-/zuklappen.
+                    Action::Space if report.is_some() => technical = !technical,
+                    // Enter auf COVERAGE: der Diff des abgeglichenen Commits.
                     Action::Enter if report.is_some() && cursor == ARTIFACT_SECTION => {
                         jump = artifacts.first().map(|a| a.commit);
                     }
@@ -2235,7 +2185,9 @@ impl<'a> App<'a> {
                         report,
                         uninterpreted,
                         artifacts,
+                        lines,
                         cursor,
+                        technical,
                     });
                 }
                 if let Some(commit) = jump {
@@ -2414,40 +2366,20 @@ impl<'a> App<'a> {
         while !self.quit {
             self.now = SystemTime::now();
             terminal.draw(|frame| view::draw(frame, &mut self))?;
-            // Steht eine Prüfung der Signer aus, ist „checking…" jetzt
-            // gezeichnet: erst dann prüfen (ssh-keygen je Seal) und sofort
-            // neu zeichnen.
-            // Vom Nutzer verlangt: sofort; nach einem Neuladen gedrosselt —
-            // jede Prüfung startet ssh-keygen je Seal und `minds verify`.
-            let due = self
-                .verify
-                .as_ref()
-                .is_some_and(|v| v.due(verified.elapsed(), VERIFY_EVERY));
-            if self.tab == Tab::Verify && due {
-                match worker.as_mut() {
-                    // Im Worker (B6): die Schleife bleibt bei den Tasten.
-                    Some(worker) => {
-                        if self.send_check(worker) {
-                            verified = Instant::now();
-                        }
-                    }
-                    None => {
-                        self.fill_verify(source);
-                        verified = Instant::now();
-                        continue;
-                    }
-                }
-            }
             // Das Detail der Übersicht (C3.4): das Urteil des gewählten
-            // Commits, gedrosselt wie der Verify-Tab.
-            let due = self.tab == Tab::Overview
+            // Commits. Steht eine Prüfung der Signer aus, ist „checking"
+            // jetzt gezeichnet: erst dann prüfen (ssh-keygen je Seal) und
+            // sofort neu zeichnen. Vom Nutzer verlangt (`v`, Tab gezeigt):
+            // sofort; nach einem Neuladen gedrosselt — jede Prüfung startet
+            // ssh-keygen je Seal und `minds verify`.
+            let due = self.check_wanted()
                 && self
                     .overview
                     .as_ref()
-                    .is_some_and(|o| o.check_due().is_some())
-                && verified.elapsed() >= VERIFY_EVERY;
+                    .is_some_and(|o| o.check_due_in(verified.elapsed(), VERIFY_EVERY));
             if due {
                 match worker.as_mut() {
+                    // Im Worker (B6): die Schleife bleibt bei den Tasten.
                     Some(worker) => {
                         if self.send_overview_check(worker) {
                             verified = Instant::now();
@@ -2472,7 +2404,7 @@ impl<'a> App<'a> {
                 .intent
                 .as_ref()
                 .is_some_and(|i| i.due(anchored.elapsed(), VERIFY_EVERY));
-            if self.tab == Tab::Intent && due {
+            if self.tab == Tab::Requirements && due {
                 self.fill_intents(source);
                 anchored = Instant::now();
                 continue;
@@ -2562,11 +2494,27 @@ fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
                 View::Evidence { .. } => "Evidence".to_string(),
             })
             .collect(),
-        Tab::Overview | Tab::Verify | Tab::Changes => {
+        Tab::Overview | Tab::Changes => {
             let mut out = vec![tab.title().to_string()];
             out.extend(commit.map(short_commit));
             out
         }
         _ => vec![tab.title().to_string()],
+    }
+}
+
+/// Die Zeilenklassen eines Commits (C3.1): **die** eine Rechnung für
+/// Übersicht, Changes-Tab und Evidence-Ebene — oder warum nicht.
+pub(crate) fn count_lines(
+    inspection: &Inspection,
+    repo: &Repo,
+    commit: CommitId,
+) -> Result<minds_reader::changes::LineClasses, String> {
+    match inspection.changes(repo, commit) {
+        Ok(set) => match &set.unassessed {
+            Some(why) => Err(why.clone()),
+            None => Ok(set.line_classes()),
+        },
+        Err(err) => Err(minds_reader::sanitize(&err.to_string())),
     }
 }

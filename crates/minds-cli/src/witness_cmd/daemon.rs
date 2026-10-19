@@ -1492,6 +1492,9 @@ impl Writer {
         Ok(event)
     }
 
+    /// Parsen und schreiben in einem Zug — der Weg der Tests; der Eventloop
+    /// nimmt die zwei Hälften ([`Self::prepare_hook`], [`Self::commit_hook`]).
+    #[cfg(test)]
     fn hook(
         &mut self,
         agent: &str,
@@ -1499,15 +1502,33 @@ impl Writer {
         stdin: Vec<u8>,
         at: (String, u64),
     ) -> Fallible<()> {
+        if let Some((key, event)) = self.prepare_hook(agent, event_override, stdin, at)? {
+            self.commit_hook(&key, event)?;
+        }
+        Ok(())
+    }
+
+    /// Die erste Hälfte von [`Self::hook`]: parsen, prüfen, Mauer — ohne zu
+    /// schreiben. Der Eventloop hält ein `Stop`/`SessionEnd` so lange zurück,
+    /// bis der `Model`-Frame derselben Verbindung da ist oder sie endet
+    /// (K1); alles andere schreibt er sofort mit [`Self::commit_hook`].
+    /// `None`: abgewiesen und geloggt, nichts zu schreiben.
+    pub(super) fn prepare_hook(
+        &mut self,
+        agent: &str,
+        event_override: Option<&str>,
+        stdin: Vec<u8>,
+        at: (String, u64),
+    ) -> Fallible<Option<(SessionKey, NewEvent)>> {
         if agent.eq_ignore_ascii_case("witness") {
             log(&self.home, "reserved agent rejected");
-            return Ok(());
+            return Ok(None);
         }
         let mut parsed = match hook_event::parse(stdin, agent, event_override, at) {
             Ok(parsed) => parsed,
             Err(_) => {
                 log(&self.home, "invalid hook dropped");
-                return Ok(());
+                return Ok(None);
             }
         };
         // Synthetische Witness-Events (`minds.intent`, EA-14) schreibt nur
@@ -1519,13 +1540,18 @@ impl Writer {
             .starts_with(intent::RESERVED_KIND_PREFIX)
         {
             log(&self.home, "reserved event rejected");
-            return Ok(());
+            return Ok(None);
         }
         secretwall::guard(&mut parsed.event);
-        let stamp = (parsed.event.at.clone(), parsed.event.at_nanos);
-        let starts = intent::starts_session(&parsed.event);
-        self.bind_intent(&parsed.key, &stamp, starts)?;
-        self.append(&parsed.key, parsed.event)?;
+        Ok(Some((parsed.key, parsed.event)))
+    }
+
+    /// Die zweite Hälfte von [`Self::hook`]: Intent binden, anhängen.
+    pub(super) fn commit_hook(&mut self, key: &SessionKey, event: NewEvent) -> Fallible<()> {
+        let stamp = (event.at.clone(), event.at_nanos);
+        let starts = intent::starts_session(&event);
+        self.bind_intent(key, &stamp, starts)?;
+        self.append(key, event)?;
         Ok(())
     }
 
@@ -1545,6 +1571,7 @@ impl Writer {
                 raw_kind: kind.into(),
                 cwd: None,
                 transcript_path: None,
+                model: None,
                 payload: serde_json::value::RawValue::from_string(payload.to_string())?,
             },
         )?;
@@ -1659,6 +1686,7 @@ impl Writer {
                     raw_kind: crate::checkpoint::core::FS_OBSERVED.into(),
                     cwd: None,
                     transcript_path: None,
+                    model: None,
                     payload,
                 },
             )?;
@@ -1945,6 +1973,7 @@ impl Writer {
                     raw_kind: "fs.checkpoint".into(),
                     cwd: None,
                     transcript_path: None,
+                    model: None,
                     payload: serde_json::value::RawValue::from_string("{}".into())?,
                 },
             )?;
@@ -2640,6 +2669,7 @@ fn verify_events(events: &[JournalEvent]) -> Fallible<()> {
             raw_kind: &event.raw_kind,
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
+            model: event.model.as_deref(),
             payload_hash: &payload_hash,
         });
         if event.payload_hash.as_ref() != Some(&payload_hash)

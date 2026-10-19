@@ -110,6 +110,7 @@ pub fn parse(
             raw_kind,
             cwd: envelope.cwd,
             transcript_path: envelope.transcript_path,
+            model: None,
             payload: payload_of(bytes),
         },
     })

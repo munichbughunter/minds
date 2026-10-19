@@ -29,7 +29,6 @@ mod intent;
 mod overview;
 pub mod story;
 pub mod trust;
-pub mod verify;
 
 #[cfg(test)]
 mod tests;
@@ -104,14 +103,6 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
-    if app.tab == Tab::Verify {
-        verify::draw(frame, app, body);
-        footer(frame, app, foot);
-        if app.help {
-            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
-        }
-        return;
-    }
     if app.tab == Tab::Overview {
         overview::draw(frame, app, body);
         footer(frame, app, foot);
@@ -120,7 +111,7 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
         }
         return;
     }
-    if app.tab == Tab::Intent {
+    if app.tab == Tab::Requirements {
         intent::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
@@ -195,15 +186,20 @@ fn view_draw(frame: &mut Frame, app: &App, area: Rect, view: &View) {
             report,
             uninterpreted,
             artifacts,
+            lines,
             cursor,
+            technical,
         } => evidence::draw(
             frame,
             area,
+            app,
             *id,
             report.as_ref(),
             *uninterpreted,
             artifacts,
+            lines,
             *cursor,
+            *technical,
         ),
     }
 }
@@ -331,24 +327,6 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         changes_footer(frame, app, area);
         return;
     }
-    if app.tab == Tab::Verify {
-        // Zeile 1: der Satz zum Urteil (C1) — kein statischer Erklärsatz.
-        let word = crate::copy::overall(app.verify.as_ref().map(|v| v.overall()));
-        let status = explain(word);
-        let keys = Line::from(vec![
-            freshness(app),
-            Span::raw("  "),
-            Span::styled(actions(app).join("  "), theme::dim()),
-        ]);
-        frame.render_widget(
-            Paragraph::new(vec![
-                status_line(with_context(app, status, area.width), area.width),
-                pinned(keys, area.width, app.searching),
-            ]),
-            area,
-        );
-        return;
-    }
     if app.tab == Tab::Overview {
         // Zeile 1 (C3.5): die Kurz-Id (aus `context`) und der Filterzustand —
         // kein Erklärsatz; „sealed is not verified" steht im Detail und in
@@ -371,7 +349,7 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if app.tab == Tab::Intent {
+    if app.tab == Tab::Requirements {
         // Zeile 1 (C1): Bindungen an einen Anker sind aufgezeichnet — Aussagen.
         let status = explain("claim");
         let mut keys = vec![
@@ -453,38 +431,31 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
                 sentence
             }
         }
-        // Evidence: der Satz des Reports, dahinter der Glossar-Satz der
-        // fokussierten Achse (C1).
+        // Evidence (C12.1): nur Id, Trust Strip (aus `context`) und das
+        // Urteil von `minds verify` — keine Sätze; Legacy sagt sein Wort.
         Some(View::Evidence {
+            id,
             report,
-            uninterpreted,
-            cursor,
+            artifacts,
             ..
-        }) => {
-            let axes = report.as_ref().map(|r| {
-                minds_reader::model::TrustAxes::of(
-                    &minds_reader::model::Provenance::Chained(r.state),
-                    *uninterpreted,
-                )
-            });
-            let word = axes.and_then(|axes| match cursor {
-                0 => Some(crate::copy::integrity(axes.integrity)),
-                1 => Some(crate::copy::coverage(axes.coverage)),
-                5 => Some(crate::copy::interpretation(axes.interpretation)),
-                _ => None,
-            });
-            let mut spans = vec![Span::styled(
-                report
-                    .as_ref()
-                    .map(|r| r.sentence())
-                    .unwrap_or(minds_reader::model::LEGACY_SENTENCE),
-                theme::dim(),
-            )];
-            if let Some(sentence) = word.and_then(crate::copy::sentence) {
-                spans.push(Span::styled(format!("  ·  {sentence}"), theme::dim()));
+        }) => match report.as_ref() {
+            Some(report) => {
+                let (words, style) = evidence::verdict_words(
+                    report,
+                    app.evidence_check(*id, artifacts),
+                    app.evidence_checking(artifacts),
+                    false,
+                );
+                Line::from(Span::styled(words, style))
             }
-            Line::from(spans)
-        }
+            None => {
+                let slot = trust::integrity(minds_reader::model::IntegrityAxis::Legacy);
+                Line::from(Span::styled(
+                    format!("{} {}", slot.glyph, slot.word),
+                    slot.style,
+                ))
+            }
+        },
     };
     let keys = if app.searching {
         Line::from(vec![
@@ -637,11 +608,23 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
                     "Esc back",
                 ]
             }
-            Some(View::Evidence { .. }) => vec!["↑↓ section", "Enter open", "d diff", "Esc back"],
+            Some(View::Evidence { .. }) => vec![
+                "↑↓ section",
+                "Space technical",
+                "v verify",
+                "Enter open",
+                "d diff",
+                "Esc back",
+            ],
         },
-        Tab::Verify => vec!["↑↓ row", "Enter open", "[ ] commit", "d diff", "e evidence"],
         Tab::Changes => Vec::new(),
-        Tab::Intent => vec!["↑↓ anchor", "Enter story", "PgUp PgDn scroll", "/ filter"],
+        Tab::Requirements => vec![
+            "↑↓ requirement",
+            "Enter story",
+            "Space technical",
+            "PgUp PgDn scroll",
+            "/ filter",
+        ],
     }
 }
 
@@ -685,7 +668,6 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
             Some(crate::overview::Selected::Commit(row)) => Some(row.id),
             _ => None,
         },
-        Tab::Verify => app.verify.as_ref().and_then(|v| v.commit()),
         _ => None,
     };
     if let Some(commit) = commit {
@@ -694,14 +676,19 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
             Style::default().fg(theme::CHANGE),
         ));
     }
-    if app.tab == Tab::Intent
+    if app.tab == Tab::Requirements
         && let Some(anchor) = app.intent.as_ref().and_then(|i| i.selected())
     {
-        let id = anchor.id.to_string();
+        // Kurz-Id wie überall, dann der Status in Wörtern (C12.3).
+        let stale = app.intent.as_ref().is_some_and(|i| i.stale);
         spans.push(Span::styled(
-            format!("{}… ", id.get(..14).unwrap_or(&id)),
+            format!("{} · ", overview::anchor_short(&anchor.id)),
             theme::title(),
         ));
+        spans.push(Span::raw(format!(
+            "{}  ",
+            intent::status_words(anchor, stale)
+        )));
     }
     spans
 }
@@ -883,6 +870,85 @@ pub fn when(ts: Option<&str>) -> String {
         },
         None => "—".into(),
     }
+}
+
+/// `HH:MM` (UTC) eines Zeitpunkts in Sekunden seit Epoch — die Prüfzeit
+/// in Overview-EVIDENCE und Evidence-Ebene.
+/// Die hinzugefügten Zeilen eines Commits nach Zustand, in **einem**
+/// Wortlaut für Übersicht und Evidence-Ebene (C9.4/C12.1): das offenste
+/// Wort vorn, die übrigen Zahlen dahinter — `◦ 6 of 10 added lines not
+/// observed · 4 reported`, `◇ 95 of 95 added lines reported, 0 observed`,
+/// `◍ 2 of 3 added lines fs only, 1 observed`, `✓ all 3 added lines
+/// observed`; nie „explained", nie „unexplained". ✓ nur, wenn jede Zeile
+/// beobachtet ist (C3.7 liest ✓ als „nichts offen"). Glyph, Text, Stil.
+pub(crate) fn class_words(c: &minds_reader::changes::LineClasses) -> (&'static str, String, Style) {
+    use minds_reader::reconcile::ReconClass;
+    let observed = c.explained + c.fs_only;
+    if c.all_explained() {
+        return (
+            "✓",
+            format!("all {} added lines observed", c.added),
+            Style::default().fg(theme::OK),
+        );
+    }
+    let (reported_glyph, reported_word, reported_style) = theme::state(ReconClass::ReportedOnly);
+    let (fs_glyph, fs_word, fs_style) = theme::state(ReconClass::ExplainedFsOnly);
+    if c.unexplained > 0 {
+        let (glyph, word, style) = theme::not_observed();
+        let mut text = format!("{} of {} added lines {word}", c.unexplained, c.added);
+        if c.stated > 0 {
+            text.push_str(&format!(" · {} {reported_word}", c.stated));
+        }
+        if observed > 0 {
+            text.push_str(&format!(" · {observed} observed"));
+        }
+        return (glyph, text, style);
+    }
+    if c.stated > 0 {
+        return (
+            reported_glyph,
+            format!(
+                "{} of {} added lines {reported_word}, {observed} observed",
+                c.stated, c.added
+            ),
+            reported_style,
+        );
+    }
+    if c.fs_only > 0 {
+        return (
+            fs_glyph,
+            format!(
+                "{} of {} added lines {fs_word}, {} observed",
+                c.fs_only, c.added, c.explained
+            ),
+            fs_style,
+        );
+    }
+    if c.not_assessed > 0 {
+        return (
+            "?",
+            format!("{} of {} added lines not assessed", c.not_assessed, c.added),
+            Style::default().fg(theme::REVIEW),
+        );
+    }
+    if c.skipped_files > 0 {
+        // Nur Dateien ohne Zeilenansicht: das steht im Kopf.
+        return ("·", not_diffed(c.skipped_files), theme::dim());
+    }
+    ("·", "no added lines".into(), theme::dim())
+}
+
+/// `N files not diffed` — Dateien ohne Zeilenansicht (binär, zu groß, …).
+pub(crate) fn not_diffed(files: usize) -> String {
+    format!(
+        "{files} file{} not diffed",
+        if files == 1 { "" } else { "s" }
+    )
+}
+
+pub(crate) fn clock(secs: i64) -> String {
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
 }
 
 /// `HH:MM:SSZ` aus dem RFC-3339-Zeitstempel (C9.3) — die Uhrzeit, nicht

@@ -33,11 +33,11 @@ pub enum Action {
     Zoom(u8),
     /// `z` (`true`): feiner — mehr Details; `Z`: gröber.
     ZoomStep(bool),
-    /// `v` — der Commit unter dem Fokus im Verify-Tab.
+    /// `v` — den Commit unter dem Fokus prüfen (in der Übersicht, EVIDENCE).
     Verify,
     /// `d` — der Diff des Commits unter dem Fokus.
     Diff,
-    /// `i` — der Intent-Anker der Session unter dem Fokus.
+    /// `i` — die Anforderung (Intent-Anker) der Session unter dem Fokus.
     Intent,
     /// `c` — im Changes-Tab die Spalte „Why this line?“ ein/aus.
     Context,
@@ -113,8 +113,10 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Char('w') => Action::None,
         KeyCode::Char('e') => Action::Evidence,
         // B4: Ziffern wählen den Tab, `z` / `Z` zoomen, die Objekt-Verben
-        // sind in jedem Tab dieselben.
-        KeyCode::Char(c @ '1'..='5') => Action::TabTo(c as u8 - b'1'),
+        // sind in jedem Tab dieselben. Seit C12.2 sind es vier Tabs — `5`
+        // bleibt belegt, ohne Aktion (nichts verschwindet stillschweigend).
+        KeyCode::Char(c @ '1'..='4') => Action::TabTo(c as u8 - b'1'),
+        KeyCode::Char('5') => Action::None,
         KeyCode::Char('z') => Action::ZoomStep(true),
         KeyCode::Char('Z') => Action::ZoomStep(false),
         KeyCode::Char('v') => Action::Verify,
@@ -166,12 +168,14 @@ mod tests {
             ('e', Action::Evidence),
             // C11: `t` bleibt in der Tabelle — die Zeitleiste ist die Story.
             ('t', Action::None),
-            // B4: Ziffern sind Tabs, Zoom liegt auf z / Z.
+            // B4: Ziffern sind Tabs, Zoom liegt auf z / Z. C12.2: vier Tabs
+            // (Overview · Changes · Sessions · Requirements); `5` bleibt in
+            // der Tabelle — ohne Aktion, nichts verschwindet stillschweigend.
             ('1', Action::TabTo(0)),
             ('2', Action::TabTo(1)),
             ('3', Action::TabTo(2)),
             ('4', Action::TabTo(3)),
-            ('5', Action::TabTo(4)),
+            ('5', Action::None),
             ('z', Action::ZoomStep(true)),
             ('Z', Action::ZoomStep(false)),
             ('v', Action::Verify),

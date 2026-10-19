@@ -49,6 +49,7 @@ fn checkpoint_at(journal: &Journal, root: Option<&std::path::Path>) -> Session {
     let ctx = Checkpoint {
         root,
         commit: None,
+        home: None,
         tracked: None,
         redaction: Some(&policy),
     };

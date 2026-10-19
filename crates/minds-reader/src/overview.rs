@@ -79,6 +79,73 @@ pub struct WipSession {
     /// Was über ihr Ende bekannt ist — nur das beobachtete `SessionEnd`
     /// zählt (`closed`); `ended_at` ist bloß das letzte erfasste Event.
     pub state: WipState,
+    /// Der Start als Epoch-Sekunden, für das Alter in Listen (C3.7) —
+    /// aus `started`, nie aus der Uhr des Readers; `None` ohne Start.
+    pub started_epoch: Option<i64>,
+    /// Woher die Session stammt (K2) — aus dem Record abgeleitet, siehe
+    /// [`Origin`].
+    pub origin: Origin,
+}
+
+/// Woher eine Session ohne Commit stammt (K2). Eine Session im Store dieses
+/// Repositories, die an keinem Commit hängt, ist entweder noch offen — oder
+/// sie gehört gar nicht hierher: `minds enable` importiert im Hintergrund
+/// die alten Transkripte unter `~/.claude/projects/<slug>/`, und der Slug ist
+/// der Verzeichnispfad. Ein am selben Pfad neu angelegtes Repository erbt so
+/// fremde Sessions. Der Reader liest die Herkunft aus dem, was der Record
+/// trägt, und rät nicht:
+///
+/// - Ein Seal mit Scope `witness/v1` oder `witness-fs/v1`: ein Witness hat
+///   die Session bezeugt — `witnessed`.
+/// - Sonst ein Seal mit Scope `agent-hooks/v1`: die Hooks des Harness haben
+///   sie erfasst — `captured`.
+/// - Kein Seal-Material, aber ein gelesenes Transkript
+///   ([`TranscriptStatus::Read`](minds_core::TranscriptStatus::Read)): So
+///   baut nur `minds import` (der Import *ist* das Transkript; er versiegelt
+///   kein Journal) — `imported`.
+/// - Alles andere (kein Seal, kein oder anderer Transkript-Status): vor der
+///   Evidence-Chain erfasst oder von einem Binary ohne das Feld — `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Aus dem Transkript-Store des Agenten importiert, nicht von den Hooks
+    /// dieses Repositories erfasst.
+    Imported,
+    /// Von den Hooks des Harness erfasst und versiegelt.
+    Captured,
+    /// Von einem Witness bezeugt.
+    Witnessed,
+    /// Der Record sagt es nicht.
+    Unknown,
+}
+
+impl Origin {
+    /// Das Wort in Listen — Glyph kommt aus dem Theme, das Wort von hier.
+    pub fn word(self) -> &'static str {
+        match self {
+            Origin::Imported => "imported",
+            Origin::Captured => "captured",
+            Origin::Witnessed => "witnessed",
+            Origin::Unknown => "origin unknown",
+        }
+    }
+
+    /// Der Satz fürs Detail: woher, und was das bedeutet.
+    pub fn sentence(self) -> &'static str {
+        match self {
+            Origin::Imported => {
+                "not from this repository's hooks — imported from the agent's transcript store"
+            }
+            Origin::Captured => "captured by the agent's hooks in this repository",
+            Origin::Witnessed => "witnessed by a separate witness in this repository",
+            Origin::Unknown => "the record does not say where it came from",
+        }
+    }
+}
+
+/// Der Befehl, der eine Session aus dem Store dieses Repositories entfernt —
+/// **ein** Wortlaut für TUI und CLI. Der Reader führt ihn nicht aus.
+pub fn forget_command(id: &SessionId) -> String {
+    format!("minds forget {id}")
 }
 
 /// Was über das Ende einer Session ohne Commit bekannt ist.
@@ -496,6 +563,10 @@ impl crate::Inspection {
                         Some(l) if l.closed => WipState::Ended,
                         Some(_) => WipState::Open,
                     },
+                    started_epoch: lineage
+                        .and_then(|l| l.started_at.as_deref())
+                        .and_then(minds_metrics::epoch_seconds),
+                    origin: origin_of(index, id, lineage),
                 })
             })
             .collect();
@@ -636,6 +707,28 @@ pub fn layout(commits: &[GraphCommit]) -> (Vec<Vec<Cell>>, usize) {
         rows.push(cells);
     }
     (rows, width)
+}
+
+/// Die Herkunft einer Session aus ihrem Seal-Material und ihrer Lineage —
+/// die Regel steht an [`Origin`].
+fn origin_of(index: &crate::Index, id: SessionId, lineage: Option<&minds_core::Lineage>) -> Origin {
+    use minds_core::evidence::{SCOPE_AGENT_HOOKS_V1, SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1};
+    match index.evidence_report(id) {
+        Some(report) => {
+            let has = |scope: &str| report.epochs.iter().any(|e| e.scope == scope);
+            if has(SCOPE_WITNESS_V1) || has(SCOPE_WITNESS_FS_V1) {
+                Origin::Witnessed
+            } else if has(SCOPE_AGENT_HOOKS_V1) {
+                Origin::Captured
+            } else {
+                Origin::Unknown
+            }
+        }
+        None => match lineage {
+            Some(l) if l.transcript == Some(minds_core::TranscriptStatus::Read) => Origin::Imported,
+            _ => Origin::Unknown,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -835,6 +928,85 @@ mod tests {
                 ..Intent::default()
             },
         )
+    }
+
+    /// K2: Eine Session ohne Commit sagt, woher sie stammt und wie alt sie
+    /// ist — aus dem Record, nie geraten. Ein Hook-Seal heißt `captured`,
+    /// ein Witness-Seal `witnessed`; ohne Seal-Material baut nur der Import
+    /// eine Session mit gelesenem Transkript (`imported`); alles andere
+    /// bleibt `unknown`. Der `minds forget`-Befehl kommt fertig mit.
+    #[test]
+    fn a_session_without_a_commit_names_its_origin_and_age() {
+        use minds_core::evidence::{SCOPE_AGENT_HOOKS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome};
+        use minds_core::{Lineage, TranscriptStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        git_in(dir.path(), &["init", "-q", "-b", "main"]);
+        git_in(dir.path(), &["commit", "-q", "--allow-empty", "-m", "one"]);
+        let repo = Repo::open(dir.path()).unwrap();
+
+        let with_lineage = |request: &str, transcript: Option<TranscriptStatus>| {
+            let mut s = agent_session(request);
+            let mut l = Lineage::new("local");
+            l.started_at = Some("2026-07-20T10:00:00Z".into());
+            l.transcript = transcript;
+            s.lineage = Some(l);
+            s
+        };
+        let seal = |id: SessionId, scope: &str| {
+            let seal = Seal {
+                root: minds_core::ContentHash::from_bytes([7u8; 32]),
+                agent: "claude-code".into(),
+                scope: scope.into(),
+                first_seq: 0,
+                last_seq: 3,
+                events: 4,
+                gaps: 0,
+                pre_chain: 0,
+                outcome: SealOutcome::Stored {
+                    session: id.to_string(),
+                },
+                previous: None,
+                last_event_at: "2026-07-20T10:05:00Z".into(),
+            };
+            let seal_id = Seal::id_of_text(&seal.to_text().unwrap());
+            (seal_id, seal, true)
+        };
+
+        let imported = with_lineage("imported", Some(TranscriptStatus::Read));
+        let captured = with_lineage("captured", Some(TranscriptStatus::Read));
+        let witnessed = with_lineage("witnessed", Some(TranscriptStatus::NotReadByWitness));
+        let legacy = agent_session("legacy");
+        let ids: Vec<SessionId> = [&imported, &captured, &witnessed, &legacy]
+            .iter()
+            .map(|s| SessionId::of(s).unwrap())
+            .collect();
+        let mut sessions = BTreeMap::new();
+        for (id, s) in ids.iter().zip([imported, captured, witnessed, legacy]) {
+            sessions.insert(*id, s);
+        }
+        let index = crate::Index::from_parts(sessions, BTreeMap::new())
+            .with_seals(ids[1], vec![seal(ids[1], SCOPE_AGENT_HOOKS_V1)])
+            .with_seals(ids[2], vec![seal(ids[2], SCOPE_WITNESS_V1)]);
+        let inspection = crate::Inspection::from_index(index, Vec::new(), "t");
+        let overview = inspection.overview(&repo).unwrap();
+        let wip = |id: SessionId| overview.wip.iter().find(|w| w.id == id).unwrap();
+
+        assert_eq!(wip(ids[0]).origin, Origin::Imported);
+        assert_eq!(wip(ids[1]).origin, Origin::Captured);
+        assert_eq!(wip(ids[2]).origin, Origin::Witnessed);
+        assert_eq!(wip(ids[3]).origin, Origin::Unknown);
+        // Das Alter als Epoch-Sekunden aus dem erfassten Start — nicht aus
+        // der Uhr des Readers; ohne Start keins.
+        assert_eq!(
+            wip(ids[0]).started_epoch,
+            minds_metrics::epoch_seconds("2026-07-20T10:00:00Z")
+        );
+        assert_eq!(wip(ids[3]).started_epoch, None);
+        // Ein Wort je Herkunft, und der Befehl, der sie entfernt.
+        assert_eq!(Origin::Imported.word(), "imported");
+        assert_eq!(Origin::Unknown.word(), "origin unknown");
+        assert_eq!(forget_command(&ids[0]), format!("minds forget {}", ids[0]));
     }
 
     /// C3.1: Die Zahlen der Übersicht kommen aus genau den gelesenen Zeilen

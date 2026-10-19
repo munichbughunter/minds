@@ -123,6 +123,7 @@ impl Fixture {
                         raw_kind: raw_kind.into(),
                         cwd: None,
                         transcript_path: None,
+                        model: None,
                         payload: serde_json::value::RawValue::from_string(payload).unwrap(),
                     },
                 )
@@ -252,6 +253,7 @@ fn a_session_is_stored_closed_only_from_a_complete_range() {
                         raw_kind: raw_kind.into(),
                         cwd: None,
                         transcript_path: None,
+                        model: None,
                         payload: serde_json::value::RawValue::from_string(payload.into()).unwrap(),
                     },
                 )
@@ -323,6 +325,7 @@ fn the_local_checkpoint_binds_the_active_intent_unchained() {
                     raw_kind: INTENT_EVENT_KIND.into(),
                     cwd: None,
                     transcript_path: None,
+                    model: None,
                     payload: serde_json::value::RawValue::from_string(forged).unwrap(),
                 },
             )

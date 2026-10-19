@@ -29,6 +29,9 @@ const HEADER_LEN: usize = 12;
 const MAX_AGENT: usize = 64;
 const MAX_TEXT: usize = 4 * 1024;
 
+/// Longest model id a [`Frame::HookModel`] may carry (K1): one short line.
+pub const MAX_MODEL: usize = 128;
+
 /// A single request or response. Raw hook stdin is preserved byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
@@ -36,6 +39,17 @@ pub enum Frame {
         agent: String,
         event_override: Option<String>,
         stdin: Vec<u8>,
+    },
+    /// The model id the hook read from the tail of the transcript at
+    /// `Stop`/`SessionEnd` (K1), sent on the same connection **right after**
+    /// the `Hook` frame of that event. Only the id travels, never text or
+    /// token counts. A witness that does not know this kind drops it and
+    /// closes the connection — the event before it has already landed, so
+    /// an old witness loses the model, never the event.
+    Model {
+        agent: String,
+        session: String,
+        model: String,
     },
     CheckpointRequest {
         commit: Option<String>,
@@ -101,6 +115,16 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             put_short(&mut out, agent);
             put_short(&mut out, event_override.as_deref().unwrap_or_default());
             out.extend_from_slice(stdin);
+        }
+        Frame::Model {
+            agent,
+            session,
+            model,
+        } => {
+            out.push(0x07);
+            put_short(&mut out, agent);
+            put_short(&mut out, session);
+            put_short(&mut out, model);
         }
         Frame::CheckpointRequest { commit, request_id } => {
             out.push(0x02);
@@ -191,6 +215,20 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
                 stdin: cursor.0.to_vec(),
             }
         }
+        0x07 => {
+            let agent = cursor.short_text("agent")?;
+            check_agent(agent)?;
+            let session = cursor.short_text("session")?;
+            check_session(session)?;
+            let model = cursor.short_text("model")?;
+            check_model(model)?;
+            cursor.finish()?;
+            Frame::Model {
+                agent: agent.to_owned(),
+                session: session.to_owned(),
+                model: model.to_owned(),
+            }
+        }
         0x02 => {
             let commit = cursor.short_text("commit")?;
             check_commit(commit)?;
@@ -276,6 +314,16 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_line(event, u16::MAX as usize, "event_override")?;
             (5 + agent.len() + event.len()).saturating_add(stdin.len())
         }
+        Frame::Model {
+            agent,
+            session,
+            model,
+        } => {
+            check_agent(agent)?;
+            check_session(session)?;
+            check_model(model)?;
+            7 + agent.len() + session.len() + model.len()
+        }
         Frame::CheckpointRequest { commit, .. } => {
             let commit = commit.as_deref().unwrap_or_default();
             check_commit(commit)?;
@@ -329,6 +377,31 @@ fn check_agent(value: &str) -> Result<(), ProtoError> {
 fn check_line(value: &str, max: usize, field: &'static str) -> Result<(), ProtoError> {
     if value.len() > max || value.chars().any(char::is_control) {
         return Err(ProtoError::BadField(field));
+    }
+    Ok(())
+}
+
+/// A model id is one short, non-empty word of printable ASCII (K1) — the
+/// same rule on every side: the hook before it sends, the decoder, and the
+/// witness before it writes. `pub`, so the hook applies it before encoding
+/// and never trades the event for a bad id.
+pub fn check_model(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty() || value.len() > MAX_MODEL || !value.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ProtoError::BadField("model"));
+    }
+    Ok(())
+}
+
+/// The session id a [`Frame::Model`] names: what a journal session key
+/// accepts (`[A-Za-z0-9._-]`, 1–128 bytes); the writer checks it again.
+fn check_session(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(ProtoError::BadField("session"));
     }
     Ok(())
 }

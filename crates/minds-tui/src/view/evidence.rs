@@ -1,7 +1,8 @@
-//! Der Evidence-Report einer Session — drei Ebenen über demselben
-//! Read-Model: das **Verdikt** (ist die Evidence belastbar?), die
-//! **Erklärung** (warum?) und die **Kryptographie** (welche Seals, Roots,
-//! Epochen liegen zugrunde).
+//! Der Evidence-Report einer Session (C12.1): **ein Satz für Menschen** —
+//! je Achse ein Satzteil, kein Gesamturteil —, darunter das Urteil von
+//! `minds verify` in dessen Wörtern (oder „sealed, not yet verified"), dann
+//! genau die **drei Achsen** Integrität · Coverage · Deutung, die Grenze der
+//! Stufe als Satz und die Technik für Auditoren hinter Space.
 //!
 //! Die TUI rechnet hier nichts nach: Alles kommt fertig aus
 //! [`EvidenceReport`] ([`minds_reader`]) — derselben Rechnung, die auch
@@ -10,83 +11,127 @@
 //! Beobachtungsgrenze; was außerhalb liegt, ist `— nicht erfasst`, keine
 //! Lücke — und eine Lücke ist kein Beweis, dass etwas geschah.
 //!
-//! Die Sektion **ARTIFACT** (EA-03) zeigt den Abgleich der Commits, die die
-//! Session tragen: `artifact X/Y lines explained` und je Datei die Klasse,
-//! darunter die unerklärten Zeilen. Unerklärt ist nie ein Fehler — es steht
-//! im neutralen Stil „not observed in the session", nie in Rot.
+//! Der Abgleich der Commits, die die Session tragen (EA-03), steht als
+//! zweite Zeile unter COVERAGE — mit den Zustandswörtern aus C9.4
+//! (`reported`, `observed`, `not observed`), nie als „explained". Die Zahlen
+//! kommen aus derselben Reader-Rechnung wie Overview und Changes (C3.1).
+//! Unerklärt ist nie ein Fehler — es steht im neutralen Stil „not observed
+//! in the session", nie in Rot.
 
 use minds_core::SessionId;
+use minds_git::CommitId;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
-use minds_reader::artifact::{
-    ArtifactState, CommitArtifact, NOT_OBSERVED, provenance_note, summary,
+use minds_reader::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, provenance_note};
+use minds_reader::changes::LineClasses;
+use minds_reader::model::{
+    CoverageAxis, EpochLink, EpochReport, EvidenceReport, EvidenceVerdict, InterpretationAxis,
+    LEGACY_SENTENCE, Provenance, TrustAxes,
 };
-use minds_reader::model::{EpochLink, EpochReport, EvidenceReport, LEGACY_SENTENCE};
 use minds_reader::reconcile::ReconClass;
 
+use crate::app::App;
 use crate::theme;
+use crate::view::trust;
+
+/// Die Zeilenklassen je abgeglichenem Commit — aus derselben Rechnung wie
+/// `◦n` im Changes-Tab und COVERAGE in der Übersicht.
+pub type CommitLines = (CommitId, Result<LineClasses, String>);
 
 /// Die Sektionen, in Anzeige-Reihenfolge — muss zu
 /// [`crate::app::EVIDENCE_SECTIONS`] passen (testfixiert).
 const SECTIONS: [&str; crate::app::EVIDENCE_SECTIONS] = [
     "INTEGRITY",
     "COVERAGE",
-    "ARTIFACT",
-    "EPOCHS",
-    "SIGNATURE",
     "INTERPRETATION",
     "LIMITS",
+    "TECHNICAL",
 ];
+
+/// Die Sektion TECHNICAL — Space klappt sie auf.
+const TECHNICAL: usize = 4;
+
+/// Breite der Label-Spalte vor den Achsen.
+const LABEL: usize = 16;
 
 /// Zeichnet den Report. `report: None` ist Legacy — ein ehrlicher Zustand
 /// mit einem Satz, kein leerer Bildschirm.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     area: Rect,
+    app: &App,
     id: SessionId,
     report: Option<&EvidenceReport>,
     uninterpreted: usize,
     artifacts: &[CommitArtifact],
+    lines: &[CommitLines],
     cursor: usize,
+    technical: bool,
 ) {
     let short: String = id.to_string().chars().take(11).collect();
     let Some(report) = report else {
-        legacy(frame, area, &short, uninterpreted, artifacts);
+        legacy(frame, area, &short, uninterpreted, artifacts, lines);
         return;
     };
 
-    let verdict_h = 2 + SECTIONS.len() as u16;
-    let [head, verdict_area, detail_area] = Layout::vertical([
-        Constraint::Length(5),
-        Constraint::Length(verdict_h),
+    let inner = area.width.saturating_sub(4) as usize;
+    let check = app.evidence_check(id, artifacts);
+    let intact = intact(&check);
+
+    // Kopf: Identität, Trust Strip, Prüfzeit — dann der Satz für Menschen
+    // und das Urteil von `minds verify`.
+    let story = wrap(&sentence(report, uninterpreted, lines, intact), inner);
+    let head_h = 2 + 1 + story.len() as u16 + 1;
+    let (_, v_word, v_style) = theme::provenance(&Provenance::Chained(report.state));
+    let axes = TrustAxes::of(&Provenance::Chained(report.state), uninterpreted);
+    let mut first = vec![Span::styled(
+        format!("EVIDENCE · session {short}…  "),
+        theme::title().fg(theme::AGENT),
+    )];
+    first.extend(trust::spans(&axes, trust::Density::Glyphs));
+    if let Some((_, _, Some(at))) = &check {
+        let used: usize = first.iter().map(|s| s.content.chars().count()).sum();
+        let stamp = format!("checked {}Z", super::clock(*at));
+        let pad = inner.saturating_sub(used + stamp.chars().count());
+        first.push(Span::raw(" ".repeat(pad)));
+        first.push(Span::styled(stamp, theme::dim()));
+    }
+    let mut head_lines = vec![Line::from(first)];
+    head_lines.extend(story.into_iter().map(|l| Line::from(Span::raw(l))));
+    let (words, style) = verdict_words(report, check, app.evidence_checking(artifacts), true);
+    head_lines.push(Line::from(vec![
+        Span::styled("Verdict of minds verify: ", theme::dim()),
+        Span::styled(words, style),
+    ]));
+
+    // Die Achsen: drei Zeilen, der Abgleich unter COVERAGE, LIMITS als
+    // Satz, TECHNICAL zu- oder aufgeklappt.
+    let rows = rows(
+        report,
+        uninterpreted,
+        artifacts,
+        lines,
+        inner,
+        technical,
+        cursor,
+        intact,
+    );
+    let rows_h = rows.len() as u16 + 2;
+
+    let [head, rows_area, detail_area] = Layout::vertical([
+        Constraint::Length(head_h),
+        Constraint::Length(rows_h),
         Constraint::Min(1),
     ])
     .areas(area);
 
-    // Kopf: die Seal-Karte — Titel trägt den Zustand als EIN Wort
-    // (SEALED/INCOMPLETE/TAMPERED, dieselbe Familie wie der CLI-Block aus
-    // `minds checkpoint`), darin Session, Verdikt-Wort, Leitsatz und die
-    // Kennzahlen. Der Leitsatz behauptet nie mehr, als das Verdikt trägt.
-    let (v_glyph, v_word, v_style) =
-        theme::provenance(&minds_reader::model::Provenance::Chained(report.state));
-    let state = &report.state;
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("EVIDENCE {short}…  "),
-                    theme::title().fg(theme::AGENT),
-                ),
-                Span::styled(format!("{v_glyph} {v_word}"), v_style.patch(theme::title())),
-            ]),
-            Line::from(Span::styled(report.sentence(), theme::dim())),
-            Line::from(Span::raw(state.metrics_line())),
-        ])
-        .block(
+        Paragraph::new(head_lines).block(
             Block::bordered()
                 .title(format!(" SESSION {} ", v_word.to_uppercase()))
                 .title_style(v_style.patch(theme::title()))
@@ -94,36 +139,18 @@ pub fn draw(
         ),
         head,
     );
-
-    // Ebene 1: das Verdikt — sieben Zeilen, je Achse eine Aussage.
-    let lines: Vec<Line> = rows(report, uninterpreted, artifacts)
-        .into_iter()
-        .enumerate()
-        .map(|(i, (glyph, status, style))| {
-            let mut line = Line::from(vec![
-                Span::styled(format!(" {glyph} "), style),
-                Span::styled(format!("{:<15}", SECTIONS[i]), style.patch(theme::title())),
-                Span::raw(" "),
-                Span::styled(status, style),
-            ]);
-            if i == cursor {
-                line = line.style(theme::cursor());
-            }
-            line
-        })
-        .collect();
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(rows).block(
             Block::bordered()
-                .title(" VERDICT ")
+                .title(" EVIDENCE ")
                 .title_style(theme::title()),
         ),
-        verdict_area,
+        rows_area,
     );
 
-    // Ebene 2 + 3: das Detail folgt dem Fokus — wie der Inspector der
-    // Why-Kette, ohne dass Enter etwas verspricht.
-    let (title, lines) = detail(report, uninterpreted, artifacts, cursor);
+    // Das Detail folgt dem Fokus — wie bisher, ohne dass Enter etwas
+    // verspricht.
+    let (title, lines) = detail(report, uninterpreted, artifacts, lines, cursor);
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
@@ -134,22 +161,504 @@ pub fn draw(
     );
 }
 
+/// Ob `minds verify` den Record geprüft und für intakt befunden hat:
+/// nur dann heißt INTEGRITY `✓ record intact`. Ohne Urteil, nach einem
+/// Fehler der Prüfung oder bei NOT VERIFIABLE ist der Record **sealed** —
+/// sealed ist nicht verified (Design-Regel 2: dieselbe Darstellung wie
+/// `… checking` in der Übersicht, nie ✓ davor).
+fn intact(check: &Option<(CommitId, Result<&crate::CommitVerify, String>, Option<i64>)>) -> bool {
+    match check {
+        Some((_, Ok(c), _)) => {
+            matches!(
+                c.verdict,
+                Ok(crate::VerifyVerdict::Verified | crate::VerifyVerdict::Incomplete)
+            ) && !c.sessions.iter().any(|s| s.tampered)
+        }
+        _ => false,
+    }
+}
+
+/// Die Wörter des Urteils (C12.1): **die von `minds verify`**, wörtlich,
+/// mit der Prüfzeit — oder „sealed, not yet verified", solange keine
+/// Signaturprüfung lief. Nie VERIFIED davor. `checking`: die Prüfung
+/// läuft gerade (`v`) — dann `… checking`, kein Urteil.
+/// `with_time` hängt die Prüfzeit an (Kopf); die Fußzeile lässt sie weg.
+pub(crate) fn verdict_words(
+    report: &EvidenceReport,
+    check: Option<(CommitId, Result<&crate::CommitVerify, String>, Option<i64>)>,
+    checking: bool,
+    with_time: bool,
+) -> (String, Style) {
+    use crate::verify::Overall;
+    match check {
+        None if checking => ("… checking".into(), theme::dim()),
+        None => {
+            if report.state.verdict == EvidenceVerdict::Tampered {
+                let (glyph, word, style) = theme::tampered();
+                (
+                    format!("{glyph} {word} — seal material altered · v: run verify"),
+                    style,
+                )
+            } else {
+                (
+                    "sealed, not yet verified — v: run verify".into(),
+                    theme::dim(),
+                )
+            }
+        }
+        Some((_, Err(why), _)) => (
+            format!("not checked — {why}"),
+            Style::default().fg(theme::REVIEW),
+        ),
+        Some((_, Ok(c), at)) => {
+            let tampered = report.state.verdict == EvidenceVerdict::Tampered
+                || c.sessions.iter().any(|s| s.tampered);
+            let overall = match &c.verdict {
+                _ if tampered => Overall::Tampered,
+                Ok(crate::VerifyVerdict::Verified) => Overall::Verified,
+                Ok(crate::VerifyVerdict::Incomplete) => Overall::Incomplete,
+                Ok(crate::VerifyVerdict::Tampered) => Overall::Tampered,
+                Ok(crate::VerifyVerdict::NotVerifiable) => Overall::NotVerifiable,
+                Err(why) => {
+                    return (
+                        format!("not checked — {why}"),
+                        Style::default().fg(theme::REVIEW),
+                    );
+                }
+            };
+            let (words, style) = trust::verify_headline(overall);
+            match at.filter(|_| with_time) {
+                Some(at) => (
+                    format!("{words} (signatures checked {}Z)", super::clock(at)),
+                    style,
+                ),
+                None => (words, style),
+            }
+        }
+    }
+}
+
+/// Der Satz für Menschen: je Achse ein Satzteil — Integrität, Coverage,
+/// Abgleich, Deutung —, nie ein Gesamturteil.
+/// `intact` sagt, ob `minds verify` das Siegel schon bestätigt hat — davor
+/// ist der Record sealed, nicht intact.
+fn sentence(
+    report: &EvidenceReport,
+    uninterpreted: usize,
+    lines: &[CommitLines],
+    intact: bool,
+) -> String {
+    let state = &report.state;
+    let axes = TrustAxes::of(&Provenance::Chained(*state), uninterpreted);
+    let mut out = if state.verdict == EvidenceVerdict::Tampered {
+        "This session's seal material was altered — the record is not intact".to_string()
+    } else {
+        format!(
+            "This session's record is {} and {}",
+            if intact { "intact" } else { "sealed" },
+            signed_words(state.signed, state.seals)
+        )
+    };
+    let boundary = boundary_word(report.scope.as_deref());
+    out.push_str(&match axes.coverage {
+        CoverageAxis::Complete => format!(
+            ", and all {} {} lie inside the {boundary}.",
+            state.events,
+            plural(state.events as usize, "event", "events")
+        ),
+        CoverageAxis::Incomplete => format!(
+            "; {} {} interrupt the {} events recorded inside the {boundary}.",
+            state.gaps,
+            plural(state.gaps as usize, "gap", "gaps"),
+            state.events
+        ),
+        CoverageAxis::NotAssessable => "; coverage cannot be assessed on altered material.".into(),
+        CoverageAxis::NotRecorded => "; no events were recorded.".into(),
+    });
+    out.push(' ');
+    out.push_str(&artifact_sentence(lines));
+    out.push(' ');
+    out.push_str(&match axes.interpretation {
+        InterpretationAxis::Interpreted => "Every tool call was interpreted.".to_string(),
+        InterpretationAxis::Uninterpreted(n) => format!(
+            "{n} tool {} observed but not interpreted.",
+            plural(n, "call was", "calls were")
+        ),
+    });
+    out
+}
+
+/// Der Satzteil zum Abgleich: die Zeilen des Commits nach Zustand.
+fn artifact_sentence(lines: &[CommitLines]) -> String {
+    let counted: Vec<&LineClasses> = lines.iter().filter_map(|(_, l)| l.as_ref().ok()).collect();
+    if lines.is_empty() {
+        return "No commit carries this session, so no lines were reconciled.".into();
+    }
+    let Some(c) = counted.first() else {
+        return "The commit's lines were not reconciled.".into();
+    };
+    let c = if counted.len() == 1 {
+        (*c).clone()
+    } else {
+        counted.iter().fold(LineClasses::default(), |mut acc, c| {
+            // Sättigend: Zahlen aus dem Store, kein Überlauf-Panic.
+            acc.added = acc.added.saturating_add(c.added);
+            acc.explained = acc.explained.saturating_add(c.explained);
+            acc.fs_only = acc.fs_only.saturating_add(c.fs_only);
+            acc.stated = acc.stated.saturating_add(c.stated);
+            acc.unexplained = acc.unexplained.saturating_add(c.unexplained);
+            acc.not_assessed = acc.not_assessed.saturating_add(c.not_assessed);
+            acc
+        })
+    };
+    let observed = c.explained + c.fs_only;
+    if c.added == 0 {
+        "The commit adds no lines.".into()
+    } else if c.unexplained == 0 && c.stated == 0 && c.not_assessed == 0 {
+        format!("All {} added lines were observed.", c.added)
+    } else if c.unexplained > 0 {
+        format!(
+            "{} of {} added lines {} not observed in the session; {} reported by the agent and {} observed.",
+            c.unexplained,
+            c.added,
+            plural(c.unexplained, "is", "are"),
+            c.stated,
+            observed
+        )
+    } else {
+        format!(
+            "The {} added lines are reported by the agent; {} observed by a witness.",
+            c.added,
+            if observed == 0 {
+                "none were".to_string()
+            } else {
+                format!("{observed} were")
+            }
+        )
+    }
+}
+
+fn signed_words(signed: usize, seals: usize) -> String {
+    if signed == 0 {
+        "unsigned".into()
+    } else if signed == seals {
+        "signed".into()
+    } else {
+        format!("signed in {signed} of {seals} seals")
+    }
+}
+
+fn boundary_word(scope: Option<&str>) -> &'static str {
+    match scope {
+        Some(s) if s.contains("witness") => "witness boundary",
+        Some(s) if s.contains("hook") => "hook boundary",
+        _ => "recorded boundary",
+    }
+}
+
+fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
+    if n == 1 { one } else { many }
+}
+
+/// Zeilenumbruch an Wortgrenzen auf höchstens `width` Zeichen.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let w = word.chars().count();
+        if used > 0 && used + 1 + w > width {
+            out.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        if used > 0 {
+            current.push(' ');
+            used += 1;
+        }
+        current.push_str(word);
+        used += w;
+    }
+    if !current.is_empty() || out.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// Eine Achsenzeile: Label (16 Spalten), dann Glyph und Text.
+fn axis(label: &str, glyph: &str, text: String, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {label:<LABEL$}"), theme::dim()),
+        Span::styled(format!("{glyph} {text}"), style),
+    ])
+}
+
+/// Eine eingerückte Folgezeile unter einer Achse.
+fn sub(glyph: &str, text: String, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::raw(" ".repeat(LABEL + 1)),
+        Span::styled(format!("{glyph} {text}"), style),
+    ])
+}
+
+/// Die Achsenzeilen — mit dem Cursor auf `cursor`. `intact`: ob `minds
+/// verify` das Siegel bestätigt hat — erst dann `✓ record intact`, davor
+/// `◈ record sealed` (der Trust-Glyph der Achse).
+#[allow(clippy::too_many_arguments)]
+fn rows(
+    report: &EvidenceReport,
+    uninterpreted: usize,
+    artifacts: &[CommitArtifact],
+    lines: &[CommitLines],
+    width: usize,
+    technical: bool,
+    cursor: usize,
+    intact: bool,
+) -> Vec<Line<'static>> {
+    let state = &report.state;
+    let axes = TrustAxes::of(&Provenance::Chained(*state), uninterpreted);
+    let [i, c, d] = trust::slots(&axes);
+    let ok = Style::default().fg(theme::OK);
+    let warn = Style::default().fg(theme::REVIEW);
+    let mut out: Vec<(usize, Line<'static>)> = Vec::new();
+
+    // INTEGRITY: Record, Seals und Signatur, Kette und Stufe — in einem.
+    let level = report.assurance.code();
+    if state.verdict == EvidenceVerdict::Tampered {
+        let (glyph, word, style) = theme::tampered();
+        out.push((
+            0,
+            axis(
+                SECTIONS[0],
+                glyph,
+                format!("{word} — seal material altered"),
+                style,
+            ),
+        ));
+    } else {
+        let mut text = format!(
+            "record {} · {} {}, {} · chain {} ({} {})",
+            if intact { "intact" } else { "sealed" },
+            state.seals,
+            plural(state.seals, "seal", "seals"),
+            signed_words(state.signed, state.seals),
+            if state.chain_closed { "closed" } else { "open" },
+            state.seals,
+            plural(state.seals, "epoch", "epochs")
+        );
+        // Sealed ist nicht verified: ✓ erst mit dem Urteil, davor der
+        // Trust-Glyph der Achse (`◈`) — wie die Übersicht nie ✓ vor dem
+        // Urteil zeigt.
+        let (mut glyph, mut style) = if intact {
+            ("✓", ok)
+        } else {
+            (i.glyph, i.style)
+        };
+        if !state.chain_closed {
+            glyph = "!";
+            style = warn;
+        }
+        if state.rejected {
+            text.push_str(" · block seal in the chain");
+            glyph = "!";
+            style = warn;
+        }
+        text.push_str(&format!(" · {level}"));
+        out.push((0, axis(SECTIONS[0], glyph, text, style)));
+    }
+
+    // COVERAGE: die Zahlen, darunter der Abgleich mit den C9.4-Wörtern.
+    let coverage = match axes.coverage {
+        CoverageAxis::Complete => format!(
+            "{} · {} {} · {} {}",
+            c.word,
+            state.events,
+            plural(state.events as usize, "event", "events"),
+            state.gaps,
+            plural(state.gaps as usize, "gap", "gaps")
+        ),
+        CoverageAxis::Incomplete => format!(
+            "{} · {} events · {} {} · {} pre-chain",
+            c.word,
+            state.events,
+            state.gaps,
+            plural(state.gaps as usize, "gap", "gaps"),
+            state.pre_chain
+        ),
+        CoverageAxis::NotAssessable => format!("{} — the seal material is altered", c.word),
+        CoverageAxis::NotRecorded => c.word.to_string(),
+    };
+    out.push((1, axis(SECTIONS[1], c.glyph, coverage, c.style)));
+    for (glyph, text, style) in artifact_rows(artifacts, lines) {
+        out.push((1, sub(glyph, text, style)));
+    }
+
+    // INTERPRETATION: die dritte Achse, getrennt von den beiden anderen.
+    let interpretation = match axes.interpretation {
+        InterpretationAxis::Interpreted => format!("all tool calls {}", d.word),
+        InterpretationAxis::Uninterpreted(n) => {
+            format!("{n} {} observed but {}", plural(n, "call", "calls"), d.word)
+        }
+    };
+    out.push((2, axis(SECTIONS[2], d.glyph, interpretation, d.style)));
+
+    // LIMITS: die Grenze der Stufe als Satz, nicht als Zahl.
+    let limit = format!(
+        "{} at {level} — {}",
+        level_word(report.assurance),
+        crate::copy::assurance_limit(report.assurance)
+    );
+    let text_width = width.saturating_sub(LABEL + 1);
+    for (i, part) in wrap(&limit, text_width).into_iter().enumerate() {
+        if i == 0 {
+            out.push((
+                3,
+                Line::from(vec![
+                    Span::styled(format!(" {:<LABEL$}", SECTIONS[3]), theme::dim()),
+                    Span::raw(part),
+                ]),
+            ));
+        } else {
+            out.push((
+                3,
+                Line::from(vec![Span::raw(" ".repeat(LABEL + 1)), Span::raw(part)]),
+            ));
+        }
+    }
+
+    // TECHNICAL: zugeklappt eine Zeile; Space klappt die Technik auf.
+    let label = format!(" {} (for auditors)", SECTIONS[4]);
+    let hint = if technical { "▾ Space" } else { "▸ Space" };
+    let pad = width.saturating_sub(label.chars().count() + hint.chars().count());
+    out.push((
+        TECHNICAL,
+        Line::from(vec![
+            Span::styled(label, theme::dim()),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(hint, theme::dim()),
+        ]),
+    ));
+    if technical {
+        for line in integrity(report) {
+            let mut spans = vec![Span::raw("   ")];
+            spans.extend(line.spans);
+            out.push((usize::MAX, Line::from(spans)));
+        }
+    }
+
+    // Der Cursor liegt auf der ersten Zeile seiner Sektion.
+    let mut seen = std::collections::HashSet::new();
+    out.into_iter()
+        .map(|(section, line)| {
+            if section == cursor && seen.insert(section) {
+                line.style(theme::cursor())
+            } else {
+                line
+            }
+        })
+        .collect()
+}
+
+/// Das Wort der Stufe ohne Kürzel (`observed` für `A1 observed`).
+fn level_word(level: minds_reader::assurance::Assurance) -> &'static str {
+    level
+        .word()
+        .split_once(' ')
+        .map(|(_, word)| word)
+        .unwrap_or(level.word())
+}
+
+/// Die Abgleich-Zeilen unter COVERAGE: je abgeglichenem Commit eine.
+fn artifact_rows(
+    artifacts: &[CommitArtifact],
+    lines: &[CommitLines],
+) -> Vec<(&'static str, String, Style)> {
+    if artifacts.is_empty() {
+        return vec![(
+            "·",
+            "no commit carries this session — nothing to reconcile".into(),
+            theme::dim(),
+        )];
+    }
+    let many = artifacts.len() > 1;
+    let mut out = Vec::new();
+    let mut skipped = 0;
+    for artifact in artifacts {
+        let counted = lines
+            .iter()
+            .find(|(c, _)| *c == artifact.commit)
+            .map(|(_, l)| l);
+        match (&artifact.state, counted) {
+            (ArtifactState::Assessed(_), Some(Ok(classes))) => {
+                let (glyph, mut text, style) = super::class_words(classes);
+                if many {
+                    text = format!("{} · {text}", short_commit(artifact));
+                }
+                let note = provenance_note(artifact);
+                if !note.is_empty() {
+                    text.push_str(&format!(" · {note}"));
+                }
+                out.push((glyph, text, style));
+            }
+            (ArtifactState::Assessed(_), counted) => {
+                let mut text = match counted {
+                    Some(Err(why)) => format!("lines not counted — {why}"),
+                    _ => "lines not counted".to_string(),
+                };
+                if many {
+                    text = format!("{} · {text}", short_commit(artifact));
+                }
+                let note = provenance_note(artifact);
+                if !note.is_empty() {
+                    text.push_str(&format!(" · {note}"));
+                }
+                out.push(("·", text, theme::dim()));
+            }
+            (ArtifactState::Unavailable(why), _) => {
+                if many {
+                    skipped += 1;
+                } else {
+                    out.push(("·", format!("not assessed ({why})"), theme::dim()));
+                }
+            }
+            (ArtifactState::Failed(_), _) => {
+                if many {
+                    skipped += 1;
+                } else {
+                    out.push(("·", "not assessed (error)".into(), theme::dim()));
+                }
+            }
+        }
+    }
+    if many {
+        let mut text = format!("{} commits", artifacts.len());
+        if skipped > 0 {
+            text.push_str(&format!(" · {skipped} not assessed"));
+        }
+        if artifacts.iter().any(|a| a.inferred) {
+            text.push_str(" · partly inferred links");
+        }
+        out.push(("·", text, theme::dim()));
+    }
+    out
+}
+
 fn legacy(
     frame: &mut Frame,
     area: Rect,
     short: &str,
     uninterpreted: usize,
     artifacts: &[CommitArtifact],
+    lines: &[CommitLines],
 ) {
-    let mut lines = vec![
+    let mut out = vec![
         Line::from(vec![
             Span::styled(
-                format!("EVIDENCE {short}…  "),
+                format!("EVIDENCE · session {short}…  "),
                 theme::title().fg(theme::AGENT),
             ),
             {
-                let slot =
-                    crate::view::trust::integrity(minds_reader::model::IntegrityAxis::Legacy);
+                let slot = trust::integrity(minds_reader::model::IntegrityAxis::Legacy);
                 Span::styled(
                     format!("{} {}", slot.glyph, slot.word),
                     slot.style.patch(theme::title()),
@@ -162,14 +671,11 @@ fn legacy(
     ];
     // Die drei Achsen in der vollen Dichte (A4): Legacy hat keine
     // Integrität und keine Coverage zu prüfen — die Deutung schon.
-    lines.extend(crate::view::trust::render(
-        &minds_reader::model::TrustAxes::of(
-            &minds_reader::model::Provenance::Legacy,
-            uninterpreted,
-        ),
-        crate::view::trust::Density::Full,
+    out.extend(trust::render(
+        &TrustAxes::of(&Provenance::Legacy, uninterpreted),
+        trust::Density::Full,
     ));
-    lines.extend([
+    out.extend([
         Line::default(),
         Line::from(Span::styled(
             "This session was captured before the evidence chain. It never gets a chain \
@@ -180,11 +686,11 @@ fn legacy(
     // Der Abgleich hängt nicht an der Chain: Auch eine Legacy-Session kann
     // Zeilen eines Commits erklären — oder eben nicht.
     if !artifacts.is_empty() {
-        lines.push(Line::default());
-        lines.extend(artifact(artifacts));
+        out.push(Line::default());
+        out.extend(artifact(artifacts, lines));
     }
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(
+        Paragraph::new(out).wrap(Wrap { trim: false }).block(
             Block::bordered()
                 .title(" SESSION · LEGACY ")
                 .title_style(theme::dim().patch(theme::title()))
@@ -194,193 +700,30 @@ fn legacy(
     );
 }
 
-/// Glyph, Statustext und Stil je Sektion — die Verdikt-Zeilen.
-fn rows(
-    report: &EvidenceReport,
-    uninterpreted: usize,
-    artifacts: &[CommitArtifact],
-) -> Vec<(String, String, Style)> {
-    let state = &report.state;
-    let ok = Style::default().fg(theme::OK);
-    let warn = Style::default().fg(theme::REVIEW);
-    let mut out = Vec::with_capacity(SECTIONS.len());
-
-    // Integrität und Coverage: aus dem Trust Strip (A4) — dieselben Glyphen
-    // und Wörter wie überall, ergänzt um die Kennzahlen und die Grenze.
-    let [integrity, coverage, interpretation] =
-        crate::view::trust::evidence_rows(report, uninterpreted);
-    out.push(integrity);
-    out.push(coverage);
-
-    // Artefakt: wie viel des Commits die Session erklärt.
-    out.push(artifact_row(artifacts));
-
-    // Epochen: schließt sich die previous-Kette?
-    let mut epochs = if state.chain_closed {
-        (
-            "✓".into(),
-            format!("chain closed · {} epoch(s)", state.seals),
-            ok,
-        )
-    } else {
-        (
-            "!".into(),
-            format!("chain open · {} epoch(s)", state.seals),
-            warn,
-        )
-    };
-    if state.rejected {
-        epochs.1.push_str(" · block seal in the chain");
-        epochs.0 = "!".into();
-        epochs.2 = warn;
-    }
-    out.push(epochs);
-
-    // Signatur: unsigniert ist ein Zustand, kein Fehler — und Anwesenheit
-    // ist keine Prüfung.
-    out.push(if state.signed == 0 {
-        (
-            "○".into(),
-            "NOT SIGNED — unsigned ≠ invalid".into(),
-            theme::dim(),
-        )
-    } else {
-        (
-            "✓".into(),
-            format!(
-                "{}/{} signed · validity is checked by `minds verify`",
-                state.signed, state.seals
-            ),
-            ok,
-        )
-    });
-
-    // Deutung: die dritte Achse, getrennt von Integrität und Coverage.
-    out.push(interpretation);
-
-    // Grenzen: keine Achse, aber Teil des Reports.
-    out.push((
-        "·".into(),
-        format!(
-            "{} named limits at {}",
-            report.limitations.len(),
-            report.assurance.word()
-        ),
-        theme::dim(),
-    ));
-    out
-}
-
 /// Der Detail-Block der fokussierten Sektion.
 fn detail(
     report: &EvidenceReport,
     uninterpreted: usize,
     artifacts: &[CommitArtifact],
+    lines: &[CommitLines],
     cursor: usize,
 ) -> (&'static str, Vec<Line<'static>>) {
     match cursor {
-        0 => ("INTEGRITY", integrity(report)),
-        1 => ("COVERAGE", coverage(report)),
-        2 => ("ARTIFACT", artifact(artifacts)),
-        3 => ("EPOCHS", epochs(report)),
-        4 => ("SIGNATURE", signature(report)),
-        5 => ("INTERPRETATION", interpretation(uninterpreted)),
-        _ => ("LIMITS", limitations(report)),
-    }
-}
-
-/// Ob ein abgeglichener Commit irgendetwas Unerklärtes trägt — Zeilen,
-/// ganze Dateien (Löschung, binär) oder strukturelle Änderungen.
-fn any_unexplained(assessed: &minds_reader::artifact::Assessed) -> bool {
-    !assessed.structural.is_empty()
-        || assessed
-            .recon
-            .files
-            .iter()
-            .any(|f| f.class == ReconClass::Unexplained)
-}
-
-/// Ob ein abgeglichener Commit Zeilen trägt, die nur berichtet sind — ein
-/// Tool-Claim ohne Zeugen.
-fn any_reported_only(assessed: &minds_reader::artifact::Assessed) -> bool {
-    assessed.recon.files.iter().any(|f| {
-        f.class == ReconClass::ReportedOnly
-            || matches!(&f.line_level, minds_reader::reconcile::LineLevel::Available(lines)
-                if lines.iter().any(|l| l.class == ReconClass::ReportedOnly))
-    })
-}
-
-/// Glyph und Stil der Artefakt-Zeile: unerklärt → neutral `◦`; nur durch
-/// Claims belegt → `◇` (belegt, aber nicht bezeugt, also nicht grün); alles
-/// bezeugt → `✓`.
-fn artifact_mark(unexplained: bool, reported_only: bool) -> (String, Style) {
-    let (neutral_glyph, _, neutral) = theme::not_observed();
-    if unexplained {
-        (neutral_glyph.into(), neutral)
-    } else if reported_only {
-        let (glyph, _, style) = theme::recon(ReconClass::ReportedOnly);
-        (glyph.into(), style)
-    } else {
-        ("✓".into(), Style::default().fg(theme::OK))
-    }
-}
-
-/// Die Verdikt-Zeile der Artefakt-Sektion. Unerklärtes ist neutral
-/// (`◦`, gedimmt) — nie die Warn- oder Fehlerfarbe.
-fn artifact_row(artifacts: &[CommitArtifact]) -> (String, String, Style) {
-    match artifacts {
-        [] => (
-            "·".into(),
-            "not assessed (no linked commit)".into(),
-            theme::dim(),
-        ),
-        [one] => match &one.state {
-            ArtifactState::Assessed(assessed) => {
-                let mut text = format!("{} · {}", summary(&assessed.recon), short_commit(one));
-                let note = provenance_note(one);
-                if !note.is_empty() {
-                    text.push_str(&format!(" · {note}"));
-                }
-                let (glyph, style) =
-                    artifact_mark(any_unexplained(assessed), any_reported_only(assessed));
-                (glyph, text, style)
-            }
-            ArtifactState::Unavailable(why) => {
-                ("·".into(), format!("not assessed ({why})"), theme::dim())
-            }
-            ArtifactState::Failed(_) => ("·".into(), "not assessed (error)".into(), theme::dim()),
-        },
-        many => {
-            let assessed: Vec<_> = many
-                .iter()
-                .filter_map(|a| match &a.state {
-                    ArtifactState::Assessed(assessed) => Some(assessed),
-                    _ => None,
-                })
-                .collect();
-            let backed: u64 = assessed.iter().map(|a| a.recon.backed_lines()).sum();
-            let total: u64 = assessed.iter().map(|a| a.recon.total_changed_lines).sum();
-            let mut text = format!(
-                "artifact {backed}/{total} lines explained · {} commits",
-                many.len()
-            );
-            let skipped = many.len() - assessed.len();
-            if skipped > 0 {
-                text.push_str(&format!(" · {skipped} not assessed"));
-            }
-            if many.iter().any(|a| a.inferred) {
-                text.push_str(" · partly inferred links");
-            }
-            let unexplained = assessed.iter().any(|a| any_unexplained(a));
-            // Nicht abgeglichen ist nicht „nicht beobachtet": `·` wie im
-            // Ein-Commit-Fall, nicht das `◦` der Legende.
-            let (glyph, style) = if !unexplained && skipped > 0 {
-                ("·".into(), theme::dim())
-            } else {
-                artifact_mark(unexplained, assessed.iter().any(|a| any_reported_only(a)))
-            };
-            (glyph, text, style)
+        0 => {
+            let mut out = epochs(report);
+            out.push(Line::default());
+            out.extend(signature(report));
+            ("INTEGRITY", out)
         }
+        1 => {
+            let mut out = artifact(artifacts, lines);
+            out.push(Line::default());
+            out.extend(coverage(report));
+            ("COVERAGE", out)
+        }
+        2 => ("INTERPRETATION", interpretation(uninterpreted)),
+        3 => ("LIMITS", limitations(report)),
+        _ => ("TECHNICAL", integrity(report)),
     }
 }
 
@@ -402,10 +745,10 @@ fn short_commit(artifact: &CommitArtifact) -> String {
     artifact.commit.to_string().chars().take(7).collect()
 }
 
-/// Das Detail der Artefakt-Sektion: je Commit die Zusammenfassung, dann je
+/// Das Detail des Abgleichs: je Commit die Zeilen nach Zustand, dann je
 /// Datei Klasse, Pfad und was unerklärt ist. Pfade sind fremdbestimmt und
 /// laufen durch die Terminal-Härtung des Readers.
-fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
+fn artifact(artifacts: &[CommitArtifact], lines: &[CommitLines]) -> Vec<Line<'static>> {
     if artifacts.is_empty() {
         return vec![
             Line::from(Span::raw(
@@ -419,10 +762,10 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
         ];
     }
     let (neutral_glyph, _, neutral) = theme::not_observed();
-    let mut lines = Vec::new();
+    let mut out = Vec::new();
     for (i, artifact) in artifacts.iter().enumerate() {
         if i > 0 {
-            lines.push(Line::default());
+            out.push(Line::default());
         }
         let mut head = vec![
             Span::styled(format!("{:<12} ", "Commit"), theme::dim()),
@@ -436,27 +779,36 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
         if !note.is_empty() {
             head.push(Span::styled(format!("  · {note}"), theme::dim()));
         }
-        lines.push(Line::from(head));
+        out.push(Line::from(head));
         let assessed = match &artifact.state {
             ArtifactState::Assessed(assessed) => assessed,
             ArtifactState::Unavailable(why) => {
-                lines.push(Line::from(Span::styled(
+                out.push(Line::from(Span::styled(
                     format!("{:<12} not assessed ({why})", ""),
                     theme::dim(),
                 )));
                 continue;
             }
             ArtifactState::Failed(err) => {
-                lines.push(Line::from(Span::styled(
+                out.push(Line::from(Span::styled(
                     format!("{:<12} not assessed (error: {err})", ""),
                     theme::dim(),
                 )));
                 continue;
             }
         };
-        lines.push(Line::from(vec![
+        let counted = lines
+            .iter()
+            .find(|(c, _)| *c == artifact.commit)
+            .map(|(_, l)| l);
+        let (glyph, text, style) = match counted {
+            Some(Ok(classes)) => super::class_words(classes),
+            Some(Err(why)) => ("·", format!("lines not counted — {why}"), theme::dim()),
+            None => ("·", "lines not counted".into(), theme::dim()),
+        };
+        out.push(Line::from(vec![
             Span::raw(format!("{:<12} ", "")),
-            Span::styled(summary(&assessed.recon), theme::title()),
+            Span::styled(format!("{glyph} {text}"), style.patch(theme::title())),
         ]));
         let width = assessed
             .recon
@@ -487,11 +839,11 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
                 };
                 spans.push(Span::styled(format!("  {note}"), note_style));
             }
-            lines.push(Line::from(spans));
+            out.push(Line::from(spans));
         }
         for structural in &assessed.structural {
             let (glyph, word, style) = theme::recon(ReconClass::Unexplained);
-            lines.push(Line::from(vec![
+            out.push(Line::from(vec![
                 Span::styled(format!("  {glyph} "), style),
                 Span::styled(format!("{word:<20}"), style),
                 Span::raw(format!("{:<width$}", shown_path(&structural.path))),
@@ -499,26 +851,31 @@ fn artifact(artifacts: &[CommitArtifact]) -> Vec<Line<'static>> {
             ]));
         }
     }
-    lines.push(Line::default());
-    lines.push(Line::from(vec![
-        Span::styled(format!("{neutral_glyph} "), neutral),
-        Span::styled(NOT_OBSERVED, neutral),
-        Span::styled(
-            "  ·  ◇ reported only: a tool claim, no witness",
-            theme::dim(),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        "\"explained\" counts every line with evidence, reported only included.",
-        theme::dim(),
-    )));
-    lines
+    // Die Legende nur, wo Dateizeilen stehen — nicht unter „not assessed".
+    if artifacts
+        .iter()
+        .any(|a| matches!(a.state, ArtifactState::Assessed(_)))
+    {
+        out.push(Line::default());
+        out.push(Line::from(vec![
+            Span::styled(format!("{neutral_glyph} "), neutral),
+            Span::styled(NOT_OBSERVED, neutral),
+            Span::styled(
+                "  ·  ◇ reported only: a tool claim, no witness",
+                theme::dim(),
+            ),
+        ]));
+    }
+    out
 }
 
 fn short_hash(hash: &minds_core::ContentHash) -> String {
     hash.to_string().chars().take(14).collect()
 }
 
+/// Die Technik für Auditoren (TECHNICAL, hinter Space): Algorithmus und
+/// Kontexte, Seal-Ids und Roots, die Grenze des Proof-Modells —
+/// unverändert die früheren INTEGRITY-Zeilen.
 fn integrity(report: &EvidenceReport) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
@@ -557,16 +914,14 @@ fn coverage(report: &EvidenceReport) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(vec![
             Span::styled(format!("{:<12} ", "Scope"), theme::dim()),
-            Span::raw(report.scope.clone().unwrap_or_else(|| "?".into())),
-        ]),
-        Line::from(vec![
-            Span::styled(format!("{:<12} ", "Captured"), theme::dim()),
             Span::raw(format!(
-                "{} event(s) · {} gap(s) · {} pre-chain",
-                state.events, state.gaps, state.pre_chain
+                "{} · {} event(s) · {} gap(s) · {} pre-chain",
+                report.scope.clone().unwrap_or_else(|| "?".into()),
+                state.events,
+                state.gaps,
+                state.pre_chain
             )),
         ]),
-        Line::default(),
         Line::from(Span::styled("Observation boundary", theme::title())),
         Line::from(Span::styled(
             "✓ agent hook events (scope in the seal)",
@@ -582,7 +937,6 @@ fn coverage(report: &EvidenceReport) -> Vec<Line<'static>> {
     ] {
         lines.push(Line::from(Span::styled(outside, theme::dim())));
     }
-    lines.push(Line::default());
     lines.push(Line::from(Span::raw(
         "Missing evidence does not prove that nothing happened — it means: Minds cannot attest it.",
     )));
@@ -684,11 +1038,11 @@ fn signature(report: &EvidenceReport) -> Vec<Line<'static>> {
 
 fn interpretation(uninterpreted: usize) -> Vec<Line<'static>> {
     let axis = if uninterpreted == 0 {
-        minds_reader::model::InterpretationAxis::Interpreted
+        InterpretationAxis::Interpreted
     } else {
-        minds_reader::model::InterpretationAxis::Uninterpreted(uninterpreted)
+        InterpretationAxis::Uninterpreted(uninterpreted)
     };
-    let slot = crate::view::trust::interpretation(axis);
+    let slot = trust::interpretation(axis);
     let mut lines = vec![Line::from(Span::styled(
         format!("{} {} — {}", slot.glyph, slot.word, slot.sentence),
         slot.style,

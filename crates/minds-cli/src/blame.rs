@@ -175,7 +175,7 @@ fn summary_view(attribution: &Attribution) -> String {
             out,
             "  {count} line(s) · {} · {} · {}",
             session.agent.name,
-            session.model.id,
+            minds_reader::text::sanitize(&session.model.id),
             short_id(*id),
         );
     }

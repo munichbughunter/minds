@@ -446,6 +446,7 @@ fn connected(control: bool) -> (socket::Client, std::os::unix::net::UnixStream) 
         control,
         challenge: None,
         partial_since: None,
+        held: None,
     };
     (client, theirs)
 }

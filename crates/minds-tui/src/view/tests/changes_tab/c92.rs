@@ -233,7 +233,7 @@ fn c92_tab_cycles_the_tab_when_files_is_a_pane() {
     let out = render_sized(&mut app, 160, 40);
     assert!(!out.contains("Tab file"), "{out}");
     app.reduce(Action::CycleTab(true));
-    assert_eq!(app.tab, Tab::Intent);
+    assert_eq!(app.tab, Tab::Sessions);
     assert_eq!(app.changes.as_ref().unwrap().file, 0);
     app.reduce(Action::CycleTab(false));
     assert_eq!(app.tab, Tab::Changes);

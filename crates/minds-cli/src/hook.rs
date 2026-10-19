@@ -49,10 +49,12 @@
 pub(crate) mod witness;
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use minds_capture::{Journal, NewEvent, clock, hook_event, secretwall};
+use minds_capture::{
+    EventKind, Journal, NewEvent, clock, hook_event, secretwall, transcript, witness_proto,
+};
 
 use crate::hooklog::{self, Source};
 
@@ -66,6 +68,11 @@ use crate::hooklog::{self, Source};
 /// unvollständiges Event ist besser als ein OOM im Prozess des Nutzers und
 /// besser als gar keines.
 const MAX_STDIN: u64 = 32 * 1024 * 1024;
+
+/// Wie viel vom **Ende** des Transkripts der Hook höchstens liest, um die
+/// Modell-Kennung zu finden (K1). Das Modell steht in jeder Assistant-Zeile;
+/// ein Megabyte reicht für die letzte, auch bei langen Antworten.
+const TRANSCRIPT_TAIL: u64 = 1024 * 1024;
 
 /// Führt den Hook aus. Gibt **immer** [`ExitCode::SUCCESS`] zurück.
 ///
@@ -150,6 +157,13 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
     // weggelassen, nicht aufgehoben.
     let walled = secretwall::guard(&mut parsed.event).is_some();
 
+    // K1: Beim Ende eines Zugs oder der Session kennt der Hook das Transkript
+    // und meldet die Modell-Kennung mit — nur die Kennung, vom Ende der Datei
+    // gelesen, damit der heiße Pfad nicht an einem großen Transkript hängt.
+    // Der Witness liest das Transkript nicht selbst; so kennt auch er das
+    // Modell, und das lokale Journal hat es, falls die Datei später fehlt.
+    attach_model(&mut parsed.event);
+
     // Über den Standardpfad gefunden, aber das Event gehört zu einem anderen
     // Repo (der Agent startet Hooks nicht zwingend im Projekt): Dann geht es
     // nicht an diesen Witness, sondern wie bisher ins Journal seines Repos.
@@ -187,9 +201,14 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
             } else {
                 raw
             };
-            match stdin
-                .and_then(|stdin| witness::forward(&socket, peer, agent, event_override, stdin))
-            {
+            let model = parsed
+                .event
+                .model
+                .clone()
+                .map(|model| (parsed.key.local_id().to_owned(), model));
+            match stdin.and_then(|stdin| {
+                witness::forward_with_model(&socket, peer, agent, event_override, stdin, model)
+            }) {
                 Ok(()) => return Ok(()),
                 Err(kind) => Some(kind),
             }
@@ -230,4 +249,92 @@ fn record(agent: &str, event_override: Option<&str>) -> Result<(), Box<dyn std::
 /// hatte darin keinen Pfad zu sehen.
 fn salvaged(event: &NewEvent) -> bool {
     event.payload.get().starts_with('"')
+}
+
+/// Hängt beim `Stop`/`SessionEnd` die Modell-Kennung aus dem Ende des
+/// Transkripts an das Event (K1). Andere Events bleiben ohne — das Transkript
+/// wird nicht bei jedem Tool-Aufruf angefasst. Fehlt die Datei oder das
+/// Modell, bleibt das Feld leer; der Hook scheitert daran nie.
+///
+/// Die Kennung kommt aus einer Datei, die der Agent schreibt: Nur was die
+/// Regel des Protokolls erfüllt ([`witness_proto::check_model`]: nicht leer,
+/// höchstens `MAX_MODEL` Bytes, druckbares ASCII) wird angehängt — alles
+/// andere ist kein Modell, und nie ein Grund, das Event zu opfern.
+fn attach_model(event: &mut NewEvent) {
+    if !matches!(event.kind, EventKind::TurnEnd | EventKind::SessionEnd) {
+        return;
+    }
+    let Some(path) = event.transcript_path.as_deref() else {
+        return;
+    };
+    event.model = transcript::model_in_tail(Path::new(path), TRANSCRIPT_TAIL)
+        .filter(|model| witness_proto::check_model(model).is_ok());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(kind: EventKind, path: Option<&Path>) -> NewEvent {
+        NewEvent {
+            at: "2026-10-19T10:00:00Z".into(),
+            at_nanos: 0,
+            kind,
+            raw_kind: format!("{kind:?}"),
+            cwd: None,
+            transcript_path: path.map(|p| p.to_string_lossy().into_owned()),
+            model: None,
+            payload: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+        }
+    }
+
+    /// K1: Nur `Stop` und `SessionEnd` lesen das Ende des Transkripts; ein
+    /// Tool-Event bleibt ohne Modell, ebenso ein Event ohne Pfad.
+    #[test]
+    fn the_model_is_attached_at_stop_and_session_end_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            br#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[]}}"#,
+        )
+        .unwrap();
+        for kind in [EventKind::TurnEnd, EventKind::SessionEnd] {
+            let mut e = event(kind, Some(&path));
+            attach_model(&mut e);
+            assert_eq!(e.model.as_deref(), Some("claude-opus-4-1"), "{kind:?}");
+        }
+        let mut e = event(EventKind::ToolPost, Some(&path));
+        attach_model(&mut e);
+        assert_eq!(e.model, None);
+        let mut e = event(EventKind::TurnEnd, None);
+        attach_model(&mut e);
+        assert_eq!(e.model, None);
+        let mut e = event(EventKind::TurnEnd, Some(&dir.path().join("missing.jsonl")));
+        attach_model(&mut e);
+        assert_eq!(e.model, None, "fehlende Datei: kein Modell, kein Fehler");
+    }
+
+    /// M2: Was im Transkript als Modell steht, prüft der Hook wie der
+    /// Witness — zu lang, Steuerzeichen, Leerraum: kein Modell, Event bleibt.
+    #[test]
+    fn an_unusable_model_id_is_dropped_and_the_event_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bad) in [
+            ("long", "m".repeat(witness_proto::MAX_MODEL + 1)),
+            ("control", "a\u{1b}b".to_string()),
+            ("space", "claude opus".to_string()),
+        ] {
+            let path = dir.path().join(format!("{name}.jsonl"));
+            let line = serde_json::json!({
+                "type": "assistant",
+                "message": {"model": bad, "content": []}
+            });
+            std::fs::write(&path, format!("{line}\n")).unwrap();
+            let mut e = event(EventKind::TurnEnd, Some(&path));
+            attach_model(&mut e);
+            assert_eq!(e.model, None, "{name}");
+            assert_eq!(e.kind, EventKind::TurnEnd, "{name}: das Event bleibt");
+        }
+    }
 }

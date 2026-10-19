@@ -168,36 +168,58 @@ pub fn integrity(axis: minds_reader::model::IntegrityAxis) -> &'static str {
     }
 }
 
-/// Das Glossar-Wort der Coverage-Achse.
-pub fn coverage(axis: minds_reader::model::CoverageAxis) -> &'static str {
-    use minds_reader::model::CoverageAxis;
-    match axis {
-        CoverageAxis::Complete => "complete",
-        CoverageAxis::Incomplete => "incomplete",
-        CoverageAxis::NotAssessable => "not assessable",
-        CoverageAxis::NotRecorded => "not recorded",
+/// Der Satz zur Grenze einer Assurance-Stufe (C12.1, LIMITS): wer auf
+/// dieser Stufe zusah — und was deshalb nur Aussage des Agenten bleibt.
+pub fn assurance_limit(level: minds_reader::assurance::Assurance) -> &'static str {
+    use minds_reader::assurance::Assurance;
+    match level {
+        Assurance::A0Claimed => {
+            "nothing independent observed this session; every fact here is what the agent recorded."
+        }
+        Assurance::A1Observed => {
+            "no witness ran; the agent's own reports are the only source for file contents."
+        }
+        Assurance::A2Witnessed => {
+            "a separated witness observed and signed the record; file contents it did not read are still the agent's reports."
+        }
+        Assurance::A3Reproduced => {
+            "the result was reproduced independently; what was not reproduced remains observed, not proven."
+        }
     }
 }
 
-/// Das Glossar-Wort der Deutungsachse.
-pub fn interpretation(axis: minds_reader::model::InterpretationAxis) -> &'static str {
-    use minds_reader::model::InterpretationAxis;
-    match axis {
-        InterpretationAxis::Interpreted => "interpreted",
-        InterpretationAxis::Uninterpreted(_) => "uninterpreted",
+/// Der Beleg einer Anforderung als Satz (C12.3): bei `file:`-Ankern mit
+/// dem Blob, sonst mit der Quelle.
+pub fn proven_sentence(blob: Option<&str>, source: &str) -> String {
+    match blob {
+        Some(blob) => format!("proven — the stored snapshot matches the file at {blob}"),
+        None => format!("proven — the stored snapshot matches its anchor ({source})"),
     }
 }
 
-/// Das Glossar-Wort zum Urteil des Verify-Tabs.
-pub fn overall(overall: Option<crate::verify::Overall>) -> &'static str {
-    use crate::verify::Overall;
-    match overall {
-        Some(Overall::Verified) => "verified",
-        Some(Overall::Incomplete) => "incomplete",
-        Some(Overall::Tampered) => "TAMPERED",
-        Some(Overall::NotVerifiable) => "not verifiable",
-        Some(Overall::Checking) => "checking",
-        Some(Overall::NotChecked) => "not checked",
-        Some(Overall::NoSession) | None => "no session",
+/// Die Signatur einer Anforderung als Satz (C12.3) — geprüft wie `minds
+/// verify`, gegen die eigenen `allowed_signers`.
+pub fn signed_sentence(kind: &str) -> String {
+    format!("signed — {kind}, checked against your allowed_signers (as minds verify does)")
+}
+
+/// Die Bindung (A1) als Satz (C12.3): wer den Anker nannte — eine Session
+/// in einem Witness-Event, die lokale Datei-Bindung, oder niemand.
+pub fn binding_sentence(witness: bool, local: bool) -> String {
+    match (witness, local) {
+        (true, false) => {
+            "binding A1 — the agent named this anchor in a witness event, not a local file".into()
+        }
+        (true, true) => {
+            "binding A1 — the agent named this anchor in a witness event; also the local file binding".into()
+        }
+        (false, true) => {
+            "binding A1 — the local file binding points to this anchor; no session named it in a witness event"
+                .into()
+        }
+        (false, false) => {
+            "binding A1 — no local file binding points to it and no session names it in a witness event"
+                .into()
+        }
     }
 }

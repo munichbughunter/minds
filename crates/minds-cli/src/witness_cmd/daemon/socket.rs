@@ -249,6 +249,10 @@ pub(super) struct Client {
     pub(super) challenge: Option<(String, Instant)>,
     /// Seit wann ein unvollständiger Frame im Puffer liegt.
     pub(super) partial_since: Option<Instant>,
+    /// Ein `Stop`/`SessionEnd`, das auf seinen `Model`-Frame wartet (K1):
+    /// geschrieben, sobald der nächste Frame kommt oder die Verbindung
+    /// endet — nie verloren, höchstens ohne Modell.
+    pub(super) held: Option<(SessionKey, NewEvent)>,
 }
 
 impl Client {
@@ -266,6 +270,24 @@ impl Client {
 }
 
 pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
+    let keep = step_inner(client, writer)?;
+    // Endet die Verbindung — EOF, Frist, kaputter Frame, abgewiesen —, geht
+    // ein zurückgehaltenes Event jetzt ins Journal, ohne Modell.
+    if !keep {
+        flush_held(client, writer)?;
+    }
+    Ok(keep)
+}
+
+/// Schreibt das zurückgehaltene Event (K1), falls eines wartet.
+fn flush_held(client: &mut Client, writer: &mut Writer) -> Fallible<()> {
+    if let Some((key, event)) = client.held.take() {
+        writer.commit_hook(&key, event)?;
+    }
+    Ok(())
+}
+
+fn step_inner(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
     let mut chunk = [0u8; 64 * 1024];
     if !client.eof && !client.pending {
         match client.stream.read(&mut chunk) {
@@ -328,12 +350,54 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
         );
         return Ok(false);
     }
+    // Jeder Frame außer `Model` beendet das Warten auf den `Model`-Frame.
+    if !matches!(frame, Frame::Model { .. }) {
+        flush_held(client, writer)?;
+    }
     match frame {
         Frame::Hook {
             agent,
             event_override,
             stdin,
-        } => writer.hook(&agent, event_override.as_deref(), stdin, clock::now())?,
+        } => {
+            if let Some((key, event)) =
+                writer.prepare_hook(&agent, event_override.as_deref(), stdin, clock::now())?
+            {
+                // K1: Beim Ende eines Zugs oder der Session kann der Hook die
+                // Modell-Kennung nachschieben — kurz warten, dann schreiben.
+                if matches!(
+                    event.kind,
+                    minds_capture::EventKind::TurnEnd | minds_capture::EventKind::SessionEnd
+                ) {
+                    client.held = Some((key, event));
+                } else {
+                    writer.commit_hook(&key, event)?;
+                }
+            }
+        }
+        Frame::Model {
+            agent,
+            session,
+            model,
+        } => match client.held.take() {
+            Some((key, mut event)) => {
+                // Der Schreiber ist die Vertrauensgrenze: dieselbe Session,
+                // dieselbe Regel für die Kennung wie beim Hook.
+                if key.agent() == agent
+                    && key.local_id() == session
+                    && witness_proto::check_model(&model).is_ok()
+                {
+                    event.model = Some(model);
+                } else {
+                    log(
+                        &writer.home,
+                        "model frame does not match the event; ignored",
+                    );
+                }
+                writer.commit_hook(&key, event)?;
+            }
+            None => log(&writer.home, "model frame without an event; ignored"),
+        },
         Frame::Ping => {
             let bytes = witness_proto::encode(&Frame::Ack {
                 request_id: [0; 16],
@@ -736,6 +800,7 @@ pub(super) fn accept(
                     control,
                     challenge: None,
                     partial_since: None,
+                    held: None,
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -783,6 +848,7 @@ mod tests {
             control: false,
             challenge: None,
             partial_since: None,
+            held: None,
         }
     }
 

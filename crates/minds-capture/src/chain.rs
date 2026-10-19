@@ -154,6 +154,7 @@ mod tests {
             raw_kind: "X".into(),
             cwd: None,
             transcript_path: None,
+            model: None,
             payload: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
             payload_hash: None,
             event_hash: stamped.then(|| ContentHash::from_bytes([seq as u8; 32])),

@@ -510,6 +510,12 @@ fn must_redact() -> Vec<MustRedact> {
 /// URL, die auch Zugangsdaten tragen könnte. Die Kommentare nennen den Detektor,
 /// der hier zu Recht schweigt.
 const MUST_SURVIVE: &[(&str, &str)] = &[
+    // --- Modell-Kennungen, wie der Hook sie meldet (K1) ---------------------
+    ("model-id-claude-opus", "claude-opus-4-1"),
+    ("model-id-claude-sonnet-dated", "claude-sonnet-4-5-20250929"),
+    ("model-id-gpt", "gpt-5"),
+    ("model-id-gemini", "gemini-2.0-flash-exp"),
+    ("model-id-o-series", "o3-mini-2025-01-31"),
     // --- Das Evidence-Chain-Vokabular (ADR-0011) bleibt lesbar --------------
     // Ein voller Seal-Text, in Prosa zitiert (Log-Ausschnitt): Das
     // Beweismittel darf die Redaction nicht anfressen.
@@ -1467,6 +1473,52 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
             "cwd mit Fund überlebte: {:?}",
             turn.tool_calls[3].outcome
         );
+    }
+}
+
+/// K1: `model.id` kommt vom Hook aus dem Transkript — auf dem Legacy-Pfad
+/// ungeprüft. Ein Schlüssel dort fällt wie in jedem Feld; die echten
+/// Kennungen überleben unverändert.
+#[test]
+fn a_model_id_is_redacted_like_any_field_and_real_ids_survive() {
+    let with_model = |id: &str| {
+        Session::new(
+            Agent {
+                name: "claude-code".into(),
+                version: "1.0.0".into(),
+            },
+            Model {
+                provider: "anthropic".into(),
+                id: id.into(),
+            },
+            Intent {
+                request: "Deploy-Pipeline reparieren".into(),
+                ..Intent::default()
+            },
+        )
+    };
+
+    let redacted = policy()
+        .redact_session(with_model(ANTHROPIC_KEY))
+        .expect("eine Session mit Schlüssel im Modellfeld wird redigiert, nicht verworfen");
+    assert!(
+        !redacted.session().model.id.contains("api03"),
+        "{:?}",
+        redacted.session().model.id
+    );
+    assert!(redacted.audit().fields_changed() >= 1);
+
+    for id in [
+        "model-id-claude-opus",
+        "model-id-claude-sonnet-dated",
+        "model-id-gpt",
+        "model-id-gemini",
+        "model-id-o-series",
+    ] {
+        let text = survivor(id);
+        let redacted = policy().redact_session(with_model(text)).unwrap();
+        assert_eq!(redacted.session().model.id, text, "{id}");
+        assert_eq!(redacted.audit().fields_changed(), 0, "{id}");
     }
 }
 

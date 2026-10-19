@@ -17,7 +17,65 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The evidence view says `sealed` until `minds verify` has checked.** Before
+  a check, INTEGRITY read `✓ record intact …` while the Overview showed `…
+  checking` for the same state. Now the line carries the trust glyph of the
+  axis — `◈ record sealed · 1 seal, signed · chain closed (1 epoch) · A1` —
+  and the sentence for humans says `This session's record is sealed and
+  signed`; `✓ record intact` appears only with the verdict VERIFIED or
+  VERIFIED, INCOMPLETE of this session, `✗ TAMPERED` stays loud. A failed or
+  missing check never reads as intact (sealed is not verified).
+- **One wording for the added lines of a commit.** The Overview's COVERAGE
+  line and the evidence view's reconciliation line come from one function
+  and say the same thing for the same count: `◦ 6 of 10 added lines not
+  observed · 4 reported`, `◇ 95 of 95 added lines reported, 0 observed`,
+  `◍ 2 of 3 added lines fs only, 1 observed`, `✓ all 3 added lines
+  observed`. `unexplained` and `reported, not observed` are gone from the
+  Overview (C9.4: one word per state across tabs); the reason sentence
+  below (`— no tool claim or shell mention found: all 46`) stays.
+- **The evidence view reconciles each commit once.** It counted the added
+  lines by reconciling every commit a second time (`changes` → a fresh
+  artifact) next to the reconciliation it already held. The reader now
+  derives the line classes from a given artifact
+  (`Inspection::line_classes_of`, `Inspection::changes_of`); the numbers
+  are the ones of `changes(commit).line_classes()`, so Overview, Changes
+  tab and evidence view still count from one function (C3.1).
+- **`v` in the evidence view runs the check there.** It used to open the
+  Overview on the commit; now the view stays open, asks the same check
+  (the B6 worker, or synchronously without one) for the commit it shows,
+  reads `… checking` in the head and in footer line 1 until the verdict
+  arrives, and then names it in the words of `minds verify` — never a
+  verdict before the check, never one over other sessions. Footer line 2
+  carries `v verify`. A commit outside the history read still points to
+  `minds verify <id>`.
+
 ### Added
+
+- **The model is recorded even when the witness does not read the
+  transcript (K1).** At `Stop` and `SessionEnd` the hook reads only the end
+  of the transcript (at most 1 MiB) and passes the model id on — nothing
+  else: no text, no token counts, and only an id that is one short word of
+  printable ASCII (anything else is no model, and never a reason to drop
+  the event). It travels as `model` on the journal event (part of the
+  event hash when present; events without it keep their hash) and, to a
+  witness, as a small `Model` frame (kind `0x07`) sent right after the
+  unchanged `Hook` frame on the same connection; the witness holds a
+  `Stop`/`SessionEnd` until that frame arrives or the connection ends, so
+  a witness older than this release loses only the model, never the event.
+  A session the witness builds then names the model with
+  `lineage.transcript = model_from_hook` (`minds inspect`: `claude-code ·
+  claude-opus-4-1 (Anthropic)`, and AGENT SAID says `transcript not read:
+  the hook reported the model; texts and token counts were not read`); the
+  local checkpoint uses the hook's id too when the file is gone, and keeps
+  a read error or an empty transcript named as such. The hook opens only
+  an absolute path to a regular file, without blocking — a FIFO or a
+  device as `transcript_path` costs nothing but the model. When no event
+  names a transcript path, the checkpoint looks under
+  `~/.claude/projects/<slug of the repo root>/<session id>.jsonl` and reads
+  the file if it is there — never imports it — and says so with
+  `read_from_slug`.
 
 - **The Overview detail names the next action (C3.7).** EVIDENCE ends with
   one `NEXT → …` line — the topmost axis that is not `✓` decides it:
@@ -39,6 +97,97 @@ versioning follows [Semantic Versioning](https://semver.org/).
   (`NEXT → …`). The TUI does not write: the `minds …` lines are text.
 
 ### Changed
+
+- **A session without a commit says where it came from and how old it is
+  (K2, C3.7).** The Overview row reads `open · imported · 3d ago · no
+  commit linked` instead of `open · no commit linked yet`: the state only
+  when a `SessionEnd` was or was not seen, the origin only when the record
+  carries it — `imported` (no seal material, a read transcript: only
+  `minds import` builds a session that way, and `minds enable` imports the
+  transcripts under `~/.claude/projects/<slug>/` in the background, so a
+  repository re-created at the same path inherits foreign sessions),
+  `captured` (a hook seal), `witnessed` (a witness seal) —, the age from
+  the recorded start, never from the clock of the reader. The detail says
+  it in a sentence (`not from this repository's hooks — imported from the
+  agent's transcript store`) and, for an imported session, names the full
+  `minds forget <session>` that removes it; the TUI does not run it. The
+  reader derives the origin (`minds_reader::overview::Origin`, `WipSession::
+  origin`, `started_epoch`) and provides the command (`forget_command`) so
+  that TUI and CLI use one wording. Nothing is red: a foreign session is a
+  gap, not a tamper finding.
+
+- **Tabs in the order of an investigation (C12.2).** `minds inspect` has
+  four tabs: `1 Overview · 2 Changes · 3 Sessions · 4 Requirements` —
+  what and why → what exactly → how → under which requirement. `F1`–`F4`,
+  `1`–`4` and `Tab`/`Shift-Tab` switch; `5` and `F5` do nothing (they are
+  not reassigned). The Intent tab is called **Requirements** (the UI word
+  of C3; the CLI stays `minds intent …`), also in the breadcrumb and in the
+  next action (`→ i: Requirements tab — the binding is not proven`).
+  The EVIDENCE block of the Overview detail took over what only the Verify
+  tab showed: **SCOPE** (`✓ all changes inside src/**` with the globs of
+  the anchor, `◦ 2 files outside the scope: …`, `· not assessed (…)`; only
+  when a session names a requirement), **CONFORMANCE** (only with a signed
+  spec: `✓ conforms` / `◦ N findings`, the counts, the spec and signer, and
+  each finding with what was expected), and the assurance level next to
+  the verdict (`✓ VERIFIED · A2 witnessed`, one sub-line per session with
+  several — never next to TAMPERED). NEXT knows the new lines: `→ d:
+  inspect the 2 files outside the scope`, `→ d: inspect the diff — 1
+  finding against the signed spec`. `v` runs the check again in the
+  Overview at once (the B6 worker does it; the heading shows `checking`
+  with a spinner while it runs); from another tab `v` opens the Overview
+  on the commit, or names `minds verify <id>` when the commit is not in
+  the history read. Returning to the Overview after a reload checks at
+  once, not throttled; `r` too.
+- **The evidence view of a session reads as one sentence (C12.1).** `e`
+  opens with a sentence for humans — one clause per axis, never an
+  overall verdict: `This session's record is intact and signed, and all
+  24 events lie inside the witness boundary. The 95 added lines are
+  reported by the agent; none were observed by a witness. Every tool
+  call was interpreted.` — followed by the verdict of `minds verify` in
+  its own words and with its time (`Verdict of minds verify: ✓ VERIFIED
+  (signatures checked 10:42Z)`, the same check the Overview shows) or,
+  before any check, `sealed, not yet verified — v: run verify`; the
+  sentence `Cryptographically verified within the recorded observation
+  boundary` is gone (sealed is not verified). The seven VERDICT rows
+  (INTEGRITY, COVERAGE, ARTIFACT, EPOCHS, SIGNATURE, INTERPRETATION,
+  LIMITS) are the three axes: INTEGRITY carries seals, signature, chain
+  and assurance level in one line (`✓ record intact · 1 seal, signed ·
+  chain closed (1 epoch) · A1`), COVERAGE the events and gaps with the
+  commit's reconciliation as a second line in the words of every other
+  tab (`◇ 95 of 95 added lines reported, 0 observed` — from the same
+  count as the Overview and the Changes tab; `artifact X/Y lines
+  explained` and `hash-valid` no longer appear here), INTERPRETATION as
+  before. LIMITS is a sentence for the level (`observed at A1 — no
+  witness ran; the agent's own reports are the only source for file
+  contents.`), not `17 named limits`. The
+  technical part — seal ids, chain roots, algorithm and contexts, what
+  is verifiable outside this host — stands unchanged behind `TECHNICAL
+  (for auditors) ▸ Space`. The detail box follows the cursor over the
+  five sections; `Enter` on COVERAGE opens the diff. Footer line 1
+  names only the session, its trust strip and the verdict — no
+  sentences.
+- **The Requirements tab shows the requirement first, then its status,
+  technical details last (C12.3).** The list reads as one line per anchor
+  — `✓ ac8f1bb7 · anforderung.md (HEAD) · src/** · 1 session`: the short
+  id of the Overview, the source with `(HEAD)` or `(working tree)` for
+  file anchors, the declared scope, the sessions naming it as a number
+  (`◉1` is gone). The status glyph is `✓` proven and signed, `◦` proven
+  but not signed (open, not an error), `✗` snapshot mismatch or invalid
+  signature, `?` not checked or rechecking, `!` not readable. The detail
+  has a fixed order: **REQUIREMENT** — the stored text on top, in full,
+  only when the anchor is proven (otherwise `text hidden — the anchor is
+  not proven`, never the text); **STATUS** — three sentences, `✓ proven —
+  the stored snapshot matches the file at 996395ef`, `✓ signed — software
+  key, checked against your allowed_signers (as minds verify does)` (or
+  `◦ not signed — minds intent sign <anchor> adds a signature`, `✗ not
+  proven — <reason>`), `· binding A1 — the agent named this anchor in a
+  witness event, not a local file`; **SESSIONS (n)** — agent, model, id,
+  time and how the anchor was named, the request below as a claim (`◌`),
+  `Enter` opens the story; **TECHNICAL (for auditors)** — anchor, content
+  hash, source, version, proof and signature in full, folded, `Space`
+  unfolds. No keys in the detail; footer line 1 names the anchor and its
+  status (`ac8f1bb7 · ✓ proven · ✓ signed`). The tab's own name and
+  position change with C12.2.
 
 - **Tool contents are shown in full where they are read (C8).** The
   story's step detail carries the agent's answer text of the step's turn
@@ -81,6 +230,21 @@ versioning follows [Semantic Versioning](https://semver.org/).
   its step across zoom levels.
 
 ### Removed
+
+- **The Verify tab of `minds inspect` (C12.2, breaking).** Its verdict
+  line, scope, conformance, assurance level and the per-session facts
+  live in the EVIDENCE block of the Overview detail (INTEGRITY, COVERAGE,
+  INTERPRETATION, REQUIREMENT, SCOPE, CONFORMANCE, REVIEW, NEXT); `v`
+  checks there. Gone with the tab: the artifact bar (the counts per line
+  state stand in COVERAGE, from the same reader function as the Changes
+  tab), the `Not proven` list (the LIMITS sentence of the Evidence view
+  names the assurance level) and `Enter` on Scope (NEXT → `d` opens the
+  diff). The promises of its tests moved to the Overview with their
+  comments: the verdict is the one of `minds verify` (`! VERIFIED,
+  INCOMPLETE` stays literal), never VERIFIED or INCOMPLETE without a
+  checked verdict, a failed check says why, a reload checks the signers
+  again, a tampered verdict shows neither scope nor level, a hidden tab
+  does not check, the throttle and the worker stay.
 
 - **The why chain view of `minds inspect` (C10).** The `w` key, the
   `Why` level in the Sessions tab and its inspector are gone: every link of

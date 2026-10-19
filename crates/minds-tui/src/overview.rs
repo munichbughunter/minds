@@ -86,6 +86,9 @@ pub struct OverviewState {
     pub checked_at: HashMap<CommitId, i64>,
     /// Der Commit, dessen Prüfung beim Worker liegt.
     pub asked: Option<CommitId>,
+    /// Vom Nutzer verlangt (`v`, Tab gezeigt, `r`): die ausstehende Prüfung
+    /// sofort, nicht gedrosselt (C5, C12.2). Wird mit der Anfrage verbraucht.
+    pub urgent: bool,
     /// Die Zeilen je Commit (C3.4): unerklärte und hinzugefügte — aus
     /// derselben Rechnung wie der Changes-Tab — oder warum nicht.
     pub lines: HashMap<CommitId, Result<minds_reader::changes::LineClasses, String>>,
@@ -123,6 +126,8 @@ impl OverviewState {
             checks: HashMap::new(),
             checked_at: HashMap::new(),
             asked: None,
+            // Beim Öffnen: sofort prüfen.
+            urgent: true,
             lines: HashMap::new(),
             requirements: HashMap::new(),
             requirement_open: false,
@@ -200,6 +205,9 @@ impl OverviewState {
         next.filter = std::mem::take(&mut self.filter);
         next.agent_only = self.agent_only;
         next.narrow = self.narrow;
+        // Ein Neuladen beginnt ohne Urteil und gedrosselt — außer der Nutzer
+        // hatte eine Prüfung verlangt, die noch nicht lief.
+        next.urgent = self.urgent && self.check_due().is_some();
         next.cursor = next.nearest_shown(next.cursor);
         *self = next;
     }
@@ -253,6 +261,31 @@ impl OverviewState {
     pub fn check_due(&self) -> Option<CommitId> {
         let row = self.agent_commit()?;
         (!self.checks.contains_key(&row.id) && self.asked != Some(row.id)).then_some(row.id)
+    }
+
+    /// Ob jetzt geprüft werden soll: ausstehend und entweder vom Nutzer
+    /// verlangt oder die Drossel (`every`) seit der letzten Prüfung um.
+    pub fn check_due_in(
+        &self,
+        since_last: std::time::Duration,
+        every: std::time::Duration,
+    ) -> bool {
+        self.check_due().is_some() && (self.urgent || since_last >= every)
+    }
+
+    /// `v` (C5): das Urteil des gewählten Commits vergessen und sofort neu
+    /// prüfen — eine laufende Antwort des Workers wird verworfen.
+    pub fn recheck(&mut self) {
+        let Some(row) = self.agent_commit() else {
+            return;
+        };
+        let commit = row.id;
+        self.checks.remove(&commit);
+        self.checked_at.remove(&commit);
+        if self.asked == Some(commit) {
+            self.asked = None;
+        }
+        self.urgent = true;
     }
 
     /// Wählt die Zeile des Commits, wenn es sie gibt (B3: der aktive Commit).

@@ -752,9 +752,13 @@ fn store_one(
     // Vor-Amend-Commit hängen (siehe Modul-Doku). Der Artefakt-Hash braucht die
     // Repo-Wurzel, um relative Pfade aufzulösen; das tracked-Set ist die
     // Read-Hash-Grenze (nur getrackter, ohnehin sichtbarer Inhalt).
+    // K1: Nennt kein Event den Transkript-Pfad, darf der Checkpoint die Datei
+    // unter dem Home des Nutzers suchen (Claude-Slug der Wurzel) — nur lesen.
+    let home = home_dir();
     let ctx = Checkpoint {
         root: Some(root),
         commit: None,
+        home: home.as_deref(),
         tracked,
         // Dieselbe Policy, die gleich die Session redigiert, prüft vorher die
         // Bytes hinter jedem Schreib-Hash (EA-01a).
@@ -913,4 +917,17 @@ fn report(log_dir: &Path, guard: Option<&dyn CheckpointGuard>, message: &str) {
         Some(guard) => guard.report(message),
         None => hooklog::report_at(log_dir, Source::Checkpoint, message),
     }
+}
+
+/// Das Home des Nutzers, wie `minds import` es nimmt (`HOME`, auf Windows
+/// `USERPROFILE`) — für den Transkript-Fallback des Checkpoints (K1). Die
+/// einzige Stelle, an der der Fallback Umgebung liest: Ohne `HOME` gibt es
+/// keinen Fallback (und keinen Fehler); im Git-Hook und im Witness ist das
+/// das Home des Prozesses, der den Checkpoint baut — beim geschützten
+/// Witness also `_minds`, wo kein Transkript liegt (dort meldet der Hook
+/// das Modell, Punkt 2).
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
 }

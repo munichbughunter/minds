@@ -12,9 +12,7 @@
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
-use minds_reader::model::{
-    CoverageAxis, EvidenceReport, IntegrityAxis, InterpretationAxis, TrustAxes,
-};
+use minds_reader::model::{CoverageAxis, IntegrityAxis, InterpretationAxis, TrustAxes};
 
 use crate::theme;
 use crate::verify::Overall;
@@ -224,65 +222,8 @@ pub fn lines(axes: &TrustAxes) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Die drei Achsenzeilen des Evidence-Verdikts (Glyph, Text mit den
-/// Kennzahlen, Stil) — dieselben Glyphen und Wörter wie überall, ergänzt
-/// um das, was die Aussage begrenzt.
-pub fn evidence_rows(
-    report: &EvidenceReport,
-    uninterpreted: usize,
-) -> [(String, String, Style); 3] {
-    let state = &report.state;
-    let scope = report.scope.as_deref().unwrap_or("?");
-    let axes = TrustAxes::of(
-        &minds_reader::model::Provenance::Chained(*state),
-        uninterpreted,
-    );
-    let [i, c, d] = slots(&axes);
-    let integrity = match axes.integrity {
-        IntegrityAxis::Tampered => format!("{} — seal material altered", i.word.to_uppercase()),
-        _ => format!(
-            "{} · {} seal(s) hash-valid",
-            i.word.to_uppercase(),
-            state.seals
-        ),
-    };
-    let coverage = match axes.coverage {
-        CoverageAxis::Complete => format!(
-            "{} · {} event(s) · within {scope}",
-            c.word.to_uppercase(),
-            state.events
-        ),
-        // Keine Zahlen aus verändertem Material: Die Coverage-Aussage trägt
-        // nicht, also nennt die Zeile auch keine.
-        CoverageAxis::NotAssessable => {
-            format!("{} — the seal material is altered", c.word.to_uppercase())
-        }
-        _ => format!(
-            "{} · {} gap(s) · {} pre-chain · {} event(s) · within {scope}",
-            c.word.to_uppercase(),
-            state.gaps,
-            state.pre_chain,
-            state.events
-        ),
-    };
-
-    let interpretation = match axes.interpretation {
-        InterpretationAxis::Interpreted => format!("{} — all tool calls", d.word.to_uppercase()),
-        InterpretationAxis::Uninterpreted(_) => {
-            format!(
-                "{} — call(s) observed, not interpreted",
-                d.word.to_uppercase()
-            )
-        }
-    };
-    [
-        (i.glyph.to_string(), integrity, i.style),
-        (c.glyph.to_string(), coverage, c.style),
-        (d.glyph.to_string(), interpretation, d.style),
-    ]
-}
-
-/// Das Kopf-Urteil des Verify-Tabs — **die Wörter von `minds verify`**,
+/// Das Urteil in Overview-EVIDENCE und Evidence-Ebene — **die Wörter von
+/// `minds verify`**,
 /// wörtlich (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT VERIFIABLE).
 pub fn verify_headline(overall: Overall) -> (String, Style) {
     match overall {
@@ -304,72 +245,15 @@ pub fn verify_headline(overall: Overall) -> (String, Style) {
             "? NOT CHECKED — run minds verify, or press v".to_string(),
             Style::default().fg(theme::REVIEW),
         ),
-        Overall::NoSession => ("· NO SESSION".to_string(), theme::dim()),
     }
 }
 
-/// Die Seal-Marke einer Session-Zeile im Verify-Tab: kein eigenes Verdikt,
-/// nur Fakten — ✗ nur bei Manipulation.
+/// Die Seal-Marke einer Session-Unterzeile in INTEGRITY: kein eigenes
+/// Verdikt, nur Fakten — ✗ nur bei Manipulation.
 pub fn verify_session_mark(tampered: bool) -> (&'static str, &'static str, Style) {
     if tampered {
         theme::tampered()
     } else {
         ("·", "hash-valid", theme::dim())
-    }
-}
-
-/// Die Integritätszeile des Verify-Tabs, wörtlich wie `minds verify` sie
-/// sagt — ohne geprüftes Urteil weder ✓ noch „intact".
-pub fn verify_integrity(
-    overall: Overall,
-    seals: usize,
-    signed: usize,
-    without: &str,
-    pending_word: &str,
-) -> (&'static str, Style, String) {
-    let unchecked = matches!(overall, Overall::Checking | Overall::NotChecked);
-    if overall == Overall::Tampered {
-        let (glyph, word, style) = theme::tampered();
-        (
-            glyph,
-            style,
-            format!("{word} — seal material altered or a witness signature invalid"),
-        )
-    } else if unchecked {
-        (
-            "·",
-            theme::dim(),
-            format!("{seals} seal(s) hash-valid · {pending_word}{without}"),
-        )
-    } else if overall == Overall::NotVerifiable {
-        // Kein ✓ neben „nichts prüfbar".
-        (
-            "·",
-            theme::dim(),
-            format!("{seals} seal(s) hash-valid{without}"),
-        )
-    } else {
-        // „trägt eine Signatur", nicht „gültig signiert": Gültigkeit steht in
-        // der Stufe (gegen die vertrauenswürdigen Signer).
-        (
-            "✓",
-            Style::default().fg(theme::OK),
-            format!(
-                "intact · {seals} seal(s) hash-valid · {signed}/{seals} carry a signature{without}"
-            ),
-        )
-    }
-}
-
-/// Die Coverage-Zeile des Verify-Tabs: Das Wort folgt dem Urteil von
-/// `verify`, nicht den Lücken des Readers — nur `verify` sieht alle Seals
-/// des Namensraums.
-pub fn verify_coverage(overall: Overall, pending_word: &str) -> (&'static str, Style, &str) {
-    match overall {
-        Overall::Tampered => ("·", theme::dim(), "not assessable"),
-        Overall::Verified => ("✓", Style::default().fg(theme::OK), "complete"),
-        Overall::Incomplete => ("!", Style::default().fg(theme::REVIEW), "incomplete"),
-        Overall::NotVerifiable => ("·", theme::dim(), "not verifiable (no seal)"),
-        _ => ("·", theme::dim(), pending_word),
     }
 }

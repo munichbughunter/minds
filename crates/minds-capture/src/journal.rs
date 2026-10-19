@@ -316,6 +316,14 @@ pub struct JournalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
 
+    /// Die Modell-Kennung, die der Hook beim `Stop`/`SessionEnd` vom Ende des
+    /// Transkripts gemeldet hat (K1) — nur die Kennung (`claude-opus-4-1`),
+    /// nie Text, nie Token. Damit kennt auch ein Witness, der das Transkript
+    /// nicht liest, das Modell. Additiv: `None` wird nicht geschrieben, alte
+    /// Events behalten Bytes und Hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+
     /// Der unveränderte Payload des Agenten.
     ///
     /// [`RawValue`] statt [`serde_json::Value`], damit die Bytes exakt so
@@ -350,6 +358,8 @@ pub struct NewEvent {
     pub raw_kind: String,
     pub cwd: Option<String>,
     pub transcript_path: Option<String>,
+    /// Die Modell-Kennung aus dem Hook (K1), siehe [`JournalEvent::model`].
+    pub model: Option<String>,
     pub payload: Box<RawValue>,
 }
 
@@ -471,6 +481,7 @@ impl Journal {
             raw_kind: &event.raw_kind,
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
+            model: event.model.as_deref(),
             payload_hash: &payload_hash,
         });
 
@@ -482,6 +493,7 @@ impl Journal {
             raw_kind: event.raw_kind,
             cwd: event.cwd,
             transcript_path: event.transcript_path,
+            model: event.model,
             payload: event.payload,
             payload_hash: Some(payload_hash),
             event_hash: Some(event_hash),
@@ -1271,6 +1283,7 @@ mod tests {
             raw_kind: format!("{kind:?}"),
             cwd: Some("/tmp/repo".into()),
             transcript_path: Some("/home/anna/.claude/projects/x/y.jsonl".into()),
+            model: None,
             payload: raw(r#"{"tool_name":"Read"}"#),
         }
     }
@@ -1298,6 +1311,7 @@ mod tests {
             raw_kind: &stored.raw_kind,
             cwd: stored.cwd.as_deref(),
             transcript_path: stored.transcript_path.as_deref(),
+            model: stored.model.as_deref(),
             payload_hash: &payload,
         };
         assert_eq!(stored.event_hash, Some(evidence::event_hash(&facts)));
@@ -1326,6 +1340,44 @@ mod tests {
         assert!(read.events[0].payload_hash.is_some());
         assert!(read.events[1].payload_hash.is_none());
         assert!(read.events[1].event_hash.is_none());
+        // K1: ein Alt-Event kennt kein Modell — und bleibt lesbar.
+        assert!(read.events[1].model.is_none());
+    }
+
+    #[test]
+    fn the_model_of_the_hook_is_stored_and_stamped() {
+        // K1: Die Kennung reist mit, kommt beim Lesen zurück und steckt im
+        // `event_hash` — nachrechenbar wie jedes andere Feld.
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "m1").unwrap();
+        let stored = j
+            .append(
+                &key,
+                NewEvent {
+                    model: Some("claude-opus-4-1".into()),
+                    ..event(EventKind::TurnEnd)
+                },
+            )
+            .unwrap();
+        let read = j.read(&key).unwrap();
+        assert_eq!(read.events[0].model.as_deref(), Some("claude-opus-4-1"));
+        let payload = evidence::payload_hash(stored.payload.get().as_bytes());
+        let facts = EventFacts {
+            seq: stored.seq,
+            at: &stored.at,
+            at_nanos: stored.at_nanos,
+            raw_kind: &stored.raw_kind,
+            cwd: stored.cwd.as_deref(),
+            transcript_path: stored.transcript_path.as_deref(),
+            model: stored.model.as_deref(),
+            payload_hash: &payload,
+        };
+        assert_eq!(stored.event_hash, Some(evidence::event_hash(&facts)));
+        let without = EventFacts {
+            model: None,
+            ..facts
+        };
+        assert_ne!(stored.event_hash, Some(evidence::event_hash(&without)));
     }
 
     #[test]
@@ -1343,6 +1395,7 @@ mod tests {
             raw_kind: "PreToolUse".into(),
             cwd: None,
             transcript_path: None,
+            model: None,
             payload: raw(r#"{"tool_name":"Read","tool_input":{"file_path":"/repo/.env"}}"#),
         };
         let reason = crate::secretwall::guard(&mut walled);

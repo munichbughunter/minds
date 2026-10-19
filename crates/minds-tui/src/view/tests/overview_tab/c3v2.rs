@@ -443,12 +443,12 @@ fn c33_the_filter_survives_tabs_and_reloads() {
     let (_dir, repo, _, inspection) = human_on_top();
     let mut app = opened(&repo, inspection);
     app.reduce(Action::AgentFilter);
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::TabTo(0));
     assert!(agent_only(&app));
     let again = app.inspection.clone();
     app.reload(Ok(again), None, now());
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::TabTo(0));
     assert!(agent_only(&app));
     let out = lines_at(&mut app, 160, 40).join("\n");
@@ -480,7 +480,7 @@ fn c33_no_agent_session_says_so() {
 fn c33_a_elsewhere_says_where_it_works() {
     let (_dir, repo, _, inspection) = human_on_top();
     let mut app = opened(&repo, inspection);
-    app.reduce(Action::TabTo(1));
+    app.reduce(Action::TabTo(2));
     app.reduce(Action::AgentFilter);
     assert!(!agent_only(&app));
     assert!(
@@ -529,7 +529,7 @@ impl crate::Source for Detailed {
         match self.verdict {
             Some(verdict) => Ok(crate::CommitVerify {
                 verdict: Ok(verdict),
-                sessions: Vec::new(),
+                sessions: vec![super::c122::verified_session('a')],
                 out_of_scope: None,
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,
@@ -771,13 +771,15 @@ fn c34_unexplained_lines_match_the_changes_tab() {
     let set = app.inspection.changes(&repo, commit).unwrap();
     let per_file: usize = set.files.iter().map(|f| f.unexplained()).sum();
     assert!(per_file > 0);
+    // Klasse 2 (Review Batch 5): `unexplained` → `not observed` (C9.4).
     assert!(
         detail.contains(&format!(
-            "◦ {per_file} of {} added lines unexplained",
+            "◦ {per_file} of {} added lines not observed",
             set.added()
         )),
         "{detail}"
     );
+    assert!(!detail.contains("lines unexplained"), "{detail}");
     // Die Aktion steht in NEXT (C3.7), nicht als Unterzeile der Achse.
     assert!(!detail.contains("→ d, then n"), "{detail}");
     assert!(detail.contains("NEXT"), "{detail}");
@@ -949,12 +951,15 @@ fn review_coverage_never_counts_a_claim_as_explained() {
         ..LineClasses::default()
     });
     assert!(!stated.contains('✓'), "{stated}");
-    // Klasse 2 (Batch 2, Paket 6 / C9.4): ein Wort je Zustand — `reported,
-    // not observed` statt `stated`, und keine Zeile `· 40 added lines`.
+    // Klasse 2 (Batch 2, Paket 6 / C9.4): ein Wort je Zustand — `reported`
+    // statt `stated`, und keine Zeile `· 40 added lines`; Review Batch 5:
+    // `reported, not observed` → `reported, 0 observed` (ein Wortlaut mit
+    // der Evidence-Ebene).
     assert!(
-        stated.contains("◇ 40 of 40 added lines reported, not observed"),
+        stated.contains("◇ 40 of 40 added lines reported, 0 observed"),
         "{stated}"
     );
+    assert!(!stated.contains("reported, not observed"), "{stated}");
     assert!(!stated.contains("stated"), "{stated}");
     assert!(!stated.contains("· 40 added lines"), "{stated}");
     let skipped = text(LineClasses {
@@ -982,7 +987,7 @@ fn review_a_stale_worker_answer_after_reload_is_dropped() {
         fn verify(&mut self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
             Ok(crate::CommitVerify {
                 verdict: Ok(crate::VerifyVerdict::Verified),
-                sessions: Vec::new(),
+                sessions: vec![super::c122::verified_session('a')],
                 out_of_scope: None,
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,

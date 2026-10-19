@@ -10,50 +10,56 @@ fn render_sized(app: &mut App, width: u16, height: u16) -> String {
     terminal.backend().to_string()
 }
 
-/// Die Verify-Zeile einer Session (sonst `None`).
-fn session_row(app: &App) -> Option<usize> {
-    let state = app.verify.as_ref()?;
-    (!state.sessions.is_empty()).then_some(0)
-}
-
-/// Das AC der Spec: Verify → Enter (Session) → `e` → Esc → Esc landet wieder
-/// in Verify auf derselben Zeile. (Bis C10 war die zweite Ebene die
-/// Why-Kette; jetzt der Evidence-Report — der Rückweg ist derselbe.)
+/// Das AC der Spec: ein Tab mit Zeile → Enter (Session) → `e` → Esc → Esc
+/// landet wieder dort auf derselben Zeile. (Bis C10 war die zweite Ebene
+/// die Why-Kette, jetzt der Evidence-Report; bis C12.2 war der Ursprung
+/// der Verify-Tab, der in der Übersicht aufgegangen ist — der Rückweg ist
+/// derselbe.)
 #[test]
 fn b2_esc_returns_across_tabs_to_the_same_row() {
     let (_dir, repo, _, inspection) = history();
     let mut app = opened(&repo, inspection);
-    // Ein Commit mit Session wählen (B3: F3 öffnet den aktiven Commit).
     select_commit_with_sessions(&mut app);
-    app.reduce(Action::TabTo(2));
-    let row = session_row(&app).expect("a commit with a session");
-    app.verify.as_mut().unwrap().cursor = row;
-    let commit = app.verify.as_ref().unwrap().commit();
+    let row = app.overview.as_ref().unwrap().cursor;
+    let commit = overview_commit(&app);
     app.reduce(Action::Enter);
+    // Mehrere Sessions: erst wählen (Fokus rechts), dann Enter.
+    if app.tab == Tab::Overview {
+        app.reduce(Action::Enter);
+    }
     assert_eq!(app.tab, Tab::Sessions);
+    assert!(matches!(app.top(), Some(View::Story { .. })));
     app.reduce(Action::Evidence);
     assert!(matches!(app.top(), Some(View::Evidence { .. })));
     let out = render_sized(&mut app, 160, 40);
     let crumb = out.lines().nth(1).unwrap();
-    assert!(crumb.contains("Verify"), "{out}");
+    assert!(crumb.contains("Overview"), "{out}");
     assert!(crumb.contains("› Session b3-"), "{out}");
     // Der Pfad endet am Ziel: … › Session … › Evidence (die Statistik
     // rechts daneben ist kein Teil des Pfads).
     assert!(crumb.contains("› Evidence"), "{crumb}");
     assert!(
-        crumb.find("Verify").unwrap() < crumb.find("› Evidence").unwrap(),
+        crumb.find("Overview").unwrap() < crumb.find("› Evidence").unwrap(),
         "{crumb}"
     );
     app.reduce(Action::Back); // Evidence schließt
     assert!(matches!(app.top(), Some(View::Story { .. })));
     app.reduce(Action::Back); // die Ebene des Sprungs: zurück zum Ursprung
-    assert_eq!(app.tab, Tab::Verify);
-    assert_eq!(app.verify.as_ref().unwrap().cursor, row);
-    assert_eq!(app.verify.as_ref().unwrap().commit(), commit);
+    assert_eq!(app.tab, Tab::Overview);
+    assert_eq!(app.overview.as_ref().unwrap().cursor, row);
+    assert_eq!(overview_commit(&app), commit);
     // Kein weiterer Ursprung: nichts.
     app.reduce(Action::Back);
-    assert_eq!(app.tab, Tab::Verify);
+    assert_eq!(app.tab, Tab::Overview);
     assert!(!app.quit);
+}
+
+/// Der Commit der gewählten Zeile.
+fn overview_commit(app: &App) -> Option<CommitId> {
+    match app.overview.as_ref()?.selected()? {
+        crate::overview::Selected::Commit(row) => Some(row.id),
+        crate::overview::Selected::Wip(_) => None,
+    }
 }
 
 fn select_commit_with_sessions(app: &mut App) {

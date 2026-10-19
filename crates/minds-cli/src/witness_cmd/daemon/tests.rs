@@ -114,6 +114,141 @@ fn append(writer: &mut Writer) {
     writer.hook("claude-code", None, payload(), at()).unwrap();
 }
 
+/// Der Stop-Payload der Demo-Session, mit Transkript-Pfad.
+fn stop_payload() -> Vec<u8> {
+    br#"{"session_id":"test-session","hook_event_name":"Stop","transcript_path":"/home/anna/.claude/projects/p/t.jsonl","cwd":"/workspaces/demo"}"#.to_vec()
+}
+
+/// Eine Verbindung der Agent-Seite, wie der Eventloop sie führt.
+fn agent_client(stream: std::os::unix::net::UnixStream) -> socket::Client {
+    stream.set_nonblocking(true).unwrap();
+    socket::Client {
+        stream,
+        bytes: Vec::new(),
+        since: std::time::Instant::now(),
+        eof: false,
+        pending: false,
+        control: false,
+        challenge: None,
+        partial_since: None,
+        held: None,
+    }
+}
+
+/// Treibt die Verbindung, bis der Eventloop sie schließt.
+fn drain(client: &mut socket::Client, writer: &mut Writer) {
+    for _ in 0..8 {
+        if !socket::step(client, writer).unwrap() {
+            return;
+        }
+    }
+    panic!("die Verbindung schließt nicht");
+}
+
+/// K1/M1: Der `Model`-Frame folgt dem `Hook`-Frame des `Stop`; der Eventloop
+/// hält das Event kurz zurück und schreibt es mit der Kennung. Der
+/// Witness-Checkpoint trägt sie als `ModelFromHook` — ohne je das Transkript
+/// zu lesen. Eine Kennung für eine andere Session wird nicht übernommen,
+/// das Event trotzdem geschrieben.
+#[test]
+fn a_model_frame_after_the_stop_names_the_model_without_reading_the_transcript() {
+    use minds_capture::witness_proto::{self, Frame};
+    use std::os::unix::net::UnixStream;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    append(&mut writer);
+
+    let hook = witness_proto::encode(&Frame::Hook {
+        agent: "claude-code".into(),
+        event_override: None,
+        stdin: stop_payload(),
+    })
+    .unwrap();
+    let model = |session: &str| {
+        witness_proto::encode(&Frame::Model {
+            agent: "claude-code".into(),
+            session: session.into(),
+            model: "claude-opus-4-1".into(),
+        })
+        .unwrap()
+    };
+
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .write_all(&[hook.clone(), model("test-session")].concat())
+        .unwrap();
+    drop(theirs);
+    drain(&mut agent_client(ours), &mut writer);
+
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .write_all(&[hook.clone(), model("other-session")].concat())
+        .unwrap();
+    drop(theirs);
+    drain(&mut agent_client(ours), &mut writer);
+
+    let events = writer.journal.read(&key()).unwrap().events;
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[1].model.as_deref(), Some("claude-opus-4-1"));
+    assert_eq!(events[1].raw_kind, "Stop");
+    assert_eq!(events[2].model, None, "fremde Session: Kennung verworfen");
+    assert_eq!(events[2].raw_kind, "Stop", "… das Event aber geschrieben");
+
+    let session = minds_capture::adapter::checkpoint_witness(
+        &key(),
+        &events,
+        &minds_capture::Checkpoint::default(),
+        &[],
+    );
+    assert_eq!(session.model.id, "claude-opus-4-1");
+    assert_eq!(session.model.provider, "anthropic");
+    assert_eq!(
+        session.lineage.as_ref().unwrap().transcript,
+        Some(minds_core::TranscriptStatus::ModelFromHook)
+    );
+}
+
+/// M1 (c): Ein Witness, der den zweiten Frame nicht kennt — hier eine
+/// unbekannte Art hinter dem `Hook` —, schließt die Verbindung; das Event
+/// steht trotzdem im Journal, nur ohne Modell. Und ein `Stop` ohne jeden
+/// zweiten Frame wird geschrieben, sobald die Verbindung endet.
+#[test]
+fn an_unknown_frame_after_the_stop_costs_only_the_model() {
+    use minds_capture::witness_proto::{self, Frame, MAGIC};
+    use std::os::unix::net::UnixStream;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+
+    let hook = witness_proto::encode(&Frame::Hook {
+        agent: "claude-code".into(),
+        event_override: None,
+        stdin: stop_payload(),
+    })
+    .unwrap();
+    let mut unknown = MAGIC.to_vec();
+    unknown.extend_from_slice(&1u32.to_le_bytes());
+    unknown.push(0x09);
+
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs.write_all(&[hook.clone(), unknown].concat()).unwrap();
+    let mut client = agent_client(ours);
+    drain(&mut client, &mut writer);
+    assert_eq!(writer.journal.read(&key()).unwrap().events.len(), 1);
+
+    // Nur der Hook, dann EOF.
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs.write_all(&hook).unwrap();
+    drop(theirs);
+    drain(&mut agent_client(ours), &mut writer);
+    let events = writer.journal.read(&key()).unwrap().events;
+    assert_eq!(events.len(), 2);
+    assert!(
+        events
+            .iter()
+            .all(|e| e.model.is_none() && e.raw_kind == "Stop")
+    );
+}
+
 #[test]
 fn witness_chain_equals_legacy_chain() {
     let f = Fixture::new();
@@ -317,6 +452,7 @@ fn witness_ledger_is_idempotent_after_sealing_before_discard() {
                     kind: event.kind,
                     cwd: event.cwd,
                     transcript_path: event.transcript_path,
+                    model: None,
                     payload: event.payload,
                 },
             )
@@ -454,6 +590,7 @@ fn witness_path_mapping_keeps_evidence_verbatim_and_ignores_transcripts() {
     let tracked = crate::checkpoint::tracked_files(&root);
     let ctx = minds_capture::Checkpoint {
         root: Some(&root),
+        home: None,
         tracked: tracked.as_ref(),
         commit: None,
         redaction: Some(&pipeline),
@@ -653,6 +790,7 @@ fn witness_session_carries_the_commit_edge_like_legacy() {
     let head = git(&f.root, &["rev-parse", "HEAD"]);
     let ctx = minds_capture::Checkpoint {
         root: Some(&f.root),
+        home: None,
         tracked: None,
         commit: Some(head.trim()),
         redaction: None,
@@ -693,6 +831,7 @@ fn witness_processes_every_complete_frame_in_one_pass() {
         control: false,
         challenge: None,
         partial_since: None,
+        held: None,
     };
     assert!(socket::step(&mut client, &mut writer).unwrap());
     assert!(client.bytes.is_empty());
@@ -723,6 +862,7 @@ fn witness_caps_frames_per_pass_without_dropping_any() {
         control: false,
         challenge: None,
         partial_since: None,
+        held: None,
     };
     assert!(socket::step(&mut client, &mut writer).unwrap());
     assert!(client.pending);
