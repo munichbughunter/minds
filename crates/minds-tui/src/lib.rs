@@ -143,7 +143,7 @@ pub trait Source {
     /// Die signaturabhängigen Teile des Urteils über `commit` — Assurance
     /// je Session, Intent-Lage, Scope —, wie `minds verify` sie rechnet
     /// (gegen die vertrauenswürdigen Signer). `Err`: nicht bestimmbar, mit
-    /// Grund — der Verify-Tab sagt dann nie VERIFIED.
+    /// Grund — die Overview-EVIDENCE sagt dann nie VERIFIED.
     fn verify(&self, _commit: minds_git::CommitId) -> Result<CommitVerify, String> {
         Err("not available".into())
     }

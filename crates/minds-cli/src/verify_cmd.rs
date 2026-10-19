@@ -636,7 +636,7 @@ fn trailer_commits(ctx: &Context, id: SessionId) -> Fallible<Vec<CommitId>> {
 }
 
 /// Die Sessions eines Commits, wie `verify` sie wählt — der Kern von
-/// [`sessions_of_revision`], ohne Ausgabe (auch für den Verify-Tab von
+/// [`sessions_of_revision`], ohne Ausgabe (auch für die Overview-EVIDENCE von
 /// `minds inspect`, damit beide dieselben Sessions meinen).
 pub(crate) fn sessions_of_commit(
     ctx: &Context,

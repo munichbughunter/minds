@@ -18,7 +18,7 @@ impl crate::Source for Judged {
     fn verify(&self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
         Ok(crate::CommitVerify {
             verdict: Ok(self.0),
-            sessions: Vec::new(),
+            sessions: vec![super::c122::verified_session('a')],
             out_of_scope: None,
             out_of_scope_paths: Vec::new(),
             scope_note: None,

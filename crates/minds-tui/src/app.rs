@@ -51,6 +51,10 @@ pub(crate) const VERIFY_EVERY: Duration = Duration::from_secs(5);
 /// Wie oft `r` höchstens lädt, auch wenn die Taste gehalten wird.
 const REPEAT: Duration = Duration::from_millis(250);
 
+/// Der Grund, wenn `minds verify` andere Sessions geprüft hat als die
+/// gezeigten (Store zwischen Laden und Lauf verändert): kein Urteil.
+pub(crate) const SESSIONS_DIFFER: &str = "the checked sessions differ from the shown ones";
+
 /// Eine Ebene über der Liste.
 #[derive(Debug, Clone)]
 pub enum View {
@@ -1362,14 +1366,23 @@ impl<'a> App<'a> {
     /// Prüfzeit; `None`, solange keiner geprüft ist.
     pub fn evidence_check(
         &self,
+        id: SessionId,
         artifacts: &[CommitArtifact],
-    ) -> Option<(CommitId, &Result<CommitVerify, String>, Option<i64>)> {
+    ) -> Option<(CommitId, Result<&CommitVerify, String>, Option<i64>)> {
         let overview = self.overview.as_ref()?;
         artifacts.iter().find_map(|a| {
-            overview
-                .checks
-                .get(&a.commit)
-                .map(|check| (a.commit, check, overview.checked_at.get(&a.commit).copied()))
+            overview.checks.get(&a.commit).map(|check| {
+                // Ein Urteil über andere Sessions ist keins über diese: nie
+                // VERIFIED ohne Signaturprüfung **dieser** Session.
+                let check = match check {
+                    Ok(c) if !c.sessions.iter().any(|s| s.session == id) => {
+                        Err(SESSIONS_DIFFER.to_string())
+                    }
+                    Ok(c) => Ok(c),
+                    Err(why) => Err(why.clone()),
+                };
+                (a.commit, check, overview.checked_at.get(&a.commit).copied())
+            })
         })
     }
 

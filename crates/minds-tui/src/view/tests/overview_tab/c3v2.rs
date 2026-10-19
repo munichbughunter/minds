@@ -529,7 +529,7 @@ impl crate::Source for Detailed {
         match self.verdict {
             Some(verdict) => Ok(crate::CommitVerify {
                 verdict: Ok(verdict),
-                sessions: Vec::new(),
+                sessions: vec![super::c122::verified_session('a')],
                 out_of_scope: None,
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,
@@ -982,7 +982,7 @@ fn review_a_stale_worker_answer_after_reload_is_dropped() {
         fn verify(&mut self, _commit: CommitId) -> Result<crate::CommitVerify, String> {
             Ok(crate::CommitVerify {
                 verdict: Ok(crate::VerifyVerdict::Verified),
-                sessions: Vec::new(),
+                sessions: vec![super::c122::verified_session('a')],
                 out_of_scope: None,
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,

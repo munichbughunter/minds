@@ -746,15 +746,9 @@ pub(crate) fn anchor_short(id: &minds_core::ContentHash) -> String {
     hex.chars().take(8).collect()
 }
 
-/// `HH:MM` (UTC) eines Zeitpunkts in Sekunden seit Epoch.
-fn clock(secs: i64) -> String {
-    let day = secs.rem_euclid(86_400);
-    format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
-}
-
 /// `HH:MM` aus einem RFC-3339-Text, sonst nichts.
 fn clock_of(ts: Option<&str>) -> Option<String> {
-    ts.and_then(minds_metrics::epoch_seconds).map(clock)
+    ts.and_then(minds_metrics::epoch_seconds).map(super::clock)
 }
 
 /// Eine Zeile des EVIDENCE-Blocks: Label (16 Spalten), dann Glyph + Wort.
@@ -1219,7 +1213,7 @@ fn evidence_lines(
         state
             .checked_at
             .get(&row.id)
-            .map(|at| format!("checked {}Z", clock(*at)))
+            .map(|at| format!("checked {}Z", super::clock(*at)))
     };
     if let Some(right) = right {
         let pad = inner.saturating_sub("EVIDENCE".len() + right.chars().count());
@@ -1440,6 +1434,15 @@ pub(crate) fn next_action_of(app: &App) -> Option<String> {
     Some(next_action(state, row, &cards))
 }
 
+/// Prüfte `minds verify` andere Sessions als die Zeile zeigt (der Store
+/// änderte sich zwischen Laden und Lauf), sagt sein Urteil nichts über
+/// diese — es gilt dann nicht.
+fn sessions_differ(row: &CommitRow, c: &crate::CommitVerify) -> bool {
+    row.sessions
+        .iter()
+        .any(|shown| !c.sessions.iter().any(|s| s.session == *shown))
+}
+
 /// Das Gesamturteil der INTEGRITY-Zeile aus Seal-Zustand und Prüfung —
 /// `None`, wenn die Prüfung selbst scheiterte.
 fn overall_of(
@@ -1447,8 +1450,17 @@ fn overall_of(
     check: Option<&Result<crate::CommitVerify, String>>,
 ) -> Option<crate::verify::Overall> {
     use crate::verify::Overall;
-    let tampered_cli = matches!(check, Some(Ok(c)) if c.sessions.iter().any(|s| s.tampered));
-    if row.seal == Some(SealMark::Tampered) || tampered_cli {
+    if row.seal == Some(SealMark::Tampered) {
+        return Some(Overall::Tampered);
+    }
+    // Ein Urteil über andere Sessions ist keins über diese — auch ihr
+    // TAMPERED nicht.
+    if let Some(Ok(c)) = check
+        && sessions_differ(row, c)
+    {
+        return Some(Overall::NotChecked);
+    }
+    if matches!(check, Some(Ok(c)) if c.sessions.iter().any(|s| s.tampered)) {
         return Some(Overall::Tampered);
     }
     match check {
@@ -1480,6 +1492,7 @@ fn integrity_lines(
         Some(Overall::NotChecked) | None => {
             let why = match check {
                 Some(Err(why)) => why.clone(),
+                Some(Ok(c)) if sessions_differ(row, c) => crate::app::SESSIONS_DIFFER.into(),
                 Some(Ok(c)) => c.verdict.clone().err().unwrap_or_default(),
                 None => String::new(),
             };
@@ -1521,9 +1534,11 @@ fn integrity_lines(
             Span::styled(" — sealed is not verified", theme::dim()),
         ]));
     }
-    // Mehrere Sessions: je Session eine Unterzeile, nie zu einem ✓ gemischt.
+    // Mehrere Sessions: je Session eine Unterzeile, nie zu einem ✓ gemischt
+    // — und nur, wenn es die gezeigten sind.
     if let Some(Ok(c)) = check
         && c.sessions.len() > 1
+        && !sessions_differ(row, c)
     {
         for s in &c.sessions {
             let (glyph, word, style) = super::trust::verify_session_mark(s.tampered);
@@ -1564,6 +1579,11 @@ fn scope_lines(
         }
         (_, None) => vec![mark("…", "checking", theme::dim())],
         (_, Some(Err(why))) => vec![mark("·", format!("not checked ({why})"), theme::dim())],
+        (_, Some(Ok(c))) if sessions_differ(row, c) => vec![mark(
+            "·",
+            format!("not checked ({})", crate::app::SESSIONS_DIFFER),
+            theme::dim(),
+        )],
         (_, Some(Ok(c))) => match (&c.out_of_scope, &c.scope_note) {
             (Some(paths), _) if paths.is_empty() => {
                 let globs = row

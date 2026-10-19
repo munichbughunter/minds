@@ -434,11 +434,14 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
         // Evidence (C12.1): nur Id, Trust Strip (aus `context`) und das
         // Urteil von `minds verify` — keine Sätze; Legacy sagt sein Wort.
         Some(View::Evidence {
-            report, artifacts, ..
+            id,
+            report,
+            artifacts,
+            ..
         }) => match report.as_ref() {
             Some(report) => {
                 let (words, style) =
-                    evidence::verdict_words(report, app.evidence_check(artifacts), false);
+                    evidence::verdict_words(report, app.evidence_check(*id, artifacts), false);
                 Line::from(Span::styled(words, style))
             }
             None => {
@@ -862,6 +865,13 @@ pub fn when(ts: Option<&str>) -> String {
         },
         None => "—".into(),
     }
+}
+
+/// `HH:MM` (UTC) eines Zeitpunkts in Sekunden seit Epoch — die Prüfzeit
+/// in Overview-EVIDENCE und Evidence-Ebene.
+pub(crate) fn clock(secs: i64) -> String {
+    let day = secs.rem_euclid(86_400);
+    format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
 }
 
 /// `HH:MM:SSZ` aus dem RFC-3339-Zeitstempel (C9.3) — die Uhrzeit, nicht

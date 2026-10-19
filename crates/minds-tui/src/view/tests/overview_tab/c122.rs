@@ -55,6 +55,18 @@ impl crate::Background for Slow {
     }
 }
 
+/// Die Session-Zeile von `minds verify` über die Session `c` — ohne
+/// Anker, Stufe A0: das Urteil gilt der gezeigten Session, mehr nicht.
+pub(super) fn verified_session(c: char) -> SessionAssurance {
+    SessionAssurance {
+        session: sid(c),
+        level: Assurance::A0Claimed,
+        reason: None,
+        intent: IntentState::Unbound,
+        tampered: false,
+    }
+}
+
 fn witnessed(tampered: bool) -> CommitVerify {
     verdict(
         tampered,
@@ -456,6 +468,31 @@ fn without_a_checked_verdict_neither_verified_nor_incomplete() {
     assert!(!out.contains("INCOMPLETE"), "{out}");
     assert!(!integrity.contains('✓'), "{integrity}");
     assert!(!out.contains("✓ intact"), "{out}");
+}
+
+/// Prüfte die CLI andere Sessions als gezeigt, gilt das Urteil nicht.
+/// (Umzug von `a_different_session_set_is_not_checked`: INTEGRITY sagt es,
+/// zeigt kein Urteil und keine Stufe; SCOPE prüft dann auch nicht.)
+#[test]
+fn a_different_session_set_is_not_checked() {
+    let (_dir, repo, commits, inspection) = history();
+    let mut app = on_agent(&repo, inspection, &commits);
+    let mut other = witnessed(false);
+    other.sessions[0].session = sid('e');
+    assert!(app.fill_overview_verify(&signers(Some(other))));
+    let out = text_at(&mut app, 160, 40);
+    let integrity = line_with(&out, "INTEGRITY");
+    assert!(
+        integrity.contains("? not checked — the checked sessions differ"),
+        "{integrity}"
+    );
+    assert!(!out.contains("VERIFIED"), "{out}");
+    assert!(!integrity.contains('✓'), "{integrity}");
+    assert!(!integrity.contains("witnessed"), "no level: {integrity}");
+    assert!(
+        line_with(&out, "SCOPE").contains("· not checked (the checked sessions differ"),
+        "{out}"
+    );
 }
 
 /// TAMPERED von `verify` selbst: kein ✓-Scope und keine Stufe aus einer

@@ -80,22 +80,22 @@ pub fn draw(
     };
 
     let inner = area.width.saturating_sub(4) as usize;
-    let check = app.evidence_check(artifacts);
+    let check = app.evidence_check(id, artifacts);
 
     // Kopf: Identität, Trust Strip, Prüfzeit — dann der Satz für Menschen
     // und das Urteil von `minds verify`.
     let story = wrap(&sentence(report, uninterpreted, lines), inner);
     let head_h = 2 + 1 + story.len() as u16 + 1;
-    let (v_glyph, v_word, v_style) = theme::provenance(&Provenance::Chained(report.state));
+    let (_, v_word, v_style) = theme::provenance(&Provenance::Chained(report.state));
     let axes = TrustAxes::of(&Provenance::Chained(report.state), uninterpreted);
     let mut first = vec![Span::styled(
         format!("EVIDENCE · session {short}…  "),
         theme::title().fg(theme::AGENT),
     )];
     first.extend(trust::spans(&axes, trust::Density::Glyphs));
-    if let Some((_, _, Some(at))) = check {
+    if let Some((_, _, Some(at))) = &check {
         let used: usize = first.iter().map(|s| s.content.chars().count()).sum();
-        let stamp = format!("checked {}Z", clock(at));
+        let stamp = format!("checked {}Z", super::clock(*at));
         let pad = inner.saturating_sub(used + stamp.chars().count());
         first.push(Span::raw(" ".repeat(pad)));
         first.push(Span::styled(stamp, theme::dim()));
@@ -107,7 +107,6 @@ pub fn draw(
         Span::styled("Verdict of minds verify: ", theme::dim()),
         Span::styled(words, style),
     ]));
-    let _ = v_glyph;
 
     // Die Achsen: drei Zeilen, der Abgleich unter COVERAGE, LIMITS als
     // Satz, TECHNICAL zu- oder aufgeklappt.
@@ -160,19 +159,13 @@ pub fn draw(
     );
 }
 
-/// Die Prüfzeit als `HH:MM` (UTC).
-fn clock(secs: i64) -> String {
-    let day = secs.rem_euclid(86_400);
-    format!("{:02}:{:02}", day / 3_600, day % 3_600 / 60)
-}
-
 /// Die Wörter des Urteils (C12.1): **die von `minds verify`**, wörtlich,
 /// mit der Prüfzeit — oder „sealed, not yet verified", solange keine
 /// Signaturprüfung lief. Nie VERIFIED davor.
 /// `with_time` hängt die Prüfzeit an (Kopf); die Fußzeile lässt sie weg.
 pub(crate) fn verdict_words(
     report: &EvidenceReport,
-    check: Option<(CommitId, &Result<crate::CommitVerify, String>, Option<i64>)>,
+    check: Option<(CommitId, Result<&crate::CommitVerify, String>, Option<i64>)>,
     with_time: bool,
 ) -> (String, Style) {
     use crate::verify::Overall;
@@ -214,7 +207,7 @@ pub(crate) fn verdict_words(
             let (words, style) = trust::verify_headline(overall);
             match at.filter(|_| with_time) {
                 Some(at) => (
-                    format!("{words} (signatures checked {}Z)", clock(at)),
+                    format!("{words} (signatures checked {}Z)", super::clock(at)),
                     style,
                 ),
                 None => (words, style),
@@ -278,12 +271,13 @@ fn artifact_sentence(lines: &[CommitLines]) -> String {
         (*c).clone()
     } else {
         counted.iter().fold(LineClasses::default(), |mut acc, c| {
-            acc.added += c.added;
-            acc.explained += c.explained;
-            acc.fs_only += c.fs_only;
-            acc.stated += c.stated;
-            acc.unexplained += c.unexplained;
-            acc.not_assessed += c.not_assessed;
+            // Sättigend: Zahlen aus dem Store, kein Überlauf-Panic.
+            acc.added = acc.added.saturating_add(c.added);
+            acc.explained = acc.explained.saturating_add(c.explained);
+            acc.fs_only = acc.fs_only.saturating_add(c.fs_only);
+            acc.stated = acc.stated.saturating_add(c.stated);
+            acc.unexplained = acc.unexplained.saturating_add(c.unexplained);
+            acc.not_assessed = acc.not_assessed.saturating_add(c.not_assessed);
             acc
         })
     };

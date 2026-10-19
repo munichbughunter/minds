@@ -20,10 +20,22 @@ fn footer_line(out: &str) -> String {
     out.lines().rev().nth(1).expect("footer").to_string()
 }
 
+/// Die Session-Zeile, die `minds verify` zu `c` liefert.
+fn assurance(c: char) -> crate::SessionAssurance {
+    crate::SessionAssurance {
+        session: sid(c),
+        level: minds_reader::assurance::Assurance::A1Observed,
+        reason: None,
+        intent: minds_reader::assurance::IntentState::Unbound,
+        tampered: false,
+    }
+}
+
+/// Ein Urteil über die gezeigte Session a.
 fn check(verdict: Result<crate::VerifyVerdict, String>) -> crate::CommitVerify {
     crate::CommitVerify {
         verdict,
-        sessions: Vec::new(),
+        sessions: vec![assurance('a')],
         out_of_scope: None,
         out_of_scope_paths: Vec::new(),
         scope_note: None,
@@ -36,19 +48,96 @@ fn check(verdict: Result<crate::VerifyVerdict, String>) -> crate::CommitVerify {
 fn evidence_from_overview(
     verdict: Option<Result<crate::VerifyVerdict, String>>,
 ) -> (tempfile::TempDir, App<'static>) {
+    evidence_with(verdict.map(check))
+}
+
+/// Wie [`evidence_from_overview`], mit einem fertigen `CommitVerify`.
+fn evidence_with(check: Option<crate::CommitVerify>) -> (tempfile::TempDir, App<'static>) {
     let (dir, repo, inspection) = reconciled(false);
     let repo: &'static Repo = Box::leak(Box::new(repo));
     let mut app = App::new(inspection, repo, None);
     app.open_overview();
     let head = app.inspection.index().commits_of(sid('a'))[0];
-    if let Some(verdict) = verdict {
+    if let Some(check) = check {
         let state = app.overview.as_mut().unwrap();
-        state.checks.insert(head, Ok(check(verdict)));
+        state.checks.insert(head, Ok(check));
         state.checked_at.insert(head, 10 * 3_600);
     }
     app.reduce(Action::Evidence);
     assert!(matches!(app.top(), Some(View::Evidence { .. })));
     (dir, app)
+}
+
+/// Eine manipulierte Session (Seal-Material verändert), ohne Prüfung,
+/// aus der Sessions-Liste geöffnet.
+fn tampered_without_a_check() -> (tempfile::TempDir, App<'static>) {
+    let mut sessions = BTreeMap::new();
+    sessions.insert(sid('a'), session("Task a", "2026-07-25T14:10:00Z"));
+    let (seal_id, seal) = clean_seal(sid('a'));
+    let index = Index::from_parts(sessions, BTreeMap::new())
+        .with_seals(sid('a'), vec![(seal_id, seal, false)])
+        .with_tampered_seal(sid('a'));
+    let (dir, repo) = repo();
+    let repo: &'static Repo = Box::leak(Box::new(repo));
+    let mut app = App::new(Inspection::from_index(index, vec![], "repo"), repo, None);
+    app.reduce(Action::Evidence);
+    assert!(matches!(app.top(), Some(View::Evidence { .. })));
+    (dir, app)
+}
+
+/// Prüfte die CLI andere Sessions als die gezeigte, gilt das Urteil nicht:
+/// nie VERIFIED ohne Signaturprüfung **dieser** Session. (Gegenstück zu
+/// `a_different_session_set_is_not_checked` in der Übersicht.)
+#[test]
+fn c121_a_verdict_over_other_sessions_is_not_shown_as_this_sessions() {
+    let mut other = check(Ok(crate::VerifyVerdict::Verified));
+    other.sessions = vec![assurance('e')];
+    let (_dir, mut app) = evidence_with(Some(other));
+    let out = render_sized(&mut app, 160, 40);
+    assert!(
+        out.contains(
+            "Verdict of minds verify: not checked — the checked sessions differ from the shown ones"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("VERIFIED"), "{out}");
+    let line = footer_line(&out);
+    assert!(line.contains("not checked"), "{line}");
+    assert!(!line.contains("VERIFIED"), "{line}");
+}
+
+/// Manipuliertes Seal-Material ohne gelaufene Prüfung: TAMPERED, laut —
+/// und nie VERIFIED, nie „not yet verified" (das wäre zu leise).
+#[test]
+fn c121_tampered_without_a_check_is_tampered_never_verified() {
+    let (_dir, mut app) = tampered_without_a_check();
+    let out = render_sized(&mut app, 160, 40);
+    assert!(
+        out.contains("Verdict of minds verify: ✗ TAMPERED — seal material altered · v: run verify"),
+        "{out}"
+    );
+    assert!(!out.contains("VERIFIED"), "{out}");
+    assert!(!out.contains("not yet verified"), "{out}");
+    let line = footer_line(&out);
+    assert!(line.contains("✗ TAMPERED"), "{line}");
+}
+
+/// Aufgeklappte Technik bei 80×24: kein Panic, `? help` und die Achsen
+/// bleiben auf dem Schirm.
+#[test]
+fn c121_unfolded_technical_still_fits_80x24() {
+    let (_dir, mut app) = evidence_from_overview(Some(Ok(crate::VerifyVerdict::Verified)));
+    app.reduce(Action::Space);
+    let out = render_sized(&mut app, 80, 24);
+    for want in [
+        "? help",
+        "INTEGRITY",
+        "COVERAGE",
+        "INTERPRETATION",
+        "TECHNICAL",
+    ] {
+        assert!(out.contains(want), "{want} in {out}");
+    }
 }
 
 #[test]

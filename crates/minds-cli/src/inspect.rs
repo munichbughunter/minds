@@ -85,7 +85,7 @@ struct Live<'a> {
     reviews: &'a ReviewStore,
     name: &'a str,
     /// Dieses Binary, festgehalten — für das Urteil `minds verify <commit>`
-    /// im Verify-Tab. `Err` (Tests, Binary im Checkout): kein Urteil, der Tab
+    /// in der Overview-EVIDENCE. `Err` (Tests, Binary im Checkout): kein Urteil, der Block
     /// sagt „not checked" mit diesem Grund.
     exe: Result<PinnedExe, &'static str>,
     /// Was der Intent-Tab über Durchgänge hinweg behält.
@@ -126,7 +126,7 @@ impl Source for Live<'_> {
     }
 
     fn conformance(&self, commit: CommitId) -> Option<minds_reader::conformance::Report> {
-        // Dieselben Signer wie der Verify-Tab (`~/.ssh/allowed_signers`) —
+        // Dieselben Signer wie die Overview-EVIDENCE (`~/.ssh/allowed_signers`) —
         // die Pille sagt nie mehr als `verify`. Je Aufruf frisch gelesen: Ein
         // widerrufener Schlüssel gilt ab der nächsten Pille nicht mehr.
         let trust = crate::verify_cmd::witness_trust::WitnessTrust::for_specs(
@@ -138,7 +138,7 @@ impl Source for Live<'_> {
     }
 }
 
-/// Die Prüfung des Verify-Tabs abseits des Event-Loops (B6): besitzt nur
+/// Die Prüfung der Overview-EVIDENCE abseits des Event-Loops (B6): besitzt nur
 /// eigene Daten — das festgehaltene Binary und die Wurzel des Repos — und
 /// öffnet Repo und Store je Prüfung im Worker selbst (`Context` ist nicht
 /// `Send`). Urteilt wie [`Live`]'s `verify`.
@@ -602,14 +602,14 @@ fn verify_commit(
     })
 }
 
-/// Wie lange `minds verify` für den Verify-Tab höchstens laufen darf.
+/// Wie lange `minds verify` für die Overview-EVIDENCE höchstens laufen darf.
 const VERIFY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// So viel stderr wird gelesen (die erste Zeile ist der Grund).
 const STDERR_CAP: usize = 4096;
 
 /// Dieses Binary, beim Start festgehalten: kanonischer Pfad und Identität
-/// der Datei. Das Urteil des Verify-Tabs soll von **diesem** Programm
+/// der Datei. Das Urteil der Overview-EVIDENCE soll von **diesem** Programm
 /// kommen — nicht von dem, was später an seinem Pfad liegt.
 #[derive(Debug, Clone)]
 struct PinnedExe {
@@ -1175,7 +1175,7 @@ mod tests {
         assert!(!snapshot[0].contains('\t'));
     }
 
-    /// Der signaturabhängige Teil des Verify-Tabs gegen ein echtes Repo: Die
+    /// Der signaturabhängige Teil der Overview-EVIDENCE gegen ein echtes Repo: Die
     /// Session am Trailer wird gefunden und bewertet; ohne gebundenen Intent
     /// sagt der Scope, warum er nicht geprüft wurde.
     /// B6: Die Prüfung im Worker besitzt nur eigene Daten (Send) und

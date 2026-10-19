@@ -222,7 +222,8 @@ pub fn lines(axes: &TrustAxes) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Das Kopf-Urteil des Verify-Tabs — **die Wörter von `minds verify`**,
+/// Das Urteil in Overview-EVIDENCE und Evidence-Ebene — **die Wörter von
+/// `minds verify`**,
 /// wörtlich (VERIFIED, VERIFIED, INCOMPLETE, TAMPERED, NOT VERIFIABLE).
 pub fn verify_headline(overall: Overall) -> (String, Style) {
     match overall {
