@@ -1327,18 +1327,17 @@ impl<'a> App<'a> {
         let (artifacts, lines) = cached.unwrap_or_else(|| {
             let artifacts = self.inspection.artifacts(self.repo, id);
             // Die Zeilen aus derselben Rechnung wie die Übersicht (C3.1) —
-            // ihr Zwischenstand zuerst, sonst neu gezählt.
+            // ihr Zwischenstand zuerst, sonst aus dem Abgleich, der schon
+            // da ist (`line_classes_of`): kein Commit wird zweimal
+            // abgeglichen, nur sein Diff gelesen.
             let lines = artifacts
                 .iter()
                 .map(|a| {
-                    let counted = match &a.state {
-                        minds_reader::artifact::ArtifactState::Assessed(_) => self
-                            .overview
-                            .as_ref()
-                            .and_then(|o| o.lines.get(&a.commit).cloned())
-                            .unwrap_or_else(|| count_lines(&self.inspection, self.repo, a.commit)),
-                        _ => Err("not assessed".into()),
-                    };
+                    let counted = self
+                        .overview
+                        .as_ref()
+                        .and_then(|o| o.lines.get(&a.commit).cloned())
+                        .unwrap_or_else(|| self.inspection.line_classes_of(self.repo, a));
                     (a.commit, counted)
                 })
                 .collect();

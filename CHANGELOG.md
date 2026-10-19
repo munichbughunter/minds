@@ -35,6 +35,13 @@ versioning follows [Semantic Versioning](https://semver.org/).
   observed`. `unexplained` and `reported, not observed` are gone from the
   Overview (C9.4: one word per state across tabs); the reason sentence
   below (`— no tool claim or shell mention found: all 46`) stays.
+- **The evidence view reconciles each commit once.** It counted the added
+  lines by reconciling every commit a second time (`changes` → a fresh
+  artifact) next to the reconciliation it already held. The reader now
+  derives the line classes from a given artifact
+  (`Inspection::line_classes_of`, `Inspection::changes_of`); the numbers
+  are the ones of `changes(commit).line_classes()`, so Overview, Changes
+  tab and evidence view still count from one function (C3.1).
 
 ### Added
 

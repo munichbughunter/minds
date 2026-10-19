@@ -294,3 +294,33 @@ fn nothing_in_the_changes_can_steer_the_terminal() {
         }
     }
 }
+
+/// Eine Zeilen-Rechnung (C3.1): Wer den Abgleich eines Commits schon
+/// hält (`artifacts`, Evidence-Ebene), bekommt die Zeilenklassen daraus —
+/// ohne den Abgleich ein zweites Mal zu rechnen — und dieselben Zahlen wie
+/// `changes(commit).line_classes()` (Übersicht, Changes-Tab).
+#[test]
+fn line_classes_of_an_artifact_equal_the_change_set_count() {
+    let (_dir, repo, store) = fixture();
+    let inspection = Inspection::load(&repo, &store, None, "t").unwrap();
+    let head = repo.head().unwrap().commit().unwrap();
+    let id = inspection.index().sessions_of(head)[0];
+    let artifacts = inspection.artifacts(&repo, id);
+    let artifact = artifacts.iter().find(|a| a.commit == head).unwrap();
+    let from_artifact = inspection.line_classes_of(&repo, artifact).unwrap();
+    let from_changes = inspection.changes(&repo, head).unwrap().line_classes();
+    assert_eq!(from_artifact, from_changes);
+    assert_eq!(from_artifact.added, 2);
+    assert_eq!(from_artifact.unexplained, 1, "the human line");
+    assert_eq!(from_artifact.skipped_files, 1, "the binary");
+
+    // Ohne Abgleich (Shallow/Partial, Lesefehler) der Grund — nie Zahlen.
+    let unavailable = minds_reader::artifact::CommitArtifact {
+        state: minds_reader::artifact::ArtifactState::Unavailable("shallow clone"),
+        ..artifact.clone()
+    };
+    assert_eq!(
+        inspection.line_classes_of(&repo, &unavailable),
+        Err("shallow clone".to_string())
+    );
+}

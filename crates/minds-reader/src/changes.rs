@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use minds_core::{ChangeId, Role, SessionId};
 use minds_git::{CommitId, DiffKind, Repo};
 
-use crate::artifact::{ArtifactState, roots_of};
+use crate::artifact::{ArtifactState, CommitArtifact, roots_of};
 use crate::model::ReviewState;
 use crate::reconcile::{FileRecon, Gap, LINE_LEVEL_LIMIT, LineLevel, LineSource, ReconClass};
 use crate::text::{sanitize, sanitize_path};
@@ -338,25 +338,59 @@ impl crate::Inspection {
         let spellings: Vec<PathBuf> = roots_of(repo);
         let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
         let artifact = self.index().artifact_detailed(repo, &roots, commit, true);
-        let (recon, unassessed): (BTreeMap<String, FileRecon>, Option<String>) =
-            match artifact.state {
+        self.changes_of(repo, &artifact)
+    }
+
+    /// Die Zeilenklassen eines Commits aus einem schon gerechneten Abgleich
+    /// (C3.1: **eine** Rechnung — wer `artifacts` hält, rechnet den Abgleich
+    /// nicht ein zweites Mal; nur der Diff wird gelesen). Dieselben Zahlen
+    /// wie [`ChangeSet::line_classes`] über [`Inspection::changes`]. `Err`
+    /// mit dem Grund, wenn der Commit nicht abgeglichen ist (Shallow/Partial
+    /// Clone, Lesefehler) oder der Diff nicht lesbar war.
+    pub fn line_classes_of(
+        &self,
+        repo: &Repo,
+        artifact: &CommitArtifact,
+    ) -> Result<LineClasses, String> {
+        match &artifact.state {
+            ArtifactState::Unavailable(why) => Err(why.to_string()),
+            ArtifactState::Failed(err) => Err(err.clone()),
+            ArtifactState::Assessed(_) => self
+                .changes_of(repo, artifact)
+                .map(|set| set.line_classes())
+                .map_err(|err| crate::sanitize(&err.to_string())),
+        }
+    }
+
+    /// [`Inspection::changes`] über einen schon gerechneten Abgleich. Ohne
+    /// `sources` im Abgleich tragen die Zeilen keine Herkunft (`source:
+    /// None`) — für die Zählung reicht das, die Why-Box braucht
+    /// [`Inspection::changes`].
+    pub fn changes_of(
+        &self,
+        repo: &Repo,
+        artifact: &CommitArtifact,
+    ) -> minds_git::Result<ChangeSet> {
+        let commit = artifact.commit;
+        let (recon, unassessed): (BTreeMap<&str, &FileRecon>, Option<String>) =
+            match &artifact.state {
                 ArtifactState::Assessed(assessed) => (
                     assessed
                         .recon
                         .files
-                        .into_iter()
-                        .map(|f| (f.path.clone(), f))
+                        .iter()
+                        .map(|f| (f.path.as_str(), f))
                         .collect(),
                     None,
                 ),
                 ArtifactState::Unavailable(why) => (BTreeMap::new(), Some(why.to_string())),
-                ArtifactState::Failed(err) => (BTreeMap::new(), Some(err)),
+                ArtifactState::Failed(err) => (BTreeMap::new(), Some(err.clone())),
             };
         let changed = repo.commit_changes(commit)?;
         let mut files = Vec::new();
         let mut rows = 0usize;
         for (i, entry) in changed.files.iter().enumerate() {
-            let recon = recon.get(&entry.path);
+            let recon = recon.get(entry.path.as_str()).copied();
             let mut file = FileDiff {
                 path: display(&entry.path),
                 identity: entry.path.clone(),

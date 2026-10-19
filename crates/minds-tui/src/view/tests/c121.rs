@@ -520,3 +520,34 @@ fn c121_evidence_and_overview_say_the_lines_in_the_same_words() {
     assert!(out.contains(&format!("{glyph} {text}")), "{out}");
     assert!(!out.contains("unexplained"), "{out}");
 }
+
+/// Eine Zeilen-Rechnung (C3.1): Die Evidence-Ebene zählt die Zeilen aus dem
+/// Abgleich, den sie schon hält (`line_classes_of`), und kommt auf dieselben
+/// Zahlen wie `count_lines` der Übersicht und des Changes-Tabs — kein
+/// Commit wird zweimal abgeglichen.
+#[test]
+fn c121_evidence_counts_lines_from_the_reconciliation_it_holds() {
+    let (_dir, repo, inspection) = reconciled(true);
+    let mut app = App::new(inspection, &repo, None);
+    assert!(app.overview.is_none(), "no cached count from the overview");
+    app.reduce(Action::Evidence);
+    let Some(View::Evidence {
+        artifacts, lines, ..
+    }) = app.top()
+    else {
+        panic!("evidence");
+    };
+    assert_eq!(artifacts.len(), 1);
+    let (commit, counted) = &lines[0];
+    assert_eq!(*commit, artifacts[0].commit);
+    let counted = counted.clone().expect("counted");
+    assert_eq!(
+        Ok(counted.clone()),
+        app.inspection.line_classes_of(&repo, &artifacts[0])
+    );
+    assert_eq!(
+        Ok(counted.clone()),
+        crate::app::count_lines(&app.inspection, &repo, *commit)
+    );
+    assert_eq!((counted.added, counted.unexplained), (4, 1));
+}
