@@ -690,6 +690,9 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
         serde_json::json!({"previous_stop": previous, "profile": profile, "key": key_fingerprint}),
         || observer::Observer::watch(&root, Box::new(observer::Blake3)),
     )?;
+    // Start und Scheitern des Beobachters auch nach stderr: Als Dienst
+    // landet das in `log/witness.err` (launchd) bzw. im Journal (systemd)
+    // — sichtbar, bevor je ein Checkpoint lief.
     match watched {
         Ok(observer) => {
             let observer = match pipeline {
@@ -702,10 +705,13 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
                     observer
                 }
             };
+            eprintln!("witness observer: watching {}", root.display());
             writer.observe_into(key.clone(), observer)
         }
         Err(err) => {
-            log(&home, &format!("file observer unavailable: {err}"));
+            let note = format!("file observer unavailable: {err}");
+            log(&home, &note);
+            eprintln!("witness observer: {}", crate::hooklog::diagnostic(&note));
             writer.lifecycle(&key, "fs.gap", serde_json::json!({"reason": "unavailable"}))?;
         }
     }

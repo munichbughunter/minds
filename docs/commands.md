@@ -46,7 +46,8 @@ the witness under its own user — the only setup that can reach A2:
    (`ssh-keygen -l` at creation), **not** with the `.pub` next to it — the Git config and that
    file are writable for the agent; a key pinned earlier is kept;
    afterwards `enable` prints `intent key at the witness: …`, computed by the witness user —
-   the line to compare), `keygen` and `signers` as that user; installs and starts a system service (`/Library/LaunchDaemons/dev.minds.witness.<repo-id>.plist`
+   the line to compare), `keygen` and `signers` as that user; installs and starts a system service (`/Library/LaunchDaemons/dev.minds.witness.<repo-id>.plist`,
+   its stderr in `<witness home>/log/witness.err`,
    or `/etc/systemd/system/minds-witness-<repo-id>.service` with `NoNewPrivileges`,
    `ProtectSystem=strict`; umask 007); and writes Claude Code managed settings with deny rules
    only (`minds witness`, `Edit` of `.git/refs/minds`, `Read`/`Edit` of the witness home — Claude
@@ -557,7 +558,10 @@ Each journal append advances a salted, atomically persisted chain. Restart check
 the persisted prefix before completing interrupted updates. `witness.start` records
 whether the previous run stopped cleanly; SIGINT and SIGTERM append `witness.stop`.
 `--follow` shows sequence, event kind, interpreted tool/path and chain head, without
-prompts, arguments or tool responses. Redacted diagnostics go to `log/witness.log`.
+prompts, arguments or tool responses. Redacted diagnostics go to `log/witness.log`;
+the file observer's start (`witness observer: watching <root>`), its failure to start
+and its gaps also go to stderr, which the LaunchDaemon writes to `log/witness.err`
+(systemd: the journal).
 `status` shows the profile, repository, socket health, open hook sessions, most recent
 event, key fingerprint and the ten latest ledger entries.
 

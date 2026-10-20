@@ -19,6 +19,12 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The observer announces itself on stderr.** `minds witness run` prints
+  `witness observer: watching <root>` when the file observer starts, and the
+  reason when it cannot (plus its gaps, throttled like the log). The
+  protected LaunchDaemon writes that stderr to `<witness home>/log/witness.err`
+  (`StandardErrorPath`), so a witness that never watched is visible without
+  a checkpoint; under systemd it is in the journal.
 - **Observer gaps are named, not silent.** When the file observer loses
   notifications (a full channel, a panic, unreadable ignore rules, no
   watcher), its `fs.gap` event now counts what the full channel refused

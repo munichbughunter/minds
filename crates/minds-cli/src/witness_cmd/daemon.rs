@@ -1725,6 +1725,8 @@ impl Writer {
         self.gap_dropped = 0;
         self.last_gap.insert(reason, now);
         log(&self.home, note);
+        // Gedrosselt wie das Log: höchstens eine Zeile je Grund und Sekunde.
+        eprintln!("witness observer: {}", crate::hooklog::diagnostic(note));
         let payload = if dropped > 0 {
             serde_json::json!({ "reason": reason, "dropped": dropped })
         } else {

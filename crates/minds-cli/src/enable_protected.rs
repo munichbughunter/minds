@@ -536,7 +536,10 @@ fn word(text: &str) -> bool {
 
 /// Der LaunchDaemon: unter dem Witness-Nutzer, Umask 007 — was er in
 /// `.git` anlegt, bleibt für die Gruppe schreibbar; sein Home legt er mit
-/// eigenen, engeren Modi an.
+/// eigenen, engeren Modi an. Sein stderr (Start und Fehler des
+/// Datei-Beobachters, Panics) landet in `<home>/log/witness.err` — neben
+/// `witness.log`, das der Witness selbst schreibt; ohne die Datei wäre ein
+/// Beobachter, der nie startete, nur über `minds doctor` zu sehen.
 fn launch_daemon(label: &str, home: &str) -> std::io::Result<String> {
     let xml = |text: &str| {
         text.replace('&', "&amp;")
@@ -574,6 +577,8 @@ fn launch_daemon(label: &str, home: &str) -> std::io::Result<String> {
 		<key>SuccessfulExit</key>
 		<false/>
 	</dict>
+	<key>StandardErrorPath</key>
+	<string>{home}/log/witness.err</string>
 	<key>Umask</key>
 	<integer>7</integer>
 </dict>
@@ -1140,6 +1145,25 @@ mod tests {
             std::fs::create_dir(&spaced).unwrap();
             assert!(super::script(&values(&spaced, Path::new("/opt/minds"))).is_err());
         }
+    }
+
+    /// Der LaunchDaemon schreibt sein stderr in das Log-Verzeichnis des
+    /// Witness-Homes — XML-sicher, auch bei einem Home mit Sonderzeichen.
+    #[test]
+    fn the_launch_daemon_writes_stderr_into_the_witness_home() {
+        let plist =
+            launch_daemon("dev.minds.witness.x", "/private/var/db/minds-witness/x").unwrap();
+        assert!(
+            plist.contains(
+                "\t<key>StandardErrorPath</key>\n\t<string>/private/var/db/minds-witness/x/log/witness.err</string>\n"
+            ),
+            "{plist}"
+        );
+        let odd = launch_daemon("l", "/tmp/a&b<c>").unwrap();
+        assert!(
+            odd.contains("<string>/tmp/a&amp;b&lt;c&gt;/log/witness.err</string>"),
+            "{odd}"
+        );
     }
 
     /// Beide Vorlagen nennen nur Platzhalter, die `script` kennt — auch die
