@@ -325,8 +325,11 @@ fn c37_while_the_requirement_loads_next_waits() {
                 verdict: Ok(crate::VerifyVerdict::Verified),
                 sessions: vec![crate::SessionAssurance {
                     session: sid('a'),
-                    level: minds_reader::assurance::Assurance::A0Claimed,
-                    reason: None,
+                    rating: minds_reader::assurance::Assurance::A1 {
+                        level: minds_reader::assurance::AssuranceLevel::A0Claimed,
+                        reason: minds_reader::assurance::Reason::NoSeal,
+                        range: None,
+                    },
                     intent: minds_reader::assurance::IntentState::Bound {
                         anchor_id: minds_core::ContentHash::from_bytes([1; 32]),
                         chained: true,

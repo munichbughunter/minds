@@ -6,7 +6,10 @@
 //!
 //! Die TUI rechnet hier nichts nach: Alles kommt fertig aus
 //! [`EvidenceReport`] ([`minds_reader`]) — derselben Rechnung, die auch
-//! `minds verify` und das Audit-Bundle tragen. Und sie behauptet nie mehr
+//! `minds verify` und das Audit-Bundle tragen. Die Stufe (INTEGRITY, LIMITS)
+//! kommt aus [`App::session_rating`]: dem Urteil von `minds verify`, sobald
+//! es da ist — dasselbe Wort wie in der Übersicht —, davor der Stufe, die
+//! das Repository allein trägt. Und sie behauptet nie mehr
 //! als das Modell: „vollständig" heißt vollständig **innerhalb** der
 //! Beobachtungsgrenze; was außerhalb liegt, ist `— nicht erfasst`, keine
 //! Lücke — und eine Lücke ist kein Beweis, dass etwas geschah.
@@ -27,6 +30,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use minds_reader::artifact::{ArtifactState, CommitArtifact, NOT_OBSERVED, provenance_note};
+use minds_reader::assurance::Assurance;
 use minds_reader::changes::LineClasses;
 use minds_reader::model::{
     CoverageAxis, EpochLink, EpochReport, EvidenceReport, EvidenceVerdict, InterpretationAxis,
@@ -82,6 +86,9 @@ pub fn draw(
     let inner = area.width.saturating_sub(4) as usize;
     let check = app.evidence_check(id, artifacts);
     let intact = intact(&check);
+    // Die Stufe: einmal berechnet, für INTEGRITY und LIMITS — aus dem
+    // Urteil von `minds verify`, wenn es diese Session nennt.
+    let (rating, checked) = app.session_rating(id);
 
     // Kopf: Identität, Trust Strip, Prüfzeit — dann der Satz für Menschen
     // und das Urteil von `minds verify`.
@@ -113,6 +120,7 @@ pub fn draw(
     // Satz, TECHNICAL zu- oder aufgeklappt.
     let rows = rows(
         report,
+        &rating,
         uninterpreted,
         artifacts,
         lines,
@@ -150,7 +158,15 @@ pub fn draw(
 
     // Das Detail folgt dem Fokus — wie bisher, ohne dass Enter etwas
     // verspricht.
-    let (title, lines) = detail(report, uninterpreted, artifacts, lines, cursor);
+    let (title, lines) = detail(
+        report,
+        &rating,
+        checked,
+        uninterpreted,
+        artifacts,
+        lines,
+        cursor,
+    );
     frame.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }).block(
             Block::bordered()
@@ -403,10 +419,12 @@ fn sub(glyph: &str, text: String, style: Style) -> Line<'static> {
 
 /// Die Achsenzeilen — mit dem Cursor auf `cursor`. `intact`: ob `minds
 /// verify` das Siegel bestätigt hat — erst dann `✓ record intact`, davor
-/// `◈ record sealed` (der Trust-Glyph der Achse).
+/// `◈ record sealed` (der Trust-Glyph der Achse). `rating`: die Stufe aus
+/// [`App::session_rating`] — INTEGRITY nennt ihr Wort, LIMITS ihren Satz.
 #[allow(clippy::too_many_arguments)]
 fn rows(
     report: &EvidenceReport,
+    rating: &Assurance,
     uninterpreted: usize,
     artifacts: &[CommitArtifact],
     lines: &[CommitLines],
@@ -423,7 +441,6 @@ fn rows(
     let mut out: Vec<(usize, Line<'static>)> = Vec::new();
 
     // INTEGRITY: Record, Seals und Signatur, Kette und Stufe — in einem.
-    let level = report.assurance.code();
     if state.verdict == EvidenceVerdict::Tampered {
         let (glyph, word, style) = theme::tampered();
         out.push((
@@ -463,7 +480,7 @@ fn rows(
             glyph = "!";
             style = warn;
         }
-        text.push_str(&format!(" · {level}"));
+        text.push_str(&format!(" · {}", rating.word()));
         out.push((0, axis(SECTIONS[0], glyph, text, style)));
     }
 
@@ -502,12 +519,9 @@ fn rows(
     };
     out.push((2, axis(SECTIONS[2], d.glyph, interpretation, d.style)));
 
-    // LIMITS: die Grenze der Stufe als Satz, nicht als Zahl.
-    let limit = format!(
-        "{} at {level} — {}",
-        level_word(report.assurance),
-        crate::copy::assurance_limit(report.assurance)
-    );
+    // LIMITS: die Grenze der Stufe als Satz, nicht als Zahl — aus der
+    // Variante der Stufe, nicht aus dieser Ansicht.
+    let limit = rating.limit();
     let text_width = width.saturating_sub(LABEL + 1);
     for (i, part) in wrap(&limit, text_width).into_iter().enumerate() {
         if i == 0 {
@@ -557,15 +571,6 @@ fn rows(
             }
         })
         .collect()
-}
-
-/// Das Wort der Stufe ohne Kürzel (`observed` für `A1 observed`).
-fn level_word(level: minds_reader::assurance::Assurance) -> &'static str {
-    level
-        .word()
-        .split_once(' ')
-        .map(|(_, word)| word)
-        .unwrap_or(level.word())
 }
 
 /// Die Abgleich-Zeilen unter COVERAGE: je abgeglichenem Commit eine.
@@ -701,8 +706,11 @@ fn legacy(
 }
 
 /// Der Detail-Block der fokussierten Sektion.
+#[allow(clippy::too_many_arguments)]
 fn detail(
     report: &EvidenceReport,
+    rating: &Assurance,
+    checked: bool,
     uninterpreted: usize,
     artifacts: &[CommitArtifact],
     lines: &[CommitLines],
@@ -722,7 +730,7 @@ fn detail(
             ("COVERAGE", out)
         }
         2 => ("INTERPRETATION", interpretation(uninterpreted)),
-        3 => ("LIMITS", limitations(report)),
+        3 => ("LIMITS", limitations(rating, checked)),
         _ => ("TECHNICAL", integrity(report)),
     }
 }
@@ -1060,34 +1068,31 @@ fn interpretation(uninterpreted: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Der Hinweis unter der Überschrift: Nur wo eine Signaturprüfung die
-/// Stufe ändern könnte — A1 mit einem Witness-Seal —, verweist er auf
-/// `minds verify --signers`; sonst versprach er etwas, das nicht kommt.
-fn limits_note(report: &EvidenceReport) -> &'static str {
-    let witnessed = report
-        .epochs
-        .iter()
-        .any(|epoch| epoch.scope == minds_core::evidence::SCOPE_WITNESS_V1);
-    if report.assurance == minds_reader::assurance::Assurance::A1Observed && witnessed {
-        "Level from the repository alone, witness signatures unchecked — `minds verify --signers` may rate differently."
-    } else {
-        "Level from the repository alone."
+/// Der Hinweis unter der Überschrift: woher die Stufe stammt. Eine
+/// ungeprüfte Witness-Signatur sagt es mit dem Satz der Variante —
+/// `minds verify --signers` urteilt dann; sonst versprach der Hinweis
+/// etwas, das nicht kommt.
+fn limits_note(rating: &Assurance, checked: bool) -> String {
+    match rating {
+        Assurance::Unchecked { .. } => rating.limit(),
+        _ if checked => "Level as minds verify rated it, signatures checked.".into(),
+        _ => "Level from the repository alone.".into(),
     }
 }
 
-/// Die Grenzen der Stufe, die das Material aus dem Repository allein trägt
-/// (EA-13) — die Stufe steht über der Liste, damit niemand die Grenzen
-/// einer anderen Stufe unterstellt.
-pub(super) fn limitations(report: &EvidenceReport) -> Vec<Line<'static>> {
+/// Die Grenzen der Stufe (EA-13) — die Stufe steht über der Liste, damit
+/// niemand die Grenzen einer anderen Stufe unterstellt. `checked`: die
+/// Stufe stammt aus der Signaturprüfung von `minds verify`.
+pub(super) fn limitations(rating: &Assurance, checked: bool) -> Vec<Line<'static>> {
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("At {}, Minds does NOT prove:", report.assurance.word()),
+            format!("At {}, Minds does NOT prove:", rating.word()),
             theme::title(),
         )),
-        Line::from(Span::styled(limits_note(report), theme::dim())),
+        Line::from(Span::styled(limits_note(rating, checked), theme::dim())),
         Line::default(),
     ];
-    for limit in &report.limitations {
+    for limit in rating.limitations() {
         lines.push(Line::from(vec![
             Span::styled("• ", theme::dim()),
             Span::raw(limit.text),

@@ -107,8 +107,13 @@ impl Source for Live<'_> {
     }
 
     fn verify(&self, commit: CommitId) -> Result<CommitVerify, String> {
-        verify_commit(self.ctx, commit, self.exe.as_ref().map_err(|why| *why))
-            .map_err(|err| minds_reader::sanitize(&err.to_string()))
+        verify_commit(
+            self.ctx,
+            commit,
+            self.exe.as_ref().map_err(|why| *why),
+            None,
+        )
+        .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
 
     fn intents(&self, named: &[minds_core::ContentHash]) -> Result<minds_tui::IntentList, String> {
@@ -157,7 +162,7 @@ impl minds_tui::Background for BackgroundVerify {
             })
         };
         let ctx = open().map_err(|err| minds_reader::sanitize(&err.to_string()))?;
-        verify_commit(&ctx, commit, self.exe.as_ref().map_err(|why| *why))
+        verify_commit(&ctx, commit, self.exe.as_ref().map_err(|why| *why), None)
             .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
 }
@@ -450,12 +455,13 @@ fn intent_infos_with<'a>(
 }
 
 /// Das signaturabhängige Urteil über `commit` — dieselben Bausteine wie
-/// `minds verify` (`session_assurance`, gegen `~/.ssh/allowed_signers`) und
-/// derselbe Bereichs-Check. Strikt lesend.
+/// `minds verify` (`session_assurance`, gegen `signers`; `None`:
+/// `~/.ssh/allowed_signers`) und derselbe Bereichs-Check. Strikt lesend.
 fn verify_commit(
     ctx: &Context,
     commit: CommitId,
     exe: Result<&PinnedExe, &str>,
+    signers: Option<&str>,
 ) -> Fallible<CommitVerify> {
     use crate::verify_cmd::{ArtifactState, scope::ScopeState};
 
@@ -463,7 +469,7 @@ fn verify_commit(
     let ids = crate::verify_cmd::sessions_of_commit(ctx, commit)?;
     // Wie `minds verify`: ssh-keygen für Gegenzeichnungen außerhalb des
     // Checkouts aufgelöst — kein vom Agenten abgelegtes `ssh-keygen` im PATH.
-    let trust = crate::verify_cmd::witness_trust::WitnessTrust::new(store, None)
+    let trust = crate::verify_cmd::witness_trust::WitnessTrust::new(store, signers)
         .with_anchor_program(
             std::env::var("PATH")
                 .ok()
@@ -478,7 +484,7 @@ fn verify_commit(
         let report = crate::verify_cmd::session_assurance(
             store,
             &trust,
-            None,
+            signers,
             &ctx.root,
             *id,
             Some(*source),
@@ -492,9 +498,8 @@ fn verify_commit(
         );
         sessions.push(SessionAssurance {
             session: *id,
-            level: report.overall,
-            reason: crate::verify_cmd::assurance::first_reason(&report)
-                .map(|r| minds_reader::sanitize(&r)),
+            // Dieselbe Stufe wie die `Assurance`-Zeile von `verify`.
+            rating: report.rating.clone(),
             tampered: report.reasons.contains(&Reason::IntegrityBroken),
             intent: report.intent,
         });
@@ -1245,7 +1250,7 @@ mod tests {
             store: Box::new(store),
         };
         let head = ctx.repo.head().unwrap().commit().unwrap();
-        let live = super::verify_commit(&ctx, head, Err("not available"))
+        let live = super::verify_commit(&ctx, head, Err("not available"), None)
             .map_err(|err| minds_reader::sanitize(&err.to_string()));
         let mut background = super::BackgroundVerify {
             root: dir.path().to_path_buf(),
@@ -1254,6 +1259,153 @@ mod tests {
         let answer = minds_tui::Background::verify(&mut background, head);
         assert_eq!(answer, live);
         assert_eq!(answer.unwrap().sessions[0].session, id);
+    }
+
+    /// Identischer Seal, identische Signer-Datei, drei Pfade: `minds verify`
+    /// (`session_assurance` mit `--signers`), die TUI-Quelle
+    /// (`verify_commit`, deren `SessionAssurance.rating` Overview, Evidence
+    /// und Bindung zeigen) und der Report selbst — dieselbe `Assurance`. Ein
+    /// echter `witness/v1`-Seal, mit einem frischen Schlüssel unter
+    /// `minds-witness` signiert, gegen eine echte `allowed_signers`-Datei
+    /// außerhalb des Repositorys geprüft. (Eine **fehlende** Signer-Datei
+    /// ist in `verify` ein operativer Fehler, kein `Unchecked` — den Fall
+    /// ohne Signer prüfen Reader und TUI.)
+    #[test]
+    fn the_same_seal_and_signers_file_rate_the_same_on_every_path() {
+        use minds_core::evidence::{SCOPE_WITNESS_V1, Seal, SealOutcome};
+        use minds_reader::assurance::Assurance;
+
+        assert!(
+            minds_attest::ssh_keygen_available(),
+            "SSH signature tests require ssh-keygen"
+        );
+        let dir = code_repo();
+        let store = InRepoStore::open(dir.path()).unwrap();
+        let session = Session::new(
+            Agent {
+                name: "claude-code".into(),
+                version: "1".into(),
+            },
+            Model {
+                provider: "anthropic".into(),
+                id: "opus".into(),
+            },
+            Intent {
+                request: "Signer-Probe".into(),
+                ..Intent::default()
+            },
+        );
+        let redacted = minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_session(session)
+            .unwrap();
+        let id = store.put(&redacted).unwrap().id();
+
+        // Der Seal: ein bezeugter Bereich dieser Session, im Store.
+        let seal = Seal {
+            root: minds_core::ContentHash::from_bytes([7u8; 32]),
+            agent: "claude-code".into(),
+            scope: SCOPE_WITNESS_V1.into(),
+            first_seq: 0,
+            last_seq: 2,
+            events: 3,
+            gaps: 0,
+            pre_chain: 0,
+            outcome: SealOutcome::Stored {
+                session: id.to_string(),
+            },
+            previous: None,
+            last_event_at: "2026-07-25T14:10:00Z".into(),
+        };
+        let text = seal.to_text().unwrap();
+        let seal_id = store.put_seal(&text).unwrap();
+        store.record_session_seal(id, &seal_id).unwrap();
+
+        // Schlüssel und Signer-Datei außerhalb des Repositorys; der
+        // Principal ist als getrennter Witness eingetragen.
+        let trust_dir = tempfile::tempdir().unwrap();
+        let key = trust_dir.path().join("witness");
+        assert!(
+            Command::new("ssh-keygen")
+                .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+                .arg(&key)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+        let signers = trust_dir.path().join("allowed_signers");
+        std::fs::write(
+            &signers,
+            format!(
+                "minds-witness-user@test namespaces=\"minds-witness\" {}\n",
+                public.trim()
+            ),
+        )
+        .unwrap();
+        let signature = minds_attest::ssh_sign_ns(&text, &key, minds_attest::NS_WITNESS).unwrap();
+        store.put_seal_signature(&seal_id, &signature).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "x\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]);
+        git(
+            dir.path(),
+            &[
+                "commit",
+                "-q",
+                "-m",
+                &format!("probe\n\nMinds-Session-Id: {id}"),
+            ],
+        );
+        let ctx = Context {
+            repo: Repo::open(dir.path()).unwrap(),
+            root: dir.path().to_path_buf(),
+            store: Box::new(store),
+        };
+        let head = ctx.repo.head().unwrap().commit().unwrap();
+        let signers = signers.to_str().unwrap();
+
+        // Pfad 1 — `minds verify --signers`: der Report der Session.
+        let trust =
+            crate::verify_cmd::witness_trust::WitnessTrust::new(ctx.store.as_ref(), Some(signers));
+        let report = crate::verify_cmd::session_assurance(
+            ctx.store.as_ref(),
+            &trust,
+            Some(signers),
+            &ctx.root,
+            id,
+            Some(minds_core::EvidenceSource::Observed),
+            Some(&head.to_string()),
+        )
+        .unwrap();
+        // Pfad 2 — die TUI-Quelle: dieselbe Stufe in `SessionAssurance`.
+        let verdict =
+            super::verify_commit(&ctx, head, Err("not available"), Some(signers)).unwrap();
+        assert_eq!(verdict.sessions.len(), 1);
+        assert_eq!(verdict.sessions[0].rating, report.rating);
+        // Die Signatur wurde geprüft: ein Witness hat signiert — A1 aus
+        // anderen Gründen (kein Beobachtungsfenster), nie ungeprüft, nie
+        // „no witness ran".
+        assert!(
+            matches!(report.rating, Assurance::A1 { .. }),
+            "{:?}",
+            report.rating
+        );
+        assert_eq!(
+            report.witness.as_ref().map(|w| w.principals.clone()),
+            Some(vec!["minds-witness-user@test".to_string()])
+        );
+        assert!(
+            !report.rating.limit().contains("no witness ran"),
+            "{}",
+            report.rating.limit()
+        );
+        assert!(
+            !report.rating.limit().contains("not checked"),
+            "{}",
+            report.rating.limit()
+        );
     }
 
     #[test]
@@ -1297,13 +1449,18 @@ mod tests {
             store: Box::new(store),
         };
         let head = ctx.repo.head().unwrap().commit().unwrap();
-        let verdict = super::verify_commit(&ctx, head, Err("not available")).unwrap();
+        let verdict = super::verify_commit(&ctx, head, Err("not available"), None).unwrap();
         assert_eq!(verdict.sessions.len(), 1);
         assert_eq!(verdict.sessions[0].session, id);
-        // Ohne Seal: nichts beobachtet, nur behauptet.
+        // Ohne Seal: nichts beobachtet, nur behauptet — in den Worten der
+        // `Assurance`-Zeile von `verify` (vor der Evidence-Kette erfasst).
         assert_eq!(
-            verdict.sessions[0].level,
-            minds_reader::assurance::Assurance::A0Claimed
+            verdict.sessions[0].rating,
+            minds_reader::assurance::Assurance::A1 {
+                level: minds_reader::assurance::AssuranceLevel::A0Claimed,
+                reason: minds_reader::assurance::Reason::Legacy,
+                range: None,
+            }
         );
         assert!(!verdict.sessions[0].tampered);
         // Wie `verify`: ohne Seal keine Evidence-Kette, kein Scope-Befund.
@@ -1324,7 +1481,7 @@ mod tests {
         match exe {
             Some(exe) => {
                 let pinned = super::pin_exe(&exe, &ctx.root, dir.path()).unwrap();
-                let verdict = super::verify_commit(&ctx, head, Ok(&pinned)).unwrap();
+                let verdict = super::verify_commit(&ctx, head, Ok(&pinned), None).unwrap();
                 assert_eq!(verdict.verdict, Ok(minds_tui::VerifyVerdict::NotVerifiable));
             }
             None => {

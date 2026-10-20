@@ -9,7 +9,9 @@
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
-use minds_reader::assurance::{Assurance, IntentSignature, IntentState, SignerKind};
+use minds_reader::assurance::{
+    Assurance, AssuranceLevel, IntentSignature, IntentState, Reason, SignerKind,
+};
 use minds_reader::changes::LineClasses;
 
 use super::*;
@@ -60,8 +62,11 @@ impl crate::Background for Slow {
 pub(super) fn verified_session(c: char) -> SessionAssurance {
     SessionAssurance {
         session: sid(c),
-        level: Assurance::A0Claimed,
-        reason: None,
+        rating: Assurance::A1 {
+            level: AssuranceLevel::A0Claimed,
+            reason: Reason::NoSeal,
+            range: None,
+        },
         intent: IntentState::Unbound,
         tampered: false,
     }
@@ -85,8 +90,12 @@ fn verdict(tampered: bool, verdict: VerifyVerdict) -> CommitVerify {
         verdict: Ok(verdict),
         sessions: vec![SessionAssurance {
             session: sid('a'),
-            level: Assurance::A2Witnessed,
-            reason: Some("not reproduced in CI".into()),
+            rating: Assurance::A2 {
+                level: AssuranceLevel::A2Witnessed,
+                principal: "minds-witness-user@build-07".into(),
+                profile: vec![minds_core::evidence::WitnessProfile::User],
+                intent: "intent signed, software key".into(),
+            },
             intent: IntentState::Bound {
                 anchor_id: minds_core::ContentHash::from_bytes([1u8; 32]),
                 chained: true,
@@ -852,4 +861,202 @@ fn b6_the_spinner_is_ascii_and_turns() {
     }
     let out = text_at(&mut app, 160, 40);
     assert!(line_with(&out, "EVIDENCE").contains("checked "), "{out}");
+}
+
+// ---------------------------------------------------------------------
+// Eine Assurance-Berechnung für alle Ansichten
+// ---------------------------------------------------------------------
+
+/// Derselbe Seal — ein signierter `witness/v1`-Bereich der Session a, im
+/// Index — und dieselbe Signer-Lage, wie `minds verify --signers` sie
+/// feststellt: Die Stufe kommt aus der einen Funktion
+/// (`minds_reader::assurance::assurance`), die Quelle reicht sie als
+/// `SessionAssurance.rating` durch, und die drei Ansichten rendern ihr
+/// Wort — F1 INTEGRITY, F3 INTEGRITY und LIMITS, F4 die Bindung —, nie
+/// ein eigenes. Vor der Prüfung zeigt F3 für denselben Seal, was der
+/// Index ohne Signer durch dieselbe Funktion rechnet: ungeprüft, nie
+/// „no witness ran".
+#[test]
+fn c122_the_three_views_render_the_rating_of_the_same_seal() {
+    use minds_core::evidence::{SCOPE_WITNESS_V1, Seal, SealOutcome, WitnessProfile};
+    use minds_reader::assurance::{
+        FsCoverage, LedgerCheck, RangeInput, SealMaterial, SealSignature, Seals,
+        Signers as Trusted, WitnessStart, assurance,
+    };
+    use minds_reader::model::EvidenceVerdict;
+
+    let (_dir, repo, commits, inspection) = history();
+    // Der Seal, im Index der Session a.
+    let seal = Seal {
+        root: minds_core::ContentHash::from_bytes([9u8; 32]),
+        agent: "claude-code".into(),
+        scope: SCOPE_WITNESS_V1.into(),
+        first_seq: 0,
+        last_seq: 3,
+        events: 4,
+        gaps: 0,
+        pre_chain: 0,
+        outcome: SealOutcome::Stored {
+            session: sid('a').to_string(),
+        },
+        previous: None,
+        last_event_at: "2026-07-25T14:10:00Z".into(),
+    };
+    let seal_id = Seal::id_of_text(&seal.to_text().unwrap());
+    let index = inspection.index();
+    let sessions: BTreeMap<SessionId, Session> =
+        index.sessions().map(|(id, s)| (*id, s.clone())).collect();
+    let mut links: BTreeMap<CommitId, Vec<SessionId>> = BTreeMap::new();
+    for id in sessions.keys() {
+        for commit in index.commits_of(*id) {
+            links.entry(commit).or_default().push(*id);
+        }
+    }
+    let inspection = Inspection::from_index(
+        Index::from_parts(sessions, links)
+            .with_seals(sid('a'), vec![(seal_id.clone(), seal, true)]),
+        Vec::new(),
+        "demo",
+    );
+
+    // Derselbe Seal als Material, dieselbe Signer-Lage — die Stufe aus der
+    // einen Funktion.
+    let intent = IntentState::Bound {
+        anchor_id: minds_core::ContentHash::from_bytes([1u8; 32]),
+        chained: true,
+        signature: IntentSignature::Valid(SignerKind::SoftwareKey),
+        snapshot_matches: true,
+        from_session_start: true,
+        changed_mid_session: false,
+    };
+    let ranges = [RangeInput {
+        seal: seal_id,
+        scope: SCOPE_WITNESS_V1.into(),
+        signature: SealSignature::Witness {
+            principal: "minds-witness-user@build-07".into(),
+        },
+        closes_session: true,
+    }];
+    let material = SealMaterial {
+        seals: Seals::Sealed(&ranges),
+        integrity: EvidenceVerdict::Verified,
+        chain_closed: true,
+        ledger: &LedgerCheck::NotChecked,
+        link: Some(EvidenceSource::Observed),
+        intent: &intent,
+    };
+    let starts = [WitnessStart {
+        profile: Some(WitnessProfile::User),
+        isolated: true,
+        key: None,
+    }];
+    let trusted = Trusted {
+        witness_starts: &starts,
+        observations: &FsCoverage::Complete,
+        replay: None,
+        anchors: None,
+    };
+    let rating = assurance(&material, Some(&trusted));
+    assert_eq!(rating.word(), "A2 witnessed");
+    // Ohne Signer rechnet der Index für denselben Seal dieselbe Funktion.
+    let unchecked = assurance(&material, None);
+    assert_eq!(
+        inspection.evidence_report(sid('a')).unwrap().rating,
+        unchecked
+    );
+    assert!(
+        matches!(unchecked, Assurance::Unchecked { .. }),
+        "{unchecked:?}"
+    );
+
+    /// Die Quelle: das Urteil von `minds verify` mit dieser Stufe, und der
+    /// Anker, den Session a nennt.
+    struct Rated(CommitVerify);
+    impl crate::Source for Rated {
+        fn load(&self) -> minds_reader::Result<Inspection> {
+            unreachable!("the test loads with an explicit inspection")
+        }
+        fn stamp(&self) -> Option<crate::Stamp> {
+            Some("1".into())
+        }
+        fn verify(&self, _commit: CommitId) -> Result<CommitVerify, String> {
+            Ok(self.0.clone())
+        }
+        fn intents(&self, _named: &[minds_core::ContentHash]) -> Result<crate::IntentList, String> {
+            Ok(crate::IntentList {
+                entries: vec![crate::IntentInfo {
+                    id: minds_core::ContentHash::from_bytes([1u8; 32]),
+                    active: false,
+                    detail: Ok(proven_anchor()),
+                }],
+                total: 1,
+                skipped: 0,
+            })
+        }
+    }
+    let source = Rated(CommitVerify {
+        verdict: Ok(VerifyVerdict::Verified),
+        sessions: vec![SessionAssurance {
+            session: sid('a'),
+            rating: rating.clone(),
+            intent: intent.clone(),
+            tampered: false,
+        }],
+        out_of_scope: None,
+        out_of_scope_paths: Vec::new(),
+        scope_note: None,
+        conformance: None,
+        observations: Vec::new(),
+    });
+    let word = format!("· {}", rating.word());
+
+    // Vor der Prüfung: F3 zeigt die Stufe des Repositorys allein.
+    let mut app = on_agent(&repo, inspection, &commits);
+    app.reduce(Action::Evidence);
+    let out = text_at(&mut app, 180, 50);
+    assert!(
+        line_with(&out, "INTEGRITY").contains(&format!("· {}", unchecked.word())),
+        "{out}"
+    );
+    assert!(
+        line_with(&out, "LIMITS").contains(&unchecked.limit()),
+        "{out}"
+    );
+    assert!(!out.contains("no witness ran"), "{out}");
+    app.reduce(Action::Back);
+    app.reduce(Action::TabTo(0));
+
+    // F1 — die Übersicht, mit dem Urteil der Quelle.
+    assert!(app.fill_overview_verify(&source));
+    let out = text_at(&mut app, 180, 50);
+    let integrity = line_with(&out, "INTEGRITY");
+    assert!(integrity.contains("✓ VERIFIED"), "{integrity}");
+    assert!(integrity.contains(&word), "{integrity}");
+
+    // F3 — der Evidence-Report derselben Session: dasselbe Wort, der
+    // Grenz-Satz der Stufe.
+    app.reduce(Action::Evidence);
+    let out = text_at(&mut app, 180, 50);
+    assert!(out.contains("Verdict of minds verify: ✓ VERIFIED"), "{out}");
+    assert!(line_with(&out, "INTEGRITY").contains(&word), "{out}");
+    assert!(
+        line_with(&out, "LIMITS")
+            .contains("witnessed at A2 — a separated witness observed and signed the record"),
+        "{out}"
+    );
+    assert!(!out.contains("A1 observed"), "{out}");
+    assert!(!out.contains("no witness ran"), "{out}");
+
+    // F4 — die Bindung des Ankers, den Session a im Witness-Event nennt.
+    app.reduce(Action::TabTo(3));
+    app.fill_intents(&source);
+    let out = text_at(&mut app, 180, 50);
+    assert!(
+        out.contains(&format!(
+            "· binding {} — the agent named this anchor in a witness event, not a local file",
+            rating.word()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("binding A1"), "{out}");
 }

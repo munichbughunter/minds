@@ -77,7 +77,7 @@ pub(crate) mod witness_trust;
 
 use artifact::Artifact;
 use minds_core::EvidenceSource;
-use minds_reader::assurance::{Assurance, FsCoverage, LedgerCheck};
+use minds_reader::assurance::{AssuranceLevel, FsCoverage, LedgerCheck};
 
 type Fallible<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -298,7 +298,7 @@ fn verify_target(
     options: ArtifactOptions<'_>,
     required: Option<u8>,
     assurance_options: AssuranceOptions<'_>,
-    required_assurance: Option<Assurance>,
+    required_assurance: Option<AssuranceLevel>,
 ) -> ExitCode {
     let ctx = match Context::open() {
         Ok(ctx) => ctx,
@@ -764,7 +764,7 @@ fn verify_session(
     link: Option<EvidenceSource>,
     artifact: &ArtifactState,
     commit: Option<&str>,
-) -> Fallible<(Verdict, Assurance, scope::ScopeState)> {
+) -> Fallible<(Verdict, AssuranceLevel, scope::ScopeState)> {
     println!("Session        {id}");
     let store = ctx.store.as_ref();
 

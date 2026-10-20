@@ -168,26 +168,6 @@ pub fn integrity(axis: minds_reader::model::IntegrityAxis) -> &'static str {
     }
 }
 
-/// Der Satz zur Grenze einer Assurance-Stufe (C12.1, LIMITS): wer auf
-/// dieser Stufe zusah — und was deshalb nur Aussage des Agenten bleibt.
-pub fn assurance_limit(level: minds_reader::assurance::Assurance) -> &'static str {
-    use minds_reader::assurance::Assurance;
-    match level {
-        Assurance::A0Claimed => {
-            "nothing independent observed this session; every fact here is what the agent recorded."
-        }
-        Assurance::A1Observed => {
-            "no witness ran; the agent's own reports are the only source for file contents."
-        }
-        Assurance::A2Witnessed => {
-            "a separated witness observed and signed the record; file contents it did not read are still the agent's reports."
-        }
-        Assurance::A3Reproduced => {
-            "the result was reproduced independently; what was not reproduced remains observed, not proven."
-        }
-    }
-}
-
 /// Der Beleg einer Anforderung als Satz (C12.3): bei `file:`-Ankern mit
 /// dem Blob, sonst mit der Quelle.
 pub fn proven_sentence(blob: Option<&str>, source: &str) -> String {
@@ -203,23 +183,48 @@ pub fn signed_sentence(kind: &str) -> String {
     format!("signed — {kind}, checked against your allowed_signers (as minds verify does)")
 }
 
-/// Die Bindung (A1) als Satz (C12.3): wer den Anker nannte — eine Session
-/// in einem Witness-Event, die lokale Datei-Bindung, oder niemand.
-pub fn binding_sentence(witness: bool, local: bool) -> String {
-    match (witness, local) {
+/// Die Bindung als Satz (C12.3): wer den Anker nannte — eine Session in
+/// einem Witness-Event (`witness`: ihre Stufe, aus derselben Ableitung wie
+/// `minds verify` und die Übersicht; bei mehreren die schwächste), die
+/// lokale Datei-Bindung, oder niemand. Die Bindung trägt die Stufe der
+/// Session; eine ungeprüfte Witness-Signatur sagt es mit dem Satz der
+/// Variante. Die lokale Datei kann der Agent bearbeiten — sie bleibt A1.
+pub fn binding_sentence(
+    witness: Option<&minds_reader::assurance::Assurance>,
+    local: bool,
+) -> String {
+    use minds_reader::assurance::Assurance;
+    let (word, note) = match witness {
+        Some(rating @ Assurance::Unchecked { .. }) => (
+            rating.word(),
+            format!(" ({})", rating.limit().trim_end_matches('.')),
+        ),
+        Some(rating) => (rating.word(), String::new()),
+        None => (
+            minds_reader::assurance::AssuranceLevel::A1Observed.word(),
+            String::new(),
+        ),
+    };
+    match (witness.is_some(), local) {
         (true, false) => {
-            "binding A1 — the agent named this anchor in a witness event, not a local file".into()
+            format!(
+                "binding {word} — the agent named this anchor in a witness event, not a local file{note}"
+            )
         }
         (true, true) => {
-            "binding A1 — the agent named this anchor in a witness event; also the local file binding".into()
+            format!(
+                "binding {word} — the agent named this anchor in a witness event; also the local file binding{note}"
+            )
         }
         (false, true) => {
-            "binding A1 — the local file binding points to this anchor; no session named it in a witness event"
-                .into()
+            format!(
+                "binding {word} — the local file binding points to this anchor; no session named it in a witness event"
+            )
         }
         (false, false) => {
-            "binding A1 — no local file binding points to it and no session names it in a witness event"
-                .into()
+            format!(
+                "binding {word} — no local file binding points to it and no session names it in a witness event"
+            )
         }
     }
 }

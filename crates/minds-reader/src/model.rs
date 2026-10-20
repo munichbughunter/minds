@@ -432,19 +432,21 @@ pub struct EvidenceReport {
     pub scope: Option<String>,
     /// Die Epochen in Ablage-Reihenfolge.
     pub epochs: Vec<EpochReport>,
-    /// Die Stufe, die das Material **aus dem Repository allein** trägt
-    /// ([`crate::assurance::assess`] ohne vertrauenswürdige Signer, EA-13).
-    /// Der Reader prüft keine Signaturen — ohne geprüfte Witness-Signatur
-    /// gibt es kein A2, die Stufe liegt also höchstens bei A1. Ein
-    /// Rückverweis auf einen fehlenden Seal öffnet die Kette (A0), wie in
-    /// `minds verify`.
+    /// Die Stufe, wie jede Oberfläche sie zeigt ([`crate::assurance::rate`]),
+    /// aus dem Material **des Repositorys allein** ([`crate::assurance::assess`]
+    /// ohne vertrauenswürdige Signer, EA-13). Der Reader prüft keine
+    /// Signaturen: Ein signierter Witness-Seal ist hier
+    /// [`crate::assurance::Assurance::Unchecked`] — die Stufe steht bei A1, und
+    /// erst `minds verify --signers` urteilt höher. „no witness ran" sagt
+    /// nur ein Material ohne Witness-Signatur. Ein Rückverweis auf einen
+    /// fehlenden Seal öffnet die Kette (A0), wie in `minds verify`.
     ///
     /// Bekannte Abweichung: Der Reader liest die Seals über die
     /// Rückverweise der Session; `minds verify` nimmt zusätzlich jeden Seal
     /// des Namensraums, der die Session nennt, und kann deshalb **niedriger**
     /// urteilen (etwa bei einem dort unlesbaren Seal). Die Grenzen
     /// unterscheiden sich dabei nicht — A0 und A1 nennen dieselben.
-    pub assurance: crate::assurance::Assurance,
+    pub rating: crate::assurance::Assurance,
     /// Was das Proof-Modell auf dieser Stufe **nicht** belegt — das
     /// kanonische Vokabular ([`minds_core::evidence::limits_at`]), Teil des
     /// Reports, damit die Grenze in jeder Oberfläche steht.

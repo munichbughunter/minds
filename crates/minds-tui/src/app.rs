@@ -20,6 +20,7 @@ use minds_core::{ContentHash, SessionId};
 use minds_git::{CommitId, Repo};
 use minds_reader::Inspection;
 use minds_reader::artifact::CommitArtifact;
+use minds_reader::assurance::Assurance;
 use minds_reader::changes::ChangeSet;
 use minds_reader::model::{EvidenceReport, SessionCard};
 use minds_reader::story::Story;
@@ -1501,6 +1502,39 @@ impl<'a> App<'a> {
             lines,
             cursor: cursor.min(last),
             technical,
+        }
+    }
+
+    /// Die Stufe einer Session, wie **jede** Ansicht sie zeigt — und ob sie
+    /// aus der Signaturprüfung stammt. Die eine Stelle der Oberfläche
+    /// dafür: Hat `minds verify` die Session geprüft (ein Urteil der
+    /// Übersicht nennt sie), gilt dessen [`Assurance`] — dasselbe Wort wie in
+    /// INTEGRITY der Übersicht; sonst die Stufe, die das Repository allein
+    /// trägt ([`EvidenceReport::rating`]: ein signierter Witness-Seal ist
+    /// dann `Unchecked`, nie „no witness ran"). Ohne Seal-Material A0
+    /// (Legacy). Nichts hier leitet die Stufe aus Epochen oder Zeilen ab.
+    pub fn session_rating(&self, id: SessionId) -> (Assurance, bool) {
+        if let Some(overview) = &self.overview {
+            let checked = overview
+                .checks
+                .values()
+                .filter_map(|check| check.as_ref().ok())
+                .flat_map(|check| &check.sessions)
+                .find(|session| session.session == id);
+            if let Some(session) = checked {
+                return (session.rating.clone(), true);
+            }
+        }
+        match self.inspection.evidence_report(id) {
+            Some(report) => (report.rating, false),
+            None => (
+                Assurance::A1 {
+                    level: minds_reader::assurance::AssuranceLevel::A0Claimed,
+                    reason: minds_reader::assurance::Reason::Legacy,
+                    range: None,
+                },
+                false,
+            ),
         }
     }
 

@@ -235,10 +235,10 @@ pub struct IntentDetail {
 pub struct SessionAssurance {
     /// Die Session.
     pub session: minds_core::SessionId,
-    /// Die erreichte Stufe.
-    pub level: minds_reader::assurance::Assurance,
-    /// Warum nicht höher — der erste Grund, entschärft.
-    pub reason: Option<String>,
+    /// Die Stufe, wie `minds verify` sie zeigt — dieselbe Ableitung
+    /// ([`minds_reader::assurance::rate`]) für Overview, Evidence und
+    /// Requirements: ein Wort, ein Grenz-Satz.
+    pub rating: minds_reader::assurance::Assurance,
     /// Die Intent-Lage (gebunden, verkettet, Signatur).
     pub intent: minds_reader::assurance::IntentState,
     /// Das Seal-Material ist verändert (auch eine ungültige

@@ -619,11 +619,12 @@ impl Index {
         let scope = epochs
             .first()
             .map(|epoch: &EpochReport| epoch.scope.clone());
-        let assurance = repository_assurance(
+        let rating = repository_rating(
             seals,
             verdict,
             chain_closed && !self.seal_unresolved.contains(&id),
         );
+        let limitations = rating.limitations().collect();
         Some(EvidenceReport {
             state: EvidenceState {
                 verdict,
@@ -637,8 +638,8 @@ impl Index {
             },
             scope,
             epochs,
-            assurance,
-            limitations: minds_core::evidence::limits_at(assurance.level()).collect(),
+            rating,
+            limitations,
         })
     }
 
@@ -929,14 +930,13 @@ fn push_unique<T: PartialEq>(ids: &mut Vec<T>, id: T) {
 /// was der Reader allein zuspricht — ein `agent-hooks/v1`-Seal trägt es, ein
 /// Witness-Seal ohne Prüfung ebenso. Wer A2 belegen will, prüft die
 /// Witness-Signatur gegen `--signers` (`minds verify`).
-fn repository_assurance(
+fn repository_rating(
     seals: &[(ContentHash, Seal, bool)],
     verdict: crate::model::EvidenceVerdict,
     chain_closed: bool,
 ) -> crate::assurance::Assurance {
     use crate::assurance::{
-        AssuranceInput, FsCoverage, IntentState, LedgerCheck, RangeInput, SealSignature, Seals,
-        assess,
+        IntentState, LedgerCheck, RangeInput, SealMaterial, SealSignature, Seals, assurance,
     };
     // Zeitliche Reihenfolge wie in `minds verify`: Der letzte Bereich ist
     // das Ende der Session.
@@ -961,20 +961,18 @@ fn repository_assurance(
             closes_session: false,
         })
         .collect();
-    assess(&AssuranceInput {
-        seals: Seals::Sealed(&ranges),
-        integrity: verdict,
-        chain_closed,
-        ledger: &LedgerCheck::NotChecked,
-        link: None,
-        trusted_signers: false,
-        observations: &FsCoverage::Unavailable { cause: None },
-        witness_starts: &[],
-        intent: &IntentState::Unbound,
-        replay: None,
-        anchors: None,
-    })
-    .overall
+    // Dieselbe Tür wie `minds verify` — nur ohne Signer.
+    assurance(
+        &SealMaterial {
+            seals: Seals::Sealed(&ranges),
+            integrity: verdict,
+            chain_closed,
+            ledger: &LedgerCheck::NotChecked,
+            link: None,
+            intent: &IntentState::Unbound,
+        },
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -1292,7 +1290,10 @@ mod tests {
         // Audit-Bundle, nie eine eigene Liste, und zwar die der Stufe: Ein
         // `agent-hooks/v1`-Seal trägt A1.
         use minds_core::evidence::{DOES_NOT_PROVE, Level, limits_at};
-        assert_eq!(report.assurance, crate::assurance::Assurance::A1Observed);
+        assert_eq!(
+            report.rating.level(),
+            crate::assurance::AssuranceLevel::A1Observed
+        );
         assert_eq!(report.limitations, limits_at(Level::A1).collect::<Vec<_>>());
         assert_eq!(
             report
@@ -1317,12 +1318,13 @@ mod tests {
         assert_eq!(index.evidence_state(sid), Some(report.state));
     }
 
-    /// Der Reader prüft keine Signaturen: Ein signierter Witness-Seal
-    /// trägt hier A1, nie A2 — die Grenzen der Stufe A1 bleiben stehen
-    /// (fail-closed, EA-13). Verändertes Material fällt auf A0.
+    /// Der Reader prüft keine Signaturen: Ein signierter Witness-Seal ist
+    /// hier `Unchecked` — die Stufe A1, nie A2, und die Grenzen der Stufe
+    /// A1 bleiben stehen (fail-closed, EA-13). Verändertes Material fällt
+    /// auf A0.
     #[test]
     fn the_report_level_is_fail_closed_without_signers() {
-        use crate::assurance::Assurance;
+        use crate::assurance::{Assurance, AssuranceLevel};
         use minds_core::evidence::{Level, SCOPE_WITNESS_V1, limits_at};
         let sid: SessionId = format!("b3-{}", "a".repeat(64)).parse().unwrap();
         let mut sessions = BTreeMap::new();
@@ -1337,7 +1339,12 @@ mod tests {
         let index = Index::from_parts(sessions.clone(), BTreeMap::new())
             .with_seals(sid, vec![(witnessed_id, witnessed, true)]);
         let report = index.evidence_report(sid).unwrap();
-        assert_eq!(report.assurance, Assurance::A1Observed);
+        assert!(
+            matches!(report.rating, Assurance::Unchecked { .. }),
+            "{:?}",
+            report.rating
+        );
+        assert_eq!(report.rating.level(), AssuranceLevel::A1Observed);
         assert!(
             report
                 .limitations
@@ -1351,13 +1358,13 @@ mod tests {
             .with_seals(sid, vec![seal_for(sid, 0, None)])
             .with_unresolved_seal(sid);
         let report = index.evidence_report(sid).unwrap();
-        assert_eq!(report.assurance, Assurance::A0Claimed);
+        assert_eq!(report.rating.level(), AssuranceLevel::A0Claimed);
 
         // Zeigen **alle** Rückverweise ins Leere, ist das kein Legacy: ein
         // Report mit offener Kette, A0.
         let index = Index::from_parts(sessions.clone(), BTreeMap::new()).with_unresolved_seal(sid);
         let report = index.evidence_report(sid).expect("kein Legacy");
-        assert_eq!(report.assurance, Assurance::A0Claimed);
+        assert_eq!(report.rating.level(), AssuranceLevel::A0Claimed);
         assert_eq!(
             report.state.verdict,
             crate::model::EvidenceVerdict::Incomplete
@@ -1368,7 +1375,7 @@ mod tests {
             .with_seals(sid, vec![seal_for(sid, 0, None)])
             .with_tampered_seal(sid);
         let report = index.evidence_report(sid).unwrap();
-        assert_eq!(report.assurance, Assurance::A0Claimed);
+        assert_eq!(report.rating.level(), AssuranceLevel::A0Claimed);
         assert_eq!(report.limitations, limits_at(Level::A0).collect::<Vec<_>>());
     }
 

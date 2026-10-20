@@ -580,7 +580,7 @@ fn evidence_mode_limits_snapshot_a1() {
     let (_dir, repo) = repo();
     let app = App::new(filled(), &repo, None);
     let report = app.inspection.evidence_report(sid('a')).expect("Seal");
-    let text: Vec<String> = super::evidence::limitations(&report)
+    let text: Vec<String> = super::evidence::limitations(&report.rating, false)
         .iter()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
         .collect();
@@ -2619,7 +2619,7 @@ mod intent_tab {
 
     use minds_core::ContentHash;
     use minds_core::intent_anchor::IntentEvent;
-    use minds_reader::assurance::{IntentSignature, SignerKind};
+    use minds_reader::assurance::{Assurance, IntentSignature, SignerKind};
 
     use super::*;
     use crate::app::{Tab, View};
@@ -2645,11 +2645,216 @@ mod intent_tab {
         sessions.insert(sid('b'), b);
         let mut commits = BTreeMap::new();
         commits.insert(commit('1'), vec![sid('a')]);
-        Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t")
+        // Session a trägt einen sauberen `agent-hooks/v1`-Seal: Ihre Stufe
+        // aus dem Repository allein ist A1 — kein Witness lief.
+        let (seal_id, seal) = clean_seal(sid('a'));
+        let index =
+            Index::from_parts(sessions, commits).with_seals(sid('a'), vec![(seal_id, seal, false)]);
+        Inspection::from_index(index, Vec::new(), "t")
     }
 
     fn anchored() -> Inspection {
         anchored_to(1)
+    }
+
+    /// Wie [`anchored`], aber Session a trägt einen **signierten**
+    /// `witness/v1`-Seal — den der Index nicht prüfen kann.
+    fn anchored_witnessed() -> Inspection {
+        let mut a = session("Fix retry handling", "2026-07-25T14:10:00Z");
+        a.intent_events.push(IntentEvent {
+            seq: 1,
+            anchor_id: anchor(1),
+            opens_session: true,
+        });
+        let mut sessions = BTreeMap::new();
+        sessions.insert(sid('a'), a);
+        let mut commits = BTreeMap::new();
+        commits.insert(commit('1'), vec![sid('a')]);
+        let (_, seal) = clean_seal(sid('a'));
+        let witnessed = minds_core::evidence::Seal {
+            scope: minds_core::evidence::SCOPE_WITNESS_V1.into(),
+            ..seal
+        };
+        let seal_id = minds_core::evidence::Seal::id_of_text(&witnessed.to_text().unwrap());
+        let index = Index::from_parts(sessions, commits)
+            .with_seals(sid('a'), vec![(seal_id, witnessed, true)]);
+        Inspection::from_index(index, Vec::new(), "t")
+    }
+
+    /// Nennen zwei Sessions den Anker im Witness-Event und ist nur eine von
+    /// `minds verify` geprüft (A2), trägt die Bindung diese Stufe: Eine
+    /// ungeprüfte Session ist keine niedrigere Stufe, sondern keine — sie
+    /// zählt nur, solange keine der Sessions geprüft ist.
+    #[test]
+    fn the_binding_prefers_a_rated_session_over_an_unchecked_one() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut inspection = anchored_witnessed();
+        // Session c: ebenfalls signierter Witness-Seal, nennt denselben
+        // Anker — aber kein Commit trägt sie, also prüft sie kein Urteil.
+        let mut c = session("Rename the module", "2026-07-25T15:00:00Z");
+        c.intent_events.push(IntentEvent {
+            seq: 1,
+            anchor_id: anchor(1),
+            opens_session: true,
+        });
+        let (_, seal) = clean_seal(sid('c'));
+        let witnessed = minds_core::evidence::Seal {
+            scope: minds_core::evidence::SCOPE_WITNESS_V1.into(),
+            ..seal
+        };
+        let seal_id = minds_core::evidence::Seal::id_of_text(&witnessed.to_text().unwrap());
+        let mut sessions: BTreeMap<SessionId, Session> = inspection
+            .index()
+            .sessions()
+            .map(|(id, s)| (*id, s.clone()))
+            .collect();
+        sessions.insert(sid('c'), c);
+        let mut commits = BTreeMap::new();
+        commits.insert(commit('1'), vec![sid('a')]);
+        let (a_id, a_seal) = {
+            let (_, seal) = clean_seal(sid('a'));
+            let w = minds_core::evidence::Seal {
+                scope: minds_core::evidence::SCOPE_WITNESS_V1.into(),
+                ..seal
+            };
+            (
+                minds_core::evidence::Seal::id_of_text(&w.to_text().unwrap()),
+                w,
+            )
+        };
+        inspection = Inspection::from_index(
+            Index::from_parts(sessions, commits)
+                .with_seals(sid('a'), vec![(a_id, a_seal, true)])
+                .with_seals(sid('c'), vec![(seal_id, witnessed, true)]),
+            Vec::new(),
+            "t",
+        );
+        let mut app = App::new(inspection, &repo, None);
+        app.reduce(Action::TabTo(3));
+        app.fill_intents(&source);
+        let out = render(&mut app);
+        assert!(out.contains("2 sessions"), "{out}");
+        assert!(out.contains("· binding A1 observed —"), "{out}");
+        assert!(out.contains("--signers rates this seal)"), "{out}");
+
+        app.open_overview();
+        app.overview.as_mut().unwrap().checks.insert(
+            commit('1'),
+            Ok(check_rated(Assurance::A2 {
+                level: minds_reader::assurance::AssuranceLevel::A2Witnessed,
+                principal: "minds-witness-user@build-07".into(),
+                profile: vec![minds_core::evidence::WitnessProfile::User],
+                intent: "intent signed, sk key".into(),
+            })),
+        );
+        app.reduce(Action::TabTo(3));
+        let out = render(&mut app);
+        assert!(out.contains("· binding A2 witnessed —"), "{out}");
+        assert!(!out.contains("rates this seal"), "{out}");
+    }
+
+    /// Ein Urteil von `minds verify` über Session a mit der Stufe `rating`.
+    fn check_rated(rating: Assurance) -> crate::CommitVerify {
+        crate::CommitVerify {
+            verdict: Ok(crate::VerifyVerdict::Verified),
+            sessions: vec![crate::SessionAssurance {
+                session: sid('a'),
+                rating,
+                intent: minds_reader::assurance::IntentState::Unbound,
+                tampered: false,
+            }],
+            out_of_scope: None,
+            out_of_scope_paths: Vec::new(),
+            scope_note: None,
+            conformance: None,
+            observations: Vec::new(),
+        }
+    }
+
+    /// Eine Assurance-Berechnung für alle Ansichten: Hat `minds verify`
+    /// die Session als A2 bezeugt, zeigen Evidence (F3) und die Bindung
+    /// im Requirements-Tab (F4) dasselbe Wort wie INTEGRITY der Übersicht
+    /// — `A2 witnessed` —, und LIMITS den Satz der Stufe, nie „no witness
+    /// ran". Davor, auf einem signierten Witness-Seal, den der Index nicht
+    /// prüfen kann: A1 mit dem Satz der ungeprüften Signatur, ebenfalls nie
+    /// „no witness ran".
+    #[test]
+    fn evidence_and_binding_take_the_level_from_the_one_verify_check() {
+        let (_dir, repo) = repo();
+        let source = source();
+        let mut app = App::new(anchored_witnessed(), &repo, None);
+
+        // Ohne Prüfung: die Stufe des Repositorys allein — ungeprüft.
+        app.reduce(Action::Evidence);
+        let out = render(&mut app);
+        assert!(out.contains("· A1 observed"), "{out}");
+        assert!(
+            out.contains(
+                "witness signature not checked here — minds verify --signers rates this seal."
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("no witness ran"), "{out}");
+        app.reduce(Action::Back);
+        app.reduce(Action::TabTo(3));
+        app.fill_intents(&source);
+        let out = render(&mut app);
+        // Anker 1 ist auch die lokale Datei-Bindung; der Satz der Variante
+        // steht in Klammern dahinter (im Rahmen umgebrochen).
+        assert!(
+            out.contains(
+                "· binding A1 observed — the agent named this anchor in a witness event; also the local file binding (witness"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("--signers rates this seal)"), "{out}");
+        assert!(!out.contains("no witness ran"), "{out}");
+
+        // Mit dem Urteil von `minds verify` (A2): überall dasselbe Wort.
+        app.open_overview();
+        let state = app.overview.as_mut().unwrap();
+        state.checks.insert(
+            commit('1'),
+            Ok(check_rated(Assurance::A2 {
+                level: minds_reader::assurance::AssuranceLevel::A2Witnessed,
+                principal: "minds-witness-user@build-07".into(),
+                profile: vec![minds_core::evidence::WitnessProfile::User],
+                intent: "intent signed, sk key".into(),
+            })),
+        );
+        app.reduce(Action::TabTo(3));
+        let out = render(&mut app);
+        assert!(
+            out.contains(
+                "· binding A2 witnessed — the agent named this anchor in a witness event; also the local file binding"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("binding A1"), "{out}");
+        assert!(!out.contains("rates this seal"), "{out}");
+        app.reduce(Action::TabTo(2));
+        app.reduce(Action::Evidence);
+        let out = render(&mut app);
+        assert!(out.contains("· A2 witnessed"), "{out}");
+        assert!(
+            out.contains("witnessed at A2 — a separated witness observed and signed the record"),
+            "{out}"
+        );
+        assert!(!out.contains("no witness ran"), "{out}");
+        assert!(!out.contains("A1 observed"), "{out}");
+        // Das Detail unter LIMITS nennt dieselbe Stufe — und woher sie kommt.
+        app.reduce(Action::End);
+        app.reduce(Action::Up);
+        let out = render(&mut app);
+        assert!(
+            out.contains("At A2 witnessed, Minds does NOT prove:"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Level as minds verify rated it, signatures checked."),
+            "{out}"
+        );
     }
 
     fn proven(byte: u8) -> IntentInfo {
@@ -2802,7 +3007,7 @@ mod intent_tab {
         assert!(out.contains("◦ not signed"), "{out}");
         assert!(!out.contains("signature none"), "{out}");
         assert!(
-            out.contains("binding A1 — no local file binding points to it"),
+            out.contains("binding A1 observed — no local file binding points to it"),
             "{out}"
         );
         assert!(!out.contains("not the local file binding (A1)"), "{out}");
