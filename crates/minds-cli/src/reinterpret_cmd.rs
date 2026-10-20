@@ -102,6 +102,8 @@ fn reinterpret(target: &str) -> Fallible<()> {
                             if stored.kind == EffectKind::Write {
                                 now.effect.written = stored.written.clone();
                                 now.effect.written_unavailable = stored.written_unavailable;
+                                // Die Zeit des Claims gehört zum Hash.
+                                now.effect.written_at = stored.written_at.clone();
                             }
                         }
                     }

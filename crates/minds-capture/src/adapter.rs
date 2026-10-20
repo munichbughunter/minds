@@ -533,22 +533,29 @@ fn written_hashes(
         if effect.kind != EffectKind::Write {
             continue;
         }
+        let post = posts.post_for(events.get(pre_index));
         let outcome = match effect.path.as_deref() {
             None => Err(WrittenUnavailable::PayloadWithoutContent),
             Some(path) if minds_redact::is_secret_file(path) => Err(WrittenUnavailable::SecretFile),
             Some(path) if !inside_repo_resolved(path, &roots) => {
                 Err(WrittenUnavailable::OutsideRepo)
             }
-            Some(path) => match posts.post_for(events.get(pre_index)) {
+            Some(path) => match post {
                 Some(post) => adapter
                     .written_bytes(post, path)
                     .and_then(|bytes| scanned_hash(ctx.redaction, &bytes, bytes.as_bytes())),
                 None => Err(WrittenUnavailable::PayloadWithoutContent),
             },
         };
-        match outcome {
-            Ok(hash) => effect.written = Some(hash),
-            Err(reason) => effect.written_unavailable = Some(reason),
+        match (outcome, post) {
+            // Der Claim ist Hash **und** Zeit: wann der Agent das Geschriebene
+            // meldete (das Post-Event), nicht wann sein Zug begann.
+            (Ok(hash), Some(post)) => {
+                effect.written = Some(hash);
+                effect.written_at = Some(post.at.clone());
+            }
+            (Ok(hash), None) => effect.written = Some(hash),
+            (Err(reason), _) => effect.written_unavailable = Some(reason),
         }
     }
 }

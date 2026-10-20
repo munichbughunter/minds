@@ -619,6 +619,7 @@ pub fn claude_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
         content: None,
         written: None,
         written_unavailable: None,
+        written_at: None,
     }
 }
 
@@ -684,6 +685,7 @@ pub fn codex_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
                 content: None,
                 written: None,
                 written_unavailable: None,
+                written_at: None,
             }
         }
         "Bash" => Effect {
@@ -692,6 +694,7 @@ pub fn codex_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
             content: None,
             written: None,
             written_unavailable: None,
+            written_at: None,
         },
         _ => Effect {
             kind: EffectKind::Other,
@@ -699,6 +702,7 @@ pub fn codex_effect(tool_name: &str, tool_input: Option<&RawValue>) -> Effect {
             content: None,
             written: None,
             written_unavailable: None,
+            written_at: None,
         },
     }
 }

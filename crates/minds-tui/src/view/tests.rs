@@ -64,6 +64,7 @@ fn session(request: &str, started: &str) -> Session {
                     content: None,
                     written: None,
                     written_unavailable: None,
+                    written_at: None,
                 }),
             },
             ToolCall {
@@ -77,6 +78,7 @@ fn session(request: &str, started: &str) -> Session {
                     content: None,
                     written: None,
                     written_unavailable: None,
+                    written_at: None,
                 }),
             },
             ToolCall {
@@ -90,6 +92,7 @@ fn session(request: &str, started: &str) -> Session {
                     content: None,
                     written: None,
                     written_unavailable: None,
+                    written_at: None,
                 }),
             },
         ],
@@ -1129,6 +1132,7 @@ fn write_call(path: &str, text: &str) -> ToolCall {
                 *blake3::hash(text.as_bytes()).as_bytes(),
             )),
             written_unavailable: None,
+            written_at: None,
         }),
     }
 }
@@ -2605,6 +2609,7 @@ mod changes_tab {
     mod c92;
     mod c93;
     mod c94;
+    mod observed;
 }
 
 // --- Verify-Tab -------------------------------------------------------------

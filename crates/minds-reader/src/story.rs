@@ -964,6 +964,7 @@ mod tests {
                 content: None,
                 written: None,
                 written_unavailable: None,
+                written_at: None,
             }),
         )
     }
@@ -980,6 +981,7 @@ mod tests {
                 written_unavailable: written
                     .is_none()
                     .then_some(WrittenUnavailable::PayloadWithoutContent),
+                written_at: None,
             }),
         )
     }
@@ -1068,6 +1070,7 @@ mod tests {
                         content: None,
                         written: None,
                         written_unavailable: None,
+                        written_at: None,
                     }),
                 ),
                 foo,

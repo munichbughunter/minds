@@ -314,7 +314,8 @@ impl crate::Index {
     /// Ohne Witness-Beobachtungen: Der Index kennt keine `allowed_signers`
     /// und könnte einen `witness-fs/v1`-Seal nicht von einem gefälschten
     /// unterscheiden. Beobachtungen nutzt `minds verify`, das die
-    /// Witness-Signatur prüft.
+    /// Witness-Signatur prüft — und wer sie von dort hat, gibt sie
+    /// [`Index::artifact_detailed_with`] mit.
     pub fn artifact(&self, repo: &Repo, roots: &[&Path], commit: CommitId) -> CommitArtifact {
         self.artifact_detailed(repo, roots, commit, false)
     }
@@ -327,8 +328,24 @@ impl crate::Index {
         commit: CommitId,
         sources: bool,
     ) -> CommitArtifact {
+        self.artifact_detailed_with(repo, roots, commit, sources, &[])
+    }
+
+    /// Wie [`Index::artifact_detailed`], mit den Beobachtungen des
+    /// Datei-Beobachters — schon auf vertrauenswürdige Epochen und die
+    /// Fenster der Sessions gefiltert, wie `minds verify` sie liest
+    /// ([`crate::observations::observations_in_windows`]). Mit ihnen wird
+    /// eine berichtete Zeile, deren Inhalt der Witness sah, `observed`.
+    pub fn artifact_detailed_with(
+        &self,
+        repo: &Repo,
+        roots: &[&Path],
+        commit: CommitId,
+        sources: bool,
+        observations: &[FsObservation],
+    ) -> CommitArtifact {
         let (claimants, inferred) = self.claimants(commit);
-        let state = match assess_detailed(repo, roots, commit, &claimants, &[], sources) {
+        let state = match assess_detailed(repo, roots, commit, &claimants, observations, sources) {
             Ok(Ok(assessed)) => ArtifactState::Assessed(assessed),
             Ok(Err(why)) => ArtifactState::Unavailable(why),
             Err(err) => ArtifactState::Failed(crate::sanitize(&err.to_string())),

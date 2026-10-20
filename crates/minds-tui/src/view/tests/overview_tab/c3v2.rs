@@ -534,6 +534,7 @@ impl crate::Source for Detailed {
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,
                 conformance: None,
+                observations: Vec::new(),
             }),
             None => Err("minds verify not found".into()),
         }
@@ -992,6 +993,7 @@ fn review_a_stale_worker_answer_after_reload_is_dropped() {
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,
                 conformance: None,
+                observations: Vec::new(),
             })
         }
     }

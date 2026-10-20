@@ -335,9 +335,24 @@ impl crate::Inspection {
     /// Fail-soft beim Abgleich (dann `unassessed`); ein Fehler beim Lesen
     /// des Diffs selbst ist `Err`.
     pub fn changes(&self, repo: &Repo, commit: CommitId) -> minds_git::Result<ChangeSet> {
+        self.changes_with(repo, commit, &[])
+    }
+
+    /// Wie [`Inspection::changes`], mit den Beobachtungen des
+    /// Datei-Beobachters aus einem Urteil von `minds verify`
+    /// ([`crate::Index::artifact_detailed_with`]): Was der Witness sah,
+    /// ist `observed`, nicht nur `reported`.
+    pub fn changes_with(
+        &self,
+        repo: &Repo,
+        commit: CommitId,
+        observations: &[crate::reconcile::FsObservation],
+    ) -> minds_git::Result<ChangeSet> {
         let spellings: Vec<PathBuf> = roots_of(repo);
         let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
-        let artifact = self.index().artifact_detailed(repo, &roots, commit, true);
+        let artifact =
+            self.index()
+                .artifact_detailed_with(repo, &roots, commit, true, observations);
         self.changes_of(repo, &artifact)
     }
 

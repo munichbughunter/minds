@@ -4199,6 +4199,7 @@ fn verify_gate_resists_unverified_claims_and_weightless_changes() {
                         .unwrap(),
                 ),
                 written_unavailable: None,
+                written_at: None,
             }),
         }],
     });

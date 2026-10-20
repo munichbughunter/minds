@@ -138,14 +138,34 @@ impl Drop for Socket {
 }
 
 pub(crate) fn ping(path: &Path) -> bool {
-    let request = witness_proto::encode(&Frame::Ping).expect("static ping");
+    matches!(
+        ask(path, &Frame::Ping),
+        Some(Frame::Ack { request_id, status }) if request_id == [0; 16] && status == "pong"
+    )
+}
+
+/// Was der Beobachter des Witness hinter `path` tut (`watching <root> ·
+/// <n> frames · last <ts>`), `Err` mit dem Grund, wenn er keinen hat, und
+/// `None`, wenn der Witness nicht (oder nicht darauf) antwortet.
+pub(crate) fn observer_status(path: &Path) -> Option<Result<String, String>> {
+    match ask(path, &Frame::Status)? {
+        Frame::Ack { request_id, status } if request_id == [0; 16] => Some(Ok(status)),
+        Frame::Nack { request_id, reason } if request_id == [0; 16] => Some(Err(reason)),
+        _ => None,
+    }
+}
+
+/// Schickt `request` und liest genau eine Antwort — innerhalb einer Sekunde,
+/// gleich wie langsam die Gegenseite tröpfelt.
+fn ask(path: &Path, request: &Frame) -> Option<Frame> {
+    let request = witness_proto::encode(request).expect("static request");
     let Ok(mut stream) = UnixStream::connect(path) else {
-        return false;
+        return None;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
     if stream.write_all(&request).is_err() {
-        return false;
+        return None;
     }
     let mut bytes = Vec::new();
     let mut chunk = [0; 128];
@@ -155,21 +175,19 @@ pub(crate) fn ping(path: &Path) -> bool {
     let deadline = Instant::now() + Duration::from_secs(1);
     while bytes.len() < 4096 {
         if Instant::now() >= deadline {
-            return false;
+            return None;
         }
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return None,
             Ok(n) => bytes.extend_from_slice(&chunk[..n]),
         }
         match witness_proto::decode(&bytes) {
-            Ok((Frame::Ack { request_id, status }, _)) => {
-                return request_id == [0; 16] && status == "pong";
-            }
+            Ok((frame, _)) => return Some(frame),
             Err(ProtoError::Incomplete) => {}
-            _ => return false,
+            Err(_) => return None,
         }
     }
-    false
+    None
 }
 
 /// Die UID der Gegenstelle einer Unix-Socket-Verbindung — `None`, wo das
@@ -343,10 +361,15 @@ fn step_inner(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
 fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<bool> {
     // Der Steuer-Socket nimmt nur Steuerung an: Hook-Events und
     // Checkpoint-Anfragen gehören auf den Socket der Agent-Seite.
-    if client.control && !matches!(frame, Frame::Ping | Frame::IntentActivate { .. }) {
+    if client.control
+        && !matches!(
+            frame,
+            Frame::Ping | Frame::Status | Frame::IntentActivate { .. }
+        )
+    {
         log(
             &writer.home,
-            "control socket accepts only ping and intent frames",
+            "control socket accepts only ping, status and intent frames",
         );
         return Ok(false);
     }
@@ -404,6 +427,26 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                 status: "pong".into(),
             })?;
             if client.stream.write_all(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
+        Frame::Status => {
+            // Was der Beobachter tut — für `minds doctor`; nur lesend.
+            let answer = match writer.observer_status() {
+                Ok(status) => Frame::Ack {
+                    request_id: [0; 16],
+                    status,
+                },
+                Err(reason) => Frame::Nack {
+                    request_id: [0; 16],
+                    reason: reason.into(),
+                },
+            };
+            if client
+                .stream
+                .write_all(&witness_proto::encode(&answer)?)
+                .is_err()
+            {
                 return Ok(false);
             }
         }
@@ -690,6 +733,9 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
         serde_json::json!({"previous_stop": previous, "profile": profile, "key": key_fingerprint}),
         || observer::Observer::watch(&root, Box::new(observer::Blake3)),
     )?;
+    // Start und Scheitern des Beobachters auch nach stderr: Als Dienst
+    // landet das in `log/witness.err` (launchd) bzw. im Journal (systemd)
+    // — sichtbar, bevor je ein Checkpoint lief.
     match watched {
         Ok(observer) => {
             let observer = match pipeline {
@@ -702,10 +748,13 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
                     observer
                 }
             };
+            eprintln!("witness observer: watching {}", root.display());
             writer.observe_into(key.clone(), observer)
         }
         Err(err) => {
-            log(&home, &format!("file observer unavailable: {err}"));
+            let note = format!("file observer unavailable: {err}");
+            log(&home, &note);
+            eprintln!("witness observer: {}", crate::hooklog::diagnostic(&note));
             writer.lifecycle(&key, "fs.gap", serde_json::json!({"reason": "unavailable"}))?;
         }
     }

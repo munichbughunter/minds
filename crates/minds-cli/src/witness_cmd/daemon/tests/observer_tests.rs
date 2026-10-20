@@ -583,15 +583,88 @@ fn fs_observer_records_a_gap_on_overflow() {
     let mut writer = f.writer();
     writer.observe_into(stream(), observer);
     writer.observe(false).unwrap();
-    let gaps = writer
+    let gaps: Vec<String> = writer
         .journal
         .read(&stream())
         .unwrap()
         .events
         .iter()
         .filter(|e| e.raw_kind == "fs.gap")
-        .count();
-    assert_eq!(gaps, 1);
+        .map(|e| e.payload.get().to_owned())
+        .collect();
+    // Der Kanal fasst genau MAX_PENDING Meldungen; eine wies er ab — und
+    // die Lücke zählt sie.
+    assert_eq!(gaps, [r#"{"dropped":1,"reason":"overflow"}"#]);
+}
+
+/// Die Lücken des Beobachters stehen nach dem Checkpoint im
+/// Observation-Objekt — mit Grund, Zeit und Zahl der verlorenen Meldungen;
+/// in der gedrosselten Sekunde Verlorenes zählt das nächste `fs.gap` mit.
+#[test]
+fn observer_gaps_reach_the_observation_object() {
+    use minds_core::evidence::{Seal, SealOutcome};
+    use minds_core::observation::GapReason;
+    let f = Fixture::new();
+    f.keygen();
+    let root = canonical_root(&f);
+    let mut writer = f.writer();
+    writer
+        .lifecycle(&stream(), "witness.start", serde_json::json!({}))
+        .unwrap();
+    let observer = observer::Observer::detached(&root, Box::new(observer::Blake3)).unwrap();
+    writer.observe_into(stream(), observer);
+    writer.gap(&stream(), "overflow", "test", 12).unwrap();
+    // Gedrosselt: nicht geschrieben, aber gezählt …
+    writer.last_gap.insert("overflow", Instant::now());
+    writer.gap(&stream(), "overflow", "test", 3).unwrap();
+    writer
+        .last_gap
+        .insert("overflow", Instant::now() - Duration::from_millis(1100));
+    // … und beim nächsten genannt.
+    writer.gap(&stream(), "overflow", "test", 1).unwrap();
+    writer.gap(&stream(), "panic", "test", 0).unwrap();
+    fs::write(root.join("merge.rs"), "fn merge() {}\n").unwrap();
+    writer
+        .observer
+        .as_ref()
+        .unwrap()
+        .note(&root.join("merge.rs"));
+    writer.observe(true).unwrap();
+    writer.checkpoint_now(None).unwrap();
+
+    let store = minds_store::InRepoStore::open(&f.root).unwrap();
+    let object = store
+        .list_seals()
+        .unwrap()
+        .into_iter()
+        .find_map(|id| {
+            let seal = Seal::parse(&store.seal_text(&id).unwrap().unwrap()).unwrap();
+            match seal.outcome {
+                SealOutcome::ObservationsStored { observations } => store
+                    .get_observations(&observations.parse().unwrap())
+                    .unwrap(),
+                _ => None,
+            }
+        })
+        .expect("observation object");
+    assert_eq!(object.observations.len(), 1);
+    let gaps: Vec<(u64, GapReason, Option<u64>)> = object
+        .gaps
+        .iter()
+        .map(|g| (g.seq, g.reason, g.dropped))
+        .collect();
+    // seq 0 ist `witness.start`.
+    assert_eq!(
+        gaps,
+        [
+            (1, GapReason::Overflow, Some(12)),
+            (2, GapReason::Overflow, Some(4)),
+            (3, GapReason::Panic, None),
+        ]
+    );
+    for gap in &object.gaps {
+        gap.at.parse::<jiff::Timestamp>().unwrap();
+    }
 }
 
 #[test]
@@ -783,18 +856,18 @@ fn fs_gaps_are_coalesced_per_reason() {
     // Die Zeit wird gesetzt, nicht abgewartet: Unter Last kann schon ein
     // einzelner fsyncender Append länger als eine Sekunde dauern.
     let just_now = || Instant::now();
-    writer.gap(&stream(), "overflow", "test").unwrap();
+    writer.gap(&stream(), "overflow", "test", 0).unwrap();
     writer.last_gap.insert("overflow", just_now());
-    writer.gap(&stream(), "overflow", "test").unwrap();
+    writer.gap(&stream(), "overflow", "test", 0).unwrap();
     assert_eq!(gaps(&writer), 1);
     // Ein anderer Grund ist eine eigene Lücke.
-    writer.gap(&stream(), "panic", "test").unwrap();
+    writer.gap(&stream(), "panic", "test", 0).unwrap();
     assert_eq!(gaps(&writer), 2);
     // Nach mehr als einer Sekunde wieder.
     writer
         .last_gap
         .insert("overflow", just_now() - Duration::from_millis(1100));
-    writer.gap(&stream(), "overflow", "test").unwrap();
+    writer.gap(&stream(), "overflow", "test", 0).unwrap();
     assert_eq!(gaps(&writer), 3);
     assert!(writer.fs_dirty);
 }
@@ -1153,4 +1226,209 @@ fn witness_refuses_home_inside_repo() {
     let mut config = load(&f.home).unwrap();
     config.repo_root = f._dir.path().canonicalize().unwrap();
     assert!(refuse_home_in_repo(&alias, &config).is_err());
+}
+
+/// Ein Zeitpunkt `seconds` Sekunden vor jetzt — als Ablesung eines Hooks.
+fn seconds_ago(seconds: u64) -> (String, u64) {
+    let nanos = clock::now().1 - seconds * 1_000_000_000;
+    (clock::rfc3339_from_nanos(nanos), nanos)
+}
+
+/// Die Zeit eines Schreib-Claims ist die seines `PostToolUse`-Events — nicht
+/// die seines Zugs. Eine Demo-Session (2026-10-20): Der Zug begann mit einem
+/// `Read`, die `Write`s kamen Minuten später; der Witness sah jede Datei mit
+/// genau dem gemeldeten Hash, und `verify` meldete trotzdem jeden Claim als
+/// ohne Beobachtung, die TUI `observed 0`. Der Weg Ende zu Ende: Hook-Events
+/// über den Writer, die Beobachtung des Beobachters, Checkpoint, Seal und
+/// Objekt im Store, dann der Reader — Fenster, Claim-Zeit und Zeilenklasse
+/// des Commits. (Die Zeitregel selbst prüft der Reader in seinen Tests.)
+#[test]
+fn a_write_claim_minutes_into_the_turn_meets_its_observation() {
+    use minds_core::evidence::{Seal, SealOutcome};
+    use minds_reader::observations::session_observations;
+
+    let f = Fixture::plain();
+    let signers_line = f.keygen();
+    let signers = f._dir.path().join("allowed_signers");
+    fs::write(&signers, &signers_line).unwrap();
+    let principal = signers_line.split_whitespace().next().unwrap();
+    let root = canonical_root(&f);
+    let mut writer = f.writer();
+    // Der Lauf begann vor zehn Minuten (die erste Epoche verankert die Kette
+    // nur, wenn sie vor dem Fenster der Session begann).
+    let start = seconds_ago(600);
+    writer
+        .append(
+            &stream(),
+            NewEvent {
+                at: start.0,
+                at_nanos: start.1,
+                kind: minds_capture::EventKind::Other,
+                raw_kind: "witness.start".into(),
+                cwd: None,
+                transcript_path: None,
+                model: None,
+                payload: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+            },
+        )
+        .unwrap();
+    let observer = observer::Observer::detached(&root, Box::new(observer::Blake3)).unwrap();
+    writer.observe_into(stream(), observer);
+
+    let file = root.join("src/merge.rs");
+    let content = "fn merge() {}\n";
+    let hook = |writer: &mut Writer, event: &str, extra: &str, at: (String, u64)| {
+        let payload = format!(
+            r#"{{"session_id":"test-session","hook_event_name":"{event}","cwd":"{}"{extra}}}"#,
+            root.display()
+        );
+        writer
+            .hook("claude-code", None, payload.into_bytes(), at)
+            .unwrap();
+    };
+    // Die Session begann vor fünf Minuten; ihr Zug mit einem `Read`.
+    hook(&mut writer, "SessionStart", "", seconds_ago(300));
+    hook(
+        &mut writer,
+        "UserPromptSubmit",
+        r#","prompt":"Implement merge""#,
+        seconds_ago(299),
+    );
+    hook(
+        &mut writer,
+        "PreToolUse",
+        &format!(
+            r#","tool_name":"Read","tool_use_id":"toolu_0","tool_input":{{"file_path":"{}"}}"#,
+            root.join("README").display()
+        ),
+        seconds_ago(298),
+    );
+    // Minuten später das `Write`: Erst die Datei (der Beobachter sieht sie),
+    // dann die Meldung des Agenten mit demselben Inhalt.
+    fs::create_dir(root.join("src")).unwrap();
+    let write = format!(
+        r#","tool_name":"Write","tool_use_id":"toolu_1","tool_input":{{"file_path":"{path}","content":"{content}"}}"#,
+        path = file.display(),
+        content = content.escape_default()
+    );
+    hook(&mut writer, "PreToolUse", &write, clock::now());
+    fs::write(&file, content).unwrap();
+    writer.observer.as_ref().unwrap().note(&file);
+    writer.observe(true).unwrap();
+    assert_eq!(
+        observed(&writer).len(),
+        1,
+        "die Beobachtung steht im Stream"
+    );
+    let post = format!(
+        r#"{write},"tool_response":{{"type":"create","filePath":"{path}","content":"{content}"}}"#,
+        path = file.display(),
+        content = content.escape_default()
+    );
+    hook(&mut writer, "PostToolUse", &post, clock::now());
+    hook(&mut writer, "Stop", "", clock::now());
+    writer.checkpoint_now(None).unwrap();
+
+    // Der Store: die Session und die Beobachtungs-Epoche ihres Checkpoints.
+    let store = minds_store::InRepoStore::open(&f.root).unwrap();
+    let id = store
+        .list_seals()
+        .unwrap()
+        .into_iter()
+        .find_map(|seal_id| {
+            let seal = Seal::parse(&store.seal_text(&seal_id).unwrap().unwrap()).unwrap();
+            match seal.outcome {
+                SealOutcome::Stored { session } => session.parse::<minds_core::SessionId>().ok(),
+                _ => None,
+            }
+        })
+        .expect("die Session ist versiegelt");
+    let session = store.get(id).unwrap().unwrap();
+    let claims: Vec<&minds_core::ToolCall> = session
+        .turns
+        .iter()
+        .flat_map(|t| &t.tool_calls)
+        .filter(|c| c.name == "Write")
+        .collect();
+    assert_eq!(claims.len(), 1);
+    let effect = claims[0].effect.as_ref().unwrap();
+    assert_eq!(
+        effect.written.as_ref().map(ToString::to_string).as_deref(),
+        Some(b3(content.as_bytes()).as_str()),
+        "{effect:?}"
+    );
+    // Der Claim trägt die Zeit seiner Meldung (das Post-Event, vom Witness
+    // gestempelt) — Minuten nach dem Beginn seines Zugs.
+    let at = |text: &str| text.parse::<jiff::Timestamp>().unwrap();
+    let turn_at = at(session.turns[1].at.as_deref().unwrap());
+    let written_at = at(effect.written_at.as_deref().expect("claim time"));
+    assert!(
+        written_at.duration_since(turn_at) >= jiff::SignedDuration::from_secs(290),
+        "{turn_at} .. {written_at}"
+    );
+    let trusted = |seal_id: &minds_core::ContentHash, text: &str| {
+        store
+            .seal_signature(seal_id)
+            .ok()
+            .flatten()
+            .is_some_and(|signature| {
+                minds_attest::ssh_verify_ns(
+                    text,
+                    &signature,
+                    &signers,
+                    principal,
+                    minds_attest::NS_WITNESS,
+                )
+                .unwrap_or(false)
+            })
+    };
+    let (windows, observations) = session_observations(&store, id, &session, &trusted);
+    assert_eq!(windows.len(), 1, "die bezeugte Session öffnet ihr Fenster");
+    assert!(observations.complete);
+    let seen: Vec<(&str, Option<String>)> = observations
+        .observations
+        .iter()
+        .map(|o| {
+            (
+                o.path.as_str(),
+                o.observed.hash.as_ref().map(ToString::to_string),
+            )
+        })
+        .collect();
+    assert_eq!(seen, [("src/merge.rs", Some(b3(content.as_bytes())))]);
+    // Die Beobachtung liegt im Fenster der Claim-Zeit (−2 s … +30 s) — und
+    // weit außerhalb dessen, was der Zugbeginn eröffnete.
+    let observed_at = at(observations.observations[0].observed.at.as_deref().unwrap());
+    let since_claim = observed_at.duration_since(written_at);
+    assert!(
+        jiff::SignedDuration::from_secs(-2) <= since_claim
+            && since_claim <= jiff::SignedDuration::from_secs(30),
+        "{written_at} .. {observed_at}"
+    );
+    assert!(observed_at.duration_since(turn_at) > jiff::SignedDuration::from_secs(30));
+
+    // Und der Commit mit dieser Datei: ihre Zeilen sind beobachtet, nicht nur
+    // berichtet (TUI: `● observed`, nicht `◇ reported`).
+    let spellings = minds_reader::artifact::root_spellings(&root);
+    let roots: Vec<&Path> = spellings.iter().map(PathBuf::as_path).collect();
+    git(&f.root, &["add", "src/merge.rs"]);
+    git(&f.root, &["commit", "-qm", "feat: merge"]);
+    let head: minds_git::CommitId = git(&f.root, &["rev-parse", "HEAD"]).trim().parse().unwrap();
+    let repo = minds_git::Repo::open(&f.root).unwrap();
+    let assessed = minds_reader::artifact::assess(
+        &repo,
+        &roots,
+        head,
+        &[&session],
+        &observations.observations,
+    )
+    .unwrap()
+    .unwrap();
+    let merge = assessed
+        .recon
+        .files
+        .iter()
+        .find(|file| file.path == "src/merge.rs")
+        .unwrap();
+    assert!(merge.class.explained(), "{:?}", merge.class);
 }

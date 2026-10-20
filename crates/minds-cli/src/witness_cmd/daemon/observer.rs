@@ -25,7 +25,9 @@
 //! Je Durchlauf gilt ein Budget an Pfaden und Bytes — auch beim Checkpoint —,
 //! damit die Hooks nie lange warten. Läuft der Kanal oder die Sammlung über,
 //! wird das als `fs.gap` in die Kette geschrieben — eine sichtbare Lücke
-//! statt einer stillen. Neu angelegte Verzeichnisse werden begrenzt
+//! statt einer stillen, mit der Zahl der Meldungen, die der volle Kanal
+//! abwies (`dropped`); der Sealer trägt sie ins Observation-Objekt, und
+//! `minds verify` nennt sie an jedem Claim, dessen Beobachtung hineinfiel. Neu angelegte Verzeichnisse werden begrenzt
 //! durchsucht: inotify meldet Dateien nicht, die vor ihrer Watch entstanden.
 //!
 //! # Ignore-Regeln
@@ -58,7 +60,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
@@ -163,6 +165,9 @@ pub(super) struct Batch {
     /// Meldungen gingen verloren (Kanal, Sammlung, zu großes Verzeichnis,
     /// Wurzel ausgetauscht).
     pub(super) overflow: bool,
+    /// Wie viele Meldungen der volle Kanal abwies — der zählbare Teil des
+    /// Verlusts (`0`: keine, oder nicht zählbar).
+    pub(super) dropped: u64,
     /// Ignore-Regeln ließen sich nicht sicher lesen; betroffene Pfade wurden
     /// verworfen.
     pub(super) ignore_failed: bool,
@@ -190,7 +195,8 @@ pub(super) struct Observer {
     root_ino: u64,
     rx: Receiver<notify::Result<notify::Event>>,
     tx: SyncSender<notify::Result<notify::Event>>,
-    overflow: Arc<AtomicBool>,
+    /// Meldungen, die der volle Kanal abwies, seit dem letzten Durchlauf.
+    dropped: Arc<AtomicUsize>,
     _watcher: Option<notify::RecommendedWatcher>,
     pending: HashMap<PathBuf, Pending>,
     /// Letzter festgehaltener Stand je Pfad: Eine Meldung ohne
@@ -231,10 +237,12 @@ impl Observer {
         use notify::Watcher;
         let mut observer = Self::detached(root, hasher)?;
         let tx = observer.tx.clone();
-        let overflow = observer.overflow.clone();
+        let dropped = observer.dropped.clone();
         let handler = move |event| match tx.try_send(event) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-            Err(TrySendError::Full(_)) => overflow.store(true, Ordering::Relaxed),
+            Err(TrySendError::Full(_)) => {
+                dropped.fetch_add(1, Ordering::Relaxed);
+            }
         };
         // Nie einem Symlink in ein Verzeichnis folgen: Ein `ln -s ~ home` im
         // Worktree ließe den Witness sonst das Home des Hosts beobachten
@@ -260,7 +268,7 @@ impl Observer {
             root_fd,
             rx,
             tx,
-            overflow: Arc::new(AtomicBool::new(false)),
+            dropped: Arc::new(AtomicUsize::new(0)),
             _watcher: None,
             pending: HashMap::new(),
             last: HashMap::new(),
@@ -285,7 +293,7 @@ impl Observer {
         let event = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
             .add_path(path.to_path_buf());
         if self.tx.try_send(Ok(event)).is_err() {
-            self.overflow.store(true, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -295,7 +303,7 @@ impl Observer {
         let event = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::Any))
             .add_path(path.to_path_buf());
         if self.tx.try_send(Ok(event)).is_err() {
-            self.overflow.store(true, Ordering::Relaxed);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -308,8 +316,10 @@ impl Observer {
     /// alle, ohne die Ruhe abzuwarten) lesen und klassifizieren — innerhalb
     /// der Budgets je Durchlauf.
     pub(super) fn tick(&mut self, now: Instant, settle: bool) -> Batch {
+        let (lost, dropped) = self.drain(now);
         let mut batch = Batch {
-            overflow: self.drain(now),
+            overflow: lost,
+            dropped,
             ..Batch::default()
         };
         // Wurde die Wurzel ausgetauscht (umbenannt, ein Symlink an ihrer
@@ -409,9 +419,11 @@ impl Observer {
         true
     }
 
-    /// Gibt zurück, ob Meldungen verloren gingen.
-    fn drain(&mut self, now: Instant) -> bool {
-        let mut lost = self.overflow.swap(false, Ordering::Relaxed);
+    /// Gibt zurück, ob Meldungen verloren gingen — und wie viele davon der
+    /// volle Kanal abwies (der zählbare Teil).
+    fn drain(&mut self, now: Instant) -> (bool, u64) {
+        let dropped = self.dropped.swap(0, Ordering::Relaxed) as u64;
+        let mut lost = dropped > 0;
         while let Ok(event) = self.rx.try_recv() {
             let event = match event {
                 Ok(event) => event,
@@ -437,7 +449,7 @@ impl Observer {
                 }
             }
         }
-        lost
+        (lost, dropped)
     }
 
     /// Repo-relativer Pfad eines Host-Pfads, oder `None` für alles, was nicht

@@ -59,7 +59,21 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::in_dir(tempfile::tempdir().unwrap())
+    }
+    /// Unter einem schlichten Pfad (`/tmp/minds-…`): Der Pfad des
+    /// Systemverzeichnisses für temporäre Dateien liest sich für die
+    /// Redaction wie ein Token, und ein redigierter Pfad lässt den
+    /// Schreibzeit-Hash eines Claims fallen.
+    fn plain() -> Self {
+        Self::in_dir(
+            tempfile::Builder::new()
+                .prefix("minds-")
+                .tempdir_in("/tmp")
+                .unwrap(),
+        )
+    }
+    fn in_dir(dir: tempfile::TempDir) -> Self {
         let root = dir.path().join("repo");
         fs::create_dir(&root).unwrap();
         git(&root, &["init", "-q", "--template="]);
@@ -2225,4 +2239,58 @@ fn stale_lock_reports_are_bounded() {
         MAX_REPORTED_LOCKS
     );
     assert!(log.contains("and 12 more lock file(s)"), "{log}");
+}
+
+/// `Frame::Status` (für `minds doctor`): ohne Beobachter ein `Nack`, sonst
+/// `watching <root> · <n> frames · last <ts>` — auf beiden Sockets, nur
+/// lesend.
+#[test]
+fn a_status_frame_reports_the_observer_on_both_sockets() {
+    use minds_capture::witness_proto::{self, Frame};
+    use std::io::{Read, Write};
+    use std::net::Shutdown;
+    use std::os::unix::net::UnixStream;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    let ask = |writer: &mut Writer, control: bool| -> Frame {
+        let (ours, mut theirs) = UnixStream::pair().unwrap();
+        theirs
+            .write_all(&witness_proto::encode(&Frame::Status).unwrap())
+            .unwrap();
+        theirs.shutdown(Shutdown::Write).unwrap();
+        let mut client = agent_client(ours);
+        client.control = control;
+        drain(&mut client, writer);
+        drop(client);
+        let mut bytes = Vec::new();
+        theirs.read_to_end(&mut bytes).unwrap();
+        witness_proto::decode(&bytes).unwrap().0
+    };
+    assert_eq!(
+        ask(&mut writer, false),
+        Frame::Nack {
+            request_id: [0; 16],
+            reason: "no file observer".into()
+        }
+    );
+    let root = load(&f.home).unwrap().repo_root;
+    let observer = observer::Observer::detached(&root, Box::new(observer::Blake3)).unwrap();
+    writer.observe_into(SessionKey::new("witness", "1").unwrap(), observer);
+    assert_eq!(
+        ask(&mut writer, true),
+        Frame::Ack {
+            request_id: [0; 16],
+            status: format!("watching {} · 0 frames · last none", root.display())
+        }
+    );
+    fs::write(root.join("a.rs"), "x\n").unwrap();
+    writer.observer.as_ref().unwrap().note(&root.join("a.rs"));
+    writer.observe(true).unwrap();
+    let Frame::Ack { status, .. } = ask(&mut writer, false) else {
+        panic!("no ack");
+    };
+    assert!(
+        status.starts_with(&format!("watching {} · 1 frames · last 20", root.display())),
+        "{status}"
+    );
 }

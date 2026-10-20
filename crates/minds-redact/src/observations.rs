@@ -17,7 +17,9 @@
 //! Bereinigung: Ein Platzhalter darf aus einem Pfad keinen absoluten oder
 //! leeren machen.
 
-use minds_core::observation::{Isolation, Observation, Observations, SpecSeen, WitnessFacts};
+use minds_core::observation::{
+    Isolation, Observation, ObservationGap, Observations, SpecSeen, WitnessFacts,
+};
 
 use crate::pipeline::RedactionPipeline;
 use crate::session::{Field, RedactionAudit, RedactionError};
@@ -61,6 +63,7 @@ impl RedactionPipeline {
             last_at,
             observations,
             witness,
+            gaps,
         } = observations;
         let started_at = started_at
             .map(|at| self.redact_field(Field::ObservationsStartedAt, at, &mut audit))
@@ -124,6 +127,23 @@ impl RedactionPipeline {
                 })
             })
             .transpose()?;
+        // Lücken: der Zeitstempel ist Text und wird gescannt; Grund (ein
+        // geschlossenes Enum), Nummer und Zähler tragen keinen Freitext.
+        let mut redacted_gaps = Vec::with_capacity(gaps.len());
+        for (index, gap) in gaps.into_iter().enumerate() {
+            let ObservationGap {
+                seq,
+                at,
+                reason,
+                dropped,
+            } = gap;
+            redacted_gaps.push(ObservationGap {
+                seq,
+                at: self.redact_field(Field::ObservationGapAt(index), at, &mut audit)?,
+                reason,
+                dropped,
+            });
+        }
         let observations = Observations {
             schema,
             started_at,
@@ -131,6 +151,7 @@ impl RedactionPipeline {
             last_at,
             observations: redacted,
             witness,
+            gaps: redacted_gaps,
         };
         observations.check()?;
         Ok(RedactedObservations {
@@ -215,6 +236,29 @@ mod tests {
 
     fn pipeline() -> RedactionPipeline {
         RedactionConfig::default().pipeline().unwrap()
+    }
+
+    /// Die Lücken des Beobachters kommen durch; ihr Zeitstempel wird gescannt
+    /// wie jeder andere, Grund und Zähler bleiben.
+    #[test]
+    fn observer_gaps_survive_redaction() {
+        use minds_core::observation::GapReason;
+        let object = object(&["src/a.rs"]).with_gaps(vec![ObservationGap {
+            seq: 2,
+            at: "2026-10-05T10:00:01Z".into(),
+            reason: GapReason::Overflow,
+            dropped: Some(7),
+        }]);
+        let redacted = pipeline().redact_observations(object.clone()).unwrap();
+        assert_eq!(redacted.observations(), &object);
+        assert!(redacted.audit().is_clean());
+        // Ein Zeitstempel, der wie ein Secret aussieht, wird ersetzt — und
+        // das Objekt bleibt schreibbar.
+        let mut suspicious = object;
+        suspicious.gaps[0].at = "ghp_0123456789abcdefghijABCDEFGHIJ012345".into();
+        let redacted = pipeline().redact_observations(suspicious).unwrap();
+        assert!(!redacted.audit().is_clean());
+        assert!(!redacted.observations().gaps[0].at.contains("ghp_"));
     }
 
     /// Korpus wie bei Sessions: Was in einem Pfad steckt, muss raus; was ein

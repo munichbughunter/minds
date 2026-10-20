@@ -541,6 +541,20 @@ pub struct Effect {
     /// nicht kannte.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub written_unavailable: Option<WrittenUnavailable>,
+
+    /// Wann der Agent das Geschriebene meldete: der Zeitstempel des
+    /// `PostToolUse`-Events, aus dem `written` stammt (RFC 3339, UTC) — am
+    /// Witness von dessen monotoner Uhr gestempelt, lokal die Ablesung des
+    /// Hooks. Der Zeitpunkt des **Claims**, gegen den der Reader die
+    /// Beobachtung des Datei-Beobachters sucht: Ein Zug kann Minuten dauern,
+    /// und sein `turn.at` (der erste Tool-Aufruf) läge dann weit vor dem
+    /// Schreiben.
+    ///
+    /// Nur zusammen mit `written`; fällt der Hash weg (Redaction), fällt
+    /// auch die Zeit. `None` in Sessions von vor diesem Feld — der Reader
+    /// nimmt dann `turn.at`. Additiv und hash-stabil wie `written`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at: Option<String>,
 }
 
 /// Warum ein Schreib-Effekt keinen Schreibzeit-Hash ([`Effect::written`])
@@ -831,6 +845,7 @@ mod tests {
             content: Some(ContentHash::from_bytes([1u8; 32])),
             written: Some(ContentHash::from_bytes([2u8; 32])),
             written_unavailable: None,
+            written_at: None,
         };
         let json = serde_json::to_string(&effect).unwrap();
         assert!(json.contains("\"written\":\"b3-0202"));

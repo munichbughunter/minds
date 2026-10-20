@@ -78,6 +78,7 @@ fn write(path: &str, text: &str) -> ToolCall {
             content: None,
             written: Some(hash(text.as_bytes())),
             written_unavailable: None,
+            written_at: None,
         }),
     }
 }
@@ -124,10 +125,15 @@ fn seen(
 
 /// Legt ein redigiertes Objekt und seinen `witness-fs/v1`-Seal ab.
 fn seal_observations(store: &InRepoStore, observations: Vec<Observation>) -> ContentHash {
+    seal_object(store, Observations::new(UNANCHORED, observations))
+}
+
+/// Wie [`seal_observations`], mit einem fertigen Objekt (etwa mit Lücken).
+fn seal_object(store: &InRepoStore, object: Observations) -> ContentHash {
     let redacted = minds_redact::RedactionConfig::default()
         .pipeline()
         .unwrap()
-        .redact_observations(Observations::new(UNANCHORED, observations))
+        .redact_observations(object)
         .unwrap();
     let object = store.put_observations(&redacted).unwrap();
     let seal = Seal {
@@ -1255,4 +1261,152 @@ fn a_witnessed_session_without_a_window_is_incomplete() {
     // Unbestätigt bezeugt nichts — auch keine Unvollständigkeit.
     let (_, read) = session_observations(&store, witnessed_id, &witnessed, &|_, _| false);
     assert!(read.complete);
+}
+
+/// Ein Zug, der Minuten dauert: Der Claim trägt die Zeit seiner Meldung
+/// (`written_at`, das `PostToolUse`-Event), und die zählt — nicht der Beginn
+/// seines Zugs. Eine Demo-Session (2026-10-20): `Read` zu Beginn, die
+/// `Write`s Minuten später; der Witness sah jede Datei mit dem gemeldeten
+/// Hash, und jeder Claim blieb `uncorroborated`. Ohne `written_at` (ältere
+/// Sessions) bleibt es beim Zug.
+#[test]
+fn a_claim_is_dated_by_its_report_not_by_the_start_of_its_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let mut late = write("late.rs", "late\n");
+    late.effect.as_mut().unwrap().written_at = Some("2026-10-02T10:03:00Z".into());
+    let agent = session(vec![
+        write("early.rs", "early\n"),
+        late,
+        write("undated.rs", "undated\n"),
+    ]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    for (path, text) in [
+        ("early.rs", "early\n"),
+        ("late.rs", "late\n"),
+        ("undated.rs", "undated\n"),
+    ] {
+        std::fs::write(dir.path().join(path), text).unwrap();
+    }
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "fixture"]);
+    let minutes_later = |seq: u64, path: &str, bytes: &[u8]| Observation {
+        seq,
+        at: "2026-10-02T10:03:01Z".into(),
+        path: path.into(),
+        content: Some(hash(bytes)),
+        reason: None,
+    };
+    let witnessed = seal_observations(
+        &store,
+        vec![
+            seen(1, "early.rs", Some(b"early\n"), None),
+            minutes_later(2, "late.rs", b"late\n"),
+            minutes_later(3, "undated.rs", b"undated\n"),
+        ],
+    );
+    // Das Fenster reicht bis zum Checkpoint (wie bei einer bezeugten
+    // Session), weit über den Zug hinaus.
+    let (from, _) = session_window(&[&agent]).unwrap();
+    let to: jiff::Timestamp = "2026-10-02T10:04:00Z".parse().unwrap();
+    let trusted = |seal: &ContentHash, _: &str| seal == &witnessed;
+    let observations = observations_in_window(&store, from, to, &trusted);
+    assert_eq!(observations.len(), 3);
+
+    let repo = Repo::open(dir.path()).unwrap();
+    let spellings = minds_reader::artifact::roots_of(&repo);
+    let roots: Vec<&Path> = spellings.iter().map(|p| p.as_path()).collect();
+    let corroborated: Vec<(Option<String>, Corroboration)> =
+        corroborations(&[&agent], &roots, &observations)
+            .into_iter()
+            .map(|c| (c.path, c.corroboration))
+            .collect();
+    assert_eq!(
+        corroborated,
+        [
+            (Some("early.rs".into()), Corroboration::Corroborated),
+            (Some("late.rs".into()), Corroboration::Corroborated),
+            (Some("undated.rs".into()), Corroboration::Uncorroborated),
+        ]
+    );
+    // Die Zeilen des Commits: beobachtet, nicht nur berichtet.
+    let commit = repo.head().unwrap().commit().unwrap();
+    let assessed = minds_reader::artifact::assess(&repo, &roots, commit, &[&agent], &observations)
+        .unwrap()
+        .unwrap();
+    let late = assessed
+        .recon
+        .files
+        .iter()
+        .find(|f| f.path == "late.rs")
+        .unwrap();
+    assert_eq!(late.class, ReconClass::Explained);
+}
+
+/// Wo der Beobachter blind war, ist das Material unvollständig — und die
+/// Lücken im Fenster werden genannt, damit ein Claim ohne Beobachtung
+/// seinen Grund bekommt (`observation gap (overflow: 5 events dropped)`
+/// statt `no file-system observation`).
+#[test]
+fn observer_gaps_make_the_window_incomplete_and_are_listed() {
+    use minds_core::observation::{GapReason, ObservationGap};
+    use minds_reader::observations::{Window, gap_near, observations_in_windows_checked};
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let window = Window {
+        from: "2026-10-02T10:00:00Z".parse().unwrap(),
+        to: "2026-10-02T10:00:09Z".parse().unwrap(),
+        epochs: None,
+    };
+    let gapped = seal_object(
+        &store,
+        Observations::new(UNANCHORED, vec![seen(1, "a.rs", Some(b"a\n"), None)]).with_gaps(vec![
+            ObservationGap {
+                seq: 2,
+                at: "2026-10-02T10:00:03Z".into(),
+                reason: GapReason::Overflow,
+                dropped: Some(5),
+            },
+            // Außerhalb des Fensters: nicht genannt — die Epoche bleibt
+            // trotzdem unvollständig.
+            ObservationGap {
+                seq: 3,
+                at: "2026-10-02T11:00:00Z".into(),
+                reason: GapReason::Panic,
+                dropped: None,
+            },
+        ]),
+    );
+    let trusted = |_: &ContentHash, _: &str| true;
+    let read = observations_in_windows_checked(&store, std::slice::from_ref(&window), &trusted);
+    assert!(!read.complete);
+    assert_eq!(read.observations.len(), 1);
+    let listed: Vec<(String, GapReason, Option<u64>)> = read
+        .gaps
+        .iter()
+        .map(|g| (g.at.to_string(), g.reason, g.dropped))
+        .collect();
+    assert_eq!(
+        listed,
+        [(
+            "2026-10-02T10:00:03Z".to_string(),
+            GapReason::Overflow,
+            Some(5)
+        )]
+    );
+    assert_eq!(read.gaps[0].describe(), "overflow: 5 events dropped");
+    // Ein Claim um 10:00:02 fiel in die Lücke; einer um 10:30 nicht.
+    let near = gap_near(&read.gaps, "2026-10-02T10:00:02Z".parse().unwrap());
+    assert_eq!(near, Some(&read.gaps[0]));
+    assert_eq!(
+        gap_near(&read.gaps, "2026-10-02T10:30:00Z".parse().unwrap()),
+        None
+    );
+    // Nur Epochen, die das Fenster nennt, zählen.
+    let untrusted = |id: &ContentHash, _: &str| *id != gapped;
+    let read = observations_in_windows_checked(&store, &[window], &untrusted);
+    assert!(read.complete);
+    assert!(read.gaps.is_empty());
 }

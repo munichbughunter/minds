@@ -241,24 +241,54 @@ fn witness_checks(root: Option<&Path>, probe_home: Option<&Path>, checks: &mut V
 #[cfg(unix)]
 fn protected_side(socket: &Path, checks: &mut Vec<Check>) {
     let home = socket.parent().and_then(Path::parent);
+    let answers = crate::witness_cmd::ping(socket);
     checks.extend(protected_checks(
         socket,
-        crate::witness_cmd::ping(socket),
+        answers,
         home.map(|home| std::fs::read_dir(home).map(drop)),
         // SAFETY: geteuid hat keine Vorbedingungen.
         unsafe { libc::geteuid() } == 0,
+        answers.then(|| crate::witness_cmd::observer_status(socket)),
     ));
+}
+
+/// Die Zeile zum Datei-Beobachter aus seiner Auskunft über den Socket
+/// (`Frame::Status`): `None`, wenn der Witness nicht antwortete (oder den
+/// Frame nicht kennt), sonst was er beobachtet — oder warum nicht. Ohne
+/// Beobachter ist nichts bezeugt außer dem, was der Agent meldet: `fail`.
+#[cfg(unix)]
+fn observer_check(status: Option<Result<String, String>>) -> Check {
+    match status {
+        Some(Ok(line)) => Check::new(Status::Ok, "witness observer", crate::text::sanitize(&line)),
+        Some(Err(reason)) => Check::new(
+            Status::Fail,
+            "witness observer",
+            format!(
+                "{} — the witness records only what the agent reports; check its log \
+                 (log/witness.err) and restart its service",
+                crate::text::sanitize(&reason)
+            ),
+        ),
+        None => Check::new(
+            Status::Fail,
+            "witness observer",
+            "no answer — the witness does not report its observer (an older binary?) \
+             or stopped answering",
+        ),
+    }
 }
 
 /// Die Zeilen zu [`protected_side`] aus den Befunden — ohne Dateisystem,
 /// testbar. `home`: ob sich das Home (zwei Ebenen über dem Socket) lesen
-/// ließ.
+/// ließ; `observer`: die Auskunft des Beobachters, sofern der Witness
+/// antwortete (sonst sagt schon die Zeile davor, dass er nicht läuft).
 #[cfg(unix)]
 fn protected_checks(
     socket: &Path,
     answers: bool,
     home: Option<std::io::Result<()>>,
     root: bool,
+    observer: Option<Option<Result<String, String>>>,
 ) -> Vec<Check> {
     let user = crate::enable_protected::WITNESS_USER;
     let mut checks = vec![if answers {
@@ -302,6 +332,9 @@ fn protected_checks(
             ),
         });
     }
+    if let Some(observer) = observer {
+        checks.push(observer_check(observer));
+    }
     checks
 }
 
@@ -325,15 +358,16 @@ fn agent_side(
                 "witness socket",
                 format!("MINDS_WITNESS_SOCKET={}", path.display()),
             ));
-            checks.push(if crate::witness_cmd::ping(path) {
-                Check::new(Status::Ok, "witness", "answers ping")
+            if crate::witness_cmd::ping(path) {
+                checks.push(Check::new(Status::Ok, "witness", "answers ping"));
+                checks.push(observer_check(crate::witness_cmd::observer_status(path)));
             } else {
-                Check::new(
+                checks.push(Check::new(
                     Status::Fail,
                     "witness",
                     format!("does not answer ping at \"{}\"", path.display()),
-                )
-            });
+                ));
+            }
         }
     }
     // Ohne `--probe-home`: wo die Agent-Seite ein Home vermuten könnte —
@@ -754,15 +788,16 @@ fn host_side(home: &Path, root: Option<&Path>, checks: &mut Vec<Check>) {
         )),
     }
     let socket = home.join("run/witness.sock");
-    checks.push(if crate::witness_cmd::ping(&socket) {
-        Check::new(Status::Ok, "witness", "running, answers ping")
+    if crate::witness_cmd::ping(&socket) {
+        checks.push(Check::new(Status::Ok, "witness", "running, answers ping"));
+        checks.push(observer_check(crate::witness_cmd::observer_status(&socket)));
     } else {
-        Check::new(
+        checks.push(Check::new(
             Status::Fail,
             "witness",
             "not running — rerun `minds enable` (or start its service)",
-        )
-    });
+        ));
+    }
     let key = home.join("key/witness_ed25519");
     checks.push(match std::fs::symlink_metadata(&key) {
         // SAFETY: geteuid hat keine Vorbedingungen.
@@ -912,35 +947,77 @@ mod tests {
         let status = |checks: Vec<Check>| -> Vec<Status> {
             checks.into_iter().map(|check| check.status).collect()
         };
+        let watching = || {
+            Some(Some(
+                Ok("watching /repo · 3 frames · last none".to_string()),
+            ))
+        };
         assert_eq!(
-            status(protected_checks(socket, true, denied(), false)),
-            [Status::Ok, Status::Ok]
+            status(protected_checks(socket, true, denied(), false, watching())),
+            [Status::Ok, Status::Ok, Status::Ok]
         );
         assert_eq!(
-            status(protected_checks(socket, false, denied(), false)),
+            status(protected_checks(socket, false, denied(), false, None)),
             [Status::Fail, Status::Ok]
         );
         assert_eq!(
-            status(protected_checks(socket, true, Some(Ok(())), false)),
-            [Status::Ok, Status::Fail]
+            status(protected_checks(
+                socket,
+                true,
+                Some(Ok(())),
+                false,
+                watching()
+            )),
+            [Status::Ok, Status::Fail, Status::Ok]
         );
         assert_eq!(
-            status(protected_checks(socket, true, Some(Ok(())), true)),
-            [Status::Ok, Status::Warn]
+            status(protected_checks(
+                socket,
+                true,
+                Some(Ok(())),
+                true,
+                watching()
+            )),
+            [Status::Ok, Status::Warn, Status::Ok]
         );
         assert_eq!(
             status(protected_checks(
                 socket,
                 true,
                 Some(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
-                false
+                false,
+                watching()
             )),
-            [Status::Ok, Status::Warn]
+            [Status::Ok, Status::Warn, Status::Ok]
         );
         assert_eq!(
-            status(protected_checks(socket, true, None, false)),
-            [Status::Ok]
+            status(protected_checks(socket, true, None, false, watching())),
+            [Status::Ok, Status::Ok]
         );
+        // Ohne Beobachter oder ohne Auskunft: fail — nichts bezeugt außer
+        // dem, was der Agent meldet.
+        let blind = || {
+            protected_checks(
+                socket,
+                true,
+                None,
+                false,
+                Some(Some(Err("no file observer".to_string()))),
+            )
+        };
+        assert_eq!(status(blind()), [Status::Ok, Status::Fail]);
+        assert!(
+            blind()[1].reason.contains("no file observer"),
+            "{:?}",
+            blind()[1]
+        );
+        assert_eq!(
+            status(protected_checks(socket, true, None, false, Some(None))),
+            [Status::Ok, Status::Fail]
+        );
+        let line = observer_check(Some(Ok("watching /repo · 3 frames · last none".into())));
+        assert_eq!(line.name, "witness observer");
+        assert_eq!(line.reason, "watching /repo · 3 frames · last none");
     }
 
     #[test]

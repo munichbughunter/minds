@@ -40,6 +40,7 @@ fn exec(command: &str) -> ToolCall {
             content: None,
             written: None,
             written_unavailable: None,
+            written_at: None,
         }),
     )
 }
@@ -94,6 +95,7 @@ fn demo() -> Inspection {
                     content: None,
                     written: Some(minds_core::ContentHash::from_bytes([7u8; 32])),
                     written_unavailable: None,
+                    written_at: None,
                 }),
             ),
             tests,
@@ -237,6 +239,7 @@ fn c11_a_handover_row_shows_a_relative_path() {
         content: Some(hash.clone()),
         written: None,
         written_unavailable: None,
+        written_at: None,
     };
     let mut reader = session("Read the notes", "2026-10-16T10:37:12Z");
     reader.redaction.applied = true;
@@ -444,6 +447,7 @@ fn c8_a_long_answer_never_hides_the_write_evidence() {
             content: None,
             written: Some(minds_core::ContentHash::from_bytes([1u8; 32])),
             written_unavailable: None,
+            written_at: None,
         }),
     )];
     let mut sessions = BTreeMap::new();

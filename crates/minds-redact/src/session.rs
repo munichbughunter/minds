@@ -324,6 +324,8 @@ pub enum Field {
         /// Index des Tool-Calls im Zug.
         call: usize,
     },
+    /// `turns[turn].tool_calls[call].effect.written_at`
+    EffectWrittenAt { turn: usize, call: usize },
     /// `turns[t].tool_calls[c].outcome.runner`
     OutcomeRunner {
         /// Index des Zugs.
@@ -403,6 +405,8 @@ pub enum Field {
     ObservationPath(usize),
     /// `observations[i].at`
     ObservationAt(usize),
+    /// `gaps[i].at` eines Observation-Objekts.
+    ObservationGapAt(usize),
     /// Der Snapshot einer Anforderung (EA-14).
     IntentSnapshot,
     /// Die `source=`-Zeile eines Intent-Ankers.
@@ -444,6 +448,9 @@ impl fmt::Display for Field {
             }
             Field::EffectPath { turn, call } => {
                 write!(f, "turns[{turn}].tool_calls[{call}].effect.path")
+            }
+            Field::EffectWrittenAt { turn, call } => {
+                write!(f, "turns[{turn}].tool_calls[{call}].effect.written_at")
             }
             Field::OutcomeRunner { turn, call } => {
                 write!(f, "turns[{turn}].tool_calls[{call}].outcome.runner")
@@ -487,6 +494,7 @@ impl fmt::Display for Field {
             Field::ObservationsLastAt => f.write_str("last_at"),
             Field::ObservationPath(i) => write!(f, "observations[{i}].path"),
             Field::ObservationAt(i) => write!(f, "observations[{i}].at"),
+            Field::ObservationGapAt(i) => write!(f, "gaps[{i}].at"),
             Field::IntentSnapshot => f.write_str("intent.snapshot"),
             Field::IntentSource => f.write_str("intent.source"),
             Field::IntentScope(i) => write!(f, "intent.scope[{i}]"),
@@ -1028,12 +1036,20 @@ impl RedactionPipeline {
             content,
             written,
             written_unavailable,
+            written_at,
         }) = effect
         else {
             return Ok(None);
         };
         let path = match path {
             Some(path) => Some(self.redact_field(Field::EffectPath { turn, call }, path, audit)?),
+            None => None,
+        };
+        // Ein Zeitstempel ist Text und wird gescannt wie `turns[i].at`.
+        let written_at = match written_at {
+            Some(at) => {
+                Some(self.redact_field(Field::EffectWrittenAt { turn, call }, at, audit)?)
+            }
             None => None,
         };
         // `written` ist wie `content` ein [`ContentHash`](minds_core::ContentHash)
@@ -1046,12 +1062,15 @@ impl RedactionPipeline {
         } else {
             (written, written_unavailable)
         };
+        // Die Zeit gehört zum Hash: ohne ihn keine.
+        let written_at = written_at.filter(|_| written.is_some());
         Ok(Some(Effect {
             kind,
             path,
             content,
             written,
             written_unavailable,
+            written_at,
         }))
     }
 
@@ -1896,6 +1915,7 @@ mod tests {
                 content: Some(hash.clone()),
                 written: Some(hash.clone()),
                 written_unavailable: None,
+                written_at: Some("2026-07-23T09:12:04.512Z".into()),
             }),
         });
         // Derselbe Aufruf ohne Treffer: Der Hash bleibt.
@@ -1910,6 +1930,7 @@ mod tests {
                 content: None,
                 written: Some(hash.clone()),
                 written_unavailable: None,
+                written_at: Some("2026-07-23T09:12:05.001Z".into()),
             }),
         });
         s.turns.push(turn);
@@ -1926,9 +1947,16 @@ mod tests {
         // Und `content` ebenso: meist byte-gleich mit `written`, also
         // dasselbe Orakel unter anderem Namen.
         assert_eq!(hit.content, None, "Platten-Hash neben dem Template");
+        // Die Zeit gehoert zum Hash: ohne ihn keine.
+        assert_eq!(hit.written_at, None, "Claim-Zeit ohne Hash");
         let clean = calls[1].effect.as_ref().unwrap();
         assert_eq!(clean.written, Some(hash));
         assert_eq!(clean.written_unavailable, None);
+        assert_eq!(
+            clean.written_at.as_deref(),
+            Some("2026-07-23T09:12:05.001Z"),
+            "die Claim-Zeit uebersteht die Redaction neben dem Hash"
+        );
     }
 
     #[test]
@@ -1975,6 +2003,7 @@ mod tests {
                 content: None,
                 written: None,
                 written_unavailable: None,
+                written_at: None,
             }),
         });
         s.turns.push(turn);

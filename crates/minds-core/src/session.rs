@@ -617,6 +617,7 @@ mod tests {
             content: None,
             written: None,
             written_unavailable: None,
+            written_at: None,
         });
         let json = crate::to_canonical_string(&with_effect).unwrap();
         for key in ["written", "written_unavailable", "content"] {
@@ -733,6 +734,7 @@ mod tests {
             content: Some(ContentHash::from_bytes([7u8; 32])),
             written: None,
             written_unavailable: None,
+            written_at: None,
         });
 
         let json = serde_json::to_string(&s).unwrap();

@@ -17,8 +17,45 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`minds doctor` shows the file observer.** A new read-only `Status`
+  frame (accepted on the agent and the control socket) makes the witness
+  report `watching <root> · <n> frames · last <ts>`; `doctor` prints it as
+  `witness observer: …` wherever the witness answers `ping`, and fails when
+  the witness has no file observer or does not answer the request.
+- **The observer announces itself on stderr.** `minds witness run` prints
+  `witness observer: watching <root>` when the file observer starts, and the
+  reason when it cannot (plus its gaps, throttled like the log). The
+  protected LaunchDaemon writes that stderr to `<witness home>/log/witness.err`
+  (`StandardErrorPath`), so a witness that never watched is visible without
+  a checkpoint; under systemd it is in the journal.
+- **Observer gaps are named, not silent.** When the file observer loses
+  notifications (a full channel, a panic, unreadable ignore rules, no
+  watcher), its `fs.gap` event now counts what the full channel refused
+  (`dropped`), the checkpoint carries the gaps into the observation object
+  (`gaps`, additive — an object without gaps serializes as before), and
+  `minds verify` reads them: a write claim whose observation fell into a gap
+  says `observation gap (overflow: 12 events dropped)` instead of `no
+  file-system observation`, the Assurance reason names the gap's cause, and
+  a window with a gap is incomplete material for the scope.
+
 ### Fixed
 
+- **Write claims are corroborated by the witness's file observations.** A
+  write claim carried no time of its own; the reader dated it to the start of
+  its turn (`turn.at`, the first tool call) and looked for the observation
+  within 30 s of that. A turn runs for minutes: every `Write`/`Edit` after the
+  first half minute stayed `uncorroborated · no file-system observation`,
+  although the observation epoch of the checkpoint held every file with the
+  reported hash. The claim now carries `effect.written_at`, the time of its
+  `PostToolUse` event (additive, hash-stable; dropped together with the hash
+  under redaction), and the reader correlates with it — sessions stored
+  before the field fall back to the turn. The TUI's Changes tab and the
+  Overview's line count now take the witness observations from the `minds
+  verify` result of the commit (the index alone knows no signers): what the
+  witness saw is `● observed`, not `◇ reported`, and the tab is recomputed in
+  place when the verdict arrives.
 - **The evidence view says `sealed` until `minds verify` has checked.** Before
   a check, INTEGRITY read `✓ record intact …` while the Overview showed `…
   checking` for the same state. Now the line carries the trust glyph of the

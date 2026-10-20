@@ -1043,6 +1043,7 @@ mod tests {
                         content: Some(h.clone()),
                         written: None,
                         written_unavailable: None,
+                        written_at: None,
                     }),
                 }],
                 parent: None,

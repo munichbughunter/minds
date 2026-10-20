@@ -40,6 +40,7 @@ fn check(verdict: Result<crate::VerifyVerdict, String>) -> crate::CommitVerify {
         out_of_scope_paths: Vec::new(),
         scope_note: None,
         conformance: None,
+        observations: Vec::new(),
     }
 }
 
@@ -547,7 +548,7 @@ fn c121_evidence_counts_lines_from_the_reconciliation_it_holds() {
     );
     assert_eq!(
         Ok(counted.clone()),
-        crate::app::count_lines(&app.inspection, &repo, *commit)
+        crate::app::count_lines(&app.inspection, &repo, *commit, &[])
     );
     assert_eq!((counted.added, counted.unexplained), (4, 1));
 }

@@ -500,8 +500,62 @@ impl<'a> App<'a> {
     /// zur Meldung (fail-soft).
     fn load_changes(&self, commit: CommitId) -> Result<ChangeSet, String> {
         self.inspection
-            .changes(self.repo, commit)
+            .changes_with(self.repo, commit, self.observations_for(commit))
             .map_err(|err| minds_reader::sanitize(&err.to_string()))
+    }
+
+    /// Die Beobachtungen des Datei-Beobachters zu `commit` aus dem Urteil
+    /// von `minds verify`, sobald die Übersicht eines hat — leer davor und
+    /// ohne Witness. Nur `verify` prüft die Witness-Signatur; der Index
+    /// allein nähme keine Beobachtung.
+    fn observations_for(&self, commit: CommitId) -> &[minds_reader::reconcile::FsObservation] {
+        self.overview
+            .as_ref()
+            .and_then(|state| state.checks.get(&commit))
+            .and_then(|check| check.as_ref().ok())
+            .map_or(&[], |check| check.observations.as_slice())
+    }
+
+    /// Ein Urteil zu `commit` ist da, das Beobachtungen bringt (oder das
+    /// vorige brachte welche): Was damit anders zählt, wird neu gerechnet —
+    /// die Zeilen der Übersicht und, zeigt der Changes-Tab diesen Commit,
+    /// sein Satz (an derselben Stelle). Ein Urteil ohne Beobachtungen
+    /// ändert an den Zeilen nichts und lässt die Zählung stehen.
+    fn checked(&mut self, commit: CommitId) {
+        if let Some(state) = self.overview.as_mut() {
+            state.lines.remove(&commit);
+        }
+        if self.changes.as_ref().and_then(|s| s.commit()) == Some(commit) {
+            self.reload_changes();
+        }
+    }
+
+    /// Liest den Satz des Changes-Tabs neu und bleibt an derselben Stelle
+    /// (Datei, Zeile, Fokus, Darstellung), wenn es sie noch gibt.
+    fn reload_changes(&mut self) {
+        let Some(state) = self.changes.take() else {
+            return;
+        };
+        let Some(commit) = state.commit() else {
+            self.changes = Some(state);
+            return;
+        };
+        let path = state.current().map(|f| f.identity.clone());
+        let set = self.load_changes(commit);
+        let mut next = ChangesState::new(state.commits.clone(), state.at, set);
+        next.split = state.split;
+        next.why = state.why;
+        next.filter = state.filter.clone();
+        next.why_layer = state.why_layer;
+        next.landed = state.landed;
+        if let Some(path) = path
+            && next.select_path(&path)
+        {
+            next.focus = state.focus;
+            next.row = state.row;
+            next.move_row(0);
+        }
+        self.changes = Some(next);
     }
 
     /// Öffnet den Changes-Tab — auf `commit`, sonst auf HEAD.
@@ -885,7 +939,19 @@ impl<'a> App<'a> {
             return true;
         }
         if let std::collections::hash_map::Entry::Vacant(slot) = state.lines.entry(commit) {
-            slot.insert(count_lines(&self.inspection, self.repo, commit));
+            // Mit den Beobachtungen des Urteils, wenn es schon da ist
+            // (`checked` löscht die Zählung, sobald eines kommt).
+            let observations = state
+                .checks
+                .get(&commit)
+                .and_then(|check| check.as_ref().ok())
+                .map_or(&[][..], |check| check.observations.as_slice());
+            slot.insert(count_lines(
+                &self.inspection,
+                self.repo,
+                commit,
+                observations,
+            ));
             return true;
         }
         false
@@ -905,10 +971,15 @@ impl<'a> App<'a> {
             return false;
         };
         state.urgent = false;
+        let had = carries_observations(state.checks.get(&commit));
         state.checks.insert(commit, source.verify(commit));
         state.checked_at.insert(commit, now);
+        let has = carries_observations(state.checks.get(&commit));
         if self.verify_asked == Some(commit) {
             self.verify_asked = None;
+        }
+        if had || has {
+            self.checked(commit);
         }
         true
     }
@@ -949,10 +1020,15 @@ impl<'a> App<'a> {
             && state.asked == Some(commit)
         {
             state.asked = None;
+            let had = carries_observations(state.checks.get(&commit));
             state.checks.insert(commit, answer);
             state.checked_at.insert(commit, now);
+            let has = carries_observations(state.checks.get(&commit));
             if self.verify_asked == Some(commit) {
                 self.verify_asked = None;
+            }
+            if had || has {
+                self.checked(commit);
             }
         }
         true
@@ -2503,14 +2579,23 @@ fn place(tab: Tab, views: &[View], commit: Option<CommitId>) -> Vec<String> {
     }
 }
 
+/// Ob ein Urteil Beobachtungen des Witness trägt — nur dann zählen die
+/// Zeilen eines Commits anders als ohne Urteil.
+fn carries_observations(check: Option<&Result<CommitVerify, String>>) -> bool {
+    check
+        .and_then(|check| check.as_ref().ok())
+        .is_some_and(|check| !check.observations.is_empty())
+}
+
 /// Die Zeilenklassen eines Commits (C3.1): **die** eine Rechnung für
 /// Übersicht, Changes-Tab und Evidence-Ebene — oder warum nicht.
 pub(crate) fn count_lines(
     inspection: &Inspection,
     repo: &Repo,
     commit: CommitId,
+    observations: &[minds_reader::reconcile::FsObservation],
 ) -> Result<minds_reader::changes::LineClasses, String> {
-    match inspection.changes(repo, commit) {
+    match inspection.changes_with(repo, commit, observations) {
         Ok(set) => match &set.unassessed {
             Some(why) => Err(why.clone()),
             None => Ok(set.line_classes()),

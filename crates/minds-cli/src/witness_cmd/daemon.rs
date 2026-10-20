@@ -47,7 +47,7 @@ mod tests;
 mod witness_clock;
 mod worker;
 pub use socket::run;
-pub(crate) use socket::{CONTROL_SOCKET, peer_uid, ping};
+pub(crate) use socket::{CONTROL_SOCKET, observer_status, peer_uid, ping};
 pub(crate) use worker::worker;
 
 /// Das Isolationsprofil (00-conventions, ADR-0012) — ein Typ für Witness-
@@ -1273,6 +1273,10 @@ struct Writer {
     stream: Option<SessionKey>,
     /// Das zweite Auge (EA-08); `None`, solange `run` es nicht startet.
     observer: Option<observer::Observer>,
+    /// Wie viele `fs.observed` dieser Lauf anhängte, und wann zuletzt — die
+    /// Auskunft für `minds doctor` (`Frame::Status`).
+    fs_frames: u64,
+    fs_last: Option<String>,
     /// Ob seit dem letzten Versiegeln eine Datei-Beobachtung kam.
     fs_dirty: bool,
     /// Ob ein Scheitern der Ignore-Auswertung schon geloggt wurde.
@@ -1283,6 +1287,9 @@ struct Writer {
     /// je Grund und Sekunde — eine dauerhafte Störung füllt das Journal
     /// nicht im Takt der Eventloop.
     last_gap: std::collections::HashMap<&'static str, std::time::Instant>,
+    /// Verlorene Meldungen, die noch kein `fs.gap` nennt (in der Sekunde
+    /// nach dem letzten): Das nächste zählt sie mit.
+    gap_dropped: u64,
     /// Ob in diesem Durchlauf der Eventloop schon für einen Checkpoint
     /// ohne Entprellung beobachtet wurde. Eine Flut von Anfragen in einem
     /// Durchlauf kostet so höchstens einmal das Budget.
@@ -1340,11 +1347,14 @@ impl Writer {
             last_failure: None,
             stream: None,
             observer: None,
+            fs_frames: 0,
+            fs_last: None,
             fs_dirty: false,
             ignore_failure_logged: false,
             fs_ready: std::collections::VecDeque::new(),
             settled_this_step: false,
             last_gap: std::collections::HashMap::new(),
+            gap_dropped: 0,
             // Erst `open` lädt den aktiven Intent (samt Beleg); der Worker
             // eines Checkpoints braucht ihn nicht.
             intent: None,
@@ -1623,7 +1633,7 @@ impl Writer {
                 Ok(batch) => batch,
                 Err(_) => {
                     observer.forget_caches();
-                    self.gap(&stream, "panic", "file observer panicked; gap recorded")?;
+                    self.gap(&stream, "panic", "file observer panicked; gap recorded", 0)?;
                     observer::Batch::default()
                 }
             }
@@ -1636,6 +1646,7 @@ impl Writer {
                 &stream,
                 "overflow",
                 "file observer lost notifications; gap recorded",
+                batch.dropped,
             )?;
         }
         if batch.ignore_failed {
@@ -1677,6 +1688,7 @@ impl Writer {
             };
             let payload = serde_json::value::RawValue::from_string(seen.payload()?)?;
             let at = seen.at.clone();
+            let stamp = at.0.clone();
             self.append(
                 &stream,
                 NewEvent {
@@ -1692,24 +1704,60 @@ impl Writer {
             )?;
             self.fs_ready.pop_front();
             self.fs_dirty = true;
+            self.fs_frames = self.fs_frames.saturating_add(1);
+            self.fs_last = Some(stamp);
         }
         Ok(())
     }
 
+    /// Die Auskunft über den Beobachter (`Frame::Status`): was er
+    /// beobachtet, wie viele Beobachtungen dieser Lauf anhängte und wann
+    /// zuletzt — oder der Grund, warum keiner läuft. Nur die kanonische
+    /// Wurzel aus `witness.json`, nie ein beobachteter Pfad.
+    pub(super) fn observer_status(&self) -> Result<String, &'static str> {
+        if self.observer.is_none() {
+            return Err("no file observer");
+        }
+        Ok(format!(
+            "watching {} · {} frames · last {}",
+            self.config.repo_root.display(),
+            self.fs_frames,
+            self.fs_last.as_deref().unwrap_or("none")
+        ))
+    }
+
     /// Hängt ein `fs.gap` mit `reason` an und loggt `note` — höchstens
-    /// einmal je Grund und Sekunde.
-    fn gap(&mut self, stream: &SessionKey, reason: &'static str, note: &str) -> Fallible<()> {
+    /// einmal je Grund und Sekunde. `dropped` zählt die Meldungen, die der
+    /// volle Kanal abwies (`0`: keine oder nicht zählbar); was in der
+    /// gedrosselten Sekunde anfällt, nennt das nächste `fs.gap` mit.
+    fn gap(
+        &mut self,
+        stream: &SessionKey,
+        reason: &'static str,
+        note: &str,
+        dropped: u64,
+    ) -> Fallible<()> {
         let now = std::time::Instant::now();
+        let dropped = self.gap_dropped.saturating_add(dropped);
         if self
             .last_gap
             .get(reason)
             .is_some_and(|at| now.duration_since(*at) < std::time::Duration::from_secs(1))
         {
+            self.gap_dropped = dropped;
             return Ok(());
         }
+        self.gap_dropped = 0;
         self.last_gap.insert(reason, now);
         log(&self.home, note);
-        self.lifecycle(stream, "fs.gap", serde_json::json!({ "reason": reason }))?;
+        // Gedrosselt wie das Log: höchstens eine Zeile je Grund und Sekunde.
+        eprintln!("witness observer: {}", crate::hooklog::diagnostic(note));
+        let payload = if dropped > 0 {
+            serde_json::json!({ "reason": reason, "dropped": dropped })
+        } else {
+            serde_json::json!({ "reason": reason })
+        };
+        self.lifecycle(stream, "fs.gap", payload)?;
         self.fs_dirty = true;
         Ok(())
     }

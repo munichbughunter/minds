@@ -33,6 +33,7 @@ fn call(name: &str, path: &str, arguments: serde_json::Value, written: Option<&[
             content: None,
             written: written.map(hash),
             written_unavailable: None,
+            written_at: None,
         }),
     }
 }

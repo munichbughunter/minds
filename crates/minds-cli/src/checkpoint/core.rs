@@ -358,9 +358,11 @@ pub fn seal_observation_streams(
     sealed
 }
 
-/// Das Observation-Objekt aus den `fs.observed`-Events einer Epoche. Die
-/// übrigen Events des Streams (Lebenszyklus, Lücken des Beobachters) bindet
-/// allein die Kette. Ein unlesbares eigenes Event ist ein Integritätsfehler.
+/// Das Observation-Objekt aus den `fs.observed`-Events einer Epoche — samt
+/// ihren `fs.gap`-Events ([`minds_core::observation::ObservationGap`]): Wo
+/// der Beobachter blind war, soll der Leser es sehen, nicht nur die Kette.
+/// Die übrigen Events des Streams (Lebenszyklus) bindet allein die Kette.
+/// Ein unlesbares eigenes Event ist ein Integritätsfehler.
 ///
 /// `started_at` (EA-08a) ist der Zeitstempel des ersten Events der Epoche —
 /// `witness.start` in der ersten Epoche eines Laufs, sonst das erste Event
@@ -370,7 +372,9 @@ pub fn seal_observation_streams(
 pub fn observations_of(
     events: &[minds_capture::JournalEvent],
 ) -> Fallible<minds_core::observation::Observations> {
-    use minds_core::observation::{Observation, ObservationReason, Observations};
+    use minds_core::observation::{
+        GapReason, Observation, ObservationGap, ObservationReason, Observations,
+    };
 
     #[derive(serde::Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -379,20 +383,38 @@ pub fn observations_of(
         content: Option<minds_core::ContentHash>,
         reason: Option<ObservationReason>,
     }
+    #[derive(serde::Deserialize)]
+    struct GapPayload {
+        reason: String,
+        #[serde(default)]
+        dropped: Option<u64>,
+    }
     let started_at = events.first().ok_or("empty witness stream")?.at.clone();
     let mut observations = Vec::new();
-    for event in events.iter().filter(|e| e.raw_kind == FS_OBSERVED) {
-        let payload: Payload = serde_json::from_str(event.payload.get())
-            .map_err(|_| "unreadable fs.observed event")?;
-        observations.push(Observation {
-            seq: event.seq,
-            at: event.at.clone(),
-            path: payload.path,
-            content: payload.content,
-            reason: payload.reason,
-        });
+    let mut gaps = Vec::new();
+    for event in events {
+        if event.raw_kind == FS_OBSERVED {
+            let payload: Payload = serde_json::from_str(event.payload.get())
+                .map_err(|_| "unreadable fs.observed event")?;
+            observations.push(Observation {
+                seq: event.seq,
+                at: event.at.clone(),
+                path: payload.path,
+                content: payload.content,
+                reason: payload.reason,
+            });
+        } else if event.raw_kind == FS_GAP {
+            let payload: GapPayload =
+                serde_json::from_str(event.payload.get()).map_err(|_| "unreadable fs.gap event")?;
+            gaps.push(ObservationGap {
+                seq: event.seq,
+                at: event.at.clone(),
+                reason: GapReason::parse(&payload.reason),
+                dropped: payload.dropped.filter(|n| *n > 0),
+            });
+        }
     }
-    Ok(Observations::new(started_at, observations))
+    Ok(Observations::new(started_at, observations).with_gaps(gaps))
 }
 
 /// Redigiert das Objekt; lehnt die Pipeline es ab, wird jede Beobachtung
@@ -447,6 +469,10 @@ fn redact_each(
 /// `raw_kind` einer Datei-Beobachtung im Witness-Stream.
 #[cfg(unix)]
 pub const FS_OBSERVED: &str = "fs.observed";
+
+/// `raw_kind` einer Lücke des Beobachters im Witness-Stream.
+#[cfg(unix)]
+pub const FS_GAP: &str = "fs.gap";
 
 /// Baut den Seal dieser Epoche, legt ihn ab und schreibt den Epochen-Zustand
 /// fort. Gibt die [`SealSummary`] zurück — oder `None`, wenn die Ablage

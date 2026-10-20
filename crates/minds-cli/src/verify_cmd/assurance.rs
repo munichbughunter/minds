@@ -45,7 +45,7 @@ use minds_reader::assurance::{
     LedgerCheck, MAX_LISTED, RangeInput, Reason, Seals, assess,
 };
 use minds_reader::model::EvidenceVerdict;
-use minds_reader::observations::Window;
+use minds_reader::observations::{Window, WindowObservations};
 use minds_store::{ContextStore, StoreError};
 
 use super::witness_trust::WitnessTrust;
@@ -403,11 +403,14 @@ fn closes_session(facts: &Facts<'_>, seal: &Seal) -> bool {
 }
 
 /// Die Abdeckung durch den Datei-Beobachter: lückenlos, wenn der Witness
-/// ein Fenster über die Session trägt und keine seiner Epochen eine Lücke
-/// zählt; ohne Fenster nicht verfügbar.
+/// ein Fenster über die Session trägt, keine seiner Epochen ein Glied der
+/// Kette verlor und der Beobachter in keiner blind war; ohne Fenster nicht
+/// verfügbar.
 ///
-/// Die Lückengründe (EA-08c) stehen heute nicht im Material — eine Lücke
-/// erscheint deshalb ohne Grund (`observation gap`).
+/// Die Gründe sind die der `fs.gap`-Events, wie das Observation-Objekt der
+/// Epoche sie trägt (`overflow`, `panic`, …). Ein verlorenes Kettenglied
+/// (`gaps=` im Seal) hat keinen Grund im Material: `observation gap` ohne
+/// Klammer.
 pub(crate) fn fs_coverage(store: &dyn ContextStore, windows: &[Window]) -> FsCoverage {
     if windows.is_empty() {
         return FsCoverage::Unavailable { cause: None };
@@ -417,21 +420,42 @@ pub(crate) fn fs_coverage(store: &dyn ContextStore, windows: &[Window]) -> FsCov
     if windows.iter().any(|window| window.epochs.is_none()) {
         return FsCoverage::Unavailable { cause: None };
     }
-    let gapped = windows
+    let mut gapped = false;
+    let mut reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for epoch in windows
         .iter()
         .flat_map(|window| window.epochs.iter().flatten())
-        .any(|epoch| {
-            // Unlesbar heißt: nicht belegt lückenlos.
-            store
-                .seal_text(epoch)
-                .ok()
-                .flatten()
-                .and_then(|text| Seal::parse(&text).ok())
-                .is_none_or(|seal| seal.gaps > 0)
-        });
+    {
+        // Unlesbar heißt: nicht belegt lückenlos.
+        let Some(seal) = store
+            .seal_text(epoch)
+            .ok()
+            .flatten()
+            .and_then(|text| Seal::parse(&text).ok())
+        else {
+            gapped = true;
+            continue;
+        };
+        if seal.gaps > 0 {
+            gapped = true;
+        }
+        let SealOutcome::ObservationsStored { observations } = &seal.outcome else {
+            continue;
+        };
+        let object = observations
+            .parse::<ContentHash>()
+            .ok()
+            .and_then(|id| store.get_observations(&id).ok().flatten());
+        if let Some(object) = object {
+            for gap in &object.gaps {
+                gapped = true;
+                reasons.insert(gap.reason.word().to_owned());
+            }
+        }
+    }
     if gapped {
         FsCoverage::Gapped {
-            reasons: Vec::new(),
+            reasons: reasons.into_iter().collect(),
         }
     } else {
         FsCoverage::Complete
@@ -478,26 +502,42 @@ pub(crate) fn witness_starts(
 /// Nur mit Beobachtungsfenster: Ohne bezeugtes Fenster hat niemand
 /// beobachtet, und „unbestätigt" wäre über jeden Claim wahr und damit
 /// nichtssagend. Die Stelle ist Zug und Aufruf in der gespeicherten Session
-/// (1-basiert) — die Event-`seq` des Journals steht nicht im Store.
+/// (1-basiert) — die Event-`seq` des Journals steht nicht im Store. War
+/// der Beobachter im Fenster des Claims blind ([`gap_near`]), sagt die
+/// Zeile das (`observation gap (overflow: 12 events dropped)`) statt
+/// `no file-system observation`.
 pub(super) fn uncorroborated_lines(
     root: &Path,
     id: SessionId,
     session: &Session,
-    observations: &[minds_reader::reconcile::FsObservation],
+    observations: &WindowObservations,
     all: bool,
 ) -> Vec<String> {
-    use minds_reader::observations::{Corroboration, corroborations};
+    use minds_reader::observations::{Corroboration, corroborations, gap_near};
     let spellings = minds_reader::artifact::root_spellings(root);
     let roots: Vec<&Path> = spellings.iter().map(std::path::PathBuf::as_path).collect();
-    let claims: Vec<String> = corroborations(&[session], &roots, observations)
+    let claims: Vec<String> = corroborations(&[session], &roots, &observations.observations)
         .into_iter()
         .filter(|claim| claim.corroboration == Corroboration::Uncorroborated)
         .filter_map(|claim| {
-            let call = session.turns.get(claim.turn)?.tool_calls.get(claim.call)?;
-            let written = call.effect.as_ref()?.written.as_ref()?.to_string();
+            let turn = session.turns.get(claim.turn)?;
+            let call = turn.tool_calls.get(claim.call)?;
+            let effect = call.effect.as_ref()?;
+            let written = effect.written.as_ref()?.to_string();
             let path = super::artifact::shown_path(claim.path.as_deref()?);
+            // Dieselbe Claim-Zeit wie die Korroboration: die Meldung, sonst
+            // der Zug.
+            let claimed_at = effect
+                .written_at
+                .as_deref()
+                .or(turn.at.as_deref())
+                .and_then(|at| at.parse::<jiff::Timestamp>().ok());
+            let why = match claimed_at.and_then(|at| gap_near(&observations.gaps, at)) {
+                Some(gap) => format!("observation gap ({})", gap.describe()),
+                None => "no file-system observation".to_owned(),
+            };
             Some(format!(
-                "  uncorroborated  turn {} call {}  {} {path}  {}…  no file-system observation",
+                "  uncorroborated  turn {} call {}  {} {path}  {}…  {why}",
                 claim.turn + 1,
                 claim.call + 1,
                 shown_tool(&call.name),

@@ -25,7 +25,7 @@
 
 use jiff::{SignedDuration, Timestamp};
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome};
-use minds_core::observation::ObservationReason;
+use minds_core::observation::{GapReason, ObservationReason};
 use minds_core::{ContentHash, EffectKind, Session, SessionId};
 use minds_store::ContextStore;
 
@@ -105,6 +105,45 @@ pub struct WindowObservations {
     /// was beobachtet wurde (Scope-Befunde, EA-17), ist das Material dann
     /// unvollständig.
     pub complete: bool,
+    /// Wo der Beobachter in den Fenstern blind war
+    /// ([`minds_core::observation::ObservationGap`] der genannten Epochen),
+    /// nach Zeit sortiert. Jede macht das Material unvollständig — und
+    /// erklärt einem Claim ohne Beobachtung, warum
+    /// ([`gap_near`]).
+    pub gaps: Vec<FsGap>,
+}
+
+/// Eine Lücke des Beobachters, gelesen: wann, warum, wie viele Meldungen
+/// (wo zählbar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsGap {
+    pub at: Timestamp,
+    pub reason: GapReason,
+    pub dropped: Option<u64>,
+}
+
+impl FsGap {
+    /// Der Text für ein Urteil: `overflow: 12 events dropped`, sonst nur
+    /// das Grund-Wort.
+    pub fn describe(&self) -> String {
+        match self.dropped {
+            Some(n) => format!("{}: {n} events dropped", self.reason.word()),
+            None => self.reason.word().to_owned(),
+        }
+    }
+}
+
+/// Die Lücke, in die die Beobachtung eines Claims um `claim_at` gefallen
+/// sein kann: eine im Fenster `[claim − 2 s, claim + 30 s]` — dasselbe
+/// Fenster wie bei [`corroborate`]. Die erste nach Zeit.
+pub fn gap_near(gaps: &[FsGap], claim_at: Timestamp) -> Option<&FsGap> {
+    let (Ok(from), Ok(to)) = (
+        claim_at.checked_sub(CORROBORATION_BEFORE),
+        claim_at.checked_add(CORROBORATION_AFTER),
+    ) else {
+        return None;
+    };
+    gaps.iter().find(|gap| from <= gap.at && gap.at <= to)
 }
 
 /// Fenster und Beobachtungen **einer** Session, wie `minds verify` sie
@@ -132,6 +171,7 @@ pub fn session_observations(
             WindowObservations {
                 observations: Vec::new(),
                 complete: !witnessed,
+                gaps: Vec::new(),
             },
         );
     }
@@ -170,16 +210,19 @@ pub fn observations_in_windows_checked(
         return WindowObservations {
             observations: Vec::new(),
             complete: true,
+            gaps: Vec::new(),
         };
     };
     let Ok(seals) = store.list_seals() else {
         return WindowObservations {
             observations: Vec::new(),
             complete: false,
+            gaps: Vec::new(),
         };
     };
     let mut complete = true;
     let mut out: Vec<(Timestamp, FsObservation)> = Vec::new();
+    let mut gaps: Vec<FsGap> = Vec::new();
     let mut seen_objects = std::collections::BTreeSet::new();
     for seal_id in seals {
         // Ein aufgelisteter, aber nicht lesbarer Seal kann eine Epoche des
@@ -222,6 +265,22 @@ pub fn observations_in_windows_checked(
             .iter()
             .filter_map(|o| time(Some(&o.at)))
             .any(|at| inside(&seal_id, at));
+        // Der Beobachter war in dieser Epoche blind: unvollständig — und
+        // die Lücken im Fenster werden genannt.
+        if !object.gaps.is_empty() && named(&seal_id) {
+            complete = false;
+        }
+        for gap in &object.gaps {
+            if let Some(at) = time(Some(&gap.at))
+                && inside(&seal_id, at)
+            {
+                gaps.push(FsGap {
+                    at,
+                    reason: gap.reason,
+                    dropped: gap.dropped,
+                });
+            }
+        }
         if !overlaps || !seen_objects.insert(object_id) {
             continue;
         }
@@ -253,9 +312,12 @@ pub fn observations_in_windows_checked(
         }
     }
     out.sort_by(|a, b| (a.0, &a.1.path, a.1.observed.seq).cmp(&(b.0, &b.1.path, b.1.observed.seq)));
+    gaps.sort_by_key(|gap| gap.at);
+    gaps.dedup();
     WindowObservations {
         observations: out.into_iter().map(|(_, o)| o).collect(),
         complete,
+        gaps,
     }
 }
 
@@ -657,9 +719,11 @@ pub struct ClaimCorroboration {
 /// deterministisch.
 ///
 /// Grenzen, die das Ergebnis mitprägen:
-/// - Der Zeitpunkt eines Claims ist der seines **Zugs** (`turn.at`). Liegen
-///   die Tool-Calls eines Zugs über mehr als 30 s verteilt, kann ein später
-///   Schreibzugriff aus dem Fenster fallen und unbestätigt bleiben.
+/// - Der Zeitpunkt eines Claims ist der seiner Meldung
+///   ([`minds_core::Effect::written_at`], das `PostToolUse`-Event). Fehlt
+///   er (Sessions von vor diesem Feld), gilt der des **Zugs** (`turn.at`):
+///   Liegen die Tool-Calls eines Zugs dann über mehr als 30 s verteilt,
+///   fällt ein später Schreibzugriff aus dem Fenster und bleibt unbestätigt.
 /// - Der Witness hält Inhalts**änderungen** fest: Schreibt jemand innerhalb
 ///   einer Epoche denselben Inhalt erneut, entsteht keine zweite
 ///   Beobachtung; ein Claim dafür findet nur die erste.
@@ -688,8 +752,11 @@ pub fn corroborations(
                     .path
                     .as_deref()
                     .and_then(|p| claim_path(p, cwd, roots, &known, false));
+                let claimed_at = time(effect.written_at.as_deref()).or(at);
                 let corroboration = match (&path, &effect.written) {
-                    (Some(path), Some(written)) => corroborate(path, written, at, observations),
+                    (Some(path), Some(written)) => {
+                        corroborate(path, written, claimed_at, observations)
+                    }
                     _ => Corroboration::NotApplicable,
                 };
                 out.push(ClaimCorroboration {
@@ -812,7 +879,7 @@ mod tests {
     #[test]
     fn corroborations_cover_every_write_claim() {
         use minds_core::{Agent, Effect, Intent, Model, Role, ToolCall, Turn};
-        let call = |path: &str, written: Option<ContentHash>| ToolCall {
+        let call_at = |path: &str, written: Option<ContentHash>, at: Option<&str>| ToolCall {
             outcome: None,
             name: "Write".into(),
             arguments: String::new(),
@@ -823,8 +890,10 @@ mod tests {
                 content: None,
                 written,
                 written_unavailable: None,
+                written_at: at.map(str::to_owned),
             }),
         };
+        let call = |path: &str, written: Option<ContentHash>| call_at(path, written, None);
         let mut session = Session::new(
             Agent {
                 name: "claude-code".into(),
@@ -852,6 +921,18 @@ mod tests {
             ),
             // Ohne Zeitpunkt kein Fenster.
             (None, vec![call("/repo/src/a.rs", Some(h(1)))]),
+            // Ein Zug, der Minuten dauert: Der Claim trägt die Zeit seiner
+            // Meldung, und die zählt — nicht der Beginn des Zugs. Ohne sie
+            // (ältere Sessions) bleibt es beim Zug.
+            (
+                Some("2026-10-05T10:00:10Z"),
+                vec![
+                    call_at("/repo/src/c.rs", Some(h(3)), Some("2026-10-05T10:04:00Z")),
+                    call("/repo/src/d.rs", Some(h(4))),
+                    // Die Meldung liegt vor der Beobachtung — erfunden.
+                    call_at("/repo/src/c.rs", Some(h(3)), Some("2026-10-05T10:03:00Z")),
+                ],
+            ),
         ] {
             session.turns.push(Turn {
                 role: Role::Assistant,
@@ -861,7 +942,11 @@ mod tests {
                 at: at.map(str::to_owned),
             });
         }
-        let observations = [obs("src/a.rs", Some(h(1)), "2026-10-05T10:00:12Z", false)];
+        let observations = [
+            obs("src/a.rs", Some(h(1)), "2026-10-05T10:00:12Z", false),
+            obs("src/c.rs", Some(h(3)), "2026-10-05T10:04:01Z", false),
+            obs("src/d.rs", Some(h(4)), "2026-10-05T10:04:01Z", false),
+        ];
         let root = std::path::Path::new("/repo");
         let got: Vec<(usize, usize, Option<String>, Corroboration)> =
             corroborations(&[&session], &[root], &observations)
@@ -876,6 +961,9 @@ mod tests {
                 (0, 2, None, Corroboration::NotApplicable),
                 (0, 3, Some("src/b.rs".into()), Corroboration::Uncorroborated),
                 (1, 0, Some("src/a.rs".into()), Corroboration::Uncorroborated),
+                (2, 0, Some("src/c.rs".into()), Corroboration::Corroborated),
+                (2, 1, Some("src/d.rs".into()), Corroboration::Uncorroborated),
+                (2, 2, Some("src/c.rs".into()), Corroboration::Uncorroborated),
             ]
         );
     }

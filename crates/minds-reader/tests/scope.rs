@@ -34,6 +34,7 @@ fn call(kind: EffectKind, path: &str) -> ToolCall {
             content: None,
             written: Some(ContentHash::from_bytes([7; 32])),
             written_unavailable: None,
+            written_at: None,
         }),
     }
 }

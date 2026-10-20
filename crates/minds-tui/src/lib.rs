@@ -279,6 +279,12 @@ pub struct CommitVerify {
     /// Die Conformance gegen das signierte Soll — `None` ohne Soll. Eine
     /// Anzeige neben dem Urteil, nie ein Teil davon (wie in `verify`).
     pub conformance: Option<minds_reader::conformance::Report>,
+    /// Die Beobachtungen des Datei-Beobachters in den Fenstern der
+    /// verknüpften Sessions — nur aus Witness-signierten Epochen, geprüft
+    /// wie in `verify`. Changes-Tab und Zeilenzählung rechnen mit ihnen:
+    /// Was der Witness sah, ist `● observed`, nicht `◇ reported`. Leer ohne
+    /// Witness oder ohne Vertrauen in seine Signatur.
+    pub observations: Vec<minds_reader::reconcile::FsObservation>,
 }
 
 /// Startet die Oberfläche — oder, wenn stdout kein Terminal ist, schreibt die
