@@ -101,6 +101,7 @@ fn verdict(tampered: bool, verdict: VerifyVerdict) -> CommitVerify {
         out_of_scope_paths: vec!["Cargo.lock".into()],
         scope_note: None,
         conformance: None,
+        observations: Vec::new(),
     }
 }
 

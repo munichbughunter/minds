@@ -161,6 +161,7 @@ impl Fixture {
                         content: None,
                         written: Some(hash(bytes)),
                         written_unavailable: None,
+                        written_at: None,
                     }),
                 }]
             })

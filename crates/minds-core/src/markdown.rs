@@ -228,6 +228,7 @@ mod tests {
                     content: None,
                     written: None,
                     written_unavailable: None,
+                    written_at: None,
                 }),
             }],
             parent: None,

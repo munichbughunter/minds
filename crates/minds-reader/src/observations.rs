@@ -657,9 +657,11 @@ pub struct ClaimCorroboration {
 /// deterministisch.
 ///
 /// Grenzen, die das Ergebnis mitprägen:
-/// - Der Zeitpunkt eines Claims ist der seines **Zugs** (`turn.at`). Liegen
-///   die Tool-Calls eines Zugs über mehr als 30 s verteilt, kann ein später
-///   Schreibzugriff aus dem Fenster fallen und unbestätigt bleiben.
+/// - Der Zeitpunkt eines Claims ist der seiner Meldung
+///   ([`minds_core::Effect::written_at`], das `PostToolUse`-Event). Fehlt
+///   er (Sessions von vor diesem Feld), gilt der des **Zugs** (`turn.at`):
+///   Liegen die Tool-Calls eines Zugs dann über mehr als 30 s verteilt,
+///   fällt ein später Schreibzugriff aus dem Fenster und bleibt unbestätigt.
 /// - Der Witness hält Inhalts**änderungen** fest: Schreibt jemand innerhalb
 ///   einer Epoche denselben Inhalt erneut, entsteht keine zweite
 ///   Beobachtung; ein Claim dafür findet nur die erste.
@@ -688,8 +690,11 @@ pub fn corroborations(
                     .path
                     .as_deref()
                     .and_then(|p| claim_path(p, cwd, roots, &known, false));
+                let claimed_at = time(effect.written_at.as_deref()).or(at);
                 let corroboration = match (&path, &effect.written) {
-                    (Some(path), Some(written)) => corroborate(path, written, at, observations),
+                    (Some(path), Some(written)) => {
+                        corroborate(path, written, claimed_at, observations)
+                    }
                     _ => Corroboration::NotApplicable,
                 };
                 out.push(ClaimCorroboration {
@@ -812,7 +817,7 @@ mod tests {
     #[test]
     fn corroborations_cover_every_write_claim() {
         use minds_core::{Agent, Effect, Intent, Model, Role, ToolCall, Turn};
-        let call = |path: &str, written: Option<ContentHash>| ToolCall {
+        let call_at = |path: &str, written: Option<ContentHash>, at: Option<&str>| ToolCall {
             outcome: None,
             name: "Write".into(),
             arguments: String::new(),
@@ -823,8 +828,10 @@ mod tests {
                 content: None,
                 written,
                 written_unavailable: None,
+                written_at: at.map(str::to_owned),
             }),
         };
+        let call = |path: &str, written: Option<ContentHash>| call_at(path, written, None);
         let mut session = Session::new(
             Agent {
                 name: "claude-code".into(),
@@ -852,6 +859,18 @@ mod tests {
             ),
             // Ohne Zeitpunkt kein Fenster.
             (None, vec![call("/repo/src/a.rs", Some(h(1)))]),
+            // Ein Zug, der Minuten dauert: Der Claim trägt die Zeit seiner
+            // Meldung, und die zählt — nicht der Beginn des Zugs. Ohne sie
+            // (ältere Sessions) bleibt es beim Zug.
+            (
+                Some("2026-10-05T10:00:10Z"),
+                vec![
+                    call_at("/repo/src/c.rs", Some(h(3)), Some("2026-10-05T10:04:00Z")),
+                    call("/repo/src/d.rs", Some(h(4))),
+                    // Die Meldung liegt vor der Beobachtung — erfunden.
+                    call_at("/repo/src/c.rs", Some(h(3)), Some("2026-10-05T10:03:00Z")),
+                ],
+            ),
         ] {
             session.turns.push(Turn {
                 role: Role::Assistant,
@@ -861,7 +880,11 @@ mod tests {
                 at: at.map(str::to_owned),
             });
         }
-        let observations = [obs("src/a.rs", Some(h(1)), "2026-10-05T10:00:12Z", false)];
+        let observations = [
+            obs("src/a.rs", Some(h(1)), "2026-10-05T10:00:12Z", false),
+            obs("src/c.rs", Some(h(3)), "2026-10-05T10:04:01Z", false),
+            obs("src/d.rs", Some(h(4)), "2026-10-05T10:04:01Z", false),
+        ];
         let root = std::path::Path::new("/repo");
         let got: Vec<(usize, usize, Option<String>, Corroboration)> =
             corroborations(&[&session], &[root], &observations)
@@ -876,6 +899,9 @@ mod tests {
                 (0, 2, None, Corroboration::NotApplicable),
                 (0, 3, Some("src/b.rs".into()), Corroboration::Uncorroborated),
                 (1, 0, Some("src/a.rs".into()), Corroboration::Uncorroborated),
+                (2, 0, Some("src/c.rs".into()), Corroboration::Corroborated),
+                (2, 1, Some("src/d.rs".into()), Corroboration::Uncorroborated),
+                (2, 2, Some("src/c.rs".into()), Corroboration::Uncorroborated),
             ]
         );
     }

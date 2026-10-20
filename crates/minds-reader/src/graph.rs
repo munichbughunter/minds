@@ -560,6 +560,7 @@ mod tests {
                     content: Some(hash.clone()),
                     written: None,
                     written_unavailable: None,
+                    written_at: None,
                 }),
             }],
         ));
@@ -580,6 +581,7 @@ mod tests {
                     content: Some(hash),
                     written: None,
                     written_unavailable: None,
+                    written_at: None,
                 }),
             }],
         ));
@@ -652,6 +654,7 @@ mod tests {
                 content: None,
                 written: None,
                 written_unavailable: None,
+                written_at: None,
             }),
         }
     }

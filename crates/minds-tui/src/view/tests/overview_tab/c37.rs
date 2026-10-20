@@ -23,6 +23,7 @@ impl crate::Source for Judged {
             out_of_scope_paths: Vec::new(),
             scope_note: None,
             conformance: None,
+            observations: Vec::new(),
         })
     }
 }
@@ -340,6 +341,7 @@ fn c37_while_the_requirement_loads_next_waits() {
                 out_of_scope_paths: Vec::new(),
                 scope_note: None,
                 conformance: None,
+                observations: Vec::new(),
             })
         }
     }

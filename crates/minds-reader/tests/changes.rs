@@ -56,6 +56,7 @@ fn write(path: &str, text: &str) -> ToolCall {
                 *blake3::hash(text.as_bytes()).as_bytes(),
             )),
             written_unavailable: None,
+            written_at: None,
         }),
     }
 }

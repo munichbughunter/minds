@@ -78,6 +78,7 @@ fn write(path: &str, text: &str) -> ToolCall {
             content: None,
             written: Some(hash(text.as_bytes())),
             written_unavailable: None,
+            written_at: None,
         }),
     }
 }
@@ -1255,4 +1256,84 @@ fn a_witnessed_session_without_a_window_is_incomplete() {
     // Unbestätigt bezeugt nichts — auch keine Unvollständigkeit.
     let (_, read) = session_observations(&store, witnessed_id, &witnessed, &|_, _| false);
     assert!(read.complete);
+}
+
+/// Ein Zug, der Minuten dauert: Der Claim trägt die Zeit seiner Meldung
+/// (`written_at`, das `PostToolUse`-Event), und die zählt — nicht der Beginn
+/// seines Zugs. Eine Demo-Session (2026-10-20): `Read` zu Beginn, die
+/// `Write`s Minuten später; der Witness sah jede Datei mit dem gemeldeten
+/// Hash, und jeder Claim blieb `uncorroborated`. Ohne `written_at` (ältere
+/// Sessions) bleibt es beim Zug.
+#[test]
+fn a_claim_is_dated_by_its_report_not_by_the_start_of_its_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let mut late = write("late.rs", "late\n");
+    late.effect.as_mut().unwrap().written_at = Some("2026-10-02T10:03:00Z".into());
+    let agent = session(vec![
+        write("early.rs", "early\n"),
+        late,
+        write("undated.rs", "undated\n"),
+    ]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    for (path, text) in [
+        ("early.rs", "early\n"),
+        ("late.rs", "late\n"),
+        ("undated.rs", "undated\n"),
+    ] {
+        std::fs::write(dir.path().join(path), text).unwrap();
+    }
+    git(dir.path(), &["add", "."]);
+    git(dir.path(), &["commit", "-qm", "fixture"]);
+    let minutes_later = |seq: u64, path: &str, bytes: &[u8]| Observation {
+        seq,
+        at: "2026-10-02T10:03:01Z".into(),
+        path: path.into(),
+        content: Some(hash(bytes)),
+        reason: None,
+    };
+    let witnessed = seal_observations(
+        &store,
+        vec![
+            seen(1, "early.rs", Some(b"early\n"), None),
+            minutes_later(2, "late.rs", b"late\n"),
+            minutes_later(3, "undated.rs", b"undated\n"),
+        ],
+    );
+    // Das Fenster reicht bis zum Checkpoint (wie bei einer bezeugten
+    // Session), weit über den Zug hinaus.
+    let (from, _) = session_window(&[&agent]).unwrap();
+    let to: jiff::Timestamp = "2026-10-02T10:04:00Z".parse().unwrap();
+    let trusted = |seal: &ContentHash, _: &str| seal == &witnessed;
+    let observations = observations_in_window(&store, from, to, &trusted);
+    assert_eq!(observations.len(), 3);
+
+    let repo = Repo::open(dir.path()).unwrap();
+    let spellings = minds_reader::artifact::roots_of(&repo);
+    let roots: Vec<&Path> = spellings.iter().map(|p| p.as_path()).collect();
+    let corroborated: Vec<(Option<String>, Corroboration)> =
+        corroborations(&[&agent], &roots, &observations)
+            .into_iter()
+            .map(|c| (c.path, c.corroboration))
+            .collect();
+    assert_eq!(
+        corroborated,
+        [
+            (Some("early.rs".into()), Corroboration::Corroborated),
+            (Some("late.rs".into()), Corroboration::Corroborated),
+            (Some("undated.rs".into()), Corroboration::Uncorroborated),
+        ]
+    );
+    // Die Zeilen des Commits: beobachtet, nicht nur berichtet.
+    let commit = repo.head().unwrap().commit().unwrap();
+    let assessed = minds_reader::artifact::assess(&repo, &roots, commit, &[&agent], &observations)
+        .unwrap()
+        .unwrap();
+    let late = assessed
+        .recon
+        .files
+        .iter()
+        .find(|f| f.path == "late.rs")
+        .unwrap();
+    assert_eq!(late.class, ReconClass::Explained);
 }

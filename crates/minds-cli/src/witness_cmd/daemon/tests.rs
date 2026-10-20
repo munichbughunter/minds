@@ -59,7 +59,21 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::in_dir(tempfile::tempdir().unwrap())
+    }
+    /// Unter einem schlichten Pfad (`/tmp/minds-…`): Der Pfad des
+    /// Systemverzeichnisses für temporäre Dateien liest sich für die
+    /// Redaction wie ein Token, und ein redigierter Pfad lässt den
+    /// Schreibzeit-Hash eines Claims fallen.
+    fn plain() -> Self {
+        Self::in_dir(
+            tempfile::Builder::new()
+                .prefix("minds-")
+                .tempdir_in("/tmp")
+                .unwrap(),
+        )
+    }
+    fn in_dir(dir: tempfile::TempDir) -> Self {
         let root = dir.path().join("repo");
         fs::create_dir(&root).unwrap();
         git(&root, &["init", "-q", "--template="]);

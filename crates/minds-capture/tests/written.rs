@@ -103,6 +103,9 @@ fn written_hash_for_write_payload() {
     ));
     assert_eq!(effect.written, Some(expected.clone()));
     assert_eq!(effect.written_unavailable, None);
+    // Die Zeit des Claims ist die des Post-Events (Journal-Stempel `at(1)`),
+    // nicht die des Pre-Events und nicht die des Zugs.
+    assert_eq!(effect.written_at, Some(at(1).0));
     // Der Spec-Satz wörtlich: `written == blake3(content)` — und als Golden
     // eingefroren, damit „deterministisch" mehr heißt als „zweimal gleich".
     assert_eq!(expected, b3(b"hello world\nsecond line\n"));
@@ -317,6 +320,7 @@ fn a_failed_write_yields_no_written_hash() {
         effect.written_unavailable,
         Some(WrittenUnavailable::PayloadWithoutContent)
     );
+    assert_eq!(effect.written_at, None, "ohne Hash keine Claim-Zeit");
 }
 
 /// Pre + Post eines Aufrufs, eine Session, Checkpoint mit Default-Policy.

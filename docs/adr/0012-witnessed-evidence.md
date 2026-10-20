@@ -236,7 +236,11 @@ to no window. A session sealed at several checkpoints has one window up to its l
 witnessed range. An opaque latest observation (no hash)
 does not erase an earlier contradicting one; otherwise the file is classified as without a
 witness. Corroboration window: an observation of H at P within `[claim − 2 s,
-claim + 30 s]`.
+claim + 30 s]`, where the claim's time is the moment the agent reported the write
+(`effect.written_at`, the `PostToolUse` event, stamped by the witness) — not the start
+of its turn: a turn runs for minutes, and its first tool call would put every later
+write outside the window. Sessions stored before that field fall back to the turn's
+time.
 
 Known limits: a rewrite of identical content within one epoch is a single observation
 (a later claim for it stays uncorroborated); in SHA-256 repositories tracked files that

@@ -500,6 +500,26 @@ fn verify_commit(
         });
     }
 
+    // Die Beobachtungen des Datei-Beobachters, wie `verify` sie liest: nur
+    // aus Witness-signierten Epochen in den Fenstern der bezeugten Sessions.
+    // Der Changes-Tab rechnet damit — ohne Urteil zeigt er jede Zeile als
+    // `reported`, weil der Index keine Signer kennt.
+    let observations = {
+        let loaded: Vec<(minds_core::SessionId, Session)> = ids
+            .iter()
+            .filter_map(|(id, _)| Some((*id, store.get(*id).ok().flatten()?)))
+            .collect();
+        let pairs: Vec<(minds_core::SessionId, &Session)> =
+            loaded.iter().map(|(id, session)| (*id, session)).collect();
+        let trusted = |seal_id: &minds_core::ContentHash, text: &str| {
+            matches!(
+                trust.signature(seal_id, text),
+                minds_reader::assurance::SealSignature::Witness { .. }
+            )
+        };
+        let windows = minds_reader::observations::witness_windows(store, &pairs, &trusted);
+        minds_reader::observations::observations_in_windows(store, &windows, &trusted)
+    };
     // Der Bereich — Session für Session wie `verify` (`scope::assess`: eigener
     // Anker, Claims, bezeugte Beobachtungen, fail-closed); aus verändertem
     // Material kein Befund. Ein Fehler hier kostet nur den Scope.
@@ -599,6 +619,7 @@ fn verify_commit(
         out_of_scope_paths,
         scope_note,
         conformance,
+        observations,
     })
 }
 

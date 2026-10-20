@@ -249,7 +249,9 @@ impl FileRecon {
 }
 
 impl ReconClass {
-    fn explained(self) -> bool {
+    /// Der jüngste Stand des Witness passt zum Commit — mit oder ohne
+    /// Claim (`observed` bzw. `fs only` in der Oberfläche).
+    pub fn explained(self) -> bool {
         matches!(self, Self::Explained | Self::ExplainedFsOnly)
     }
 }

@@ -19,6 +19,20 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Write claims are corroborated by the witness's file observations.** A
+  write claim carried no time of its own; the reader dated it to the start of
+  its turn (`turn.at`, the first tool call) and looked for the observation
+  within 30 s of that. A turn runs for minutes: every `Write`/`Edit` after the
+  first half minute stayed `uncorroborated · no file-system observation`,
+  although the observation epoch of the checkpoint held every file with the
+  reported hash. The claim now carries `effect.written_at`, the time of its
+  `PostToolUse` event (additive, hash-stable; dropped together with the hash
+  under redaction), and the reader correlates with it — sessions stored
+  before the field fall back to the turn. The TUI's Changes tab and the
+  Overview's line count now take the witness observations from the `minds
+  verify` result of the commit (the index alone knows no signers): what the
+  witness saw is `● observed`, not `◇ reported`, and the tab is recomputed in
+  place when the verdict arrives.
 - **The evidence view says `sealed` until `minds verify` has checked.** Before
   a check, INTEGRITY read `✓ record intact …` while the Overview showed `…
   checking` for the same state. Now the line carries the trust glyph of the
