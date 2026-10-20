@@ -292,7 +292,7 @@ impl fmt::Display for Shown {
 /// Die Assurance-Stufe — geordnet: `A0Claimed < … < A3Reproduced`, damit
 /// die Gesamtstufe das Minimum über die Ranges ist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Assurance {
+pub enum AssuranceLevel {
     /// Behauptet: Import, Heuristik, Legacy — niemand Unabhängiges sah zu.
     A0Claimed,
     /// Beobachtet von den Hooks des Harness, unter derselben Kennung wie der
@@ -304,13 +304,13 @@ pub enum Assurance {
     A3Reproduced,
 }
 
-impl Assurance {
+impl AssuranceLevel {
     /// Alle Stufen, aufsteigend.
-    pub const ALL: [Assurance; 4] = [
-        Assurance::A0Claimed,
-        Assurance::A1Observed,
-        Assurance::A2Witnessed,
-        Assurance::A3Reproduced,
+    pub const ALL: [AssuranceLevel; 4] = [
+        AssuranceLevel::A0Claimed,
+        AssuranceLevel::A1Observed,
+        AssuranceLevel::A2Witnessed,
+        AssuranceLevel::A3Reproduced,
     ];
 
     /// Liest ein Kürzel (`A0` … `A3`) zurück — strikt, für Gates wie
@@ -352,7 +352,7 @@ impl Assurance {
     }
 }
 
-impl fmt::Display for Assurance {
+impl fmt::Display for AssuranceLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.word())
     }
@@ -564,6 +564,24 @@ pub enum IntentState {
     },
 }
 
+impl IntentState {
+    /// Die Intent-Lage in festen Worten (EA-15): `intent not bound`,
+    /// `intent unsigned`, `intent signed, sk key`, `intent signed, software
+    /// key`, `intent signature not checked`, `intent signature invalid for
+    /// minds-intent`. Dieselben Sätze wie die Gründe — eine Wortquelle für
+    /// `minds verify` und die TUI.
+    pub fn phrase(&self) -> String {
+        match self {
+            Self::Unbound => Reason::IntentNotBound.text(),
+            Self::Bound { signature, .. } => match signature {
+                IntentSignature::Valid(kind) => format!("intent signed, {}", kind.word()),
+                IntentSignature::Unsigned => Reason::IntentUnsigned.text(),
+                IntentSignature::NotChecked => Reason::IntentSignatureNotChecked.text(),
+                IntentSignature::Invalid => Reason::IntentSignatureInvalid.text(),
+            },
+        }
+    }
+}
 /// Das Ergebnis des Replays der entscheidenden Befehle in CI (EA-18b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReplaySummary {
@@ -755,6 +773,19 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Ob der Grund die ganze Session trifft (verändertes Material, offene
+    /// Kette, Ledger, fremde Signaturbefunde) — dann nennt keine Ausgabe
+    /// eine Range dazu: Die Nummer zählte nur die lesbaren Seals und zeigte
+    /// auf eine Zeile, die gar nicht der Grund ist.
+    pub fn is_session_wide(&self) -> bool {
+        matches!(
+            self,
+            Self::IntegrityBroken
+                | Self::ChainOpen
+                | Self::LedgerSealsMissing { .. }
+                | Self::OtherSealsInvalid { .. }
+        )
+    }
     /// Der Anzeigetext (englisch, eine Wortquelle für CLI und TUI).
     pub fn text(&self) -> String {
         match self {
@@ -870,7 +901,7 @@ pub struct RangeAssurance {
     /// Die `seal_id` der Range.
     pub seal: ContentHash,
     /// Die erreichte Stufe.
-    pub level: Assurance,
+    pub level: AssuranceLevel,
     /// Warum nicht höher — leer bei A3.
     pub reasons: Vec<Reason>,
 }
@@ -902,7 +933,7 @@ pub struct WitnessFacts {
 #[non_exhaustive]
 pub struct AssuranceReport {
     /// Die schwächste Range; A0 ohne Ranges.
-    pub overall: Assurance,
+    pub overall: AssuranceLevel,
     /// Der Index der schwächsten Range in [`Self::ranges`] (bei Gleichstand
     /// die erste); `None` ohne Ranges.
     pub weakest: Option<usize>,
@@ -927,6 +958,11 @@ pub struct AssuranceReport {
     pub replay: Option<ReplaySummary>,
     /// Die Gegenzeichnungen — unter denselben Bedingungen, sonst `None`.
     pub anchored: Option<AnchorSummary>,
+    /// Die Stufe, wie jede Oberfläche sie zeigt — einmal hier gerechnet,
+    /// aus `overall`, dem ersten Grund und den Witness-Fakten
+    /// ([`Assurance`]). `minds verify`, Overview, Evidence und die Bindung
+    /// lesen dieses Feld; keine leitet die Stufe selbst ab.
+    pub rating: Assurance,
 }
 
 /// Rechnet die Assurance einer Session aus — rein und deterministisch:
@@ -966,7 +1002,7 @@ pub fn assess(input: &AssuranceInput<'_>) -> AssuranceReport {
             if inferred(input.link) {
                 reasons.push(Reason::Inferred);
             }
-            (Assurance::A0Claimed, reasons)
+            (AssuranceLevel::A0Claimed, reasons)
         }
     };
 
@@ -1007,6 +1043,8 @@ pub fn assess(input: &AssuranceInput<'_>) -> AssuranceReport {
             },
         },
     };
+    let witness = witness_facts(input, ranges).filter(|_| checked && !ranges.is_empty());
+    let rating = rating_of(overall, &reasons, weakest, witness.as_ref(), &intent);
     AssuranceReport {
         overall,
         weakest,
@@ -1014,13 +1052,328 @@ pub fn assess(input: &AssuranceInput<'_>) -> AssuranceReport {
         ranges: assessed,
         // Ohne versiegelten Bereich gibt es nichts, wofür ein Witness
         // bürgte — keine Fakten neben „no seal".
-        witness: witness_facts(input, ranges).filter(|_| checked && !ranges.is_empty()),
+        witness,
         intent,
         // Die Zählung eines unsignierten Records ist eine Behauptung, kein
         // Ergebnis — sie erscheint nicht.
         replay: input.replay.filter(|r| checked && r.signed).copied(),
         anchored: input.anchors.filter(|_| checked).cloned(),
+        rating,
     }
+}
+
+/// Die Stufe, wie **jede** Oberfläche sie zeigt — `minds verify`, die
+/// Overview, der Evidence-Report und die Bindung im Requirements-Tab —,
+/// einmal in [`assess`] gerechnet ([`AssuranceReport::rating`], für ein
+/// Seal-Material und eine Signer-Lage: [`assurance`]), in denselben
+/// Worten. Keine Oberfläche leitet die Stufe selbst ab: nicht
+/// aus den Epochen, nicht aus der Zahl beobachteter Zeilen, nicht aus dem
+/// Material des Repositorys allein.
+///
+/// Drei Varianten: [`Assurance::Unchecked`] — die Witness-Signatur hat
+/// hier niemand geprüft; [`Assurance::A1`] — nicht bezeugt, mit der
+/// Stufe (`A0 claimed` oder `A1 observed`), dem **ersten** Grund, warum
+/// sie nicht höher liegt, und der Nummer der Range, aus der er stammt
+/// (1-basiert; `None` für einen Grund, der die ganze Session trifft);
+/// [`Assurance::A2`] — bezeugt, mit der Stufe (`A2 witnessed` oder `A3
+/// reproduced`) und den geprüften Witness-Fakten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Assurance {
+    /// Das Material trägt eine Witness-Signatur, die **hier** niemand
+    /// geprüft hat — keine vertrauenswürdigen Signer oder kein
+    /// `ssh-keygen`. Die Stufe steht bei A1 (fail-closed), und `minds
+    /// verify --signers` kann höher urteilen. Nie „no witness ran": Ein
+    /// Witness hat signiert.
+    Unchecked {
+        /// [`Reason::SignersUntrusted`] oder [`Reason::SignatureNotChecked`].
+        reason: Reason,
+        /// Die Range, aus der der Grund stammt.
+        range: Option<usize>,
+    },
+    /// Nicht bezeugt. [`Reason::AgentHooks`] heißt: Kein Witness lief;
+    /// jeder andere Grund auf A1 heißt: Ein Witness hat signiert, trägt
+    /// aber kein A2. Auf A0 sah nichts Unabhängiges zu (verändertes
+    /// Material, offene Kette, Legacy, kein Seal, …).
+    A1 {
+        /// [`AssuranceLevel::A0Claimed`] oder [`AssuranceLevel::A1Observed`]
+        /// — nie höher ([`assess`] hält das ein).
+        level: AssuranceLevel,
+        /// Warum nicht höher.
+        reason: Reason,
+        /// Die Range, aus der der Grund stammt.
+        range: Option<usize>,
+    },
+    /// Bezeugt — von einem getrennten Witness, auf A3 zusätzlich in CI
+    /// nachvollzogen.
+    A2 {
+        /// [`AssuranceLevel::A2Witnessed`] oder
+        /// [`AssuranceLevel::A3Reproduced`] — nie niedriger ([`assess`]
+        /// hält das ein).
+        level: AssuranceLevel,
+        /// Die Principals der gültigen Witness-Signaturen (entschärft,
+        /// gekürzt, `+n more`), durch `, ` getrennt.
+        principal: String,
+        /// Die Profile der Witness-Läufe, ohne Dubletten.
+        profile: Vec<WitnessProfile>,
+        /// Die Intent-Lage in festen Worten ([`IntentState::phrase`]).
+        intent: String,
+    },
+}
+
+impl Assurance {
+    /// Die Stufe — für [`Assurance::Unchecked`] A1, der Boden, den das
+    /// Material ohne geprüfte Signatur trägt.
+    pub const fn level(&self) -> AssuranceLevel {
+        match self {
+            Self::Unchecked { .. } => AssuranceLevel::A1Observed,
+            Self::A1 { level, .. } | Self::A2 { level, .. } => *level,
+        }
+    }
+
+    /// Das Anzeige-Wort der Stufe (`A2 witnessed`) — dasselbe in jeder
+    /// Oberfläche.
+    pub const fn word(&self) -> &'static str {
+        self.level().word()
+    }
+
+    /// Das Kürzel der Stufe (`A2`).
+    pub const fn code(&self) -> &'static str {
+        self.level().code()
+    }
+
+    /// Was in der Klammer hinter dem Wort steht: unter A2 der erste Grund
+    /// mit seiner Range (`range 2: witness signature not checked — no
+    /// trusted allowed_signers`), ab A2 die Witness-Fakten
+    /// (`minds-witness-user@build-07, profile user; intent signed, sk key`).
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Unchecked { reason, range } | Self::A1 { reason, range, .. } => match range {
+                Some(n) => format!("range {n}: {}", reason.text()),
+                None => reason.text(),
+            },
+            Self::A2 {
+                principal,
+                profile,
+                intent,
+                ..
+            } => {
+                let mut parts: Vec<String> = Vec::new();
+                if !principal.is_empty() {
+                    parts.push(principal.clone());
+                }
+                if !profile.is_empty() {
+                    let names: Vec<&str> = profile.iter().map(|p| p.name()).collect();
+                    parts.push(format!("profile {}", names.join("/")));
+                }
+                if parts.is_empty() {
+                    intent.clone()
+                } else {
+                    format!("{}; {intent}", parts.join(", "))
+                }
+            }
+        }
+    }
+
+    /// Die Grenze der Stufe als Satz (LIMITS): wer auf dieser Stufe zusah
+    /// — und was deshalb nur Aussage des Agenten bleibt. „no witness ran"
+    /// steht nur dort, wo das Material keine Witness-Signatur trägt.
+    pub fn limit(&self) -> String {
+        match self {
+            Self::Unchecked { .. } => {
+                "witness signature not checked here — minds verify --signers rates this seal.".into()
+            }
+            Self::A1 {
+                level: AssuranceLevel::A0Claimed,
+                ..
+            } => {
+                "claimed at A0 — nothing independent observed this session; every fact here is what the agent recorded.".into()
+            }
+            Self::A1 {
+                reason: Reason::AgentHooks,
+                ..
+            } => {
+                "observed at A1 — no witness ran; the agent's own reports are the only source for file contents.".into()
+            }
+            Self::A1 { reason, .. } => format!(
+                "observed at A1 — a witness signed, but the record does not reach A2 ({}); the agent's own reports are the only source for file contents.",
+                reason.text()
+            ),
+            Self::A2 {
+                level: AssuranceLevel::A3Reproduced,
+                ..
+            } => {
+                "reproduced at A3 — the result was reproduced independently; what was not reproduced remains observed, not proven.".into()
+            }
+            Self::A2 { .. } => {
+                "witnessed at A2 — a separated witness observed and signed the record; file contents it did not read are still the agent's reports.".into()
+            }
+        }
+    }
+
+    /// Was das Proof-Modell auf dieser Stufe **nicht** belegt — das
+    /// kanonische Vokabular ([`minds_core::evidence::limits_at`]).
+    pub fn limitations(
+        &self,
+    ) -> impl Iterator<Item = &'static minds_core::evidence::ProofSentence> {
+        minds_core::evidence::limits_at(self.level().level())
+    }
+}
+
+impl fmt::Display for Assurance {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.word())
+    }
+}
+
+/// Die Stufe aus den Teilen eines Reports — einmal gerechnet, in
+/// [`assess`], und als [`AssuranceReport::rating`] abgelegt. Rein und
+/// deterministisch: gleiche Teile, gleiche [`Assurance`].
+fn rating_of(
+    overall: AssuranceLevel,
+    reasons: &[Reason],
+    weakest: Option<usize>,
+    witness: Option<&WitnessFacts>,
+    intent: &IntentState,
+) -> Assurance {
+    let first = || {
+        let reason = reasons.first().cloned();
+        let range = weakest
+            .filter(|_| !reason.as_ref().is_some_and(Reason::is_session_wide))
+            .map(|index| index + 1);
+        (reason, range)
+    };
+    match overall {
+        AssuranceLevel::A0Claimed => {
+            let (reason, range) = first();
+            debug_assert!(reason.is_some(), "assess names a reason below A2");
+            Assurance::A1 {
+                level: overall,
+                // `assess` nennt unterhalb von A2 immer einen Grund; ohne
+                // Range ist es „no seal".
+                reason: reason.unwrap_or(Reason::NoSeal),
+                range,
+            }
+        }
+        AssuranceLevel::A1Observed => {
+            let (reason, range) = first();
+            debug_assert!(reason.is_some(), "assess names a reason below A2");
+            match reason {
+                Some(reason @ (Reason::SignersUntrusted | Reason::SignatureNotChecked)) => {
+                    Assurance::Unchecked { reason, range }
+                }
+                Some(reason) => Assurance::A1 {
+                    level: overall,
+                    reason,
+                    range,
+                },
+                // Unerreichbar: Eine A1-Range trägt `AgentHooks` oder die
+                // Gründe des A2-Tors.
+                None => Assurance::A1 {
+                    level: overall,
+                    reason: Reason::AgentHooks,
+                    range,
+                },
+            }
+        }
+        AssuranceLevel::A2Witnessed | AssuranceLevel::A3Reproduced => {
+            let (principal, profile) = match witness {
+                Some(facts) => {
+                    let mut parts: Vec<String> = facts.principals.clone();
+                    if facts.principals_omitted > 0 {
+                        parts.push(format!("+{} more", facts.principals_omitted));
+                    }
+                    (parts.join(", "), facts.profiles.clone())
+                }
+                None => (String::new(), Vec::new()),
+            };
+            Assurance::A2 {
+                level: overall,
+                principal,
+                profile,
+                intent: intent.phrase(),
+            }
+        }
+    }
+}
+
+/// Das Seal-Material einer Session, wie der Aufrufer es gelesen hat —
+/// unabhängig davon, ob er Signern traut: die Seals mit ihrer
+/// Signaturlage, das Integritäts-Verdikt, die Kette, der Ledger, die
+/// Verknüpfung mit dem Commit und die Intent-Lage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SealMaterial<'a> {
+    /// Siehe [`AssuranceInput::seals`].
+    pub seals: Seals<'a>,
+    /// Siehe [`AssuranceInput::integrity`].
+    pub integrity: EvidenceVerdict,
+    /// Siehe [`AssuranceInput::chain_closed`].
+    pub chain_closed: bool,
+    /// Siehe [`AssuranceInput::ledger`].
+    pub ledger: &'a LedgerCheck,
+    /// Siehe [`AssuranceInput::link`].
+    pub link: Option<EvidenceSource>,
+    /// Siehe [`AssuranceInput::intent`].
+    pub intent: &'a IntentState,
+}
+
+/// Was nur mit **vertrauenswürdigen Signern** zählt — die Fakten, die der
+/// Aufrufer gegen seine `allowed_signers`-Datei (`--signers`) geprüft hat.
+/// `None` an [`assurance`] heißt: keine Signer — kein Witness-Start, kein
+/// Beobachtungsfenster, kein Replay, keine Gegenzeichnung zählt, und kein
+/// Seal trägt mehr als A1 ([`Assurance::Unchecked`]).
+///
+/// **Vertrag des Aufrufers:** wie [`AssuranceInput::trusted_signers`] — die
+/// Datei liegt nicht im geprüften Worktree und nicht an einer Stelle, die
+/// der Agent schreiben kann.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Signers<'a> {
+    /// Siehe [`AssuranceInput::witness_starts`].
+    pub witness_starts: &'a [WitnessStart],
+    /// Siehe [`AssuranceInput::observations`].
+    pub observations: &'a FsCoverage,
+    /// Siehe [`AssuranceInput::replay`].
+    pub replay: Option<&'a ReplaySummary>,
+    /// Siehe [`AssuranceInput::anchors`].
+    pub anchors: Option<&'a AnchorSummary>,
+}
+
+/// Ohne Signer: kein Beobachtungsfenster.
+static NO_OBSERVATIONS: FsCoverage = FsCoverage::Unavailable { cause: None };
+
+impl<'a> AssuranceInput<'a> {
+    /// Die Fakten aus Seal-Material und Signer-Lage — die eine Tür, durch
+    /// die `minds verify`, der Index und [`assurance`] gehen: ohne Signer
+    /// (`None`) `trusted_signers: false` und nichts, was nur mit Signern
+    /// zählte.
+    pub fn of(seal: &SealMaterial<'a>, signers: Option<&Signers<'a>>) -> Self {
+        Self {
+            seals: seal.seals,
+            integrity: seal.integrity,
+            chain_closed: seal.chain_closed,
+            ledger: seal.ledger,
+            link: seal.link,
+            trusted_signers: signers.is_some(),
+            observations: signers.map_or(&NO_OBSERVATIONS, |s| s.observations),
+            witness_starts: signers.map_or(&[], |s| s.witness_starts),
+            intent: seal.intent,
+            replay: signers.and_then(|s| s.replay),
+            anchors: signers.and_then(|s| s.anchors),
+        }
+    }
+}
+
+/// Die Stufe eines Seal-Materials, wie **jede** Oberfläche sie zeigt —
+/// `minds verify`, die Overview, der Evidence-Report, die Bindung im
+/// Requirements-Tab —, aus demselben Material und derselben Signer-Lage:
+/// rein und deterministisch, gleiche Eingabe, gleiche [`Assurance`]. Ohne
+/// Signer (`None`) trägt ein signierter Witness-Seal [`Assurance::Unchecked`];
+/// „no witness ran" sagt nur Material ohne Witness-Signatur.
+///
+/// Dasselbe wie `assess(&AssuranceInput::of(seal, signers)).rating` — wer
+/// den ganzen Report braucht (`minds verify`), nimmt den Weg über
+/// [`assess`] und liest dort dieselbe Stufe.
+pub fn assurance(seal: &SealMaterial<'_>, signers: Option<&Signers<'_>>) -> Assurance {
+    assess(&AssuranceInput::of(seal, signers)).rating
 }
 
 /// Die Bedingungen, die für jede Range der Session gleich ausfallen —
@@ -1232,10 +1585,10 @@ fn assess_range(
         });
     }
     if !claimed.is_empty() {
-        return verdict(Assurance::A0Claimed, claimed);
+        return verdict(AssuranceLevel::A0Claimed, claimed);
     }
     if scope == SCOPE_AGENT_HOOKS_V1 {
-        return verdict(Assurance::A1Observed, vec![Reason::AgentHooks]);
+        return verdict(AssuranceLevel::A1Observed, vec![Reason::AgentHooks]);
     }
 
     // Tor zu A2: ein Witness, dem der Prüfer traut, mit zweitem Auge.
@@ -1249,7 +1602,7 @@ fn assess_range(
     }
     observed.extend(session.witnessed.iter().cloned());
     if !observed.is_empty() {
-        return verdict(Assurance::A1Observed, observed);
+        return verdict(AssuranceLevel::A1Observed, observed);
     }
 
     // Tor zu A3: in CI nachvollzogen und gegengezeichnet.
@@ -1261,9 +1614,9 @@ fn assess_range(
         witnessed.push(Reason::NotAnchored);
     }
     if !witnessed.is_empty() {
-        return verdict(Assurance::A2Witnessed, witnessed);
+        return verdict(AssuranceLevel::A2Witnessed, witnessed);
     }
-    verdict(Assurance::A3Reproduced, Vec::new())
+    verdict(AssuranceLevel::A3Reproduced, Vec::new())
 }
 
 /// Der Ledger-Grund, falls bezeugte Seals fehlen — sortiert und ohne
@@ -1573,19 +1926,24 @@ mod tests {
     #[test]
     fn assurance_rules_table() {
         type Change = fn(&mut Fixture);
-        let table: &[(&str, Change, Assurance, &[&str])] = &[
-            ("all conditions met", |_| {}, Assurance::A3Reproduced, &[]),
+        let table: &[(&str, Change, AssuranceLevel, &[&str])] = &[
+            (
+                "all conditions met",
+                |_| {},
+                AssuranceLevel::A3Reproduced,
+                &[],
+            ),
             // A0
             (
                 "legacy",
                 |f| f.legacy = true,
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["captured before the evidence chain"],
             ),
             (
                 "no seal",
                 |f| f.ranges.clear(),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["no seal"],
             ),
             (
@@ -1594,13 +1952,13 @@ mod tests {
                     f.legacy = true;
                     f.link = Some(EvidenceSource::Heuristic);
                 },
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["captured before the evidence chain", "provenance inferred"],
             ),
             (
                 "seal material altered",
                 |f| f.integrity = EvidenceVerdict::Tampered,
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["integrity broken — seal material was altered"],
             ),
             (
@@ -1609,31 +1967,31 @@ mod tests {
                     f.integrity = EvidenceVerdict::Tampered;
                     f.ranges.clear();
                 },
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["integrity broken — seal material was altered", "no seal"],
             ),
             (
                 "incomplete coverage does not lower the level",
                 |f| f.integrity = EvidenceVerdict::Incomplete,
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
                 "ledger checked, nothing missing",
                 |f| f.ledger = LedgerCheck::Complete,
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
                 "ledger checked, empty list of missing seals",
                 |f| f.ledger = LedgerCheck::Missing(Vec::new()),
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
                 "a witnessed seal from the ledger is missing",
                 |f| f.ledger = LedgerCheck::Missing(vec![seal(7)]),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["witnessed seal(s) missing from the repository: \
                      b3-0707070707070707070707070707070707070707070707070707070707070707"],
             ),
@@ -1643,7 +2001,7 @@ mod tests {
                 // Unsortiert und doppelt gemeldet, sortiert genannt.
                 "a foreign witnessed seal is missing, reported out of order",
                 |f| f.ledger = LedgerCheck::Missing(vec![seal(0xb), seal(0xa), seal(0xb)]),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["witnessed seal(s) missing from the repository: \
                      b3-0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a, \
                      b3-0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"],
@@ -1654,7 +2012,7 @@ mod tests {
                     f.integrity = EvidenceVerdict::Incomplete;
                     f.chain_closed = false;
                 },
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["epoch chain open — a sealed range is missing"],
             ),
             (
@@ -1663,7 +2021,7 @@ mod tests {
                     f.integrity = EvidenceVerdict::Tampered;
                     f.chain_closed = false;
                 },
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &[
                     "integrity broken — seal material was altered",
                     "epoch chain open — a sealed range is missing",
@@ -1672,37 +2030,37 @@ mod tests {
             (
                 "provenance inferred",
                 |f| f.link = Some(EvidenceSource::Heuristic),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["provenance inferred"],
             ),
             (
                 "no commit context",
                 |f| f.link = None,
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
                 "declared link",
                 |f| f.link = Some(EvidenceSource::HumanDeclared),
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
                 "observation scope seals no session",
                 |f| f.ranges[0].scope = SCOPE_WITNESS_FS_V1.into(),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["seal scope „witness-fs/v1“ is not a session scope"],
             ),
             (
                 "unknown scope",
                 |f| f.ranges[0].scope = "agent-hooks/v2".into(),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["seal scope „agent-hooks/v2“ is not a session scope"],
             ),
             (
                 "a scope is compared exactly",
                 |f| f.ranges[0].scope = "witness/v1 ".into(),
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["seal scope „witness/v1 “ is not a session scope"],
             ),
             (
@@ -1711,7 +2069,7 @@ mod tests {
                     f.link = Some(EvidenceSource::Heuristic);
                     f.ranges[0].scope = "x/v1".into();
                 },
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &[
                     "provenance inferred",
                     "seal scope „x/v1“ is not a session scope",
@@ -1721,7 +2079,7 @@ mod tests {
             (
                 "agent hooks",
                 |f| f.ranges[0] = hooks_range(1),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["observed by the agent's hooks only (scope agent-hooks/v1)"],
             ),
             (
@@ -1730,13 +2088,13 @@ mod tests {
                     f.ranges[0].scope = SCOPE_AGENT_HOOKS_V1.into();
                     f.ranges[0].signature = SealSignature::NotWitness;
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["observed by the agent's hooks only (scope agent-hooks/v1)"],
             ),
             (
                 "no trusted allowed_signers",
                 |f| f.trusted_signers = false,
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 // Ohne Signer zählt weder ein `witness.start` (der
                 // Signer-Grund sagt das schon) noch eine als gültig
                 // gemeldete Intent-Signatur.
@@ -1748,7 +2106,7 @@ mod tests {
             (
                 "signature not checked",
                 |f| f.ranges[0].signature = SealSignature::NotChecked,
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 // Der letzte Bereich ist ungeprüft — damit auch das Ende.
                 &[
                     "witness signature not checked",
@@ -1760,7 +2118,7 @@ mod tests {
                 // Integritätsbefund — A0, nicht A1.
                 "signature missing",
                 |f| f.ranges[0].signature = SealSignature::Missing,
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["witness seal missing signature"],
             ),
             (
@@ -1769,13 +2127,13 @@ mod tests {
                     f.ranges[0].signature = SealSignature::Missing;
                     f.trusted_signers = false;
                 },
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["witness seal missing signature"],
             ),
             (
                 "not signed under minds-witness",
                 |f| f.ranges[0].signature = SealSignature::NotWitness,
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 &["witness seal not signed under minds-witness"],
             ),
             (
@@ -1784,7 +2142,7 @@ mod tests {
                     f.ranges[0].signature = SealSignature::NotWitness;
                     f.trusted_signers = false;
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "witness signature not checked — no trusted allowed_signers",
                     "intent signature not checked",
@@ -1793,7 +2151,7 @@ mod tests {
             (
                 "no observation window",
                 |f| f.observations = unavailable(),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["no file-system observation window covering the session"],
             ),
             (
@@ -1803,7 +2161,7 @@ mod tests {
                         cause: Some("epoch b3-0123 missing".into()),
                     }
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "no file-system observation window covering the session („epoch b3-0123 missing“)",
                 ],
@@ -1815,7 +2173,7 @@ mod tests {
                         reasons: vec!["panic".into(), "overflow".into(), "overflow".into()],
                     }
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["observation gap (overflow, panic)"],
             ),
             (
@@ -1829,25 +2187,25 @@ mod tests {
                         ],
                     }
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["observation gap (overflow, unknown)"],
             ),
             (
                 "observation gap without a reason",
                 |f| f.observations = FsCoverage::Gapped { reasons: vec![] },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["observation gap"],
             ),
             (
                 "profile unknown",
                 |f| f.witness_starts.clear(),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["witness profile unknown"],
             ),
             (
                 "profile managed (until EA-S1)",
                 |f| f.witness_starts = vec![start(WitnessProfile::Managed)],
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["profile managed not qualified for A2"],
             ),
             // Die Hook-Evidence unter einem gewöhnlichen Witness-Principal
@@ -1860,7 +2218,7 @@ mod tests {
                         principal: "minds-witness@build-07".into(),
                     }
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent",
                 ],
@@ -1870,13 +2228,13 @@ mod tests {
             (
                 "profile local (never)",
                 |f| f.witness_starts = vec![start(WitnessProfile::Local)],
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["profile local not qualified for A2"],
             ),
             (
                 "profile container (until EA-S2)",
                 |f| f.witness_starts = vec![start(WitnessProfile::Container)],
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["profile container not qualified for A2"],
             ),
             (
@@ -1889,7 +2247,7 @@ mod tests {
                         start(WitnessProfile::Managed),
                     ]
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "profile container not qualified for A2",
                     "profile managed not qualified for A2",
@@ -1898,7 +2256,7 @@ mod tests {
             (
                 "several user runs",
                 |f| f.witness_starts.push(start(WitnessProfile::User)),
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
@@ -1910,13 +2268,13 @@ mod tests {
                         key: None,
                     })
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["witness profile unknown"],
             ),
             (
                 "a profile name without proven isolation",
                 |f| f.witness_starts[0].isolated = false,
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent",
                 ],
@@ -1930,7 +2288,7 @@ mod tests {
                         key: None,
                     })
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent",
                 ],
@@ -1938,25 +2296,25 @@ mod tests {
             (
                 "intent signature not checked",
                 |f| f.intent = bound(IntentSignature::NotChecked),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent signature not checked"],
             ),
             (
                 "intent not bound",
                 |f| f.intent = IntentState::Unbound,
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent not bound"],
             ),
             (
                 "intent unsigned",
                 |f| f.intent = bound(IntentSignature::Unsigned),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent unsigned"],
             ),
             (
                 "the last range does not close the session",
                 |f| f.ranges[0].closes_session = false,
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["session end not witnessed — a later range could be missing"],
             ),
             (
@@ -1966,7 +2324,7 @@ mod tests {
                     hooks.closes_session = true;
                     f.ranges.push(hooks);
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 // Gleichstand bei A1: der erste Bereich, der Witness-Bereich
                 // — sein Grund ist das unbezeugte Ende.
                 &["session end not witnessed — a later range could be missing"],
@@ -1977,7 +2335,7 @@ mod tests {
                     f.trusted_signers = false;
                     f.intent = bound(IntentSignature::Invalid);
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "witness signature not checked — no trusted allowed_signers",
                     "intent signature not checked",
@@ -1986,7 +2344,7 @@ mod tests {
             (
                 "intent signature invalid",
                 |f| f.intent = bound(IntentSignature::Invalid),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent signature invalid for minds-intent"],
             ),
             (
@@ -1997,26 +2355,26 @@ mod tests {
                         t.from_start = false;
                     })
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 // Unverkettet: kein zweiter Grund für den fehlenden Anfang.
                 &["intent bound (unchained)"],
             ),
             (
                 "intent start not proven",
                 |f| f.intent = bound_with(|t| t.from_start = false),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent not proven from session start"],
             ),
             (
                 "intent changed mid-session",
                 |f| f.intent = bound_with(|t| t.changed = true),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent changed mid-session"],
             ),
             (
                 "intent snapshot missing or altered",
                 |f| f.intent = bound_with(|t| t.matches = false),
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent snapshot missing or does not match its anchor"],
             ),
             (
@@ -2026,7 +2384,7 @@ mod tests {
                         (t.from_start, t.matches, t.changed) = (false, false, true);
                     })
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "intent not proven from session start",
                     "intent changed mid-session",
@@ -2036,7 +2394,7 @@ mod tests {
             (
                 "intent signed with a software key",
                 |f| f.intent = bound(IntentSignature::Valid(SignerKind::SoftwareKey)),
-                Assurance::A3Reproduced,
+                AssuranceLevel::A3Reproduced,
                 &[],
             ),
             (
@@ -2047,7 +2405,7 @@ mod tests {
                     f.observations = unavailable();
                     f.ranges[0].signature = SealSignature::NotChecked;
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &[
                     "witness signature not checked",
                     "no file-system observation window covering the session",
@@ -2063,20 +2421,20 @@ mod tests {
                     f.replay = None;
                     f.anchors = None;
                 },
-                Assurance::A1Observed,
+                AssuranceLevel::A1Observed,
                 &["intent not bound"],
             ),
             // A2
             (
                 "no replay",
                 |f| f.replay = None,
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["no replay record"],
             ),
             (
                 "replay unsigned",
                 |f| f.replay.as_mut().unwrap().signed = false,
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["replay record unsigned"],
             ),
             (
@@ -2086,7 +2444,7 @@ mod tests {
                     replay.reproduced = 2;
                     replay.not_reproduced = 1;
                 },
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["claim not reproduced (1 decisive command(s))"],
             ),
             (
@@ -2096,7 +2454,7 @@ mod tests {
                     replay.decisive = 0;
                     replay.reproduced = 0;
                 },
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["no decisive commands to reproduce"],
             ),
             (
@@ -2106,7 +2464,7 @@ mod tests {
                     replay.reproduced = 0;
                     replay.skipped = 3;
                 },
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["3 decisive command(s) skipped, not replayed"],
             ),
             (
@@ -2116,37 +2474,37 @@ mod tests {
                     replay.reproduced = 2;
                     replay.skipped = 1;
                 },
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["1 decisive command(s) skipped, not replayed"],
             ),
             (
                 "the record silently omits a decisive command",
                 |f| f.replay.as_mut().unwrap().decisive = 4,
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["replay covers 3 of 4 decisive command(s)"],
             ),
             (
                 "the record lists more than the session ran",
                 |f| f.replay.as_mut().unwrap().decisive = 2,
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["replay record counts 3 decisive command(s), the session has 2"],
             ),
             (
                 "a session without decisive commands, record with some",
                 |f| f.replay.as_mut().unwrap().decisive = 0,
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["no decisive commands to reproduce"],
             ),
             (
                 "no countersignatures",
                 |f| f.anchors = None,
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["seal not anchored — no minds-anchor countersignature"],
             ),
             (
                 "countersignature for another seal",
                 |f| f.anchors.as_mut().unwrap().anchored = [seal(9)].into_iter().collect(),
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &["seal not anchored — no minds-anchor countersignature"],
             ),
             (
@@ -2161,7 +2519,7 @@ mod tests {
                     });
                     f.anchors = None;
                 },
-                Assurance::A2Witnessed,
+                AssuranceLevel::A2Witnessed,
                 &[
                     "replay record unsigned",
                     "claim not reproduced (2 decisive command(s))",
@@ -2190,16 +2548,16 @@ mod tests {
         fixture.anchors = None;
         let report = fixture.assess();
 
-        let levels: Vec<Assurance> = report.ranges.iter().map(|r| r.level).collect();
+        let levels: Vec<AssuranceLevel> = report.ranges.iter().map(|r| r.level).collect();
         assert_eq!(
             levels,
             [
-                Assurance::A2Witnessed,
-                Assurance::A1Observed,
-                Assurance::A2Witnessed
+                AssuranceLevel::A2Witnessed,
+                AssuranceLevel::A1Observed,
+                AssuranceLevel::A2Witnessed
             ]
         );
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         assert_eq!(report.weakest, Some(1));
         assert_eq!(report.ranges[1].seal, seal(2));
         assert_eq!(report.reasons, [Reason::AgentHooks]);
@@ -2218,7 +2576,7 @@ mod tests {
         // bezeugt: auch die Witness-Bereiche bleiben bei A1.
         fixture.ranges = vec![witness_range(1), hooks_range(2)];
         let report = fixture.assess();
-        assert_eq!(report.ranges[0].level, Assurance::A1Observed);
+        assert_eq!(report.ranges[0].level, AssuranceLevel::A1Observed);
         assert_eq!(report.ranges[0].reasons, [Reason::SessionEndNotWitnessed]);
 
         // Nur ein Seal gegengezeichnet: Die andere Range hält die Session
@@ -2226,9 +2584,9 @@ mod tests {
         let mut fixture = Fixture::reproduced();
         fixture.ranges = vec![witness_range(1), witness_range(2)];
         let report = fixture.assess();
-        assert_eq!(report.ranges[0].level, Assurance::A3Reproduced);
-        assert_eq!(report.ranges[1].level, Assurance::A2Witnessed);
-        assert_eq!(report.overall, Assurance::A2Witnessed);
+        assert_eq!(report.ranges[0].level, AssuranceLevel::A3Reproduced);
+        assert_eq!(report.ranges[1].level, AssuranceLevel::A2Witnessed);
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
         assert_eq!(report.reasons, [Reason::NotAnchored]);
     }
 
@@ -2247,13 +2605,13 @@ mod tests {
             anchored: [seal(1), seal(2)].into_iter().collect(),
         });
         fixture.ranges = vec![w1.clone(), w2.clone(), hooks_range(3)];
-        assert_eq!(fixture.assess().overall, Assurance::A1Observed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
 
         // Der Agent löscht den Hooks-Bereich am Ende: Kette geschlossen,
         // kein Ledger — und doch bleibt es bei A1.
         fixture.ranges = vec![w1, w2.clone()];
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         assert_eq!(report.reasons, [Reason::SessionEndNotWitnessed]);
 
         // Löscht er einen bezeugten Seal am Ende, nennt ihn das Ledger.
@@ -2261,7 +2619,7 @@ mod tests {
         fixture.ranges = vec![witness_range(1)];
         fixture.ranges[0].closes_session = false;
         fixture.ledger = LedgerCheck::Missing(vec![seal(2)]);
-        assert_eq!(fixture.assess().overall, Assurance::A0Claimed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A0Claimed);
     }
 
     /// Die bekannten Grenzen (Modul-Doku, „Bekannte Grenzen") — jede als
@@ -2285,30 +2643,30 @@ mod tests {
         let mut fixture = Fixture::reproduced();
         fixture.ranges = vec![open(1)];
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         assert_eq!(report.reasons, [Reason::SessionEndNotWitnessed]);
         fixture.ranges.push(witness_range(2));
         fixture.anchors = anchored(&[1, 2]);
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // `--resume`: Nach dem bezeugten Ende geht es weiter — A1; wird der
         // fortgesetzte Teil gelöscht, steht das alte Ende wieder als letztes.
         let mut fixture = Fixture::reproduced();
         fixture.anchors = anchored(&[1, 2]);
         fixture.ranges = vec![witness_range(1), open(2)];
-        assert_eq!(fixture.assess().overall, Assurance::A1Observed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
         fixture.ranges.pop();
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Ohne Ledger: ein gelöschter letzter Witness-Seal hinter einem
         // schon bezeugten Ende bleibt unbemerkt.
         let mut fixture = Fixture::reproduced();
         fixture.anchors = anchored(&[1, 2]);
         fixture.ranges = vec![witness_range(1), witness_range(2)];
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
         fixture.ranges.pop();
         assert_eq!(fixture.ledger, LedgerCheck::NotChecked);
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Ein verschwiegener Rückfall-Bereich: h2 lag zeitlich zwischen w1
         // und w3, aber in eigener Kette. Liegt er vor, zieht er die Session
@@ -2318,10 +2676,10 @@ mod tests {
         fixture.anchors = anchored(&[1, 3]);
         fixture.ledger = LedgerCheck::Complete;
         fixture.ranges = vec![open(1), hooks_range(2), witness_range(3)];
-        assert_eq!(fixture.assess().overall, Assurance::A1Observed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
         fixture.ranges = vec![open(1), witness_range(3)];
         assert!(fixture.chain_closed);
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Ein vorgetäuschtes Ende direkt vor dem Commit — oder eine ganz
         // erfundene Session (neue `local_id`, `SessionStart` … `SessionEnd`
@@ -2330,7 +2688,7 @@ mod tests {
         let mut fixture = Fixture::reproduced();
         fixture.ledger = LedgerCheck::Complete;
         fixture.ranges = vec![witness_range(1)];
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Eine verpflanzte Kette: Session samt Kette aus einem anderen
         // Repository unter demselben Witness-Schlüssel kopiert — die Seals
@@ -2340,14 +2698,14 @@ mod tests {
         fixture.ledger = LedgerCheck::Complete;
         fixture.ranges = vec![witness_range(7)];
         fixture.anchors = anchored(&[7]);
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Eine Lücke im schließenden Bereich (etwa ein einmal fail-open
         // gelaufener Hook): Der Checkpoint setzt `closed` dann nicht — der
         // Bereich kommt als nicht schließend an, A1.
         let mut fixture = Fixture::reproduced();
         fixture.ranges = vec![open(1)];
-        assert_eq!(fixture.assess().overall, Assurance::A1Observed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
 
         // Ein Harness ohne `SessionEnd` (OpenCode): Kein Bereich schließt je
         // — dauerhaft A1, auch nach jedem späteren Checkpoint.
@@ -2355,7 +2713,7 @@ mod tests {
         fixture.anchors = anchored(&[1, 2]);
         fixture.ranges = vec![open(1), open(2)];
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         assert_eq!(report.reasons, [Reason::SessionEndNotWitnessed]);
 
         // Ein vorgetäuschtes Ende, danach am Witness vorbei (h3) — auch mit
@@ -2365,10 +2723,10 @@ mod tests {
         fixture.ledger = LedgerCheck::Complete;
         // w2 schließt (vorgetäuscht), danach lief die Session per Hooks.
         fixture.ranges = vec![witness_range(1), witness_range(2), hooks_range(3)];
-        assert_eq!(fixture.assess().overall, Assurance::A1Observed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
         // Ohne den Hooks-Bereich steht das bezeugte Ende als letztes da.
         fixture.ranges.pop();
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
         fixture.ledger = LedgerCheck::NotChecked;
 
         // Dasselbe ohne Blenden: Nach dem vorgetäuschten Ende versiegelt der
@@ -2380,12 +2738,12 @@ mod tests {
         fixture.anchors = Some(AnchorSummary {
             anchored: [seal(1), seal(2), seal(3)].into_iter().collect(),
         });
-        assert_eq!(fixture.assess().overall, Assurance::A1Observed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
         fixture.ranges.pop();
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
         // … mit Ledger nicht.
         fixture.ledger = LedgerCheck::Missing(vec![seal(3)]);
-        assert_eq!(fixture.assess().overall, Assurance::A0Claimed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A0Claimed);
     }
 
     /// Wer den schwächsten Witness-Seal aus der Mitte der Witness-Kette
@@ -2402,14 +2760,14 @@ mod tests {
         });
         fixture.ranges = vec![witness_range(1), witness_range(2), witness_range(3)];
         let before = fixture.assess().overall;
-        assert_eq!(before, Assurance::A2Witnessed);
+        assert_eq!(before, AssuranceLevel::A2Witnessed);
 
         fixture.ranges = vec![witness_range(1), witness_range(3)];
         fixture.integrity = EvidenceVerdict::Incomplete;
         fixture.chain_closed = false;
         let after = fixture.assess();
         assert!(after.overall <= before, "{:?}", after.overall);
-        assert_eq!(after.overall, Assurance::A0Claimed);
+        assert_eq!(after.overall, AssuranceLevel::A0Claimed);
         assert_eq!(after.reasons, [Reason::ChainOpen]);
     }
 
@@ -2420,16 +2778,16 @@ mod tests {
         fixture.anchors = Some(AnchorSummary {
             anchored: [seal(1), seal(2)].into_iter().collect(),
         });
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Eine als gültig gemeldete Witness-Signatur zählt nicht ohne
         // vertrauenswürdige Signer — fail-closed, auch bei widersprüchlicher
         // Eingabe.
         fixture.trusted_signers = false;
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         for range in &report.ranges {
-            assert_eq!(range.level, Assurance::A1Observed);
+            assert_eq!(range.level, AssuranceLevel::A1Observed);
             assert_eq!(
                 range.reasons,
                 [Reason::SignersUntrusted, Reason::IntentSignatureNotChecked]
@@ -2484,11 +2842,11 @@ mod tests {
             let mut fixture = Fixture::reproduced();
             change(&mut fixture);
             let report = fixture.assess();
-            assert_eq!(report.overall, Assurance::A0Claimed);
+            assert_eq!(report.overall, AssuranceLevel::A0Claimed);
             // Jede Range, nicht nur die Gesamtstufe: Eine Oberfläche, die je
             // Range rendert, darf neben einem Befund kein „A3" zeigen.
             for range in &report.ranges {
-                assert_eq!(range.level, Assurance::A0Claimed, "{range:?}");
+                assert_eq!(range.level, AssuranceLevel::A0Claimed, "{range:?}");
             }
             assert_eq!(report.witness, None);
             assert_eq!(report.intent, unchecked_intent());
@@ -2537,7 +2895,7 @@ mod tests {
         let mut fixture = Fixture::reproduced();
         fixture.replay.as_mut().unwrap().signed = false;
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A2Witnessed);
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
         assert_eq!(report.reasons, [Reason::ReplayUnsigned]);
         assert_eq!(report.replay, None);
     }
@@ -2546,18 +2904,18 @@ mod tests {
     fn assurance_requires_fs_coverage_for_a2() {
         let mut fixture = Fixture::reproduced();
         fixture.replay = None;
-        assert_eq!(fixture.assess().overall, Assurance::A2Witnessed);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A2Witnessed);
 
         fixture.observations = unavailable();
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         assert_eq!(report.reasons, [Reason::NoObservationWindow(None)]);
 
         fixture.observations = FsCoverage::Gapped {
             reasons: vec!["overflow".into()],
         };
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A1Observed);
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
         assert_eq!(texts(&report.reasons), ["observation gap (overflow)"]);
     }
 
@@ -2787,7 +3145,7 @@ mod tests {
             })
             .collect();
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A0Claimed);
+        assert_eq!(report.overall, AssuranceLevel::A0Claimed);
         for range in &report.ranges {
             assert!(range.reasons.len() <= 3, "{:?}", range.reasons);
         }
@@ -2818,7 +3176,7 @@ mod tests {
             skipped: usize::MAX,
         });
         let report = fixture.assess();
-        assert_eq!(report.overall, Assurance::A2Witnessed);
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
         assert_eq!(
             report.reasons,
             [
@@ -2834,26 +3192,280 @@ mod tests {
             not_reproduced: 0,
             skipped: 0,
         });
-        assert_eq!(fixture.assess().overall, Assurance::A3Reproduced);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
+    }
+
+    /// Identischer Seal, identische Signer-Lage, drei Pfade — `minds verify`
+    /// (der Report aus [`assess`], Pfad der `Assurance`-Zeile), die TUI
+    /// (Overview, Evidence und Bindung lesen `rating` desselben Reports über
+    /// `SessionAssurance`) und der Index ([`assurance`]) — ergeben dieselbe
+    /// Stufe, dasselbe Wort, dieselbe Klammer und denselben Grenz-Satz.
+    /// Ohne Signer: auf allen Pfaden `Unchecked`.
+    #[test]
+    fn the_same_seal_and_signers_rate_the_same_on_every_path() {
+        let mut fixture = Fixture::reproduced();
+        fixture.replay = None;
+        let seal = SealMaterial {
+            seals: Seals::Sealed(&fixture.ranges),
+            integrity: fixture.integrity,
+            chain_closed: fixture.chain_closed,
+            ledger: &fixture.ledger,
+            link: fixture.link,
+            intent: &fixture.intent,
+        };
+        let signers = Signers {
+            witness_starts: &fixture.witness_starts,
+            observations: &fixture.observations,
+            replay: None,
+            anchors: fixture.anchors.as_ref(),
+        };
+        // Die eine Tür: dieselben Fakten, die `verify` von Hand zusammenträgt.
+        assert_eq!(AssuranceInput::of(&seal, Some(&signers)), fixture.input());
+
+        // Pfad 1 — `minds verify`: der Report, seine `Assurance`-Zeile.
+        let verify = assess(&AssuranceInput::of(&seal, Some(&signers)));
+        // Pfad 2 — die TUI: `SessionAssurance.rating` ist dieses Feld.
+        let overview = verify.rating.clone();
+        // Pfad 3 — der Index und jeder, der nur die Stufe braucht.
+        let evidence = assurance(&seal, Some(&signers));
+        assert_eq!(verify.rating, evidence);
+        assert_eq!(overview, evidence);
+        assert_eq!(
+            evidence,
+            Assurance::A2 {
+                level: AssuranceLevel::A2Witnessed,
+                principal: PRINCIPAL.into(),
+                profile: vec![WitnessProfile::User],
+                intent: "intent signed, sk key".into(),
+            }
+        );
+        // Dieselben Worte auf jeder Oberfläche.
+        assert_eq!(
+            format!("{} ({})", verify.rating.word(), verify.rating.detail()),
+            format!("A2 witnessed ({PRINCIPAL}, profile user; intent signed, sk key)")
+        );
+        assert_eq!(overview.word(), "A2 witnessed");
+        assert_eq!(evidence.word(), "A2 witnessed");
+        assert_eq!(
+            evidence.limit(),
+            "witnessed at A2 — a separated witness observed and signed the record; file contents it did not read are still the agent's reports."
+        );
+        // Dreimal gefragt, dreimal dasselbe — und nichts geschrieben.
+        assert_eq!(assurance(&seal, Some(&signers)), evidence);
+        assert_eq!(assess(&AssuranceInput::of(&seal, Some(&signers))), verify);
+
+        // Ohne Signer: auf jedem Pfad ungeprüft, nichts zählt, was nur mit
+        // Signern zählte.
+        let input = AssuranceInput::of(&seal, None);
+        assert!(!input.trusted_signers);
+        assert_eq!(input.observations, &FsCoverage::Unavailable { cause: None });
+        assert!(input.witness_starts.is_empty());
+        assert_eq!(input.replay, None);
+        assert_eq!(input.anchors, None);
+        let unchecked = assurance(&seal, None);
+        assert_eq!(assess(&input).rating, unchecked);
+        assert_eq!(
+            unchecked,
+            Assurance::Unchecked {
+                reason: Reason::SignersUntrusted,
+                range: Some(1),
+            }
+        );
+        assert_eq!(
+            unchecked.limit(),
+            "witness signature not checked here — minds verify --signers rates this seal."
+        );
+    }
+
+    /// Die Varianten der Stufe, ihre Worte, Klammern und Grenz-Sätze — je
+    /// Stufe einmal; „no witness ran" nur für Material ohne
+    /// Witness-Signatur.
+    #[test]
+    fn the_rating_is_one_derivation_for_every_surface() {
+        // A2: bezeugt, mit den geprüften Witness-Fakten in der Klammer.
+        let mut fixture = Fixture::reproduced();
+        fixture.replay = None;
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
+        let rating = report.rating.clone();
+        assert_eq!(
+            rating,
+            Assurance::A2 {
+                level: AssuranceLevel::A2Witnessed,
+                principal: PRINCIPAL.into(),
+                profile: vec![WitnessProfile::User],
+                intent: "intent signed, sk key".into(),
+            }
+        );
+        assert_eq!(rating.word(), "A2 witnessed");
+        assert_eq!(rating.code(), "A2");
+        assert_eq!(
+            rating.detail(),
+            format!("{PRINCIPAL}, profile user; intent signed, sk key")
+        );
+        assert!(
+            rating.limit().starts_with("witnessed at A2 — "),
+            "{}",
+            rating.limit()
+        );
+        assert!(!rating.limit().contains("no witness ran"));
+        assert_eq!(
+            rating.limitations().map(|s| s.id).collect::<Vec<_>>(),
+            minds_core::evidence::limits_at(minds_core::evidence::Level::A2)
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        );
+        // Dreimal gefragt, dreimal dasselbe — und der Report blieb, was er
+        // war (nichts wird geschrieben).
+        let again = fixture.assess();
+        assert_eq!(again.rating, rating);
+        assert_eq!(again, report);
+
+        // A3: dieselbe Klammer, das Wort der Stufe.
+        let rating = Fixture::reproduced().assess().rating;
+        assert!(
+            matches!(
+                rating,
+                Assurance::A2 {
+                    level: AssuranceLevel::A3Reproduced,
+                    ..
+                }
+            ),
+            "{rating:?}"
+        );
+        assert_eq!(rating.word(), "A3 reproduced");
+        assert!(rating.limit().starts_with("reproduced at A3 — "));
+
+        // Dasselbe Material ohne Signer: ungeprüft — A1 als Boden, die
+        // Klammer wie die `Assurance`-Zeile von `verify`, der Grenz-Satz
+        // verweist auf `--signers`. Nie „no witness ran": Ein Witness hat
+        // signiert.
+        fixture.trusted_signers = false;
+        let rating = fixture.assess().rating;
+        assert_eq!(
+            rating,
+            Assurance::Unchecked {
+                reason: Reason::SignersUntrusted,
+                range: Some(1),
+            }
+        );
+        assert_eq!(rating.level(), AssuranceLevel::A1Observed);
+        assert_eq!(rating.word(), "A1 observed");
+        assert_eq!(
+            rating.detail(),
+            "range 1: witness signature not checked — no trusted allowed_signers"
+        );
+        assert_eq!(
+            rating.limit(),
+            "witness signature not checked here — minds verify --signers rates this seal."
+        );
+        assert!(!rating.limit().contains("no witness ran"));
+
+        // Mit Signern, aber ohne `ssh-keygen`: ebenso ungeprüft.
+        fixture.trusted_signers = true;
+        fixture.ranges[0].signature = SealSignature::NotChecked;
+        let rating = fixture.assess().rating;
+        assert!(
+            matches!(
+                rating,
+                Assurance::Unchecked {
+                    reason: Reason::SignatureNotChecked,
+                    range: Some(1)
+                }
+            ),
+            "{rating:?}"
+        );
+
+        // Nur Hooks: A1 — und **nur hier** „no witness ran".
+        let mut hooks = Fixture::reproduced();
+        hooks.ranges = vec![hooks_range(1)];
+        let rating = hooks.assess().rating;
+        assert_eq!(
+            rating,
+            Assurance::A1 {
+                level: AssuranceLevel::A1Observed,
+                reason: Reason::AgentHooks,
+                range: Some(1),
+            }
+        );
+        assert_eq!(
+            rating.limit(),
+            "observed at A1 — no witness ran; the agent's own reports are the only source for file contents."
+        );
+        assert_eq!(
+            rating.detail(),
+            "range 1: observed by the agent's hooks only (scope agent-hooks/v1)"
+        );
+
+        // Ein Witness, der signierte, aber kein A2 trägt (Profil `local`):
+        // A1 mit dem Grund — nicht „no witness ran".
+        let mut local = Fixture::reproduced();
+        local.witness_starts = vec![start(WitnessProfile::Local)];
+        let rating = local.assess().rating;
+        assert!(
+            matches!(
+                &rating,
+                Assurance::A1 {
+                    level: AssuranceLevel::A1Observed,
+                    reason: Reason::ProfileNotQualified(WitnessProfile::Local),
+                    range: Some(1)
+                }
+            ),
+            "{rating:?}"
+        );
+        assert_eq!(
+            rating.limit(),
+            "observed at A1 — a witness signed, but the record does not reach A2 (profile local not qualified for A2); the agent's own reports are the only source for file contents."
+        );
+
+        // A0: verändertes Material — ein Grund für die ganze Session, ohne
+        // Range; Legacy ohne Range.
+        let mut altered = Fixture::reproduced();
+        altered.integrity = EvidenceVerdict::Tampered;
+        let rating = altered.assess().rating;
+        assert_eq!(
+            rating,
+            Assurance::A1 {
+                level: AssuranceLevel::A0Claimed,
+                reason: Reason::IntegrityBroken,
+                range: None,
+            }
+        );
+        assert_eq!(rating.detail(), Reason::IntegrityBroken.text());
+        assert!(rating.limit().starts_with("claimed at A0 — "));
+        let mut legacy = Fixture::reproduced();
+        legacy.legacy = true;
+        assert_eq!(
+            legacy.assess().rating,
+            Assurance::A1 {
+                level: AssuranceLevel::A0Claimed,
+                reason: Reason::Legacy,
+                range: None,
+            }
+        );
+        assert_eq!(legacy.assess().rating.to_string(), "A0 claimed");
     }
 
     #[test]
     fn levels_are_ordered_and_named() {
-        let mut sorted = Assurance::ALL;
+        let mut sorted = AssuranceLevel::ALL;
         sorted.sort();
-        assert_eq!(sorted, Assurance::ALL);
-        let words: Vec<String> = Assurance::ALL.iter().map(ToString::to_string).collect();
+        assert_eq!(sorted, AssuranceLevel::ALL);
+        let words: Vec<String> = AssuranceLevel::ALL
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(
             words,
             ["A0 claimed", "A1 observed", "A2 witnessed", "A3 reproduced"]
         );
-        let codes: Vec<&str> = Assurance::ALL.iter().map(|a| a.code()).collect();
+        let codes: Vec<&str> = AssuranceLevel::ALL.iter().map(|a| a.code()).collect();
         assert_eq!(codes, ["A0", "A1", "A2", "A3"]);
-        for level in Assurance::ALL {
-            assert_eq!(Assurance::parse(level.code()), Some(level));
+        for level in AssuranceLevel::ALL {
+            assert_eq!(AssuranceLevel::parse(level.code()), Some(level));
         }
         for wrong in ["a2", "A4", "A2 witnessed", " A2", ""] {
-            assert_eq!(Assurance::parse(wrong), None, "{wrong:?}");
+            assert_eq!(AssuranceLevel::parse(wrong), None, "{wrong:?}");
         }
         assert_eq!(SignerKind::SecurityKey.word(), "sk key");
         assert_eq!(SignerKind::SoftwareKey.word(), "software key");

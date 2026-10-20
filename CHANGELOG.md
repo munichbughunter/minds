@@ -42,6 +42,24 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **One assurance computation for every view.** `minds verify`, the
+  Overview's INTEGRITY line, the Evidence report of a session and the
+  binding line of the Requirements tab showed different levels for the same
+  seal: with a verified A2 seal, Evidence said `A1` and `observed at A1 — no
+  witness ran` right under `Verdict of minds verify: ✓ VERIFIED`, and the
+  Requirements tab said `binding A1`. The reader now derives the shown level
+  once — `minds_reader::assurance::assurance(seal, signers)` → `Assurance`,
+  computed in `assess` and carried as `AssuranceReport.rating`: `A1` (level
+  A0 or A1) with the first reason and its range, `A2` (level A2 or A3) with
+  principal, profile and intent, `Unchecked` for a witness signature nobody
+  checked here; the level enumeration A0–A3 is now `AssuranceLevel` — and
+  all four surfaces render that: the same word (`A2 witnessed`) and the same LIMITS
+  sentence, derived from the variant, not the view. Without trusted signers
+  a witness seal reads `witness signature not checked here — minds verify
+  --signers rates this seal.`; `no witness ran` exists only for material
+  without a witness signature. The TUI takes the rating from the `minds
+  verify` result of the commit as soon as it is in, before that from the
+  repository alone.
 - **Write claims are corroborated by the witness's file observations.** A
   write claim carried no time of its own; the reader dated it to the start of
   its turn (`turn.at`, the first tool call) and looked for the observation

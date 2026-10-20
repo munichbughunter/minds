@@ -1553,7 +1553,7 @@ fn integrity_lines(
                 && let [only] = c.sessions.as_slice()
             {
                 spans.push(Span::styled(
-                    format!(" · {}", only.level.word()),
+                    format!(" · {}", only.rating.word()),
                     theme::dim(),
                 ));
             }
@@ -1586,7 +1586,10 @@ fn integrity_lines(
                 Span::styled(format!("{glyph} {word}"), style),
             ];
             if !s.tampered && overall != Some(Overall::Tampered) {
-                spans.push(Span::styled(format!(" · {}", s.level.word()), theme::dim()));
+                spans.push(Span::styled(
+                    format!(" · {}", s.rating.word()),
+                    theme::dim(),
+                ));
             }
             out.push(Line::from(spans));
         }

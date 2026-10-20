@@ -102,7 +102,7 @@ fn c123_status_lines_carry_a_sentence_each() {
         "{out}"
     );
     assert!(
-        out.contains("· binding A1 — the agent named this anchor in a witness event"),
+        out.contains("· binding A1 observed — the agent named this anchor in a witness event"),
         "{out}"
     );
     // Die alten Rohzeilen sind weg.
@@ -134,7 +134,7 @@ fn c123_not_signed_is_open_and_not_proven_hides_the_text() {
     );
     assert!(!out.contains("PLANTED_SECRET"), "{out}");
     assert!(!out.contains("Snapshot (11 bytes) not shown"), "{out}");
-    assert!(out.contains("· binding A1 —"), "{out}");
+    assert!(out.contains("· binding A1 observed —"), "{out}");
 }
 
 /// C12.3-AC6: TECHNICAL ist eingeklappt — Space zeigt Anker, Inhalts-Hash

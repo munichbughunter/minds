@@ -41,8 +41,8 @@ use std::path::Path;
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome, limits_at};
 use minds_core::{ContentHash, EvidenceSource, Session, SessionId};
 use minds_reader::assurance::{
-    Assurance, AssuranceInput, AssuranceReport, FsCoverage, IntentSignature, IntentState,
-    LedgerCheck, MAX_LISTED, RangeInput, Reason, Seals, assess,
+    AssuranceInput, AssuranceLevel, AssuranceReport, FsCoverage, IntentState, LedgerCheck,
+    MAX_LISTED, RangeInput, Reason, SealMaterial, Seals, Signers, assess,
 };
 use minds_reader::model::EvidenceVerdict;
 use minds_reader::observations::{Window, WindowObservations};
@@ -63,8 +63,8 @@ const NOT_PROVEN_SHORT: usize = 3;
 const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Liest `--require-assurance`: genau `A0` … `A3`.
-pub(crate) fn parse_required(raw: &str) -> Result<Assurance, String> {
-    Assurance::parse(raw).ok_or_else(|| {
+pub(crate) fn parse_required(raw: &str) -> Result<AssuranceLevel, String> {
+    AssuranceLevel::parse(raw).ok_or_else(|| {
         format!(
             "--require-assurance expects A0, A1, A2 or A3, got \"{}\"",
             crate::text::sanitize(raw)
@@ -311,7 +311,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
     } else {
         EvidenceVerdict::Incomplete
     };
-    assess(&AssuranceInput {
+    let seal = SealMaterial {
         seals: if facts.legacy {
             Seals::Legacy
         } else {
@@ -321,13 +321,21 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
         chain_closed: facts.chain_closed,
         ledger: facts.ledger,
         link: facts.link,
-        trusted_signers: trust.trusted(),
-        observations: facts.observations,
-        witness_starts: facts.witness_starts,
         intent: facts.intent,
+    };
+    let signers = Signers {
+        witness_starts: facts.witness_starts,
+        observations: facts.observations,
         replay: replay.as_ref(),
         anchors: Some(&anchors),
-    })
+    };
+    // Dieselbe Tür wie der Index (`minds_reader::assurance::assurance`):
+    // ohne vertrauenswürdige Signer zählt nichts, was nur mit ihnen zählte
+    // — und der Report trägt die Stufe (`rating`), die jede Oberfläche zeigt.
+    assess(&AssuranceInput::of(
+        &seal,
+        trust.trusted().then_some(&signers),
+    ))
 }
 
 /// Die Intent-Lage der Session (EA-14/EA-15), zur Lesezeit aus dem Store:
@@ -580,23 +588,22 @@ fn shown_tool(name: &str) -> String {
 // Ausgabe
 // ---------------------------------------------------------------------------
 
-/// Die `Assurance`-Zeile. Unter A2 steht in der Klammer der erste Grund,
-/// warum die Stufe nicht höher liegt — mit der Range, aus der er stammt; ab
-/// A2 stehen dort die geprüften Witness-Fakten.
+/// Die `Assurance`-Zeile — Wort und Klammer aus der einen Stufe des Reports
+/// ([`AssuranceReport::rating`]), die auch die TUI zeigt. Unter A2 steht in
+/// der Klammer der erste Grund, warum die Stufe nicht höher liegt — mit der
+/// Range, aus der er stammt; ab A2 stehen dort die geprüften Witness-Fakten.
 pub(super) fn assurance_line(report: &AssuranceReport) -> String {
-    let word = report.overall.word();
-    let detail = if report.overall >= Assurance::A2Witnessed {
-        witness_detail(report).or_else(|| first_reason(report))
-    } else {
-        first_reason(report)
-    };
-    match detail {
-        Some(detail) => format!("Assurance      {word:<LEVEL_WIDTH$}({detail})"),
-        None => format!("Assurance      {word}"),
-    }
+    let rating = &report.rating;
+    // Der Reader entschärft Principals und Gründe schon; die zweite Schicht
+    // an der Senke kostet nichts (wie `SignatureState::word`).
+    let detail = crate::text::sanitize(&rating.detail());
+    format!("Assurance      {:<LEVEL_WIDTH$}({detail})", rating.word())
 }
 
-/// `range 2: witness signature not checked — no trusted allowed_signers`.
+/// `range 2: witness signature not checked — no trusted allowed_signers`
+/// — der erste Grund, warum die Stufe nicht höher liegt, auf jeder Stufe
+/// (für Gates und das Audit-Bündel; die `Assurance`-Zeile nennt ab A2 die
+/// Witness-Fakten).
 ///
 /// Ein Grund, der die ganze Session trifft (veränderte Seals, offene Kette,
 /// Ledger, fremde Signaturbefunde), steht ohne Range: Die Nummer zählte nur
@@ -604,57 +611,11 @@ pub(super) fn assurance_line(report: &AssuranceReport) -> String {
 /// ist.
 pub(crate) fn first_reason(report: &AssuranceReport) -> Option<String> {
     let first = report.reasons.first()?;
-    let session_wide = matches!(
-        first,
-        Reason::IntegrityBroken
-            | Reason::ChainOpen
-            | Reason::LedgerSealsMissing { .. }
-            | Reason::OtherSealsInvalid { .. }
-    );
     let reason = first.text();
     Some(match report.weakest {
-        Some(index) if !session_wide => format!("range {}: {reason}", index + 1),
+        Some(index) if !first.is_session_wide() => format!("range {}: {reason}", index + 1),
         _ => reason,
     })
-}
-
-/// `minds-witness-user@build-07, profile user; intent signed, sk key`.
-fn witness_detail(report: &AssuranceReport) -> Option<String> {
-    let facts = report.witness.as_ref()?;
-    // Der Reader entschärft die Principals schon; die zweite Schicht an der
-    // Senke kostet nichts (wie `SignatureState::word`).
-    let mut parts: Vec<String> = facts
-        .principals
-        .iter()
-        .map(|principal| crate::text::sanitize(principal))
-        .collect();
-    if facts.principals_omitted > 0 {
-        parts.push(format!("+{} more", facts.principals_omitted));
-    }
-    if !facts.profiles.is_empty() {
-        let names: Vec<&str> = facts.profiles.iter().map(|p| p.name()).collect();
-        parts.push(format!("profile {}", names.join("/")));
-    }
-    // Ab A2 ist der Intent verkettet (sonst `intent bound (unchained)` als
-    // Grund) — die Signaturlage genügt.
-    let intent = intent_phrase(&report.intent);
-    Some(format!("{}; {intent}", parts.join(", ")))
-}
-
-/// Die Intent-Lage in festen Worten (EA-15): `intent not bound`, `intent
-/// unsigned`, `intent signed, sk key`, `intent signed, software key`,
-/// `intent signature not checked`, `intent signature invalid for
-/// minds-intent`. Dieselben Sätze wie die Gründe des Readers.
-fn intent_phrase(intent: &IntentState) -> String {
-    match intent {
-        IntentState::Unbound => Reason::IntentNotBound.text(),
-        IntentState::Bound { signature, .. } => match signature {
-            IntentSignature::Valid(kind) => format!("intent signed, {}", kind.word()),
-            IntentSignature::Unsigned => Reason::IntentUnsigned.text(),
-            IntentSignature::NotChecked => Reason::IntentSignatureNotChecked.text(),
-            IntentSignature::Invalid => Reason::IntentSignatureInvalid.text(),
-        },
-    }
 }
 
 /// Die `Intent`-Zeile des Session-Blocks: die Signaturlage, dann der Anker
@@ -664,7 +625,7 @@ fn intent_phrase(intent: &IntentState) -> String {
 /// Ein Assurance-Fakt, kein Verdikt: Eine fehlende oder ungültige
 /// Signatur ändert weder Integrität noch Exit-Code (W6).
 pub(super) fn intent_line(report: &AssuranceReport) -> String {
-    let phrase = intent_phrase(&report.intent);
+    let phrase = report.intent.phrase();
     let IntentState::Bound {
         anchor_id,
         chained,
@@ -694,7 +655,7 @@ pub(super) fn intent_line(report: &AssuranceReport) -> String {
 /// Die `Not proven`-Zeile(n) für die erreichte Stufe: die Kurzformen, mit
 /// ` · ` verbunden, höchstens drei, dann der Verweis auf `--limits`; mit
 /// `full` (`--limits`) jeder Satz ausgeschrieben.
-pub(super) fn not_proven_lines(level: Assurance, full: bool) -> Vec<String> {
+pub(super) fn not_proven_lines(level: AssuranceLevel, full: bool) -> Vec<String> {
     let limits: Vec<_> = limits_at(level.level()).collect();
     if full {
         let mut lines = vec![format!(
@@ -720,7 +681,7 @@ pub(super) fn not_proven_lines(level: Assurance, full: bool) -> Vec<String> {
 
 /// Die Gate-Zeile, falls die schwächste Stufe unter `required` liegt.
 /// Ohne bewertete Session ist das Gate nicht bestanden (fail-closed).
-pub(crate) fn gate_failure(levels: &[Assurance], required: Assurance) -> Option<String> {
+pub(crate) fn gate_failure(levels: &[AssuranceLevel], required: AssuranceLevel) -> Option<String> {
     match levels.iter().min() {
         None => Some(format!(
             "Gate           assurance not assessed (no session) — required {}",
@@ -739,7 +700,7 @@ pub(crate) fn gate_failure(levels: &[Assurance], required: Assurance) -> Option<
 mod tests {
     use super::*;
     use minds_core::evidence::WitnessProfile;
-    use minds_reader::assurance::{SealSignature, SignerKind, WitnessStart};
+    use minds_reader::assurance::{IntentSignature, SealSignature, SignerKind, WitnessStart};
 
     fn h(byte: u8) -> ContentHash {
         ContentHash::from_bytes([byte; 32])
@@ -796,7 +757,7 @@ mod tests {
     #[test]
     fn verify_assurance_golden_a2_clean() {
         let report = a2_report();
-        assert_eq!(report.overall, Assurance::A2Witnessed);
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
         let mut lines = vec![assurance_line(&report)];
         lines.extend(not_proven_lines(report.overall, false));
         assert_eq!(
@@ -873,11 +834,11 @@ mod tests {
 
     #[test]
     fn verify_limits_flag() {
-        let short = not_proven_lines(Assurance::A1Observed, false);
+        let short = not_proven_lines(AssuranceLevel::A1Observed, false);
         assert_eq!(short.len(), 1);
         assert!(short[0].ends_with("(minds verify --limits)"), "{short:?}");
-        let full = not_proven_lines(Assurance::A1Observed, true);
-        let count = limits_at(Assurance::A1Observed.level()).count();
+        let full = not_proven_lines(AssuranceLevel::A1Observed, true);
+        let count = limits_at(AssuranceLevel::A1Observed.level()).count();
         assert_eq!(
             full[0],
             format!("Not proven     {count} limit(s) at A1 observed")
@@ -890,7 +851,7 @@ mod tests {
             .unwrap()
             .text;
         assert!(full.iter().any(|line| line.ends_with(append)));
-        let a2 = not_proven_lines(Assurance::A2Witnessed, true);
+        let a2 = not_proven_lines(AssuranceLevel::A2Witnessed, true);
         assert!(!a2.iter().any(|line| line.ends_with(append)));
     }
 
@@ -906,7 +867,7 @@ mod tests {
 
     #[test]
     fn the_gate_compares_the_weakest_session() {
-        use Assurance::*;
+        use AssuranceLevel::*;
         assert_eq!(
             gate_failure(&[A2Witnessed, A3Reproduced], A2Witnessed),
             None
@@ -921,7 +882,7 @@ mod tests {
 
     #[test]
     fn required_levels_parse_strictly() {
-        assert_eq!(parse_required("A2"), Ok(Assurance::A2Witnessed));
+        assert_eq!(parse_required("A2"), Ok(AssuranceLevel::A2Witnessed));
         for bad in ["a2", "A4", "", "2", " A2", "A2 witnessed"] {
             assert!(parse_required(bad).is_err(), "{bad}");
         }

@@ -24,8 +24,11 @@ fn footer_line(out: &str) -> String {
 fn assurance(c: char) -> crate::SessionAssurance {
     crate::SessionAssurance {
         session: sid(c),
-        level: minds_reader::assurance::Assurance::A1Observed,
-        reason: None,
+        rating: minds_reader::assurance::Assurance::A1 {
+            level: minds_reader::assurance::AssuranceLevel::A1Observed,
+            reason: minds_reader::assurance::Reason::AgentHooks,
+            range: Some(1),
+        },
         intent: minds_reader::assurance::IntentState::Unbound,
         tampered: false,
     }

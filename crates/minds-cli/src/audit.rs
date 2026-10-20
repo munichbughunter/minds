@@ -31,7 +31,7 @@ use std::process::{Command, ExitCode};
 use minds_core::evidence::{ProofSentence, limits_at, proves_at};
 use minds_core::{ChangeId, Review, SessionId, Trailer, attestation_payload, review_payload};
 use minds_git::{CommitId, Repo};
-use minds_reader::assurance::Assurance;
+use minds_reader::assurance::AssuranceLevel;
 use minds_store::{ContextStore, ReviewStore};
 use serde::Serialize;
 
@@ -303,7 +303,7 @@ fn audit(out: Option<&str>, base: Option<&str>, mode: Mode, signers: Option<&str
         }
     }
     let trust = WitnessTrust::new(store.as_ref(), signers);
-    let mut levels: BTreeMap<SessionId, (Assurance, SessionAssurance)> = BTreeMap::new();
+    let mut levels: BTreeMap<SessionId, (AssuranceLevel, SessionAssurance)> = BTreeMap::new();
 
     let head = repo.head()?.commit().ok_or("HEAD has no commit yet")?;
 
@@ -399,7 +399,7 @@ fn audit(out: Option<&str>, base: Option<&str>, mode: Mode, signers: Option<&str
         proof: match levels.values().map(|(level, _)| *level).min() {
             Some(weakest) => proof_section(weakest, trust.trusted(), None),
             None => proof_section(
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 trust.trusted(),
                 Some(NO_SESSION_IN_RANGE),
             ),
@@ -431,7 +431,7 @@ fn bundle_len(changes: &[ChangeRecord]) -> usize {
 /// in TUI und `minds verify`. Die Grenzen gehören ins Artefakt, nicht nur
 /// in die Doku.
 fn proof_section(
-    level: Assurance,
+    level: AssuranceLevel,
     trusted_signers_available: bool,
     reason: Option<&'static str>,
 ) -> ProofSection {
@@ -462,7 +462,7 @@ fn session_level(
     signers: Option<&str>,
     root: &Path,
     id: SessionId,
-    levels: &mut BTreeMap<SessionId, (Assurance, SessionAssurance)>,
+    levels: &mut BTreeMap<SessionId, (AssuranceLevel, SessionAssurance)>,
 ) -> SessionAssurance {
     if let Some((_, known)) = levels.get(&id) {
         return known.clone();
@@ -486,7 +486,7 @@ fn session_level(
             // nicht ins Bündel.
             eprintln!("minds audit: assurance of {id} not assessed: {err}");
             (
-                Assurance::A0Claimed,
+                AssuranceLevel::A0Claimed,
                 Some("assurance not assessed — evidence unreadable".to_owned()),
             )
         }
@@ -670,7 +670,7 @@ fn repo_root(repo: &Repo) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn section_json(level: Assurance, trusted_signers_available: bool) -> String {
+    fn section_json(level: AssuranceLevel, trusted_signers_available: bool) -> String {
         format!(
             "{}\n",
             serde_json::to_string_pretty(&proof_section(level, trusted_signers_available, None))
@@ -691,8 +691,8 @@ mod tests {
 
     #[test]
     fn audit_bundle_carries_level_golden() {
-        let a1 = section_json(Assurance::A1Observed, false);
-        let a2 = section_json(Assurance::A2Witnessed, true);
+        let a1 = section_json(AssuranceLevel::A1Observed, false);
+        let a2 = section_json(AssuranceLevel::A2Witnessed, true);
         assert_eq!(a1, GOLDEN_A1);
         assert_eq!(a2, GOLDEN_A2);
         assert_eq!(
@@ -710,13 +710,13 @@ mod tests {
     #[test]
     fn the_bundle_states_exactly_the_sentences_of_its_level() {
         let ids = |records: &[SentenceRecord]| records.iter().map(|r| r.id).collect::<Vec<_>>();
-        let a1 = proof_section(Assurance::A1Observed, false, None);
+        let a1 = proof_section(AssuranceLevel::A1Observed, false, None);
         assert_eq!(a1.assurance.level, "A1");
         assert_eq!(a1.assurance.name, "A1 observed");
         assert!(ids(&a1.does_not_prove).contains(&"append_to_seal_window"));
         assert!(!ids(&a1.proves).contains(&"witness_chaining"));
 
-        let a2 = proof_section(Assurance::A2Witnessed, true, None);
+        let a2 = proof_section(AssuranceLevel::A2Witnessed, true, None);
         assert_eq!(a2.assurance.level, "A2");
         let limits = ids(&a2.does_not_prove);
         assert!(!limits.contains(&"append_to_seal_window"));
@@ -730,7 +730,7 @@ mod tests {
         assert!(limits.contains(&"bundle_level_self_reported"));
 
         // Jede Stufe: genau die Sätze aus `minds-core`, in derselben Folge.
-        for level in Assurance::ALL {
+        for level in AssuranceLevel::ALL {
             let section = proof_section(level, false, None);
             let proves: Vec<&str> = proves_at(level.level()).map(|s| s.id).collect();
             let limits: Vec<&str> = limits_at(level.level()).map(|s| s.id).collect();
@@ -743,8 +743,8 @@ mod tests {
     #[ignore = "Golden-Dateien neu erzeugen: --ignored --nocapture"]
     fn audit_proof_reference() {
         for (name, level, signers) in [
-            ("a1", Assurance::A1Observed, false),
-            ("a2", Assurance::A2Witnessed, true),
+            ("a1", AssuranceLevel::A1Observed, false),
+            ("a2", AssuranceLevel::A2Witnessed, true),
         ] {
             let json = section_json(level, signers);
             println!(

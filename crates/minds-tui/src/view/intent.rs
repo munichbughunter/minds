@@ -212,12 +212,24 @@ fn status_block(
     let (glyph, text, style) = signed_status(info, d, stale);
     lines.push(mark(glyph, text, style));
     let sessions = bound_sessions(&app.inspection, &info.id);
-    let witness = sessions
+    // Die Stufe der Bindung: die der Sessions, die den Anker im
+    // Witness-Event nennen — aus derselben Ableitung wie `minds verify` und
+    // die Übersicht (`App::session_rating`). Bei mehreren die schwächste
+    // **geprüfte** Stufe; `Unchecked` ist keine niedrigere Stufe, sondern
+    // keine — sie zählt nur, wenn keine der Sessions geprüft ist.
+    let rating = sessions
         .iter()
-        .any(|(_, record)| *record == AnchorRecord::WitnessEvent);
+        .filter(|(_, record)| *record == AnchorRecord::WitnessEvent)
+        .map(|(id, _)| app.session_rating(*id).0)
+        .min_by_key(|rating| {
+            (
+                matches!(rating, minds_reader::assurance::Assurance::Unchecked { .. }),
+                rating.level(),
+            )
+        });
     lines.push(mark(
         "·",
-        crate::copy::binding_sentence(witness, info.active),
+        crate::copy::binding_sentence(rating.as_ref(), info.active),
         theme::dim(),
     ));
 }

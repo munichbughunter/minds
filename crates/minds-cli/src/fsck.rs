@@ -32,7 +32,7 @@ use std::process::{Command, ExitCode};
 use minds_capture::Journal;
 use minds_core::{ChangeId, Decision, SessionId, Trailer};
 use minds_git::{CommitId, Repo};
-use minds_reader::assurance::Assurance;
+use minds_reader::assurance::AssuranceLevel;
 use minds_store::ReviewStore;
 
 use crate::config;
@@ -102,7 +102,7 @@ pub fn run(options: Options<'_>) -> ExitCode {
 
 /// Liefert [`Outcome::Clean`], wenn kein Trailer verwaist ist (und, falls
 /// verlangt, jeder agent-authored Change ein Approve trägt).
-fn fsck(options: Options<'_>, required: Option<Assurance>) -> Fallible<Outcome> {
+fn fsck(options: Options<'_>, required: Option<AssuranceLevel>) -> Fallible<Outcome> {
     let Options {
         require_review,
         require_seal,
@@ -177,7 +177,7 @@ fn check_require_assurance(
     root: &Path,
     store: &dyn minds_store::ContextStore,
     signers: Option<&str>,
-    required: Assurance,
+    required: AssuranceLevel,
 ) -> Fallible<bool> {
     let Some(head) = repo.head()?.commit() else {
         println!("Assurance: HEAD has no commit yet — nothing to check");
