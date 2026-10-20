@@ -872,6 +872,7 @@ mod tests {
                 discarded: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                tokens: crate::summary::Tokens::NotRead,
             },
             started_at: None,
             epoch: None,

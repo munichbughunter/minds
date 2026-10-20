@@ -68,13 +68,17 @@ fn recap(limit: usize) -> Fallible<()> {
         };
         let headline = minds_reader::summary::headline(&session.intent.request, 80);
         println!("{when}  {headline}");
+        // Agent und Modell wie überall (`agent not recorded`, `model not
+        // recorded — <Grund>` statt des Platzhalters); Token-Zahlen nur,
+        // wenn das Transkript gelesen wurde — sonst kein Token-Segment.
+        let tokens = minds_reader::summary::Tokens::of(session)
+            .label()
+            .map(|label| format!(" · {label}"))
+            .unwrap_or_default();
         println!(
-            "                       {} · {} · {} file(s) · {}/{} tokens",
-            session.agent.name,
-            minds_reader::text::sanitize(&session.model.id),
+            "                       {} · {} file(s){tokens}",
+            minds_reader::summary::actor_line(session),
             session.produced.files.len(),
-            session.usage.input_tokens,
-            session.usage.output_tokens,
         );
     }
     Ok(())

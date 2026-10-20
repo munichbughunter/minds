@@ -113,21 +113,14 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
             println!("{cont}  » {}", bold(line));
         }
 
-        // Herkunft, dezent.
+        // Herkunft, dezent — nur, was erfasst ist: keine Version `unknown`,
+        // kein Modell `unknown/unknown`, und Token-Zahlen nur, wenn das
+        // Transkript gelesen wurde (`(reported)`, wenn der Hook sie meldete;
+        // sonst gar kein Token-Segment) — eine Null, die „nicht gelesen"
+        // bedeutet, wäre eine falsche Aussage.
         let files = s.produced.files.len();
         let fileword = if files == 1 { "file" } else { "files" };
-        println!(
-            "{cont}{}",
-            dim(&format!(
-                "{} {} · {}/{} · {}/{} Token · {files} {fileword}",
-                sanitize(&s.agent.name),
-                sanitize(&s.agent.version),
-                sanitize(&s.model.provider),
-                sanitize(&s.model.id),
-                s.usage.input_tokens,
-                s.usage.output_tokens,
-            ))
-        );
+        println!("{cont}{}", dim(&attribution(s, files, fileword)));
         let vermerk = if item.evidence == Evidence::Observed {
             String::new()
         } else {
@@ -160,6 +153,32 @@ pub fn tree(header: &str, items: &[Shown], full: bool) {
             println!("{cont}{}", dim("minds show --full shows files and prompt"));
         }
     }
+}
+
+/// Die Herkunftszeile einer Session: `claude-code 2.0.76 ·
+/// anthropic/claude-opus-4-1 · 14.2k/3.9k tokens (reported) · 5 files`.
+/// Jeder Teil nur, wie er erfasst ist — die Version fehlt, wenn sie nicht
+/// bekannt ist, das Modell heißt sonst `model not recorded`, die Token
+/// kommen über [`minds_reader::summary::Tokens`]. Entschärft.
+fn attribution(s: &Session, files: usize, fileword: &str) -> String {
+    use minds_reader::summary::{Actor, MODEL_NOT_RECORDED, Tokens, recorded};
+    let actor = Actor::of(s);
+    let agent = match (&actor.agent, &actor.version) {
+        (Some(agent), Some(version)) => format!("{agent} {version}"),
+        (Some(agent), None) => agent.clone(),
+        (None, _) => "agent not recorded".to_string(),
+    };
+    let model = match (recorded(&s.model.provider), &actor.model) {
+        (Some(provider), Some(model)) => format!("{}/{model}", sanitize(provider)),
+        (None, Some(model)) => model.clone(),
+        (_, None) => MODEL_NOT_RECORDED.to_string(),
+    };
+    let mut parts = vec![agent, model];
+    // Kein Segment, wenn nichts gezählt wurde — weder eine Null noch ein
+    // Satz darüber; das Segment erscheint nur mit Zahlen.
+    parts.extend(Tokens::of(s).label());
+    parts.push(format!("{files} {fileword}"));
+    parts.join(" · ")
 }
 
 /// Löst die Verweise eines Commits gegen den Store auf und zeichnet den Baum —
@@ -349,6 +368,63 @@ mod tests {
         format!("b3-{}", hex.to_string().repeat(64))
             .parse()
             .unwrap()
+    }
+
+    fn session(version: &str, provider: &str, model: &str) -> Session {
+        Session::new(
+            minds_core::Agent {
+                name: "claude-code".into(),
+                version: version.into(),
+            },
+            minds_core::Model {
+                provider: provider.into(),
+                id: model.into(),
+            },
+            minds_core::Intent::default(),
+        )
+    }
+
+    /// Die Herkunftszeile sagt nur, was erfasst ist: keine Version
+    /// `unknown`, kein Modell `unknown/unknown`, Token nur, wenn gelesen —
+    /// und `(reported)`, wenn der Hook sie meldete.
+    #[test]
+    fn the_attribution_line_omits_what_was_not_recorded() {
+        use minds_core::{Lineage, TranscriptStatus, Usage};
+        let mut s = session("unknown", "unknown", "unknown");
+        let mut lineage = Lineage::new("31f3f224");
+        lineage.transcript = Some(TranscriptStatus::NotReadByWitness);
+        s.lineage = Some(lineage.clone());
+        assert_eq!(
+            attribution(&s, 5, "files"),
+            "claude-code · model not recorded · 5 files"
+        );
+
+        let mut s = session("unknown", "anthropic", "claude-sonnet-5-5");
+        lineage.transcript = Some(TranscriptStatus::ModelFromHook);
+        s.lineage = Some(lineage.clone());
+        assert_eq!(
+            attribution(&s, 5, "files"),
+            "claude-code · anthropic/claude-sonnet-5-5 · 5 files"
+        );
+
+        let mut s = session("2.0.76", "anthropic", "claude-sonnet-5-5");
+        s.usage = Usage {
+            input_tokens: 14_200,
+            output_tokens: 3_900,
+        };
+        lineage.transcript = Some(TranscriptStatus::ReportedByHook);
+        s.lineage = Some(lineage.clone());
+        assert_eq!(
+            attribution(&s, 5, "files"),
+            "claude-code 2.0.76 · anthropic/claude-sonnet-5-5 · 14.2k/3.9k tokens (reported) · 5 files"
+        );
+
+        lineage.transcript = Some(TranscriptStatus::Read);
+        s.lineage = Some(lineage);
+        assert_eq!(
+            attribution(&s, 1, "file"),
+            "claude-code 2.0.76 · anthropic/claude-sonnet-5-5 · 14.2k/3.9k tokens · 1 file"
+        );
     }
 
     #[test]

@@ -19,6 +19,26 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`minds show` and `minds recap` no longer print zeros for counts nobody
+  read.** The attribution line shows the agent version only when it was
+  recorded (no `claude-code unknown`), `model not recorded` instead of
+  `unknown/unknown`, and token counts only when the transcript was read:
+  `14.2k/3.9k tokens`, `14.2k/3.9k tokens (reported)` when the `SessionEnd`
+  hook passed the sums on, and no token segment at all otherwise. The TUI's
+  size column follows (`5.7k tok ◌` for reported counts, nothing when not
+  read); the decision sits in one place of the reader (`summary::Tokens`). A record
+  without `lineage.transcript` (older binary) shows its counts unless they
+  are all zero.
+- **The prompt loses Claude Code's `<pasted_content id="…">` wrapper.** The
+  normalizer strips it at capture (the content stays, line for line) and
+  the reader strips it when showing older records — headline, `show --full`,
+  Overview, Why this line?, story, Requirements and the brief of `recall`.
+- **`minds recall <file>` resolves the path like `minds blame`.** Relative
+  to the repository root, not to the working directory, and through the
+  blame of the whole file — every line to its commit, every commit to its
+  sessions — plus the sessions whose record names the file. Before, a
+  session that named the file the way the agent saw it (absolute) was not
+  found, while `blame` attributed every line.
 - **A2 no longer needs `/exit`.** The condition "session end witnessed"
   becomes "session quiescent at checkpoint": the last event of the sealed
   range is a `Stop`, `SubagentStop` or `SessionEnd`, and no `PreToolUse` is

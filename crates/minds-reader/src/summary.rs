@@ -41,6 +41,9 @@ pub struct Summary {
     pub input_tokens: u64,
     /// Token aus.
     pub output_tokens: u64,
+    /// Dieselben Zähler mit ihrer Herkunft — gelesen, gemeldet oder gar
+    /// nicht; die Oberfläche druckt die Zahlen nur über diesen Weg.
+    pub tokens: Tokens,
 }
 
 impl Summary {
@@ -55,7 +58,80 @@ impl Summary {
             discarded: session.intent.discarded.len(),
             input_tokens: session.usage.input_tokens,
             output_tokens: session.usage.output_tokens,
+            tokens: Tokens::of(session),
         }
+    }
+}
+
+/// Die Token-Zähler einer Session **mit ihrer Herkunft**. `usage` im Record
+/// ist immer belegt — auch dann, wenn niemand gezählt hat; dann steht dort
+/// `0/0`, und eine Null, die „nicht gelesen" bedeutet, ist eine falsche
+/// Aussage. Deshalb entscheidet eine Stelle, ob die Zahlen gezeigt werden,
+/// und jede Oberfläche druckt sie über [`Tokens::label`] oder diesen Typ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tokens {
+    /// Aus dem Transkript, das der Checkpoint selbst gelesen hat.
+    Read { input: u64, output: u64 },
+    /// Vom `SessionEnd`-Hook gemeldet (`reported_by_hook`) — eine Angabe
+    /// aus dem Namensraum des Agenten, keine Beobachtung des Witness.
+    Reported { input: u64, output: u64 },
+    /// Nicht gelesen: kein Pfad, keine Datei, nicht lesbar, nur das Modell
+    /// gemeldet. Die Zähler des Records sind dann Platzhalter.
+    NotRead,
+}
+
+impl Tokens {
+    /// Liest Zähler und Herkunft einer Session.
+    pub fn of(session: &Session) -> Self {
+        let input = session.usage.input_tokens;
+        let output = session.usage.output_tokens;
+        match session.lineage.as_ref().and_then(|l| l.transcript) {
+            Some(
+                TranscriptStatus::Read | TranscriptStatus::ReadFromSlug | TranscriptStatus::Empty,
+            ) => Self::Read { input, output },
+            Some(TranscriptStatus::ReportedByHook) => Self::Reported { input, output },
+            Some(
+                TranscriptStatus::NoPathInEvents
+                | TranscriptStatus::NotFound
+                | TranscriptStatus::NotReadable
+                | TranscriptStatus::ParseFailed
+                | TranscriptStatus::NotReadByWitness
+                | TranscriptStatus::ModelFromHook,
+            ) => Self::NotRead,
+            // Von einem Binary ohne das Feld gebaut: Damals las der Checkpoint
+            // das Transkript, wenn er konnte — Zähler ungleich null stammen
+            // daraus; lauter Nullen heißen eher „nicht gelesen" als „nichts
+            // verbraucht".
+            None if input == 0 && output == 0 => Self::NotRead,
+            None => Self::Read { input, output },
+        }
+    }
+
+    /// `14.2k/3.9k tokens` oder `14.2k/3.9k tokens (reported)` — und
+    /// `None`, wenn nichts gezählt wurde: Dann fällt das Segment weg, statt
+    /// eine Null zu drucken, die nichts zählt, oder einen Satz, der niemandem
+    /// hilft.
+    pub fn label(self) -> Option<String> {
+        match self {
+            Self::Read { input, output } => {
+                Some(format!("{}/{} tokens", compact(input), compact(output)))
+            }
+            Self::Reported { input, output } => Some(format!(
+                "{}/{} tokens (reported)",
+                compact(input),
+                compact(output)
+            )),
+            Self::NotRead => None,
+        }
+    }
+}
+
+/// Eine Token-Zahl kurz: `999`, `14.2k`, `1.2M`.
+pub fn compact(n: u64) -> String {
+    match n {
+        n if n < 1_000 => n.to_string(),
+        n if n < 1_000_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        n => format!("{:.1}M", n as f64 / 1_000_000.0),
     }
 }
 
@@ -429,6 +505,89 @@ mod tests {
         let out = headline(&"x".repeat(200), 20);
         assert!(out.chars().count() <= 21, "{out}");
         assert!(out.ends_with('…'));
+    }
+
+    /// Eine Null, die „nicht gelesen" bedeutet, wird nicht gedruckt: Die
+    /// Zahlen erscheinen nur, wenn das Transkript gelesen wurde — und als
+    /// `(reported)`, wenn der Hook sie meldete.
+    #[test]
+    fn tokens_are_shown_only_when_read_and_marked_when_reported() {
+        let mut session = session_of("claude-code", "2.0", "anthropic", "claude-opus-4-1");
+        session.usage = minds_core::Usage {
+            input_tokens: 14_200,
+            output_tokens: 3_900,
+        };
+        let mut lineage = minds_core::Lineage::new("31f3f224");
+        let mut with = |status: Option<TranscriptStatus>, session: &Session| {
+            let mut s = session.clone();
+            lineage.transcript = status;
+            s.lineage = Some(lineage.clone());
+            Tokens::of(&s)
+        };
+        for status in [
+            TranscriptStatus::Read,
+            TranscriptStatus::ReadFromSlug,
+            TranscriptStatus::Empty,
+        ] {
+            assert_eq!(
+                with(Some(status), &session).label().as_deref(),
+                Some("14.2k/3.9k tokens"),
+                "{status:?}"
+            );
+        }
+        assert_eq!(
+            with(Some(TranscriptStatus::ReportedByHook), &session)
+                .label()
+                .as_deref(),
+            Some("14.2k/3.9k tokens (reported)")
+        );
+        for status in [
+            TranscriptStatus::NoPathInEvents,
+            TranscriptStatus::NotFound,
+            TranscriptStatus::NotReadable,
+            TranscriptStatus::ParseFailed,
+            TranscriptStatus::NotReadByWitness,
+            TranscriptStatus::ModelFromHook,
+        ] {
+            assert_eq!(
+                with(Some(status), &session),
+                Tokens::NotRead,
+                "{status:?}: die Zähler sind Platzhalter"
+            );
+            assert_eq!(with(Some(status), &session).label(), None, "kein Segment");
+        }
+        // Ohne das Feld (älteres Binary): Zahlen zählen, lauter Nullen nicht.
+        assert_eq!(
+            with(None, &session),
+            Tokens::Read {
+                input: 14_200,
+                output: 3_900
+            }
+        );
+        session.usage = minds_core::Usage::default();
+        assert_eq!(with(None, &session), Tokens::NotRead);
+        assert_eq!(
+            with(Some(TranscriptStatus::Read), &session)
+                .label()
+                .as_deref(),
+            Some("0/0 tokens"),
+            "gelesen und wirklich null: eine wahre Null"
+        );
+        let summary = Summary::of(SessionId::from_canonical_bytes(b"x"), &{
+            let mut s = session.clone();
+            lineage.transcript = Some(TranscriptStatus::ModelFromHook);
+            s.lineage = Some(lineage.clone());
+            s
+        });
+        assert_eq!(summary.tokens, Tokens::NotRead);
+    }
+
+    #[test]
+    fn compact_token_counts_read_like_the_tui() {
+        assert_eq!(compact(999), "999");
+        assert_eq!(compact(14_200), "14.2k");
+        assert_eq!(compact(3_900), "3.9k");
+        assert_eq!(compact(1_234_567), "1.2M");
     }
 
     #[test]
