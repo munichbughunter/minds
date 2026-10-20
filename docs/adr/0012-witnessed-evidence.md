@@ -244,8 +244,12 @@ time.
 
 Known limits: a rewrite of identical content within one epoch is a single observation
 (a later claim for it stays uncorroborated); in SHA-256 repositories tracked files that
-match an ignore pattern are not observed; `fs.gap` events are chained but not yet surfaced
-by `minds verify` (EA-11/EA-12); linked worktrees (`.git` is a file) are not observed.
+match an ignore pattern are not observed; linked worktrees (`.git` is a file) are not
+observed. `fs.gap` events (a full channel, a panic, unreadable ignore rules, no watcher)
+are chained and carried into the observation object (`gaps`, with the number of
+notifications a full channel refused); `minds verify` names them at every claim whose
+observation fell into one (`observation gap (overflow: 12 events dropped)`) and in the
+Assurance reason, and a window with a gap counts as incomplete material.
 `explained (fs only)` means the witness saw exactly the committed bytes in the window —
 it says nothing about who wrote them (an agent can re-surface existing content with a
 `touch` after an epoch boundary). The witness seals the observation epoch **before** the sessions of the same checkpoint;

@@ -14,10 +14,23 @@
 //! ```
 //!
 //! Alle Schlüssel stehen immer da, auch mit `null` — eine Form, ein Hash.
-//! Nur `started_at` (ab Schema 2) und `witness` (seit den Witness-Fakten)
+//! Nur `started_at` (ab Schema 2), `witness` (seit den Witness-Fakten) und
+//! `gaps` (seit den Lücken des Beobachters; nur, wenn es welche gab)
 //! fehlen in älteren Objekten ganz — ein zusätzliches Feld hebt das Schema
 //! nicht (CHANGELOG); der Leser ist tolerant, die Id gilt den gespeicherten
 //! Bytes.
+//!
+//! # Lücken des Beobachters (`gaps`)
+//!
+//! Wo der Beobachter Meldungen verlor — ein voller Kanal, ein Panic, nicht
+//! lesbare Ignore-Regeln, kein Watcher —, steht im Stream des Witness ein
+//! `fs.gap`-Event. Es ist gekettet wie jede Beobachtung; hier steht es
+//! als [`ObservationGap`], damit der Leser die Lücke **sieht**: Ein Claim,
+//! dessen Beobachtung in eine Lücke fiel, ist nicht „nie beobachtet",
+//! sondern „der Beobachter war blind" (`observation gap (overflow: 12
+//! events dropped)` statt `no file-system observation`). `dropped` zählt
+//! die verlorenen Meldungen, wo der Beobachter sie zählen konnte (ein
+//! voller Kanal); eine Lücke ohne Zahl ist eine Lücke unbekannter Größe.
 //!
 //! # Was der Witness über sich festhält (`witness`)
 //!
@@ -96,6 +109,73 @@ pub struct Observations {
     /// älteren Objekten (und wo er nichts festhalten konnte).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub witness: Option<WitnessFacts>,
+    /// Wo der Beobachter in dieser Epoche Meldungen verlor — die
+    /// `fs.gap`-Events des Streams, nach `seq` aufsteigend. Leer (und nicht
+    /// serialisiert), wenn er lückenlos sah.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gaps: Vec<ObservationGap>,
+}
+
+/// Eine Lücke des Beobachters: `fs.gap { reason, dropped }` im Stream des
+/// Witness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObservationGap {
+    /// Die Sequenznummer des `fs.gap`-Events in seiner Epoche.
+    pub seq: u64,
+    /// Wann der Witness die Lücke festhielt (RFC 3339) — die verlorenen
+    /// Meldungen liegen davor, seit der vorigen Beobachtung.
+    pub at: String,
+    /// Warum der Beobachter blind war.
+    pub reason: GapReason,
+    /// Wie viele Meldungen verloren gingen, wo der Beobachter zählen konnte
+    /// (ein voller Kanal); `None`: nicht zählbar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
+}
+
+/// Warum der Beobachter Meldungen verlor — das Wort aus dem `fs.gap`-Event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapReason {
+    /// Der Kanal zwischen Watcher und Eventloop (oder die Sammlung
+    /// wartender Pfade) lief über; `dropped` zählt, was der Kanal abwies.
+    Overflow,
+    /// Die Eventloop des Beobachters ist in Agent-bestimmten Bytes
+    /// (Index, `.gitignore`) abgestürzt; der Durchlauf ging verloren.
+    Panic,
+    /// Ignore-Regeln ließen sich nicht sicher lesen; betroffene Pfade wurden
+    /// verworfen (lieber blind als einen ignorierten Pfad fingerprinten).
+    IgnoreRules,
+    /// Kein Watcher (etwa das inotify-Limit): Der Witness lief blind.
+    Unavailable,
+    /// Ein Grund, den dieses Binary nicht kennt (tolerant gelesen; dieses
+    /// Binary schreibt ihn nie).
+    #[serde(other)]
+    Unknown,
+}
+
+impl GapReason {
+    /// Das Wire-Wort — dasselbe wie im `fs.gap`-Event.
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Overflow => "overflow",
+            Self::Panic => "panic",
+            Self::IgnoreRules => "ignore_rules",
+            Self::Unavailable => "unavailable",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Das Wort gelesen; alles andere ist [`GapReason::Unknown`].
+    pub fn parse(word: &str) -> Self {
+        match word {
+            "overflow" => Self::Overflow,
+            "panic" => Self::Panic,
+            "ignore_rules" => Self::IgnoreRules,
+            "unavailable" => Self::Unavailable,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 /// Was der Witness beim Versiegeln einer Epoche über sich prüfte.
@@ -233,6 +313,8 @@ pub enum ObservationError {
     Start,
     #[error("witness facts are not in canonical order or name an unknown profile")]
     Witness,
+    #[error("gap {0}: unknown reason or sequence numbers not increasing")]
+    Gap(usize),
 }
 
 impl Observations {
@@ -247,6 +329,7 @@ impl Observations {
             last_at: observations.last().map(|o| o.at.clone()),
             observations,
             witness: None,
+            gaps: Vec::new(),
         }
     }
 
@@ -254,6 +337,13 @@ impl Observations {
     #[must_use]
     pub fn with_witness(mut self, witness: WitnessFacts) -> Self {
         self.witness = Some(witness);
+        self
+    }
+
+    /// Dasselbe Objekt mit den Lücken des Beobachters (in `seq`-Reihenfolge).
+    #[must_use]
+    pub fn with_gaps(mut self, gaps: Vec<ObservationGap>) -> Self {
+        self.gaps = gaps;
         self
     }
 
@@ -303,6 +393,13 @@ impl Observations {
             if !known || !ascending(&witness.isolation.agent_uids) || !envelopes {
                 return Err(ObservationError::Witness);
             }
+        }
+        let mut last = None;
+        for (index, gap) in self.gaps.iter().enumerate() {
+            if gap.reason == GapReason::Unknown || last.is_some_and(|seq| gap.seq <= seq) {
+                return Err(ObservationError::Gap(index));
+            }
+            last = Some(gap.seq);
         }
         Ok(())
     }
@@ -587,6 +684,59 @@ mod tests {
         );
         // … geschrieben wird so etwas aber nie.
         assert_eq!(read.check(), Err(ObservationError::ContentReason(2)));
+    }
+
+    /// Lücken des Beobachters stehen im Objekt — und fehlen ganz, wo es
+    /// keine gab: Ein Objekt ohne Lücken serialisiert byte-identisch wie
+    /// vor dem Feld (dieselbe Id).
+    #[test]
+    fn observer_gaps_are_carried_and_absent_when_there_were_none() {
+        let plain = sample();
+        let bytes = plain.canonical_bytes().unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("gaps"));
+        let gapped = sample().with_gaps(vec![
+            ObservationGap {
+                seq: 3,
+                at: "2026-10-05T10:00:01.500Z".into(),
+                reason: GapReason::Overflow,
+                dropped: Some(12),
+            },
+            ObservationGap {
+                seq: 5,
+                at: "2026-10-05T10:00:03Z".into(),
+                reason: GapReason::Panic,
+                dropped: None,
+            },
+        ]);
+        gapped.check().unwrap();
+        let bytes = gapped.canonical_bytes().unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            text.contains(
+                r#""gaps":[{"at":"2026-10-05T10:00:01.500Z","dropped":12,"reason":"overflow","seq":3},{"at":"2026-10-05T10:00:03Z","reason":"panic","seq":5}]"#
+            ),
+            "{text}"
+        );
+        let back: Observations = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back, gapped);
+        assert_ne!(back.id().unwrap(), plain.id().unwrap());
+        // Ein künftiger Grund liest sich tolerant — und wird nie geschrieben.
+        let future: Observations =
+            serde_json::from_str(&text.replace("\"panic\"", "\"eclipse\"")).unwrap();
+        assert_eq!(future.gaps[1].reason, GapReason::Unknown);
+        assert_eq!(future.check(), Err(ObservationError::Gap(1)));
+        let mut order = gapped.clone();
+        order.gaps[1].seq = 3;
+        assert_eq!(order.check(), Err(ObservationError::Gap(1)));
+        for reason in [
+            GapReason::Overflow,
+            GapReason::Panic,
+            GapReason::IgnoreRules,
+            GapReason::Unavailable,
+        ] {
+            assert_eq!(GapReason::parse(reason.word()), reason);
+        }
+        assert_eq!(GapReason::parse("eclipse"), GapReason::Unknown);
     }
 
     #[test]

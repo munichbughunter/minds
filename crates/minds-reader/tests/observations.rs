@@ -125,10 +125,15 @@ fn seen(
 
 /// Legt ein redigiertes Objekt und seinen `witness-fs/v1`-Seal ab.
 fn seal_observations(store: &InRepoStore, observations: Vec<Observation>) -> ContentHash {
+    seal_object(store, Observations::new(UNANCHORED, observations))
+}
+
+/// Wie [`seal_observations`], mit einem fertigen Objekt (etwa mit Lücken).
+fn seal_object(store: &InRepoStore, object: Observations) -> ContentHash {
     let redacted = minds_redact::RedactionConfig::default()
         .pipeline()
         .unwrap()
-        .redact_observations(Observations::new(UNANCHORED, observations))
+        .redact_observations(object)
         .unwrap();
     let object = store.put_observations(&redacted).unwrap();
     let seal = Seal {
@@ -1336,4 +1341,72 @@ fn a_claim_is_dated_by_its_report_not_by_the_start_of_its_turn() {
         .find(|f| f.path == "late.rs")
         .unwrap();
     assert_eq!(late.class, ReconClass::Explained);
+}
+
+/// Wo der Beobachter blind war, ist das Material unvollständig — und die
+/// Lücken im Fenster werden genannt, damit ein Claim ohne Beobachtung
+/// seinen Grund bekommt (`observation gap (overflow: 5 events dropped)`
+/// statt `no file-system observation`).
+#[test]
+fn observer_gaps_make_the_window_incomplete_and_are_listed() {
+    use minds_core::observation::{GapReason, ObservationGap};
+    use minds_reader::observations::{Window, gap_near, observations_in_windows_checked};
+
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let window = Window {
+        from: "2026-10-02T10:00:00Z".parse().unwrap(),
+        to: "2026-10-02T10:00:09Z".parse().unwrap(),
+        epochs: None,
+    };
+    let gapped = seal_object(
+        &store,
+        Observations::new(UNANCHORED, vec![seen(1, "a.rs", Some(b"a\n"), None)]).with_gaps(vec![
+            ObservationGap {
+                seq: 2,
+                at: "2026-10-02T10:00:03Z".into(),
+                reason: GapReason::Overflow,
+                dropped: Some(5),
+            },
+            // Außerhalb des Fensters: nicht genannt — die Epoche bleibt
+            // trotzdem unvollständig.
+            ObservationGap {
+                seq: 3,
+                at: "2026-10-02T11:00:00Z".into(),
+                reason: GapReason::Panic,
+                dropped: None,
+            },
+        ]),
+    );
+    let trusted = |_: &ContentHash, _: &str| true;
+    let read = observations_in_windows_checked(&store, std::slice::from_ref(&window), &trusted);
+    assert!(!read.complete);
+    assert_eq!(read.observations.len(), 1);
+    let listed: Vec<(String, GapReason, Option<u64>)> = read
+        .gaps
+        .iter()
+        .map(|g| (g.at.to_string(), g.reason, g.dropped))
+        .collect();
+    assert_eq!(
+        listed,
+        [(
+            "2026-10-02T10:00:03Z".to_string(),
+            GapReason::Overflow,
+            Some(5)
+        )]
+    );
+    assert_eq!(read.gaps[0].describe(), "overflow: 5 events dropped");
+    // Ein Claim um 10:00:02 fiel in die Lücke; einer um 10:30 nicht.
+    let near = gap_near(&read.gaps, "2026-10-02T10:00:02Z".parse().unwrap());
+    assert_eq!(near, Some(&read.gaps[0]));
+    assert_eq!(
+        gap_near(&read.gaps, "2026-10-02T10:30:00Z".parse().unwrap()),
+        None
+    );
+    // Nur Epochen, die das Fenster nennt, zählen.
+    let untrusted = |id: &ContentHash, _: &str| *id != gapped;
+    let read = observations_in_windows_checked(&store, &[window], &untrusted);
+    assert!(read.complete);
+    assert!(read.gaps.is_empty());
 }

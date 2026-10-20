@@ -17,6 +17,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Observer gaps are named, not silent.** When the file observer loses
+  notifications (a full channel, a panic, unreadable ignore rules, no
+  watcher), its `fs.gap` event now counts what the full channel refused
+  (`dropped`), the checkpoint carries the gaps into the observation object
+  (`gaps`, additive — an object without gaps serializes as before), and
+  `minds verify` reads them: a write claim whose observation fell into a gap
+  says `observation gap (overflow: 12 events dropped)` instead of `no
+  file-system observation`, the Assurance reason names the gap's cause, and
+  a window with a gap is incomplete material for the scope.
+
 ### Fixed
 
 - **Write claims are corroborated by the witness's file observations.** A

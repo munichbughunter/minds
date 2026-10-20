@@ -25,7 +25,7 @@
 
 use jiff::{SignedDuration, Timestamp};
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome};
-use minds_core::observation::ObservationReason;
+use minds_core::observation::{GapReason, ObservationReason};
 use minds_core::{ContentHash, EffectKind, Session, SessionId};
 use minds_store::ContextStore;
 
@@ -105,6 +105,45 @@ pub struct WindowObservations {
     /// was beobachtet wurde (Scope-Befunde, EA-17), ist das Material dann
     /// unvollständig.
     pub complete: bool,
+    /// Wo der Beobachter in den Fenstern blind war
+    /// ([`minds_core::observation::ObservationGap`] der genannten Epochen),
+    /// nach Zeit sortiert. Jede macht das Material unvollständig — und
+    /// erklärt einem Claim ohne Beobachtung, warum
+    /// ([`gap_near`]).
+    pub gaps: Vec<FsGap>,
+}
+
+/// Eine Lücke des Beobachters, gelesen: wann, warum, wie viele Meldungen
+/// (wo zählbar).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FsGap {
+    pub at: Timestamp,
+    pub reason: GapReason,
+    pub dropped: Option<u64>,
+}
+
+impl FsGap {
+    /// Der Text für ein Urteil: `overflow: 12 events dropped`, sonst nur
+    /// das Grund-Wort.
+    pub fn describe(&self) -> String {
+        match self.dropped {
+            Some(n) => format!("{}: {n} events dropped", self.reason.word()),
+            None => self.reason.word().to_owned(),
+        }
+    }
+}
+
+/// Die Lücke, in die die Beobachtung eines Claims um `claim_at` gefallen
+/// sein kann: eine im Fenster `[claim − 2 s, claim + 30 s]` — dasselbe
+/// Fenster wie bei [`corroborate`]. Die erste nach Zeit.
+pub fn gap_near(gaps: &[FsGap], claim_at: Timestamp) -> Option<&FsGap> {
+    let (Ok(from), Ok(to)) = (
+        claim_at.checked_sub(CORROBORATION_BEFORE),
+        claim_at.checked_add(CORROBORATION_AFTER),
+    ) else {
+        return None;
+    };
+    gaps.iter().find(|gap| from <= gap.at && gap.at <= to)
 }
 
 /// Fenster und Beobachtungen **einer** Session, wie `minds verify` sie
@@ -132,6 +171,7 @@ pub fn session_observations(
             WindowObservations {
                 observations: Vec::new(),
                 complete: !witnessed,
+                gaps: Vec::new(),
             },
         );
     }
@@ -170,16 +210,19 @@ pub fn observations_in_windows_checked(
         return WindowObservations {
             observations: Vec::new(),
             complete: true,
+            gaps: Vec::new(),
         };
     };
     let Ok(seals) = store.list_seals() else {
         return WindowObservations {
             observations: Vec::new(),
             complete: false,
+            gaps: Vec::new(),
         };
     };
     let mut complete = true;
     let mut out: Vec<(Timestamp, FsObservation)> = Vec::new();
+    let mut gaps: Vec<FsGap> = Vec::new();
     let mut seen_objects = std::collections::BTreeSet::new();
     for seal_id in seals {
         // Ein aufgelisteter, aber nicht lesbarer Seal kann eine Epoche des
@@ -222,6 +265,22 @@ pub fn observations_in_windows_checked(
             .iter()
             .filter_map(|o| time(Some(&o.at)))
             .any(|at| inside(&seal_id, at));
+        // Der Beobachter war in dieser Epoche blind: unvollständig — und
+        // die Lücken im Fenster werden genannt.
+        if !object.gaps.is_empty() && named(&seal_id) {
+            complete = false;
+        }
+        for gap in &object.gaps {
+            if let Some(at) = time(Some(&gap.at))
+                && inside(&seal_id, at)
+            {
+                gaps.push(FsGap {
+                    at,
+                    reason: gap.reason,
+                    dropped: gap.dropped,
+                });
+            }
+        }
         if !overlaps || !seen_objects.insert(object_id) {
             continue;
         }
@@ -253,9 +312,12 @@ pub fn observations_in_windows_checked(
         }
     }
     out.sort_by(|a, b| (a.0, &a.1.path, a.1.observed.seq).cmp(&(b.0, &b.1.path, b.1.observed.seq)));
+    gaps.sort_by_key(|gap| gap.at);
+    gaps.dedup();
     WindowObservations {
         observations: out.into_iter().map(|(_, o)| o).collect(),
         complete,
+        gaps,
     }
 }
 

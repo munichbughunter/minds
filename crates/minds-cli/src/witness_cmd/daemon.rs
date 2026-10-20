@@ -1283,6 +1283,9 @@ struct Writer {
     /// je Grund und Sekunde — eine dauerhafte Störung füllt das Journal
     /// nicht im Takt der Eventloop.
     last_gap: std::collections::HashMap<&'static str, std::time::Instant>,
+    /// Verlorene Meldungen, die noch kein `fs.gap` nennt (in der Sekunde
+    /// nach dem letzten): Das nächste zählt sie mit.
+    gap_dropped: u64,
     /// Ob in diesem Durchlauf der Eventloop schon für einen Checkpoint
     /// ohne Entprellung beobachtet wurde. Eine Flut von Anfragen in einem
     /// Durchlauf kostet so höchstens einmal das Budget.
@@ -1345,6 +1348,7 @@ impl Writer {
             fs_ready: std::collections::VecDeque::new(),
             settled_this_step: false,
             last_gap: std::collections::HashMap::new(),
+            gap_dropped: 0,
             // Erst `open` lädt den aktiven Intent (samt Beleg); der Worker
             // eines Checkpoints braucht ihn nicht.
             intent: None,
@@ -1623,7 +1627,7 @@ impl Writer {
                 Ok(batch) => batch,
                 Err(_) => {
                     observer.forget_caches();
-                    self.gap(&stream, "panic", "file observer panicked; gap recorded")?;
+                    self.gap(&stream, "panic", "file observer panicked; gap recorded", 0)?;
                     observer::Batch::default()
                 }
             }
@@ -1636,6 +1640,7 @@ impl Writer {
                 &stream,
                 "overflow",
                 "file observer lost notifications; gap recorded",
+                batch.dropped,
             )?;
         }
         if batch.ignore_failed {
@@ -1697,19 +1702,35 @@ impl Writer {
     }
 
     /// Hängt ein `fs.gap` mit `reason` an und loggt `note` — höchstens
-    /// einmal je Grund und Sekunde.
-    fn gap(&mut self, stream: &SessionKey, reason: &'static str, note: &str) -> Fallible<()> {
+    /// einmal je Grund und Sekunde. `dropped` zählt die Meldungen, die der
+    /// volle Kanal abwies (`0`: keine oder nicht zählbar); was in der
+    /// gedrosselten Sekunde anfällt, nennt das nächste `fs.gap` mit.
+    fn gap(
+        &mut self,
+        stream: &SessionKey,
+        reason: &'static str,
+        note: &str,
+        dropped: u64,
+    ) -> Fallible<()> {
         let now = std::time::Instant::now();
+        let dropped = self.gap_dropped.saturating_add(dropped);
         if self
             .last_gap
             .get(reason)
             .is_some_and(|at| now.duration_since(*at) < std::time::Duration::from_secs(1))
         {
+            self.gap_dropped = dropped;
             return Ok(());
         }
+        self.gap_dropped = 0;
         self.last_gap.insert(reason, now);
         log(&self.home, note);
-        self.lifecycle(stream, "fs.gap", serde_json::json!({ "reason": reason }))?;
+        let payload = if dropped > 0 {
+            serde_json::json!({ "reason": reason, "dropped": dropped })
+        } else {
+            serde_json::json!({ "reason": reason })
+        };
+        self.lifecycle(stream, "fs.gap", payload)?;
         self.fs_dirty = true;
         Ok(())
     }

@@ -565,6 +565,7 @@ fn verify_commit(
                 None => minds_reader::observations::WindowObservations {
                     observations: Vec::new(),
                     complete: true,
+                    gaps: Vec::new(),
                 },
             };
             match crate::verify_cmd::scope::assess(

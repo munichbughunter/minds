@@ -1042,6 +1042,7 @@ fn verify_session(
             minds_reader::observations::WindowObservations {
                 observations: Vec::new(),
                 complete: true,
+                gaps: Vec::new(),
             },
         ),
     };
@@ -1120,13 +1121,9 @@ fn verify_session(
     }
 
     if let (Some(session), false) = (&loaded, windows.is_empty()) {
-        for line in assurance::uncorroborated_lines(
-            &ctx.root,
-            id,
-            session,
-            &window_observations.observations,
-            run.all,
-        ) {
+        for line in
+            assurance::uncorroborated_lines(&ctx.root, id, session, &window_observations, run.all)
+        {
             println!("{line}");
         }
     }

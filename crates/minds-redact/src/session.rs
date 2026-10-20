@@ -405,6 +405,8 @@ pub enum Field {
     ObservationPath(usize),
     /// `observations[i].at`
     ObservationAt(usize),
+    /// `gaps[i].at` eines Observation-Objekts.
+    ObservationGapAt(usize),
     /// Der Snapshot einer Anforderung (EA-14).
     IntentSnapshot,
     /// Die `source=`-Zeile eines Intent-Ankers.
@@ -492,6 +494,7 @@ impl fmt::Display for Field {
             Field::ObservationsLastAt => f.write_str("last_at"),
             Field::ObservationPath(i) => write!(f, "observations[{i}].path"),
             Field::ObservationAt(i) => write!(f, "observations[{i}].at"),
+            Field::ObservationGapAt(i) => write!(f, "gaps[{i}].at"),
             Field::IntentSnapshot => f.write_str("intent.snapshot"),
             Field::IntentSource => f.write_str("intent.source"),
             Field::IntentScope(i) => write!(f, "intent.scope[{i}]"),

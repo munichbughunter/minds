@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome};
-use minds_core::observation::{Isolation, Observation, Observations, WitnessFacts};
+use minds_core::observation::{
+    GapReason, Isolation, Observation, ObservationGap, Observations, WitnessFacts,
+};
 use minds_core::{ContentHash, SessionId};
 use minds_store::{ContextStore, InRepoStore};
 
@@ -274,6 +276,33 @@ impl Fixture {
         first: Option<WitnessFacts>,
         second: Option<WitnessFacts>,
     ) -> ContentHash {
+        self.observe_full(bytes, first, second, Vec::new())
+    }
+
+    /// Wie [`Self::observe`]: Der Beobachter war in der Epoche der
+    /// Beobachtung blind — ein voller Kanal um 10:00:03, drei Meldungen
+    /// verloren.
+    fn observe_gapped(&self, bytes: &[u8]) -> ContentHash {
+        self.observe_full(
+            bytes,
+            None,
+            None,
+            vec![ObservationGap {
+                seq: 2,
+                at: "2026-10-02T10:00:03Z".into(),
+                reason: GapReason::Overflow,
+                dropped: Some(3),
+            }],
+        )
+    }
+
+    fn observe_full(
+        &self,
+        bytes: &[u8],
+        first: Option<WitnessFacts>,
+        second: Option<WitnessFacts>,
+        gaps: Vec<ObservationGap>,
+    ) -> ContentHash {
         let with = |object: Observations, witness: &Option<WitnessFacts>| match witness {
             Some(facts) => object.with_witness(facts.clone()),
             None => object,
@@ -301,7 +330,8 @@ impl Fixture {
                         content: Some(hash(bytes)),
                         reason: None,
                     }],
-                ),
+                )
+                .with_gaps(gaps),
                 &second,
             ))
             .unwrap();
@@ -526,6 +556,33 @@ Coverage       complete within the boundary (boundary: witness/v1 — activity o
   uncorroborated  turn 1 call 1  Write generated.rs  {claimed}…  no file-system observation
 Interpretation complete
 Assurance      A1 observed    (range 1: witness profile unknown)
+Intent         intent not bound
+Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
+Overall        VERIFIED
+"
+        )
+    );
+}
+
+#[test]
+fn verify_assurance_golden_observer_gap() {
+    // Der Beobachter war blind, als der Agent schrieb: Der Claim ist nicht
+    // „nie beobachtet", sondern fiel in eine Lücke — die Zeile sagt es,
+    // und die Assurance nennt den Grund der Lücke.
+    let fixture = Fixture::new(&[SCOPE_WITNESS_V1], Some(b"forged\n"));
+    fixture.observe_gapped(b"shell\n");
+    let run = fixture.minds(&["verify", "HEAD", "--signers", fixture.signers()]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    let claimed = &hash(b"forged\n").to_string()[..11];
+    assert_eq!(
+        axes(&run.stdout),
+        format!(
+            "\
+Integrity      intact
+Coverage       complete within the boundary (boundary: witness/v1 — activity outside it is not captured · 0 gaps · artifact 1/1 lines explained)
+  uncorroborated  turn 1 call 1  Write generated.rs  {claimed}…  observation gap (overflow: 3 events dropped)
+Interpretation complete
+Assurance      A1 observed    (range 1: observation gap (overflow))
 Intent         intent not bound
 Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)
 Overall        VERIFIED

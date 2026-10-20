@@ -583,15 +583,88 @@ fn fs_observer_records_a_gap_on_overflow() {
     let mut writer = f.writer();
     writer.observe_into(stream(), observer);
     writer.observe(false).unwrap();
-    let gaps = writer
+    let gaps: Vec<String> = writer
         .journal
         .read(&stream())
         .unwrap()
         .events
         .iter()
         .filter(|e| e.raw_kind == "fs.gap")
-        .count();
-    assert_eq!(gaps, 1);
+        .map(|e| e.payload.get().to_owned())
+        .collect();
+    // Der Kanal fasst genau MAX_PENDING Meldungen; eine wies er ab — und
+    // die Lücke zählt sie.
+    assert_eq!(gaps, [r#"{"dropped":1,"reason":"overflow"}"#]);
+}
+
+/// Die Lücken des Beobachters stehen nach dem Checkpoint im
+/// Observation-Objekt — mit Grund, Zeit und Zahl der verlorenen Meldungen;
+/// in der gedrosselten Sekunde Verlorenes zählt das nächste `fs.gap` mit.
+#[test]
+fn observer_gaps_reach_the_observation_object() {
+    use minds_core::evidence::{Seal, SealOutcome};
+    use minds_core::observation::GapReason;
+    let f = Fixture::new();
+    f.keygen();
+    let root = canonical_root(&f);
+    let mut writer = f.writer();
+    writer
+        .lifecycle(&stream(), "witness.start", serde_json::json!({}))
+        .unwrap();
+    let observer = observer::Observer::detached(&root, Box::new(observer::Blake3)).unwrap();
+    writer.observe_into(stream(), observer);
+    writer.gap(&stream(), "overflow", "test", 12).unwrap();
+    // Gedrosselt: nicht geschrieben, aber gezählt …
+    writer.last_gap.insert("overflow", Instant::now());
+    writer.gap(&stream(), "overflow", "test", 3).unwrap();
+    writer
+        .last_gap
+        .insert("overflow", Instant::now() - Duration::from_millis(1100));
+    // … und beim nächsten genannt.
+    writer.gap(&stream(), "overflow", "test", 1).unwrap();
+    writer.gap(&stream(), "panic", "test", 0).unwrap();
+    fs::write(root.join("merge.rs"), "fn merge() {}\n").unwrap();
+    writer
+        .observer
+        .as_ref()
+        .unwrap()
+        .note(&root.join("merge.rs"));
+    writer.observe(true).unwrap();
+    writer.checkpoint_now(None).unwrap();
+
+    let store = minds_store::InRepoStore::open(&f.root).unwrap();
+    let object = store
+        .list_seals()
+        .unwrap()
+        .into_iter()
+        .find_map(|id| {
+            let seal = Seal::parse(&store.seal_text(&id).unwrap().unwrap()).unwrap();
+            match seal.outcome {
+                SealOutcome::ObservationsStored { observations } => store
+                    .get_observations(&observations.parse().unwrap())
+                    .unwrap(),
+                _ => None,
+            }
+        })
+        .expect("observation object");
+    assert_eq!(object.observations.len(), 1);
+    let gaps: Vec<(u64, GapReason, Option<u64>)> = object
+        .gaps
+        .iter()
+        .map(|g| (g.seq, g.reason, g.dropped))
+        .collect();
+    // seq 0 ist `witness.start`.
+    assert_eq!(
+        gaps,
+        [
+            (1, GapReason::Overflow, Some(12)),
+            (2, GapReason::Overflow, Some(4)),
+            (3, GapReason::Panic, None),
+        ]
+    );
+    for gap in &object.gaps {
+        gap.at.parse::<jiff::Timestamp>().unwrap();
+    }
 }
 
 #[test]
@@ -783,18 +856,18 @@ fn fs_gaps_are_coalesced_per_reason() {
     // Die Zeit wird gesetzt, nicht abgewartet: Unter Last kann schon ein
     // einzelner fsyncender Append länger als eine Sekunde dauern.
     let just_now = || Instant::now();
-    writer.gap(&stream(), "overflow", "test").unwrap();
+    writer.gap(&stream(), "overflow", "test", 0).unwrap();
     writer.last_gap.insert("overflow", just_now());
-    writer.gap(&stream(), "overflow", "test").unwrap();
+    writer.gap(&stream(), "overflow", "test", 0).unwrap();
     assert_eq!(gaps(&writer), 1);
     // Ein anderer Grund ist eine eigene Lücke.
-    writer.gap(&stream(), "panic", "test").unwrap();
+    writer.gap(&stream(), "panic", "test", 0).unwrap();
     assert_eq!(gaps(&writer), 2);
     // Nach mehr als einer Sekunde wieder.
     writer
         .last_gap
         .insert("overflow", just_now() - Duration::from_millis(1100));
-    writer.gap(&stream(), "overflow", "test").unwrap();
+    writer.gap(&stream(), "overflow", "test", 0).unwrap();
     assert_eq!(gaps(&writer), 3);
     assert!(writer.fs_dirty);
 }
