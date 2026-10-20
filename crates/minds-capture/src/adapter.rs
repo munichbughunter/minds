@@ -1224,9 +1224,10 @@ fn basename(path: &str) -> &str {
 }
 
 /// Die Herkunft: Kennung, Zeitfenster aus dem ersten und letzten Event, `cwd`
-/// aus dem ersten Event, das eines nennt, und ob der Bereich mit dem
+/// aus dem ersten Event, das eines nennt, ob der Bereich mit dem
 /// `SessionEnd` des Harness schließt — nur wenn es das **letzte** Event ist:
-/// Ging die Session danach weiter (`--resume`), ist sie hier nicht zu Ende.
+/// Ging die Session danach weiter (`--resume`), ist sie hier nicht zu Ende —
+/// und ob die Session am Ende des Bereichs ruhte ([`quiescence`]).
 /// Maßgeblich ist der von der Kette gebundene `raw_kind` (der Event-Hash
 /// deckt ihn, das gespeicherte `kind` nicht); `kind` muss dazu passen.
 ///
@@ -1242,19 +1243,68 @@ fn lineage(key: &SessionKey, events: &[JournalEvent]) -> Lineage {
         closed: events
             .last()
             .is_some_and(|e| e.raw_kind == "SessionEnd" && e.kind == crate::EventKind::SessionEnd),
+        quiescence: quiescence(key.agent(), events),
         // Den Status setzt `build_with_transcript` — er weiß, ob gelesen wurde.
         transcript: None,
     }
 }
 
-/// Zieht das Ende der Session (`lineage.closed`) zurück, wenn der Bereich
-/// nicht vollständig gelesen wurde ([`crate::ReadOutcome::is_complete`]):
-/// Ein abgestürzter Schreibvorgang oder eine Lücke kann hinter dem
-/// `SessionEnd` liegen — dann ist nicht belegt, dass es das letzte Event war.
-/// Jeder Pfad, der aus einem Journal-Lesestand eine Session baut, ruft das.
+/// Ob die Session am Ende des Bereichs ruhte (EA-11, A2 „session quiescent
+/// at checkpoint"): kein `PreToolUse` ohne sein `PostToolUse`, und das
+/// letzte Event ein `Stop`, `SubagentStop` oder `SessionEnd` — nach dem
+/// kettengebundenen `raw_kind`, passend zum `kind`, wie bei `closed`. Ein
+/// offener Tool-Aufruf wiegt schwerer als das letzte Event und wird zuerst
+/// genannt: Er sagt, **was** noch lief. `None` ohne Events.
+///
+/// Zugeordnet wird über die Kennung des Adapters
+/// ([`normalize::ToolAdapter::call_id`]); ein Pre-Event ohne Kennung gilt
+/// durch das nächste Post-Event ohne Kennung als beantwortet (Reihenfolge
+/// der Journal-Sequenz). Ein `PostToolUseFailure` zählt als `PostToolUse`
+/// (`hook_event::classify`): Auch ein gescheiterter Aufruf ist zu Ende.
+fn quiescence(agent: &str, events: &[JournalEvent]) -> Option<minds_core::Quiescence> {
+    use minds_core::Quiescence;
+    let last = events.last()?;
+    let adapter = normalize::adapter_for(agent);
+    let id_of = |event: &JournalEvent| adapter.and_then(|adapter| adapter.call_id(event));
+    let mut open: Vec<(Option<String>, u64)> = Vec::new();
+    for event in events {
+        match event.kind {
+            EventKind::ToolPre => open.push((id_of(event), event.seq)),
+            EventKind::ToolPost => {
+                let id = id_of(event);
+                if let Some(at) = open.iter().position(|(pre, _)| *pre == id) {
+                    open.remove(at);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some((_, seq)) = open.first() {
+        return Some(Quiescence::ToolCallOpen { seq: *seq });
+    }
+    let at_rest = matches!(
+        (last.raw_kind.as_str(), last.kind),
+        ("Stop", EventKind::TurnEnd)
+            | ("SubagentStop", EventKind::SubagentEnd)
+            | ("SessionEnd", EventKind::SessionEnd)
+    );
+    Some(if at_rest {
+        Quiescence::Quiescent
+    } else {
+        Quiescence::Active { seq: last.seq }
+    })
+}
+
+/// Zieht das Ende der Session (`lineage.closed`) und ihre Ruhe
+/// (`lineage.quiescence`) zurück, wenn der Bereich nicht vollständig gelesen
+/// wurde ([`crate::ReadOutcome::is_complete`]): Ein abgestürzter
+/// Schreibvorgang oder eine Lücke kann hinter dem letzten gelesenen Event
+/// liegen — dann ist nicht belegt, dass es das letzte war. Jeder Pfad, der
+/// aus einem Journal-Lesestand eine Session baut, ruft das.
 pub fn settle_closed(session: &mut Session, read_complete: bool) {
     if !read_complete && let Some(lineage) = session.lineage.as_mut() {
         lineage.closed = false;
+        lineage.quiescence = None;
     }
 }
 
@@ -1508,6 +1558,132 @@ mod tests {
         assert!(session.lineage.as_ref().unwrap().closed);
         settle_closed(&mut session, false);
         assert!(!session.lineage.unwrap().closed);
+    }
+
+    /// `quiescence` (EA-11): Die Session ruht, wenn das letzte Event ein
+    /// `Stop`, `SubagentStop` oder `SessionEnd` ist und jedes `PreToolUse`
+    /// sein `PostToolUse` hat. Ein offener Aufruf wird vor dem letzten Event
+    /// genannt, mit seiner `seq`; ein gescheiterter Aufruf
+    /// (`PostToolUseFailure`) ist zu Ende.
+    #[test]
+    fn a_range_is_quiescent_only_at_a_stop_without_open_tool_calls() {
+        use minds_core::Quiescence;
+        let prompt = || {
+            ev(
+                0,
+                EventKind::Prompt,
+                "UserPromptSubmit",
+                "t0",
+                r#"{"prompt":"x"}"#,
+            )
+        };
+        let pre = |seq, id: &str| {
+            ev(
+                seq,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t1",
+                &format!(
+                    r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"tool_use_id":"{id}"}}"#
+                ),
+            )
+        };
+        let post = |seq, raw: &str, id: &str| {
+            ev(
+                seq,
+                EventKind::ToolPost,
+                raw,
+                "t2",
+                &format!(
+                    r#"{{"tool_name":"Bash","tool_input":{{"command":"ls"}},"tool_use_id":"{id}"}}"#
+                ),
+            )
+        };
+        let stop = |seq| ev(seq, EventKind::TurnEnd, "Stop", "t3", "{}");
+        let quiescence =
+            |events: &[JournalEvent]| build_one(&key(), events).lineage.unwrap().quiescence;
+
+        // Fertig geantwortet, alle Aufrufe beantwortet: Ruhe.
+        assert_eq!(
+            quiescence(&[prompt(), pre(1, "a"), post(2, "PostToolUse", "a"), stop(3)]),
+            Some(Quiescence::Quiescent)
+        );
+        // Ein gescheiterter Aufruf ist beantwortet.
+        assert_eq!(
+            quiescence(&[
+                prompt(),
+                pre(1, "a"),
+                post(2, "PostToolUseFailure", "a"),
+                stop(3)
+            ]),
+            Some(Quiescence::Quiescent)
+        );
+        // `SubagentStop` und `SessionEnd` sind ebenso Ruhe.
+        assert_eq!(
+            quiescence(&[
+                prompt(),
+                ev(1, EventKind::SubagentEnd, "SubagentStop", "t1", "{}")
+            ]),
+            Some(Quiescence::Quiescent)
+        );
+        assert_eq!(
+            quiescence(&[
+                prompt(),
+                ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+            ]),
+            Some(Quiescence::Quiescent)
+        );
+        // Mitten im Aufruf: Das offene `PreToolUse` wird genannt — auch wenn
+        // ein `Stop` folgt (das `PostToolUse` ging verloren oder steht aus).
+        assert_eq!(
+            quiescence(&[prompt(), pre(1, "a"), stop(2)]),
+            Some(Quiescence::ToolCallOpen { seq: 1 })
+        );
+        // Zugeordnet wird über die Kennung: Das Post-Event eines anderen
+        // Aufrufs beantwortet nichts; das erste offene wird genannt.
+        assert_eq!(
+            quiescence(&[
+                prompt(),
+                pre(1, "a"),
+                pre(2, "b"),
+                post(3, "PostToolUse", "b"),
+                stop(4)
+            ]),
+            Some(Quiescence::ToolCallOpen { seq: 1 })
+        );
+        // Kein Stop am Ende: Der Agent arbeitete noch.
+        assert_eq!(
+            quiescence(&[prompt(), pre(1, "a"), post(2, "PostToolUse", "a")]),
+            Some(Quiescence::Active { seq: 2 })
+        );
+        assert_eq!(quiescence(&[prompt()]), Some(Quiescence::Active { seq: 0 }));
+        // Maßgeblich ist der kettengebundene `raw_kind`, wie bei `closed`.
+        assert_eq!(
+            quiescence(&[
+                prompt(),
+                ev(1, EventKind::TurnEnd, "Notification", "t1", "{}")
+            ]),
+            Some(Quiescence::Active { seq: 1 })
+        );
+        // Ein Event nach dem Stop (etwa `Notification`) hebt die Ruhe auf.
+        assert_eq!(
+            quiescence(&[
+                prompt(),
+                stop(1),
+                ev(2, EventKind::Other, "Notification", "t2", "{}")
+            ]),
+            Some(Quiescence::Active { seq: 2 })
+        );
+
+        // Ohne vollständigen Lesestand ist nichts festgestellt.
+        let mut session = build_one(&key(), &[prompt(), stop(1)]);
+        settle_closed(&mut session, true);
+        assert_eq!(
+            session.lineage.as_ref().unwrap().quiescence,
+            Some(Quiescence::Quiescent)
+        );
+        settle_closed(&mut session, false);
+        assert_eq!(session.lineage.unwrap().quiescence, None);
     }
 
     #[test]

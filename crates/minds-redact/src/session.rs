@@ -1259,6 +1259,7 @@ impl RedactionPipeline {
             ended_at,
             cwd,
             closed,
+            quiescence,
             transcript,
         }) = lineage
         else {
@@ -1278,14 +1279,16 @@ impl RedactionPipeline {
             .transpose()?;
         // `closed` ist ein Bool ohne Text — nichts zu scannen, aber es muss
         // durch: sonst verlöre die redigierte Session das bezeugte Ende.
-        // `transcript` ist ein festes Wort aus einem geschlossenen Vokabular
-        // (nie ein Pfad, nie Freitext) — ebenfalls nichts zu scannen.
+        // `quiescence` (feste Wörter und Event-Nummern) und `transcript`
+        // (ein festes Wort aus einem geschlossenen Vokabular, nie ein Pfad,
+        // nie Freitext) — ebenfalls nichts zu scannen.
         Ok(Some(Lineage {
             local_id,
             started_at,
             ended_at,
             cwd,
             closed,
+            quiescence,
             transcript,
         }))
     }
@@ -1556,6 +1559,7 @@ mod tests {
             ended_at: Some(TERM.into()),
             cwd: Some(TERM.into()),
             closed: false,
+            quiescence: None,
             transcript: None,
         });
         s.edges = vec![
@@ -1665,6 +1669,7 @@ mod tests {
             cwd: Some("/srv/projekt".into()),
             // Das bezeugte Ende (EA-11) darf die Pipeline nicht verlieren.
             closed: true,
+            quiescence: None,
             transcript: None,
         });
         s.edges = vec![
@@ -1865,6 +1870,7 @@ mod tests {
             cwd: Some("/home/anna@example.com/projekt".into()),
             // Auch wenn daneben redigiert wird: das Ende bleibt (EA-11).
             closed: true,
+            quiescence: None,
             transcript: None,
         });
 
@@ -2268,6 +2274,7 @@ mod tests {
             ended_at: None,
             cwd: Some("/home/dev/projekt/minds".into()),
             closed: false,
+            quiescence: None,
             transcript: None,
         });
 

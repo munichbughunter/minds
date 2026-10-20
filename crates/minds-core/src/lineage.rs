@@ -105,10 +105,10 @@ pub struct Lineage {
     /// das `SessionEnd` des Harness. Eine Beobachtung, keine Ableitung —
     /// und über die Session-Id im Seal mitsigniert: Steht das Feld in einer
     /// Session, die ein Witness versiegelt hat, hat der Witness das
-    /// `SessionEnd` empfangen. Ein später gelöschter Bereich fällt damit auf
-    /// — nicht aber nach einem vom Agenten vorgetäuschten Ende oder nach
-    /// `--resume` (EA-11, `minds_reader::assurance`, „Bekannte Grenzen").
-    /// Nur ein lückenloser, unbeschädigter Bereich setzt es (Checkpoint).
+    /// `SessionEnd` empfangen. Für die Stufe zählt seit EA-11 die Ruhe
+    /// ([`Self::quiescence`]); das Ende ist Information (`minds verify`,
+    /// `Not proven`). Nur ein lückenloser, unbeschädigter Bereich setzt es
+    /// (Checkpoint).
     ///
     /// Additiv: `false` wird nicht geschrieben — alte Sessions behalten
     /// Bytes und Id, alte Binaries lesen neue tolerant (kein
@@ -120,6 +120,28 @@ pub struct Lineage {
     /// gespeicherten Bytes) bleibt die maßgebliche.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub closed: bool,
+
+    /// Ob die Session am Ende des Bereichs **ruhte** (EA-11, A2): Das
+    /// letzte Event ist ein `Stop`, `SubagentStop` oder `SessionEnd` des
+    /// Harness, und kein `PreToolUse` des Bereichs wartet noch auf sein
+    /// `PostToolUse`. Eine Beobachtung wie `closed`, nicht dessen Ersatz:
+    /// `closed` sagt, dass die Session zu Ende ist; `quiescence` sagt, dass
+    /// der Agent beim Checkpoint nichts mehr tat — eine fertige Antwort,
+    /// nach der der Mensch committet, ohne die Session zu beenden. Was
+    /// danach noch kommt, läuft in die nächste Epoche.
+    ///
+    /// Über die Session-Id im Seal mitsigniert: Unter einem Witness-Seal hat
+    /// der Witness die Ruhe selbst gesehen. Nur ein lückenloser,
+    /// unbeschädigter Bereich setzt das Feld (Checkpoint); `None` heißt
+    /// „nicht festgestellt" — von einem Binary ohne das Feld gebaut oder
+    /// unvollständig gelesen — und zählt beim Lesen als nicht ruhend
+    /// (fail-closed), es sei denn, `closed` steht: Ein `SessionEnd` als
+    /// letztes Event ist Ruhe.
+    ///
+    /// Additiv wie `closed`: `None` wird nicht geschrieben — alte Sessions
+    /// behalten Bytes und Id; alte Binaries lesen neue tolerant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quiescence: Option<Quiescence>,
 
     /// Ob und warum das Transkript des Agenten beim Bau der Session gelesen
     /// wurde (K1). Ohne Transkript fehlen Modell, Antworttexte und Token —
@@ -133,6 +155,31 @@ pub struct Lineage {
     /// heißt „von einem Binary ohne dieses Feld gebaut", nicht „gelesen".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript: Option<TranscriptStatus>,
+}
+
+/// Ob die Session am Ende eines versiegelten Bereichs ruhte, und wenn nicht,
+/// woran es lag ([`Lineage::quiescence`]). Ein geschlossenes Vokabular mit
+/// Event-Nummern, nie Text aus dem Payload: Der Reader nennt die Nummer
+/// (`PreToolUse #3 open`), der Mensch findet das Event im Record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum Quiescence {
+    /// Das letzte Event ist `Stop`, `SubagentStop` oder `SessionEnd`, und
+    /// jedes `PreToolUse` des Bereichs hat sein `PostToolUse`.
+    Quiescent,
+    /// Ein `PreToolUse` wartet noch auf sein `PostToolUse` — `seq` ist die
+    /// laufende Nummer des ersten offenen. Der Agent war mitten in einem
+    /// Tool-Aufruf (oder das `PostToolUse` ging verloren).
+    ToolCallOpen {
+        /// Die `seq` des offenen `PreToolUse`.
+        seq: u64,
+    },
+    /// Das letzte Event (`seq`) ist kein `Stop`, `SubagentStop` oder
+    /// `SessionEnd`: Der Agent arbeitete noch, als der Checkpoint lief.
+    Active {
+        /// Die `seq` des letzten Events.
+        seq: u64,
+    },
 }
 
 /// Warum ein Transkript (nicht) gelesen wurde — der Grund hinter einem
@@ -184,6 +231,7 @@ impl Lineage {
             ended_at: None,
             cwd: None,
             closed: false,
+            quiescence: None,
             transcript: None,
         }
     }

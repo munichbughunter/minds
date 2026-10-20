@@ -124,6 +124,21 @@ impl Fixture {
     /// fehlen im Rückverweis (`evidence.json`) — der Agent kann ihn
     /// schreiben.
     fn build(scopes: &[&str], claim: Option<&[u8]>, unreferenced: &[usize]) -> Self {
+        Self::build_with(scopes, claim, unreferenced, None)
+    }
+
+    /// Ein einzelner Witness-Bereich, dessen Session die Herkunft `lineage`
+    /// trägt (Ruhe, Ende) — wie der Checkpoint sie schreibt.
+    fn with_lineage(lineage: minds_core::Lineage) -> Self {
+        Self::build_with(&[SCOPE_WITNESS_V1], Some(b"shell\n"), &[], Some(lineage))
+    }
+
+    fn build_with(
+        scopes: &[&str],
+        claim: Option<&[u8]>,
+        unreferenced: &[usize],
+        lineage: Option<minds_core::Lineage>,
+    ) -> Self {
         assert!(minds_attest::ssh_keygen_available());
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -175,6 +190,7 @@ impl Fixture {
             parent: None,
             at: Some("2026-10-02T10:00:00Z".into()),
         });
+        session.lineage = lineage;
         let session = minds_redact::RedactionConfig::default()
             .pipeline()
             .unwrap()
@@ -647,9 +663,82 @@ fn verify_accepts_a_separated_user_witness() {
         assert!(!line.contains(unwanted), "{line}");
     }
     assert!(
-        line.contains("session end not witnessed") || line.contains("intent"),
+        line.contains("session active at checkpoint") || line.contains("intent"),
         "{line}"
     );
+}
+
+/// Die Herkunft, wie der Checkpoint sie schreibt: `quiescence` und `closed`.
+fn lineage(quiescence: Option<minds_core::Quiescence>, closed: bool) -> minds_core::Lineage {
+    minds_core::Lineage {
+        closed,
+        quiescence,
+        ..minds_core::Lineage::new("s1")
+    }
+}
+
+/// Ein getrennter `user`-Witness mit Profil und Trennung, über `fixture`.
+fn separated_user_witness(fixture: &Fixture) {
+    fixture.register_as("minds-witness-user@build-07");
+    fixture.observe_as(b"shell\n", Some(witness_facts("user", 498)));
+}
+
+/// EA-11, A2 ohne `/exit`: Versiegelt der Checkpoint die Session mitten im
+/// Tool-Aufruf, bleibt sie bei A1, und der Grund nennt das offene Event;
+/// ruht sie (letztes Event `Stop`), fällt die Ruhe als Grund weg — zu A2
+/// fehlt dann nur noch der Intent —, und `Not proven` nennt das fehlende
+/// Sessionende als Information, nicht als Abzug.
+#[test]
+fn verify_names_an_open_tool_call_and_takes_a_quiescent_range_as_witnessed() {
+    use minds_core::Quiescence;
+    let fixture = Fixture::with_lineage(lineage(Some(Quiescence::ToolCallOpen { seq: 3 }), false));
+    separated_user_witness(&fixture);
+    let line = assurance_line(&fixture);
+    assert!(
+        line.contains("A1 observed")
+            && line.contains("session active at checkpoint (PreToolUse #3 open)"),
+        "{line}"
+    );
+
+    let fixture = Fixture::with_lineage(lineage(Some(Quiescence::Active { seq: 5 }), false));
+    separated_user_witness(&fixture);
+    let line = assurance_line(&fixture);
+    assert!(
+        line.contains("session active at checkpoint (last event #5 is not a stop)"),
+        "{line}"
+    );
+
+    // Ruhend, ohne `SessionEnd`: Die Ruhe ist kein Grund mehr; die Zeile
+    // nennt den nächsten (Intent). Das Ende steht unter `Not proven`.
+    let fixture = Fixture::with_lineage(lineage(Some(Quiescence::Quiescent), false));
+    separated_user_witness(&fixture);
+    let line = assurance_line(&fixture);
+    assert!(line.contains("(range 1: intent not bound)"), "{line}");
+    let run = fixture.minds(&["verify", "HEAD", "--signers", fixture.signers(), "--limits"]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(
+        run.stdout
+            .contains("  - Not that the session has ended: the last sealed range ends at a stop"),
+        "{}",
+        run.stdout
+    );
+
+    // Mit `SessionEnd`: dieselbe Stufe, der Satz fehlt.
+    let fixture = Fixture::with_lineage(lineage(Some(Quiescence::Quiescent), true));
+    separated_user_witness(&fixture);
+    let run = fixture.minds(&["verify", "HEAD", "--signers", fixture.signers(), "--limits"]);
+    assert_eq!(run.code, 0, "{}", run.all);
+    assert!(
+        !run.stdout.contains("Not that the session has ended"),
+        "{}",
+        run.stdout
+    );
+    // Ein älteres Objekt ohne `quiescence`, das mit `SessionEnd` schließt,
+    // ruht.
+    let fixture = Fixture::with_lineage(lineage(None, true));
+    separated_user_witness(&fixture);
+    let line = assurance_line(&fixture);
+    assert!(line.contains("(range 1: intent not bound)"), "{line}");
 }
 
 /// Dieselben Fakten unter dem gewöhnlichen Witness-Principal: Was der

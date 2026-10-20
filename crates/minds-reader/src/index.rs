@@ -957,7 +957,8 @@ fn repository_rating(
             } else {
                 SealSignature::Missing
             },
-            // Ohne geprüfte Witness-Signatur ist kein Ende bezeugt.
+            // Ohne geprüfte Witness-Signatur ist keine Ruhe und kein Ende bezeugt.
+            quiescence: None,
             closes_session: false,
         })
         .collect();
