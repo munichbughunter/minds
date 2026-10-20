@@ -111,6 +111,7 @@ pub fn parse(
             cwd: envelope.cwd,
             transcript_path: envelope.transcript_path,
             model: None,
+            report: None,
             payload: payload_of(bytes),
         },
     })

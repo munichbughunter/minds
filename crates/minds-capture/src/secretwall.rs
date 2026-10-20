@@ -231,6 +231,7 @@ mod tests {
             cwd: None,
             transcript_path: None,
             model: None,
+            report: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
         }
     }

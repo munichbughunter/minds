@@ -38,6 +38,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The `SessionEnd` hook reports version, token counts and texts.** The
+  witness never reads a transcript from the agent's namespace, so sessions
+  built by it had `claude-code unknown`, `0/0 Token` and no answer texts.
+  Now the hook — running as the developer, with the `transcript_path` — reads
+  the transcript once at `SessionEnd` (whole file, at most 64 MiB, else
+  nothing), takes the agent version, sums the `usage` fields, joins the
+  answer texts per turn, redacts them with the repository's policy
+  fail-closed (no policy, no text; an unclean text leaves its turn empty)
+  and passes everything to the witness as new frames behind the event
+  (`Usage` 0x09, `Said` 0x0a, after `Model`). The witness attaches them to
+  the `SessionEnd` event (`report`, in the `event_hash`), the checkpoint
+  builds the session from them with `lineage.transcript = reported_by_hook`.
+  Nothing of this is an observation of the witness: the reader shows it as a
+  statement of the hook (`tokens (reported)`, `◌`). An older witness drops
+  the frames and keeps the event.
+
 - **`minds enable` registers `PostToolUseFailure` for Claude Code.** Claude
   Code sends no `PostToolUse` for a failed tool call; without the
   registration a failed `Bash` left its `PreToolUse` open in the record (the

@@ -103,8 +103,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use minds_core::ContentHash;
 use minds_core::evidence::{self, EventFacts};
+use minds_core::{ContentHash, HookReport};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
@@ -324,6 +324,16 @@ pub struct JournalEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 
+    /// Was der Hook beim `SessionEnd` aus dem Transkript gemeldet hat:
+    /// Agent-Version, Token-Summen und die redigierten Antworttexte je Zug
+    /// ([`HookReport`]). Eine Angabe des Hooks, keine Beobachtung — der
+    /// Checkpoint kennzeichnet die Session damit als `reported_by_hook`.
+    /// Additiv wie `model`: `None` wird nicht geschrieben, alte Events
+    /// behalten Bytes und Hash; ein gesetzter Report geht in den
+    /// `event_hash` ein.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<HookReport>,
+
     /// Der unveränderte Payload des Agenten.
     ///
     /// [`RawValue`] statt [`serde_json::Value`], damit die Bytes exakt so
@@ -360,6 +370,8 @@ pub struct NewEvent {
     pub transcript_path: Option<String>,
     /// Die Modell-Kennung aus dem Hook (K1), siehe [`JournalEvent::model`].
     pub model: Option<String>,
+    /// Die Angaben des `SessionEnd`-Hooks, siehe [`JournalEvent::report`].
+    pub report: Option<HookReport>,
     pub payload: Box<RawValue>,
 }
 
@@ -482,6 +494,7 @@ impl Journal {
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
             model: event.model.as_deref(),
+            report: event.report.as_ref(),
             payload_hash: &payload_hash,
         });
 
@@ -494,6 +507,7 @@ impl Journal {
             cwd: event.cwd,
             transcript_path: event.transcript_path,
             model: event.model,
+            report: event.report,
             payload: event.payload,
             payload_hash: Some(payload_hash),
             event_hash: Some(event_hash),
@@ -1284,6 +1298,7 @@ mod tests {
             cwd: Some("/tmp/repo".into()),
             transcript_path: Some("/home/anna/.claude/projects/x/y.jsonl".into()),
             model: None,
+            report: None,
             payload: raw(r#"{"tool_name":"Read"}"#),
         }
     }
@@ -1312,6 +1327,7 @@ mod tests {
             cwd: stored.cwd.as_deref(),
             transcript_path: stored.transcript_path.as_deref(),
             model: stored.model.as_deref(),
+            report: stored.report.as_ref(),
             payload_hash: &payload,
         };
         assert_eq!(stored.event_hash, Some(evidence::event_hash(&facts)));
@@ -1344,6 +1360,56 @@ mod tests {
         assert!(read.events[1].model.is_none());
     }
 
+    /// Der Report des `SessionEnd`-Hooks reist mit, kommt beim Lesen zurück
+    /// und steckt im `event_hash` — additiv: ohne Report der alte Hash.
+    #[test]
+    fn the_report_of_the_hook_is_stored_and_stamped() {
+        let (_tmp, j) = journal();
+        let key = SessionKey::new("claude-code", "r1").unwrap();
+        let report = minds_core::HookReport {
+            agent_version: Some("2.0.76".into()),
+            usage: Some(minds_core::Usage {
+                input_tokens: 14_200,
+                output_tokens: 3_900,
+            }),
+            said: vec!["Ich schaue nach.".into(), String::new(), "Fertig.".into()],
+        };
+        let stored = j
+            .append(
+                &key,
+                NewEvent {
+                    report: Some(report.clone()),
+                    ..event(EventKind::SessionEnd)
+                },
+            )
+            .unwrap();
+        let read = j.read(&key).unwrap();
+        assert_eq!(read.events[0].report.as_ref(), Some(&report));
+        let payload = evidence::payload_hash(stored.payload.get().as_bytes());
+        let facts = EventFacts {
+            seq: stored.seq,
+            at: &stored.at,
+            at_nanos: stored.at_nanos,
+            raw_kind: &stored.raw_kind,
+            cwd: stored.cwd.as_deref(),
+            transcript_path: stored.transcript_path.as_deref(),
+            model: stored.model.as_deref(),
+            report: stored.report.as_ref(),
+            payload_hash: &payload,
+        };
+        assert_eq!(stored.event_hash, Some(evidence::event_hash(&facts)));
+        let without = EventFacts {
+            report: None,
+            ..facts
+        };
+        assert_ne!(stored.event_hash, Some(evidence::event_hash(&without)));
+        // Ein Event ohne Report schreibt das Feld nicht.
+        let plain = j.append(&key, event(EventKind::TurnEnd)).unwrap();
+        let raw = fs::read_to_string(j.session_dir(&key).join(format!("{:010}.json", plain.seq)))
+            .unwrap();
+        assert!(!raw.contains("\"report\""), "{raw}");
+    }
+
     #[test]
     fn the_model_of_the_hook_is_stored_and_stamped() {
         // K1: Die Kennung reist mit, kommt beim Lesen zurück und steckt im
@@ -1370,6 +1436,7 @@ mod tests {
             cwd: stored.cwd.as_deref(),
             transcript_path: stored.transcript_path.as_deref(),
             model: stored.model.as_deref(),
+            report: stored.report.as_ref(),
             payload_hash: &payload,
         };
         assert_eq!(stored.event_hash, Some(evidence::event_hash(&facts)));
@@ -1396,6 +1463,7 @@ mod tests {
             cwd: None,
             transcript_path: None,
             model: None,
+            report: None,
             payload: raw(r#"{"tool_name":"Read","tool_input":{"file_path":"/repo/.env"}}"#),
         };
         let reason = crate::secretwall::guard(&mut walled);

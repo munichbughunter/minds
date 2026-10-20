@@ -499,3 +499,53 @@ fn hook_forwards_a_walled_event_whose_raw_payload_was_too_large() {
     assert!(!f.local_journal_dir().exists());
     assert_eq!(f.hook_log(), None);
 }
+
+/// Der `SessionEnd`-Hook liest das Transkript einmal ganz und meldet dem
+/// Witness Version, Token-Summen und die redigierten Texte je Zug — als
+/// Frames hinter dem Event. Im Journal des Witness hängt der Report am
+/// `SessionEnd`; der Witness hat die Datei nie geöffnet (sie liegt außerhalb
+/// seiner Zuständigkeit und könnte überall liegen).
+#[test]
+fn hook_reports_version_tokens_and_texts_at_session_end() {
+    let f = Fixture::new();
+    let _daemon = f.start();
+    let transcript = f.dir.path().join("t.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"user","message":{"role":"user","content":"erster Auftrag"}}"#,
+            "\n",
+            r#"{"type":"assistant","version":"2.0.76","message":{"model":"claude-opus-4-1","content":[{"type":"text","text":"Ich schaue nach."}],"usage":{"input_tokens":100,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"zweiter Auftrag"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[{"type":"text","text":"Token AKIAIOSFODNN7EXAMPLE, fertig."}],"usage":{"input_tokens":20,"output_tokens":10}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let stdin = f.payload(
+        "report",
+        "SessionEnd",
+        &format!(r#","transcript_path":"{}""#, transcript.display()),
+    );
+
+    let (out, _) = f.hook(Some(&f.socket()), stdin.as_bytes());
+
+    assert_silent_success(&out);
+    let events = wait_for_events(&f.witness_journal(), "report", 1);
+    assert_eq!(events[0].raw_kind, "SessionEnd");
+    assert_eq!(events[0].model.as_deref(), Some("claude-opus-4-1"));
+    let report = events[0].report.as_ref().expect("der Report reist mit");
+    assert_eq!(report.agent_version.as_deref(), Some("2.0.76"));
+    let usage = report.usage.expect("Summen gemeldet");
+    assert_eq!((usage.input_tokens, usage.output_tokens), (120, 50));
+    assert_eq!(report.said.len(), 2);
+    assert_eq!(report.said[0], "Ich schaue nach.");
+    assert!(
+        !report.said[1].contains("AKIAIOSFODNN7EXAMPLE"),
+        "redigiert, bevor es den Socket überquert: {}",
+        report.said[1]
+    );
+    assert_eq!(f.hook_log(), None, "eine gelungene Weitergabe loggt nichts");
+}

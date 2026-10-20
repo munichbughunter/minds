@@ -114,6 +114,13 @@ pub struct EventFacts<'a> {
     /// bleiben nachrechenbar).
     pub model: Option<&'a str>,
 
+    /// Was der `SessionEnd`-Hook aus dem Transkript meldete (Version,
+    /// Token-Summen, Antworttexte je Zug), falls vorhanden.
+    ///
+    /// Additiv wie `model`: Nur ein gesetzter Report geht in den Hash ein —
+    /// ein Event ohne Report behält den Hash, den es vor diesem Feld hatte.
+    pub report: Option<&'a crate::HookReport>,
+
     /// Der [`payload_hash`] des Events.
     pub payload_hash: &'a ContentHash,
 }
@@ -131,6 +138,24 @@ pub fn event_hash(facts: &EventFacts<'_>) -> ContentHash {
     if let Some(model) = facts.model {
         put_bytes(&mut buf, b"model");
         put_bytes(&mut buf, model.as_bytes());
+    }
+    if let Some(report) = facts.report {
+        // Feld für Feld, längenpräfigiert — eine feste Kodierung, kein
+        // JSON, damit der Hash nicht an einer Serializer-Fassung hängt.
+        put_bytes(&mut buf, b"report");
+        put_opt(&mut buf, report.agent_version.as_deref().map(str::as_bytes));
+        match report.usage {
+            Some(usage) => {
+                buf.push(1);
+                put_u64(&mut buf, usage.input_tokens);
+                put_u64(&mut buf, usage.output_tokens);
+            }
+            None => buf.push(0),
+        }
+        put_u64(&mut buf, report.said.len() as u64);
+        for text in &report.said {
+            put_bytes(&mut buf, text.as_bytes());
+        }
     }
     ContentHash::from_bytes(blake3::derive_key(CTX_EVENT, &buf))
 }
@@ -1318,6 +1343,7 @@ mod tests {
             cwd: Some("/work/repo"),
             transcript_path: None,
             model: None,
+            report: None,
             payload_hash: payload,
         }
     }
@@ -1356,6 +1382,55 @@ mod tests {
         assert_ne!(without, with);
         assert_ne!(without, empty);
         assert_ne!(with, empty);
+    }
+
+    #[test]
+    fn a_hook_report_counts_only_when_present_and_field_for_field() {
+        // Additiv wie das Modell: ohne Report der alte Hash; mit Report ein
+        // anderer — und jedes Feld zählt für sich, auch die Reihenfolge der
+        // Texte und die Grenze zwischen zwei Texten.
+        let payload = payload_hash(b"x");
+        let base = event_hash(&sample_facts(&payload));
+        let report =
+            |version: Option<&str>, usage: Option<(u64, u64)>, said: &[&str]| crate::HookReport {
+                agent_version: version.map(str::to_owned),
+                usage: usage.map(|(i, o)| crate::Usage {
+                    input_tokens: i,
+                    output_tokens: o,
+                }),
+                said: said.iter().map(|s| (*s).to_owned()).collect(),
+            };
+        let hash = |r: &crate::HookReport| {
+            event_hash(&EventFacts {
+                report: Some(r),
+                ..sample_facts(&payload)
+            })
+        };
+        let empty = report(None, None, &[]);
+        let full = report(Some("2.0.76"), Some((14_200, 3_900)), &["ab", "c"]);
+        assert_ne!(base, hash(&empty), "ein leerer Report ist nicht keiner");
+        assert_ne!(hash(&empty), hash(&full));
+        assert_ne!(
+            hash(&full),
+            hash(&report(Some("2.0.77"), Some((14_200, 3_900)), &["ab", "c"]))
+        );
+        assert_ne!(
+            hash(&full),
+            hash(&report(Some("2.0.76"), Some((3_900, 14_200)), &["ab", "c"]))
+        );
+        assert_ne!(
+            hash(&full),
+            hash(&report(Some("2.0.76"), None, &["ab", "c"]))
+        );
+        assert_ne!(
+            hash(&full),
+            hash(&report(Some("2.0.76"), Some((14_200, 3_900)), &["c", "ab"]))
+        );
+        assert_ne!(
+            hash(&full),
+            hash(&report(Some("2.0.76"), Some((14_200, 3_900)), &["a", "bc"]))
+        );
+        assert_eq!(hash(&full), hash(&full.clone()));
     }
 
     fn golden_items() -> Vec<ChainItem> {

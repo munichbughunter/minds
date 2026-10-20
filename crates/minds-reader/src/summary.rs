@@ -158,6 +158,9 @@ pub fn transcript_reason(status: TranscriptStatus) -> &'static str {
         TranscriptStatus::ReadFromSlug => {
             "the transcript was read from the agent's project folder — no event named its path"
         }
+        TranscriptStatus::ReportedByHook => {
+            "the session-end hook read the transcript and reported version, token counts and texts; the witness did not read it"
+        }
     }
 }
 
@@ -331,6 +334,10 @@ mod tests {
             (
                 TranscriptStatus::ModelFromHook,
                 "the hook reported the model; texts and token counts were not read",
+            ),
+            (
+                TranscriptStatus::ReportedByHook,
+                "the session-end hook read the transcript and reported version, token counts and texts; the witness did not read it",
             ),
         ] {
             lineage.transcript = Some(status);

@@ -219,6 +219,13 @@ pub enum TranscriptStatus {
     /// hier eine Ableitung aus Pfadkonvention und Kennung ist, keine
     /// Angabe des Hooks.
     ReadFromSlug,
+    /// Der `SessionEnd`-Hook hat das Transkript gelesen und Version,
+    /// Token-Summen und Antworttexte je Zug gemeldet
+    /// ([`HookReport`](crate::HookReport)); der Witness selbst hat die
+    /// Datei nicht angefasst. Alles davon ist eine Angabe des Hooks aus dem
+    /// Namensraum des Agenten — der Reader zeigt es als Aussage (`◌`,
+    /// `tokens (reported)`), nicht als Beobachtung.
+    ReportedByHook,
 }
 
 impl Lineage {
@@ -1118,6 +1125,9 @@ mod tests {
             (TranscriptStatus::Empty, "empty"),
             (TranscriptStatus::ParseFailed, "parse_failed"),
             (TranscriptStatus::NotReadByWitness, "not_read_by_witness"),
+            (TranscriptStatus::ModelFromHook, "model_from_hook"),
+            (TranscriptStatus::ReadFromSlug, "read_from_slug"),
+            (TranscriptStatus::ReportedByHook, "reported_by_hook"),
         ] {
             lineage.transcript = Some(status);
             let text = crate::to_canonical_string(&lineage).unwrap();
