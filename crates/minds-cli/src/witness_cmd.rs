@@ -15,7 +15,7 @@ mod daemon;
 #[cfg(unix)]
 pub(crate) use daemon::{
     CONTROL_SOCKET, InitRequest, Initialized, UNPINNED, init_config, intent_key_line,
-    key_display_with, load, peer_uid, ping,
+    key_display_with, load, observer_status, peer_uid, ping,
 };
 
 /// Das versteckte Unterkommando, unter dem der Witness seinen Checkpoint als

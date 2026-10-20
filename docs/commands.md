@@ -145,6 +145,11 @@ Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of
   an agent started elsewhere (e.g. from the Dock) may see another one.
 - **Protected witness** (found at its fixed place, see `minds enable`): it answers `ping` (`fail`
   if not) and its home is not readable for you (`ok` on permission denied, `fail` if it opens).
+- **Witness observer** (whenever the witness answers `ping`, on every side): the witness's own
+  answer to a status request over its socket — `witness observer: watching <root> · <n> frames ·
+  last <ts>` (observations appended in this run and the time of the last one). `fail` when it
+  reports no file observer (it records only what the agent reports; see `log/witness.err`)
+  or does not answer the request (an older binary).
 - **Protected witness, not reachable yet** (Linux): set up for this repository, but its group is
   not yet in effect for your session (after your next login) — `warn`, not "not configured".
 - **Agent side** (`MINDS_WITNESS_SOCKET` set or `--probe-home` given): the socket variable is set, the witness answers `ping`, and the **isolation probe** — `doctor` tries to open the witness home given with `--probe-home` and the private files in it (non-blocking; a FIFO does not hang it). If anything opens, the result is `fail` ("agent can reach the witness home"). A home that exists but is refused (`EACCES`, e.g. the `user` profile) is `ok` — that is proof. A home that is simply absent (the `container` profile) is only `warn`: absence in another mount namespace proves nothing. On Linux, `doctor` also reads `/proc/self/mountinfo` and fails if a mount exposes the witness home other than its `run/` — a heuristic that does not recognise a mount of a parent directory or a source on another partition, so "nothing found" stays `warn`. Check the container's mounts yourself. An empty `--probe-home` is `fail`, and so is an unclear error (anything but `EACCES`/`ENOENT`/`ENOTDIR`) with `--probe-home`. Without it, `doctor` probes `MINDS_WITNESS_HOME` or the default location: nothing there is at most `warn`, since a missing default path proves little; something that opens is still `fail`. Nothing is read; an opened path is closed immediately.

@@ -88,6 +88,7 @@ fn examples() -> Vec<Frame> {
             session: "31f3f224-aa".into(),
             model: "claude-opus-4-1".into(),
         },
+        Frame::Status,
         Frame::Hook {
             agent: "claude-code".into(),
             event_override: None,
@@ -305,7 +306,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=7 | 0x81 | 0x82) {
+        if matches!(kind, 1..=8 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(

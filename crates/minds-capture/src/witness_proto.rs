@@ -56,6 +56,12 @@ pub enum Frame {
         request_id: [u8; 16],
     },
     Ping,
+    /// Asks what the file observer is doing. Answered with `Ack` (status
+    /// `watching <root> · <n> frames · last <ts>`) or `Nack` (`no file
+    /// observer`), request id zero — read-only, accepted on both sockets.
+    /// A witness that does not know this kind closes the connection, which
+    /// `minds doctor` reports as "not answering".
+    Status,
     IntentActivate {
         anchor: String,
         signature: Option<String>,
@@ -132,6 +138,7 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             out.extend_from_slice(request_id);
         }
         Frame::Ping => out.push(0x03),
+        Frame::Status => out.push(0x08),
         Frame::IntentActivate {
             anchor,
             signature,
@@ -243,6 +250,10 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
             cursor.finish()?;
             Frame::Ping
         }
+        0x08 => {
+            cursor.finish()?;
+            Frame::Status
+        }
         0x04 => {
             let anchor = cursor.short_text("anchor")?;
             check_anchor(anchor)?;
@@ -329,7 +340,7 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_commit(commit)?;
             19 + commit.len()
         }
-        Frame::Ping => 1,
+        Frame::Ping | Frame::Status => 1,
         Frame::IntentActivate {
             anchor, signature, ..
         } => {

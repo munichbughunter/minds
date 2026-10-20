@@ -19,6 +19,11 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`minds doctor` shows the file observer.** A new read-only `Status`
+  frame (accepted on the agent and the control socket) makes the witness
+  report `watching <root> · <n> frames · last <ts>`; `doctor` prints it as
+  `witness observer: …` wherever the witness answers `ping`, and fails when
+  the witness has no file observer or does not answer the request.
 - **The observer announces itself on stderr.** `minds witness run` prints
   `witness observer: watching <root>` when the file observer starts, and the
   reason when it cannot (plus its gaps, throttled like the log). The

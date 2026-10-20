@@ -221,6 +221,13 @@ fn doctor_isolation_probe_ok_and_fail() {
         "{stdout}"
     );
     assert!(line(&stdout, "witness").starts_with("ok "), "{stdout}");
+    // Der Beobachter des laufenden Witness, über den Socket befragt.
+    let observer = line(&stdout, "witness observer");
+    assert!(observer.starts_with("ok "), "{stdout}");
+    assert!(
+        observer.contains("watching ") && observer.contains(" frames · last "),
+        "{stdout}"
+    );
     assert!(line(&stdout, "agent hooks").starts_with("ok "), "{stdout}");
     assert!(line(&stdout, "git hooks").starts_with("ok "), "{stdout}");
     assert!(line(&stdout, "store").starts_with("ok "), "{stdout}");
@@ -252,6 +259,8 @@ fn doctor_fails_when_the_witness_does_not_answer() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(line(&stdout, "witness").starts_with("fail"), "{stdout}");
+    // Ohne Antwort keine Beobachter-Zeile: Die Zeile davor sagt schon alles.
+    assert!(!stdout.contains("witness observer:"), "{stdout}");
     // Der Exit-Code kommt allein vom Ping: Die Probe auf ein fehlendes Home
     // ist warn — kein Nachweis, aber auch kein Fehler.
     assert!(line(&stdout, "isolation").starts_with("warn"), "{stdout}");
@@ -303,6 +312,10 @@ fn doctor_reports_the_host_side() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{}", text(&out));
     assert!(line(&stdout, "witness").starts_with("ok "), "{stdout}");
+    let observer = line(&stdout, "witness observer");
+    assert!(observer.starts_with("ok "), "{stdout}");
+    assert!(observer.contains("watching "), "{stdout}");
+    assert!(observer.contains(" · 0 frames · last none"), "{stdout}");
 }
 
 /// Ein Witness-Home, das ein anderes Repo pinnt (etwa ein global gesetztes

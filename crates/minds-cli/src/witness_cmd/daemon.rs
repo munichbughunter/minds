@@ -47,7 +47,7 @@ mod tests;
 mod witness_clock;
 mod worker;
 pub use socket::run;
-pub(crate) use socket::{CONTROL_SOCKET, peer_uid, ping};
+pub(crate) use socket::{CONTROL_SOCKET, observer_status, peer_uid, ping};
 pub(crate) use worker::worker;
 
 /// Das Isolationsprofil (00-conventions, ADR-0012) — ein Typ für Witness-
@@ -1273,6 +1273,10 @@ struct Writer {
     stream: Option<SessionKey>,
     /// Das zweite Auge (EA-08); `None`, solange `run` es nicht startet.
     observer: Option<observer::Observer>,
+    /// Wie viele `fs.observed` dieser Lauf anhängte, und wann zuletzt — die
+    /// Auskunft für `minds doctor` (`Frame::Status`).
+    fs_frames: u64,
+    fs_last: Option<String>,
     /// Ob seit dem letzten Versiegeln eine Datei-Beobachtung kam.
     fs_dirty: bool,
     /// Ob ein Scheitern der Ignore-Auswertung schon geloggt wurde.
@@ -1343,6 +1347,8 @@ impl Writer {
             last_failure: None,
             stream: None,
             observer: None,
+            fs_frames: 0,
+            fs_last: None,
             fs_dirty: false,
             ignore_failure_logged: false,
             fs_ready: std::collections::VecDeque::new(),
@@ -1682,6 +1688,7 @@ impl Writer {
             };
             let payload = serde_json::value::RawValue::from_string(seen.payload()?)?;
             let at = seen.at.clone();
+            let stamp = at.0.clone();
             self.append(
                 &stream,
                 NewEvent {
@@ -1697,8 +1704,26 @@ impl Writer {
             )?;
             self.fs_ready.pop_front();
             self.fs_dirty = true;
+            self.fs_frames = self.fs_frames.saturating_add(1);
+            self.fs_last = Some(stamp);
         }
         Ok(())
+    }
+
+    /// Die Auskunft über den Beobachter (`Frame::Status`): was er
+    /// beobachtet, wie viele Beobachtungen dieser Lauf anhängte und wann
+    /// zuletzt — oder der Grund, warum keiner läuft. Nur die kanonische
+    /// Wurzel aus `witness.json`, nie ein beobachteter Pfad.
+    pub(super) fn observer_status(&self) -> Result<String, &'static str> {
+        if self.observer.is_none() {
+            return Err("no file observer");
+        }
+        Ok(format!(
+            "watching {} · {} frames · last {}",
+            self.config.repo_root.display(),
+            self.fs_frames,
+            self.fs_last.as_deref().unwrap_or("none")
+        ))
     }
 
     /// Hängt ein `fs.gap` mit `reason` an und loggt `note` — höchstens
