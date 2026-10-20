@@ -273,10 +273,48 @@ fn a_session_is_stored_closed_only_from_a_complete_range() {
         let outcome = fixture.run(&pipeline, SCOPE_AGENT_HOOKS_V1, SealSigner::None);
         assert_eq!(outcome.stored.len(), 1);
         let session = fixture.store.get(outcome.stored[0]).unwrap().unwrap();
-        session.lineage.unwrap().closed
+        let lineage = session.lineage.unwrap();
+        (lineage.closed, lineage.quiescence)
     };
-    assert!(closed_after(false));
-    assert!(!closed_after(true));
+    use minds_core::Quiescence;
+    assert_eq!(closed_after(false), (true, Some(Quiescence::Quiescent)));
+    // Beschädigt: weder Ende noch Ruhe festgestellt.
+    assert_eq!(closed_after(true), (false, None));
+}
+
+/// EA-11, A2 ohne `/exit`: Ein Bereich, dessen letztes Event das `Stop` ist
+/// (der Agent hat geantwortet, kein `SessionEnd`), wird als ruhend
+/// gespeichert — und der zweite Checkpoint derselben Session versiegelt die
+/// Events danach als zweite Epoche, verkettet auf die erste.
+#[test]
+fn a_range_ending_at_a_stop_is_stored_quiescent_and_the_next_checkpoint_chains() {
+    use minds_core::Quiescence;
+    let pipeline = RedactionConfig::default().pipeline().unwrap();
+    let fixture = Fixture::new(true);
+    // `feed` endet mit `Stop`, ohne `SessionEnd`.
+    fixture.feed(0);
+    let first = fixture.run(&pipeline, SCOPE_AGENT_HOOKS_V1, SealSigner::None);
+    assert_eq!(first.sealed.len(), 1);
+    let session = fixture.store.get(first.stored[0]).unwrap().unwrap();
+    let lineage = session.lineage.unwrap();
+    assert_eq!(lineage.quiescence, Some(Quiescence::Quiescent));
+    assert!(!lineage.closed, "kein SessionEnd gesehen");
+    assert_eq!(first.sealed[0].seal.previous, None);
+
+    // Die Session geht weiter; der zweite Commit versiegelt Epoche 2.
+    fixture.feed(1);
+    let second = fixture.run(&pipeline, SCOPE_AGENT_HOOKS_V1, SealSigner::None);
+    assert_eq!(second.sealed.len(), 1);
+    assert_eq!(
+        second.sealed[0].seal.previous.as_ref(),
+        Some(&first.sealed[0].seal_id),
+        "Epoche 2 verkettet auf Epoche 1"
+    );
+    let session = fixture.store.get(second.stored[0]).unwrap().unwrap();
+    assert_eq!(
+        session.lineage.unwrap().quiescence,
+        Some(Quiescence::Quiescent)
+    );
 }
 
 /// EA-14, A1: Ohne Witness bindet der lokale Checkpoint die aktive

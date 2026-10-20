@@ -289,6 +289,9 @@ struct AgentSpec {
     home_dirs: &'static [&'static str],
     /// … oder Programme unter einem absoluten `PATH`-Eintrag.
     binaries: &'static [&'static str],
+    /// Events, die nur dieser Agent kennt — zusätzlich zu [`HOOK_EVENTS`],
+    /// in dieser Reihenfolge dahinter.
+    extra_events: &'static [(&'static str, bool)],
 }
 
 /// **Die** Liste der Agents: `enable` schreibt daraus, `fsck` prüft dagegen.
@@ -299,8 +302,9 @@ struct AgentSpec {
 /// `agent != "claude-code"` als Zeichenkettenvergleich beim Aufrufer. Vier
 /// Orte, die auseinanderlaufen können, für eine Tatsache.
 ///
-/// Die fünfunddreißig Registrierungen entstehen als **Produkt** aus dieser
-/// Liste und [`HOOK_EVENTS`], nicht als Aufzählung.
+/// Die Registrierungen entstehen als **Produkt** aus dieser Liste und
+/// [`HOOK_EVENTS`] (dazu je Agent seine `extra_events`), nicht als
+/// Aufzählung.
 const ALL_AGENTS: [(Which, AgentSpec); 5] = [
     (
         Which::ClaudeCode,
@@ -311,6 +315,7 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             event_in_payload: true,
             home_dirs: &[".claude"],
             binaries: &["claude"],
+            extra_events: CLAUDE_CODE_EVENTS,
         },
     ),
     (
@@ -321,6 +326,7 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             event_in_payload: false,
             home_dirs: &[".codex"],
             binaries: &["codex"],
+            extra_events: &[],
         },
     ),
     (
@@ -331,6 +337,7 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             event_in_payload: false,
             home_dirs: &[".cursor"],
             binaries: &["cursor-agent", "cursor"],
+            extra_events: &[],
         },
     ),
     (
@@ -341,6 +348,7 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             event_in_payload: false,
             home_dirs: &[".gemini"],
             binaries: &["gemini"],
+            extra_events: &[],
         },
     ),
     (
@@ -354,6 +362,7 @@ const ALL_AGENTS: [(Which, AgentSpec); 5] = [
             event_in_payload: true,
             home_dirs: &[".config/opencode", ".opencode"],
             binaries: &["opencode"],
+            extra_events: &[],
         },
     ),
 ];
@@ -1365,6 +1374,15 @@ const HOOK_EVENTS: &[(&str, bool)] = &[
     ("SessionEnd", false),
 ];
 
+/// Was nur Claude Code kennt: `PostToolUseFailure` — das Ende eines
+/// gescheiterten Tool-Aufrufs (Exit-Code ≠ 0, Tool-Fehler). Claude Code
+/// schickt dann **kein** `PostToolUse`; ohne diese Registrierung bliebe
+/// jeder gescheiterte Aufruf im Record offen (`PreToolUse` ohne Antwort),
+/// die Session ruhte nie (EA-11, `lineage.quiescence`) und das Ergebnis
+/// fehlgeschlagener Tests (`exec_outcome`) käme nicht an. Der Hook ordnet
+/// es wie `PostToolUse` ein (`hook_event::classify`).
+const CLAUDE_CODE_EVENTS: &[(&str, bool)] = &[("PostToolUseFailure", true)];
+
 /// Trägt in eine Claude-artige `hooks`-Map je Event einen Command-Hook ein, der
 /// `minds hook --agent <agent>` aufruft — idempotent und ohne Fremdes zu
 /// verwerfen.
@@ -1524,12 +1542,14 @@ pub(crate) struct Registration {
 const RECALL_COMMAND: &str = "minds brief --hook 2>/dev/null || true";
 
 /// Alle Registrierungen, die `enable` für diesen Agenten schreibt — je Event
-/// eine, in der Reihenfolge von [`HOOK_EVENTS`].
+/// eine, in der Reihenfolge von [`HOOK_EVENTS`], dahinter die Events, die
+/// nur dieser Agent kennt ([`AgentSpec::extra_events`]).
 pub(crate) fn expected_entries(which: Which) -> Vec<Registration> {
     let spec = which.spec();
     let name = which.name();
     HOOK_EVENTS
         .iter()
+        .chain(spec.extra_events)
         .map(|&(event, matcher)| Registration {
             event,
             matcher,
@@ -3891,7 +3911,7 @@ mod tests {
         let report = inspect_agent(dir.path(), Which::ClaudeCode);
         assert!(report.refused.is_none(), "{:?}", report.refused);
         assert_eq!(report.current, 0);
-        assert_eq!(report.total, HOOK_EVENTS.len());
+        assert_eq!(report.total, expected_entries(Which::ClaudeCode).len());
 
         // Und `enable` kommt damit tatsächlich zurecht.
         claude_style(dir.path(), Which::ClaudeCode).unwrap();
@@ -5429,7 +5449,13 @@ mod tests {
 
         let value = read_json(&dir.path().join(".claude/settings.json")).unwrap();
         let hooks = value["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), HOOK_EVENTS.len());
+        assert_eq!(hooks.len(), expected_entries(Which::ClaudeCode).len());
+        assert_eq!(
+            hooks.len(),
+            HOOK_EVENTS.len() + 1,
+            "PostToolUseFailure dazu"
+        );
+        assert_eq!(hooks["PostToolUseFailure"][0]["matcher"], "*");
         let pre = hooks["PreToolUse"].as_array().unwrap();
         assert_eq!(pre[0]["matcher"], "*");
         assert!(

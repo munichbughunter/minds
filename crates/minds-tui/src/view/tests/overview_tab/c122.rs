@@ -935,6 +935,7 @@ fn c122_the_three_views_render_the_rating_of_the_same_seal() {
         signature: SealSignature::Witness {
             principal: "minds-witness-user@build-07".into(),
         },
+        quiescence: Some(minds_core::Quiescence::Quiescent),
         closes_session: true,
     }];
     let material = SealMaterial {

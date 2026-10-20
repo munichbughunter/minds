@@ -46,9 +46,11 @@
 //!   `witness-fs/v1`-Fenster über die Session; jeder Witness-Lauf im
 //!   Fenster mit qualifiziertem Profil ([`profile_qualifies`]) **und**
 //!   belegter Trennung ([`WitnessStart::isolated`]) — der Profilname allein
-//!   gewährt nie A2; das **Ende der Session bezeugt** (der letzte Bereich
-//!   ist ein solcher Witness-Bereich und schließt mit `SessionEnd`,
-//!   [`RangeInput::closes_session`]); Intent gebunden — vom Witness
+//!   gewährt nie A2; die **Session ruht beim Checkpoint** (der letzte
+//!   Bereich ist ein solcher Witness-Bereich, und seine gespeicherte Session
+//!   endet in Ruhe: letztes Event `Stop`, `SubagentStop` oder `SessionEnd`,
+//!   kein `PreToolUse` ohne `PostToolUse` — [`RangeInput::quiescence`]);
+//!   Intent gebunden — vom Witness
 //!   **verkettet**, belegt ab dem Anfang der Session, ohne Wechsel,
 //!   Snapshot passend zum Anker (EA-14) — **und** unter `minds-intent`
 //!   gültig signiert.
@@ -76,8 +78,8 @@
 //! nach dem letzten Seal oder Lücken innerhalb eines Seals: Die Stufe gilt
 //! je **versiegelter** Range; das macht das Verdikt `INCOMPLETE`
 //! (Coverage-Achse). Mit einer Ausnahme: Ein Bereich mit Lücke oder
-//! beschädigtem Eintrag gilt nie als Ende der Session (`closed`, siehe „Das
-//! bezeugte Ende") — schließt die Session in einem solchen Bereich, bleibt
+//! beschädigtem Eintrag gilt nie als ruhend (`quiescence`, siehe „Die
+//! bezeugte Ruhe") — endet die Session in einem solchen Bereich, bleibt
 //! sie bei A1. Eine Range, die ganz fehlt, ist dagegen kein Coverage-Fakt
 //! (siehe unten).
 //!
@@ -106,17 +108,28 @@
 //! löschen oder gar nicht erst zu versiegeln, öffnet keine Kette und fehlt
 //! in keinem Ledger (siehe „Bekannte Grenzen").
 //!
-//! # Das bezeugte Ende
+//! # Die bezeugte Ruhe
 //!
 //! Den **letzten** Witness-Bereich zu löschen, öffnet die Kette nicht: Auf
 //! ihn verweist nichts Signiertes. Ohne Ledger (CI) fiele das nicht auf, und
-//! mit Ledger nur für Witness-Seals. Deshalb verlangt A2,
-//! dass der Witness das Ende der Session selbst gesehen hat: Der letzte
-//! Bereich ist ein vertrauenswürdiger `witness/v1`-Bereich, dessen
-//! gespeicherte Session mit dem `SessionEnd` des Harness schließt
-//! (`lineage.closed`, über die Session-Id im Seal mitsigniert). Fehlt das,
-//! bleibt die Session bei A1 — und wer dann einen Bereich am Ende löscht,
-//! hebt sie über A1 nie hinaus.
+//! mit Ledger nur für Witness-Seals. Deshalb verlangt A2, dass der Witness
+//! die Session am Checkpoint **ruhend** gesehen hat: Der letzte Bereich ist
+//! ein vertrauenswürdiger `witness/v1`-Bereich, dessen gespeicherte Session
+//! in Ruhe endet — letztes Event `Stop`, `SubagentStop` oder `SessionEnd`,
+//! kein `PreToolUse` ohne `PostToolUse` (`lineage.quiescence`, über die
+//! Session-Id im Seal mitsigniert; ein älteres Objekt mit `lineage.closed`
+//! zählt als ruhend). Ein Commit, den der Mensch macht, nachdem der Agent
+//! geantwortet hat, erreicht so A2, ohne dass die Session enden muss; was
+//! der Agent danach tut, läuft in die nächste Epoche, und der nächste
+//! Checkpoint versiegelt sie. Lief der Agent beim Checkpoint noch (ein
+//! offener Tool-Aufruf, ein letztes Event, das kein Stop ist), bleibt die
+//! Session bei A1 — `session active at checkpoint`, mit der Event-Nummer.
+//!
+//! Ob der Witness auch das **Ende** der Session gesehen hat
+//! (`lineage.closed`, [`RangeInput::closes_session`]), senkt die Stufe nicht
+//! mehr; der Report nennt es ([`AssuranceReport::session_end`]),
+//! `minds verify` trägt es unter `Not proven` ein: Die Session kann weiter-
+//! gehen, und ein späterer Bereich gehört dann zu einer weiteren Epoche.
 //!
 //! # Bekannte Grenzen
 //!
@@ -149,8 +162,8 @@
 //!   Witness-Schlüssel je Repository (EA-08b bindet Schlüssel und
 //!   Repository) — und ein Aufrufer, der prüft, dass jeder Principal zu
 //!   **diesem** Repository gehört (siehe [`AssuranceInput::trusted_signers`]).
-//! - **Ein Harness ohne `SessionEnd`** (etwa OpenCode, dessen Plugin
-//!   `session.*`-Events liefert, die als `Other` ankommen) schließt nie:
+//! - **Ein Harness ohne `Stop`/`SessionEnd`** (etwa OpenCode, dessen Plugin
+//!   `session.*`-Events liefert, die als `Other` ankommen) ruht nie:
 //!   Seine Sessions bleiben dauerhaft bei A1 — fail-closed, aber eine
 //!   Erreichbarkeitsgrenze für EA-12/EA-22.
 //!
@@ -162,30 +175,30 @@
 //!   ADR-0012s „Witness 40 s unerreichbar → gemischt, Minimum A1" gilt
 //!   damit nur, solange der Rückfall-Bereich vorliegt; der Aufrufer hängt ihn
 //!   an, wenn er ihn findet ([`Seals::Sealed`]).
-//! - **Ein vorgetäuschtes Ende.** Schickt der Agent ein falsches
-//!   `SessionEnd` und löst einen Checkpoint aus, versiegelt der Witness einen
-//!   Bereich mit `closed`. Dann
-//!   - erreicht ein Commit direkt danach A2 ohne jede Löschung, obwohl die
-//!     Session weiterläuft — das Ledger sieht nichts Fehlendes;
-//!   - arbeitet er danach am Witness vorbei, steht das vorgetäuschte Ende als
-//!     letzter Witness-Bereich da — auch mit vollständigem Ledger;
+//! - **Ein ruhender Zwischenstand.** Jeder Checkpoint, der die Session in
+//!   Ruhe trifft (der Agent hat geantwortet, der Mensch committet),
+//!   versiegelt einen ruhenden Bereich — auch ein vom Agenten vorgetäuschtes
+//!   `Stop` oder `SessionEnd` tut das. Dann
+//!   - erreicht dieser Commit A2 ohne jede Löschung, obwohl die Session
+//!     weitergeht — gewollt: Das ist der Commit nach der fertigen Antwort;
+//!   - arbeitet der Agent danach am Witness vorbei, steht der ruhende
+//!     Bereich als letzter Witness-Bereich da — auch mit vollständigem
+//!     Ledger;
 //!   - arbeitet er danach bezeugt weiter und löscht diese späteren
 //!     Witness-Seals, fällt das nur mit Ledger auf (A0); ohne Ledger (CI)
-//!     nicht.
-//! - **Ein Commit mitten in der Session bleibt sonst bei A1**, bis ein
-//!   späterer Checkpoint den Bereich mit dem `SessionEnd` versiegelt und
-//!   dieser Seal ins geprüfte Repository gelangt. Versiegelt wird heute nur
-//!   per Checkpoint (am Commit), nicht beim `SessionEnd` selbst.
-//!   Fail-closed — aber für EA-12/EA-22 heißt das: A2 braucht einen
-//!   Checkpoint nach dem Ende der Session (Folgearbeit: der Witness
-//!   versiegelt beim `SessionEnd`).
-//! - **`--resume`.** Setzt ein Mensch eine beendete Session fort, ist der
-//!   bezeugte Abschluss nicht mehr der letzte Bereich (A1) — es sei denn,
-//!   der fortgesetzte Teil wird gelöscht (wie beim vorgetäuschten Ende).
+//!     nicht — jeder ruhende Zwischenstand ist ohne Ledger ein mögliches
+//!     „Ende".
+//! - **Ein Commit, während der Agent arbeitet, bleibt bei A1**
+//!   (`session active at checkpoint`), bis ein späterer Checkpoint einen
+//!   ruhenden Bereich versiegelt und dieser Seal ins geprüfte Repository
+//!   gelangt. Versiegelt wird heute nur per Checkpoint (am Commit).
+//! - **`--resume`.** Setzt ein Mensch eine Session fort und committet,
+//!   während der Agent arbeitet, ist der ruhende Bereich nicht mehr der
+//!   letzte (A1) — es sei denn, der fortgesetzte Teil wird gelöscht (wie
+//!   beim ruhenden Zwischenstand).
 //! - **Ohne Ledger** fällt ein gelöschter Witness-Seal mitten in der Kette
-//!   über den Kettenschluss auf (A0) und ein gelöschter letzter über das
-//!   fehlende bezeugte Ende (höchstens A1) — außer, das Ende davor war
-//!   (vorgetäuscht oder nach `--resume`) schon einmal bezeugt.
+//!   über den Kettenschluss auf (A0) und ein gelöschter letzter über die
+//!   fehlende Ruhe (höchstens A1) — außer, der Bereich davor ruhte schon.
 //!
 //! Der Test `known_limits_are_pinned` hält jede dieser Grenzen fest.
 //!
@@ -202,7 +215,7 @@ use std::fmt;
 use minds_core::evidence::{
     SCOPE_AGENT_HOOKS_V1, SCOPE_WITNESS_V1, SEPARATED_WITNESS_PRINCIPAL, WitnessProfile,
 };
-use minds_core::{ContentHash, EvidenceSource};
+use minds_core::{ContentHash, EvidenceSource, Quiescence};
 
 use crate::model::EvidenceVerdict;
 use crate::text::sanitize;
@@ -408,10 +421,24 @@ pub struct RangeInput {
     pub scope: String,
     /// Die Signaturlage.
     pub signature: SealSignature,
+    /// Ob die Session, die dieser Seal nennt, am Ende des Bereichs ruhte
+    /// (`lineage.quiescence`): letztes Event `Stop`, `SubagentStop` oder
+    /// `SessionEnd`, kein `PreToolUse` ohne `PostToolUse`. Das Objekt ist
+    /// inhaltsadressiert und seine Id steht im Seal-Text — unter einem
+    /// vertrauenswürdigen Witness-Seal ist die Ruhe also bezeugt. `None`:
+    /// nicht festgestellt (älteres Objekt, unvollständig gelesen) — zählt
+    /// als nicht ruhend, es sei denn, [`Self::closes_session`] steht.
+    ///
+    /// Derselbe Vertrag wie bei [`Self::closes_session`]: aus genau dem
+    /// Objekt dieses Seals, mit Hash-Prüfung, zur geprüften Agent-Session
+    /// gehörend; sonst `None` — fail-closed.
+    pub quiescence: Option<Quiescence>,
     /// Ob die Session, die dieser Seal nennt, mit dem Ende der Session
     /// schließt (`lineage.closed`). Das Objekt ist inhaltsadressiert und
     /// seine Id steht im Seal-Text — unter einem vertrauenswürdigen
-    /// Witness-Seal ist das Ende also bezeugt.
+    /// Witness-Seal ist das Ende also bezeugt. Für die Stufe zählt die
+    /// Ruhe ([`Self::quiescence`]); das Ende nennt der Report nur noch
+    /// ([`AssuranceReport::session_end`]).
     ///
     /// **Vertrag des Aufrufers:** gelesen aus genau dem Objekt, dessen Id
     /// die `session=`-Zeile **dieses** Seals nennt, mit Hash-Prüfung über
@@ -729,9 +756,12 @@ pub enum Reason {
     ProfileNotQualified(WitnessProfile),
     /// Ein Lauf hat seine Trennung vom Agenten nicht belegt.
     IsolationNotProven,
-    /// Das Ende der Session ist nicht bezeugt — ein späterer Bereich
-    /// könnte fehlen.
-    SessionEndNotWitnessed,
+    /// Der letzte Bereich ist kein vertrauenswürdiger Witness-Bereich — ein
+    /// späterer bezeugter Bereich könnte fehlen.
+    LastRangeNotWitnessed,
+    /// Die Session ruhte beim Checkpoint nicht: Der letzte Witness-Bereich
+    /// endet mitten in der Arbeit des Agenten.
+    SessionActive(Activity),
     /// Kein Intent-Anker.
     IntentNotBound,
     /// Intent nur lokal gebunden, nicht vom Witness verkettet (EA-14).
@@ -770,6 +800,51 @@ pub enum Reason {
     DecisiveSkipped(usize),
     /// Der Seal trägt keine `minds-anchor`-Gegenzeichnung.
     NotAnchored,
+}
+
+/// Woran die Ruhe scheiterte ([`Reason::SessionActive`]) — mit der
+/// laufenden Nummer des Events, damit der Mensch es im Record findet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity {
+    /// Ein `PreToolUse` (diese `seq`) ohne sein `PostToolUse`.
+    ToolCallOpen(u64),
+    /// Das letzte Event (diese `seq`) ist kein `Stop`, `SubagentStop` oder
+    /// `SessionEnd`.
+    LastEvent(u64),
+    /// Das Objekt sagt nichts über die Ruhe (älteres Binary, unvollständig
+    /// gelesen, Block-Seal oder fremde Session) und schließt nicht mit
+    /// `SessionEnd` — fail-closed.
+    Unrecorded,
+}
+
+/// Was der Witness über das **Ende** der Session gesehen hat
+/// ([`AssuranceReport::session_end`]) — Information neben der Stufe, keine
+/// Bedingung (Modul-Doku, „Die bezeugte Ruhe").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// Nichts: Der letzte Bereich ist nicht bezeugt ruhend (die Stufe nennt
+    /// den Grund), oder das Material ist nicht geprüft.
+    Unknown,
+    /// Bezeugt ruhend, ohne `SessionEnd`: Die Session kann weitergehen; ein
+    /// späterer Bereich liegt in der nächsten Epoche.
+    Open,
+    /// Bezeugt mit `SessionEnd` als letztem Event.
+    Witnessed,
+}
+
+impl Activity {
+    /// Die Ruhe aus dem gespeicherten Objekt: `None` oder ein nicht
+    /// ruhender Zustand ergibt die Aktivität, Ruhe `None`. Ein älteres
+    /// Objekt ohne das Feld, das mit `SessionEnd` schließt, ruht.
+    fn of(quiescence: Option<Quiescence>, closes_session: bool) -> Option<Self> {
+        match quiescence {
+            Some(Quiescence::Quiescent) => None,
+            Some(Quiescence::ToolCallOpen { seq }) => Some(Self::ToolCallOpen(seq)),
+            Some(Quiescence::Active { seq }) => Some(Self::LastEvent(seq)),
+            None if closes_session => None,
+            None => Some(Self::Unrecorded),
+        }
+    }
 }
 
 impl Reason {
@@ -855,8 +930,17 @@ impl Reason {
                 format!("profile {} not qualified for A2", profile.name())
             }
             Self::IsolationNotProven => "witness isolation not proven — not listed as separated (minds-witness-user@), or the witness shares its user ID, home or binary with the agent".into(),
-            Self::SessionEndNotWitnessed => {
-                "session end not witnessed — a later range could be missing".into()
+            Self::LastRangeNotWitnessed => {
+                "last sealed range not witnessed — a later range could be missing".into()
+            }
+            Self::SessionActive(Activity::ToolCallOpen(seq)) => {
+                format!("session active at checkpoint (PreToolUse #{seq} open)")
+            }
+            Self::SessionActive(Activity::LastEvent(seq)) => {
+                format!("session active at checkpoint (last event #{seq} is not a stop)")
+            }
+            Self::SessionActive(Activity::Unrecorded) => {
+                "session active at checkpoint (quiescence not recorded)".into()
             }
             Self::IntentNotBound => "intent not bound".into(),
             Self::IntentUnchained => "intent bound (unchained)".into(),
@@ -963,6 +1047,15 @@ pub struct AssuranceReport {
     /// ([`Assurance`]). `minds verify`, Overview, Evidence und die Bindung
     /// lesen dieses Feld; keine leitet die Stufe selbst ab.
     pub rating: Assurance,
+    /// Was der Witness über das **Ende** der Session gesehen hat, wenn der
+    /// letzte Bereich bezeugt ruht: mit `SessionEnd` ([`SessionEnd::Witnessed`])
+    /// oder ohne ([`SessionEnd::Open`]). Keine Bedingung der Stufe (die
+    /// verlangt Ruhe, Modul-Doku „Die bezeugte Ruhe") — eine Information,
+    /// die `minds verify` bei `Open` unter `Not proven` nennt: Die Session
+    /// kann weitergehen, ein späterer Bereich liegt in der nächsten Epoche.
+    /// Wie die übrigen Fakten nur über geprüftem, intaktem Material, sonst
+    /// [`SessionEnd::Unknown`].
+    pub session_end: SessionEnd,
 }
 
 /// Rechnet die Assurance einer Session aus — rein und deterministisch:
@@ -1059,6 +1152,12 @@ pub fn assess(input: &AssuranceInput<'_>) -> AssuranceReport {
         replay: input.replay.filter(|r| checked && r.signed).copied(),
         anchored: input.anchors.filter(|_| checked).cloned(),
         rating,
+        // Wie die übrigen Fakten: nur über geprüftem, intaktem Material.
+        session_end: if checked {
+            session.session_end
+        } else {
+            SessionEnd::Unknown
+        },
     }
 }
 
@@ -1386,6 +1485,8 @@ struct SessionFacts {
     witnessed: Vec<Reason>,
     /// Was ein A3 auf Session-Ebene verhindert (Replay).
     reproduced: Vec<Reason>,
+    /// Was über das Ende der Session bezeugt ist.
+    session_end: SessionEnd,
 }
 
 impl SessionFacts {
@@ -1438,22 +1539,44 @@ impl SessionFacts {
         if unvouched || starts.iter().any(|start| !start.isolated) {
             witnessed.push(Reason::IsolationNotProven);
         }
-        // Das Ende muss bezeugt sein: Der letzte Bereich (Ketten-
+        // Die Ruhe muss bezeugt sein: Der letzte Bereich (Ketten-
         // Reihenfolge) ist ein vertrauenswürdiger Witness-Bereich, dessen
-        // gespeicherte Session mit `SessionEnd` schließt. Sonst könnte ein
-        // späterer, schwächerer Bereich gelöscht sein — die Kette bliebe
-        // geschlossen, weil nichts Signiertes auf ihn verweist.
-        let end_witnessed = ranges.last().is_some_and(|last| {
-            last.closes_session
-                && last.scope == SCOPE_WITNESS_V1
+        // gespeicherte Session in Ruhe endet. Sonst könnte ein späterer,
+        // schwächerer Bereich gelöscht sein — die Kette bliebe geschlossen,
+        // weil nichts Signiertes auf ihn verweist —, oder der Agent war
+        // mitten in der Arbeit, als der Checkpoint lief. Ohne
+        // vertrauenswürdige Signer ist nichts bezeugt — das sagt schon der
+        // Signer-Grund.
+        let last_witnessed = |last: &RangeInput| {
+            last.scope == SCOPE_WITNESS_V1
                 && input.trusted_signers
                 && matches!(last.signature, SealSignature::Witness { .. })
-        });
-        // Ohne vertrauenswürdige Signer ist nichts bezeugt — das sagt schon
-        // der Signer-Grund.
-        if input.trusted_signers && !end_witnessed {
-            witnessed.push(Reason::SessionEndNotWitnessed);
+        };
+        if input.trusted_signers {
+            match ranges.last() {
+                Some(last) if last_witnessed(last) => {
+                    if let Some(activity) = Activity::of(last.quiescence, last.closes_session) {
+                        witnessed.push(Reason::SessionActive(activity));
+                    }
+                }
+                _ => witnessed.push(Reason::LastRangeNotWitnessed),
+            }
         }
+        // Das Ende der Session ist nur noch Information: Ruht der letzte
+        // Bereich bezeugt, sagt `closed`, ob die Session dabei zu Ende war.
+        let session_end = match ranges.last() {
+            Some(last)
+                if last_witnessed(last)
+                    && Activity::of(last.quiescence, last.closes_session).is_none() =>
+            {
+                if last.closes_session {
+                    SessionEnd::Witnessed
+                } else {
+                    SessionEnd::Open
+                }
+            }
+            _ => SessionEnd::Unknown,
+        };
         match input.intent {
             IntentState::Unbound => witnessed.push(Reason::IntentNotBound),
             IntentState::Bound {
@@ -1536,6 +1659,7 @@ impl SessionFacts {
                 .collect(),
             witnessed,
             reproduced,
+            session_end,
         }
     }
 }
@@ -1817,9 +1941,20 @@ mod tests {
             signature: SealSignature::Witness {
                 principal: PRINCIPAL.into(),
             },
-            // Jeder Witness-Bereich der Fixtures schließt die Session; es
-            // zählt nur der letzte.
+            // Jeder Witness-Bereich der Fixtures ruht und schließt die
+            // Session; es zählt nur der letzte.
+            quiescence: Some(Quiescence::Quiescent),
             closes_session: true,
+        }
+    }
+
+    /// Ein Witness-Bereich, der die Session mitten in der Arbeit des Agenten
+    /// versiegelt hat (letztes Event #9 kein Stop) — und sie nicht schließt.
+    fn active_range(n: u8) -> RangeInput {
+        RangeInput {
+            quiescence: Some(Quiescence::Active { seq: 9 }),
+            closes_session: false,
+            ..witness_range(n)
         }
     }
 
@@ -1828,6 +1963,7 @@ mod tests {
             seal: seal(n),
             scope: SCOPE_AGENT_HOOKS_V1.into(),
             signature: SealSignature::Missing,
+            quiescence: None,
             closes_session: false,
         }
     }
@@ -1891,6 +2027,15 @@ mod tests {
                 anchors: Some(AnchorSummary {
                     anchored: [seal(1)].into_iter().collect(),
                 }),
+            }
+        }
+
+        /// Jede A2-Bedingung erfüllt, kein Replay, keine Gegenzeichnung.
+        fn witnessed() -> Self {
+            Self {
+                replay: None,
+                anchors: None,
+                ..Self::reproduced()
             }
         }
 
@@ -2107,10 +2252,10 @@ mod tests {
                 "signature not checked",
                 |f| f.ranges[0].signature = SealSignature::NotChecked,
                 AssuranceLevel::A1Observed,
-                // Der letzte Bereich ist ungeprüft — damit auch das Ende.
+                // Der letzte Bereich ist ungeprüft — damit auch die Ruhe.
                 &[
                     "witness signature not checked",
-                    "session end not witnessed — a later range could be missing",
+                    "last sealed range not witnessed — a later range could be missing",
                 ],
             ),
             (
@@ -2312,22 +2457,38 @@ mod tests {
                 &["intent unsigned"],
             ),
             (
-                "the last range does not close the session",
-                |f| f.ranges[0].closes_session = false,
+                "the last range was sealed while the agent worked",
+                |f| f.ranges[0] = active_range(1),
                 AssuranceLevel::A1Observed,
-                &["session end not witnessed — a later range could be missing"],
+                &["session active at checkpoint (last event #9 is not a stop)"],
+            ),
+            (
+                "the last range was sealed inside a tool call",
+                |f| f.ranges[0].quiescence = Some(Quiescence::ToolCallOpen { seq: 4 }),
+                AssuranceLevel::A1Observed,
+                &["session active at checkpoint (PreToolUse #4 open)"],
+            ),
+            (
+                "an older object without the field that does not close",
+                |f| {
+                    f.ranges[0].quiescence = None;
+                    f.ranges[0].closes_session = false;
+                },
+                AssuranceLevel::A1Observed,
+                &["session active at checkpoint (quiescence not recorded)"],
             ),
             (
                 "the session ends in an agent-hooks range",
                 |f| {
                     let mut hooks = hooks_range(2);
+                    hooks.quiescence = Some(Quiescence::Quiescent);
                     hooks.closes_session = true;
                     f.ranges.push(hooks);
                 },
                 AssuranceLevel::A1Observed,
                 // Gleichstand bei A1: der erste Bereich, der Witness-Bereich
-                // — sein Grund ist das unbezeugte Ende.
-                &["session end not witnessed — a later range could be missing"],
+                // — sein Grund ist der unbezeugte letzte Bereich.
+                &["last sealed range not witnessed — a later range could be missing"],
             ),
             (
                 "an invalid intent signature is unknown without signers",
@@ -2410,7 +2571,7 @@ mod tests {
                     "witness signature not checked",
                     "no file-system observation window covering the session",
                     "witness profile unknown",
-                    "session end not witnessed — a later range could be missing",
+                    "last sealed range not witnessed — a later range could be missing",
                     "intent not bound",
                 ],
             ),
@@ -2572,12 +2733,12 @@ mod tests {
         ];
         assert_eq!(fixture.assess().weakest, Some(1));
 
-        // Endet die Session mit einem Hooks-Bereich, ist ihr Ende nicht
-        // bezeugt: auch die Witness-Bereiche bleiben bei A1.
+        // Endet die Session mit einem Hooks-Bereich, ist ihr letzter Bereich
+        // nicht bezeugt: auch die Witness-Bereiche bleiben bei A1.
         fixture.ranges = vec![witness_range(1), hooks_range(2)];
         let report = fixture.assess();
         assert_eq!(report.ranges[0].level, AssuranceLevel::A1Observed);
-        assert_eq!(report.ranges[0].reasons, [Reason::SessionEndNotWitnessed]);
+        assert_eq!(report.ranges[0].reasons, [Reason::LastRangeNotWitnessed]);
 
         // Nur ein Seal gegengezeichnet: Die andere Range hält die Session
         // auf A2.
@@ -2591,16 +2752,15 @@ mod tests {
     }
 
     /// Den **letzten** Bereich zu löschen, öffnet die Kette nicht — auf ihn
-    /// verweist nichts Signiertes. Ohne bezeugtes Ende kommt die Session
+    /// verweist nichts Signiertes. Ohne bezeugte Ruhe kommt die Session
     /// dann trotzdem nie über A1.
     #[test]
     fn deleting_the_last_seal_never_lifts_above_a1() {
-        // Der Witness fiel aus; die Session lief per Hooks weiter.
+        // Der Witness fiel aus (mitten in der Arbeit); die Session lief per
+        // Hooks weiter.
         let mut fixture = Fixture::reproduced();
-        let mut w1 = witness_range(1);
-        w1.closes_session = false;
-        let mut w2 = witness_range(2);
-        w2.closes_session = false;
+        let w1 = active_range(1);
+        let w2 = active_range(2);
         fixture.anchors = Some(AnchorSummary {
             anchored: [seal(1), seal(2)].into_iter().collect(),
         });
@@ -2612,14 +2772,84 @@ mod tests {
         fixture.ranges = vec![w1, w2.clone()];
         let report = fixture.assess();
         assert_eq!(report.overall, AssuranceLevel::A1Observed);
-        assert_eq!(report.reasons, [Reason::SessionEndNotWitnessed]);
+        assert_eq!(
+            report.reasons,
+            [Reason::SessionActive(Activity::LastEvent(9))]
+        );
 
         // Löscht er einen bezeugten Seal am Ende, nennt ihn das Ledger.
         let mut fixture = Fixture::reproduced();
-        fixture.ranges = vec![witness_range(1)];
-        fixture.ranges[0].closes_session = false;
+        fixture.ranges = vec![active_range(1)];
         fixture.ledger = LedgerCheck::Missing(vec![seal(2)]);
         assert_eq!(fixture.assess().overall, AssuranceLevel::A0Claimed);
+    }
+
+    /// A2 ohne Sessionende (EA-11): Ein Checkpoint, der die Session ruhend
+    /// trifft — der Agent hat geantwortet (`Stop`), der Mensch committet —,
+    /// erreicht A2; das Ende der Session ist nur noch Information. Lief der
+    /// Agent noch (offenes `PreToolUse`), bleibt es bei A1, mit der
+    /// Event-Nummer im Grund.
+    #[test]
+    fn a_quiescent_checkpoint_is_witnessed_without_a_session_end() {
+        // Letztes Event `Stop`, kein `SessionEnd`: A2, Ende nicht bezeugt.
+        let mut fixture = Fixture::witnessed();
+        fixture.ranges = vec![witness_range(1)];
+        fixture.ranges[0].closes_session = false;
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
+        assert_eq!(report.session_end, SessionEnd::Open);
+        // Mit `SessionEnd`: ebenso A2, und das Ende bezeugt.
+        fixture.ranges[0].closes_session = true;
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
+        assert_eq!(report.session_end, SessionEnd::Witnessed);
+        // Das Ende ist nur so geprüft wie die Signer.
+        fixture.trusted_signers = false;
+        assert_eq!(fixture.assess().session_end, SessionEnd::Unknown);
+
+        // Mitten im Tool-Aufruf versiegelt: A1, der Grund nennt das Event.
+        let mut fixture = Fixture::witnessed();
+        fixture.ranges = vec![witness_range(1)];
+        fixture.ranges[0].quiescence = Some(Quiescence::ToolCallOpen { seq: 3 });
+        fixture.ranges[0].closes_session = false;
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
+        assert_eq!(
+            report.reasons,
+            [Reason::SessionActive(Activity::ToolCallOpen(3))]
+        );
+        assert_eq!(
+            report.reasons[0].text(),
+            "session active at checkpoint (PreToolUse #3 open)"
+        );
+        // Über das Ende ist dann nichts gesagt — die Stufe nennt den Grund.
+        assert_eq!(report.session_end, SessionEnd::Unknown);
+
+        // Ein älteres Objekt ohne das Feld: Ruhe nur, wenn es mit
+        // `SessionEnd` schließt.
+        let mut fixture = Fixture::witnessed();
+        fixture.ranges = vec![witness_range(1)];
+        fixture.ranges[0].quiescence = None;
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A2Witnessed);
+        fixture.ranges[0].closes_session = false;
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
+        assert_eq!(
+            report.reasons,
+            [Reason::SessionActive(Activity::Unrecorded)]
+        );
+
+        // Der zweite Checkpoint derselben Session: Der ruhende Bereich
+        // davor bleibt, der neue ruht ebenso — Kette geschlossen, A2.
+        let mut fixture = Fixture::witnessed();
+        fixture.ranges = vec![witness_range(1), witness_range(2)];
+        for range in &mut fixture.ranges {
+            range.closes_session = false;
+        }
+        assert!(fixture.chain_closed);
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
+        assert_eq!(report.ranges.len(), 2);
     }
 
     /// Die bekannten Grenzen (Modul-Doku, „Bekannte Grenzen") — jede als
@@ -2627,7 +2857,11 @@ mod tests {
     /// niemand eine offene Grenze für geschlossen hält.
     #[test]
     fn known_limits_are_pinned() {
-        let open = |n| RangeInput {
+        // Ein Witness-Bereich, versiegelt, während der Agent arbeitete.
+        let open = active_range;
+        // Ein ruhender Zwischenstand: Der Agent hat geantwortet (`Stop`),
+        // die Session lief danach weiter — kein `SessionEnd`.
+        let resting = |n| RangeInput {
             closes_session: false,
             ..witness_range(n)
         };
@@ -2637,36 +2871,45 @@ mod tests {
             })
         };
 
-        // Ein Commit mitten in der Session: Sein Seal schließt die Session
-        // nicht — A1, genau aus diesem Grund, bis ein späterer Checkpoint
-        // das Ende versiegelt.
+        // Ein Commit, während der Agent arbeitet: Sein Seal ruht nicht —
+        // A1, genau aus diesem Grund, bis ein späterer Checkpoint einen
+        // ruhenden Bereich versiegelt.
         let mut fixture = Fixture::reproduced();
         fixture.ranges = vec![open(1)];
         let report = fixture.assess();
         assert_eq!(report.overall, AssuranceLevel::A1Observed);
-        assert_eq!(report.reasons, [Reason::SessionEndNotWitnessed]);
-        fixture.ranges.push(witness_range(2));
+        assert_eq!(
+            report.reasons,
+            [Reason::SessionActive(Activity::LastEvent(9))]
+        );
+        fixture.ranges.push(resting(2));
         fixture.anchors = anchored(&[1, 2]);
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
-        // `--resume`: Nach dem bezeugten Ende geht es weiter — A1; wird der
-        // fortgesetzte Teil gelöscht, steht das alte Ende wieder als letztes.
+        // `--resume` (oder einfach: weiterarbeiten): Nach dem ruhenden
+        // Bereich geht es weiter, und der Commit trifft den Agenten bei der
+        // Arbeit — A1; wird der fortgesetzte Teil gelöscht, steht der
+        // ruhende Bereich wieder als letzter.
         let mut fixture = Fixture::reproduced();
         fixture.anchors = anchored(&[1, 2]);
-        fixture.ranges = vec![witness_range(1), open(2)];
+        fixture.ranges = vec![resting(1), open(2)];
         assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
         fixture.ranges.pop();
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Ohne Ledger: ein gelöschter letzter Witness-Seal hinter einem
-        // schon bezeugten Ende bleibt unbemerkt.
+        // ruhenden Zwischenstand bleibt unbemerkt — jeder ruhende
+        // Zwischenstand ist ohne Ledger ein mögliches „Ende".
         let mut fixture = Fixture::reproduced();
         fixture.anchors = anchored(&[1, 2]);
-        fixture.ranges = vec![witness_range(1), witness_range(2)];
+        fixture.ranges = vec![resting(1), resting(2)];
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
         fixture.ranges.pop();
         assert_eq!(fixture.ledger, LedgerCheck::NotChecked);
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
+        // … mit Ledger nicht.
+        fixture.ledger = LedgerCheck::Missing(vec![seal(2)]);
+        assert_eq!(fixture.assess().overall, AssuranceLevel::A0Claimed);
 
         // Ein verschwiegener Rückfall-Bereich: h2 lag zeitlich zwischen w1
         // und w3, aber in eigener Kette. Liegt er vor, zieht er die Session
@@ -2681,13 +2924,13 @@ mod tests {
         assert!(fixture.chain_closed);
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
-        // Ein vorgetäuschtes Ende direkt vor dem Commit — oder eine ganz
-        // erfundene Session (neue `local_id`, `SessionStart` … `SessionEnd`
-        // über den Socket): ein einziger schließender Witness-Bereich, A2+
-        // ohne Löschung, auch mit vollständigem Ledger.
+        // Ein vorgetäuschtes `Stop` oder `SessionEnd` direkt vor dem Commit
+        // — oder eine ganz erfundene Session (neue `local_id`,
+        // `SessionStart` … `Stop` über den Socket): ein einziger ruhender
+        // Witness-Bereich, A2+ ohne Löschung, auch mit vollständigem Ledger.
         let mut fixture = Fixture::reproduced();
         fixture.ledger = LedgerCheck::Complete;
-        fixture.ranges = vec![witness_range(1)];
+        fixture.ranges = vec![resting(1)];
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
         // Eine verpflanzte Kette: Session samt Kette aus einem anderen
@@ -2700,41 +2943,50 @@ mod tests {
         fixture.anchors = anchored(&[7]);
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
 
-        // Eine Lücke im schließenden Bereich (etwa ein einmal fail-open
-        // gelaufener Hook): Der Checkpoint setzt `closed` dann nicht — der
-        // Bereich kommt als nicht schließend an, A1.
+        // Eine Lücke im letzten Bereich (etwa ein einmal fail-open
+        // gelaufener Hook): Der Checkpoint setzt `quiescence` dann nicht —
+        // der Bereich kommt ohne Ruhe an, A1.
         let mut fixture = Fixture::reproduced();
-        fixture.ranges = vec![open(1)];
-        assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
+        fixture.ranges = vec![witness_range(1)];
+        fixture.ranges[0].quiescence = None;
+        fixture.ranges[0].closes_session = false;
+        let report = fixture.assess();
+        assert_eq!(report.overall, AssuranceLevel::A1Observed);
+        assert_eq!(
+            report.reasons,
+            [Reason::SessionActive(Activity::Unrecorded)]
+        );
 
-        // Ein Harness ohne `SessionEnd` (OpenCode): Kein Bereich schließt je
-        // — dauerhaft A1, auch nach jedem späteren Checkpoint.
+        // Ein Harness ohne `Stop`/`SessionEnd` (OpenCode): Kein Bereich ruht
+        // je — dauerhaft A1, auch nach jedem späteren Checkpoint.
         let mut fixture = Fixture::reproduced();
         fixture.anchors = anchored(&[1, 2]);
         fixture.ranges = vec![open(1), open(2)];
         let report = fixture.assess();
         assert_eq!(report.overall, AssuranceLevel::A1Observed);
-        assert_eq!(report.reasons, [Reason::SessionEndNotWitnessed]);
+        assert_eq!(
+            report.reasons,
+            [Reason::SessionActive(Activity::LastEvent(9))]
+        );
 
-        // Ein vorgetäuschtes Ende, danach am Witness vorbei (h3) — auch mit
-        // vollständigem Ledger, denn h3 kennt es nicht.
+        // Ein ruhender Zwischenstand, danach am Witness vorbei (h3) — auch
+        // mit vollständigem Ledger, denn h3 kennt es nicht.
         let mut fixture = Fixture::reproduced();
         fixture.anchors = anchored(&[1, 2]);
         fixture.ledger = LedgerCheck::Complete;
-        // w2 schließt (vorgetäuscht), danach lief die Session per Hooks.
-        fixture.ranges = vec![witness_range(1), witness_range(2), hooks_range(3)];
+        // w2 ruht, danach lief die Session per Hooks.
+        fixture.ranges = vec![resting(1), resting(2), hooks_range(3)];
         assert_eq!(fixture.assess().overall, AssuranceLevel::A1Observed);
-        // Ohne den Hooks-Bereich steht das bezeugte Ende als letztes da.
+        // Ohne den Hooks-Bereich steht der ruhende Bereich als letzter da.
         fixture.ranges.pop();
         assert_eq!(fixture.assess().overall, AssuranceLevel::A3Reproduced);
         fixture.ledger = LedgerCheck::NotChecked;
 
-        // Dasselbe ohne Blenden: Nach dem vorgetäuschten Ende versiegelt der
-        // Witness weiter (w3, nicht schließend), der Agent löscht w3. Ohne
+        // Dasselbe ohne Blenden: Nach dem ruhenden Zwischenstand versiegelt
+        // der Witness weiter (w3, bei der Arbeit), der Agent löscht w3. Ohne
         // Ledger bleibt das unbemerkt …
-        let mut w3 = witness_range(3);
-        w3.closes_session = false;
-        fixture.ranges = vec![witness_range(1), witness_range(2), w3];
+        let w3 = open(3);
+        fixture.ranges = vec![resting(1), resting(2), w3];
         fixture.anchors = Some(AnchorSummary {
             anchored: [seal(1), seal(2), seal(3)].into_iter().collect(),
         });

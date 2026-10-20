@@ -343,6 +343,7 @@ impl Segment {
                 ended_at: self.last_ts,
                 cwd: cwd.map(str::to_string),
                 closed: false,
+                quiescence: None,
                 // Der Import *ist* das Transkript: gelesen, per Definition.
                 transcript: Some(TranscriptStatus::Read),
             }),

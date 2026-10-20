@@ -731,6 +731,7 @@ fn with_cwd(mut session: Session, cwd: &str) -> Session {
         ended_at: None,
         cwd: Some(cwd.into()),
         closed: false,
+        quiescence: None,
         transcript: None,
     });
     session

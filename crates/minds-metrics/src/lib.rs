@@ -368,6 +368,7 @@ mod tests {
             ended_at: Some("2026-07-25T09:10:00Z".into()),
             cwd: None,
             closed: false,
+            quiescence: None,
             transcript: None,
         });
         let mut long = session("x");
@@ -377,6 +378,7 @@ mod tests {
             ended_at: Some("2026-07-25T11:00:00Z".into()),
             cwd: None,
             closed: false,
+            quiescence: None,
             transcript: None,
         });
         assert_eq!(
@@ -396,6 +398,7 @@ mod tests {
                 ended_at: None,
                 cwd: None,
                 closed: false,
+                quiescence: None,
                 transcript: None,
             });
             s

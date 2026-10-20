@@ -322,6 +322,7 @@ mod tests {
             ended_at: None,
             cwd: Some("/repo".into()),
             closed: false,
+            quiescence: None,
             transcript: None,
         });
         session.turns.push(minds_core::Turn {

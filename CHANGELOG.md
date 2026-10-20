@@ -17,8 +17,32 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **A2 no longer needs `/exit`.** The condition "session end witnessed"
+  becomes "session quiescent at checkpoint": the last event of the sealed
+  range is a `Stop`, `SubagentStop` or `SessionEnd`, and no `PreToolUse` is
+  open without its `PostToolUse`. A commit made after the agent's answer,
+  with the Claude Code session still open, now reaches `A2 witnessed`;
+  events after the checkpoint run into the next epoch, which the next
+  commit seals (`chain closed (2 epochs)`). A checkpoint that catches the
+  agent mid-work stays at A1 with `session active at checkpoint (PreToolUse
+  #n open)` or `(last event #n is not a stop)`. Whether the witness also saw
+  the `SessionEnd` is now information under `Not proven` (`the session's
+  end`), never a downgrade. The session record carries the observation as
+  `lineage.quiescence` (`quiescent`, `tool_call_open {seq}`, `active
+  {seq}`), additive like `lineage.closed`; an older record that closes with
+  `SessionEnd` still counts as quiescent. Known limit: without the witness
+  ledger, a later witness seal deleted behind a quiescent checkpoint is not
+  detected — the same limit that a faked `SessionEnd` had before.
+
 ### Added
 
+- **`minds enable` registers `PostToolUseFailure` for Claude Code.** Claude
+  Code sends no `PostToolUse` for a failed tool call; without the
+  registration a failed `Bash` left its `PreToolUse` open in the record (the
+  session never quiescent) and the outcome of failed test runs never
+  reached the record.
 - **`minds doctor` shows the file observer.** A new read-only `Status`
   frame (accepted on the agent and the control socket) makes the witness
   report `watching <root> · <n> frames · last <ts>`; `doctor` prints it as
@@ -42,6 +66,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The protected witness started no more after a reinstall.** launchd
+  creates the daemon's stderr file `log/witness.err` (StandardErrorPath)
+  itself, under the service's umask 007 as 0660, and the witness refuses a
+  home with anything but 0700/0600 (`witness home requires private
+  directories and files`, exit 4, respawn loop). `minds witness init` now
+  creates the file with 0600 up front and pulls an existing one back to
+  0600 — also on a home whose configuration is unchanged, so a renewed
+  `MINDS_WITNESS=protected minds enable` repairs it.
 - **One assurance computation for every view.** `minds verify`, the
   Overview's INTEGRITY line, the Evidence report of a session and the
   binding line of the Requirements tab showed different levels for the same

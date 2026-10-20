@@ -42,7 +42,7 @@ use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutc
 use minds_core::{ContentHash, EvidenceSource, Session, SessionId};
 use minds_reader::assurance::{
     AssuranceInput, AssuranceLevel, AssuranceReport, FsCoverage, IntentState, LedgerCheck,
-    MAX_LISTED, RangeInput, Reason, SealMaterial, Seals, Signers, assess,
+    MAX_LISTED, RangeInput, Reason, SealMaterial, Seals, SessionEnd, Signers, assess,
 };
 use minds_reader::model::EvidenceVerdict;
 use minds_reader::observations::{Window, WindowObservations};
@@ -281,6 +281,7 @@ pub(crate) fn report(trust: &WitnessTrust<'_>, facts: &Facts<'_>) -> AssuranceRe
                 } else {
                     minds_reader::assurance::SealSignature::NotChecked
                 },
+                quiescence: quiescence(facts, seal),
                 closes_session: closes_session(facts, seal),
             }
         })
@@ -395,19 +396,30 @@ pub(super) fn range_order(seal: &Seal) -> (Option<jiff::Timestamp>, u64) {
     (seal.last_event_at.parse().ok(), seal.first_seq)
 }
 
-/// Ob der Bereich mit dem Ende der Session schließt: nur, wenn der Seal
-/// genau die geprüfte Session nennt — deren Objekt hat der Verdikt-Pfad mit
-/// Hash-Prüfung gelesen — und sie `lineage.closed` trägt. Alles andere
-/// (Block-Seal, eine andere Session, nicht lesbar): `false`, fail-closed.
-fn closes_session(facts: &Facts<'_>, seal: &Seal) -> bool {
+/// Die Herkunft der Session, die der Seal nennt: nur, wenn er genau die
+/// geprüfte Session nennt — deren Objekt hat der Verdikt-Pfad mit
+/// Hash-Prüfung gelesen. Alles andere (Block-Seal, eine andere Session,
+/// nicht lesbar): `None`, fail-closed.
+fn sealed_lineage<'f>(facts: &Facts<'f>, seal: &Seal) -> Option<&'f minds_core::Lineage> {
     let SealOutcome::Stored { session } = &seal.outcome else {
-        return false;
+        return None;
     };
-    session.parse::<SessionId>().ok() == Some(facts.id)
-        && facts
-            .session
-            .and_then(|session| session.lineage.as_ref())
-            .is_some_and(|lineage| lineage.closed)
+    if session.parse::<SessionId>().ok() != Some(facts.id) {
+        return None;
+    }
+    facts.session.and_then(|session| session.lineage.as_ref())
+}
+
+/// Ob der Bereich mit dem Ende der Session schließt (`lineage.closed`,
+/// [`sealed_lineage`]); sonst `false`, fail-closed.
+fn closes_session(facts: &Facts<'_>, seal: &Seal) -> bool {
+    sealed_lineage(facts, seal).is_some_and(|lineage| lineage.closed)
+}
+
+/// Ob die Session am Ende des Bereichs ruhte (`lineage.quiescence`,
+/// [`sealed_lineage`]); sonst `None`, fail-closed.
+fn quiescence(facts: &Facts<'_>, seal: &Seal) -> Option<minds_core::Quiescence> {
+    sealed_lineage(facts, seal).and_then(|lineage| lineage.quiescence)
 }
 
 /// Die Abdeckung durch den Datei-Beobachter: lückenlos, wenn der Witness
@@ -654,9 +666,19 @@ pub(super) fn intent_line(report: &AssuranceReport) -> String {
 
 /// Die `Not proven`-Zeile(n) für die erreichte Stufe: die Kurzformen, mit
 /// ` · ` verbunden, höchstens drei, dann der Verweis auf `--limits`; mit
-/// `full` (`--limits`) jeder Satz ausgeschrieben.
-pub(super) fn not_proven_lines(level: AssuranceLevel, full: bool) -> Vec<String> {
-    let limits: Vec<_> = limits_at(level.level()).collect();
+/// `full` (`--limits`) jeder Satz ausgeschrieben. Hat der Witness das Ende
+/// der Session nicht gesehen ([`SessionEnd::Open`]), steht das als
+/// letzter Satz dabei — eine Information neben der Stufe, kein Abzug
+/// (EA-11: A2 verlangt Ruhe, kein `SessionEnd`).
+pub(super) fn not_proven_lines(
+    level: AssuranceLevel,
+    full: bool,
+    session_end: SessionEnd,
+) -> Vec<String> {
+    let mut limits: Vec<_> = limits_at(level.level()).collect();
+    if session_end == SessionEnd::Open {
+        limits.push(&minds_core::evidence::SESSION_END_NOT_WITNESSED);
+    }
     if full {
         let mut lines = vec![format!(
             "Not proven     {} limit(s) at {}",
@@ -706,11 +728,13 @@ mod tests {
         ContentHash::from_bytes([byte; 32])
     }
 
+    /// `closes`: Der Bereich ruht und schließt die Session; sonst weder.
     fn range(byte: u8, scope: &str, signature: SealSignature, closes: bool) -> RangeInput {
         RangeInput {
             seal: h(byte),
             scope: scope.into(),
             signature,
+            quiescence: closes.then_some(minds_core::Quiescence::Quiescent),
             closes_session: closes,
         }
     }
@@ -759,12 +783,77 @@ mod tests {
         let report = a2_report();
         assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
         let mut lines = vec![assurance_line(&report)];
-        lines.extend(not_proven_lines(report.overall, false));
+        lines.extend(not_proven_lines(report.overall, false, report.session_end));
         assert_eq!(
             lines.join("\n"),
             "Assurance      A2 witnessed   (minds-witness-user@build-07, profile user; intent signed, sk key)\n\
              Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)"
         );
+    }
+
+    /// A2 ohne Sessionende (EA-11): Der Bereich ruht (`Stop`), schließt aber
+    /// nicht — die Stufe bleibt A2, und `Not proven` nennt das Ende als
+    /// letzten Satz, kurz wie lang.
+    #[test]
+    fn verify_assurance_a2_without_session_end_names_it_under_not_proven() {
+        let ranges = [RangeInput {
+            closes_session: false,
+            ..range(1, SCOPE_WITNESS_V1, witness(), true)
+        }];
+        let starts = [WitnessStart {
+            profile: Some(WitnessProfile::User),
+            isolated: true,
+            key: None,
+        }];
+        let intent = IntentState::Bound {
+            anchor_id: ContentHash::from_bytes([0xa1; 32]),
+            chained: true,
+            signature: IntentSignature::Valid(SignerKind::SecurityKey),
+            snapshot_matches: true,
+            from_session_start: true,
+            changed_mid_session: false,
+        };
+        let report = assess(&AssuranceInput {
+            seals: Seals::Sealed(&ranges),
+            integrity: EvidenceVerdict::Verified,
+            chain_closed: true,
+            ledger: &LedgerCheck::Complete,
+            link: Some(EvidenceSource::Observed),
+            trusted_signers: true,
+            observations: &FsCoverage::Complete,
+            witness_starts: &starts,
+            intent: &intent,
+            replay: None,
+            anchors: None,
+        });
+        assert_eq!(report.overall, AssuranceLevel::A2Witnessed);
+        assert_eq!(report.session_end, SessionEnd::Open);
+        assert_eq!(
+            assurance_line(&report),
+            "Assurance      A2 witnessed   (minds-witness-user@build-07, profile user; intent signed, sk key)"
+        );
+        let short = not_proven_lines(report.overall, false, report.session_end);
+        assert_eq!(
+            short,
+            [
+                "Not proven     model identity · correctness of the decision · actions outside the boundary (minds verify --limits)"
+            ]
+        );
+        let full = not_proven_lines(report.overall, true, report.session_end);
+        let count = limits_at(AssuranceLevel::A2Witnessed.level()).count() + 1;
+        assert_eq!(
+            full[0],
+            format!("Not proven     {count} limit(s) at A2 witnessed")
+        );
+        assert_eq!(
+            full.last().map(String::as_str),
+            Some(
+                "  - Not that the session has ended: the last sealed range ends at a stop (the agent had finished answering), but no SessionEnd was witnessed — later events run into the next epoch, which the next checkpoint seals."
+            )
+        );
+        // Mit bezeugtem Ende fehlt der Satz.
+        let full = not_proven_lines(report.overall, true, SessionEnd::Witnessed);
+        assert_eq!(full.len(), count);
     }
 
     #[test]
@@ -834,10 +923,10 @@ mod tests {
 
     #[test]
     fn verify_limits_flag() {
-        let short = not_proven_lines(AssuranceLevel::A1Observed, false);
+        let short = not_proven_lines(AssuranceLevel::A1Observed, false, SessionEnd::Witnessed);
         assert_eq!(short.len(), 1);
         assert!(short[0].ends_with("(minds verify --limits)"), "{short:?}");
-        let full = not_proven_lines(AssuranceLevel::A1Observed, true);
+        let full = not_proven_lines(AssuranceLevel::A1Observed, true, SessionEnd::Witnessed);
         let count = limits_at(AssuranceLevel::A1Observed.level()).count();
         assert_eq!(
             full[0],
@@ -851,7 +940,7 @@ mod tests {
             .unwrap()
             .text;
         assert!(full.iter().any(|line| line.ends_with(append)));
-        let a2 = not_proven_lines(AssuranceLevel::A2Witnessed, true);
+        let a2 = not_proven_lines(AssuranceLevel::A2Witnessed, true, SessionEnd::Witnessed);
         assert!(!a2.iter().any(|line| line.ends_with(append)));
     }
 

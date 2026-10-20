@@ -1207,6 +1207,22 @@ pub const DOES_NOT_PROVE_V2: &[ProofSentence] = &[
     },
 ];
 
+/// Die eine Grenze, die nicht an der Stufe hängt, sondern am Material: Ob
+/// der Witness das **Ende** der Session gesehen hat (ein `SessionEnd` als
+/// letztes Event des letzten bezeugten Bereichs). Für A2 genügt, dass die
+/// Session beim Checkpoint ruhte (EA-11, `minds_reader::assurance`); fehlt
+/// das Ende, nennt `minds verify` diesen Satz unter `Not proven` — eine
+/// Information, kein Abzug. Kein Eintrag der Tabelle: [`limits_at`] kennt
+/// ihn nicht, der Aufrufer hängt ihn an, wenn der Report es sagt
+/// (`AssuranceReport::session_end`, `Open`).
+pub const SESSION_END_NOT_WITNESSED: ProofSentence = ProofSentence {
+    id: "session_end_not_witnessed",
+    short: "the session's end",
+    text: "Not that the session has ended: the last sealed range ends at a stop (the agent had finished answering), but no SessionEnd was witnessed — later events run into the next epoch, which the next checkpoint seals.",
+    holds_from: Level::A0,
+    holds_until: None,
+};
+
 /// Die Zusagen, die auf Stufe `level` gelten — in der Reihenfolge von
 /// [`PROVES_V2`].
 pub fn proves_at(level: Level) -> impl Iterator<Item = &'static ProofSentence> {

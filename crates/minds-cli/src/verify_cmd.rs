@@ -1188,7 +1188,7 @@ fn print_assurance(report: &minds_reader::assurance::AssuranceReport, run: &RunO
     if let Some(line) = issue_version_line(report, run) {
         println!("{line}");
     }
-    for line in assurance::not_proven_lines(report.overall, run.limits) {
+    for line in assurance::not_proven_lines(report.overall, run.limits, report.session_end) {
         println!("{line}");
     }
 }
