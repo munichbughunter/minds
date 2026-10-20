@@ -66,6 +66,14 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The protected witness started no more after a reinstall.** launchd
+  creates the daemon's stderr file `log/witness.err` (StandardErrorPath)
+  itself, under the service's umask 007 as 0660, and the witness refuses a
+  home with anything but 0700/0600 (`witness home requires private
+  directories and files`, exit 4, respawn loop). `minds witness init` now
+  creates the file with 0600 up front and pulls an existing one back to
+  0600 — also on a home whose configuration is unchanged, so a renewed
+  `MINDS_WITNESS=protected minds enable` repairs it.
 - **One assurance computation for every view.** `minds verify`, the
   Overview's INTEGRITY line, the Evidence report of a session and the
   binding line of the Requirements tab showed different levels for the same

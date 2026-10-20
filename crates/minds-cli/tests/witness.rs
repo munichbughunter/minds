@@ -341,6 +341,51 @@ fn witness_keygen_names_a_separated_witness_by_its_principal() {
     }
 }
 
+/// Der Systemdienst schreibt seinen stderr nach `log/witness.err`
+/// (`StandardErrorPath`). launchd legt die Datei selbst an — unter der Umask
+/// des Dienstes (007) als 0660 —, und der Witness verweigert dann jeden
+/// Start (alles im Home muss 0600 sein). `init` legt sie deshalb vorab mit
+/// 0600 an und zieht eine vorhandene mit Gruppenrechten darauf zurück — auch
+/// auf einem schon eingerichteten Home, dessen Konfiguration unverändert
+/// bleibt.
+#[cfg(unix)]
+#[test]
+fn witness_init_keeps_the_stderr_log_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("repo");
+    std::fs::create_dir(&root).unwrap();
+    git(&root, &["init", "-q", "--template="]);
+    let home = dir.path().join("home");
+    let init = || {
+        command(&root)
+            .args(["witness", "init", "--repo"])
+            .arg(&root)
+            .args(["--profile", "user", "--home"])
+            .arg(&home)
+            .output()
+            .unwrap()
+    };
+    let mode =
+        |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+    let first = init();
+    assert!(first.status.success(), "{}", text(&first));
+    let log = home.join("log").join("witness.err");
+    assert_eq!(mode(&log), 0o600, "angelegt mit 0600");
+
+    // Was launchd hinterlässt: dieselbe Datei mit Gruppenrechten.
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let second = init();
+    assert!(second.status.success(), "{}", text(&second));
+    assert!(
+        text(&second).contains("already initialized"),
+        "{}",
+        text(&second)
+    );
+    assert_eq!(mode(&log), 0o600, "auf 0600 zurückgezogen");
+}
+
 #[test]
 fn witness_keygen_home_resolution_and_strict_arguments() {
     let dir = tempfile::tempdir().unwrap();

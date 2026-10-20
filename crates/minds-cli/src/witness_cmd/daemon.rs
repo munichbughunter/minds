@@ -192,6 +192,38 @@ const DIRECTORIES: &[&str] = &[
     "log",
     "run",
 ];
+
+/// Die Datei unter `log/`, in die der Systemdienst den stderr des Witness
+/// schreibt (`StandardErrorPath` des LaunchDaemons, `enable_protected`).
+pub(crate) const STDERR_LOG: &str = "witness.err";
+
+/// Legt `log/witness.err` mit 0600 an oder zieht eine vorhandene darauf
+/// zurück. launchd legt die Datei sonst selbst an — unter der Umask des
+/// Dienstes (007) als 0660 —, und der Witness verweigert dann jeden Start
+/// (`validate_tree`: alles im Home 0700/0600). Idempotent; ein Symlink oder
+/// etwas anderes als eine gewöhnliche Datei bleibt ein Fehler, wie überall
+/// im Home.
+fn settle_stderr_log(home: &Path) -> Fallible<()> {
+    let log = home.join("log");
+    super::private_directory(&log)?;
+    let path = log.join(STDERR_LOG);
+    match private_new(&path) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let meta = fs::symlink_metadata(&path)?;
+            if meta.file_type().is_symlink() || !meta.is_file() {
+                return Err(
+                    "witness home must be owned by this user and contain no symlinks".into(),
+                );
+            }
+            if meta.mode() & 0o077 != 0 {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+            }
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
 /// Was `init` vorfand.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Initialized {
@@ -395,7 +427,14 @@ pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
 ///   würde instabil und vertagt), wird abgelehnt.
 pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<Initialized> {
     let mut note = (None, false);
+    // Ein eingerichtetes Home prüft `load` als Ganzes — die Log-Datei des
+    // Dienstes vorher zurechtrücken, sonst scheiterte gerade das `init`,
+    // das sie reparieren soll. Ein neues Home entsteht erst unten.
+    if fs::symlink_metadata(home.join("witness.json")).is_ok() {
+        settle_stderr_log(home)?;
+    }
     let mut initialized = init_config_noting(home, request, &mut note)?;
+    settle_stderr_log(home)?;
     let (Initialized::Created(pins) | Initialized::Unchanged(pins) | Initialized::Pinned(pins)) =
         &mut initialized;
     pins.intent_key_refused = note.0;
