@@ -297,6 +297,9 @@ fn evidence(evidence: Evidence) -> &'static str {
 /// Ende fallen weg, ein leerer Prompt wird zu einer leeren Zeile — der Ast
 /// braucht immer eine erste.
 fn prompt_lines(request: &str) -> Vec<String> {
+    // Ohne die `<pasted_content>`-Hülle von Claude Code — auch bei Sessions,
+    // die sie noch im Record tragen (siehe `minds_core::prompt`).
+    let request = minds_core::without_pasted_wrapper(request);
     let mut lines: Vec<String> = request
         .split('\n')
         .map(|line| line.strip_suffix('\r').unwrap_or(line))

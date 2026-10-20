@@ -190,7 +190,13 @@ fn provider_name(provider: &str) -> String {
 /// Leerer oder nur aus Leerraum bestehender Text ergibt einen ehrlichen
 /// Platzhalter statt einer leeren Überschrift — der Reader behauptet nie, es
 /// gäbe einen Prompt, wo keiner erfasst wurde.
+///
+/// Die `<pasted_content>`-Hülle von Claude Code zählt nicht als erste Zeile:
+/// Sessions, die vor dem Normalizer erfasst wurden, tragen sie noch im
+/// Record — die Überschrift zeigt trotzdem die Absicht, nicht das Tag
+/// ([`minds_core::without_pasted_wrapper`]).
 pub fn headline(request: &str, max: usize) -> String {
+    let request = minds_core::without_pasted_wrapper(request);
     let first = request
         .lines()
         .map(str::trim)
@@ -356,6 +362,20 @@ mod tests {
         assert_eq!(
             headline("Fix den Retry-Test", HEADLINE_MAX),
             "Fix den Retry-Test"
+        );
+    }
+
+    /// Eine vor dem Normalizer erfasste Session trägt die
+    /// `<pasted_content>`-Hülle noch im Record — die Überschrift zeigt
+    /// trotzdem die Absicht, nicht das Tag.
+    #[test]
+    fn a_pasted_content_wrapper_is_not_the_headline() {
+        assert_eq!(
+            headline(
+                "<pasted_content id=\"fb19\">\nFüge __author__ hinzu.\nNicht committen.\n</pasted_content>",
+                HEADLINE_MAX
+            ),
+            "Füge __author__ hinzu."
         );
     }
 

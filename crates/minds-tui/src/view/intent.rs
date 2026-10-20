@@ -347,7 +347,8 @@ fn sessions_block(lines: &mut Vec<Line<'static>>, app: &App, info: &IntentInfo, 
                 }
                 head.push(Span::styled(format!(" · ({how})"), theme::dim()));
                 lines.push(Line::from(head));
-                let request = minds_reader::sanitize(&s.intent.request);
+                let request =
+                    minds_reader::sanitize(&minds_core::without_pasted_wrapper(&s.intent.request));
                 let request = request.lines().next().unwrap_or_default();
                 lines.push(Line::from(vec![
                     Span::raw("    "),

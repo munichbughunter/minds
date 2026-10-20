@@ -64,6 +64,9 @@ pub use extract::{CoChange, CommandFact, Correction, Extract, FileFact, Rework, 
 pub mod markdown;
 pub use markdown::session_markdown;
 
+pub mod prompt;
+pub use prompt::without_pasted_wrapper;
+
 mod change;
 pub use change::{CHANGE_ID_PREFIX, ChangeId, ChangeIdParseError};
 

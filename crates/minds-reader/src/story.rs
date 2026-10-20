@@ -451,7 +451,13 @@ impl Story {
 
         Self {
             id,
-            prompt: sanitize_lines(hide_paths(&session.intent.request, cwd).split('\n')),
+            prompt: sanitize_lines(
+                hide_paths(
+                    &minds_core::without_pasted_wrapper(&session.intent.request),
+                    cwd,
+                )
+                .split('\n'),
+            ),
             started_at,
             ended_at,
             duration_secs,
