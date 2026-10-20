@@ -175,6 +175,36 @@ impl Context {
         resolve(&self.root, rev)
     }
 
+    /// Die Sessions hinter einer **Datei**, aufgelöst wie `minds blame`: jede
+    /// Zeile per Blame zu ihrem Commit, jeder Commit zu seinen Sessions
+    /// (Trailer und Store-Index), ohne Doppelte, in der Reihenfolge, in der
+    /// die Commits in der Datei zuerst auftreten. Der Pfad ist dabei
+    /// **repo-relativ**, nicht relativ zum Arbeitsverzeichnis — dieselbe
+    /// Lesart wie bei `blame` und in `produced.files`, damit ein Aufruf aus
+    /// einem Unterverzeichnis dasselbe findet wie einer aus der Wurzel.
+    ///
+    /// Leer, wenn HEAD keinen Commit hat oder die Datei dort nicht liegt —
+    /// kein Fehler: Der Aufrufer probiert dann die nächste Deutung.
+    pub fn sessions_of_file(&self, path: &str) -> Fallible<(Vec<Session>, Skipped)> {
+        let mut skipped = Skipped::default();
+        let Some(head) = self.repo.head()?.commit() else {
+            return Ok((Vec::new(), skipped));
+        };
+        let lines = self.repo.blame().blame_file(head, path)?;
+        let mut seen: BTreeSet<SessionId> = BTreeSet::new();
+        let mut out = Vec::new();
+        for commit in unique_commits(lines.iter().map(|line| line.commit)) {
+            let (linked, s) = self.linked_sessions(commit)?;
+            skipped.merge(s);
+            for (id, session) in linked {
+                if seen.insert(id) {
+                    out.push(session);
+                }
+            }
+        }
+        Ok((out, skipped))
+    }
+
     /// Der Commit hinter `datei:zeile` via Blame — `None`, wenn HEAD leer ist
     /// oder die Zeile nicht auflösbar.
     pub fn blame_commit(&self, path: &str, line: u32) -> Fallible<Option<CommitId>> {
@@ -183,6 +213,17 @@ impl Context {
         };
         Ok(self.repo.blame().blame_line(head, path, line)?)
     }
+}
+
+/// Die Commits eines Blames ohne Doppelte, in der Reihenfolge ihres ersten
+/// Auftretens — so folgt die Reihenfolge der Sessions der Datei, nicht dem
+/// Zufall einer Hash-Menge.
+fn unique_commits(commits: impl IntoIterator<Item = CommitId>) -> Vec<CommitId> {
+    let mut seen: BTreeSet<CommitId> = BTreeSet::new();
+    commits
+        .into_iter()
+        .filter(|commit| seen.insert(*commit))
+        .collect()
 }
 
 /// `true`, wenn die Session `path` verändert hat — über die erzeugten Dateien
@@ -241,8 +282,19 @@ fn resolve(root: &Path, rev: &str) -> Option<CommitId> {
 
 #[cfg(test)]
 mod tests {
-    use super::Skipped;
+    use super::{Skipped, unique_commits};
     use minds_core::SessionId;
+    use minds_git::CommitId;
+
+    /// Die Commits einer Datei kommen in der Reihenfolge ihres ersten
+    /// Auftretens, jeder einmal — nicht sortiert, nicht gezählt.
+    #[test]
+    fn blame_commits_are_unique_and_keep_first_appearance_order() {
+        let cid = |c: char| c.to_string().repeat(40).parse::<CommitId>().unwrap();
+        let lines = ['b', 'a', 'b', 'c', 'a'].map(cid);
+        assert_eq!(unique_commits(lines), vec![cid('b'), cid('a'), cid('c')]);
+        assert!(unique_commits(Vec::new()).is_empty());
+    }
 
     fn sid(hex: char) -> SessionId {
         format!("b3-{}", hex.to_string().repeat(64))

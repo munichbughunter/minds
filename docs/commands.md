@@ -266,6 +266,8 @@ minds recall <target>
 
 Condenses the session(s) behind a file, a line (`<file>:<line>`), or a commit into a short context brief. Deterministic and costs 0 tokens — the agent-facing sibling of `why`.
 
+A file is resolved like `minds blame`: the path is **relative to the repository root**, not to the working directory (`minds recall src/sort.py` finds the same sessions from any subdirectory), and the sessions come from the blame of the whole file — every line to its commit, every commit to its sessions (trailer and store index), in the order the commits first appear in the file — plus the sessions whose record names the file (work not committed yet).
+
 Includes the complete intent request, preserving multiple lines. Terminal output is
 sanitized and wrapped to the terminal width (`COLUMNS` or 80 columns as a fallback).
 
