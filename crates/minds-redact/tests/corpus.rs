@@ -1391,6 +1391,8 @@ fn the_whole_corpus_as_one_session_is_fail_closed() {
             text: case.text.clone(),
             tool_calls: vec![
                 ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     capture: None,
                     name: "bash".into(),
@@ -1903,6 +1905,8 @@ fn a_secret_survives_json_serialization_as_a_tool_argument() {
             role: Role::Assistant,
             text: String::new(),
             tool_calls: vec![ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "Bash".into(),
@@ -2130,6 +2134,8 @@ fn fuzz_an_injected_secret_never_survives() {
 /// Ein Bash-Aufruf mit Runner-Ergebnis und sauberen `arguments`.
 fn runner_call(command: Vec<String>, bench: &str) -> ToolCall {
     ToolCall {
+        at: None,
+        ended_at: None,
         outcome: Some(ExecOutcome {
             class: ExecClass::Bench,
             runner: "cargo-bench-criterion".into(),

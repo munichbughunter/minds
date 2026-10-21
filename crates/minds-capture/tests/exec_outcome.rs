@@ -610,3 +610,24 @@ fn outcome_records_the_cwd_relative_to_the_repo_root() {
     let session = session_of(&[fixture!("bash-cargo-test-pass")]);
     assert_eq!(calls(&session)[0].outcome.as_ref().unwrap().cwd, None);
 }
+
+/// Jeder Aufruf trägt seine Zeiten: `at` vom Pre-Event, `ended_at` vom
+/// eindeutig zugeordneten Post-Event — die Ränder des Fensters, in dem der
+/// Reader Beobachtungen des Datei-Beobachters dem Bash-Aufruf zuordnet.
+/// Ohne Post-Event bleibt `ended_at` leer (kein Fenster, fail-closed).
+#[test]
+fn call_times_come_from_the_pre_and_post_events() {
+    let pair = fixture!("bash-cargo-test-pass");
+    let call = single_call(pair);
+    assert_eq!(call.at, Some(at(0).0));
+    assert_eq!(call.ended_at, Some(at(1).0));
+
+    let tmp = tempfile::tempdir().unwrap();
+    let journal = Journal::open(tmp.path());
+    feed(&journal, pair.0, 0);
+    let session = checkpoint(&journal);
+    let calls = calls(&session);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].at, Some(at(0).0));
+    assert_eq!(calls[0].ended_at, None, "ohne Post-Event kein Ende");
+}

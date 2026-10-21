@@ -11,8 +11,15 @@
 //! `reported only` (ein Tool-Claim mit passendem Schreibzeit-Hash, aber ohne
 //! Zeugen). Beobachtungen des Datei-Beobachters (EA-08) heben eine Datei zu
 //! `explained` bzw. `explained (fs only)` — nur aus Witness-signierten Seals;
-//! die Abstufung nach Belegstärke ist Sache der Assurance-Zeile (EA-12),
-//! nicht dieser Zählung.
+//! eine Beobachtung im Fenster eines Shell-Aufrufs ist `explained` mit
+//! diesem Aufruf als Herkunft. Die Abstufung nach Belegstärke ist Sache der
+//! Assurance-Zeile (EA-12), nicht dieser Zählung.
+//!
+//! Mit `--allow-heuristic` zählen zum **Gate** zusätzlich die Zeilen, für
+//! die nur die Heuristik „ein Shell-Befehl erwähnt die Datei" spricht
+//! ([`minds_reader::reconcile::GapCounts::heuristic`]). Sie bleiben
+//! `unexplained` — in Klasse, Detailzeilen und Assurance; eine eigene Zeile
+//! nennt, wie viele das Gate so hinzurechnet. Heuristik bleibt Heuristik.
 //!
 //! # Terminal-Härtung
 //!
@@ -48,6 +55,8 @@ pub(crate) struct Artifact {
     structural: Vec<Structural>,
     /// `--all`: Detailzeilen nicht kappen.
     all: bool,
+    /// `--allow-heuristic`: heuristische Zeilen zählen zum Gate.
+    allow_heuristic: bool,
     /// Der Aufruf, der genau diesen Abgleich ungekappt wiederholt — Ziel
     /// und voller Commit-Hash, nie ein (womöglich mehrdeutiges) Kürzel.
     rerun: String,
@@ -76,6 +85,7 @@ pub(crate) fn assess(
     sessions: &[&Session],
     observations: &[minds_reader::reconcile::FsObservation],
     all: bool,
+    allow_heuristic: bool,
     rerun: String,
 ) -> Fallible<Result<Artifact, &'static str>> {
     let spellings = root_spellings(&ctx.root);
@@ -86,6 +96,7 @@ pub(crate) fn assess(
                 recon: assessed.recon,
                 structural: assessed.structural,
                 all,
+                allow_heuristic,
                 rerun,
             },
         ),
@@ -97,9 +108,23 @@ impl Artifact {
         self.recon.total_changed_lines
     }
 
-    /// Geänderte Zeilen mit irgendeinem Beleg (siehe Modul-Doku).
+    /// Geänderte Zeilen mit irgendeinem Beleg (siehe Modul-Doku) — mit
+    /// `--allow-heuristic` auch die nur heuristisch zugeordneten.
     fn explained(&self) -> u64 {
-        self.recon.backed_lines()
+        self.recon
+            .backed_lines()
+            .saturating_add(self.heuristic())
+            .min(self.total())
+    }
+
+    /// Die Zeilen, die `--allow-heuristic` dem Gate hinzurechnet: 0 ohne den
+    /// Schalter.
+    fn heuristic(&self) -> u64 {
+        if self.allow_heuristic {
+            self.recon.unexplained_by_gap().heuristic()
+        } else {
+            0
+        }
     }
 
     /// Jeder geänderte Pfad des Commits — auch die ohne Blob-Inhalt
@@ -201,8 +226,19 @@ impl Artifact {
             .map(|d| d.location.chars().count())
             .max()
             .unwrap_or(0);
+        // Was das Gate über die Belege hinaus zählt — gesagt, nie
+        // stillschweigend.
+        let heuristic = Some(self.heuristic())
+            .filter(|n| *n > 0)
+            .map(|n| {
+                format!(
+                    "  {:<KIND_WIDTH$}{n} line(s) counted for the gate by --allow-heuristic: only a shell command mentions the file — heuristic, not evidence",
+                    "heuristic"
+                )
+            });
         let mut lines: Vec<String> = why
             .into_iter()
+            .chain(heuristic)
             .chain(shown.iter().map(|d| {
                 format!(
                     "  {:<KIND_WIDTH$}{:<width$}  {}",
@@ -323,6 +359,7 @@ mod tests {
             removes: false,
             last_observed: None,
             gap: None,
+            exec: None,
         }
     }
 
@@ -349,6 +386,7 @@ mod tests {
             },
             structural: Vec::new(),
             all,
+            allow_heuristic: false,
             rerun: "minds verify 1234567890123456789012345678901234567890 --all".into(),
         }
     }

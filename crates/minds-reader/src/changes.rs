@@ -73,6 +73,10 @@ pub struct FileDiff {
     pub class: Option<ReconClass>,
     /// Warum ihre unerklärten Zeilen unerklärt sind.
     pub gap: Option<Gap>,
+    /// Der Shell-Aufruf, in dessen Fenster der Witness die Commit-Fassung
+    /// sah ([`FileRecon::exec`]) — die Datei ist dann `● observed` ohne
+    /// Tool-Claim.
+    pub exec: Option<LineSource>,
     /// Warum keine Zeilen da sind: Binärdatei, zu groß, Submodul, …
     pub note: Option<String>,
     /// Die Zeilen, in Diff-Reihenfolge.
@@ -265,6 +269,10 @@ pub struct LineReason {
     pub call: usize,
     /// Das Werkzeug (`Write`, `Edit`, …), entschärft.
     pub tool: String,
+    /// Bei einem Shell-Aufruf (Exec): das Kommando aus den Argumenten,
+    /// entschärft, einzeilig, gekürzt — `None` bei jedem anderen Aufruf
+    /// und wenn die Argumente kein `command` tragen.
+    pub command: Option<String>,
     /// Wann der Turn war.
     pub at: Option<String>,
     /// Was der Agent zu diesem Schritt schrieb — der Text des Turns oder,
@@ -277,6 +285,20 @@ pub struct LineReason {
     /// Der Anker, an den die Session sich gebunden nennt (Record,
     /// ungeprüft) — Witness-Event vor lokaler Datei.
     pub anchor: Option<crate::intent::BoundAnchor>,
+}
+
+/// So viele Zeichen des Kommandos eines Shell-Aufrufs zeigt die Why-Box.
+const COMMAND_LIMIT: usize = 120;
+
+/// Das Kommando eines Shell-Aufrufs aus seinen Argumenten (`command`, bei
+/// Codex' Unified-Exec `cmd`) — nur Text, kein Parsen des Befehls.
+fn command_of(arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    value
+        .get("command")
+        .or_else(|| value.get("cmd"))
+        .and_then(|c| c.as_str())
+        .map(str::to_owned)
 }
 
 /// Eine Zeile für die Anzeige: Tabs als vier Leerzeichen, dann entschärft.
@@ -413,6 +435,7 @@ impl crate::Inspection {
                 removed: 0,
                 class: recon.map(|r| r.class),
                 gap: recon.and_then(|r| r.gap),
+                exec: recon.and_then(|r| r.exec),
                 note: None,
                 rows: Vec::new(),
             };
@@ -526,6 +549,12 @@ impl crate::Inspection {
             turn: source.turn,
             call: source.call,
             tool: one_line(&call.name, 40),
+            command: call
+                .effect
+                .as_ref()
+                .filter(|e| e.kind == minds_core::EffectKind::Exec)
+                .and_then(|_| command_of(&call.arguments))
+                .map(|c| one_line(&c, COMMAND_LIMIT)),
             at: turn.at.as_deref().map(|at| one_line(at, 40)),
             said,
             said_turn,
@@ -577,6 +606,7 @@ mod tests {
             removed: 0,
             class: None,
             gap: None,
+            exec: None,
             note: None,
             rows,
         }

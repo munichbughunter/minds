@@ -59,6 +59,8 @@ fn session_with(outcomes: Vec<ExecOutcome>) -> Session {
             role: Role::Assistant,
             text: String::new(),
             tool_calls: vec![ToolCall {
+                at: None,
+                ended_at: None,
                 name: "Bash".into(),
                 arguments: String::new(),
                 capture: None,

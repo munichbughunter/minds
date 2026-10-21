@@ -126,6 +126,8 @@ impl Fixture {
             role: minds_core::Role::Assistant,
             text: String::new(),
             tool_calls: vec![minds_core::ToolCall {
+                at: None,
+                ended_at: None,
                 name: "Bash".into(),
                 arguments: format!(r#"{{"command":"{}"}}"#, command.join(" ")),
                 capture: None,

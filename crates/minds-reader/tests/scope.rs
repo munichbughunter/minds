@@ -19,6 +19,8 @@ use ScopeSource::*;
 
 fn call(kind: EffectKind, path: &str) -> ToolCall {
     ToolCall {
+        at: None,
+        ended_at: None,
         outcome: None,
         name: if kind == EffectKind::Delete {
             "Delete"

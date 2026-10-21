@@ -240,6 +240,8 @@ mod tests {
 
     fn call(name: &str, kind: EffectKind, path: &str) -> ToolCall {
         ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: name.into(),

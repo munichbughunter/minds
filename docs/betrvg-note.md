@@ -115,8 +115,8 @@ Witness berichtet haben. Jede Zeile bekommt eine Klasse:
 
 | Klasse | Bedeutung |
 |---|---|
-| `explained` | Der Witness hat den Stand beobachtet, und ein Werkzeugaufruf des Agenten hat genau diese Bytes geschrieben. |
-| `explained (fs only)` | Der Witness hat den Stand beobachtet, ohne passenden Werkzeugaufruf. |
+| `explained` | Der Witness hat den Stand beobachtet, und ein Werkzeugaufruf des Agenten hat genau diese Bytes geschrieben — oder die Beobachtung fiel in das Zeitfenster eines Shell-Aufrufs des Agenten (Heredoc, `tee`, `sed -i`), dem sie dann zugeordnet ist. |
+| `explained (fs only)` | Der Witness hat den Stand beobachtet, ohne passenden Werkzeugaufruf und außerhalb jedes Shell-Fensters. |
 | `reported only` | Keine Beobachtung des Witness; der Bericht des Agenten passt. |
 | `unexplained` | Die Belege fehlen oder widersprechen dem committeten Stand. |
 

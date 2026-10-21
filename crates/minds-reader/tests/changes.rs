@@ -44,6 +44,8 @@ type Row<'a> = (
 
 fn write(path: &str, text: &str) -> ToolCall {
     ToolCall {
+        at: None,
+        ended_at: None,
         outcome: None,
         name: "Write".into(),
         arguments: json!({ "content": text }).to_string(),

@@ -19,6 +19,8 @@ fn commit() -> CommitId {
 }
 fn call(name: &str, path: &str, arguments: serde_json::Value, written: Option<&[u8]>) -> ToolCall {
     ToolCall {
+        at: None,
+        ended_at: None,
         outcome: None,
         name: name.into(),
         arguments: arguments.to_string(),
@@ -1520,6 +1522,7 @@ fn every_unexplained_file_names_why() {
         counts,
         GapCounts {
             after_agent: 2,
+            after_agent_shell: 1,
             witness_other: 1,
             shell: 1,
             untouched: 2,
@@ -1527,6 +1530,7 @@ fn every_unexplained_file_names_why() {
         }
     );
     assert_eq!(counts.total(), result.unexplained_lines());
+    assert_eq!(counts.heuristic(), 2);
 }
 
 /// Die Heuristik nennt nur ganze Pfade oder Dateinamen — kein Präfix — und
@@ -1949,4 +1953,304 @@ fn an_overlong_path_word_marks_the_search_incomplete() {
         gap_of(&result, "src/a.rs"),
         Some(Gap::Untouched { complete: false })
     );
+}
+
+// ---------------------------------------------------------------------------
+// Beobachtungen im Fenster eines Shell-Aufrufs
+// ---------------------------------------------------------------------------
+
+/// Ein Shell-Aufruf mit Pre- und Post-Zeit — das Fenster, dem der Witness
+/// seine Beobachtungen zuordnet.
+fn exec_at(command: &str, at: &str, ended_at: &str) -> ToolCall {
+    let mut call = exec(command);
+    call.at = Some(at.into());
+    call.ended_at = Some(ended_at.into());
+    call
+}
+
+/// Eine Beobachtung mit Zeitstempel (ohne Inhalt, wie der Witness sie
+/// ablegt).
+fn observed_at(path: &str, bytes: &[u8], at: &str) -> FsObservation {
+    let mut o = observation(path, Some(bytes), 1);
+    o.observed.at = Some(at.into());
+    o.content = None;
+    o
+}
+
+fn source_of(file: &FileRecon, line: u32) -> Option<LineSource> {
+    match &file.line_level {
+        LineLevel::Available(lines) => lines
+            .iter()
+            .find(|l| l.line == line)
+            .and_then(|l| l.source.as_deref().copied()),
+        other => panic!("expected lines, got {other:?}"),
+    }
+}
+
+/// Ein Heredoc-Schreibzugriff: Der Witness sah die Commit-Fassung im
+/// Fenster `[Pre − 2 s, Post + 5 s]` des Bash-Aufrufs — `● observed`, dem
+/// Aufruf zugeordnet, jede Zeile mit ihm als Herkunft. Dieselbe
+/// Beobachtung außerhalb jedes Fensters bleibt `fs only` ohne Herkunft.
+#[test]
+fn a_frame_in_the_window_of_a_shell_call_is_observed_and_attributed() {
+    let agent = session(vec![
+        exec_at(
+            "cargo build",
+            "2026-10-02T10:00:00Z",
+            "2026-10-02T10:00:05Z",
+        ),
+        exec_at(
+            "cat > gen.rs <<'EOF'\nfn gen() {}\nEOF",
+            "2026-10-02T10:00:20Z",
+            "2026-10-02T10:00:21Z",
+        ),
+    ]);
+    let changed = [file("gen.rs", None, Some(b"fn gen() {}\n"))];
+    let in_window = |at: &str| {
+        reconcile_with_sources(&ReconInput {
+            commit: commit(),
+            base: None,
+            changed: &changed,
+            sessions: &[&agent],
+            observations: &[observed_at("gen.rs", b"fn gen() {}\n", at)],
+            roots: &[],
+        })
+    };
+    // Innerhalb (die Ränder eingeschlossen): Pre − 2 s … Post + 5 s.
+    for at in [
+        "2026-10-02T10:00:18Z",
+        "2026-10-02T10:00:20.5Z",
+        "2026-10-02T10:00:26Z",
+    ] {
+        let result = in_window(at);
+        let file = &result.files[0];
+        assert_eq!(file.class, Explained, "{at}");
+        assert_eq!(lines(file), [(1, Explained)], "{at}");
+        let bash = file.exec.expect("attributed to the heredoc call");
+        assert_eq!((bash.turn, bash.call), (0, 1), "{at}");
+        assert_eq!(source_of(file, 1), Some(bash), "{at}");
+        assert_eq!((result.explained_lines, result.total_changed_lines), (1, 1));
+    }
+    // Ein Fenster, das die Datei nicht nennt, genügt — die Zuordnung ist
+    // eine über die Zeit: 10:00:10 ist der letzte Augenblick von `cargo
+    // build` (Post 10:00:05 + 5 s).
+    let build = in_window("2026-10-02T10:00:10Z");
+    assert_eq!(build.files[0].class, Explained);
+    assert_eq!(build.files[0].exec.map(|s| s.call), Some(0));
+    // Außerhalb jedes Fensters: beobachtet, aber niemandem zugeordnet.
+    for at in [
+        "2026-10-02T10:00:17.999Z",
+        "2026-10-02T10:00:26.001Z",
+        "2026-10-02T10:00:12Z",
+    ] {
+        let result = in_window(at);
+        let file = &result.files[0];
+        assert_eq!(file.class, ExplainedFsOnly, "{at}");
+        assert_eq!(lines(file), [(1, ExplainedFsOnly)], "{at}");
+        assert_eq!(file.exec, None, "{at}");
+        assert_eq!(source_of(file, 1), None, "{at}");
+        assert_eq!(result.explained_lines, 1, "fs only counts as explained");
+    }
+    // Ohne Zeit an der Beobachtung: kein Fenster.
+    let timeless = reconcile(&ReconInput {
+        commit: commit(),
+        base: None,
+        changed: &changed,
+        sessions: &[&agent],
+        observations: &[observation("gen.rs", Some(b"fn gen() {}\n"), 1)],
+        roots: &[],
+    });
+    assert_eq!(timeless.files[0].class, ExplainedFsOnly);
+    assert_eq!(timeless.files[0].exec, None);
+}
+
+/// Ein Shell-Aufruf ohne Pre-Zeit (ältere Session) oder ohne Post-Zeit
+/// mit einem Aufruf danach öffnet kein Fenster — fail-closed `fs only`.
+/// Nur der **letzte** Aufruf ohne Post-Zeit ist offen: Der Agent hat aus
+/// ihm heraus committet, der Seal kam vor seinem Post-Event — alles, was
+/// der Witness ab seinem Beginn sah, gehört ihm.
+#[test]
+fn a_shell_call_without_both_times_opens_no_window() {
+    let at = "2026-10-02T10:00:21Z";
+    // Offen beim Seal: `cat > gen.rs <<EOF … && git commit` in einem Aufruf.
+    let mut open = exec("cat > gen.rs <<'EOF'\nb\nEOF\ngit add gen.rs && git commit -m x");
+    open.at = Some("2026-10-02T10:00:20Z".into());
+    let result = run(
+        &[file("gen.rs", None, Some(b"b\n"))],
+        &[&session(vec![open.clone()])],
+        &[observed_at("gen.rs", b"b\n", at)],
+    );
+    assert_eq!(result.files[0].class, Explained);
+    assert_eq!(result.files[0].exec.map(|s| s.call), Some(0));
+    // Derselbe offene Aufruf mit einem Nachfolger: kein Fenster.
+    let result = run(
+        &[file("gen.rs", None, Some(b"b\n"))],
+        &[&session(vec![
+            open,
+            exec_at("cargo test", "2026-10-02T10:00:30Z", "2026-10-02T10:00:31Z"),
+        ])],
+        &[observed_at("gen.rs", b"b\n", at)],
+    );
+    assert_eq!(result.files[0].class, ExplainedFsOnly);
+    for (pre, post) in [(None, Some("2026-10-02T10:00:22Z")), (None, None)] {
+        let mut call = exec("sed -i '' s/a/b/ gen.rs");
+        call.at = pre.map(str::to_owned);
+        call.ended_at = post.map(str::to_owned);
+        let agent = session(vec![call]);
+        let result = run(
+            &[file("gen.rs", None, Some(b"b\n"))],
+            &[&agent],
+            &[observed_at("gen.rs", b"b\n", at)],
+        );
+        assert_eq!(result.files[0].class, ExplainedFsOnly, "{pre:?} {post:?}");
+        assert_eq!(result.files[0].exec, None);
+    }
+}
+
+/// Zwei Shell-Aufrufe, deren Fenster sich überlappen (parallel abgesetzt):
+/// Die Beobachtung gehört dem, der den Pfad nennt — nennen ihn beide oder
+/// keiner, bleibt die Datei beobachtet, aber ohne Aufruf (`fs only`).
+#[test]
+fn overlapping_shell_windows_need_a_unique_mention_to_attribute() {
+    let at = "2026-10-02T10:00:21Z";
+    let observed = [observed_at("out/gen.txt", b"generated\n", at)];
+    let changed = [file("out/gen.txt", None, Some(b"generated\n"))];
+    let run_with = |first: &str, second: &str| {
+        run(
+            &changed,
+            &[&session(vec![
+                exec_at(first, "2026-10-02T10:00:20Z", "2026-10-02T10:00:30Z"),
+                exec_at(second, "2026-10-02T10:00:20Z", "2026-10-02T10:00:30Z"),
+            ])],
+            &observed,
+        )
+    };
+    // Genau einer nennt den Pfad.
+    let result = run_with("cargo test", "python3 gen.py > out/gen.txt");
+    assert_eq!(result.files[0].class, Explained);
+    assert_eq!(result.files[0].exec.map(|s| s.call), Some(1));
+    // Keiner — oder beide: keine Zuordnung, aber beobachtet.
+    for (first, second) in [
+        ("cargo test", "cargo doc"),
+        ("touch out/gen.txt", "python3 gen.py > out/gen.txt"),
+    ] {
+        let result = run_with(first, second);
+        assert_eq!(result.files[0].class, ExplainedFsOnly, "{first} / {second}");
+        assert_eq!(result.files[0].exec, None);
+    }
+}
+
+/// Erst ein Write-Claim, dann ein `sed -i` im Fenster: Die Zeilen des
+/// Claims behalten ihre Herkunft, die geänderte Zeile gehört dem
+/// Shell-Aufruf — und die Datei ist `● observed` durch ihn, nicht durch den
+/// Claim, dessen Hash nicht mehr passt.
+#[test]
+fn a_shell_edit_after_a_claim_keeps_the_claims_lines_and_owns_the_rest() {
+    let mut written = write("a.rs", "one\ntwo\nthree\n");
+    written.at = Some("2026-10-02T10:00:00Z".into());
+    written.ended_at = Some("2026-10-02T10:00:01Z".into());
+    let agent = session(vec![
+        written,
+        exec_at(
+            "sed -i '' s/two/TWO/ a.rs",
+            "2026-10-02T10:00:10Z",
+            "2026-10-02T10:00:11Z",
+        ),
+    ]);
+    let changed = [file("a.rs", None, Some(b"one\nTWO\nthree\n"))];
+    let result = reconcile_with_sources(&ReconInput {
+        commit: commit(),
+        base: None,
+        changed: &changed,
+        sessions: &[&agent],
+        observations: &[observed_at(
+            "a.rs",
+            b"one\nTWO\nthree\n",
+            "2026-10-02T10:00:12Z",
+        )],
+        roots: &[],
+    });
+    let file = &result.files[0];
+    assert_eq!(file.class, Explained);
+    assert_eq!(
+        lines(file),
+        [(1, Explained), (2, Explained), (3, Explained)]
+    );
+    let bash = file.exec.expect("the sed call explains the file");
+    assert_eq!(bash.call, 1);
+    assert_eq!(source_of(file, 1).map(|s| s.call), Some(0));
+    assert_eq!(source_of(file, 2), Some(bash));
+    assert_eq!(source_of(file, 3).map(|s| s.call), Some(0));
+    // Ein Write-Claim, der die Commit-Fassung selbst trägt, erklärt sie —
+    // der Shell-Aufruf wird dann nicht genannt.
+    let agent = session(vec![
+        write("a.rs", "one\nTWO\nthree\n"),
+        exec_at("cargo fmt", "2026-10-02T10:00:10Z", "2026-10-02T10:00:11Z"),
+    ]);
+    let result = reconcile(&ReconInput {
+        commit: commit(),
+        base: None,
+        changed: &changed,
+        sessions: &[&agent],
+        observations: &[observed_at(
+            "a.rs",
+            b"one\nTWO\nthree\n",
+            "2026-10-02T10:00:12Z",
+        )],
+        roots: &[],
+    });
+    assert_eq!(result.files[0].class, Explained);
+    assert_eq!(result.files[0].exec, None);
+}
+
+/// Die Heuristik „ein Shell-Befehl erwähnt die Datei" bleibt Claim-Seite:
+/// Ohne Beobachtung macht kein Fenster eine Zeile zu `observed`, und die
+/// Zählung der heuristischen Zeilen ([`GapCounts::heuristic`]) nennt genau
+/// sie — für `--allow-heuristic`, nie für eine Klasse.
+#[test]
+fn the_shell_mention_heuristic_never_becomes_an_observation() {
+    let agent = session(vec![
+        write("src/fmt.rs", "x\n"),
+        exec_at(
+            "cargo fmt -- src/fmt.rs && python3 gen.py > out/gen.txt",
+            "2026-10-02T10:00:20Z",
+            "2026-10-02T10:00:21Z",
+        ),
+    ]);
+    let result = run(
+        &[
+            file("src/fmt.rs", None, Some(b"y\n")),
+            file("out/gen.txt", None, Some(b"generated\n")),
+            file("hand.rs", None, Some(b"a\n")),
+        ],
+        &[&agent],
+        &[],
+    );
+    for file in &result.files {
+        assert_eq!(file.class, Unexplained, "{}", file.path);
+        assert_eq!(file.exec, None, "{}", file.path);
+    }
+    assert!(matches!(
+        gap_of(&result, "src/fmt.rs"),
+        Some(Gap::AfterAgent {
+            later_shell: Some(_)
+        })
+    ));
+    assert!(matches!(
+        gap_of(&result, "out/gen.txt"),
+        Some(Gap::Shell(_))
+    ));
+    let counts = result.unexplained_by_gap();
+    assert_eq!(
+        counts,
+        GapCounts {
+            after_agent: 1,
+            after_agent_shell: 1,
+            shell: 1,
+            untouched: 1,
+            ..GapCounts::default()
+        }
+    );
+    assert_eq!(counts.heuristic(), 2);
+    assert_eq!(counts.total(), 3);
 }

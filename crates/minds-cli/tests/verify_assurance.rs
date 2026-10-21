@@ -163,6 +163,8 @@ impl Fixture {
         let tool_calls = claim
             .map(|bytes| {
                 vec![minds_core::ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     name: "Write".into(),
                     arguments: String::new(),

@@ -1405,6 +1405,8 @@ mod tests {
             text: "Ok".into(),
             tool_calls: vec![
                 ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     capture: None,
                     name: "Bash".into(),
@@ -1419,6 +1421,8 @@ mod tests {
                     }),
                 },
                 ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     capture: None,
                     name: "Edit".into(),
@@ -1797,6 +1801,7 @@ mod tests {
             removes: false,
             last_observed: None,
             gap: None,
+            exec: None,
         }
     }
 

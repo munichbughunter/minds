@@ -68,6 +68,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 
 fn write(path: &str, text: &str) -> ToolCall {
     ToolCall {
+        at: None,
+        ended_at: None,
         outcome: None,
         name: "Write".into(),
         arguments: serde_json::json!({ "content": text }).to_string(),
@@ -284,6 +286,103 @@ fn reconcile_with_observations_end_to_end() {
     );
     // Strikt lesend: kein Ref bewegt.
     assert_eq!(git(dir.path(), &["show-ref"]), before);
+}
+
+/// Ein Heredoc über die Shell, mit laufendem Witness: Der Beobachter sah
+/// die Datei im Fenster des Bash-Aufrufs — `explained` (●), dem Aufruf
+/// zugeordnet, und `corroborations` nennt nichts `uncorroborated`: Ein
+/// Shell-Aufruf hat keinen Schreib-Claim, der bestätigt werden müsste.
+#[test]
+fn a_shell_write_seen_in_the_calls_window_is_explained_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let heredoc = ToolCall {
+        at: Some("2026-10-02T10:00:01Z".into()),
+        ended_at: Some("2026-10-02T10:00:02Z".into()),
+        outcome: None,
+        name: "Bash".into(),
+        arguments: serde_json::json!({ "command": "cat > gen.rs <<'EOF'\nfn gen() {}\nEOF" })
+            .to_string(),
+        capture: None,
+        effect: Some(Effect {
+            kind: EffectKind::Exec,
+            path: None,
+            content: None,
+            written: None,
+            written_unavailable: None,
+            written_at: None,
+        }),
+    };
+    // Ein zweiter Aufruf, dicht dahinter: Sein Fenster `[10:00:02,
+    // 10:00:09.5]` überlappt das des Heredocs `[09:59:59, 10:00:07]`.
+    let mut later = heredoc.clone();
+    later.at = Some("2026-10-02T10:00:04Z".into());
+    later.ended_at = Some("2026-10-02T10:00:04.5Z".into());
+    later.arguments = serde_json::json!({ "command": "cargo build" }).to_string();
+    let agent = session(vec![heredoc, later]);
+    let redacted = minds_redact::RedactionConfig::default()
+        .pipeline()
+        .unwrap()
+        .redact_session(agent.clone())
+        .unwrap();
+    let store = InRepoStore::open(dir.path()).unwrap();
+    let id = store.put(&redacted).unwrap().id();
+    for (path, text) in [("gen.rs", "fn gen() {}\n"), ("late.rs", "late\n")] {
+        std::fs::write(dir.path().join(path), text).unwrap();
+    }
+    git(dir.path(), &["add", "."]);
+    git(
+        dir.path(),
+        &[
+            "commit",
+            "-qm",
+            &format!("fixture\n\nMinds-Session-Id: {id}"),
+        ],
+    );
+    let witnessed = seal_observations(
+        &store,
+        vec![
+            // 10:00:03: in beiden Fenstern — nur der Heredoc nennt den
+            // Pfad, also gehört die Beobachtung ihm.
+            seen(3, "gen.rs", Some(b"fn gen() {}\n"), None),
+            // 10:00:09: nur noch im Fenster des zweiten Aufrufs. Der nennt
+            // `late.rs` nicht — die Zuordnung ist eine über die Zeit, und
+            // bei genau einem Fenster braucht sie keinen Vorzug.
+            seen(9, "late.rs", Some(b"late\n"), None),
+        ],
+    );
+    let repo = Repo::open(dir.path()).unwrap();
+    let commit = repo.head().unwrap().commit().unwrap();
+    let (from, to) = session_window(&[&agent]).unwrap();
+    let trusted = |seal: &ContentHash, _: &str| seal == &witnessed;
+    let observations = observations_in_window(&store, from, to, &trusted);
+    assert_eq!(observations.len(), 2);
+    let spellings = minds_reader::artifact::roots_of(&repo);
+    let roots: Vec<&Path> = spellings.iter().map(|p| p.as_path()).collect();
+    let assessed = minds_reader::artifact::assess(&repo, &roots, commit, &[&agent], &observations)
+        .unwrap()
+        .unwrap();
+    let file = |path: &str| {
+        assessed
+            .recon
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .unwrap()
+    };
+    assert_eq!(file("gen.rs").class, ReconClass::Explained);
+    assert_eq!(file("gen.rs").exec.map(|s| (s.turn, s.call)), Some((0, 0)));
+    assert_eq!(file("late.rs").class, ReconClass::Explained);
+    assert_eq!(file("late.rs").exec.map(|s| (s.turn, s.call)), Some((0, 1)));
+    assert_eq!(
+        (
+            assessed.recon.explained_lines,
+            assessed.recon.total_changed_lines
+        ),
+        (2, 2)
+    );
+    // Kein Schreib-Claim, nichts zu bestätigen: keine `uncorroborated`-Zeile.
+    assert!(corroborations(&[&agent], &roots, &observations).is_empty());
 }
 
 #[test]

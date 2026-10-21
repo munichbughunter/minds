@@ -54,6 +54,8 @@ fn session(request: &str, started: &str) -> Session {
         text: "Ich lese und ändere.".into(),
         tool_calls: vec![
             ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "Read".into(),
@@ -68,6 +70,8 @@ fn session(request: &str, started: &str) -> Session {
                 }),
             },
             ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "Edit".into(),
@@ -82,6 +86,8 @@ fn session(request: &str, started: &str) -> Session {
                 }),
             },
             ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "Bash".into(),
@@ -769,6 +775,8 @@ fn an_uninterpreted_tool_call_shows_as_half_seen_not_as_a_plain_tool() {
     let mut sessions = BTreeMap::new();
     let mut s = session("Wende den Patch an", "2026-07-25T14:10:00Z");
     s.turns[0].tool_calls = vec![ToolCall {
+        at: None,
+        ended_at: None,
         outcome: None,
         capture: Some(minds_core::Capture {
             note: None,
@@ -1120,6 +1128,8 @@ fn git(dir: &std::path::Path, args: &[&str]) -> String {
 /// Ein `Write`-Aufruf samt Schreibzeit-Hash — wie EA-01a ihn speichert.
 fn write_call(path: &str, text: &str) -> ToolCall {
     ToolCall {
+        at: None,
+        ended_at: None,
         outcome: None,
         capture: None,
         name: "Write".into(),
@@ -1333,6 +1343,7 @@ fn hostile_and_overlong_paths_are_sanitized_and_capped() {
             removes: false,
             last_observed: None,
             gap: None,
+            exec: None,
         })
         .collect();
     let artifacts = vec![CommitArtifact {
@@ -2045,6 +2056,7 @@ mod changes_tab {
                     removed: 1,
                     class: Some(ReconClass::ReportedOnly),
                     gap: None,
+                    exec: None,
                     note: None,
                     rows: vec![
                         row(DiffKind::Hunk, None, None, "@@ -1,3 +1,4 @@", None, None),
@@ -2083,6 +2095,7 @@ mod changes_tab {
                     removed: 0,
                     class: Some(ReconClass::Unexplained),
                     gap: None,
+                    exec: None,
                     note: None,
                     rows: vec![
                         row(DiffKind::Hunk, None, None, "@@ -0,0 +1 @@", None, None),
@@ -2098,6 +2111,33 @@ mod changes_tab {
                 },
             ],
         }
+    }
+
+    /// Der Text der Why-Box, über ihre umgebrochenen Zeilen zusammengefügt:
+    /// alles rechts der linken Rahmenkante der Box, ohne Rahmenzeichen, mit
+    /// einfachen Leerzeichen.
+    fn why_box_text(out: &str) -> String {
+        let lines: Vec<&str> = out.lines().collect();
+        let (start, left) = lines
+            .iter()
+            .enumerate()
+            .find_map(|(i, l)| l.find("┌ WHY THIS LINE?").map(|col| (i, col)))
+            .expect("the why box");
+        let left = lines[start][..left].chars().count();
+        let mut words = Vec::new();
+        for line in &lines[start + 1..] {
+            let inner: String = line.chars().skip(left).collect();
+            if inner.starts_with('└') {
+                break;
+            }
+            words.extend(
+                inner
+                    .trim_matches(|c| c == '│' || c == ' ' || c == '"')
+                    .split_whitespace()
+                    .map(str::to_owned),
+            );
+        }
+        words.join(" ")
     }
 
     fn app_with_changes(repo: &Repo) -> App<'_> {
@@ -2600,6 +2640,62 @@ mod changes_tab {
         assert_eq!(app.changes.as_ref().unwrap().focus, Focus::Files);
         app.reduce(Action::Context); // B4: c schaltet die Spalte, w öffnet die Kette
         assert!(!app.changes.as_ref().unwrap().why);
+    }
+
+    /// Eine Zeile, die der Witness im Fenster eines Bash-Aufrufs sah: Der
+    /// Kopf nennt `● OBSERVED`, den Aufruf und sein Kommando; der Satz
+    /// sagt, dass die Zuordnung über die Zeit geht; WRITTEN BY zeigt das
+    /// Kommando statt des Pfads; der Hunk-Kopf zählt sie als `observed
+    /// during Bash call`.
+    #[test]
+    fn the_why_column_names_the_shell_call_of_an_observed_line() {
+        let (_dir, repo) = repo();
+        let mut app = app_with_changes(&repo);
+        let shell = LineSource {
+            session: sid('a'),
+            turn: 0,
+            call: 2,
+        };
+        if let Ok(set) = &mut app.changes.as_mut().unwrap().set {
+            set.files[0].class = Some(ReconClass::Explained);
+            set.files[0].exec = Some(shell);
+            set.files[0].rows[3].class = Some(ReconClass::Explained);
+            set.files[0].rows[3].source = Some(shell);
+        }
+        app.reduce(Action::Enter);
+        for _ in 0..2 {
+            app.reduce(Action::Down);
+        }
+        // Die Why-Box bricht um: Ihr Text wird über die Zeilen hinweg
+        // zusammengesetzt und dann wörtlich geprüft.
+        let out = render_at(&mut app, 260);
+        let why = why_box_text(&out);
+        assert!(
+            why.contains(
+                "src/sort/mod.rs:2 ● OBSERVED · written by Bash call 3 · command: cargo test"
+            ),
+            "{why}\n{out}"
+        );
+        assert!(
+            why.contains(
+                "A witness observed this content on disk while the agent's shell call ran — the hash matched. No tool payload claims the bytes; the attribution is by time, not by content."
+            ),
+            "{why}"
+        );
+        assert!(
+            why.contains("Bash call 3 · command: cargo test (1 line)"),
+            "{why}"
+        );
+        assert!(!why.contains("Bash src/sort/mod.rs"), "{why}");
+        assert!(!why.contains("heuristic"), "{why}");
+        assert!(!out.contains("heuristic"), "{out}");
+        // Der Hunk-Kopf: die Datei im Ganzen.
+        app.reduce(Action::Bracket(false));
+        let out = render_at(&mut app, 260);
+        assert!(
+            out.contains("1 observed during Bash call 3 (turn 1)"),
+            "{out}"
+        );
     }
 
     mod b4;

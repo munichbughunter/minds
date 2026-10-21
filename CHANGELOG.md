@@ -17,6 +17,30 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Shell writes are attributed to the Bash call that made them — when a
+  witness watched.** Every tool call now records when it started
+  (`PreToolUse`) and when it reported back (`PostToolUse`, `ToolCall::at`
+  and `ToolCall::ended_at`, additive and hash-stable). The reader attributes
+  every witness observation whose time falls in the window of a Bash call
+  (`[PreToolUse − 2 s, PostToolUse + 5 s]`) to that call: a hash matching
+  the committed blob makes the file `explained` (`● observed`) with the
+  call as the lines' origin, instead of `explained (fs only)`. A Bash call
+  that is still open when the commit seals the session (the agent commits
+  from inside it) owns the observations from its start to the end of the
+  session's material. Heredocs,
+  `tee`, `sed -i` and generators thus show up as observed and attributed;
+  the WHY box reads `● OBSERVED · written by Bash call 7 · command: …`, and
+  the file summary says `observed during Bash call 7 (turn 3)`. Overlapping
+  windows (parallel calls) are resolved by which call mentions the path;
+  if that is ambiguous, the file stays `fs only`. The shell-mention
+  heuristic stays on the claim side and is never shown as an observation.
+- **`minds verify --allow-heuristic`.** With it, lines that only the
+  shell-mention heuristic speaks for count toward the `--require-explained`
+  gate — a `heuristic` line says how many. Their class, the detail lines and
+  the assurance do not change.
+
 ### Changed
 
 - **`minds show` and `minds recap` no longer print zeros for counts nobody

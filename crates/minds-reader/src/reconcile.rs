@@ -10,6 +10,8 @@ use std::path::{Component, Path};
 use minds_core::{ContentHash, Effect, EffectKind, Session, SessionId, ToolCall};
 use minds_git::{CommitId, added_line_ranges, removes_lines};
 
+use crate::observations::{ExecWindow, exec_call_at, exec_windows};
+
 /// Maximum size of any blob or reconstructed content used for line attribution.
 pub const LINE_LEVEL_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -49,6 +51,14 @@ pub struct FileRecon {
     /// Last observation matching the committed state, even if a later one
     /// contradicts it. Classification always uses the latest observation.
     pub last_observed: Option<ObservedAt>,
+    /// Der Shell-Aufruf (Exec), in dessen Fenster der Witness die
+    /// Commit-Fassung sah ([`crate::observations::exec_call_at`]) — `Some`
+    /// genau dann, wenn **er** die Datei zu [`ReconClass::Explained`] macht:
+    /// kein Tool-Claim trägt diese Fassung, die Beobachtung fiel in sein
+    /// Fenster. Die Zeilen, die kein Claim abspielt, tragen ihn als
+    /// [`LineRecon::source`]. Eine Zuordnung über die Zeit, keine über den
+    /// Inhalt: Der Aufruf **kann** die Bytes geschrieben haben.
+    pub exec: Option<LineSource>,
     /// Warum die Datei unerklärt ist — `Some` genau bei
     /// [`ReconClass::Unexplained`]. Gilt für alle ihre unerklärten Zeilen.
     pub gap: Option<Gap>,
@@ -94,6 +104,9 @@ pub enum Gap {
 pub struct GapCounts {
     /// [`Gap::AfterAgent`].
     pub after_agent: u64,
+    /// Davon mit `later_shell` — ein späterer Shell-Aufruf erwähnt die
+    /// Datei (Heuristik). Teilmenge von `after_agent`.
+    pub after_agent_shell: u64,
     /// [`Gap::Unhashed`].
     pub unhashed: u64,
     /// [`Gap::Unmapped`].
@@ -115,7 +128,12 @@ impl GapCounts {
     /// Die Zeilen von `gap` dazuzählen (sättigend).
     pub fn add(&mut self, gap: Gap, lines: u64) {
         let slot = match gap {
-            Gap::AfterAgent { .. } => &mut self.after_agent,
+            Gap::AfterAgent { later_shell } => {
+                if later_shell.is_some() {
+                    self.after_agent_shell = self.after_agent_shell.saturating_add(lines);
+                }
+                &mut self.after_agent
+            }
             Gap::Unhashed => &mut self.unhashed,
             Gap::Unmapped => &mut self.unmapped,
             Gap::WitnessOther => &mut self.witness_other,
@@ -127,6 +145,14 @@ impl GapCounts {
             }
         };
         *slot = slot.saturating_add(lines);
+    }
+
+    /// Die Zeilen, für die nur die Heuristik „ein Shell-Befehl erwähnt die
+    /// Datei" spricht ([`Gap::Shell`], [`Gap::AfterAgent`] mit
+    /// `later_shell`). Kein Beleg — `minds verify` zählt sie nur mit
+    /// `--allow-heuristic` zum Gate, nie zu einer Klasse.
+    pub fn heuristic(&self) -> u64 {
+        self.shell.saturating_add(self.after_agent_shell)
     }
 
     /// Alle gezählten Zeilen.
@@ -152,13 +178,16 @@ pub struct LineRecon {
     pub class: ReconClass,
     /// Der Aufruf, der diese Zeile einführte — nur auf Anfrage gerechnet
     /// ([`Claims::with_sources`]) und nur, wo ein Claim sich bis zu ihr
-    /// abspielen ließ. `None` bei unerklärten Zeilen, bei reiner
-    /// Dateisystem-Evidenz und über [`SOURCE_BUDGET`] hinaus.
+    /// abspielen ließ oder der Witness sie im Fenster eines Shell-Aufrufs
+    /// sah ([`FileRecon::exec`]). `None` bei unerklärten Zeilen, bei
+    /// Dateisystem-Evidenz ohne Shell-Fenster und über [`SOURCE_BUDGET`]
+    /// hinaus.
     pub source: Option<Box<LineSource>>,
 }
 
 /// Woher eine Zeile stammt: der Schreibvorgang, der sie einführte — beim
-/// Abspielen der Write-/Edit-Aufrufe von Aufruf zu Aufruf weitergetragen.
+/// Abspielen der Write-/Edit-Aufrufe von Aufruf zu Aufruf weitergetragen —
+/// oder der Shell-Aufruf, in dessen Fenster der Witness sie sah.
 /// Eine Ableitung aus gespeicherten Sessions, kein Beweismittel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LineSource {
@@ -172,9 +201,11 @@ pub struct LineSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReconClass {
-    /// Latest witness state matches, and a tool claimed those bytes.
+    /// Latest witness state matches, and a tool claimed those bytes — or the
+    /// witness saw them in the window of a shell call ([`FileRecon::exec`]).
     Explained,
-    /// Latest witness state matches, without a matching tool claim.
+    /// Latest witness state matches, without a matching tool claim and
+    /// outside every shell call's window.
     ExplainedFsOnly,
     /// No witness observation; the latest tool claim matches.
     ReportedOnly,
@@ -665,6 +696,8 @@ pub struct Claims<'a> {
     by_path: BTreeMap<String, Vec<Claim<'a>>>,
     /// Die Pfade, die Shell-Aufrufe nennen (für [`Gap`]).
     mentions: Mentions<'a>,
+    /// Die Zeitfenster der Shell-Aufrufe ([`crate::observations::exec_windows`]).
+    execs: Vec<ExecWindow>,
     /// Ob je Zeile die Herkunft (`LineRecon::source`) gerechnet wird — nur
     /// auf Anfrage einer Anzeige, nie für `verify`: Es kostet einen Diff je
     /// abgespieltem Claim.
@@ -753,8 +786,20 @@ impl<'a> Claims<'a> {
         Self {
             by_path,
             mentions,
+            execs: exec_windows(sessions),
             sources: false,
         }
+    }
+
+    /// Der Shell-Aufruf, dem eine Beobachtung von `path` um `at` zugeordnet
+    /// wird ([`exec_call_at`]). Bei mehreren Fenstern entscheidet, ob der
+    /// Aufruf den Pfad nennt — dieselbe Wortsuche wie [`Gap::Shell`], hier
+    /// aber nur als Vorzug zwischen Aufrufen, die der Witness ohnehin
+    /// bezeugt; sie macht nie etwas zur Beobachtung.
+    fn exec_source(&self, path: &str, at: Option<&str>) -> Option<LineSource> {
+        let at = timestamp(at)?;
+        let names = |source: LineSource| self.mentions.naming(path).any(|m| m.source == source);
+        exec_call_at(&self.execs, at, &names)
     }
 
     /// Rechnet beim Abgleich je Zeile die Herkunft mit (`LineRecon::source`)
@@ -813,8 +858,10 @@ impl<'a> Claims<'a> {
                 .get(file.path)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
+            let attribute =
+                |o: &FsObservation| self.exec_source(file.path, o.observed.at.as_deref());
             let (mut recon, changed, explained) =
-                reconcile_file(file, claims, observations, self.sources);
+                reconcile_file(file, claims, observations, self.sources, &attribute);
             if recon.class == ReconClass::Unexplained {
                 // Wie `reconcile_file`: nur die letzte lesbare Beobachtung.
                 let state = (!recon.deleted).then_some(&recon.committed);
@@ -876,15 +923,18 @@ fn claims_state(claims: &[Claim<'_>], state: Option<&ContentHash>) -> bool {
     })
 }
 
+/// `exec`: Die passende Beobachtung fiel ins Fenster eines Shell-Aufrufs —
+/// sie zählt dann wie ein Claim auf genau diese Fassung.
 fn classify(
     claims: &[Claim<'_>],
     observation: Option<&FsObservation>,
     state: Option<&ContentHash>,
+    exec: bool,
 ) -> ReconClass {
     if let Some(observation) = observation {
         if observation.opaque || observation.observed.hash.as_ref() != state {
             ReconClass::Unexplained
-        } else if claims_state(claims, state) {
+        } else if exec || claims_state(claims, state) {
             ReconClass::Explained
         } else {
             ReconClass::ExplainedFsOnly
@@ -899,11 +949,15 @@ fn classify(
     }
 }
 
+/// `attribute`: der Shell-Aufruf, in dessen Fenster eine Beobachtung fiel
+/// ([`Claims::exec_source`]) — gefragt nur für die jüngste lesbare
+/// Beobachtung, und nur, wenn sie die Commit-Fassung zeigt.
 fn reconcile_file(
     file: &ChangedFile<'_>,
     claims: &[Claim<'_>],
     observations: &[&FsObservation],
     sources: bool,
+    attribute: &dyn Fn(&FsObservation) -> Option<LineSource>,
 ) -> (FileRecon, u64, u64) {
     let committed = hash(file.committed.unwrap_or_default());
     let state = file.committed.map(|_| &committed);
@@ -920,14 +974,20 @@ fn reconcile_file(
             .filter(|o| o.observed.hash.as_ref() != state),
         latest => latest,
     };
-    let class = classify(claims, observation, state);
+    // Die Beobachtung der Commit-Fassung im Fenster eines Shell-Aufrufs:
+    // Ohne Claim auf diese Fassung ist er es, der die Datei erklärt.
+    let exec = observation
+        .filter(|o| !o.opaque && o.observed.hash.as_ref() == state)
+        .and_then(attribute)
+        .filter(|_| !claims_state(claims, state));
+    let class = classify(claims, observation, state, exec.is_some());
     let last_observed = observations
         .iter()
         .rev()
         .find(|o| !o.opaque && o.observed.hash.as_ref() == state)
         .map(|o| o.observed.clone());
     let (line_level, changed, explained, removes) =
-        line_reconciliation(file, claims, observation, class, sources);
+        line_reconciliation(file, claims, observation, class, sources, exec);
     (
         FileRecon {
             path: file.path.into(),
@@ -939,6 +999,7 @@ fn reconcile_file(
             removes,
             last_observed,
             gap: None,
+            exec,
         },
         changed,
         explained,
@@ -955,6 +1016,7 @@ fn line_reconciliation(
     observation: Option<&FsObservation>,
     class: ReconClass,
     sources: bool,
+    exec: Option<LineSource>,
 ) -> (LineLevel, u64, u64, bool) {
     let Some(committed) = file.committed else {
         return (LineLevel::Available(Vec::new()), 0, 0, file.base.is_some());
@@ -990,7 +1052,7 @@ fn line_reconciliation(
     let ranges = added_line_ranges(base, committed);
     let changed = lines_in(&ranges);
     let base_removes = removes_lines(base, committed);
-    let evidence = line_evidence(file, claims, observation, class, sources);
+    let evidence = line_evidence(file, claims, observation, class, sources, exec);
     let Evidence {
         content,
         origins,
@@ -1088,6 +1150,7 @@ fn line_evidence(
     observation: Option<&FsObservation>,
     class: ReconClass,
     sources: bool,
+    exec: Option<LineSource>,
 ) -> Result<Evidence, Reason> {
     if let Some(observation) = observation {
         let Some(expected) = observation
@@ -1099,7 +1162,7 @@ fn line_evidence(
             return Ok(Evidence::none());
         };
         let claimed = claims_state(claims, Some(expected));
-        let evidence_class = if claimed {
+        let evidence_class = if claimed || exec.is_some() {
             ReconClass::Explained
         } else {
             ReconClass::ExplainedFsOnly
@@ -1108,8 +1171,13 @@ fn line_evidence(
         // no tool payload is needed for filesystem-only evidence.
         if class.explained() {
             let content = file.committed.map(<[u8]>::to_vec);
-            let origins = match (&content, claimed) {
-                (Some(content), true) if sources => origins_of(file, claims, expected, content),
+            let origins = match (&content, claimed, exec) {
+                (Some(content), true, _) if sources => origins_of(file, claims, expected, content),
+                // Der Shell-Aufruf: Herkunft der Zeilen, die kein Claim
+                // abspielt.
+                (Some(content), false, Some(exec)) if sources => {
+                    exec_origins(file, claims, content, exec)
+                }
                 _ => Vec::new(),
             };
             return Ok(Evidence {
@@ -1158,6 +1226,36 @@ fn line_evidence(
         origins,
         class: ReconClass::ReportedOnly,
     })
+}
+
+/// Die Herkunft je Zeile von `content`, wenn der Witness diese Fassung im
+/// Fenster des Shell-Aufrufs `exec` sah: Was die Claims davor abspielen
+/// (bis zur Fassung des letzten Write-Claims), behält seine Herkunft; jede
+/// Zeile, die dort nicht steht, stammt aus dem Shell-Aufruf. Spielen die
+/// Claims nicht ab, endet die Kette mit einer Löschung oder gibt es keine,
+/// zählt die Basis als Davor — ihre Zeilen bleiben ohne Herkunft, die neuen
+/// gehören dem Aufruf.
+fn exec_origins(
+    file: &ChangedFile<'_>,
+    claims: &[Claim<'_>],
+    content: &[u8],
+    exec: LineSource,
+) -> Vec<Option<LineSource>> {
+    let last_written = claims
+        .iter()
+        .rev()
+        .find(|c| matches!(c.effect.kind, EffectKind::Write | EffectKind::Delete))
+        .filter(|c| c.effect.kind == EffectKind::Write)
+        .and_then(|c| c.effect.written.as_ref());
+    let replayed = last_written.and_then(|hash| reconstruct(file.base, claims, hash, true).ok());
+    let (before, origins) = match replayed {
+        Some((bytes, origins)) => (Some(bytes), origins),
+        None => (
+            file.base.map(<[u8]>::to_vec),
+            vec![None; file.base.map_or(0, line_count)],
+        ),
+    };
+    carry(before.as_deref(), &origins, content, exec)
 }
 
 /// Die Herkunft je Zeile nach einem Schreibvorgang: Unverändert gebliebene

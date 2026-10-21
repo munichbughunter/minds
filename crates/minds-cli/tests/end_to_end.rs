@@ -4112,6 +4112,76 @@ fn verify_require_explained_gate() {
     assert_eq!(out.status.code(), Some(0), "{}", stdout(&out));
 }
 
+/// Ein Shell-Schreibzugriff ohne Witness: Die Datei ist nur von einem
+/// Shell-Befehl erwähnt (Heuristik). Das Gate zählt sie erst mit
+/// `--allow-heuristic` — und sagt dann, wie viele Zeilen es so hinzunahm;
+/// die Detailzeile bleibt `unexplained`.
+#[test]
+fn verify_allow_heuristic_counts_shell_mentions_for_the_gate_only() {
+    use serde_json::json;
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    hook_json(
+        dir,
+        json!({"hook_event_name": "UserPromptSubmit", "prompt": "generate the file"}),
+    );
+    let input = json!({"command": "printf 'generated\\n' > gen.txt"});
+    hook_json(
+        dir,
+        json!({"hook_event_name": "PreToolUse", "tool_name": "Bash",
+               "tool_input": input, "tool_use_id": "toolu_sh"}),
+    );
+    hook_json(
+        dir,
+        json!({"hook_event_name": "PostToolUse", "tool_name": "Bash",
+               "tool_input": input, "tool_use_id": "toolu_sh", "tool_response": ""}),
+    );
+    std::fs::write(dir.join("gen.txt"), "generated\n").unwrap();
+    git(dir, &["add", "gen.txt"]);
+    hook_json(dir, json!({"hook_event_name": "Stop"}));
+    assert!(
+        git(dir, &["commit", "-q", "-m", "feat: generated"])
+            .status
+            .success()
+    );
+    let out = minds(dir, &["verify", "--require-explained", "100"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(
+        text.contains("no tool claim; a shell command mentions the file (heuristic)"),
+        "{text}"
+    );
+    assert!(!text.contains("  heuristic"), "{text}");
+    assert!(
+        text.ends_with("Gate           explained 0% < required 100%\n"),
+        "{text}"
+    );
+    let out = minds(
+        dir,
+        &["verify", "--require-explained", "100", "--allow-heuristic"],
+        None,
+    );
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(!text.contains("Gate"), "{text}");
+    assert!(
+        text.contains(
+            "  heuristic      1 line(s) counted for the gate by --allow-heuristic: only a shell command mentions the file — heuristic, not evidence\n"
+        ),
+        "{text}"
+    );
+    // Klasse, Zählung und Detailzeile bleiben, was sie ohne den Schalter sind.
+    assert!(text.contains("artifact 0/1 lines explained"), "{text}");
+    assert!(text.contains("unexplained    gen.txt:1"), "{text}");
+    // Der Schalter gehört zum Verdikt-Modus.
+    let out = minds(
+        dir,
+        &["verify", "--evidence", "b3-0", "--allow-heuristic"],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(4), "{}", stdout(&out));
+}
+
 #[test]
 fn verify_gate_never_masks_tampered() {
     let Some(repo) = enabled_repo() else { return };
@@ -4185,6 +4255,8 @@ fn verify_gate_resists_unverified_claims_and_weightless_changes() {
         parent: None,
         at: None,
         tool_calls: vec![minds_core::ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             name: "Write".into(),
             arguments: serde_json::json!({"file_path": "b.rs", "content": human}).to_string(),
