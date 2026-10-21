@@ -91,6 +91,12 @@ fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -889,6 +895,12 @@ fn a_panic_in_the_hook_reaches_neither_stdout_nor_stderr() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1090,6 +1102,12 @@ fn a_panic_in_brief_hook_reaches_neither_channel_but_leaves_its_place() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1150,6 +1168,12 @@ fn a_panic_message_never_carries_the_payload_into_the_log() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1202,6 +1226,12 @@ fn a_panic_before_the_guard_still_obeys_the_hook_rules() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1973,6 +2003,12 @@ fn background_import(dir: &Path, home: &Path) -> Output {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -3114,6 +3150,12 @@ fn recall_prints_full_multiline_intent() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds

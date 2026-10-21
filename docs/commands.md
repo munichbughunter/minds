@@ -60,8 +60,9 @@ the witness under its own user — the only setup that can reach A2:
 3. `enable` waits for the witness (a slow first start is reported, not replaced by the local
    witness), stops and disables the local user service of this repository (if any), and
    prints the witness key's `allowed_signers` line. Its principal is
-   `minds-witness-user@<host>` only if the witness passed the separation checks; add that
-   line to the signer file you pass to `minds verify --signers`.
+   `minds-witness-user@<host>` only if the witness passed the separation checks. The line
+   is recorded in your trusted signers file (below); an auditor keeps it in a file of
+   their own and passes that to `minds verify --signers`.
 
 Hooks find the protected witness at its fixed place without `MINDS_WITNESS_SOCKET` — only if
 every directory above it belongs to root, its home to a user other than you, and the socket's
@@ -73,6 +74,22 @@ writes with umask 002 when it writes into the store under `.git` (`hook`, `check
 `enable` or exports), so what it creates stays writable for the witness group. No (or no
 terminal, or a failed setup) sets up the local witness below, with a warning. Nothing is
 removed again automatically (no `minds disable` yet).
+
+**The trusted signers file and your intent key.** Every `enable` (unless
+`MINDS_WITNESS=off`) also sets up, once per user:
+
+- `~/.config/minds/allowed_signers` (`$XDG_CONFIG_HOME/minds/allowed_signers`): the
+  witness key's line (`namespaces="minds-witness"`) is appended if it is not there yet —
+  idempotent, nothing to copy —, and `git config --global minds.signers` points at the
+  file. `minds verify`, `minds inspect`, `minds fsck` and `minds audit` take it as the
+  default signer file (`--signers` overrides; `verify` prints `Signers <file> (<source>)`
+  first). The file lives in your home, where an agent under your user ID can write it:
+  an auditor keeps their own copy outside the agent's reach.
+- `~/.config/minds/intent_ed25519`: an ed25519 software key without passphrase, set as
+  `git config --global minds.intentKey`, its `namespaces="minds-intent"` line (principal:
+  your `user.email`, else `<user>@<host>`) appended to the signers file. `minds intent
+  sign` without `--key` uses it. A security key (FIDO) stays opt-in: with `minds.intentKey`
+  already set to another key, no key is created.
 
 **The witness, by default.** Without `--witness`, `enable` always sets up a witness for
 this repository (profile `local`): `minds witness init --profile local` and a key in the
@@ -617,7 +634,11 @@ keeps `minds-witness@`; list a separated witness's key again under
 ### minds verify
 
 Witness-scoped seals require a signature in `minds-witness` by a principal
-discovered in the trusted `allowed_signers` file. Success prints
+discovered in the trusted `allowed_signers` file: `--signers`, else `git config --global
+minds.signers`, else `~/.config/minds/allowed_signers` (both written by `minds enable`),
+else the former `~/.ssh/allowed_signers`; never the repository's git config. The first
+line of the output names the file and its source (`Signers ~/.config/minds/allowed_signers
+(minds.signers)`). Success prints
 `witness-signed (<principal>)`; missing, invalid or incorrectly namespaced
 signatures produce `TAMPERED`. Without a signer file, present signatures
 print `signature not checked`. See the [verification guide](verification-guide.md).
@@ -859,7 +880,8 @@ or issue anchor, its text) on stderr — compare the anchor id with the one your
 escaped (`\u{430}`). With a software key there is no touch — `sign` signs right
 after printing them. The activation path is settled before
 the touch: if it is blocked, nothing is signed. The key comes from `--key`, else `git config
-minds.intentKey` (the key `minds enable` pins at a protected witness), else `git config
+minds.intentKey` (the key `minds enable` sets up — `~/.config/minds/intent_ed25519`, a
+software key — or pins at a protected witness when it is a security key), else `git config
 user.signingkey`; if its `.pub`
 is a FIDO key (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`)
 ssh-keygen's "Confirm user presence" prompt is shown (also when the `.pub` is

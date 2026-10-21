@@ -77,6 +77,7 @@ mod spec_cmd;
 mod stack;
 mod sync;
 mod text;
+mod trust;
 mod verify_cmd;
 mod why;
 mod witness_cmd;
@@ -279,7 +280,8 @@ Usage:
         the HEAD commit — under ssh-sig namespace minds-spec (root-owned
         ssh-keygen only, the key's .pub required) and stores it
         content-addressed in refs/minds/specs, keeping earlier signatures
-        from keys in --signers (default ~/.ssh/allowed_signers). Shows every rule before
+        from keys in --signers (default: the trusted signers file, see minds
+        verify). Shows every rule before
         signing; a FIDO key (sk-…) asks for a touch. Refused: a spec the
         redaction policy would change. Rule kinds: no-dependency (crates),
         no-import (modules), json-schema (data contracts), graph (expected
@@ -302,6 +304,11 @@ Usage:
                [--online [--gitlab-url <url>]] [--conformance]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
+        Signatures are checked against the trusted signers file: --signers,
+        else `git config --global minds.signers`, else
+        ~/.config/minds/allowed_signers (both set up by minds enable), else
+        the former ~/.ssh/allowed_signers; the first line names the file
+        and its source (Signers … (minds.signers)).
         Multiple sessions print separate blocks; the worst verdict wins.
         The Coverage line adds the artifact coverage of the commit (the
         revision, --commit, or the session's trailer commit) and lists
@@ -327,7 +334,7 @@ Usage:
         path since (all parents) the spec and every pinned schema are
         unchanged — a rollback, removal, merge or changed schema without a
         new signature is DRIFT, and the rules then come from the newest
-        valid signature (--signers or ~/.ssh/allowed_signers). Needs the
+        valid signature (--signers or the trusted signers file). Needs the
         full history (shallow: UNKNOWN). Shown without changing the exit
         code; --conformance fails with exit 2 on any DRIFT or UNKNOWN, or
         when there is no spec (never masks 1/3/4).
@@ -347,7 +354,7 @@ Usage:
         the assurance, the verdict or the exit code.
         A seal countersigned by minds anchor shows \"anchored: pipeline
         #N, <at>\" (counted for A3 only with a valid minds-anchor signature
-        from --signers or ~/.ssh/allowed_signers). With --online (project
+        from --signers or the trusted signers file). With --online (project
         from MINDS_GITLAB_PROJECT or CI_PROJECT_PATH) the notes of the
         merge requests containing the commit are compared: a signed note
         whose anchor ref or seal is missing is TAMPERED (\"anchor ref
@@ -460,9 +467,9 @@ Usage:
         and signatures — verifiable without this tool. States the bundle's
         assurance level (its weakest session) and exactly what it proves
         and does not prove at that level. --signers is the trusted
-        allowed_signers for witness signatures (default
-        ~/.ssh/allowed_signers); without it, no level above A1. Without
-        --out, to stdout.
+        allowed_signers for witness signatures (default: the trusted
+        signers file, see minds verify); without it, no level above A1.
+        Without --out, to stdout.
 
   minds render [--out <directory>]
         Builds a static HTML page over the context (default ./site):

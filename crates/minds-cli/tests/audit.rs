@@ -52,6 +52,12 @@ fn minds(dir: &Path, args: &[&str]) -> Output {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -90,6 +96,12 @@ fn repo_with_session() -> Option<tempfile::TempDir> {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -240,6 +252,12 @@ fn feed_hook(dir: &Path, payload: &str) {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds

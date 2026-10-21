@@ -13,6 +13,12 @@ fn command(root: &Path) -> Command {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds

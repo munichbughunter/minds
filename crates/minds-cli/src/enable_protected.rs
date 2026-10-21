@@ -327,9 +327,9 @@ pub(crate) fn install(
             eprintln!("  no minds.intentKey set — intents are activated with your password")
         }
         IntentKey::Unusable(path) => eprintln!(
-            "  minds.intentKey ({}) has no security key's .pub next to it — nothing pinned; \
-             intents are activated with your password",
-            crate::text::sanitize(path)
+            "  minds.intentKey ({}) is a software key (or has no security key's .pub next to \
+             it) — nothing pinned; intents are activated with your password",
+            crate::text::sanitize(&crate::trust::tilde(Path::new(path)))
         ),
     }
     let output = elevate(&script)?;

@@ -170,6 +170,24 @@ impl Fixture {
         .unwrap()
     }
 
+    /// Wie [`Self::minds`], aber mit der globalen Git-Konfiguration der
+    /// Fixture (die `enable_default` beschreibt).
+    fn minds_global(&self, args: &[&str]) -> Output {
+        Command::new(minds())
+            .current_dir(&self.root)
+            .args(args)
+            .env("MINDS_WITNESS", "off")
+            .env("HOME", self.path("user-home"))
+            .env("XDG_STATE_HOME", self.path("state"))
+            .env("XDG_CONFIG_HOME", self.path("config"))
+            .env("GIT_CONFIG_GLOBAL", self.path("gitconfig"))
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET")
+            .output()
+            .unwrap()
+    }
+
     /// `minds enable` ohne `--witness`, mit `MINDS_WITNESS=<mode>`.
     fn enable_default(&self, mode: &str) -> Output {
         self.enable_default_with(mode, &[])
@@ -200,11 +218,25 @@ impl Fixture {
             .env("HOME", self.path("user-home"))
             .env("XDG_STATE_HOME", self.path("state"))
             .env("XDG_CONFIG_HOME", self.path("config"))
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            // Eine eigene globale Git-Konfiguration: `enable` setzt dort
+            // `minds.signers` und `minds.intentKey`.
+            .env("GIT_CONFIG_GLOBAL", self.path("gitconfig"))
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("NO_COLOR", "1")
             .output()
             .unwrap()
+    }
+
+    /// Ein Wert aus der globalen Git-Konfiguration der Fixture.
+    fn global_config(&self, key: &str) -> Option<String> {
+        let out = Command::new("git")
+            .args(["config", "--global", "--get", key])
+            .env("GIT_CONFIG_GLOBAL", self.path("gitconfig"))
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (out.status.success() && !value.is_empty()).then_some(value)
     }
 
     fn enable(&self, profile: &str) -> Output {
@@ -1172,6 +1204,96 @@ fn enable_sets_up_a_local_witness_by_default() {
     // Ein zweites `enable` ist idempotent.
     let again = f.enable_default("print");
     assert!(again.status.success(), "{}", text(&again));
+}
+
+/// `enable` legt die Vertrauensdatei und den eigenen Freigabe-Schlüssel an:
+/// die Signer-Zeile des Witness und die `minds-intent`-Zeile des neuen
+/// Schlüssels stehen in `$XDG_CONFIG_HOME/minds/allowed_signers`, die
+/// globale Git-Konfiguration zeigt mit `minds.signers` und
+/// `minds.intentKey` darauf — und ein zweites `enable` dupliziert nichts.
+#[test]
+fn enable_records_the_trusted_signers_and_an_intent_key() {
+    let f = Fixture::new();
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let signers = f.path("config").join("minds/allowed_signers");
+    let key = f.path("config").join("minds/intent_ed25519");
+    assert!(
+        stderr.contains("intent key ") && stderr.contains("created (software key, no passphrase)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("witness signers line recorded in"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("minds.signers set to"), "{stderr}");
+    assert!(key.is_file() && key.with_extension("pub").is_file());
+    let recorded = fs::read_to_string(&signers).unwrap();
+    let lines: Vec<&str> = recorded.lines().collect();
+    assert_eq!(lines.len(), 2, "{recorded}");
+    assert!(
+        lines[0].starts_with("witness@example.invalid namespaces=\"minds-intent\" ssh-ed25519 "),
+        "{recorded}"
+    );
+    assert!(
+        lines[1].starts_with("minds-witness@") && lines[1].contains("namespaces=\"minds-witness\""),
+        "{recorded}"
+    );
+    assert_eq!(
+        f.global_config("minds.signers").as_deref(),
+        signers.to_str()
+    );
+    assert_eq!(f.global_config("minds.intentKey").as_deref(), key.to_str());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&signers), 0o600);
+        assert_eq!(mode(&key), 0o600);
+        assert_eq!(mode(signers.parent().unwrap()), 0o700);
+    }
+    // Das zweite `enable`: dieselben zwei Zeilen, derselbe Schlüssel, kein
+    // zweiter Bericht.
+    let again = f.enable_default("print");
+    assert!(again.status.success(), "{}", text(&again));
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(!stderr.contains("created (software key"), "{stderr}");
+    assert!(!stderr.contains("signers line recorded"), "{stderr}");
+    assert_eq!(fs::read_to_string(&signers).unwrap(), recorded);
+    // `minds verify` nimmt die Datei ohne `--signers` und nennt die Quelle.
+    let out = f.minds_global(&["verify"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.starts_with(&format!(
+            "Signers        {} (minds.signers)\n",
+            signers.display()
+        )),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Ein eigener `minds.intentKey` (etwa ein Sicherheitsschlüssel) bleibt:
+/// `enable` legt dann keinen Software-Schlüssel an.
+#[test]
+fn enable_keeps_a_foreign_intent_key() {
+    let f = Fixture::new();
+    let out = Command::new("git")
+        .args(["config", "--global", "minds.intentKey", "/keys/sk_intent"])
+        .env("GIT_CONFIG_GLOBAL", f.path("gitconfig"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let out = f.enable_default("print");
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!f.path("config").join("minds/intent_ed25519").exists());
+    assert_eq!(
+        f.global_config("minds.intentKey").as_deref(),
+        Some("/keys/sk_intent")
+    );
+    let text = fs::read_to_string(f.path("config").join("minds/allowed_signers")).unwrap();
+    assert_eq!(text.lines().count(), 1, "nur die Witness-Zeile: {text}");
 }
 
 /// `MINDS_WITNESS=off` lässt den Witness weg; ein unbekannter Wert ist ein

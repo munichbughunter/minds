@@ -221,15 +221,22 @@ pub fn run(
             ),
             HookBinary::Same => {}
         }
-        match profile {
-            Some(profile) => crate::enable_witness::run(&paths.root, profile, store),
+        // Der eigene Freigabe-Schlüssel **vor** dem Witness: Die geschützte
+        // Einrichtung liest `minds.intentKey` und sagt, womit Intents
+        // aktiviert werden.
+        if local_mode != crate::enable_witness::LocalMode::Off {
+            crate::trust::report_intent_key(&paths.root);
+        }
+        let signers = match profile {
+            Some(profile) => crate::enable_witness::run(&paths.root, profile, store)?,
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
             // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
-            None => {
-                crate::enable_witness::default(&paths.root, store, local_mode, verbose);
-                Ok(())
-            }
-        }
+            None => crate::enable_witness::default(&paths.root, store, local_mode, verbose),
+        };
+        // Die Signer-Zeile des Witness in die Vertrauensdatei — niemand
+        // kopiert sie mehr von Hand.
+        crate::trust::report_signers(signers.as_deref());
+        Ok(())
     });
     // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
     // soll rückwirkend Kontext bekommen, ohne auf das Lesen (womöglich großer)

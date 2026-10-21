@@ -21,6 +21,12 @@ pub fn minds() -> Command {
         let mut minds = Command::new(env!("CARGO_BIN_EXE_minds"));
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
