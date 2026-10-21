@@ -353,7 +353,9 @@ fn request_id_of(frame: &Frame) -> Result<[u8; 16], &'static str> {
         Frame::CheckpointRequest { request_id, .. }
         | Frame::IntentActivate { request_id, .. }
         | Frame::IntentChallenge { request_id }
-        | Frame::IntentActivateProven { request_id, .. } => Ok(*request_id),
+        | Frame::IntentActivateProven { request_id, .. }
+        | Frame::Register { request_id, .. }
+        | Frame::Unregister { request_id, .. } => Ok(*request_id),
         _ => Err("invalid frame"),
     }
 }

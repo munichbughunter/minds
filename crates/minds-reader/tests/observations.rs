@@ -38,9 +38,10 @@ fn plain(
 }
 
 /// Beginn der Epochen in Tests, die einen Kettenanfang **nicht** verankern
-/// sollen: nach dem Fensterbeginn der Test-Session (09:59:30) — der Stand vor
-/// EA-08a, als kein Kettenanfang verankerte.
-const UNANCHORED: &str = "2026-10-02T10:00:00Z";
+/// sollen: nach dem ersten Event der Test-Session (10:00:00) — ein Witness,
+/// der erst während der Session startete; der Stand vor EA-08a, als kein
+/// Kettenanfang verankerte.
+const UNANCHORED: &str = "2026-10-02T10:00:00.001Z";
 
 fn hash(bytes: &[u8]) -> ContentHash {
     ContentHash::from_bytes(*blake3::hash(bytes).as_bytes())
@@ -1085,9 +1086,11 @@ fn chain_start_before_window_anchors() {
 
 #[test]
 fn chain_start_after_window_start_stays_incomplete() {
-    // Neustart während der Session (nach dem Fensterbeginn): Was davor
-    // geschah, sah dieser Lauf nicht — kein Fenster.
-    for started_at in ["2026-10-02T09:59:30.001Z", "2026-10-02T10:00:01Z"] {
+    // Neustart während der Session (nach ihrem ersten Event um 10:00:00):
+    // Was davor geschah, sah dieser Lauf nicht — kein Fenster. Ein Beginn
+    // zwischen Fensterbeginn (09:59:30) und erstem Event zählt dagegen: Der
+    // Witness lief, bevor die Session etwas tat.
+    for started_at in ["2026-10-02T10:00:00.001Z", "2026-10-02T10:00:01Z"] {
         let (_dir, store, id, agent) = witnessed_repo();
         let object = started_object(&store, started_at, "2026-10-02T10:00:05Z");
         fs_epoch(&store, Some(&object), "2026-10-02T10:00:32Z", None);

@@ -91,6 +91,12 @@ fn minds(dir: &Path, args: &[&str], stdin: Option<&str>) -> Output {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -889,6 +895,12 @@ fn a_panic_in_the_hook_reaches_neither_stdout_nor_stderr() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1090,6 +1102,12 @@ fn a_panic_in_brief_hook_reaches_neither_channel_but_leaves_its_place() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1150,6 +1168,12 @@ fn a_panic_message_never_carries_the_payload_into_the_log() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1202,6 +1226,12 @@ fn a_panic_before_the_guard_still_obeys_the_hook_rules() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -1973,6 +2003,12 @@ fn background_import(dir: &Path, home: &Path) -> Output {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -3114,6 +3150,12 @@ fn recall_prints_full_multiline_intent() {
         let mut minds = Command::new(MINDS);
         minds
             .env("MINDS_WITNESS", "off")
+            // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+            .env(
+                "XDG_CONFIG_HOME",
+                std::env::temp_dir().join("minds-tests-no-config"),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env_remove("MINDS_WITNESS_HOME")
             .env_remove("MINDS_WITNESS_SOCKET");
         minds
@@ -4567,6 +4609,71 @@ fn bind_requirement(dir: &Path, scope: Option<&str>) {
         .unwrap_or_else(|| panic!("keine Anker-Id:\n{text}"));
     std::fs::create_dir_all(dir.join(".git/minds/intent")).unwrap();
     std::fs::write(dir.join(".git/minds/intent/active"), format!("{id}\n")).unwrap();
+}
+
+/// Die Datei, die `minds enable` schrieb, landet im Commit des Agenten:
+/// außerhalb jedes fachlichen Bereichs, aber *tooling*, nicht `out of
+/// scope` — solange sie genau das ist, was `enable` schreibt. Das Gate
+/// scheitert daran nicht; eine Datei mit mehr darin ist ein gewöhnlicher
+/// Befund.
+#[test]
+fn verify_reports_enable_files_as_tooling() {
+    let Some(repo) = enabled_repo() else { return };
+    let dir = repo.path();
+    bind_requirement(dir, Some("src/retry/**"));
+    let settings = std::fs::read_to_string(dir.join(".claude/settings.json")).unwrap();
+    artifact_commit(
+        dir,
+        &[
+            (
+                "src/retry/backoff.rs",
+                "fn backoff() {}\n",
+                "fn backoff() {}\n",
+            ),
+            (".claude/settings.json", &settings, &settings),
+        ],
+    );
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let block = coverage_block(&text);
+    assert!(
+        block.contains(" · 0 out of scope · 1 tooling)\n"),
+        "{block}"
+    );
+    assert!(
+        block.ends_with(
+            "  tooling        .claude/settings.json  (written by minds enable; commit, claim)"
+        ),
+        "{block}"
+    );
+    assert!(!text.contains("Gate "), "{text}");
+
+    // Mit einer eigenen Berechtigung darin ist es keine Datei von `enable`
+    // mehr — ein Pfad außerhalb des Bereichs wie jeder andere.
+    let mut value: serde_json::Value = serde_json::from_str(&settings).unwrap();
+    value["permissions"] = serde_json::json!({"allow": ["Bash(curl:*)"]});
+    let edited = serde_json::to_string_pretty(&value).unwrap() + "\n";
+    artifact_commit(
+        dir,
+        &[
+            (
+                "src/retry/jitter.rs",
+                "fn jitter() {}\n",
+                "fn jitter() {}\n",
+            ),
+            (".claude/settings.json", &edited, &edited),
+        ],
+    );
+    let out = minds(dir, &["verify", "--require-in-scope"], None);
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    let block = coverage_block(&text);
+    assert!(block.contains(" · 1 out of scope)\n"), "{block}");
+    assert!(
+        block.ends_with("  out of scope   .claude/settings.json  (commit, claim)"),
+        "{block}"
+    );
 }
 
 #[test]

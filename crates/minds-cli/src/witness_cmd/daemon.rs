@@ -37,6 +37,8 @@ pub(crate) fn separated_here(home: &Path, with_key: bool) -> bool {
             && facts::separated_here(home, &config.repo_root, &git_dir, &common_dir, with_key)
     })
 }
+mod host;
+pub(crate) use host::{HOST_SOCKET, PART, host_status, register, serve, unregister};
 mod intent;
 pub(crate) use intent::witness_keygen;
 mod limits;
@@ -633,6 +635,16 @@ fn init_config_noting(
         if parent.starts_with(&repo_root) {
             return Err("witness home must not be inside the repository".into());
         }
+    }
+    // Ein liegengebliebenes Home ohne `witness.json` — eine abgebrochene
+    // Einrichtung, ein halb entferntes Home (die Gruppe durfte es
+    // durchqueren, 0710) — ist unbrauchbar: Kein Witness startet darin,
+    // kein Journal darin ist belegt. Es weicht, statt die Einrichtung mit
+    // „must be owned by this user with mode 0700" zu stoppen.
+    if fs::symlink_metadata(&home).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        && fs::symlink_metadata(home.join("witness.json")).is_err()
+    {
+        fs::remove_dir_all(&home)?;
     }
     private_directory(&home)?;
     validate_tree(&home)?;

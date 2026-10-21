@@ -536,7 +536,8 @@ impl<'a> WitnessTrust<'a> {
     fn check_spec(&self, text: &str, signature: &str) -> SpecVerdict {
         let (Some(path), Some(content)) = (self.file.as_deref(), self.content.as_deref()) else {
             return SpecVerdict::NotChecked(
-                "no trusted signers (--signers or ~/.ssh/allowed_signers)".into(),
+                "no trusted signers (--signers, minds.signers or ~/.config/minds/allowed_signers)"
+                    .into(),
             );
         };
         // Vorfilter ohne Prozess: Nur ein Schlüssel mit einer
@@ -789,14 +790,12 @@ pub(crate) fn signers_fingerprint_at(path: Option<&Path>) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// `--signers`, sonst `~/.ssh/allowed_signers` — nie aus der Repo-Konfiguration.
+/// `--signers`, sonst die Vertrauensdatei des Nutzers
+/// ([`crate::trust::resolve`]: `minds.signers` aus der globalen
+/// Konfiguration, `~/.config/minds/allowed_signers`, zuletzt
+/// `~/.ssh/allowed_signers`) — nie aus der Repo-Konfiguration.
 fn trusted_signers_file(signers: Option<&str>) -> Option<PathBuf> {
-    if let Some(signers) = signers {
-        return Some(PathBuf::from(signers));
-    }
-    let home = std::env::var_os("HOME")?;
-    let default = Path::new(&home).join(".ssh/allowed_signers");
-    default.is_file().then_some(default)
+    crate::trust::resolve(signers).map(|signers| signers.path)
 }
 
 /// Ob `principal` ein Witness ist: Er kommt in `allowed_signers` vor, und

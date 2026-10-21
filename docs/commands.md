@@ -46,22 +46,36 @@ the witness under its own user — the only setup that can reach A2:
    (`ssh-keygen -l` at creation), **not** with the `.pub` next to it — the Git config and that
    file are writable for the agent; a key pinned earlier is kept;
    afterwards `enable` prints `intent key at the witness: …`, computed by the witness user —
-   the line to compare), `keygen` and `signers` as that user; installs and starts a system service (`/Library/LaunchDaemons/dev.minds.witness.<repo-id>.plist`,
-   its stderr in `<witness home>/log/witness.err`,
-   or `/etc/systemd/system/minds-witness-<repo-id>.service` with `NoNewPrivileges`,
-   `ProtectSystem=strict`; umask 007); and writes Claude Code managed settings with deny rules
-   only (`minds witness`, `Edit` of `.git/refs/minds`, `Read`/`Edit` of the witness home — Claude
-   Code checks file access only against `Read(…)`/`Edit(…)`, and `Edit` covers every
-   file-writing tool; a file minds installed earlier, in exactly its own form, is merged — the
-   rules of other repositories stay and only accumulate; delete the file by hand to clean up) — only
+   the line to compare), `keygen` and `signers` as that user; installs and (re)starts **one
+   system service per host** (`/Library/LaunchDaemons/dev.minds.witness.plist`, its stderr in
+   `<base>/log/witness.err`, or `/etc/systemd/system/minds-witness.service` with
+   `NoNewPrivileges`; umask 007): `minds witness serve --base <base>` as the witness user runs
+   a witness per home under the base and adopts the home just created (services of earlier
+   setups, one per repository, are removed; their homes stay and are adopted); and writes
+   Claude Code managed settings with deny rules only, machine-wide (`minds witness`, `Read`/`Edit`
+   of the witness base, `Edit` of `.git/refs/minds/**` in any project — Claude Code checks file
+   access only against `Read(…)`/`Edit(…)`, and `Edit` covers every file-writing tool; a file
+   minds installed earlier, in exactly its own form, is merged; `minds disable` removes it) — only
    if no
    `managed-settings.json` exists or it is minds' own; any other file gets a
    `managed-settings.minds-proposed.json` next to it.
 3. `enable` waits for the witness (a slow first start is reported, not replaced by the local
    witness), stops and disables the local user service of this repository (if any), and
    prints the witness key's `allowed_signers` line. Its principal is
-   `minds-witness-user@<host>` only if the witness passed the separation checks; add that
-   line to the signer file you pass to `minds verify --signers`.
+   `minds-witness-user@<host>` only if the witness passed the separation checks. The line
+   is recorded in your trusted signers file (below); an auditor keeps it in a file of
+   their own and passes that to `minds verify --signers`.
+
+**Every further repository needs no administrator rights.** When the host service runs (its
+base belongs to the witness user, root's chain above it, and `<base>/run/control.sock`
+answers) and runs this `minds` binary, `enable` shares the repository with the witness group
+as you (the ACL entries, group and modes of step 2, `enable_protected::share_repo`) and sends
+`register` over the socket — the group is enough to reach it; the service creates the home
+(`witness init --profile user --socket-group`, with your `minds.intentKey` when it is a
+security key), the key and the witness, and answers with the signers line, which `enable`
+records as usual. On Linux this works from your next login on (the group); before that, or
+with a newer binary (`MINDS_WITNESS=protected`), the `sudo` script runs again. `minds witness
+register --repo <root>` does the registration by hand.
 
 Hooks find the protected witness at its fixed place without `MINDS_WITNESS_SOCKET` — only if
 every directory above it belongs to root, its home to a user other than you, and the socket's
@@ -71,8 +85,27 @@ when it runs another `minds` binary than the one you call (rerun with
 writes with umask 002 when it writes into the store under `.git` (`hook`, `checkpoint`,
 `sync`, `forget`, `import`, `intent`, `spec`, `review`, `sign`, `anchor`, `reinterpret` — not
 `enable` or exports), so what it creates stays writable for the witness group. No (or no
-terminal, or a failed setup) sets up the local witness below, with a warning. Nothing is
-removed again automatically (no `minds disable` yet).
+terminal, or a failed setup) sets up the local witness below, with a warning — except with
+`MINDS_WITNESS=protected`, where a failed protected setup fails `enable` (nothing else is set up;
+a local witness next to a half-set-up protected one would be A1, and `intent sign` would find
+the protected one silent). `minds
+disable` takes it back again (below).
+
+**The trusted signers file and your intent key.** Every `enable` (unless
+`MINDS_WITNESS=off`) also sets up, once per user:
+
+- `~/.config/minds/allowed_signers` (`$XDG_CONFIG_HOME/minds/allowed_signers`): the
+  witness key's line (`namespaces="minds-witness"`) is appended if it is not there yet —
+  idempotent, nothing to copy —, and `git config --global minds.signers` points at the
+  file. `minds verify`, `minds inspect`, `minds fsck` and `minds audit` take it as the
+  default signer file (`--signers` overrides; `verify` prints `Signers <file> (<source>)`
+  first). The file lives in your home, where an agent under your user ID can write it:
+  an auditor keeps their own copy outside the agent's reach.
+- `~/.config/minds/intent_ed25519`: an ed25519 software key without passphrase, set as
+  `git config --global minds.intentKey`, its `namespaces="minds-intent"` line (principal:
+  your `user.email`, else `<user>@<host>`) appended to the signers file. `minds intent
+  sign` without `--key` uses it. A security key (FIDO) stays opt-in: with `minds.intentKey`
+  already set to another key, no key is created.
 
 **The witness, by default.** Without `--witness`, `enable` always sets up a witness for
 this repository (profile `local`): `minds witness init --profile local` and a key in the
@@ -143,6 +176,12 @@ Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of
   setups such as the protected witness and record into the local journal. No `minds` on `PATH`
   is `warn` as well. `minds enable` prints the same warnings. This looks at your shell's `PATH`;
   an agent started elsewhere (e.g. from the Dock) may see another one.
+- **Scope trap** (`agent config`): an agent configuration `enable` wrote (`.claude/settings.json`,
+  …) that is not in the index yet is `warn` — `"… untracked — commit it before binding a scope"`.
+  Left uncommitted, it lands in the agent's next commit as a path outside every bound
+  scope; `minds verify` then calls it `tooling` as long as it is exactly what `enable`
+  writes, but anything the agent adds to it is an ordinary out-of-scope finding. Read
+  from the index in-process (gix), never through a `git` process.
 - **Protected witness** (found at its fixed place, see `minds enable`): it answers `ping` (`fail`
   if not) and its home is not readable for you (`ok` on permission denied, `fail` if it opens).
 - **Witness observer** (whenever the witness answers `ping`, on every side): the witness's own
@@ -158,6 +197,34 @@ Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of
 ```
 minds doctor --probe-home /home/alice/.local/state/minds-witness/86f649449fc18941
 ```
+
+### minds disable
+
+```
+minds disable [--all] [-v]
+```
+
+Takes back what `enable` set up in this repository: the agent hook registrations (only
+minds' own entries — capture and recall; foreign entries stay, and a file in which
+nothing else stood disappears; the OpenCode plugin is removed when it carries the minds
+mark), the minds blocks of the Git hooks (a hook with only shebang and comments left
+disappears), the local witness (its user service is stopped and disabled, the service
+file and the witness home removed — only a home owned by you that pins this repository)
+and the protected witness of this repository: one `sudo` runs a script minds generates
+(`templates/witness/disable-*.sh`) that asks the host service, as the witness user, to
+unregister the repository (`minds witness unregister`: witness stopped, home removed —
+without a running service root removes the home itself), removes a service of an earlier
+setup (one per repository) and, when no registered home is left, the host service itself,
+and takes this repository's rules of an earlier setup (its `refs/minds`, its witness home)
+out of minds' own `managed-settings.json` — the file only if it is still exactly the one
+minds read a moment ago; with the last repository the file goes. `--all` removes the host
+service, every service of earlier setups, the whole witness base, the managed settings (if
+minds' own) and the root-owned binary (`/usr/local/libexec/minds/minds`); outside a
+repository it does only that. What
+stays: the store (`refs/minds/*`) and the store config in `.git/config` — data, not
+setup, `minds show` keeps reading them —, the witness user and group, and the trusted
+signers file and intent key of your user (they serve every repository). Agents must
+not run `disable`.
 
 ## Daily use
 
@@ -391,7 +458,20 @@ minds witness run --home /private/witness --follow
 minds witness status --home /private/witness
 ```
 
-The Unix-only daemon owns one repository. `init` creates a schema-version-2
+The Unix-only daemon owns one repository. The protected setup runs them under **one** host
+service (`minds witness serve --base <base>`, see `minds enable`): it runs `witness run
+--home <base>/<repo-id>` as a child process per home it finds under the base (rescanned every
+5 s), restarts one that exits (with backoff), and takes `Ping`, `Status` (`serving N
+repositories (M running)`, shown by `minds doctor` as `witness daemon`), `Register` and
+`Unregister` frames over `<base>/run/control.sock` (mode 0660, group of the witness).
+`minds witness register --repo <root> [--intent-key <pub>]` registers a repository whose
+`.git` the witness user can already write (it is shared with the witness group by `enable`):
+the service runs `init` (profile `user`, socket group, idempotent) and `keygen`, starts the
+witness and prints `registered|running|restarted <id>`, `signers <line>`, `socket <path>`,
+`answering yes|no` and the pinned intent key. `minds witness unregister --repo <root>` stops
+the witness and removes its home — accepted only when the peer is the witness user (so an
+agent under your user ID cannot delete a journal before its seal); `minds disable` runs it
+elevated. `init` creates a schema-version-2
 `witness.json` and private journal, epoch, key, ledger, log and runtime directories.
 Without `--profile`, omitting `--path-map` selects `user` and a map selects
 `container`; `container` requires a map, `user` and `managed` refuse one, and
@@ -617,7 +697,16 @@ keeps `minds-witness@`; list a separated witness's key again under
 ### minds verify
 
 Witness-scoped seals require a signature in `minds-witness` by a principal
-discovered in the trusted `allowed_signers` file. Success prints
+discovered in the trusted `allowed_signers` file: `--signers`, else `git config --global
+minds.signers`, else `~/.config/minds/allowed_signers` (both written by `minds enable`),
+else the former `~/.ssh/allowed_signers`; never the repository's git config. The first
+line of the output names the file and its source (`Signers ~/.config/minds/allowed_signers
+(minds.signers)`). A path outside the bound scope that `minds enable` wrote
+(`.claude/settings.json` and the other agent configurations, `.codex/config.toml`) is
+listed as `tooling … (written by minds enable; …)` instead of `out of scope` — only when
+its content in the commit is exactly what `enable` writes (just minds' hook entries, just
+the Codex switch, the OpenCode plugin verbatim); it does not count for
+`--require-in-scope`, and the Coverage line adds `· N tooling`. Success prints
 `witness-signed (<principal>)`; missing, invalid or incorrectly namespaced
 signatures produce `TAMPERED`. Without a signer file, present signatures
 print `signature not checked`. See the [verification guide](verification-guide.md).
@@ -859,7 +948,8 @@ or issue anchor, its text) on stderr — compare the anchor id with the one your
 escaped (`\u{430}`). With a software key there is no touch — `sign` signs right
 after printing them. The activation path is settled before
 the touch: if it is blocked, nothing is signed. The key comes from `--key`, else `git config
-minds.intentKey` (the key `minds enable` pins at a protected witness), else `git config
+minds.intentKey` (the key `minds enable` sets up — `~/.config/minds/intent_ed25519`, a
+software key — or pins at a protected witness when it is a security key), else `git config
 user.signingkey`; if its `.pub`
 is a FIDO key (`sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`)
 ssh-keygen's "Confirm user presence" prompt is shown (also when the `.pub` is

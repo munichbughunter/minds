@@ -158,6 +158,20 @@ fn examples() -> Vec<Frame> {
             proof: SIGNATURE.into(),
             request_id: ID,
         },
+        Frame::Register {
+            repo: "/Users/dev/repo".into(),
+            intent_key: Some("sk-ssh-ed25519@openssh.com AAAA".into()),
+            request_id: ID,
+        },
+        Frame::Register {
+            repo: "/r".into(),
+            intent_key: None,
+            request_id: ID,
+        },
+        Frame::Unregister {
+            repo: "/Users/dev/repo".into(),
+            request_id: ID,
+        },
     ]
 }
 
@@ -314,13 +328,19 @@ fn frame_golden_vectors() {
         .lines()
         .filter(|line| !line.starts_with('#') && !line.is_empty())
         .collect();
-    assert_eq!(lines.len(), 8);
+    assert_eq!(lines.len(), 10);
     // Die ersten sechs Beispiele, dann Nonce-Frage und Freigabe per
-    // Berührung (Anker, Signatur, Nonce `0a`×32, Freigabe = Signatur).
+    // Berührung (Anker, Signatur, Nonce `0a`×32, Freigabe = Signatur), dann
+    // An- und Abmelden beim Dienst des Rechners.
     let all = examples();
     let frames = all[..6]
         .iter()
-        .chain([&all[all.len() - 3], &all[all.len() - 2]])
+        .chain([
+            &all[all.len() - 6],
+            &all[all.len() - 5],
+            &all[all.len() - 3],
+            &all[all.len() - 1],
+        ])
         .cloned();
     for (frame, line) in frames.zip(lines) {
         let (_, hex) = line.split_once(' ').unwrap();
@@ -394,7 +414,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=10 | 0x81 | 0x82) {
+        if matches!(kind, 1..=12 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(
@@ -437,6 +457,8 @@ fn complete_payload_with_missing_fields_or_trailing_bytes_is_malformed() {
                 | Frame::IntentActivate { .. }
                 | Frame::IntentChallenge { .. }
                 | Frame::IntentActivateProven { .. }
+                | Frame::Register { .. }
+                | Frame::Unregister { .. }
         ) {
             let mut extra = payload.to_vec();
             extra.push(0);
@@ -529,6 +551,36 @@ fn rejects_control_characters_in_single_line_fields() {
                 [vec![0x82], ID.to_vec(), value.as_bytes().to_vec()].concat(),
                 "reason",
             ),
+            (
+                Frame::Register {
+                    repo: format!("/{value}"),
+                    intent_key: None,
+                    request_id: ID,
+                },
+                [
+                    vec![0x0b],
+                    short(format!("/{value}").as_bytes()),
+                    short(b""),
+                    ID.to_vec(),
+                ]
+                .concat(),
+                "repo",
+            ),
+            (
+                Frame::Register {
+                    repo: "/r".into(),
+                    intent_key: Some(value.clone()),
+                    request_id: ID,
+                },
+                [
+                    vec![0x0b],
+                    short(b"/r"),
+                    short(value.as_bytes()),
+                    ID.to_vec(),
+                ]
+                .concat(),
+                "intent_key",
+            ),
         ] {
             assert_eq!(encode(&frame), Err(ProtoError::BadField(field)));
             assert_eq!(
@@ -536,6 +588,27 @@ fn rejects_control_characters_in_single_line_fields() {
                 Err(ProtoError::BadField(field))
             );
         }
+    }
+}
+
+/// Ein Repository-Pfad ist absolut und nie leer.
+#[test]
+fn a_repository_path_is_absolute() {
+    for repo in ["", "repo", "./repo"] {
+        let frame = Frame::Unregister {
+            repo: repo.into(),
+            request_id: ID,
+        };
+        assert_eq!(
+            encode(&frame),
+            Err(ProtoError::BadField("repo")),
+            "{repo:?}"
+        );
+        let payload = [vec![0x0c], short(repo.as_bytes()), ID.to_vec()].concat();
+        assert_eq!(
+            measured_decode(&wire(&payload)),
+            Err(ProtoError::BadField("repo"))
+        );
     }
 }
 

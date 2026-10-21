@@ -140,6 +140,17 @@ fn repo_checks(paths: &crate::enable::RepoPaths, checks: &mut Vec<Check>) {
             verdict.reason,
         ),
     });
+    // Die Scope-Falle: Eine Agent-Konfiguration, die `enable` geschrieben
+    // hat und die niemand committet, landet im nächsten Commit des Agenten —
+    // als Pfad außerhalb jedes gebundenen Bereichs. `verify` nennt sie dann
+    // tooling, aber nur, solange der Agent nichts hineinschreibt.
+    for file in untracked_agent_files(root) {
+        checks.push(Check::new(
+            Status::Warn,
+            "agent config",
+            format!("\"{file}\" untracked — commit it before binding a scope"),
+        ));
+    }
     let hooks = crate::fsck::hooks_verdict(root, paths.git_dir());
     checks.push(Check::new(
         if hooks.ok { Status::Ok } else { Status::Fail },
@@ -161,6 +172,34 @@ fn repo_checks(paths: &crate::enable::RepoPaths, checks: &mut Vec<Check>) {
             format!("{described} — cannot be opened: {err}"),
         ),
     });
+}
+
+/// Höchstgröße des Index, der für die Scope-Falle gelesen wird.
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Die Agent-Konfigurationen, die in der Arbeitskopie liegen, aber nicht im
+/// Index — gelesen mit gix, nie über einen `git`-Prozess, der
+/// `core.fsmonitor` aus der Repo-Konfiguration folgte. Ein unlesbarer Index
+/// ergibt keine Warnung (nichts behaupten).
+fn untracked_agent_files(root: &Path) -> Vec<&'static str> {
+    let present: Vec<&'static str> = crate::enable::Which::ALL
+        .iter()
+        .map(|which| which.file())
+        .filter(|file| root.join(file).is_file())
+        .collect();
+    if present.is_empty() {
+        return Vec::new();
+    }
+    let Ok(repo) = minds_git::Repo::open(root) else {
+        return Vec::new();
+    };
+    let Some(tracked) = repo.tracked_paths(MAX_INDEX_BYTES) else {
+        return Vec::new();
+    };
+    present
+        .into_iter()
+        .filter(|file| !tracked.iter().any(|tracked| tracked == file))
+        .collect()
 }
 
 #[cfg(not(unix))]
@@ -190,6 +229,27 @@ fn witness_checks(root: Option<&Path>, probe_home: Option<&Path>, checks: &mut V
                     .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
             })
         && crate::enable_protected::membership_pending();
+    // Der Witness-Dienst des Rechners (einer für alle Repos): antwortet er?
+    let host = crate::enable_protected::host_socket();
+    if std::fs::symlink_metadata(&host).is_ok_and(|meta| {
+        use std::os::unix::fs::FileTypeExt;
+        meta.file_type().is_socket()
+    }) {
+        let service = crate::enable_protected::HOST_SERVICE;
+        checks.push(match crate::witness_cmd::host_status(&host) {
+            Some(Ok(status)) => Check::new(
+                Status::Ok,
+                "witness daemon",
+                format!("{service} (one per host), {status}"),
+            ),
+            Some(Err(reason)) => Check::new(Status::Fail, "witness daemon", reason),
+            None => Check::new(
+                Status::Fail,
+                "witness daemon",
+                format!("{service} does not answer — check its system service"),
+            ),
+        });
+    }
     if socket.is_some() || probe_home.is_some() {
         agent_side(socket.as_deref(), probe_home, default_home, checks);
     } else if let Some((socket, _)) = protected {

@@ -43,6 +43,7 @@ mod brief_cmd;
 mod checkpoint;
 mod config;
 mod context;
+mod disable;
 mod distill;
 mod doctor;
 mod enable;
@@ -77,6 +78,7 @@ mod spec_cmd;
 mod stack;
 mod sync;
 mod text;
+mod trust;
 mod verify_cmd;
 mod why;
 mod witness_cmd;
@@ -101,16 +103,21 @@ Usage:
         opencode, all.
         Without --witness it always sets up a witness for the repo. On
         a terminal it asks once whether to set it up protected
-        (administrator rights, once): its own user, a root-owned binary,
-        a system service, deny-only Claude Code managed settings (only
-        if none exist) — the only setup that can reach A2. Otherwise
+        (administrator rights, once per machine): its own user, a
+        root-owned binary, one system service per host that runs a
+        witness per repository, deny-only Claude Code managed settings
+        (only if none exist) — the only setup that can reach A2. Every
+        further repository registers with the running service without
+        administrator rights (the repository is shared with the witness
+        group as you). Otherwise
         (no, no terminal, or a failed setup) profile local: same user
         ID, witness home + key, a user service, with a warning that it
         runs unprotected (A1). Hooks find either at its default socket.
         MINDS_WITNESS=protected sets up the protected one without
-        asking, =local (or on) the local one, =print prints its start
-        command, =off skips the witness. A failure is a warning, never
-        a failed enable.
+        asking — and fails enable when that setup fails (no local
+        witness instead); =local (or on) the local one, =print prints
+        its start command, =off skips the witness. Otherwise a witness
+        failure is a warning, never a failed enable.
         --child-repo puts the context into a separate repo instead of
         in-repo; it is created (bare) or cloned from --child-remote.
         --recall (Claude Code): SessionStart hook that puts the context
@@ -125,6 +132,17 @@ Usage:
         steps. managed: writes managed-settings.minds-proposed.json.
         Never runs privileged commands, never overwrites existing files
         (a *.minds-proposed file is written next to them instead).
+
+  minds disable [--all] [-v]
+        Takes back what enable set up in this repository: the agent hook
+        registrations (foreign entries stay; a file with nothing else
+        disappears), the minds blocks of the Git hooks, the local witness
+        (user service and home) and the protected witness of this
+        repository (one sudo: its system service, its witness home, its
+        rules in the managed settings). --all removes every protected
+        witness of this machine, the managed settings and the root-owned
+        binary. The store (refs/minds/*), .git/config, the trusted
+        signers file and the intent key stay.
 
   minds hook --agent <name> [--event <name>]
         Accepts an agent hook event on stdin and stores it in the local
@@ -152,6 +170,19 @@ Usage:
         Home: --home, MINDS_WITNESS_HOME, or the repository's XDG state path.
   minds witness signers [--home <directory>]
         Prints the allowed_signers line of the existing witness key.
+  minds witness serve [--base <directory>]
+        The witness service of the host (run as the witness user by the
+        system service minds enable installs): runs a witness per home
+        under the base, adopts homes that appear, and takes
+        registrations over <base>/run/control.sock (witness group).
+  minds witness register --repo <root> [--intent-key <pub>]
+        Registers a repository with the running service (witness home,
+        key, witness); prints state, signers line and socket. The
+        repository must already be shared with the witness group
+        (minds enable does both).
+  minds witness unregister --repo <root>
+        Stops the repository's witness and removes its home — accepted
+        from the witness user only (minds disable runs it elevated).
 
   minds show [<commit>] [--full]
         Shows intent and attribution of the session(s) behind a commit
@@ -279,7 +310,8 @@ Usage:
         the HEAD commit — under ssh-sig namespace minds-spec (root-owned
         ssh-keygen only, the key's .pub required) and stores it
         content-addressed in refs/minds/specs, keeping earlier signatures
-        from keys in --signers (default ~/.ssh/allowed_signers). Shows every rule before
+        from keys in --signers (default: the trusted signers file, see minds
+        verify). Shows every rule before
         signing; a FIDO key (sk-…) asks for a touch. Refused: a spec the
         redaction policy would change. Rule kinds: no-dependency (crates),
         no-import (modules), json-schema (data contracts), graph (expected
@@ -302,6 +334,11 @@ Usage:
                [--online [--gitlab-url <url>]] [--conformance]
         The evidence verdict: integrity × coverage over the session's seals.
         Defaults to HEAD; revisions use session trailers, then the store index.
+        Signatures are checked against the trusted signers file: --signers,
+        else `git config --global minds.signers`, else
+        ~/.config/minds/allowed_signers (both set up by minds enable), else
+        the former ~/.ssh/allowed_signers; the first line names the file
+        and its source (Signers … (minds.signers)).
         Multiple sessions print separate blocks; the worst verdict wins.
         The Coverage line adds the artifact coverage of the commit (the
         revision, --commit, or the session's trailer commit) and lists
@@ -327,7 +364,7 @@ Usage:
         path since (all parents) the spec and every pinned schema are
         unchanged — a rollback, removal, merge or changed schema without a
         new signature is DRIFT, and the rules then come from the newest
-        valid signature (--signers or ~/.ssh/allowed_signers). Needs the
+        valid signature (--signers or the trusted signers file). Needs the
         full history (shallow: UNKNOWN). Shown without changing the exit
         code; --conformance fails with exit 2 on any DRIFT or UNKNOWN, or
         when there is no spec (never masks 1/3/4).
@@ -347,7 +384,7 @@ Usage:
         the assurance, the verdict or the exit code.
         A seal countersigned by minds anchor shows \"anchored: pipeline
         #N, <at>\" (counted for A3 only with a valid minds-anchor signature
-        from --signers or ~/.ssh/allowed_signers). With --online (project
+        from --signers or the trusted signers file). With --online (project
         from MINDS_GITLAB_PROJECT or CI_PROJECT_PATH) the notes of the
         merge requests containing the commit are compared: a signed note
         whose anchor ref or seal is missing is TAMPERED (\"anchor ref
@@ -460,9 +497,9 @@ Usage:
         and signatures — verifiable without this tool. States the bundle's
         assurance level (its weakest session) and exactly what it proves
         and does not prove at that level. --signers is the trusted
-        allowed_signers for witness signatures (default
-        ~/.ssh/allowed_signers); without it, no level above A1. Without
-        --out, to stdout.
+        allowed_signers for witness signatures (default: the trusted
+        signers file, see minds verify); without it, no level above A1.
+        Without --out, to stdout.
 
   minds render [--out <directory>]
         Builds a static HTML page over the context (default ./site):
@@ -529,6 +566,7 @@ const SPECS: &[Spec] = &[
         hidden_flags: &[enable::BACKGROUND_IMPORT_FLAG],
         positionals: 0,
     },
+    spec("disable", &[], &["--all", "-v", "--verbose"], 0),
     spec("hook", &["--agent", "--event"], &[], 0),
     spec("checkpoint", &["--commit"], &[], 0),
     spec(
@@ -543,6 +581,7 @@ const SPECS: &[Spec] = &[
             "--policy-rev",
             "--intent-key",
             "--replace-intent-key",
+            "--base",
         ],
         &["--follow"],
         1,
@@ -963,6 +1002,11 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 )
             }
         }
+
+        "disable" => disable::run(
+            parsed.has("--all"),
+            parsed.has("-v") || parsed.has("--verbose"),
+        ),
 
         "hook" => hook::run(parsed.value("--agent"), parsed.value("--event")),
 

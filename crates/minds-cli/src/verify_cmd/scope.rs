@@ -7,9 +7,18 @@
 //! ihrem Fenster — und das Ergebnis gesetzt:
 //!
 //! ```text
-//! Coverage       complete within the boundary (… · artifact 2/2 lines explained · 1 out of scope)
+//! Coverage       complete within the boundary (… · artifact 2/2 lines explained · 1 out of scope · 1 tooling)
 //!   out of scope   docs/README.md  (commit, claim)
+//!   tooling        .claude/settings.json  (written by minds enable; commit)
 //! ```
+//!
+//! **Tooling:** eine Datei, die `minds enable` schreibt (`.claude/settings.json`,
+//! `.git`-ferne Agent-Konfigurationen, [`crate::enable::tooling_paths`]),
+//! deren Inhalt im geprüften Commit genau das ist, was `enable` schreibt
+//! ([`crate::enable::written_by_enable`]). Sie liegt außerhalb jedes
+//! fachlichen Bereichs und gehört doch in den Commit — ein `--require-in-scope`
+//! scheitert daran nicht. Steht mehr darin (eine eigene Berechtigung, ein
+//! fremder Hook), ist es eine Änderung außerhalb des Bereichs wie jede andere.
 //!
 //! Ohne erklärten Bereich (nicht gebunden, `scope=-`) fehlen Segment und
 //! Detailzeilen; ein gebundener, aber nicht lesbarer Anker steht als
@@ -37,11 +46,22 @@ use super::artifact::{DETAIL_CAP, KIND_WIDTH, shown_path};
 
 /// Was über den Bereich einer Session sagbar ist.
 pub(crate) enum ScopeState {
-    /// Ein Bereich ist erklärt; die Pfade außerhalb davon.
-    Assessed(Vec<ScopeFinding>),
+    /// Ein Bereich ist erklärt; die Pfade außerhalb davon — und darunter
+    /// getrennt die, die `minds enable` geschrieben hat (Tooling).
+    Assessed {
+        outside: Vec<ScopeFinding>,
+        tooling: Vec<ScopeFinding>,
+    },
     /// Kein Bereich lesbar — warum.
     NotAssessed(NoScope),
 }
+
+/// Das Wort für einen Tooling-Befund.
+const TOOLING: &str = "tooling";
+
+/// Höchstgröße einer Tooling-Datei, die aus dem Commit gelesen wird — die
+/// Agent-Konfigurationen sind klein; alles darüber ist kein Tooling.
+const MAX_TOOLING_BYTES: usize = 1024 * 1024;
 
 /// Die Scope-Befunde der Session `session` unter ihrer Intent-Lage
 /// `intent`. `observations` sind schon auf das Fenster der Session und auf
@@ -135,7 +155,34 @@ pub(crate) fn assess(
     if lookup_failed.get() || unresolved {
         return ScopeState::NotAssessed(NoScope::ClaimsUnresolvable);
     }
-    ScopeState::Assessed(scope_findings(&scope, changed, &claims, observations))
+    let findings = scope_findings(&scope, changed, &claims, observations);
+    // Tooling nur gegen den Baum des abgeglichenen Commits: Was dort steht,
+    // ist der Inhalt, der zählt — ein Claim ohne Commit bleibt außerhalb.
+    let commit_tree = trees.first().copied();
+    let (tooling, outside): (Vec<_>, Vec<_>) = findings
+        .into_iter()
+        .partition(|finding| commit_tree.is_some_and(|tree| is_tooling(repo, tree, &finding.path)));
+    ScopeState::Assessed { outside, tooling }
+}
+
+/// Ob `path` im Baum `tree` genau das ist, was `minds enable` schreibt
+/// ([`crate::enable::written_by_enable`]). Ein Lesefehler oder ein fehlender
+/// Blob (die Datei wurde gelöscht) ist kein Tooling — fail-closed in die
+/// Richtung des Befunds.
+fn is_tooling(repo: &Repo, tree: TreeId, path: &str) -> bool {
+    if !crate::enable::tooling_paths().any(|known| known == path) {
+        return false;
+    }
+    let Ok(Some(bytes)) = repo.read_blob(tree, path) else {
+        return false;
+    };
+    if bytes.len() > MAX_TOOLING_BYTES {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    crate::enable::written_by_enable(path, text)
 }
 
 /// Ob ein Schreib- oder Lösch-Claim der Session unterhalb der Wurzel liegt
@@ -173,8 +220,12 @@ fn unresolved_claim(session: &Session, roots: &[&Path], known: &dyn Fn(&str) -> 
 /// einer ohne Bereich.
 pub(super) fn segment(state: &ScopeState) -> Option<String> {
     match state {
-        ScopeState::Assessed(findings) => {
-            Some(format!("{} {}", findings.len(), Finding::OutOfScope.word()))
+        ScopeState::Assessed { outside, tooling } => {
+            let mut segment = format!("{} {}", outside.len(), Finding::OutOfScope.word());
+            if !tooling.is_empty() {
+                segment.push_str(&format!(" · {} {TOOLING}", tooling.len()));
+            }
+            Some(segment)
         }
         ScopeState::NotAssessed(
             why @ (NoScope::AnchorMissing
@@ -200,34 +251,46 @@ pub(super) fn segment(state: &ScopeState) -> Option<String> {
 /// Die Detailzeilen, gekappt auf [`DETAIL_CAP`] (außer mit `all`); `rerun`
 /// ist der Aufruf, der sie ungekappt wiederholt.
 pub(super) fn detail_lines(state: &ScopeState, all: bool, rerun: &str) -> Vec<String> {
-    let ScopeState::Assessed(findings) = state else {
+    let ScopeState::Assessed { outside, tooling } = state else {
         return Vec::new();
     };
+    // Erst die Pfade außerhalb, dann das Tooling — beide unter derselben
+    // Kappung.
+    let findings: Vec<(&ScopeFinding, bool)> = outside
+        .iter()
+        .map(|f| (f, false))
+        .chain(tooling.iter().map(|f| (f, true)))
+        .collect();
     let shown = if all {
         &findings[..]
     } else {
         &findings[..findings.len().min(DETAIL_CAP)]
     };
-    let rows: Vec<(String, String)> = shown
+    let rows: Vec<(&str, String, String)> = shown
         .iter()
-        .map(|finding| {
+        .map(|(finding, is_tooling)| {
             let sources: Vec<&str> = finding.sources.iter().map(|s| s.word()).collect();
-            (shown_path(&finding.path), sources.join(", "))
+            let sources = if *is_tooling {
+                format!("written by minds enable; {}", sources.join(", "))
+            } else {
+                sources.join(", ")
+            };
+            let kind = if *is_tooling {
+                TOOLING
+            } else {
+                Finding::OutOfScope.word()
+            };
+            (kind, shown_path(&finding.path), sources)
         })
         .collect();
     let width = rows
         .iter()
-        .map(|(path, _)| path.chars().count())
+        .map(|(_, path, _)| path.chars().count())
         .max()
         .unwrap_or(0);
     let mut lines: Vec<String> = rows
         .iter()
-        .map(|(path, sources)| {
-            format!(
-                "  {:<KIND_WIDTH$}{path:<width$}  ({sources})",
-                Finding::OutOfScope.word()
-            )
-        })
+        .map(|(kind, path, sources)| format!("  {kind:<KIND_WIDTH$}{path:<width$}  ({sources})"))
         .collect();
     if shown.len() < findings.len() {
         lines.push(format!(
@@ -258,7 +321,7 @@ pub(super) fn gate_failure(states: &[ScopeState], artifact: &ArtifactState) -> O
         |why: &str| format!("Gate           scope not assessed ({why}) — required in scope");
     if let Some(why) = states.iter().find_map(|state| match state {
         ScopeState::NotAssessed(why) => Some(*why),
-        ScopeState::Assessed(_) => None,
+        ScopeState::Assessed { .. } => None,
     }) {
         return Some(not_assessed(why.word()));
     }
@@ -283,7 +346,7 @@ fn outside_paths(states: &[ScopeState]) -> usize {
     states
         .iter()
         .flat_map(|state| match state {
-            ScopeState::Assessed(findings) => findings.as_slice(),
+            ScopeState::Assessed { outside, .. } => outside.as_slice(),
             ScopeState::NotAssessed(_) => &[],
         })
         .map(|finding| finding.path.as_str())
@@ -366,9 +429,16 @@ mod tests {
         assert!(check(&["src/../../x"]));
     }
 
+    fn assessed(outside: Vec<ScopeFinding>) -> ScopeState {
+        ScopeState::Assessed {
+            outside,
+            tooling: Vec::new(),
+        }
+    }
+
     #[test]
     fn detail_lines_align_and_name_their_sources() {
-        let state = ScopeState::Assessed(vec![
+        let state = assessed(vec![
             finding(
                 "docs/README.md",
                 &[ScopeSource::Commit, ScopeSource::Observation],
@@ -384,8 +454,27 @@ mod tests {
         );
         assert_eq!(segment(&state).as_deref(), Some("2 out of scope"));
         assert_eq!(
-            segment(&ScopeState::Assessed(Vec::new())).as_deref(),
+            segment(&assessed(Vec::new())).as_deref(),
             Some("0 out of scope")
+        );
+        // Tooling steht hinter den Pfaden außerhalb, mit seinem Grund.
+        let state = ScopeState::Assessed {
+            outside: vec![finding("docs/README.md", &[ScopeSource::Commit])],
+            tooling: vec![finding(
+                ".claude/settings.json",
+                &[ScopeSource::Commit, ScopeSource::Claim],
+            )],
+        };
+        assert_eq!(
+            segment(&state).as_deref(),
+            Some("1 out of scope · 1 tooling")
+        );
+        assert_eq!(
+            detail_lines(&state, false, "unused"),
+            [
+                "  out of scope   docs/README.md         (commit)",
+                "  tooling        .claude/settings.json  (written by minds enable; commit, claim)",
+            ]
         );
         assert_eq!(
             segment(&ScopeState::NotAssessed(NoScope::NotDeclared)),
@@ -414,7 +503,7 @@ mod tests {
         let findings: Vec<ScopeFinding> = (0..DETAIL_CAP + 3)
             .map(|i| finding(&format!("f{i:02}"), &[ScopeSource::Commit]))
             .collect();
-        let state = ScopeState::Assessed(findings);
+        let state = assessed(findings);
         let capped = detail_lines(&state, false, "minds verify x --all");
         assert_eq!(capped.len(), DETAIL_CAP + 1);
         assert_eq!(capped[DETAIL_CAP], "  … 3 more (minds verify x --all)");
@@ -424,7 +513,7 @@ mod tests {
     #[test]
     fn the_gate_counts_each_path_once() {
         let state = |paths: &[&str]| {
-            ScopeState::Assessed(
+            assessed(
                 paths
                     .iter()
                     .map(|p| finding(p, &[ScopeSource::Claim]))
@@ -434,10 +523,16 @@ mod tests {
         let states = [
             state(&["docs/README.md", "LICENSE"]),
             state(&["docs/README.md"]),
-            ScopeState::Assessed(Vec::new()),
+            assessed(Vec::new()),
         ];
         assert_eq!(outside_paths(&states), 2);
         assert_eq!(outside_paths(&[state(&[])]), 0);
+        // Tooling zählt nie für das Gate.
+        let tooling = ScopeState::Assessed {
+            outside: Vec::new(),
+            tooling: vec![finding(".claude/settings.json", &[ScopeSource::Commit])],
+        };
+        assert_eq!(outside_paths(&[tooling]), 0);
     }
 
     #[test]
@@ -448,12 +543,12 @@ mod tests {
             Some("Gate           scope not assessed (no scope declared) — required in scope")
         );
         assert_eq!(
-            gate_failure(&[ScopeState::Assessed(Vec::new())], &commit).as_deref(),
+            gate_failure(&[assessed(Vec::new())], &commit).as_deref(),
             Some("Gate           scope not assessed (no linked commit) — required in scope")
         );
         assert_eq!(
             gate_failure(
-                &[ScopeState::Assessed(Vec::new())],
+                &[assessed(Vec::new())],
                 &ArtifactState::Unavailable("first parent not in this clone (shallow)")
             )
             .as_deref(),

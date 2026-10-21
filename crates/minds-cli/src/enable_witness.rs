@@ -98,7 +98,7 @@ pub(crate) fn run(
     root: &Path,
     profile: Profile,
     store: &minds_store::StoreConfig,
-) -> std::io::Result<()> {
+) -> std::io::Result<Option<String>> {
     #[cfg(not(unix))]
     {
         let _ = (root, profile, store);
@@ -115,8 +115,8 @@ pub(crate) fn run(
         };
         match profile {
             Profile::Container => container(&root, child_repo),
-            Profile::User => user(&root),
-            Profile::Managed => managed(&root),
+            Profile::User => user(&root).map(|()| None),
+            Profile::Managed => managed(&root).map(|()| None),
         }
     }
 }
@@ -164,7 +164,7 @@ fn other(err: impl std::fmt::Display) -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<()> {
+fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<Option<String>> {
     use crate::witness_cmd::{InitRequest, Initialized};
 
     let root_text = utf8(root)?;
@@ -317,7 +317,7 @@ fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<()> {
              measurements pass (docs/spikes/ea-s2-container-profile.md)."
         );
     }
-    Ok(())
+    Ok(Some(signers))
 }
 
 /// Wie `enable` mit dem Standard-Witness umgeht (`MINDS_WITNESS`).
@@ -363,10 +363,10 @@ impl LocalMode {
 /// Was der Standard-Witness ergab.
 #[cfg(unix)]
 enum LocalOutcome {
-    /// Läuft — der Ping am Socket kam zurück.
-    Running(PathBuf),
-    /// Eingerichtet; gestartet würde er so.
-    Printed(String),
+    /// Läuft — der Ping am Socket kam zurück; dazu seine Signer-Zeile.
+    Running { socket: PathBuf, signers: String },
+    /// Eingerichtet; gestartet würde er so; dazu seine Signer-Zeile.
+    Printed { start: String, signers: String },
     /// Ein anderes Profil ist eingerichtet (etwa `container`) und bleibt,
     /// wie es ist — `enable` startet es nicht.
     Kept(&'static str),
@@ -375,15 +375,16 @@ enum LocalOutcome {
 /// Der Witness ohne `--witness`: ein schon laufender geschützter bleibt;
 /// sonst — auf Nachfrage oder mit `MINDS_WITNESS=protected` — der geschützte
 /// ([`crate::enable_protected`]), und wo der nicht gewählt wird oder
-/// scheitert, der ungeschützte ([`local`]).
+/// scheitert, der ungeschützte ([`local`]). Gibt die Signer-Zeile des
+/// eingerichteten Witness zurück, soweit sie hier bekannt ist.
 pub(crate) fn default(
     root: &Path,
     store: &minds_store::StoreConfig,
     mode: LocalMode,
     verbose: bool,
-) {
+) -> std::io::Result<Option<String>> {
     if mode == LocalMode::Off {
-        return;
+        return Ok(None);
     }
     #[cfg(unix)]
     if crate::hook::witness::socket_path().is_none() && mode != LocalMode::Print {
@@ -412,7 +413,9 @@ pub(crate) fn default(
                         crate::enable_protected::BINARY
                     ));
                 }
-                return;
+                // Seine Signer-Zeile steht seit der Einrichtung in der
+                // Vertrauensdatei; sein Home ist von hier nicht lesbar.
+                return Ok(None);
             }
             // Eingerichtet, aber stumm: Die Hooks fänden ihn zuerst und
             // schrieben dann ins lokale Journal — das soll man sehen.
@@ -426,6 +429,15 @@ pub(crate) fn default(
         }
         let protected = match mode {
             LocalMode::Protected => true,
+            // Läuft der Witness-Dienst des Rechners schon (mit diesem
+            // Binary), braucht ein weiteres Repo weder Rechte noch eine
+            // Rückfrage: Es meldet sich an.
+            LocalMode::Ask
+                if crate::enable_protected::host_running()
+                    && !crate::enable_protected::binary_differs() =>
+            {
+                true
+            }
             LocalMode::Ask => {
                 crate::enable_protected::interactive() && crate::enable_protected::ask()
             }
@@ -434,8 +446,18 @@ pub(crate) fn default(
         if protected {
             match crate::enable_protected::install(root, store, verbose) {
                 Ok(installed) => {
-                    report_protected(&installed);
-                    return;
+                    return Ok(report_protected(&installed));
+                }
+                // Ausdrücklich verlangt (`MINDS_WITNESS=protected`): kein
+                // Rückfall — ein lokaler Witness daneben hieße A1 und ein
+                // halb eingerichteter geschützter, den `intent sign` stumm
+                // fände. Der Fehler steht, `enable` scheitert.
+                Err(err) if mode == LocalMode::Protected => {
+                    return Err(std::io::Error::other(format!(
+                        "protected witness not set up: {} — nothing else was set up; fix the \
+                         cause and rerun `MINDS_WITNESS=protected minds enable`",
+                        crate::text::sanitize(&err.to_string())
+                    )));
                 }
                 Err(err) => crate::text::warn(&format!(
                     "protected witness not set up: {} — setting up the unprotected witness \
@@ -449,14 +471,14 @@ pub(crate) fn default(
         LocalMode::Ask | LocalMode::Protected => LocalMode::On,
         mode => mode,
     };
-    local(root, store, mode, verbose);
+    Ok(local(root, store, mode, verbose))
 }
 
 /// Was nach der geschützten Einrichtung zu sagen ist: wo er läuft, die
 /// Signer-Zeile (und ob sie für die Trennung bürgen kann), die Managed
-/// Settings.
+/// Settings. Gibt die Signer-Zeile zurück.
 #[cfg(unix)]
-fn report_protected(installed: &crate::enable_protected::Installed) {
+fn report_protected(installed: &crate::enable_protected::Installed) -> Option<String> {
     if installed.answering {
         eprintln!(
             "minds: protected witness running for this repository (user {}, socket {})",
@@ -492,9 +514,8 @@ fn report_protected(installed: &crate::enable_protected::Installed) {
     match &installed.signers {
         Some(line) if line.starts_with(minds_core::evidence::SEPARATED_WITNESS_PRINCIPAL) => {
             eprintln!(
-                "Add this line to the allowed_signers file you pass to `minds verify --signers` \
-                 (keep it outside the repository) — it vouches that this witness runs \
-                 separated:\n  {line}"
+                "minds: witness signers line — it vouches that this witness runs separated \
+                 (an auditor keeps it in a file of their own, outside the repository):\n  {line}"
             );
         }
         Some(line) => crate::text::warn(&format!(
@@ -523,21 +544,27 @@ fn report_protected(installed: &crate::enable_protected::Installed) {
             ));
         }
     }
+    installed.signers.clone()
 }
 
 /// Richtet den Standard-Witness ein (Profil `local`) und startet ihn — nach
 /// den gewöhnlichen `enable`-Schritten. Scheitert nie das ganze `enable`:
 /// Was nicht geht, steht als gelbe Warnung auf stderr, und die Hooks
 /// schreiben dann wie bisher ins lokale Journal.
-pub(crate) fn local(root: &Path, store: &minds_store::StoreConfig, mode: LocalMode, verbose: bool) {
+pub(crate) fn local(
+    root: &Path,
+    store: &minds_store::StoreConfig,
+    mode: LocalMode,
+    verbose: bool,
+) -> Option<String> {
     if mode == LocalMode::Off {
-        return;
+        return None;
     }
     // Die Hooks nutzen ausdrücklich einen anderen Witness (etwa den in den
     // Container gemounteten Socket) — hier keiner.
     if crate::hook::witness::socket_path().is_some() {
         eprintln!("minds: witness via MINDS_WITNESS_SOCKET — no local witness set up");
-        return;
+        return None;
     }
     #[cfg(unix)]
     {
@@ -549,39 +576,51 @@ pub(crate) fn local(root: &Path, store: &minds_store::StoreConfig, mode: LocalMo
             .canonicalize()
             .and_then(|root| local_unix(&root, child_repo, mode, verbose))
         {
-            Ok(LocalOutcome::Kept(profile)) => crate::text::warn(&format!(
-                "a witness with profile {profile} is set up for this repository — enable \
-                 leaves it as it is; hooks outside its isolation record into the local \
-                 journal (A1)"
-            )),
+            Ok(LocalOutcome::Kept(profile)) => {
+                crate::text::warn(&format!(
+                    "a witness with profile {profile} is set up for this repository — enable \
+                     leaves it as it is; hooks outside its isolation record into the local \
+                     journal (A1)"
+                ));
+                None
+            }
             Ok(outcome) => {
-                match outcome {
-                    LocalOutcome::Running(socket) => eprintln!(
-                        "minds: witness running for this repository (profile local, socket {})",
-                        quoted_display(&socket)
-                    ),
-                    LocalOutcome::Printed(start) => {
-                        eprintln!("minds: witness set up (profile local) — start it with: {start}")
+                let signers = match outcome {
+                    LocalOutcome::Running { socket, signers } => {
+                        eprintln!(
+                            "minds: witness running for this repository (profile local, socket {})",
+                            quoted_display(&socket)
+                        );
+                        signers
+                    }
+                    LocalOutcome::Printed { start, signers } => {
+                        eprintln!("minds: witness set up (profile local) — start it with: {start}");
+                        signers
                     }
                     LocalOutcome::Kept(_) => unreachable!("oben behandelt"),
-                }
+                };
                 crate::text::warn(
                     "the witness runs unprotected under your user ID — an agent with a shell \
                      can stop it or read its key; assurance stays at A1 (observed). A \
                      protected witness runs under its own user.",
                 );
+                Some(signers)
             }
-            Err(err) => crate::text::warn(&format!(
-                "witness not set up for this repository: {} — hooks record into the local \
-                 journal, or into a witness still running from before (A1)",
-                crate::text::sanitize(&err.to_string())
-            )),
+            Err(err) => {
+                crate::text::warn(&format!(
+                    "witness not set up for this repository: {} — hooks record into the local \
+                     journal, or into a witness still running from before (A1)",
+                    crate::text::sanitize(&err.to_string())
+                ));
+                None
+            }
         }
     }
     #[cfg(not(unix))]
     {
         let _ = (root, store, verbose);
         crate::text::warn("no witness on this platform — hooks record into the local journal (A1)");
+        None
     }
 }
 
@@ -716,7 +755,10 @@ fn local_unix(
                     }
                 ));
             }
-            Ok(LocalOutcome::Printed(crate::text::sanitize(&printed)))
+            Ok(LocalOutcome::Printed {
+                start: crate::text::sanitize(&printed),
+                signers,
+            })
         }
         LocalMode::Off => unreachable!("vorher geprüft"),
         LocalMode::On | LocalMode::Ask | LocalMode::Protected => {
@@ -726,7 +768,7 @@ fn local_unix(
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             loop {
                 if crate::witness_cmd::ping(&socket) {
-                    return Ok(LocalOutcome::Running(socket));
+                    return Ok(LocalOutcome::Running { socket, signers });
                 }
                 if std::time::Instant::now() >= deadline {
                     return Err(other(format!(
@@ -738,6 +780,102 @@ fn local_unix(
             }
         }
     }
+}
+
+/// Nimmt den Witness dieses Nutzers für `root` zurück (`minds disable`):
+/// hält den Nutzerdienst an, entfernt seine Dienstdatei und das Witness-Home
+/// — nur eines, das diesem Nutzer gehört und **dieses** Repo festhält. Gibt
+/// die Zeilen des Berichts zurück.
+pub(crate) fn disable_local(root: &Path) -> std::io::Result<Removal> {
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Ok(Removal::default())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = root.canonicalize()?;
+        let id = repo_id(&root);
+        let mut removal = Removal::default();
+        let lines = &mut removal.lines;
+        let home = witness_home(&root)?;
+        match service_path(&root, &id) {
+            Ok(Some(target)) => {
+                crate::enable_protected::stop_local_service(&root);
+                // `launchctl bootout` kehrt zurück, bevor der Dienst weg ist:
+                // Ein Witness, der noch schreibt, ließe das Home halb
+                // gelöscht zurück. Warten, bis sein Socket schweigt.
+                let socket = home.join("run").join("witness.sock");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while crate::witness_cmd::ping(&socket) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if std::fs::symlink_metadata(&target.path).is_ok() {
+                    std::fs::remove_file(&target.path)?;
+                    lines.push(format!(
+                        "user service {} removed",
+                        quoted_display(&target.path)
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => lines.push(format!("user service not removed: {err}")),
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&home) {
+            // SAFETY: geteuid hat keine Vorbedingungen.
+            let owned = meta.is_dir() && meta.uid() == unsafe { libc::geteuid() };
+            match crate::witness_cmd::load(&home) {
+                Ok(config) if owned && config.repo_root() == root => {
+                    // Noch einmal, falls der Dienst im letzten Augenblick
+                    // etwas anlegte.
+                    let mut outcome = std::fs::remove_dir_all(&home);
+                    for _ in 0..5 {
+                        if outcome.is_ok() || !home.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        outcome = std::fs::remove_dir_all(&home);
+                    }
+                    match outcome {
+                        Ok(()) => {
+                            lines.push(format!("witness home {} removed", quoted_display(&home)))
+                        }
+                        Err(err) if !home.exists() => {
+                            let _ = err;
+                            lines.push(format!("witness home {} removed", quoted_display(&home)));
+                        }
+                        Err(err) => {
+                            removal.failed = true;
+                            lines.push(format!(
+                                "witness home {} not removed ({}) — run minds disable again",
+                                quoted_display(&home),
+                                crate::text::sanitize(&err.to_string())
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => lines.push(format!(
+                    "witness home {} kept — it belongs to another repository or user",
+                    quoted_display(&home)
+                )),
+                Err(err) => lines.push(format!(
+                    "witness home {} kept — not readable as a witness home ({})",
+                    quoted_display(&home),
+                    crate::text::sanitize(&err.to_string())
+                )),
+            }
+        }
+        Ok(removal)
+    }
+}
+
+/// Was [`disable_local`] tat — die Zeilen des Berichts und ob etwas
+/// stehen blieb, das ein zweiter Lauf nachholen muss.
+#[derive(Debug, Default)]
+pub(crate) struct Removal {
+    pub(crate) lines: Vec<String>,
+    pub(crate) failed: bool,
 }
 
 /// Ein Binary aus einem Build-Verzeichnis (`target/debug`, `target/release`)

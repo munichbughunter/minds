@@ -221,15 +221,22 @@ pub fn run(
             ),
             HookBinary::Same => {}
         }
-        match profile {
-            Some(profile) => crate::enable_witness::run(&paths.root, profile, store),
+        // Der eigene Freigabe-Schlüssel **vor** dem Witness: Die geschützte
+        // Einrichtung liest `minds.intentKey` und sagt, womit Intents
+        // aktiviert werden.
+        if local_mode != crate::enable_witness::LocalMode::Off {
+            crate::trust::report_intent_key(&paths.root);
+        }
+        let signers = match profile {
+            Some(profile) => crate::enable_witness::run(&paths.root, profile, store)?,
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
             // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
-            None => {
-                crate::enable_witness::default(&paths.root, store, local_mode, verbose);
-                Ok(())
-            }
-        }
+            None => crate::enable_witness::default(&paths.root, store, local_mode, verbose)?,
+        };
+        // Die Signer-Zeile des Witness in die Vertrauensdatei — niemand
+        // kopiert sie mehr von Hand.
+        crate::trust::report_signers(signers.as_deref());
+        Ok(())
     });
     // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
     // soll rückwirkend Kontext bekommen, ohne auf das Lesen (womöglich großer)
@@ -3291,6 +3298,232 @@ pub(crate) fn create_parent(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Was `enable` geschrieben hat — für `verify` (Tooling) und `disable`
+// ---------------------------------------------------------------------------
+
+/// Die Dateien in der Arbeitskopie, die `minds enable` schreibt — repo-relativ,
+/// `/`-getrennt. `verify` stuft einen Pfad außerhalb des Bereichs als
+/// *tooling* ein, wenn er hier steht **und** sein Inhalt im Commit genau das
+/// ist, was `enable` schreibt ([`written_by_enable`]).
+pub(crate) fn tooling_paths() -> impl Iterator<Item = &'static str> {
+    Which::ALL
+        .iter()
+        .map(|which| which.file())
+        .chain(std::iter::once(CODEX_CONFIG))
+}
+
+/// Die Codex-Konfiguration, in der `enable` nur den Schalter setzt.
+const CODEX_CONFIG: &str = ".codex/config.toml";
+
+/// Ob `text` — der Inhalt von `path` in einem Commit — **genau** das ist, was
+/// `minds enable` dort schreibt, und nichts weiter: für die JSON-Agents nur
+/// `hooks` mit unseren Einträgen (Capture, bei Claude Code auch Recall), für
+/// Codex' `config.toml` nur der Schalter (und Kommentare), für OpenCode das
+/// Plugin wortgleich. Ein Eintrag, den der Agent dazugelegt hat (eine eigene
+/// Berechtigung, ein fremder Hook), macht die Datei zu einer gewöhnlichen
+/// Änderung außerhalb des Bereichs — genau die, die ein Scope-Gate sehen
+/// soll. Die Pfade stammen aus dem Commit: kein Dateisystem, kein Symlink.
+pub(crate) fn written_by_enable(path: &str, text: &str) -> bool {
+    if path == CODEX_CONFIG {
+        return text.lines().all(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with('#') || line == "codex_hooks = true"
+        });
+    }
+    let Some(which) = Which::ALL.iter().copied().find(|w| w.file() == path) else {
+        return false;
+    };
+    if which == Which::OpenCode {
+        return text == OPENCODE_PLUGIN;
+    }
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(text) else {
+        return false;
+    };
+    if object.len() != 1 {
+        return false;
+    }
+    let Some(Value::Object(hooks)) = object.get("hooks") else {
+        return false;
+    };
+    let mut expected = expected_entries(which);
+    if which == Which::ClaudeCode {
+        expected.push(recall_registration());
+    }
+    hooks.iter().all(|(event, groups)| {
+        let Some(groups) = groups.as_array() else {
+            return false;
+        };
+        let ours: Vec<&Registration> = expected.iter().filter(|r| r.event == event).collect();
+        !ours.is_empty()
+            && groups.iter().all(|group| {
+                let Some(group) = group.as_object() else {
+                    return false;
+                };
+                if !group.keys().all(|key| key == "matcher" || key == "hooks") {
+                    return false;
+                }
+                let Some(entries) = group.get("hooks").and_then(Value::as_array) else {
+                    return false;
+                };
+                entries.iter().all(|entry| {
+                    let Some(entry) = entry.as_object() else {
+                        return false;
+                    };
+                    entry
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "type" | "command" | "timeout"))
+                        && entry.get("type").and_then(Value::as_str) == Some("command")
+                        && entry
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .is_some_and(|command| {
+                                ours.iter()
+                                    .any(|reg| classify(command, reg) != Match::Foreign)
+                            })
+                })
+            })
+    })
+}
+
+/// Nimmt die Registrierungen von `enable` aus den Agent-Konfigurationen —
+/// nur die eigenen (Capture und Recall); Fremdes bleibt, eine Datei, in der
+/// nichts anderes stand, verschwindet. Gibt je Datei eine Zeile zurück.
+pub(crate) fn disable_agents(root: &Path) -> std::io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    for &which in Which::ALL {
+        let path = root.join(which.file());
+        if !path.exists() {
+            continue;
+        }
+        check_agent_path(root, &path)?;
+        if which == Which::OpenCode {
+            let text = fs::read_to_string(&path)?;
+            if text.contains(MARK) {
+                fs::remove_file(&path)?;
+                if let Some(parent) = path.parent() {
+                    let _ = fs::remove_dir(parent);
+                }
+                lines.push(format!("{} removed", which.file()));
+            } else {
+                lines.push(format!("{} kept (not written by minds)", which.file()));
+            }
+            continue;
+        }
+        let mut value = read_json(&path)?;
+        let mut changed = false;
+        let mut regs = expected_entries(which);
+        if which == Which::ClaudeCode {
+            regs.push(recall_registration());
+        }
+        if let Some(hooks) = value.get_mut("hooks").and_then(Value::as_object_mut) {
+            for reg in &regs {
+                let Some(groups) = hooks.get_mut(reg.event).and_then(Value::as_array_mut) else {
+                    continue;
+                };
+                changed |= remove_registration(groups, reg);
+                if groups.is_empty() {
+                    hooks.remove(reg.event);
+                }
+            }
+            if hooks.is_empty() {
+                value.as_object_mut().map(|object| object.remove("hooks"));
+            }
+        }
+        if !changed {
+            lines.push(format!("{} unchanged (no minds entries)", which.file()));
+            continue;
+        }
+        if value.as_object().is_some_and(Map::is_empty) {
+            fs::remove_file(&path)?;
+            // Das Verzeichnis (`.claude/`) nur, wenn sonst nichts darin liegt.
+            if let Some(parent) = path.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+            lines.push(format!("{} removed", which.file()));
+        } else {
+            write_json(&path, &value)?;
+            lines.push(format!("{} minds entries removed", which.file()));
+        }
+    }
+    Ok(lines)
+}
+
+/// Entfernt unsere Einträge zu `reg` aus den Gruppen; Gruppen, die dadurch
+/// leer werden, verschwinden mit. Ob etwas entfernt wurde.
+fn remove_registration(groups: &mut Vec<Value>, reg: &Registration) -> bool {
+    let mut changed = false;
+    let mut emptied = Vec::new();
+    for (g, group) in groups.iter_mut().enumerate() {
+        let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = entries.len();
+        entries.retain(|entry| {
+            entry
+                .get("command")
+                .and_then(Value::as_str)
+                .is_none_or(|command| classify(command, reg) == Match::Foreign)
+        });
+        if entries.len() != before {
+            changed = true;
+            if entries.is_empty() {
+                emptied.push(g);
+            }
+        }
+    }
+    let mut index = 0usize;
+    groups.retain(|_| {
+        let keep = !emptied.contains(&index);
+        index += 1;
+        keep
+    });
+    changed
+}
+
+/// Nimmt den minds-Block aus den Git-Hooks; ein Hook, in dem sonst nur
+/// Shebang, Leerzeilen und Kommentare stehen, verschwindet. Gibt je Hook
+/// eine Zeile zurück.
+pub(crate) fn disable_git_hooks(paths: &RepoPaths) -> std::io::Result<Vec<String>> {
+    let mut lines = Vec::new();
+    let hooks_dir = match &paths.hooks {
+        HooksDir::At(dir) => dir.clone(),
+        HooksDir::Unusable(_) => return Ok(lines),
+    };
+    for name in hook_names() {
+        let path = hooks_dir.join(name);
+        let Some(current) = read_existing_hook(&path)? else {
+            continue;
+        };
+        let Some(span) = block_span(&current) else {
+            lines.push(format!(
+                "{} kept (no minds block)",
+                label_for(&paths.root, &path)
+            ));
+            continue;
+        };
+        let mut rest = String::new();
+        rest.push_str(&current[..span.start]);
+        rest.push_str(&current[span.end..]);
+        let only_comments = rest.lines().all(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with('#')
+        });
+        if only_comments {
+            fs::remove_file(&path)?;
+            lines.push(format!("{} removed", label_for(&paths.root, &path)));
+        } else {
+            let rest = rest.trim_end_matches('\n').to_owned() + "\n";
+            write_hook(&path, &rest)?;
+            lines.push(format!(
+                "{} minds block removed",
+                label_for(&paths.root, &path)
+            ));
+        }
+    }
+    Ok(lines)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5637,5 +5870,90 @@ mod tests {
         assert!(claude_style(dir.path(), Which::ClaudeCode).is_err());
         // Die kaputte Datei ist noch da, nicht ersetzt.
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ kaputt ");
+    }
+
+    /// Tooling ist nur, was `enable` **genau so** schreibt: die eigenen
+    /// Hook-Einträge (Capture und Recall), der Codex-Schalter, das
+    /// OpenCode-Plugin wortgleich. Eine Berechtigung oder ein fremder Hook
+    /// daneben machen die Datei zu einer gewöhnlichen Änderung.
+    #[test]
+    fn only_what_enable_writes_counts_as_tooling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        claude_style(root, Which::ClaudeCode).unwrap();
+        enable_recall_hook(root, true).unwrap();
+        let text = fs::read_to_string(root.join(".claude/settings.json")).unwrap();
+        assert!(written_by_enable(".claude/settings.json", &text));
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value["permissions"] = json!({"allow": ["Bash(ls)"]});
+        assert!(!written_by_enable(
+            ".claude/settings.json",
+            &value.to_string()
+        ));
+        let mut value: Value = serde_json::from_str(&text).unwrap();
+        value["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"hooks": [{"type": "command", "command": "echo hi"}]}));
+        assert!(!written_by_enable(
+            ".claude/settings.json",
+            &value.to_string()
+        ));
+        // Ein Eintrag mit anderem Wortlaut (ältere Version) ist noch unserer.
+        let old = text.replace(
+            "minds hook --agent claude-code",
+            "minds hook --agent claude-code --event x",
+        );
+        assert!(written_by_enable(".claude/settings.json", &old));
+        assert!(!written_by_enable(".claude/settings.json", "{}"));
+        assert!(!written_by_enable(".claude/settings.json", "not json"));
+        assert!(!written_by_enable("src/main.rs", "fn main() {}"));
+        assert!(written_by_enable(
+            ".opencode/plugin/minds.ts",
+            OPENCODE_PLUGIN
+        ));
+        assert!(!written_by_enable(
+            ".opencode/plugin/minds.ts",
+            "export const x = 1;\n"
+        ));
+        assert!(written_by_enable(
+            ".codex/config.toml",
+            "# codex\ncodex_hooks = true\n"
+        ));
+        assert!(!written_by_enable(
+            ".codex/config.toml",
+            "codex_hooks = true\nmodel = \"x\"\n"
+        ));
+        assert!(tooling_paths().any(|path| path == ".codex/config.toml"));
+    }
+
+    /// `disable` nimmt nur die eigenen Einträge; Fremdes bleibt, eine Datei
+    /// ohne Fremdes verschwindet.
+    #[test]
+    fn disable_removes_only_our_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join(".claude")).unwrap();
+        let foreign =
+            json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo bye"}]}]}});
+        fs::write(root.join(".claude/settings.json"), foreign.to_string()).unwrap();
+        claude_style(root, Which::ClaudeCode).unwrap();
+        enable_recall_hook(root, true).unwrap();
+        assert_eq!(
+            disable_agents(root).unwrap(),
+            [".claude/settings.json minds entries removed"]
+        );
+        let text = fs::read_to_string(root.join(".claude/settings.json")).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value, foreign);
+        fs::remove_file(root.join(".claude/settings.json")).unwrap();
+        claude_style(root, Which::ClaudeCode).unwrap();
+        assert_eq!(
+            disable_agents(root).unwrap(),
+            [".claude/settings.json removed"]
+        );
+        assert!(!root.join(".claude/settings.json").exists());
+        // Nichts da: nichts zu sagen.
+        assert!(disable_agents(root).unwrap().is_empty());
     }
 }

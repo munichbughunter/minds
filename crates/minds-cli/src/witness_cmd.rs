@@ -14,8 +14,9 @@ mod daemon;
 
 #[cfg(unix)]
 pub(crate) use daemon::{
-    CONTROL_SOCKET, InitRequest, Initialized, UNPINNED, init_config, intent_key_line,
-    key_display_with, load, observer_status, peer_uid, ping,
+    CONTROL_SOCKET, HOST_SOCKET, InitRequest, Initialized, PART, UNPINNED, host_status,
+    init_config, intent_key_line, key_display_with, load, observer_status, peer_uid, ping,
+    register, witness_keygen,
 };
 
 /// Das versteckte Unterkommando, unter dem der Witness seinen Checkpoint als
@@ -37,9 +38,18 @@ pub fn run(parsed: &crate::Parsed) -> ExitCode {
 #[cfg(unix)]
 fn run_unix(parsed: &crate::Parsed) -> ExitCode {
     let result = (|| {
-        let command = parsed
-            .positional(0)
-            .ok_or("expected: witness init, run, keygen, signers, status or activate")?;
+        let command = parsed.positional(0).ok_or(
+            "expected: witness init, run, serve, register, unregister, keygen, signers, status \
+             or activate",
+        )?;
+        if command != "serve" && parsed.value("--base").is_some() {
+            return Err("--base requires witness serve".into());
+        }
+        // Der Dienst des Rechners und seine Gegenseite kennen nur `--repo`
+        // (und `--intent-key` beim Anmelden).
+        if matches!(command, "serve" | "register" | "unregister") {
+            return host_command(command, parsed);
+        }
         if command != "init"
             && [
                 "--repo",
@@ -102,7 +112,11 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
             "signers" => existing_signers_line(&home)?
                 .ok_or_else(|| "no witness key — run minds witness keygen".into()),
             "activate" => activate(&home),
-            _ => Err("expected: witness init, run, keygen, signers, status or activate".into()),
+            _ => Err(
+                "expected: witness init, run, serve, register, unregister, keygen, \
+                      signers, status or activate"
+                    .into(),
+            ),
         }
     })();
     match result {
@@ -119,6 +133,66 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
             );
             ExitCode::from(4)
         }
+    }
+}
+
+/// `minds witness serve|register|unregister` — der Witness-Dienst des
+/// Rechners und seine Gegenseite ([`daemon::serve`]).
+///
+/// - `serve [--base <dir>]`: der Dienst, als Witness-Nutzer (Standard:
+///   die Basis der geschützten Witnesses).
+/// - `register --repo <root> [--intent-key <pub>]`: meldet das Repo an —
+///   als Entwickler, über den Steuer-Socket des Rechners (Gruppe des
+///   Witness genügt); gibt die Signer-Zeile aus.
+/// - `unregister --repo <root>`: meldet es ab — nur als Witness-Nutzer
+///   (`minds disable` ruft das mit der einen Erhöhung auf).
+#[cfg(unix)]
+fn host_command(command: &str, parsed: &crate::Parsed) -> Fallible<String> {
+    for flag in [
+        "--home",
+        "--path-map",
+        "--profile",
+        "--socket-group",
+        "--child-repo",
+        "--policy-rev",
+        "--replace-intent-key",
+    ] {
+        if parsed.value(flag).is_some() {
+            return Err(format!("{flag} does not apply to witness {command}").into());
+        }
+    }
+    if command == "serve" {
+        let base = parsed
+            .value("--base")
+            .map(PathBuf::from)
+            .unwrap_or_else(crate::enable_protected::base);
+        daemon::serve(&base)?;
+        return Ok(String::new());
+    }
+    let repo = parsed
+        .value("--repo")
+        .ok_or("register and unregister require --repo")?;
+    let root = Path::new(repo).canonicalize()?;
+    let root = repo_root_of(&root).ok_or("--repo must identify a Git worktree")?;
+    let base = crate::enable_protected::base();
+    let socket = base.join(HOST_SOCKET);
+    // Die Gegenstelle muss der Eigentümer der Basis sein — der Witness-Nutzer;
+    // läuft der Dienst unter der eigenen Kennung (ein Test), prüft das `None`.
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    let peer = std::fs::metadata(&base)
+        .ok()
+        .map(|meta| std::os::unix::fs::MetadataExt::uid(&meta))
+        .filter(|uid| *uid != euid);
+    match command {
+        "register" => {
+            let registered = daemon::register(&socket, peer, &root, parsed.value("--intent-key"))
+                .map_err(|reason| format!("witness host: {reason}"))?;
+            Ok(registered.parts.join("\n"))
+        }
+        _ => daemon::unregister(&socket, peer, &root)
+            .map(|status| status.replace(PART, "\n"))
+            .map_err(|reason| format!("witness host: {reason}").into()),
     }
 }
 

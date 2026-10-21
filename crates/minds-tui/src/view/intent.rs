@@ -450,7 +450,7 @@ fn technical_block(lines: &mut Vec<Line<'static>>, info: &IntentInfo, state: &In
         _ if state.stale => ("rechecking…".to_string(), theme::dim()),
         IntentSignature::Valid(kind) => (
             format!(
-                "valid ({}) — checked against ~/.ssh/allowed_signers, as minds verify does without --signers",
+                "valid ({}) — checked against your trusted signers (minds.signers), as minds verify does without --signers",
                 kind.word()
             ),
             Style::default().fg(theme::OK),

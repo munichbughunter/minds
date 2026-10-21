@@ -322,6 +322,12 @@ fn verify_target(
     if ledger.torn {
         println!("{}", assurance::TORN_LEDGER_NOTE);
     }
+    // Woher die vertrauenswürdigen Signer kommen — einmal je Lauf, vor dem
+    // ersten Urteil: Wer `A1 observed` liest, soll sehen, gegen welche Datei
+    // geprüft wurde (oder dass keine da war).
+    if let Some(trusted) = crate::trust::resolve(signers) {
+        println!("Signers        {}", trusted.describe());
+    }
     // Ohne Commit-Kontext (eine Session-Id) gibt es keine Verknüpfung, deren
     // Herkunft zählte.
     let (links, revision): (Vec<(SessionId, Option<EvidenceSource>)>, _) =
@@ -1896,7 +1902,7 @@ fn verify_seal(target: &str, signers: Option<&str>, identity: Option<&str>) -> F
             let trusted = witness_trust::observation_trust(ctx.store.as_ref(), signers);
             if !trusted(&checked.id, &checked.text) {
                 println!(
-                    "Note           not trusted for reconciliation — needs a principal restricted to minds-witness in --signers or ~/.ssh/allowed_signers"
+                    "Note           not trusted for reconciliation — needs a principal restricted to minds-witness in --signers or the trusted signers file (minds.signers)"
                 );
             }
             if complete && reasons.is_empty() {
@@ -1968,12 +1974,14 @@ fn verify_attestation(
     )?)
 }
 
-/// Die allowed_signers-Datei: `--signers`, sonst `git config
-/// gpg.ssh.allowedSignersFile`, sonst `~/.ssh/allowed_signers`.
+/// Die allowed_signers-Datei: `--signers`, sonst die Vertrauensdatei des
+/// Nutzers (`minds.signers`, `~/.config/minds/allowed_signers`), sonst
+/// `git config gpg.ssh.allowedSignersFile`, sonst `~/.ssh/allowed_signers`.
 fn resolve_signers(signers: Option<&str>, root: &Path) -> Fallible<String> {
     resolve_signers_optional(signers, root).ok_or_else(|| {
-        "no allowed_signers file: pass --signers <file> or set \
-         `git config gpg.ssh.allowedSignersFile`"
+        "no allowed_signers file: pass --signers <file>, run `minds enable` (it records \
+         the trusted signers in ~/.config/minds/allowed_signers) or set `git config \
+         gpg.ssh.allowedSignersFile`"
             .into()
     })
 }
@@ -1984,16 +1992,15 @@ fn resolve_signers_optional(signers: Option<&str>, root: &Path) -> Option<String
     if let Some(signers) = signers {
         return Some(signers.to_string());
     }
+    if let Some(trusted) = crate::trust::resolve(None)
+        .filter(|trusted| trusted.origin != crate::trust::SignersOrigin::Legacy)
+    {
+        return Some(trusted.path.to_string_lossy().into_owned());
+    }
     if let Some(configured) = git_config(root, "gpg.ssh.allowedSignersFile") {
         return Some(configured);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        let default = format!("{home}/.ssh/allowed_signers");
-        if Path::new(&default).exists() {
-            return Some(default);
-        }
-    }
-    None
+    crate::trust::resolve(None).map(|trusted| trusted.path.to_string_lossy().into_owned())
 }
 
 /// Die Identität (Principal in allowed_signers): `--identity`, sonst

@@ -266,6 +266,12 @@ impl Fixture {
             let mut minds = Command::new(MINDS);
             minds
                 .env("MINDS_WITNESS", "off")
+                // Nie die Vertrauensdatei des Entwicklers: Signaturen gelten nur gegen `--signers`.
+                .env(
+                    "XDG_CONFIG_HOME",
+                    std::env::temp_dir().join("minds-tests-no-config"),
+                )
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env_remove("MINDS_WITNESS_HOME")
                 .env_remove("MINDS_WITNESS_SOCKET");
             minds
@@ -381,9 +387,20 @@ fn verify_uses_the_first_epoch_after_a_witness_start_that_began_before_the_sessi
 }
 
 #[test]
+fn verify_uses_a_witness_started_just_before_the_session() {
+    // `minds enable`, dann sofort die Session: Der Witness begann 15 s vor
+    // dem ersten Event — innerhalb des Fensterspielraums, aber vor der
+    // Session. Er sah jede ihrer Dateiänderungen; das Fenster steht.
+    let f = Fixture::new();
+    f.observe_from_start("2026-10-02T09:59:45Z");
+    let out = f.verify(true);
+    assert!(out.contains("artifact 1/1 lines explained"), "{out}");
+}
+
+#[test]
 fn verify_ignores_a_witness_restarted_during_the_session() {
-    // Neustart nach dem Fensterbeginn: Was davor geschah, sah dieser Lauf
-    // nicht — kein Fenster, wie ohne Witness.
+    // Neustart nach dem ersten Event der Session: Was davor geschah, sah
+    // dieser Lauf nicht — kein Fenster, wie ohne Witness.
     let f = Fixture::new();
     f.observe_from_start("2026-10-02T10:00:01Z");
     let out = f.verify(true);
