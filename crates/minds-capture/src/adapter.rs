@@ -236,7 +236,8 @@ fn build_with_transcript(
 ) -> (Session, Vec<usize>) {
     let agent = key.agent();
 
-    let (turns, call_events) = build_turns(agent, events, &transcript);
+    let (mut turns, call_events) = build_turns(agent, events, &transcript);
+    call_ends(&mut turns, events, &call_events, agent);
     let intent = Intent {
         request: first_prompt(agent, events).unwrap_or_default(),
         discarded: discarded_files(&turns),
@@ -590,6 +591,24 @@ fn written_hashes(
             (Ok(hash), None) => effect.written = Some(hash),
             (Err(reason), _) => effect.written_unavailable = Some(reason),
         }
+    }
+}
+
+/// Das Ende jedes Aufrufs: der Zeitstempel seines eindeutig zugeordneten
+/// Post-Events ([`PostIndex`], dieselbe Regel wie beim Schreibzeit-Hash).
+/// Ohne Adapter oder ohne eindeutiges Post-Event bleibt `ended_at` leer —
+/// der Reader öffnet dann kein Fenster für den Aufruf (fail-closed), statt
+/// über die Reihenfolge zu raten.
+fn call_ends(turns: &mut [Turn], events: &[JournalEvent], call_events: &[usize], agent: &str) {
+    let Some(adapter) = normalize::adapter_for(agent) else {
+        return;
+    };
+    let posts = PostIndex::new(adapter, events);
+    let calls = turns.iter_mut().flat_map(|t| &mut t.tool_calls);
+    for (call, &pre_index) in calls.zip(call_events) {
+        call.ended_at = posts
+            .post_for(events.get(pre_index))
+            .map(|post| post.at.clone());
     }
 }
 
@@ -1094,6 +1113,11 @@ fn build_turns(
                 let turn = open.get_or_insert_with(|| assistant_turn(&event.at));
                 if let Some(tool) = facts.tool {
                     turn.tool_calls.push(ToolCall {
+                        // Der Beginn des Aufrufs: das Pre-Event, vom Hook
+                        // bzw. Witness gestempelt. Das Ende folgt aus dem
+                        // Post-Event ([`call_ends`]).
+                        at: Some(event.at.clone()),
+                        ended_at: None,
                         outcome: None,
                         name: tool.name,
                         arguments: tool.arguments,

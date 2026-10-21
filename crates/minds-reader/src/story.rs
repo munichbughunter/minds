@@ -947,6 +947,8 @@ mod tests {
 
     fn call(name: &str, args: &str, effect: Option<Effect>) -> ToolCall {
         ToolCall {
+            at: None,
+            ended_at: None,
             name: name.into(),
             arguments: args.into(),
             capture: Some(Capture {

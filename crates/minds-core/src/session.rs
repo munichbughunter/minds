@@ -245,6 +245,26 @@ pub struct ToolCall {
     /// behalten Bytes und Id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<ExecOutcome>,
+
+    /// Wann der Agent das Werkzeug aufrief: der Zeitstempel des
+    /// `PreToolUse`-Events (RFC 3339, UTC) — vom Hook bzw. Witness
+    /// gestempelt, nie `now()` im Adapter. `turn.at` ist nur der Zeitpunkt
+    /// des **ersten** Aufrufs eines Zugs; ein Zug mit mehreren Aufrufen
+    /// braucht je Aufruf seinen eigenen, damit der Reader Beobachtungen des
+    /// Datei-Beobachters dem Fenster eines Shell-Aufrufs zuordnen kann.
+    ///
+    /// Additiv: `None` wird nicht geschrieben — Sessions von vor diesem Feld
+    /// (und Importe ohne Hook-Events) behalten Bytes und Id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+
+    /// Wann das Werkzeug fertig meldete: der Zeitstempel des eindeutig
+    /// zugeordneten `PostToolUse`-Events (dieselbe Zuordnung wie
+    /// [`Effect::written_at`]). `None`, wenn kein eindeutiges Post-Event
+    /// vorliegt — ein Fenster `[at, ended_at]` gibt es dann nicht. Additiv
+    /// wie [`ToolCall::at`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
 }
 
 /// Das gedeutete Ergebnis eines Test- oder Benchmark-Laufs (EA-18a).
@@ -471,6 +491,8 @@ mod tests {
             role: Role::Assistant,
             text: "Ich schaue mir die Backoff-Logik an.".into(),
             tool_calls: vec![ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "read_file".into(),

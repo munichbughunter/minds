@@ -485,6 +485,8 @@ mod tests {
 
     fn call(name: &str, arguments: &str, kind: EffectKind, path: Option<&str>) -> ToolCall {
         ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: name.into(),
@@ -734,6 +736,8 @@ mod tests {
         // einen Fehler.
         let mut s = session("no effects");
         s.turns.push(assistant(vec![ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: "Bash".into(),

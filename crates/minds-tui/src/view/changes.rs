@@ -393,7 +393,18 @@ fn file_summary(app: &App, file: &FileDiff) -> Vec<String> {
     if fs_only > 0 {
         parts.push(format!("{fs_only} fs only"));
     }
-    parts.push(format!("{observed} observed"));
+    match file
+        .exec
+        .and_then(|source| app.inspection.line_reason(source))
+    {
+        Some(reason) => parts.push(format!(
+            "{observed} observed during {} call {} (turn {})",
+            reason.tool,
+            reason.call + 1,
+            reason.turn + 1
+        )),
+        None => parts.push(format!("{observed} observed")),
+    }
     if open > 0 {
         parts.push(format!("{open} not observed"));
     }
@@ -588,9 +599,15 @@ fn draw_split(frame: &mut Frame, state: &ChangesState, file: &FileDiff, area: Re
 const BRIDGE: &str = "With a witness this line would be ● observed.";
 
 /// Der Satz zu einem Zustand mit Beleg (nicht für `not observed`, dessen
-/// Gründe eigene Sätze haben). `tool` ist das Werkzeug des Claims.
-pub(crate) fn state_sentence(class: ReconClass, tool: &str) -> Vec<String> {
+/// Gründe eigene Sätze haben). `tool` ist das Werkzeug des Claims; `exec`
+/// sagt, dass kein Claim, sondern das Fenster eines Shell-Aufrufs die Zeile
+/// zu `● observed` machte.
+pub(crate) fn state_sentence(class: ReconClass, tool: &str, exec: bool) -> Vec<String> {
     match class {
+        ReconClass::Explained if exec => vec![
+            "A witness observed this content on disk while the agent's shell call ran — the hash matched. No tool payload claims the bytes; the attribution is by time, not by content."
+                .into(),
+        ],
         ReconClass::Explained => vec![
             "A witness observed this content on disk after the agent's write — the hash matched."
                 .into(),
@@ -750,11 +767,29 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                 }
                 None => Span::styled("· NOT ASSESSED", theme::dim()),
             };
-            lines.push(Line::from(vec![
+            // Der Shell-Aufruf, in dessen Fenster der Witness die Zeile sah:
+            // Die Zeile ist beobachtet, ihr Aufruf nur über die Zeit
+            // zugeordnet — beides steht im Kopf.
+            let exec = reason
+                .as_ref()
+                .filter(|_| row.class == Some(ReconClass::Explained))
+                .and_then(|r| r.command.as_deref().map(|c| (r, c)));
+            let mut head = vec![
                 Span::styled(place, theme::title()),
                 Span::raw("  "),
                 state_span,
-            ]));
+            ];
+            if let Some((r, command)) = exec {
+                head.push(Span::styled(
+                    format!(
+                        " · written by {} call {} · command: {command}",
+                        r.tool,
+                        r.call + 1
+                    ),
+                    theme::dim(),
+                ));
+            }
+            lines.push(Line::from(head));
             // Der Satz zum Zustand.
             let tool = reason.as_ref().map_or("write", |r| r.tool.as_str());
             match row.class {
@@ -834,7 +869,7 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                     }
                 }
                 Some(class) => {
-                    for sentence in state_sentence(class, tool) {
+                    for sentence in state_sentence(class, tool, exec.is_some()) {
                         lines.push(Line::raw(sentence));
                     }
                 }
@@ -852,15 +887,18 @@ fn draw_why(frame: &mut Frame, app: &App, state: &ChangesState, file: &FileDiff,
                     .iter()
                     .filter(|r| r.kind == DiffKind::Added && r.source == row.source)
                     .count();
-                lines.push(Line::from(vec![
-                    indent(),
-                    Span::raw(format!(
-                        "{} {} ({attributed} line{})",
+                let plural = if attributed == 1 { "" } else { "s" };
+                let step = match &reason.command {
+                    // Ein Shell-Aufruf: das Kommando statt des Pfads — die
+                    // Shell nennt ihr Ziel nicht als Feld.
+                    Some(command) => format!(
+                        "{} call {} · command: {command} ({attributed} line{plural})",
                         reason.tool,
-                        file.path,
-                        if attributed == 1 { "" } else { "s" }
-                    )),
-                ]));
+                        reason.call + 1
+                    ),
+                    None => format!("{} {} ({attributed} line{plural})", reason.tool, file.path),
+                };
+                lines.push(Line::from(vec![indent(), Span::raw(step)]));
                 lines.push(Line::from(vec![indent(), model_line(reason)]));
                 let mut session = vec![label("SESSION"), Span::raw(short_session(&id))];
                 if let Some(card) = app.inspection.card(reason.session) {

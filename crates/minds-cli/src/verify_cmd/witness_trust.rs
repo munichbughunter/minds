@@ -1158,6 +1158,8 @@ mod tests {
             role: minds_core::Role::Assistant,
             text: String::new(),
             tool_calls: vec![minds_core::ToolCall {
+                at: None,
+                ended_at: None,
                 name: "Bash".into(),
                 arguments: r#"{"command":"cargo test"}"#.into(),
                 capture: None,

@@ -1032,6 +1032,8 @@ mod tests {
                 role: minds_core::Role::Assistant,
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     name: "T".into(),
                     arguments: String::new(),

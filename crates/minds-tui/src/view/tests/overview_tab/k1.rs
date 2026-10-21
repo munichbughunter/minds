@@ -111,6 +111,7 @@ fn changes_of(head: CommitId) -> ChangesState {
             removed: 0,
             class: Some(ReconClass::ReportedOnly),
             gap: None,
+            exec: None,
             note: None,
             rows: vec![
                 row(DiffKind::Hunk, None, None, "@@ -0,0 +1,2 @@", None, None),

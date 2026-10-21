@@ -336,6 +336,7 @@ mod tests {
                         removes: false,
                         last_observed: None,
                         gap: None,
+                        exec: None,
                     }],
                     explained_lines: 0,
                     total_changed_lines: 2,

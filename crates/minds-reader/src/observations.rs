@@ -26,10 +26,10 @@
 use jiff::{SignedDuration, Timestamp};
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SCOPE_WITNESS_V1, Seal, SealOutcome};
 use minds_core::observation::{GapReason, ObservationReason};
-use minds_core::{ContentHash, EffectKind, Session, SessionId};
+use minds_core::{ContentHash, EffectKind, Session, SessionId, ToolCall};
 use minds_store::ContextStore;
 
-use crate::reconcile::{FsObservation, ObservedAt, claim_path};
+use crate::reconcile::{FsObservation, LineSource, ObservedAt, claim_path};
 
 /// Spielraum um das Fenster der verknüpften Sessions (± 30 s).
 pub const WINDOW_SLACK: SignedDuration = SignedDuration::from_secs(30);
@@ -40,6 +40,144 @@ pub const CORROBORATION_BEFORE: SignedDuration = SignedDuration::from_secs(2);
 
 /// So lange **nach** dem Claim darf sie liegen (Entprellung, Latenz).
 pub const CORROBORATION_AFTER: SignedDuration = SignedDuration::from_secs(30);
+
+/// So lange **vor** dem Pre-Event eines Shell-Aufrufs darf eine Beobachtung
+/// liegen, die noch zu ihm zählt (Uhren von Hook und Witness).
+pub const EXEC_WINDOW_BEFORE: SignedDuration = CORROBORATION_BEFORE;
+
+/// Der Latenzpuffer des Beobachters **nach** dem Post-Event eines
+/// Shell-Aufrufs: Er wartet je Pfad Ruhe ab (Entprellung), liest dann und
+/// stempelt beim Lesen. Bewusst enger als [`CORROBORATION_AFTER`]: Ein
+/// Schreib-Claim bindet seine Beobachtung zusätzlich über den Hash, das
+/// Fenster eines Shell-Aufrufs nur über die Zeit.
+pub const EXEC_WINDOW_AFTER: SignedDuration = SignedDuration::from_secs(5);
+
+/// Das Zeitfenster eines Shell-Aufrufs (Exec): `[PreToolUse −
+/// EXEC_WINDOW_BEFORE, PostToolUse + EXEC_WINDOW_AFTER]`. Eine Beobachtung
+/// des Datei-Beobachters in diesem Fenster wird dem Aufruf zugeordnet
+/// ([`exec_call_at`]): Was die Shell schrieb (Heredoc, `tee`, `sed -i`, ein
+/// Generator), hat keinen Tool-Payload und damit keinen Schreib-Claim — der
+/// Witness sah es trotzdem, und zwar während dieses Aufrufs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecWindow {
+    pub source: LineSource,
+    pub from: Timestamp,
+    pub to: Timestamp,
+}
+
+/// Das Fenster **eines** Aufrufs — nur für einen Exec-Effekt mit Pre- und
+/// Post-Zeit ([`ToolCall::at`], [`ToolCall::ended_at`]). Fehlt eine (kein
+/// eindeutiges Post-Event, Session von vor den Feldern), gibt es kein
+/// Fenster: Über die Dauer wird nicht geraten (fail-closed). Ein Ende vor
+/// dem Beginn (Uhr zurückgesprungen) öffnet ebenfalls keines. Den einen
+/// Fall ohne Post-Zeit, der dennoch ein Fenster hat, kennt
+/// [`exec_window_open`].
+pub fn exec_window(call: &ToolCall) -> Option<(Timestamp, Timestamp)> {
+    if call.effect.as_ref().map(|e| e.kind) != Some(EffectKind::Exec) {
+        return None;
+    }
+    let started = time(call.at.as_deref())?;
+    let ended = time(call.ended_at.as_deref())?;
+    if ended < started {
+        return None;
+    }
+    let from = started.checked_sub(EXEC_WINDOW_BEFORE).ok()?;
+    let to = ended.checked_add(EXEC_WINDOW_AFTER).ok()?;
+    Some((from, to))
+}
+
+/// Das Fenster des **letzten** Aufrufs einer Session, der beim Checkpoint
+/// noch offen war: Pre-Zeit da, Post-Zeit nicht, kein Aufruf danach. Das
+/// ist der Agent, der aus demselben Shell-Aufruf heraus committet (`cat >
+/// … <<EOF && git add && git commit`): Der Commit versiegelt die Session,
+/// bevor sein `PostToolUse` eintrifft — das landet im nächsten Bereich,
+/// ohne Pre-Event, und erzeugt dort keinen Aufruf. Bis zum Seal lief aber
+/// genau dieser Aufruf, also gehört ihm alles, was der Witness ab seinem
+/// Beginn sah: `[at − EXEC_WINDOW_BEFORE, ∞)` — begrenzt durch die
+/// Beobachtungen, die der Aufrufer ohnehin auf die Fenster der Sessions
+/// beschränkt ([`observations_in_windows`]). Ein offener Aufruf, dem noch
+/// ein Aufruf folgt (parallele Aufrufe), bekommt weiterhin keines.
+pub fn exec_window_open(call: &ToolCall) -> Option<(Timestamp, Timestamp)> {
+    if call.effect.as_ref().map(|e| e.kind) != Some(EffectKind::Exec) || call.ended_at.is_some() {
+        return None;
+    }
+    let started = time(call.at.as_deref())?;
+    let from = started.checked_sub(EXEC_WINDOW_BEFORE).ok()?;
+    Some((from, Timestamp::MAX))
+}
+
+/// Die Fenster aller Shell-Aufrufe der `sessions`, in Session-, Turn- und
+/// Aufruf-Reihenfolge — samt dem offenen Fenster eines letzten Aufrufs
+/// ohne Post-Zeit ([`exec_window_open`]). Sessions ohne kanonische Id
+/// tragen nichts bei.
+pub fn exec_windows(sessions: &[&Session]) -> Vec<ExecWindow> {
+    let mut out = Vec::new();
+    for session in sessions {
+        let Ok(id) = SessionId::of(*session) else {
+            continue;
+        };
+        let last = session
+            .turns
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(t, turn)| {
+                (!turn.tool_calls.is_empty()).then(|| (t, turn.tool_calls.len() - 1))
+            });
+        for (turn_index, turn) in session.turns.iter().enumerate() {
+            for (call_index, call) in turn.tool_calls.iter().enumerate() {
+                let window = exec_window(call).or_else(|| {
+                    (last == Some((turn_index, call_index)))
+                        .then(|| exec_window_open(call))
+                        .flatten()
+                });
+                if let Some((from, to)) = window {
+                    out.push(ExecWindow {
+                        source: LineSource {
+                            session: id,
+                            turn: turn_index,
+                            call: call_index,
+                        },
+                        from,
+                        to,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Der Shell-Aufruf, in dessen Fenster eine Beobachtung um `at` fällt.
+///
+/// Genau ein Fenster: dieser Aufruf. Mehrere (parallel laufende Aufrufe,
+/// ein Zug, der sie dicht hintereinander absetzt): `prefer` entscheidet —
+/// typisch „der Aufruf erwähnt den Pfad" — aber nur, wenn es danach genau
+/// einen gibt. Bleibt es mehrdeutig, wird keiner genannt (fail-closed): Die
+/// Beobachtung ist dann weiterhin eine Beobachtung, nur ohne Aufruf.
+pub fn exec_call_at(
+    windows: &[ExecWindow],
+    at: Timestamp,
+    prefer: &dyn Fn(LineSource) -> bool,
+) -> Option<LineSource> {
+    let candidates: Vec<LineSource> = windows
+        .iter()
+        .filter(|w| w.from <= at && at <= w.to)
+        .map(|w| w.source)
+        .collect();
+    match candidates.as_slice() {
+        [] => None,
+        [one] => Some(*one),
+        several => {
+            let preferred: Vec<LineSource> =
+                several.iter().copied().filter(|s| prefer(*s)).collect();
+            match preferred.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            }
+        }
+    }
+}
 
 /// Die Beobachtungen aller vertrauenswürdigen `witness-fs/v1`-Epochen, die
 /// sich mit `[from, to]` überschneiden, nach Zeit sortiert — einzeln auf das
@@ -880,6 +1018,8 @@ mod tests {
     fn corroborations_cover_every_write_claim() {
         use minds_core::{Agent, Effect, Intent, Model, Role, ToolCall, Turn};
         let call_at = |path: &str, written: Option<ContentHash>, at: Option<&str>| ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             name: "Write".into(),
             arguments: String::new(),
@@ -966,6 +1106,175 @@ mod tests {
                 (2, 2, Some("src/c.rs".into()), Corroboration::Uncorroborated),
             ]
         );
+    }
+
+    /// Ein Shell-Aufruf öffnet sein Fenster nur mit Pre- und Post-Zeit, nur
+    /// als Exec, nie mit einem Ende vor dem Beginn; die Ränder sind
+    /// `[at − 2 s, ended_at + 5 s]`.
+    #[test]
+    fn exec_windows_need_both_times_and_an_exec_effect() {
+        use minds_core::Effect;
+        let call = |kind: EffectKind, at: Option<&str>, ended: Option<&str>| ToolCall {
+            at: at.map(str::to_owned),
+            ended_at: ended.map(str::to_owned),
+            outcome: None,
+            name: "Bash".into(),
+            arguments: String::new(),
+            capture: None,
+            effect: Some(Effect {
+                kind,
+                path: None,
+                content: None,
+                written: None,
+                written_unavailable: None,
+                written_at: None,
+            }),
+        };
+        let (pre, post) = ("2026-10-05T10:00:10Z", "2026-10-05T10:00:12Z");
+        let (from, to) = exec_window(&call(EffectKind::Exec, Some(pre), Some(post))).unwrap();
+        assert_eq!(from.to_string(), "2026-10-05T10:00:08Z");
+        assert_eq!(to.to_string(), "2026-10-05T10:00:17Z");
+        for (kind, at, ended) in [
+            (EffectKind::Exec, None, Some(post)),
+            (EffectKind::Exec, Some(pre), None),
+            (EffectKind::Exec, Some(post), Some(pre)),
+            (EffectKind::Write, Some(pre), Some(post)),
+            (EffectKind::Other, Some(pre), Some(post)),
+        ] {
+            assert_eq!(
+                exec_window(&call(kind, at, ended)),
+                None,
+                "{kind:?} {at:?} {ended:?}"
+            );
+        }
+        let mut plain = call(EffectKind::Exec, Some(pre), Some(post));
+        plain.effect = None;
+        assert_eq!(exec_window(&plain), None);
+    }
+
+    /// Der letzte Aufruf einer Session ohne Post-Zeit war beim Seal offen:
+    /// Sein Fenster reicht vom Pre-Event bis ans Ende des Materials. Ein
+    /// offener Aufruf mit Nachfolger und jeder Nicht-Exec bekommt keines.
+    #[test]
+    fn an_open_last_call_gets_a_window_to_the_end_of_the_material() {
+        use minds_core::{Agent, Effect, Intent, Model, Role, Turn};
+        let call = |kind: EffectKind, at: &str, ended: Option<&str>| ToolCall {
+            at: Some(at.into()),
+            ended_at: ended.map(str::to_owned),
+            outcome: None,
+            name: "Bash".into(),
+            arguments: String::new(),
+            capture: None,
+            effect: Some(Effect {
+                kind,
+                path: None,
+                content: None,
+                written: None,
+                written_unavailable: None,
+                written_at: None,
+            }),
+        };
+        let session = |calls: Vec<ToolCall>| {
+            let mut s = Session::new(
+                Agent {
+                    name: "claude-code".into(),
+                    version: "1".into(),
+                },
+                Model {
+                    provider: "anthropic".into(),
+                    id: "m".into(),
+                },
+                Intent::default(),
+            );
+            s.turns.push(Turn {
+                role: Role::Assistant,
+                text: String::new(),
+                tool_calls: calls,
+                parent: None,
+                at: Some("2026-10-05T10:00:00Z".into()),
+            });
+            s
+        };
+        let open = call(EffectKind::Exec, "2026-10-05T10:00:10Z", None);
+        assert_eq!(
+            exec_window_open(&open).map(|(from, to)| (from.to_string(), to)),
+            Some(("2026-10-05T10:00:08Z".to_string(), Timestamp::MAX))
+        );
+        assert_eq!(
+            exec_window_open(&call(
+                EffectKind::Exec,
+                "2026-10-05T10:00:10Z",
+                Some("2026-10-05T10:00:11Z")
+            )),
+            None,
+            "with a post time the closed window applies"
+        );
+        assert_eq!(
+            exec_window_open(&call(EffectKind::Write, "2026-10-05T10:00:10Z", None)),
+            None
+        );
+        // Als letzter Aufruf: offen bis ∞. Mit einem Aufruf danach: nichts.
+        let alone = session(vec![open.clone()]);
+        let windows = exec_windows(&[&alone]);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].to, Timestamp::MAX);
+        assert_eq!(windows[0].source.call, 0);
+        let followed = session(vec![
+            open,
+            call(
+                EffectKind::Exec,
+                "2026-10-05T10:00:20Z",
+                Some("2026-10-05T10:00:21Z"),
+            ),
+        ]);
+        let windows = exec_windows(&[&followed]);
+        assert_eq!(windows.len(), 1, "only the closed second call: {windows:?}");
+        assert_eq!(windows[0].source.call, 1);
+    }
+
+    /// Ein Fenster: der Aufruf. Mehrere: nur, wenn `prefer` genau einen
+    /// übrig lässt — sonst keiner.
+    #[test]
+    fn a_frame_is_attributed_to_exactly_one_exec_call_or_none() {
+        let at = |s: &str| -> Timestamp { s.parse().unwrap() };
+        let source = |call: usize| LineSource {
+            session: SessionId::from_canonical_bytes(b"session"),
+            turn: 0,
+            call,
+        };
+        let window = |call: usize, from: &str, to: &str| ExecWindow {
+            source: source(call),
+            from: at(from),
+            to: at(to),
+        };
+        let windows = [
+            window(0, "2026-10-05T10:00:00Z", "2026-10-05T10:00:20Z"),
+            window(1, "2026-10-05T10:00:10Z", "2026-10-05T10:00:30Z"),
+            window(2, "2026-10-05T10:01:00Z", "2026-10-05T10:01:05Z"),
+        ];
+        let none = |_: LineSource| false;
+        // Außerhalb jedes Fensters.
+        assert_eq!(
+            exec_call_at(&windows, at("2026-10-05T10:00:45Z"), &none),
+            None
+        );
+        // Genau eines (Ränder eingeschlossen).
+        assert_eq!(
+            exec_call_at(&windows, at("2026-10-05T10:00:05Z"), &none),
+            Some(source(0))
+        );
+        assert_eq!(
+            exec_call_at(&windows, at("2026-10-05T10:01:05Z"), &none),
+            Some(source(2))
+        );
+        // Zwei überlappende: ohne Vorzug keiner, mit eindeutigem Vorzug der.
+        let overlap = at("2026-10-05T10:00:15Z");
+        assert_eq!(exec_call_at(&windows, overlap, &none), None);
+        assert_eq!(
+            exec_call_at(&windows, overlap, &|s| s.call == 1),
+            Some(source(1))
+        );
+        assert_eq!(exec_call_at(&windows, overlap, &|_| true), None);
     }
 
     #[test]

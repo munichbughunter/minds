@@ -790,6 +790,8 @@ impl RedactionPipeline {
                     effect,
                     capture,
                     outcome,
+                    at,
+                    ended_at,
                 } = call;
                 // `arguments` zuerst: Ob die Redaction hier etwas entfernt
                 // hat, entscheidet gleich ueber den Schreibzeit-Hash des
@@ -869,6 +871,10 @@ impl RedactionPipeline {
                     }),
                 };
                 redacted_calls.push(ToolCall {
+                    // Zeitstempel des Hooks (RFC 3339) — kein Freitext,
+                    // ungescannt wie `turn.at`.
+                    at,
+                    ended_at,
                     effect,
                     capture,
                     outcome: scan.outcome,
@@ -1512,6 +1518,8 @@ mod tests {
             text: TERM.into(),
             tool_calls: vec![
                 ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     capture: None,
                     name: TERM.into(),
@@ -1522,6 +1530,8 @@ mod tests {
                 // Aufruf mit sauberen `arguments` — ein Fund dort verwürfe das
                 // Ergebnis (siehe `a_secret_split_across_argv_elements_…`).
                 ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: Some(ExecOutcome {
                         class: minds_core::ExecClass::Bench,
                         runner: TERM.into(),
@@ -1727,6 +1737,8 @@ mod tests {
             role: Role::Assistant,
             text: "deploye".into(),
             tool_calls: vec![ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "bash".into(),
@@ -1782,6 +1794,8 @@ mod tests {
             role: Role::User,
             text: "DB_PASSWORD=hunter2".into(),
             tool_calls: vec![ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: None,
                 name: "bash".into(),
@@ -1911,6 +1925,8 @@ mod tests {
         let mut s = session();
         let mut turn = user_turn("schreib die Konfiguration");
         turn.tool_calls.push(ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: "Write".into(),
@@ -1926,6 +1942,8 @@ mod tests {
         });
         // Derselbe Aufruf ohne Treffer: Der Hash bleibt.
         turn.tool_calls.push(ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: "Write".into(),
@@ -1999,6 +2017,8 @@ mod tests {
         let mut s = session();
         let mut turn = user_turn("schreib was");
         turn.tool_calls.push(ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: "Write".into(),
@@ -2037,6 +2057,8 @@ mod tests {
     fn runner_call(argv: &[&str]) -> ToolCall {
         let line = argv.join(" ");
         ToolCall {
+            at: None,
+            ended_at: None,
             outcome: Some(ExecOutcome {
                 class: minds_core::ExecClass::Test,
                 runner: "pytest".into(),

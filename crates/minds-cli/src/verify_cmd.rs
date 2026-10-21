@@ -133,6 +133,10 @@ pub struct ArtifactOptions<'a> {
     pub commit: Option<&'a str>,
     /// `--require-explained <prozent>`: das Gate, roh wie übergeben.
     pub require_explained: Option<&'a str>,
+    /// `--allow-heuristic`: Zeilen, für die nur die Heuristik „ein
+    /// Shell-Befehl erwähnt die Datei" spricht, zählen zum Gate — nie zu
+    /// einer Klasse, nie zur Assurance.
+    pub allow_heuristic: bool,
     /// `--all`: alle Detailzeilen, ungekappt.
     pub all: bool,
     /// `--require-in-scope`: das Scope-Gate (EA-17).
@@ -146,6 +150,7 @@ impl ArtifactOptions<'_> {
     fn any(&self) -> bool {
         self.commit.is_some()
             || self.require_explained.is_some()
+            || self.allow_heuristic
             || self.all
             || self.require_in_scope
             || self.conformance
@@ -222,7 +227,7 @@ pub fn run(
     // CI-Gate, das still wegfällt, wäre schlimmer als ein lauter Abbruch.
     if (options.any() || assurance_options.any()) && (evidence.is_some() || sig.is_some()) {
         eprintln!(
-            "minds verify: --commit, --require-explained, --require-in-scope, --conformance, --all, --witness-home, --require-assurance, --limits, --online and --gitlab-url apply only to the evidence verdict (not with --evidence/--sig)"
+            "minds verify: --commit, --require-explained, --allow-heuristic, --require-in-scope, --conformance, --all, --witness-home, --require-assurance, --limits, --online and --gitlab-url apply only to the evidence verdict (not with --evidence/--sig)"
         );
         return ExitCode::from(4);
     }
@@ -616,7 +621,15 @@ fn artifact_of(
         format!("minds verify {target} --commit {commit} --all")
     };
     Ok(
-        match artifact::assess(ctx, commit, &sessions, &observations, options.all, rerun) {
+        match artifact::assess(
+            ctx,
+            commit,
+            &sessions,
+            &observations,
+            options.all,
+            options.allow_heuristic,
+            rerun,
+        ) {
             Ok(Ok(artifact)) => ArtifactState::Assessed(artifact),
             Ok(Err(why)) => ArtifactState::Unavailable(why),
             Err(err) => failed(err),

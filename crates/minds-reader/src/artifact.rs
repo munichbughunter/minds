@@ -688,6 +688,7 @@ mod tests {
             removes: false,
             last_observed: None,
             gap: None,
+            exec: None,
         }
     }
 

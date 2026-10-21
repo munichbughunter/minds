@@ -540,6 +540,7 @@ fn verify_commit(
             &readable,
             &[],
             false,
+            false,
             String::new(),
         ) {
             Ok(Ok(artifact)) => ArtifactState::Assessed(artifact),

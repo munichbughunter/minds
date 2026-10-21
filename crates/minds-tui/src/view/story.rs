@@ -621,6 +621,7 @@ fn detail(
                 for sentence in crate::view::changes::state_sentence(
                     minds_reader::reconcile::ReconClass::ReportedOnly,
                     &step.tool,
+                    false,
                 ) {
                     lines.push(Line::from(Span::styled(
                         format!("{:<10} {sentence}", ""),

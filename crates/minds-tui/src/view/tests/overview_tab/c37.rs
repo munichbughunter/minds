@@ -229,6 +229,8 @@ fn c37_uninterpreted_calls_point_to_the_evidence() {
         session.intent_events.clear();
         if *id == sid('a') {
             session.turns[0].tool_calls.push(ToolCall {
+                at: None,
+                ended_at: None,
                 outcome: None,
                 capture: Some(minds_core::Capture {
                     status: minds_core::CaptureStatus::Uninterpreted,

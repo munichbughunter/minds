@@ -465,6 +465,8 @@ fn assistant_blocks(content: Option<&serde_json::Value>) -> (String, Vec<ToolCal
                         .is_some_and(crate::exec_outcome::names_runner))
                 .then_some(minds_core::CaptureNote::ResultNotCaptured);
                 tool_calls.push(ToolCall {
+                    at: None,
+                    ended_at: None,
                     outcome: None,
                     name,
                     arguments,

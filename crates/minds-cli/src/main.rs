@@ -295,7 +295,8 @@ Usage:
         many print (applied after sorting).
 
   minds verify [<session|rev>] [--signers <file>] [--identity <id>]
-               [--commit <rev>] [--require-explained <percent>] [--all]
+               [--commit <rev>] [--require-explained <percent>]
+               [--allow-heuristic] [--all]
                [--require-in-scope] [--witness-home <dir>]
                [--require-assurance <A0|A1|A2|A3>] [--limits]
                [--online [--gitlab-url <url>]] [--conformance]
@@ -306,6 +307,10 @@ Usage:
         revision, --commit, or the session's trailer commit) and lists
         unexplained lines (at most 20 without --all). --require-explained
         fails with exit 2 below the given percentage (never masks 1/3/4).
+        Observed lines count as explained, also what a shell command wrote
+        while a witness watched (observed in the window of the Bash call);
+        lines only mentioned by a shell command (heuristic) count only
+        with --allow-heuristic, and never change a class or the assurance.
         When the bound intent anchor declares a scope, the Coverage line
         counts paths outside it (commit files, write claims, file
         observations) and lists them as out of scope; --require-in-scope
@@ -599,6 +604,7 @@ const SPECS: &[Spec] = &[
             "--require-in-scope",
             "--online",
             "--conformance",
+            "--allow-heuristic",
         ],
         1,
     ),
@@ -1087,6 +1093,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             verify_cmd::ArtifactOptions {
                 commit: parsed.value("--commit"),
                 require_explained: parsed.value("--require-explained"),
+                allow_heuristic: parsed.has("--allow-heuristic"),
                 all: parsed.has("--all"),
                 require_in_scope: parsed.has("--require-in-scope"),
                 conformance: parsed.has("--conformance"),

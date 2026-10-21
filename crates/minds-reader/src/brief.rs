@@ -223,6 +223,8 @@ mod tests {
 
     fn exec(cmd: &str) -> ToolCall {
         ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: "Bash".into(),
@@ -240,6 +242,8 @@ mod tests {
 
     fn write(path: &str) -> ToolCall {
         ToolCall {
+            at: None,
+            ended_at: None,
             outcome: None,
             capture: None,
             name: "Edit".into(),
