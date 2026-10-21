@@ -910,7 +910,11 @@ fn c5_terms_no_longer_collide() {
     // seit C3.1 gar kein Prozentwert mehr (er versteckt den Nenner).
     assert!(!out.contains("% of commits"), "{out}");
     assert!(!out.contains("context coverage"), "{out}");
-    assert!(out.contains("1 file · 0 tok"), "{out}");
+    // Keine Null, die „nicht gelesen" bedeutet: Die Fixture trägt keinen
+    // Transkript-Status und keine Zähler — also kein Token-Segment.
+    assert!(out.contains("1 file "), "{out}");
+    assert!(!out.contains("0 tok"), "{out}");
+    assert!(!out.contains("not read"), "{out}");
     assert!(!out.contains(" D · "), "{out}");
     let (text, _) = super::super::trust::verify_headline(crate::verify::Overall::NotChecked);
     assert!(text.contains("NOT CHECKED — run minds verify"), "{text}");

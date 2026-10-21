@@ -1621,6 +1621,7 @@ impl Writer {
                 cwd: None,
                 transcript_path: None,
                 model: None,
+                report: None,
                 payload: serde_json::value::RawValue::from_string(payload.to_string())?,
             },
         )?;
@@ -1738,6 +1739,7 @@ impl Writer {
                     cwd: None,
                     transcript_path: None,
                     model: None,
+                    report: None,
                     payload,
                 },
             )?;
@@ -2061,6 +2063,7 @@ impl Writer {
                     cwd: None,
                     transcript_path: None,
                     model: None,
+                    report: None,
                     payload: serde_json::value::RawValue::from_string("{}".into())?,
                 },
             )?;
@@ -2757,6 +2760,7 @@ fn verify_events(events: &[JournalEvent]) -> Fallible<()> {
             cwd: event.cwd.as_deref(),
             transcript_path: event.transcript_path.as_deref(),
             model: event.model.as_deref(),
+            report: event.report.as_ref(),
             payload_hash: &payload_hash,
         });
         if event.payload_hash.as_ref() != Some(&payload_hash)

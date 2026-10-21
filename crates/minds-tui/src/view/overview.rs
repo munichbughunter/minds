@@ -2000,6 +2000,9 @@ pub(crate) fn prompt_cap(sessions: usize, open: bool, avail: usize) -> usize {
 /// überlebt den Umbruch nicht (bewusst: die Anzeige ist kein Editor).
 fn prompt_lines(request: &str, width: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    // Ohne die `<pasted_content>`-Hülle von Claude Code — auch bei Sessions,
+    // die sie noch im Record tragen (siehe `minds_core::prompt`).
+    let request = minds_core::without_pasted_wrapper(request);
     for raw in request.lines() {
         let line = minds_reader::sanitize(raw.trim_end());
         if line.trim().is_empty() {

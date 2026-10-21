@@ -19,6 +19,26 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`minds show` and `minds recap` no longer print zeros for counts nobody
+  read.** The attribution line shows the agent version only when it was
+  recorded (no `claude-code unknown`), `model not recorded` instead of
+  `unknown/unknown`, and token counts only when the transcript was read:
+  `14.2k/3.9k tokens`, `14.2k/3.9k tokens (reported)` when the `SessionEnd`
+  hook passed the sums on, and no token segment at all otherwise. The TUI's
+  size column follows (`5.7k tok ◌` for reported counts, nothing when not
+  read); the decision sits in one place of the reader (`summary::Tokens`). A record
+  without `lineage.transcript` (older binary) shows its counts unless they
+  are all zero.
+- **The prompt loses Claude Code's `<pasted_content id="…">` wrapper.** The
+  normalizer strips it at capture (the content stays, line for line) and
+  the reader strips it when showing older records — headline, `show --full`,
+  Overview, Why this line?, story, Requirements and the brief of `recall`.
+- **`minds recall <file>` resolves the path like `minds blame`.** Relative
+  to the repository root, not to the working directory, and through the
+  blame of the whole file — every line to its commit, every commit to its
+  sessions — plus the sessions whose record names the file. Before, a
+  session that named the file the way the agent saw it (absolute) was not
+  found, while `blame` attributed every line.
 - **A2 no longer needs `/exit`.** The condition "session end witnessed"
   becomes "session quiescent at checkpoint": the last event of the sealed
   range is a `Stop`, `SubagentStop` or `SessionEnd`, and no `PreToolUse` is
@@ -37,6 +57,22 @@ versioning follows [Semantic Versioning](https://semver.org/).
   detected — the same limit that a faked `SessionEnd` had before.
 
 ### Added
+
+- **The `SessionEnd` hook reports version, token counts and texts.** The
+  witness never reads a transcript from the agent's namespace, so sessions
+  built by it had `claude-code unknown`, `0/0 Token` and no answer texts.
+  Now the hook — running as the developer, with the `transcript_path` — reads
+  the transcript once at `SessionEnd` (whole file, at most 64 MiB, else
+  nothing), takes the agent version, sums the `usage` fields, joins the
+  answer texts per turn, redacts them with the repository's policy
+  fail-closed (no policy, no text; an unclean text leaves its turn empty)
+  and passes everything to the witness as new frames behind the event
+  (`Usage` 0x09, `Said` 0x0a, after `Model`). The witness attaches them to
+  the `SessionEnd` event (`report`, in the `event_hash`), the checkpoint
+  builds the session from them with `lineage.transcript = reported_by_hook`.
+  Nothing of this is an observation of the witness: the reader shows it as a
+  statement of the hook (`tokens (reported)`, `◌`). An older witness drops
+  the frames and keeps the event.
 
 - **`minds enable` registers `PostToolUseFailure` for Claude Code.** Claude
   Code sends no `PostToolUse` for a failed tool call; without the

@@ -33,7 +33,8 @@ pub const NARROW_WIDTH: u16 = 32;
 const TIME_W: u16 = 8;
 const AGENT_W: u16 = 22;
 const AGENT_COMPACT_W: u16 = 12;
-const SIZE_W: u16 = 20;
+/// `12 files · 14.2k tok ◌` passt ungekürzt.
+const SIZE_W: u16 = 22;
 /// Die SEAL-Spalte: Trust Strip (Compact, bis `✗ TAMPERED ? ◐`) und der
 /// Kanten-Beleg daneben — zusammen höchstens 18 Zeichen.
 const SEAL_W: u16 = 18;
@@ -290,19 +291,26 @@ fn row_of<'a>(card: &'a SessionCard, columns: Columns, headline_w: usize, now: i
     if columns.show_size() {
         cells.push(Cell::from(Span::styled(
             // Der Umfang in Wörtern (C5): „3 files · 5.7k tok", nicht „D/T".
+            // Token nur, wenn das Transkript gelesen wurde; vom Hook
+            // gemeldete tragen das Zeichen der Aussage, ungelesene fehlen.
             format!(
-                "{} {} · {}",
+                "{} {}{}",
                 card.summary.files,
                 if card.summary.files == 1 {
                     "file"
                 } else {
                     "files"
                 },
-                crate::view::tokens(
-                    card.summary
-                        .input_tokens
-                        .saturating_add(card.summary.output_tokens)
-                )
+                match card.summary.tokens {
+                    minds_reader::summary::Tokens::Read { input, output } =>
+                        format!(" · {}", crate::view::tokens(input.saturating_add(output))),
+                    minds_reader::summary::Tokens::Reported { input, output } => format!(
+                        " · {} {}",
+                        crate::view::tokens(input.saturating_add(output)),
+                        theme::claim().0
+                    ),
+                    minds_reader::summary::Tokens::NotRead => String::new(),
+                }
             ),
             base,
         )));

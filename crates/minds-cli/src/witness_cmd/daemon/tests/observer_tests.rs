@@ -1268,6 +1268,7 @@ fn a_write_claim_minutes_into_the_turn_meets_its_observation() {
                 cwd: None,
                 transcript_path: None,
                 model: None,
+                report: None,
                 payload: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
             },
         )

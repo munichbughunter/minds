@@ -60,7 +60,8 @@ fn render_inner(
     // --- Absicht ---------------------------------------------------------
     let requests = dedup(sessions.iter().filter_map(|s| {
         if full_intents {
-            return (!s.intent.request.trim().is_empty()).then(|| s.intent.request.clone());
+            let request = minds_core::without_pasted_wrapper(&s.intent.request);
+            return (!request.trim().is_empty()).then(|| request.into_owned());
         }
         let line = headline(&s.intent.request, REQUEST_MAX);
         (line != "(no prompt captured)").then_some(line)

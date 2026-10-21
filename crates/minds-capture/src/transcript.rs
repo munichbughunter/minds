@@ -73,22 +73,7 @@ pub fn parse(bytes: &[u8]) -> Transcript {
 /// Deskriptor (TOCTOU).
 pub fn model_in_tail(path: &Path, limit: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    if !path.is_absolute() || !std::fs::metadata(path).ok()?.is_file() {
-        return None;
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
-    let mut file = options.open(path).ok()?;
-    let meta = file.metadata().ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let len = meta.len();
+    let (mut file, len) = open_regular(path)?;
     let cut = len > limit;
     if cut {
         file.seek(SeekFrom::Start(len - limit)).ok()?;
@@ -106,6 +91,164 @@ pub fn model_in_tail(path: &Path, limit: u64) -> Option<String> {
         }
     }
     model
+}
+
+/// Öffnet den Pfad aus dem Hook-Payload, wenn er eine **reguläre Datei**
+/// ist — und nur dann (siehe [`model_in_tail`]): geprüft vor dem Öffnen,
+/// geöffnet unter Unix ohne zu blockieren, danach noch einmal am offenen
+/// Deskriptor. Liefert die Datei und ihre Länge; jeder Fehler ist `None`.
+fn open_regular(path: &Path) -> Option<(std::fs::File, u64)> {
+    if !path.is_absolute() || !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some((file, meta.len()))
+}
+
+/// Was der `SessionEnd`-Hook aus dem **ganzen** Transkript liest, um es dem
+/// Witness zu melden ([`minds_core::HookReport`]): Modell, Agent-Version,
+/// die Summe der `usage`-Felder und die Antworttexte **je Zug**.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookReading {
+    /// Das zuletzt genannte Modell.
+    pub model: Option<String>,
+    /// Die zuletzt genannte Agent-Version (Claude Codes `version`-Feld).
+    pub agent_version: Option<String>,
+    /// Die Summe der `usage`-Felder aller Assistant-Nachrichten — `None`,
+    /// wenn keine Nachricht eines trug: Dann wurde nichts gezählt, und eine
+    /// Null wäre eine falsche Aussage.
+    pub usage: Option<Usage>,
+    /// Die Antworttexte je Zug, in Reihenfolge. Ein Zug beginnt mit einem
+    /// Prompt des Menschen; alle `text`-Blöcke der Assistant-Nachrichten bis
+    /// zum nächsten Prompt bilden seinen Text (mit `\n` verbunden). Ein Zug
+    /// ohne Text steht als leerer Eintrag da, damit die Zuordnung zu den
+    /// Zügen des Journals nicht verrutscht; leere Einträge am Ende fallen weg.
+    pub turn_texts: Vec<String>,
+}
+
+/// Liest das Transkript für den Report des `SessionEnd`-Hooks — ganz, aber
+/// nur bis `limit` Bytes: Eine größere Datei ergibt `None` (fail-open — dann
+/// steht später `tokens not read`, nicht eine Summe über einen Ausschnitt).
+/// Pfadregeln wie [`model_in_tail`]; jeder Fehler ist `None`.
+pub fn read_report(path: &Path, limit: u64) -> Option<HookReading> {
+    use std::io::Read;
+    let (file, len) = open_regular(path)?;
+    if len > limit {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(len as usize);
+    file.take(limit).read_to_end(&mut bytes).ok()?;
+    Some(reading(&bytes))
+}
+
+/// Die reine Deutung hinter [`read_report`]: leniant wie [`parse`], Zeile
+/// für Zeile, mit der Zug-Bildung aus der Modul-Doku.
+pub fn reading(bytes: &[u8]) -> HookReading {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = HookReading::default();
+    let mut current: Option<String> = None;
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
+            continue;
+        };
+        if let Some(version) = entry.version {
+            out.agent_version = Some(version);
+        }
+        let Some(message) = entry.message else {
+            continue;
+        };
+        match entry.kind.as_deref() {
+            Some("user") => {
+                if message.content.as_ref().is_some_and(is_human_prompt) {
+                    // Ein neuer Zug: der bisherige ist fertig, auch wenn er
+                    // keinen Text hatte.
+                    if let Some(done) = current.take() {
+                        out.turn_texts.push(done);
+                    }
+                    current = Some(String::new());
+                }
+            }
+            Some("assistant") => {
+                if let Some(id) = message.model {
+                    out.model = Some(id);
+                }
+                if let Some(usage) = message.usage {
+                    let sum = out.usage.get_or_insert_default();
+                    sum.input_tokens = sum.input_tokens.saturating_add(usage.input_tokens);
+                    sum.output_tokens = sum.output_tokens.saturating_add(usage.output_tokens);
+                }
+                let said = message
+                    .content
+                    .as_ref()
+                    .map(content_text)
+                    .unwrap_or_default();
+                if !said.is_empty() {
+                    let turn = current.get_or_insert_with(String::new);
+                    if !turn.is_empty() {
+                        turn.push('\n');
+                    }
+                    turn.push_str(&said);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(done) = current.take() {
+        out.turn_texts.push(done);
+    }
+    while out.turn_texts.last().is_some_and(String::is_empty) {
+        out.turn_texts.pop();
+    }
+    out
+}
+
+/// Ob ein `user`-Eintrag ein Prompt des Menschen ist — und kein
+/// Tool-Ergebnis, das Claude Code ebenfalls als `user` ablegt: ein String,
+/// oder eine Block-Liste mit einem `text`-Block und ohne `tool_result`.
+fn is_human_prompt(content: &serde_json::Value) -> bool {
+    match content {
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Array(blocks) => {
+            blocks.iter().any(|b| block_kind(b) == Some("text"))
+                && !blocks.iter().any(|b| block_kind(b) == Some("tool_result"))
+        }
+        _ => false,
+    }
+}
+
+/// Der `type` eines Inhaltsblocks, falls er einen trägt.
+fn block_kind(block: &serde_json::Value) -> Option<&str> {
+    block.get("type").and_then(|t| t.as_str())
+}
+
+/// Kürzt einen Text auf höchstens `max_bytes` — an einer Zeichengrenze, mit
+/// `…` als Zeichen des Schnitts. Ein Text, der passt, bleibt unverändert.
+pub fn clip(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let keep = max_bytes.saturating_sub('…'.len_utf8());
+    let mut end = keep;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// Wie [`parse`], zählt zusätzlich die Zeilen, die sich als Eintrag deuten
@@ -319,6 +462,84 @@ mod tests {
         );
         assert_eq!(model_in_tail(&path, 8), None, "zu kurz für eine Zeile");
         assert_eq!(model_in_tail(&dir.path().join("missing.jsonl"), 512), None);
+    }
+
+    /// Der Report des `SessionEnd`-Hooks: Texte je Zug (ein Tool-Ergebnis
+    /// ist kein neuer Zug, ein leerer Zug bleibt als Lücke stehen), Summe
+    /// der Token, Version und Modell.
+    #[test]
+    fn the_reading_groups_assistant_text_by_human_turn() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"role":"user","content":"erster Auftrag"}}"#,
+            "\n",
+            r#"{"type":"assistant","version":"2.0.76","message":{"model":"claude-opus-4-1","content":[{"type":"text","text":"Ich schaue nach."},{"type":"tool_use","name":"Read","input":{}}],"usage":{"input_tokens":100,"output_tokens":40}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"x","content":"…"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[{"type":"text","text":"Fertig."}],"usage":{"input_tokens":120,"output_tokens":10}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"zweiter Auftrag"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[{"type":"tool_use","name":"Bash","input":{}}],"usage":{"input_tokens":5,"output_tokens":1}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"dritter Auftrag"}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"model":"claude-opus-4-1","content":[{"type":"text","text":"Erledigt."}],"usage":{"input_tokens":7,"output_tokens":2}}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":"vierter, ohne Antwort"}}"#,
+        );
+        let r = reading(jsonl.as_bytes());
+        assert_eq!(
+            r.turn_texts,
+            vec!["Ich schaue nach.\nFertig.", "", "Erledigt."],
+            "Tool-Ergebnis kein Zug; stummer Zug als Lücke; leerer Schluss weg"
+        );
+        assert_eq!(
+            r.usage,
+            Some(Usage {
+                input_tokens: 232,
+                output_tokens: 53
+            })
+        );
+        assert_eq!(r.agent_version.as_deref(), Some("2.0.76"));
+        assert_eq!(r.model.as_deref(), Some("claude-opus-4-1"));
+    }
+
+    /// Ohne `usage`-Feld wird nichts gezählt — `None`, nicht `0/0`.
+    #[test]
+    fn a_reading_without_usage_fields_counts_nothing() {
+        let jsonl = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"}]}}"#;
+        let r = reading(jsonl.as_bytes());
+        assert_eq!(r.usage, None);
+        assert_eq!(r.turn_texts, vec!["a"]);
+        assert_eq!(reading(b"kein json\n"), HookReading::default());
+    }
+
+    /// `read_report` liest die ganze Datei — oder gar nichts, wenn sie
+    /// größer ist als erlaubt (eine Summe über einen Ausschnitt wäre falsch).
+    #[test]
+    fn read_report_takes_the_whole_file_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"a"}],"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+        std::fs::write(&path, format!("{line}\n{line}\n")).unwrap();
+        let r = read_report(&path, 1 << 20).unwrap();
+        assert_eq!(r.usage.unwrap().input_tokens, 2);
+        assert_eq!(r.turn_texts, vec!["a\na"]);
+        assert_eq!(read_report(&path, 8), None, "zu groß: nichts statt falsch");
+        assert_eq!(
+            read_report(&dir.path().join("missing.jsonl"), 1 << 20),
+            None
+        );
+        assert_eq!(read_report(Path::new("t.jsonl"), 1 << 20), None, "relativ");
+    }
+
+    #[test]
+    fn clip_cuts_at_a_character_boundary_and_marks_the_cut() {
+        assert_eq!(clip("kurz", 10), "kurz");
+        assert_eq!(clip("ääää", 6), "ä…", "3 Bytes für …, dann Zeichengrenze");
+        assert!(clip(&"x".repeat(100), 20).len() <= 20);
+        assert!(clip(&"x".repeat(100), 20).ends_with('…'));
     }
 
     /// M3: Was keine reguläre Datei ist, wird nicht geöffnet — eine FIFO ohne

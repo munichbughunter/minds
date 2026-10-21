@@ -268,22 +268,23 @@ pub(super) fn forward(
     event_override: Option<&str>,
     stdin: Vec<u8>,
 ) -> Result<(), &'static str> {
-    forward_with_model(socket, peer, agent, event_override, stdin, None)
+    forward_with_claims(socket, peer, agent, event_override, stdin, Vec::new())
 }
 
-/// Wie [`forward`]; `model` = (Session-Kennung, Modell-Kennung) folgt dem
-/// `Hook`-Frame als eigener `Model`-Frame auf derselben Verbindung (K1).
-/// Das Event geht **immer** als `Hook` (0x01): Ein Witness, der den
-/// `Model`-Frame nicht kennt, hat das Event dann schon, verwirft nur die
-/// Kennung und schließt die Verbindung. Lässt sich der `Model`-Frame nicht
-/// bauen (die Kennung verletzt die Regel), geht das Event allein.
-pub(super) fn forward_with_model(
+/// Wie [`forward`]; `claims` sind die Angaben des Hooks zu diesem Event —
+/// der `Model`-Frame (K1) und beim `SessionEnd` `Usage` und je Zug ein
+/// `Said` —, die dem `Hook`-Frame auf derselben Verbindung folgen. Das
+/// Event geht **immer** als `Hook` (0x01): Ein Witness, der einen der
+/// weiteren Frames nicht kennt, hat das Event dann schon, verwirft nur die
+/// Angabe und schließt die Verbindung. Lässt sich ein Frame nicht bauen (der
+/// Wert verletzt die Regel), fehlt genau er; das Event geht trotzdem.
+pub(super) fn forward_with_claims(
     socket: &Path,
     peer: Option<u32>,
     agent: &str,
     event_override: Option<&str>,
     stdin: Vec<u8>,
-    model: Option<(String, String)>,
+    claims: Vec<Frame>,
 ) -> Result<(), &'static str> {
     admissible(agent, event_override, stdin.len())?;
     let mut frame = witness_proto::encode(&Frame::Hook {
@@ -295,14 +296,10 @@ pub(super) fn forward_with_model(
         ProtoError::TooLarge(_) => "frame too large",
         _ => "invalid frame",
     })?;
-    if let Some((session, model)) = model
-        && let Ok(extra) = witness_proto::encode(&Frame::Model {
-            agent: agent.to_owned(),
-            session,
-            model,
-        })
-    {
-        frame.extend_from_slice(&extra);
+    for claim in &claims {
+        if let Ok(extra) = witness_proto::encode(claim) {
+            frame.extend_from_slice(&extra);
+        }
     }
     send(socket, peer, &frame).map_err(|err| kind(&err))
 }
@@ -843,22 +840,26 @@ mod tests {
             }
             all
         });
-        forward_with_model(
+        forward_with_claims(
             &path,
             None,
             "claude-code",
             Some("Stop"),
             b"{\"a\":1}".to_vec(),
-            Some(("s-1".into(), "claude-opus-4-1".into())),
+            vec![Frame::Model {
+                agent: "claude-code".into(),
+                session: "s-1".into(),
+                model: "claude-opus-4-1".into(),
+            }],
         )
         .unwrap();
-        forward_with_model(
+        forward_with_claims(
             &path,
             None,
             "claude-code",
             Some("Stop"),
             b"{}".to_vec(),
-            None,
+            Vec::new(),
         )
         .unwrap();
 

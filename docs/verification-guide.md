@@ -145,7 +145,12 @@ counts come from the agent's transcript. When it was not read, `lineage.transcri
 says why — `no_path_in_events`, `not_found`, `not_readable`, `empty`, `parse_failed`,
 `not_read_by_witness` (the witness never loads transcripts from agent paths) or
 `model_from_hook` (the hook passed on only the model id it read from the end of
-the transcript; the witness still did not read the file) — and `read` when it was,
+the transcript; the witness still did not read the file), `reported_by_hook` (at
+`SessionEnd` the hook read the whole transcript once and passed on the agent
+version, the summed token counts and the answer texts per turn, redacted with
+the repository's policy before they crossed the socket; the witness still did
+not read the file — the reader shows these values as statements of the hook,
+`tokens (reported)`) — and `read` when it was,
 or `read_from_slug` when it was read although no event named its path (the
 checkpoint found it in the agent's project folder under the user's home; the
 file ↔ session link is then a path convention plus the session id, not a

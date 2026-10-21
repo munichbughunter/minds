@@ -124,6 +124,7 @@ impl Fixture {
                         cwd: None,
                         transcript_path: None,
                         model: None,
+                        report: None,
                         payload: serde_json::value::RawValue::from_string(payload).unwrap(),
                     },
                 )
@@ -254,6 +255,7 @@ fn a_session_is_stored_closed_only_from_a_complete_range() {
                         cwd: None,
                         transcript_path: None,
                         model: None,
+                        report: None,
                         payload: serde_json::value::RawValue::from_string(payload.into()).unwrap(),
                     },
                 )
@@ -364,6 +366,7 @@ fn the_local_checkpoint_binds_the_active_intent_unchained() {
                     cwd: None,
                     transcript_path: None,
                     model: None,
+                    report: None,
                     payload: serde_json::value::RawValue::from_string(forged).unwrap(),
                 },
             )

@@ -506,7 +506,9 @@ impl crate::Inspection {
                         .map(|t| t.strftime("%Y-%m-%d %H:%MZ").to_string())
                         .unwrap_or_default(),
                     agent: first.map(|s| one_line(&s.agent.name, 40)),
-                    request: first.map(|s| one_line(&s.intent.request, 200)),
+                    request: first.map(|s| {
+                        one_line(&minds_core::without_pasted_wrapper(&s.intent.request), 200)
+                    }),
                     change: index.change_of(commit.id).cloned(),
                     review: self.review_state_of_commit(commit.id).verdict,
                     parents: commit.parents,
@@ -554,7 +556,10 @@ impl crate::Inspection {
                 Some(WipSession {
                     id,
                     agent: one_line(&session.agent.name, 40),
-                    request: one_line(&session.intent.request, 200),
+                    request: one_line(
+                        &minds_core::without_pasted_wrapper(&session.intent.request),
+                        200,
+                    ),
                     started: lineage
                         .and_then(|l| l.started_at.as_deref())
                         .map(|s| one_line(s, 40)),

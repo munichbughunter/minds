@@ -154,6 +154,17 @@ fn build_indexed(
     fallback: Option<&Path>,
 ) -> (Session, Vec<usize>) {
     let (mut transcript, mut status) = read_transcript(events, fallback);
+    let unread = matches!(
+        status,
+        TranscriptStatus::NotFound | TranscriptStatus::NoPathInEvents
+    );
+    // Gab es keine Datei zu lesen, zählt, was der `SessionEnd`-Hook aus ihr
+    // gemeldet hat: Version, Token-Summen, Texte je Zug — als Angabe des
+    // Hooks (`ReportedByHook`). Ein gelesenes Transkript schlägt den Report.
+    if unread && let Some(report) = hook_report(events) {
+        transcript = transcript_of_report(report, hook_model(events));
+        status = TranscriptStatus::ReportedByHook;
+    }
     // K1: Blieb das Modell leer, zählt die Kennung, die der Hook gemeldet
     // hat. Der Status sagt das nur, wenn es keine Datei zu lesen gab — ein
     // Lesefehler (`NotReadable`, `ParseFailed`) oder ein gelesenes, aber
@@ -163,10 +174,7 @@ fn build_indexed(
         && let Some(id) = hook_model(events)
     {
         transcript.model = Some(model_of(id));
-        if matches!(
-            status,
-            TranscriptStatus::NotFound | TranscriptStatus::NoPathInEvents
-        ) {
+        if unread {
             status = TranscriptStatus::ModelFromHook;
         }
     }
@@ -176,6 +184,24 @@ fn build_indexed(
 /// Die Modell-Kennung aus dem letzten Event, das eine trägt (K1).
 fn hook_model(events: &[JournalEvent]) -> Option<String> {
     events.iter().rev().find_map(|e| e.model.clone())
+}
+
+/// Der Report des `SessionEnd`-Hooks aus dem letzten Event, das einen trägt.
+fn hook_report(events: &[JournalEvent]) -> Option<&minds_core::HookReport> {
+    events.iter().rev().find_map(|e| e.report.as_ref())
+}
+
+/// Was der Hook meldete, in der Form des Transkript-Lesers — damit der Bau
+/// der Session denselben Weg nimmt wie bei einer gelesenen Datei. `usage`
+/// ohne Angabe wird zu Null-Zählern; der Status `ReportedByHook` sagt dem
+/// Reader, dass es die Summe des Hooks ist.
+fn transcript_of_report(report: &minds_core::HookReport, model: Option<String>) -> Transcript {
+    Transcript {
+        model: model.map(model_of),
+        usage: report.usage.unwrap_or_default(),
+        agent_version: report.agent_version.clone(),
+        assistant_texts: report.said.clone(),
+    }
 }
 
 /// Das Modell zu einer Kennung — der Anbieter wie beim Transkript geraten.
@@ -288,25 +314,32 @@ pub fn checkpoint(key: &SessionKey, events: &[JournalEvent], ctx: &Checkpoint) -
 /// Hat der Hook die Modell-Kennung mitgegeben ([`JournalEvent::model`], K1),
 /// steht sie in der Session, mit Status `ModelFromHook`: Das Modell ist dann
 /// eine Angabe des Hooks aus dem Namensraum des Agenten, Texte und Token
-/// bleiben ungelesen.
+/// bleiben ungelesen. Hat der `SessionEnd`-Hook darüber hinaus seinen Report
+/// geschickt ([`JournalEvent::report`]), tragen Version, Token-Summen und
+/// Texte je Zug dessen Angaben — Status `ReportedByHook`; der Witness hat
+/// die Datei auch dann nicht angefasst.
 pub fn checkpoint_witness(
     key: &SessionKey,
     events: &[JournalEvent],
     ctx: &Checkpoint,
     path_map: &[(PathBuf, PathBuf)],
 ) -> Session {
-    let (transcript, status) = match hook_model(events) {
-        Some(id) => (
+    let (transcript, status) = match (hook_report(events), hook_model(events)) {
+        (Some(report), model) => (
+            transcript_of_report(report, model),
+            TranscriptStatus::ReportedByHook,
+        ),
+        (None, Some(id)) => (
             Transcript {
                 model: Some(model_of(id)),
                 ..Transcript::default()
             },
             TranscriptStatus::ModelFromHook,
         ),
-        None if events.iter().any(|e| e.transcript_path.is_some()) => {
+        (None, None) if events.iter().any(|e| e.transcript_path.is_some()) => {
             (Transcript::default(), TranscriptStatus::NotReadByWitness)
         }
-        None => (Transcript::default(), TranscriptStatus::NoPathInEvents),
+        (None, None) => (Transcript::default(), TranscriptStatus::NoPathInEvents),
     };
     let (mut session, call_events) = build_with_transcript(key, events, transcript, status);
     let agent_root = path_map
@@ -1393,6 +1426,7 @@ mod tests {
             cwd: Some("/home/anna/projects/minds".into()),
             transcript_path: None,
             model: None,
+            report: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
             payload_hash: None,
             event_hash: None,
@@ -1805,6 +1839,102 @@ mod tests {
         // Nur die Kennung: Der Witness hat die Datei nicht angefasst.
         assert!(s.turns.iter().all(|t| !t.text.contains("secret text")));
         assert_eq!(s.usage.output_tokens, 0);
+    }
+
+    /// Der Report des `SessionEnd`-Hooks auf dem Witness-Pfad: Version,
+    /// Token-Summen und Texte je Zug stehen in der Session — als Angabe des
+    /// Hooks (`ReportedByHook`), das Modell aus dem `Model`-Frame dazu; die
+    /// Datei selbst hat der Witness nicht gelesen.
+    #[test]
+    fn the_witness_path_takes_the_hook_report_without_reading_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("read.jsonl");
+        fs::write(
+            &read,
+            br#"{"type":"assistant","message":{"model":"claude-haiku-4","content":[{"type":"text","text":"secret text"}],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        let mut events = pointing_at(Some(&read));
+        events.push(ev(1, EventKind::TurnEnd, "Stop", "t1", "{}"));
+        events.push(JournalEvent {
+            model: Some("claude-opus-4-1".into()),
+            report: Some(minds_core::HookReport {
+                agent_version: Some("2.0.76".into()),
+                usage: Some(minds_core::Usage {
+                    input_tokens: 14_200,
+                    output_tokens: 3_900,
+                }),
+                said: vec!["Ich schaue nach.".into()],
+            }),
+            ..ev(2, EventKind::SessionEnd, "SessionEnd", "t2", "{}")
+        });
+
+        let s = checkpoint_witness(&key(), &events, &Checkpoint::default(), &[]);
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::ReportedByHook)
+        );
+        assert_eq!(s.agent.version, "2.0.76");
+        assert_eq!(s.model.id, "claude-opus-4-1");
+        assert_eq!(s.usage.input_tokens, 14_200);
+        assert_eq!(s.usage.output_tokens, 3_900);
+        let assistant: Vec<&str> = s
+            .turns
+            .iter()
+            .filter(|t| t.role == Role::Assistant)
+            .map(|t| t.text.as_str())
+            .collect();
+        assert_eq!(assistant, vec!["Ich schaue nach."]);
+        assert!(s.turns.iter().all(|t| !t.text.contains("secret text")));
+    }
+
+    /// Auf dem Hook-Pfad zählt der Report nur, wenn es keine Datei zu lesen
+    /// gab; ein gelesenes Transkript schlägt ihn.
+    #[test]
+    fn the_hook_report_fills_in_only_when_the_file_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = minds_core::HookReport {
+            agent_version: Some("2.0.76".into()),
+            usage: Some(minds_core::Usage {
+                input_tokens: 10,
+                output_tokens: 2,
+            }),
+            said: vec!["Fertig.".into()],
+        };
+        let mut events = pointing_at(Some(&dir.path().join("gone.jsonl")));
+        events.push(JournalEvent {
+            model: Some("gpt-5".into()),
+            report: Some(report.clone()),
+            ..ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+        });
+        let s = build_one(&key(), &events);
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::ReportedByHook)
+        );
+        assert_eq!(s.model.id, "gpt-5");
+        assert_eq!(s.agent.version, "2.0.76");
+        assert_eq!(s.usage.input_tokens, 10);
+
+        let read = dir.path().join("read.jsonl");
+        fs::write(
+            &read,
+            br#"{"type":"assistant","message":{"model":"claude-opus-4","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        let mut events = pointing_at(Some(&read));
+        events.push(JournalEvent {
+            model: Some("gpt-5".into()),
+            report: Some(report),
+            ..ev(1, EventKind::SessionEnd, "SessionEnd", "t1", "{}")
+        });
+        let s = build_one(&key(), &events);
+        assert_eq!(
+            s.lineage.as_ref().unwrap().transcript,
+            Some(TranscriptStatus::Read)
+        );
+        assert_eq!(s.model.id, "claude-opus-4", "gelesen schlägt gemeldet");
+        assert_eq!(s.usage.input_tokens, 1);
     }
 
     /// K1, Punkt 2 auf dem Hook-Pfad: Ist die Datei weg, trägt die Session

@@ -222,6 +222,112 @@ fn a_model_frame_after_the_stop_names_the_model_without_reading_the_transcript()
     );
 }
 
+/// Der Report des `SessionEnd`-Hooks: `Usage` und je Zug ein `Said` folgen
+/// dem `Hook`-Frame; der Eventloop sammelt sie am zurückgehaltenen Event und
+/// schreibt es mit ihnen, wenn die Verbindung endet. Der Witness-Checkpoint
+/// baut daraus Version, Token-Summen und Texte je Zug als `ReportedByHook`
+/// — ohne je das Transkript zu lesen. Ein Frame für eine andere Session, ein
+/// Zug jenseits der Grenze und ein Text mit Steuerzeichen werden verworfen,
+/// das Event trotzdem geschrieben.
+#[test]
+fn usage_and_said_frames_after_the_session_end_become_a_hook_report() {
+    use minds_capture::witness_proto::{self, Frame};
+    use std::os::unix::net::UnixStream;
+    let f = Fixture::new();
+    let mut writer = f.writer();
+    append(&mut writer);
+
+    let end = br#"{"session_id":"test-session","hook_event_name":"SessionEnd","transcript_path":"/home/anna/.claude/projects/p/t.jsonl","cwd":"/workspaces/demo"}"#.to_vec();
+    let hook = witness_proto::encode(&Frame::Hook {
+        agent: "claude-code".into(),
+        event_override: None,
+        stdin: end,
+    })
+    .unwrap();
+    let frame = |frame: Frame| witness_proto::encode(&frame).unwrap();
+    let session = |s: &str| s.to_string();
+    let bytes = [
+        hook.clone(),
+        frame(Frame::Model {
+            agent: "claude-code".into(),
+            session: session("test-session"),
+            model: "claude-opus-4-1".into(),
+        }),
+        frame(Frame::Usage {
+            agent: "claude-code".into(),
+            session: session("test-session"),
+            version: Some("2.0.76".into()),
+            input_tokens: 14_200,
+            output_tokens: 3_900,
+        }),
+        frame(Frame::Said {
+            agent: "claude-code".into(),
+            session: session("test-session"),
+            turn: 0,
+            text: "Ich schaue nach.".into(),
+        }),
+        // Zug 1 fehlt absichtlich — er bleibt als Lücke stehen.
+        frame(Frame::Said {
+            agent: "claude-code".into(),
+            session: session("test-session"),
+            turn: 2,
+            text: "Fertig.".into(),
+        }),
+        // Fremde Session: verworfen.
+        frame(Frame::Said {
+            agent: "claude-code".into(),
+            session: session("other-session"),
+            turn: 0,
+            text: "nicht meins".into(),
+        }),
+        // Jenseits der Grenze: verworfen.
+        frame(Frame::Said {
+            agent: "claude-code".into(),
+            session: session("test-session"),
+            turn: witness_proto::MAX_SAID_TURNS as u32,
+            text: "zu weit".into(),
+        }),
+    ]
+    .concat();
+
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs.write_all(&bytes).unwrap();
+    drop(theirs);
+    drain(&mut agent_client(ours), &mut writer);
+
+    let events = writer.journal.read(&key()).unwrap().events;
+    assert_eq!(events.len(), 2);
+    let end = &events[1];
+    assert_eq!(end.raw_kind, "SessionEnd");
+    assert_eq!(end.model.as_deref(), Some("claude-opus-4-1"));
+    let report = end.report.as_ref().expect("der Report hängt am Event");
+    assert_eq!(report.agent_version.as_deref(), Some("2.0.76"));
+    assert_eq!(
+        report.usage,
+        Some(minds_core::Usage {
+            input_tokens: 14_200,
+            output_tokens: 3_900
+        })
+    );
+    assert_eq!(report.said, vec!["Ich schaue nach.", "", "Fertig."]);
+
+    // Die Prompts dieser Session, damit die Texte Züge haben.
+    let session = minds_capture::adapter::checkpoint_witness(
+        &key(),
+        &events,
+        &minds_capture::Checkpoint::default(),
+        &[],
+    );
+    assert_eq!(
+        session.lineage.as_ref().unwrap().transcript,
+        Some(minds_core::TranscriptStatus::ReportedByHook)
+    );
+    assert_eq!(session.agent.version, "2.0.76");
+    assert_eq!(session.model.id, "claude-opus-4-1");
+    assert_eq!(session.usage.input_tokens, 14_200);
+    assert_eq!(session.usage.output_tokens, 3_900);
+}
+
 /// M1 (c): Ein Witness, der den zweiten Frame nicht kennt — hier eine
 /// unbekannte Art hinter dem `Hook` —, schließt die Verbindung; das Event
 /// steht trotzdem im Journal, nur ohne Modell. Und ein `Stop` ohne jeden
@@ -467,6 +573,7 @@ fn witness_ledger_is_idempotent_after_sealing_before_discard() {
                     cwd: event.cwd,
                     transcript_path: event.transcript_path,
                     model: None,
+                    report: None,
                     payload: event.payload,
                 },
             )

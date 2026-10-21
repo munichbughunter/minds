@@ -297,6 +297,17 @@ pub(super) fn step(client: &mut Client, writer: &mut Writer) -> Fallible<bool> {
     Ok(keep)
 }
 
+/// Das zurückgehaltene Event, wenn es zu `agent`/`session` gehört — die
+/// Angaben des Hooks (`Model`, `Usage`, `Said`) hängen nur an **ihrem**
+/// Event, nie an dem einer anderen Session auf derselben Verbindung.
+fn held_for<'c>(client: &'c mut Client, agent: &str, session: &str) -> Option<&'c mut NewEvent> {
+    client
+        .held
+        .as_mut()
+        .filter(|(key, _)| key.agent() == agent && key.local_id() == session)
+        .map(|(_, event)| event)
+}
+
 /// Schreibt das zurückgehaltene Event (K1), falls eines wartet.
 fn flush_held(client: &mut Client, writer: &mut Writer) -> Fallible<()> {
     if let Some((key, event)) = client.held.take() {
@@ -373,8 +384,14 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
         );
         return Ok(false);
     }
-    // Jeder Frame außer `Model` beendet das Warten auf den `Model`-Frame.
-    if !matches!(frame, Frame::Model { .. }) {
+    // Jeder Frame, der keine Angabe des Hooks zum zurückgehaltenen Event
+    // ist (`Model`, `Usage`, `Said`), beendet das Warten — wie das Ende der
+    // Verbindung. Die Angaben selbst sammeln sich am Event und werden mit
+    // ihm geschrieben.
+    if !matches!(
+        frame,
+        Frame::Model { .. } | Frame::Usage { .. } | Frame::Said { .. }
+    ) {
         flush_held(client, writer)?;
     }
     match frame {
@@ -398,28 +415,70 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                 }
             }
         }
+        // Die Angaben des Hooks zum zurückgehaltenen Event. Der Schreiber ist
+        // die Vertrauensgrenze: dieselbe Session, dieselbe Regel für jeden
+        // Wert wie beim Hook; was nicht passt, wird verworfen, das Event
+        // bleibt. Geschrieben wird es, sobald ein anderer Frame kommt oder
+        // die Verbindung endet.
         Frame::Model {
             agent,
             session,
             model,
-        } => match client.held.take() {
-            Some((key, mut event)) => {
-                // Der Schreiber ist die Vertrauensgrenze: dieselbe Session,
-                // dieselbe Regel für die Kennung wie beim Hook.
-                if key.agent() == agent
-                    && key.local_id() == session
-                    && witness_proto::check_model(&model).is_ok()
-                {
-                    event.model = Some(model);
-                } else {
-                    log(
-                        &writer.home,
-                        "model frame does not match the event; ignored",
-                    );
-                }
-                writer.commit_hook(&key, event)?;
+        } => match held_for(client, &agent, &session) {
+            Some(event) if witness_proto::check_model(&model).is_ok() => {
+                event.model = Some(model);
             }
-            None => log(&writer.home, "model frame without an event; ignored"),
+            _ => log(
+                &writer.home,
+                "model frame does not match the event; ignored",
+            ),
+        },
+        Frame::Usage {
+            agent,
+            session,
+            version,
+            input_tokens,
+            output_tokens,
+        } => match held_for(client, &agent, &session) {
+            Some(event)
+                if version
+                    .as_deref()
+                    .is_none_or(|v| witness_proto::check_version(v).is_ok()) =>
+            {
+                let report = event.report.get_or_insert_default();
+                report.agent_version = version;
+                report.usage = Some(minds_core::Usage {
+                    input_tokens,
+                    output_tokens,
+                });
+            }
+            _ => log(
+                &writer.home,
+                "usage frame does not match the event; ignored",
+            ),
+        },
+        Frame::Said {
+            agent,
+            session,
+            turn,
+            text,
+        } => match held_for(client, &agent, &session) {
+            Some(event)
+                if (turn as usize) < witness_proto::MAX_SAID_TURNS
+                    && witness_proto::check_said(&text).is_ok() =>
+            {
+                // Je Zug ein Text, an seinem Platz: Ein übersprungener Zug
+                // bleibt leer, damit die Zuordnung der übrigen hält.
+                let said = &mut event.report.get_or_insert_default().said;
+                let turn = turn as usize;
+                if said.len() <= turn {
+                    said.resize(turn, String::new());
+                    said.push(text);
+                } else {
+                    said[turn] = text;
+                }
+            }
+            _ => log(&writer.home, "said frame does not match the event; ignored"),
         },
         Frame::Ping => {
             let bytes = witness_proto::encode(&Frame::Ack {

@@ -4692,3 +4692,96 @@ fn verify_scope_claims_count_in_a_clone_and_never_on_a_guessed_commit() {
         "{text}"
     );
 }
+
+/// `recall <datei>` löst den Pfad auf wie `blame`: repo-relativ über das Blame
+/// der ganzen Datei, jede Zeile zu ihrem Commit, jeder Commit zu seinen
+/// Sessions — auch wenn die Session den Pfad so nennt, wie der Agent ihn sah
+/// (absolut), und auch aus einem Unterverzeichnis heraus. Ein Pfad relativ
+/// zum Arbeitsverzeichnis ist dagegen kein Treffer, genau wie bei `blame`.
+#[test]
+fn recall_resolves_a_file_like_blame_from_root_and_subdirectory() {
+    let Some(repo) = scratch_repo() else {
+        eprintln!("kein git im Pfad — Test übersprungen");
+        return;
+    };
+    let dir = repo.path();
+    assert!(
+        minds(dir, &["enable", "--agent", "claude-code"], None)
+            .status
+            .success()
+    );
+
+    // Die Session nennt die Datei absolut — so, wie Claude Code sie im
+    // `tool_input` schickt; committet wird der repo-relative Pfad.
+    let prompt = "Sortiere die Einträge stabil nach Zeitstempel";
+    let claimed = dir.join("src/sort.rs");
+    let payload = |body: &str| {
+        format!(
+            r#"{{"session_id":"sess-abs","cwd":"{}",{body}}}"#,
+            dir.display()
+        )
+    };
+    for body in [
+        format!(r#""hook_event_name":"UserPromptSubmit","prompt":"{prompt}""#),
+        format!(
+            r#""hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{{"file_path":"{}"}}"#,
+            claimed.display()
+        ),
+        r#""hook_event_name":"Stop""#.to_string(),
+    ] {
+        let out = minds(
+            dir,
+            &["hook", "--agent", "claude-code"],
+            Some(&payload(&body)),
+        );
+        assert!(out.status.success(), "hook endet immer mit 0");
+    }
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(&claimed, "fn sort() {}\n").unwrap();
+    git(dir, &["add", "src/sort.rs"]);
+    assert!(
+        git(dir, &["commit", "-q", "-m", "feat: sort"])
+            .status
+            .success()
+    );
+    let head = String::from_utf8_lossy(&git(dir, &["rev-parse", "HEAD"]).stdout)
+        .trim()
+        .to_owned();
+    let checkpoint = minds(dir, &["checkpoint", "--commit", &head], None);
+    assert!(checkpoint.status.success(), "{}", stdout(&checkpoint));
+
+    // Aus der Wurzel.
+    let from_root = minds(dir, &["recall", "src/sort.rs"], None);
+    assert!(
+        from_root.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_root.stderr)
+    );
+    assert!(
+        stdout(&from_root).contains("stabil nach Zeitstempel"),
+        "{}",
+        stdout(&from_root)
+    );
+
+    // Aus dem Unterverzeichnis, mit demselben repo-relativen Pfad.
+    let from_sub = minds(&dir.join("src"), &["recall", "src/sort.rs"], None);
+    assert!(
+        from_sub.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_sub.stderr)
+    );
+    assert_eq!(
+        stdout(&from_sub),
+        stdout(&from_root),
+        "derselbe Brief, gleich von wo aus"
+    );
+
+    // Relativ zum Arbeitsverzeichnis ist kein Pfad — wie bei `blame`.
+    let cwd_relative = minds(&dir.join("src"), &["recall", "sort.rs"], None);
+    assert!(!cwd_relative.status.success());
+    assert!(
+        String::from_utf8_lossy(&cwd_relative.stderr).contains("no context"),
+        "{}",
+        String::from_utf8_lossy(&cwd_relative.stderr)
+    );
+}

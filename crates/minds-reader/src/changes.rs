@@ -519,7 +519,10 @@ impl crate::Inspection {
                     .then(|| one_line(&actor.model_label(), 80))
             },
             transcript: session.lineage.as_ref().and_then(|l| l.transcript),
-            request: one_line(&session.intent.request, SAID_LIMIT),
+            request: one_line(
+                &minds_core::without_pasted_wrapper(&session.intent.request),
+                SAID_LIMIT,
+            ),
             turn: source.turn,
             call: source.call,
             tool: one_line(&call.name, 40),

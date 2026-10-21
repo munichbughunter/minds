@@ -107,8 +107,15 @@ pub fn facts(agent: &str, event: &JournalEvent) -> EventFacts {
         // braucht deshalb keinen agent-spezifischen Normalisierer — sonst
         // verlöre ein noch nicht normalisierter Agent seine Prompts, und das
         // Journal wäre umsonst „ein Beobachter für alle".
+        //
+        // Die Hülle, die Claude Code um eingefügten Text legt
+        // (`<pasted_content id="…">…</pasted_content>`), ist kein Teil der
+        // Absicht und fällt hier weg; der Inhalt bleibt
+        // ([`minds_core::without_pasted_wrapper`]).
         EventKind::Prompt => EventFacts {
-            prompt: parse::<Prompt>(event).and_then(|p| p.prompt),
+            prompt: parse::<Prompt>(event)
+                .and_then(|p| p.prompt)
+                .map(|p| minds_core::without_pasted_wrapper(&p).into_owned()),
             tool: None,
         },
         // Die Tool→Effect-Abbildung ist dagegen agent-spezifisch (welcher
@@ -1049,6 +1056,7 @@ mod tests {
             cwd: None,
             transcript_path: None,
             model: None,
+            report: None,
             payload: RawValue::from_string(payload.to_string()).unwrap(),
             payload_hash: None,
             event_hash: None,
@@ -1065,6 +1073,23 @@ mod tests {
         let f = facts("claude-code", &e);
         assert_eq!(f.prompt.as_deref(), Some("Fix den Retry-Test"));
         assert!(f.tool.is_none());
+    }
+
+    /// Die `<pasted_content>`-Hülle von Claude Code ist kein Teil der
+    /// Absicht: Der Normalizer streift sie ab, der Inhalt bleibt — Zeile für
+    /// Zeile, wie der Mensch ihn einfügte.
+    #[test]
+    fn a_pasted_prompt_loses_its_wrapper_and_keeps_its_content() {
+        let e = event(
+            EventKind::Prompt,
+            "UserPromptSubmit",
+            r#"{"prompt":"<pasted_content id=\"fb19\">\nFüge __author__ hinzu.\nNicht committen.\n</pasted_content>","session_id":"x"}"#,
+        );
+        let f = facts("claude-code", &e);
+        assert_eq!(
+            f.prompt.as_deref(),
+            Some("Füge __author__ hinzu.\nNicht committen.")
+        );
     }
 
     #[test]

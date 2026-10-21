@@ -657,8 +657,11 @@ fn agent_said_line(reason: &minds_reader::changes::LineReason) -> Vec<Span<'stat
         }
         None => {
             let why = match reason.transcript {
-                Some(TranscriptStatus::Read) => {
+                Some(TranscriptStatus::Read | TranscriptStatus::ReadFromSlug) => {
                     "— (no assistant text in the transcript)".to_string()
+                }
+                Some(TranscriptStatus::ReportedByHook) => {
+                    "— (no assistant text in the hook's report)".to_string()
                 }
                 Some(status) => format!(
                     "— (transcript not read: {})",

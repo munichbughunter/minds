@@ -74,6 +74,15 @@ fn terminal_markdown(markdown: &str, width: usize) -> String {
 ///
 /// Reihenfolge der Deutung: `datei:zeile` (Blame) → Git-Revision → Dateipfad.
 /// Die erste, die greift, gewinnt.
+///
+/// Ein Dateipfad wird aufgelöst wie bei `minds blame`: **repo-relativ**, nicht
+/// relativ zum Arbeitsverzeichnis, und über das Blame der ganzen Datei — jede
+/// Zeile zu ihrem Commit, jeder Commit zu seinen Sessions. Dazu kommen die
+/// Sessions, die die Datei laut eigenem Record berührt haben (für Arbeit, die
+/// noch in keinem Commit steht). Allein auf den Record zu bauen, trug nicht:
+/// Ein Agent nennt den Pfad, wie *er* ihn sieht (absolut, aus einem anderen
+/// Namensraum), und der Vergleich mit dem Aufruf ging ins Leere, während
+/// `blame` dieselbe Datei längst vollständig zuordnete.
 fn resolve_target(
     ctx: &Context,
     target: &str,
@@ -93,10 +102,17 @@ fn resolve_target(
         return Ok((format!("commit {commit}"), sessions));
     }
 
+    let (mut behind, s) = ctx.sessions_of_file(target)?;
+    skipped.merge(s);
     let (touching, s) = ctx.sessions_touching(target)?;
     skipped.merge(s);
-    if !touching.is_empty() {
-        return Ok((format!("file {target}"), touching));
+    for session in touching {
+        if !behind.contains(&session) {
+            behind.push(session);
+        }
+    }
+    if !behind.is_empty() {
+        return Ok((format!("file {target}"), behind));
     }
 
     Err(

@@ -2,7 +2,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use minds_capture::witness_proto::{
-    Frame, MAGIC, MAX_FRAME, MAX_MODEL, ProtoError, decode, encode,
+    Frame, MAGIC, MAX_FRAME, MAX_MODEL, MAX_SAID, MAX_VERSION, ProtoError, decode, encode,
 };
 
 // Count requested heap bytes only on the current test thread and only while
@@ -87,6 +87,34 @@ fn examples() -> Vec<Frame> {
             agent: "claude-code".into(),
             session: "31f3f224-aa".into(),
             model: "claude-opus-4-1".into(),
+        },
+        // Der Report des `SessionEnd`-Hooks: Version und Token-Summen, dann
+        // je Zug ein Text — ebenfalls zwischen den festen Indizes.
+        Frame::Usage {
+            agent: "claude-code".into(),
+            session: "31f3f224-aa".into(),
+            version: Some("2.0.76".into()),
+            input_tokens: 14_200,
+            output_tokens: 3_900,
+        },
+        Frame::Usage {
+            agent: "claude-code".into(),
+            session: "31f3f224-aa".into(),
+            version: None,
+            input_tokens: 0,
+            output_tokens: u64::MAX,
+        },
+        Frame::Said {
+            agent: "claude-code".into(),
+            session: "31f3f224-aa".into(),
+            turn: 2,
+            text: "Ich schaue nach.\n\tFertig — ✓".into(),
+        },
+        Frame::Said {
+            agent: "claude-code".into(),
+            session: "31f3f224-aa".into(),
+            turn: 0,
+            text: String::new(),
         },
         Frame::Status,
         Frame::Hook {
@@ -218,6 +246,66 @@ fn frame_roundtrip_all_kinds() {
     }
 }
 
+/// Der Report des Hooks hält dieselben Regeln wie die Kennung: Die Version
+/// ist leer oder ein kurzes druckbares Wort; ein Text ist begrenzt und trägt
+/// keine Steuerzeichen außer Zeilenumbruch und Tab — leer ist erlaubt (ein
+/// stummer Zug behält seinen Platz). Token-Zähler reisen als volle u64.
+#[test]
+fn usage_and_said_frames_are_bounded_and_round_trip() {
+    let usage = |version: Option<&str>| Frame::Usage {
+        agent: "claude-code".into(),
+        session: "31f3f224".into(),
+        version: version.map(str::to_owned),
+        input_tokens: u64::MAX,
+        output_tokens: 1,
+    };
+    for bad in ["a b", "a\nb", "é", &"v".repeat(MAX_VERSION + 1)] {
+        assert_eq!(
+            encode(&usage(Some(bad))),
+            Err(ProtoError::BadField("version")),
+            "{bad:?}"
+        );
+    }
+    for ok in [None, Some("2.0.76"), Some(&*"v".repeat(MAX_VERSION))] {
+        let bytes = encode(&usage(ok)).unwrap();
+        let (frame, used) = measured_decode(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(frame, usage(ok));
+    }
+    // Eine leere Version kommt als `None` zurück — wie jede leere Option.
+    assert_eq!(
+        measured_decode(&encode(&usage(Some(""))).unwrap())
+            .unwrap()
+            .0,
+        usage(None)
+    );
+
+    let said = |text: &str| Frame::Said {
+        agent: "claude-code".into(),
+        session: "31f3f224".into(),
+        turn: u32::MAX,
+        text: text.into(),
+    };
+    for bad in ["a\u{1b}[2Jb", "a\0b", &"t".repeat(MAX_SAID + 1)] {
+        assert_eq!(
+            encode(&said(bad)),
+            Err(ProtoError::BadField("text")),
+            "{}",
+            bad.len()
+        );
+    }
+    for ok in [
+        "",
+        "Zeile 1\nZeile 2\r\n\tEingerückt — ✓",
+        &"t".repeat(MAX_SAID),
+    ] {
+        let bytes = encode(&said(ok)).unwrap();
+        let (frame, used) = measured_decode(&bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(frame, said(ok));
+    }
+}
+
 #[test]
 fn frame_golden_vectors() {
     // Independently specified on-disk bytes, not produced by the Rust encoder.
@@ -306,7 +394,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=8 | 0x81 | 0x82) {
+        if matches!(kind, 1..=10 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(
@@ -343,6 +431,8 @@ fn complete_payload_with_missing_fields_or_trailing_bytes_is_malformed() {
             frame,
             Frame::Ping
                 | Frame::Model { .. }
+                | Frame::Usage { .. }
+                | Frame::Said { .. }
                 | Frame::CheckpointRequest { .. }
                 | Frame::IntentActivate { .. }
                 | Frame::IntentChallenge { .. }

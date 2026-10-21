@@ -29,8 +29,17 @@ const HEADER_LEN: usize = 12;
 const MAX_AGENT: usize = 64;
 const MAX_TEXT: usize = 4 * 1024;
 
-/// Longest model id a [`Frame::HookModel`] may carry (K1): one short line.
+/// Longest model id a [`Frame::Model`] may carry (K1): one short line.
 pub const MAX_MODEL: usize = 128;
+/// Longest agent version a [`Frame::Usage`] may carry: one short word.
+pub const MAX_VERSION: usize = 64;
+/// Longest answer text a [`Frame::Said`] may carry (64 KiB); the hook clips
+/// longer texts before sending.
+pub const MAX_SAID: usize = 64 * 1024;
+/// How many [`Frame::Said`] turns one event may carry; the hook sends no
+/// more, the witness ignores any beyond — a bound on what one connection
+/// can make the writer hold.
+pub const MAX_SAID_TURNS: usize = 512;
 
 /// A single request or response. Raw hook stdin is preserved byte for byte.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +59,29 @@ pub enum Frame {
         agent: String,
         session: String,
         model: String,
+    },
+    /// What the `SessionEnd` hook summed up from the transcript: the agent
+    /// version (empty = unknown) and the token totals. Sent on the same
+    /// connection after the `Hook` frame, like [`Frame::Model`]; a witness
+    /// that does not know this kind drops it and closes the connection —
+    /// the event has already landed. A statement of the hook, not an
+    /// observation of the witness.
+    Usage {
+        agent: String,
+        session: String,
+        version: Option<String>,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
+    /// The agent's answer text of one turn (`turn` counts the human's
+    /// prompts from 0), already redacted by the hook with the repository's
+    /// policy. One frame per turn, in order, after [`Frame::Usage`]. The
+    /// same delivery rule as `Usage`.
+    Said {
+        agent: String,
+        session: String,
+        turn: u32,
+        text: String,
     },
     CheckpointRequest {
         commit: Option<String>,
@@ -131,6 +163,32 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             put_short(&mut out, agent);
             put_short(&mut out, session);
             put_short(&mut out, model);
+        }
+        Frame::Usage {
+            agent,
+            session,
+            version,
+            input_tokens,
+            output_tokens,
+        } => {
+            out.push(0x09);
+            put_short(&mut out, agent);
+            put_short(&mut out, session);
+            put_short(&mut out, version.as_deref().unwrap_or_default());
+            out.extend_from_slice(&input_tokens.to_le_bytes());
+            out.extend_from_slice(&output_tokens.to_le_bytes());
+        }
+        Frame::Said {
+            agent,
+            session,
+            turn,
+            text,
+        } => {
+            out.push(0x0a);
+            put_short(&mut out, agent);
+            put_short(&mut out, session);
+            out.extend_from_slice(&turn.to_le_bytes());
+            put_long(&mut out, text);
         }
         Frame::CheckpointRequest { commit, request_id } => {
             out.push(0x02);
@@ -236,6 +294,41 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
                 model: model.to_owned(),
             }
         }
+        0x09 => {
+            let agent = cursor.short_text("agent")?;
+            check_agent(agent)?;
+            let session = cursor.short_text("session")?;
+            check_session(session)?;
+            let version = cursor.short_text("version")?;
+            check_version(version)?;
+            let input_tokens = cursor.u64("input_tokens")?;
+            let output_tokens = cursor.u64("output_tokens")?;
+            cursor.finish()?;
+            Frame::Usage {
+                agent: agent.to_owned(),
+                session: session.to_owned(),
+                version: optional(version),
+                input_tokens,
+                output_tokens,
+            }
+        }
+        0x0a => {
+            let agent = cursor.short_text("agent")?;
+            check_agent(agent)?;
+            let session = cursor.short_text("session")?;
+            check_session(session)?;
+            let turn = cursor.take(4, "turn")?;
+            let turn = u32::from_le_bytes(turn.try_into().unwrap());
+            let text = cursor.long_text("text")?;
+            check_said(text)?;
+            cursor.finish()?;
+            Frame::Said {
+                agent: agent.to_owned(),
+                session: session.to_owned(),
+                turn,
+                text: text.to_owned(),
+            }
+        }
         0x02 => {
             let commit = cursor.short_text("commit")?;
             check_commit(commit)?;
@@ -335,6 +428,29 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_model(model)?;
             7 + agent.len() + session.len() + model.len()
         }
+        Frame::Usage {
+            agent,
+            session,
+            version,
+            ..
+        } => {
+            check_agent(agent)?;
+            check_session(session)?;
+            let version = version.as_deref().unwrap_or_default();
+            check_version(version)?;
+            23 + agent.len() + session.len() + version.len()
+        }
+        Frame::Said {
+            agent,
+            session,
+            text,
+            ..
+        } => {
+            check_agent(agent)?;
+            check_session(session)?;
+            check_said(text)?;
+            13 + agent.len() + session.len() + text.len()
+        }
         Frame::CheckpointRequest { commit, .. } => {
             let commit = commit.as_deref().unwrap_or_default();
             check_commit(commit)?;
@@ -399,6 +515,30 @@ fn check_line(value: &str, max: usize, field: &'static str) -> Result<(), ProtoE
 pub fn check_model(value: &str) -> Result<(), ProtoError> {
     if value.is_empty() || value.len() > MAX_MODEL || !value.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(ProtoError::BadField("model"));
+    }
+    Ok(())
+}
+
+/// An agent version is empty (unknown) or one short word of printable ASCII
+/// (`2.0.76`) — the same rule on every side, like [`check_model`].
+pub fn check_version(value: &str) -> Result<(), ProtoError> {
+    if value.len() > MAX_VERSION || !value.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(ProtoError::BadField("version"));
+    }
+    Ok(())
+}
+
+/// An answer text is at most [`MAX_SAID`] bytes and carries no control
+/// characters besides line breaks and tabs — a terminal reads it later, and
+/// an escape sequence is not an answer. Empty is allowed: a turn without
+/// text keeps its place in the order.
+pub fn check_said(value: &str) -> Result<(), ProtoError> {
+    if value.len() > MAX_SAID
+        || value
+            .chars()
+            .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return Err(ProtoError::BadField("text"));
     }
     Ok(())
 }
@@ -499,6 +639,10 @@ impl<'a> Cursor<'a> {
 
     fn request_id(&mut self) -> Result<[u8; 16], ProtoError> {
         Ok(self.take(16, "request_id")?.try_into().unwrap())
+    }
+
+    fn u64(&mut self, field: &'static str) -> Result<u64, ProtoError> {
+        Ok(u64::from_le_bytes(self.take(8, field)?.try_into().unwrap()))
     }
 
     fn finish(self) -> Result<(), ProtoError> {

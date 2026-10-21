@@ -825,6 +825,7 @@ impl Writer {
                 cwd: None,
                 transcript_path: None,
                 model: None,
+                report: None,
                 payload: serde_json::value::RawValue::from_string(serde_json::to_string(payload)?)?,
             },
         )?;
