@@ -72,8 +72,8 @@ when it runs another `minds` binary than the one you call (rerun with
 writes with umask 002 when it writes into the store under `.git` (`hook`, `checkpoint`,
 `sync`, `forget`, `import`, `intent`, `spec`, `review`, `sign`, `anchor`, `reinterpret` — not
 `enable` or exports), so what it creates stays writable for the witness group. No (or no
-terminal, or a failed setup) sets up the local witness below, with a warning. Nothing is
-removed again automatically (no `minds disable` yet).
+terminal, or a failed setup) sets up the local witness below, with a warning. `minds
+disable` takes it back again (below).
 
 **The trusted signers file and your intent key.** Every `enable` (unless
 `MINDS_WITNESS=off`) also sets up, once per user:
@@ -160,6 +160,12 @@ Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of
   setups such as the protected witness and record into the local journal. No `minds` on `PATH`
   is `warn` as well. `minds enable` prints the same warnings. This looks at your shell's `PATH`;
   an agent started elsewhere (e.g. from the Dock) may see another one.
+- **Scope trap** (`agent config`): an agent configuration `enable` wrote (`.claude/settings.json`,
+  …) that is not in the index yet is `warn` — `"… untracked — commit it before binding a scope"`.
+  Left uncommitted, it lands in the agent's next commit as a path outside every bound
+  scope; `minds verify` then calls it `tooling` as long as it is exactly what `enable`
+  writes, but anything the agent adds to it is an ordinary out-of-scope finding. Read
+  from the index in-process (gix), never through a `git` process.
 - **Protected witness** (found at its fixed place, see `minds enable`): it answers `ping` (`fail`
   if not) and its home is not readable for you (`ok` on permission denied, `fail` if it opens).
 - **Witness observer** (whenever the witness answers `ping`, on every side): the witness's own
@@ -175,6 +181,31 @@ Checks the setup, one line per check — `ok`, `warn` or `fail` with one line of
 ```
 minds doctor --probe-home /home/alice/.local/state/minds-witness/86f649449fc18941
 ```
+
+### minds disable
+
+```
+minds disable [--all] [-v]
+```
+
+Takes back what `enable` set up in this repository: the agent hook registrations (only
+minds' own entries — capture and recall; foreign entries stay, and a file in which
+nothing else stood disappears; the OpenCode plugin is removed when it carries the minds
+mark), the minds blocks of the Git hooks (a hook with only shebang and comments left
+disappears), the local witness (its user service is stopped and disabled, the service
+file and the witness home removed — only a home owned by you that pins this repository)
+and the protected witness of this repository: one `sudo` runs a script minds generates
+(`templates/witness/disable-*.sh`) that stops the system service and removes its file,
+removes the witness home under the protected base and takes this repository's rules
+(its `refs/minds`, its witness home) out of minds' own `managed-settings.json` — the
+file only if it is still exactly the one minds read a moment ago; when only the
+path-less `Bash(…)` rules remain, the file goes. `--all` removes every protected witness
+of this machine, the managed settings (if minds' own) and the root-owned binary
+(`/usr/local/libexec/minds/minds`); outside a repository it does only that. What
+stays: the store (`refs/minds/*`) and the store config in `.git/config` — data, not
+setup, `minds show` keeps reading them —, the witness user and group, and the trusted
+signers file and intent key of your user (they serve every repository). Agents must
+not run `disable`.
 
 ## Daily use
 
@@ -638,7 +669,12 @@ discovered in the trusted `allowed_signers` file: `--signers`, else `git config 
 minds.signers`, else `~/.config/minds/allowed_signers` (both written by `minds enable`),
 else the former `~/.ssh/allowed_signers`; never the repository's git config. The first
 line of the output names the file and its source (`Signers ~/.config/minds/allowed_signers
-(minds.signers)`). Success prints
+(minds.signers)`). A path outside the bound scope that `minds enable` wrote
+(`.claude/settings.json` and the other agent configurations, `.codex/config.toml`) is
+listed as `tooling … (written by minds enable; …)` instead of `out of scope` — only when
+its content in the commit is exactly what `enable` writes (just minds' hook entries, just
+the Codex switch, the OpenCode plugin verbatim); it does not count for
+`--require-in-scope`, and the Coverage line adds `· N tooling`. Success prints
 `witness-signed (<principal>)`; missing, invalid or incorrectly namespaced
 signatures produce `TAMPERED`. Without a signer file, present signatures
 print `signature not checked`. See the [verification guide](verification-guide.md).

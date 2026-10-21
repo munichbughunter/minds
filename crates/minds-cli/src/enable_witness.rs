@@ -762,6 +762,102 @@ fn local_unix(
     }
 }
 
+/// Nimmt den Witness dieses Nutzers für `root` zurück (`minds disable`):
+/// hält den Nutzerdienst an, entfernt seine Dienstdatei und das Witness-Home
+/// — nur eines, das diesem Nutzer gehört und **dieses** Repo festhält. Gibt
+/// die Zeilen des Berichts zurück.
+pub(crate) fn disable_local(root: &Path) -> std::io::Result<Removal> {
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        Ok(Removal::default())
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = root.canonicalize()?;
+        let id = repo_id(&root);
+        let mut removal = Removal::default();
+        let lines = &mut removal.lines;
+        let home = witness_home(&root)?;
+        match service_path(&root, &id) {
+            Ok(Some(target)) => {
+                crate::enable_protected::stop_local_service(&root);
+                // `launchctl bootout` kehrt zurück, bevor der Dienst weg ist:
+                // Ein Witness, der noch schreibt, ließe das Home halb
+                // gelöscht zurück. Warten, bis sein Socket schweigt.
+                let socket = home.join("run").join("witness.sock");
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while crate::witness_cmd::ping(&socket) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if std::fs::symlink_metadata(&target.path).is_ok() {
+                    std::fs::remove_file(&target.path)?;
+                    lines.push(format!(
+                        "user service {} removed",
+                        quoted_display(&target.path)
+                    ));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => lines.push(format!("user service not removed: {err}")),
+        }
+        if let Ok(meta) = std::fs::symlink_metadata(&home) {
+            // SAFETY: geteuid hat keine Vorbedingungen.
+            let owned = meta.is_dir() && meta.uid() == unsafe { libc::geteuid() };
+            match crate::witness_cmd::load(&home) {
+                Ok(config) if owned && config.repo_root() == root => {
+                    // Noch einmal, falls der Dienst im letzten Augenblick
+                    // etwas anlegte.
+                    let mut outcome = std::fs::remove_dir_all(&home);
+                    for _ in 0..5 {
+                        if outcome.is_ok() || !home.exists() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                        outcome = std::fs::remove_dir_all(&home);
+                    }
+                    match outcome {
+                        Ok(()) => {
+                            lines.push(format!("witness home {} removed", quoted_display(&home)))
+                        }
+                        Err(err) if !home.exists() => {
+                            let _ = err;
+                            lines.push(format!("witness home {} removed", quoted_display(&home)));
+                        }
+                        Err(err) => {
+                            removal.failed = true;
+                            lines.push(format!(
+                                "witness home {} not removed ({}) — run minds disable again",
+                                quoted_display(&home),
+                                crate::text::sanitize(&err.to_string())
+                            ));
+                        }
+                    }
+                }
+                Ok(_) => lines.push(format!(
+                    "witness home {} kept — it belongs to another repository or user",
+                    quoted_display(&home)
+                )),
+                Err(err) => lines.push(format!(
+                    "witness home {} kept — not readable as a witness home ({})",
+                    quoted_display(&home),
+                    crate::text::sanitize(&err.to_string())
+                )),
+            }
+        }
+        Ok(removal)
+    }
+}
+
+/// Was [`disable_local`] tat — die Zeilen des Berichts und ob etwas
+/// stehen blieb, das ein zweiter Lauf nachholen muss.
+#[derive(Debug, Default)]
+pub(crate) struct Removal {
+    pub(crate) lines: Vec<String>,
+    pub(crate) failed: bool,
+}
+
 /// Ein Binary aus einem Build-Verzeichnis (`target/debug`, `target/release`)
 /// läuft nicht als Dienst: Ein Agent, der in jenem Checkout arbeitet,
 /// schreibt es bei jedem Build neu — und der Dienst eines anderen Repos

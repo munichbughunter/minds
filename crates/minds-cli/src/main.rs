@@ -43,6 +43,7 @@ mod brief_cmd;
 mod checkpoint;
 mod config;
 mod context;
+mod disable;
 mod distill;
 mod doctor;
 mod enable;
@@ -126,6 +127,17 @@ Usage:
         steps. managed: writes managed-settings.minds-proposed.json.
         Never runs privileged commands, never overwrites existing files
         (a *.minds-proposed file is written next to them instead).
+
+  minds disable [--all] [-v]
+        Takes back what enable set up in this repository: the agent hook
+        registrations (foreign entries stay; a file with nothing else
+        disappears), the minds blocks of the Git hooks, the local witness
+        (user service and home) and the protected witness of this
+        repository (one sudo: its system service, its witness home, its
+        rules in the managed settings). --all removes every protected
+        witness of this machine, the managed settings and the root-owned
+        binary. The store (refs/minds/*), .git/config, the trusted
+        signers file and the intent key stay.
 
   minds hook --agent <name> [--event <name>]
         Accepts an agent hook event on stdin and stores it in the local
@@ -536,6 +548,7 @@ const SPECS: &[Spec] = &[
         hidden_flags: &[enable::BACKGROUND_IMPORT_FLAG],
         positionals: 0,
     },
+    spec("disable", &[], &["--all", "-v", "--verbose"], 0),
     spec("hook", &["--agent", "--event"], &[], 0),
     spec("checkpoint", &["--commit"], &[], 0),
     spec(
@@ -970,6 +983,11 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 )
             }
         }
+
+        "disable" => disable::run(
+            parsed.has("--all"),
+            parsed.has("-v") || parsed.has("--verbose"),
+        ),
 
         "hook" => hook::run(parsed.value("--agent"), parsed.value("--event")),
 

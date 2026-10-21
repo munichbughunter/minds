@@ -55,22 +55,19 @@ dann keinen an.
 
 ### 0.2 Alte Witness-Dienste aufräumen (optional, braucht sudo)
 
-Auf dem Rechner laufen vier geschützte Witnesses für Repos, die es nicht mehr gibt
-(`witness-test`, `intent-test`, `minds-demo-test`, `minds-demo`). Sie stören die
-Demo nicht, aber `launchctl print system` und die Managed Settings sind damit
-unübersichtlich. Ein `minds disable` gibt es noch nicht; von Hand:
+Geschützte Witnesses früherer Repos stören die Demo nicht, aber `launchctl
+print system` und die Managed Settings sind damit unübersichtlich. Alles auf
+einmal, mit einem `sudo`:
 
 ```sh
-for id in 0f26450353f9ba6e 359758146ad15cbd 9b50dcc6600123f1 ea9ba27623381a50; do
-  sudo launchctl bootout system/dev.minds.witness.$id
-  sudo rm /Library/LaunchDaemons/dev.minds.witness.$id.plist
-  sudo rm -r /private/var/db/minds-witness/$id
-done
-sudo rm "/Library/Application Support/ClaudeCode/managed-settings.json"
+minds disable --all
+launchctl print system | grep minds    # nichts mehr
 ```
 
-Die Managed-Settings-Datei ist minds' eigene (nur Deny-Regeln); `enable` legt
-sie in Schritt 1.2 neu an, dann nur mit dem Demo-Repo.
+Nimmt jeden LaunchDaemon `dev.minds.witness.*`, die Witness-Homes unter
+`/private/var/db/minds-witness`, minds' eigene Managed-Settings-Datei (nur
+Deny-Regeln) und das root-eigene Binary; `enable` legt in Schritt 1.2 alles
+neu an, dann nur mit dem Demo-Repo.
 
 ### 0.3 Das Demo-Projekt anlegen
 
@@ -188,6 +185,7 @@ Erwartet:
 
 ```text
 ok    agent hooks: registered for claude-code
+warn  agent config: ".claude/settings.json" untracked — commit it before binding a scope
 ok    git hooks: installed in ".git/hooks"
 ok    store: in-repo, refs/minds/context
 ok    witness: protected, runs as _minds, answers ping
@@ -196,6 +194,20 @@ ok    witness home: not readable for you (permission denied)
 
 `permission denied` ist hier der Beleg, nicht der Fehler: Der Witness ist vom
 Entwickler getrennt.
+
+Die Warnung `agent config` ist die Scope-Falle: `.claude/settings.json` hat
+`enable` eben geschrieben; bliebe sie uncommittet, läge sie im Commit des
+Agenten — außerhalb des Bereichs `src/**,tests/**`. Also jetzt committen,
+vor dem Binden:
+
+```sh
+git add .claude/settings.json && git commit -qm "chore: minds hooks"
+minds doctor      # ohne die Warnung
+```
+
+(Vergisst man es, zeigt `verify` die Datei später als `tooling … (written by
+minds enable; commit, claim)` statt `out of scope`, und `--require-in-scope`
+scheitert nicht daran — solange der Agent nichts hineinschreibt.)
 
 Beleg, dass der Agent nicht an den Witness kommt (die Zeile aus dem Loom-Drehbuch):
 
@@ -684,12 +696,13 @@ Auditor  clone + fetch refs/minds/* → trust file → verify --require-… → 
 ### C · Aufräumen nach der Demo
 
 ```sh
-id=$(ls -t /private/var/db/minds-witness/ 2>/dev/null | head -1)   # oder aus der doctor-Ausgabe
-sudo launchctl bootout system/dev.minds.witness.$id
-sudo rm /Library/LaunchDaemons/dev.minds.witness.$id.plist
-sudo rm -r /private/var/db/minds-witness/$id
-sudo rm "/Library/Application Support/ClaudeCode/managed-settings.json"
+cd ~/dev/minds-demo-a2 && minds disable      # Hooks, Dienst, Witness-Home, Managed-Settings-Eintrag; ein sudo
+launchctl print system | grep minds          # nichts mehr
 rm -rf ~/dev/minds-demo-a2 ~/dev/minds-demo-a2-remote.git ~/audit
 ```
+
+(`minds disable --all` räumt jeden geschützten Witness des Rechners ab.
+Vertrauensdatei und Intent-Schlüssel unter `~/.config/minds` bleiben — sie
+gelten für alle Repos.)
 
 Nutzer und Gruppe `_minds` dürfen bleiben; die nächste Demo nutzt sie wieder.

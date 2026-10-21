@@ -332,7 +332,7 @@ pub(crate) fn install(
             crate::text::sanitize(&crate::trust::tilde(Path::new(path)))
         ),
     }
-    let output = elevate(&script)?;
+    let output = elevate(&script, "minds-protected-setup")?;
     let mut signers = None;
     let mut managed = None;
     let mut notes = Vec::new();
@@ -485,7 +485,6 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         managed_rules(values.root, &home)?,
         values.managed.as_deref(),
     )?;
-    let quote = |value: &str| format!("'{}'", value.replace('\'', r"'\''"));
     let pairs: [(&str, String); 15] = [
         ("SOURCE", quote(&text(values.source)?)),
         ("BINARY", quote(BINARY)),
@@ -503,8 +502,12 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         ("MANAGED_PREVIOUS", quote(&managed.previous)),
         ("INTENT_KEY", quote(values.intent_key.unwrap_or_default())),
     ];
-    // Ein Durchgang über die Vorlage: Eingesetzte Werte werden nie erneut
-    // nach Platzhaltern durchsucht.
+    fill(template, &pairs)
+}
+
+/// Setzt die Werte in eine Vorlage ein — ein Durchgang: Eingesetzte Werte
+/// werden nie erneut nach Platzhaltern durchsucht.
+fn fill(template: &str, pairs: &[(&str, String)]) -> std::io::Result<String> {
     let mut out = String::with_capacity(template.len() + 4096);
     let mut rest = template;
     while let Some(start) = rest.find("{{") {
@@ -523,6 +526,11 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Ein Wert in einfachen Anführungszeichen für `sh`.
+fn quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// Ein Name aus Buchstaben, Ziffern, `.`, `_`, `-` — für Nutzer und Gruppe.
@@ -683,23 +691,7 @@ fn managed_plan(new_deny: Vec<String>, existing: Option<&str>) -> std::io::Resul
     // Vorschlag: Alte und neue Fassung stehen im Skript, und das ist unter
     // Linux ein einziges Argument (höchstens 128 KiB).
     let existing = existing.filter(|text| text.len() <= 32 * 1024);
-    let ours = existing.and_then(|text| {
-        let value: serde_json::Value = serde_json::from_str(text).ok()?;
-        let object = value.as_object()?;
-        let permissions = object.get("permissions")?.as_object()?;
-        if object.len() != 2
-            || object.get("$comment")?.as_str()? != MANAGED_MARKER
-            || permissions.len() != 1
-        {
-            return None;
-        }
-        permissions
-            .get("deny")?
-            .as_array()?
-            .iter()
-            .map(|rule| rule.as_str().map(str::to_owned))
-            .collect::<Option<Vec<String>>>()
-    });
+    let ours = existing.and_then(own_rules);
     match ours {
         Some(old) => {
             let mut deny: Vec<String> = old
@@ -721,6 +713,27 @@ fn managed_plan(new_deny: Vec<String>, existing: Option<&str>) -> std::io::Resul
             previous: String::new(),
         }),
     }
+}
+
+/// Die Deny-Regeln einer Managed-Settings-Datei, wenn sie eine eigene von
+/// minds ist: als JSON **genau** unsere Form (`$comment` mit unserer
+/// Kennung, `permissions.deny` als Liste von Zeichenketten, sonst nichts).
+fn own_rules(text: &str) -> Option<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let object = value.as_object()?;
+    let permissions = object.get("permissions")?.as_object()?;
+    if object.len() != 2
+        || object.get("$comment")?.as_str()? != MANAGED_MARKER
+        || permissions.len() != 1
+    {
+        return None;
+    }
+    permissions
+        .get("deny")?
+        .as_array()?
+        .iter()
+        .map(|rule| rule.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()
 }
 
 /// Die vorhandene Managed-Settings-Datei, gelesen als Entwickler (sie ist
@@ -890,12 +903,12 @@ fn witness_gid() -> Option<u32> {
 /// Führt das Skript mit der einen Erhöhung aus. Nur in Debug-Builds (Tests)
 /// ersetzt `MINDS_SUDO_STUB` das Programm; der Ersatz bekommt dieselben
 /// Argumente.
-fn elevate(script: &str) -> std::io::Result<std::process::Output> {
+fn elevate(script: &str, name: &str) -> std::io::Result<std::process::Output> {
     let program = elevation_program();
     // `-k`: Ein zwischengespeichertes Passwort zählt nicht, und es entsteht
     // keins — der Agent könnte es sonst in den nächsten Minuten nutzen.
     std::process::Command::new(program)
-        .args(["-k", "/bin/sh", "-c", script, "minds-protected-setup"])
+        .args(["-k", "/bin/sh", "-c", script, name])
         .stdin(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::piped())
@@ -1032,6 +1045,166 @@ pub(crate) fn stop_local_service(root: &Path) {
             ],
         );
     }
+}
+
+/// Die Dienstdatei des geschützten Witness für `root` (kanonisch).
+fn service_file_of(root: &Path) -> String {
+    let id = crate::enable_witness::repo_id(root);
+    if cfg!(target_os = "macos") {
+        format!("/Library/LaunchDaemons/dev.minds.witness.{id}.plist")
+    } else {
+        format!("/etc/systemd/system/minds-witness-{id}.service")
+    }
+}
+
+/// Ob für `root` ein geschützter Witness eingerichtet ist: Sein Home liegt
+/// am festen Ort (auch wenn es für diesen Nutzer verschlossen ist) oder
+/// seine Dienstdatei. Kein Urteil über Vertrauenswürdigkeit — nur, ob
+/// `disable` etwas zu tun hat.
+pub(crate) fn installed_for(root: &Path) -> bool {
+    let Ok(root) = root.canonicalize() else {
+        return false;
+    };
+    let home = match std::fs::symlink_metadata(home_of(&root)) {
+        Ok(_) => true,
+        Err(err) => err.kind() == std::io::ErrorKind::PermissionDenied,
+    };
+    home || Path::new(&service_file_of(&root)).exists()
+}
+
+/// Nimmt den geschützten Witness zurück — mit **einer** Erhöhung, über ein
+/// Skript, das minds erzeugt (`templates/witness/disable-*.sh`): Dienst
+/// anhalten und seine Datei entfernen, das Witness-Home, und die eigenen
+/// Regeln dieses Repos aus den Managed Settings (die Datei nur, wenn sie
+/// noch genau die ist, die minds eben gelesen hat; bleiben nur die
+/// allgemeinen Regeln, verschwindet sie). Mit `all` jeden geschützten
+/// Witness des Rechners, die Managed Settings und das root-eigene Binary.
+/// Gibt die Zeilen des Berichts zurück.
+pub(crate) fn uninstall(root: Option<&Path>, all: bool) -> std::io::Result<Vec<String>> {
+    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+        return Err(other(
+            "the protected witness exists on macOS and Linux only",
+        ));
+    }
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err(other(
+            "minds disable runs as root — run it as the developer; it asks for administrator \
+             rights itself",
+        ));
+    }
+    let root = root.map(Path::canonicalize).transpose()?;
+    let id = root
+        .as_deref()
+        .map(crate::enable_witness::repo_id)
+        .unwrap_or_default();
+    if !all && id.is_empty() {
+        return Err(other(
+            "no repository — pass --all to remove every protected witness",
+        ));
+    }
+    let home = root.as_deref().map(home_of);
+    let managed = managed_removal(
+        existing_managed().as_deref(),
+        all,
+        root.as_deref(),
+        home.as_deref(),
+    )?;
+    let text = |path: &Path| -> std::io::Result<String> {
+        let text = path
+            .to_str()
+            .ok_or_else(|| other(format!("{} is not valid UTF-8", path.display())))?;
+        if text.chars().any(char::is_control) {
+            return Err(other("a path contains control characters"));
+        }
+        Ok(text.to_owned())
+    };
+    let template = if cfg!(target_os = "macos") {
+        include_str!("../templates/witness/disable-macos.sh")
+    } else {
+        include_str!("../templates/witness/disable-linux.sh")
+    };
+    let (previous, next) = managed.unwrap_or_default();
+    let pairs: [(&str, String); 7] = [
+        ("BASE", quote(&text(&base())?)),
+        ("ID", quote(&id)),
+        ("ALL", quote(if all { "1" } else { "0" })),
+        ("BINARY", quote(BINARY)),
+        ("MANAGED_DIR", quote(MANAGED_DIR)),
+        ("MANAGED_PREVIOUS", quote(&previous)),
+        ("MANAGED_NEXT", quote(&next)),
+    ];
+    let script = fill(template, &pairs)?;
+    eprintln!(
+        "minds: removing the protected witness{} — you are asked for your password once",
+        if all { "es of this machine" } else { "" }
+    );
+    let output = elevate(&script, "minds-protected-disable")?;
+    let mut lines = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = crate::text::sanitize(line.trim());
+        if let Some(rest) = line.strip_prefix("MINDS-REMOVED ") {
+            let (what, path) = rest.split_once(' ').unwrap_or((rest, ""));
+            lines.push(match what {
+                "service" => format!("system service {path} removed"),
+                "home" => format!("witness home {path} removed"),
+                "binary" => format!("witness binary {path} removed"),
+                _ => format!("{what} {path} removed"),
+            });
+        } else if let Some(rest) = line.strip_prefix("MINDS-MANAGED ") {
+            let (what, path) = rest.split_once(' ').unwrap_or((rest, ""));
+            lines.push(format!("Claude Code managed settings {what} ({path})"));
+        } else if !line.is_empty() {
+            eprintln!("  {line}");
+        }
+    }
+    if !output.status.success() {
+        return Err(other(format!(
+            "the removal stopped ({}) — see the lines above",
+            output.status
+        )));
+    }
+    Ok(lines)
+}
+
+/// Was `disable` mit den Managed Settings tut: `None` — nichts (keine
+/// eigene Datei von minds, oder zu groß); sonst die gelesene Fassung und
+/// die nächste — leer heißt entfernen. Ohne `all` fallen die Regeln dieses
+/// Repos (sein `refs/minds`, sein Witness-Home) weg; bleiben nur noch
+/// Regeln ohne Pfad (die `Bash(…)`-Regeln), ist die Datei überflüssig.
+fn managed_removal(
+    existing: Option<&str>,
+    all: bool,
+    root: Option<&Path>,
+    home: Option<&Path>,
+) -> std::io::Result<Option<(String, String)>> {
+    let Some(existing) = existing.filter(|text| text.len() <= 32 * 1024) else {
+        return Ok(None);
+    };
+    let Some(rules) = own_rules(existing) else {
+        return Ok(None);
+    };
+    if all {
+        return Ok(Some((existing.to_owned(), String::new())));
+    }
+    let refs = root.map(|root| format!("{}/.git/refs/minds", root.display()));
+    let home = home.map(|home| home.display().to_string());
+    let remaining: Vec<String> = rules
+        .into_iter()
+        .filter(|rule| {
+            !(refs.as_deref().is_some_and(|refs| rule.contains(refs))
+                || home.as_deref().is_some_and(|home| rule.contains(home)))
+        })
+        .collect();
+    let next = if remaining
+        .iter()
+        .any(|rule| rule.starts_with("Read(") || rule.starts_with("Edit("))
+    {
+        render_managed(&remaining)?
+    } else {
+        String::new()
+    };
+    Ok(Some((existing.to_owned(), next)))
 }
 
 fn other(err: impl std::fmt::Display) -> std::io::Error {
@@ -1536,5 +1709,85 @@ mod tests {
             IntentKey::Unusable(path) => assert_eq!(path, missing.to_str().unwrap()),
             _ => panic!("expected the configured path"),
         }
+    }
+
+    /// `disable` nimmt nur die Regeln dieses Repos aus der eigenen
+    /// Managed-Settings-Datei; bleiben nur die `Bash(…)`-Regeln, geht die
+    /// Datei. `--all` nimmt sie immer; eine fremde Datei bleibt.
+    #[test]
+    fn disable_takes_only_this_repositorys_rules_out_of_the_managed_settings() {
+        let a = managed_rules(Path::new("/repo/a"), Path::new("/base/aaaa")).unwrap();
+        let b = managed_rules(Path::new("/repo/b"), Path::new("/base/bbbb")).unwrap();
+        let both = managed_plan(b.clone(), Some(&render_managed(&a).unwrap()))
+            .unwrap()
+            .content;
+        let (previous, next) = managed_removal(
+            Some(&both),
+            false,
+            Some(Path::new("/repo/a")),
+            Some(Path::new("/base/aaaa")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(previous, both);
+        assert_eq!(next, render_managed(&b).unwrap());
+        let (_, last) = managed_removal(
+            Some(&next),
+            false,
+            Some(Path::new("/repo/b")),
+            Some(Path::new("/base/bbbb")),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(last, "");
+        assert_eq!(
+            managed_removal(Some(&both), true, None, None).unwrap(),
+            Some((both.clone(), String::new()))
+        );
+        assert_eq!(
+            managed_removal(
+                Some("{\"permissions\":{\"deny\":[]}}"),
+                false,
+                Some(Path::new("/repo/a")),
+                None
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    /// Das Skript von `disable` setzt jeden Wert gequotet ein und ist
+    /// gültiges sh.
+    #[test]
+    fn the_disable_script_quotes_every_value_and_parses() {
+        let template = if cfg!(target_os = "macos") {
+            include_str!("../templates/witness/disable-macos.sh")
+        } else {
+            include_str!("../templates/witness/disable-linux.sh")
+        };
+        let pairs: [(&str, String); 7] = [
+            ("BASE", quote("/base")),
+            ("ID", quote("abcd")),
+            ("ALL", quote("0")),
+            ("BINARY", quote(BINARY)),
+            ("MANAGED_DIR", quote(MANAGED_DIR)),
+            ("MANAGED_PREVIOUS", quote("it's {\"a\": 1}")),
+            ("MANAGED_NEXT", quote("")),
+        ];
+        let script = fill(template, &pairs).unwrap();
+        assert!(
+            script.contains(r#"PREVIOUS='it'\''s {"a": 1}'"#),
+            "{script}"
+        );
+        assert!(!script.contains("{{"), "{script}");
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-n", "-c", &script])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

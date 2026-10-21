@@ -385,6 +385,29 @@ fn doctor_without_a_witness_warns() {
     assert!(line(&stdout, "witness").starts_with("warn"), "{stdout}");
 }
 
+/// Die Scope-Falle: Eine Agent-Konfiguration, die `enable` geschrieben hat
+/// und die niemand committet, ist `warn` — bis sie im Index liegt.
+#[test]
+fn doctor_warns_about_an_untracked_agent_config() {
+    let f = Fixture::new();
+    let out = f.minds(&["doctor"], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(
+        line(&stdout, "agent config"),
+        "warn  agent config: \".claude/settings.json\" untracked — commit it before binding a scope",
+        "{stdout}"
+    );
+    git(&f.root, &["add", ".claude/settings.json"]);
+    git(&f.root, &["commit", "-qm", "chore: minds hooks"]);
+    let out = f.minds(&["doctor"], &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        !stdout.lines().any(|line| line.contains("agent config:")),
+        "{stdout}"
+    );
+}
+
 /// Fehlende Git-Hooks sind `fail`.
 #[test]
 fn doctor_fails_on_missing_git_hooks() {

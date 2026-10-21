@@ -583,8 +583,10 @@ fn verify_commit(
                 &artifact,
                 &observations,
             ) {
-                ScopeState::Assessed(findings) => {
-                    outside.extend(findings.into_iter().map(|f| f.path));
+                // Tooling (`.claude/settings.json`, wie `enable` es schreibt)
+                // ist kein Pfad außerhalb — wie das Gate von `verify`.
+                ScopeState::Assessed { outside: found, .. } => {
+                    outside.extend(found.into_iter().map(|f| f.path));
                 }
                 ScopeState::NotAssessed(why) => return Ok(Err(why.word().to_owned())),
             }

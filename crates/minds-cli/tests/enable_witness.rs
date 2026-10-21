@@ -170,6 +170,28 @@ impl Fixture {
         .unwrap()
     }
 
+    /// Wie [`Self::minds`], mit weiteren Variablen.
+    fn minds_with(&self, args: &[&str], vars: &[(&str, &str)]) -> Output {
+        let mut cmd = Command::new(minds());
+        cmd.env("MINDS_WITNESS", "off")
+            .env_remove("MINDS_WITNESS_HOME")
+            .env_remove("MINDS_WITNESS_SOCKET")
+            .env("MINDS_PROTECTED_BASE", self.path("protected-base"));
+        for (key, value) in vars {
+            cmd.env(key, value);
+        }
+        cmd.current_dir(&self.root)
+            .args(args)
+            .env("HOME", self.path("user-home"))
+            .env("XDG_STATE_HOME", self.path("state"))
+            .env("XDG_CONFIG_HOME", self.path("config"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("NO_COLOR", "1")
+            .output()
+            .unwrap()
+    }
+
     /// Wie [`Self::minds`], aber mit der globalen Git-Konfiguration der
     /// Fixture (die `enable_default` beschreibt).
     fn minds_global(&self, args: &[&str]) -> Output {
@@ -1294,6 +1316,130 @@ fn enable_keeps_a_foreign_intent_key() {
     );
     let text = fs::read_to_string(f.path("config").join("minds/allowed_signers")).unwrap();
     assert_eq!(text.lines().count(), 1, "nur die Witness-Zeile: {text}");
+}
+
+/// `minds disable` nimmt zurück, was `enable` schrieb: die
+/// Agent-Registrierung (die Datei verschwindet, wenn sonst nichts darin
+/// stand), die Git-Hooks, Dienstdatei und Home des lokalen Witness — und
+/// hält den Nutzerdienst an.
+#[test]
+fn disable_takes_back_what_enable_set_up() {
+    let f = Fixture::new();
+    let manager = f.manager_stub("manager.sh", "");
+    let vars = [("MINDS_SERVICE_MANAGER_STUB", manager.to_str().unwrap())];
+    let out = f.enable_default_with("print", &vars);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(f.root.join(".claude/settings.json").is_file());
+    for hook in ["post-commit", "prepare-commit-msg", "pre-push"] {
+        assert!(f.root.join(".git/hooks").join(hook).is_file(), "{hook}");
+    }
+    assert!(f.service().is_file());
+    let home = f.home();
+    let out = f.minds_with(&["disable"], &vars);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", text(&out));
+    assert!(!f.root.join(".claude/settings.json").exists(), "{stdout}");
+    for hook in ["post-commit", "prepare-commit-msg", "pre-push"] {
+        assert!(
+            !f.root.join(".git/hooks").join(hook).exists(),
+            "{hook}: {stdout}"
+        );
+    }
+    assert!(!f.service().exists(), "{stdout}");
+    assert!(!home.exists(), "{stdout}");
+    for expected in [
+        ".claude/settings.json removed",
+        "post-commit removed",
+        "user service ",
+        "witness home ",
+    ] {
+        assert!(stdout.contains(expected), "{expected}: {stdout}");
+    }
+    let log = fs::read_to_string(f.path("manager.sh.log")).unwrap();
+    assert!(log.contains("bootout") || log.contains("disable"), "{log}");
+    // Noch einmal: nichts mehr zu tun, kein Fehler.
+    let again = f.minds_with(&["disable"], &vars);
+    assert!(again.status.success(), "{}", text(&again));
+    assert!(!f.root.join(".claude/settings.json").exists());
+}
+
+/// Fremdes bleibt: eine eigene Berechtigung und ein eigener Hook in
+/// `.claude/settings.json`, eigene Zeilen in einem Git-Hook.
+#[test]
+fn disable_keeps_foreign_entries() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.root.join(".claude")).unwrap();
+    fs::write(
+        f.root.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash(ls)"]},"hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo bye"}]}]}}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(f.root.join(".git/hooks")).unwrap();
+    fs::write(
+        f.root.join(".git/hooks/post-commit"),
+        "#!/bin/sh\necho mine\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        f.root.join(".git/hooks/post-commit"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let out = f.enable_default("off");
+    assert!(out.status.success(), "{}", text(&out));
+    let settings = fs::read_to_string(f.root.join(".claude/settings.json")).unwrap();
+    assert!(settings.contains("minds hook"), "{settings}");
+    let out = f.minds(&["disable"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let settings = fs::read_to_string(f.root.join(".claude/settings.json")).unwrap();
+    assert!(!settings.contains("minds hook"), "{settings}");
+    assert!(settings.contains("Bash(ls)"), "{settings}");
+    assert!(settings.contains("echo bye"), "{settings}");
+    let hook = fs::read_to_string(f.root.join(".git/hooks/post-commit")).unwrap();
+    assert!(hook.contains("echo mine"), "{hook}");
+    assert!(!hook.contains("minds"), "{hook}");
+    assert!(!f.root.join(".git/hooks/prepare-commit-msg").exists());
+}
+
+/// Ein geschützter Witness wird mit genau **einer** Erhöhung zurückgenommen:
+/// das Skript nennt Dienst und Home dieses Repos; `--all` räumt alles.
+#[test]
+fn disable_elevates_once_for_a_protected_witness() {
+    let f = Fixture::new();
+    let stub = elevation_stub(&f, "sudo.sh", 0);
+    let manager = f.manager_stub("manager.sh", "");
+    let id = f.repo_id();
+    // Das Home am festen Ort: `disable` sieht daran, dass es etwas zu tun hat.
+    fs::create_dir_all(f.path("protected-base").join(&id)).unwrap();
+    let vars = [
+        ("MINDS_SUDO_STUB", stub.to_str().unwrap()),
+        ("MINDS_SERVICE_MANAGER_STUB", manager.to_str().unwrap()),
+    ];
+    let out = f.minds_with(&["disable"], &vars);
+    assert!(out.status.success(), "{}", text(&out));
+    let args = fs::read_to_string(f.path("sudo.sh.args")).unwrap();
+    let args: Vec<&str> = args.split("\n----\n").filter(|a| !a.is_empty()).collect();
+    assert_eq!(args.len(), 5, "{args:?}");
+    assert_eq!(args[0], "-k");
+    assert_eq!(args[4], "minds-protected-disable");
+    let script = args[3];
+    assert!(script.contains(&format!("ID='{id}'")), "{script}");
+    assert!(script.contains("ALL='0'"), "{script}");
+    assert!(
+        script.contains("dev.minds.witness.$ID") || script.contains("minds-witness-$ID"),
+        "{script}"
+    );
+    assert!(!script.contains("{{"), "{script}");
+    let parsed = Command::new("/bin/sh")
+        .args(["-n", "-c", script])
+        .output()
+        .unwrap();
+    assert!(parsed.status.success(), "{}", text(&parsed));
+    fs::remove_file(f.path("sudo.sh.args")).unwrap();
+    let out = f.minds_with(&["disable", "--all"], &vars);
+    assert!(out.status.success(), "{}", text(&out));
+    let args = fs::read_to_string(f.path("sudo.sh.args")).unwrap();
+    assert!(args.contains("ALL='1'"), "{args}");
 }
 
 /// `MINDS_WITNESS=off` lässt den Witness weg; ein unbekannter Wert ist ein
