@@ -101,6 +101,8 @@ fi
 #    these paths, and you are now in the witness group): it may pass your
 #    directories above the repository (an ACL entry, search only) and list
 #    the root; the parts of .git it writes (prepared by you) move to its group.
+#    (minds does the same without sudo for every further repository —
+#    enable_protected::share_repo — once the service runs.)
 as_dev() { /usr/bin/sudo -u "$DEVUSER" "$@"; }
 dir=$(/usr/bin/dirname "$ROOT")
 while [ "$dir" != / ]; do
@@ -131,12 +133,14 @@ as_dev /usr/bin/find "$ROOT/.git/objects" "$ROOT/.git/refs" "$ROOT/.git/logs" -x
   || fail "the witness user cannot write $ROOT/.git"
 
 # 4. Its home: the base belongs to the witness, its group may only traverse
-#    it to the socket.
+#    it to the sockets. The service (step 5) adopts the home; a later
+#    repository is registered over the service's socket instead.
 root_dirs "$(/usr/bin/dirname "$BASE")"
 if [ -e "$BASE" ] || [ -L "$BASE" ]; then
   { [ -d "$BASE" ] && [ ! -L "$BASE" ]; } || fail "$BASE is not a plain directory"
 fi
 /usr/bin/install -d -o "$WUSER" -g "$WUSER" -m 0710 "$BASE"
+/usr/bin/install -d -o "$WUSER" -g "$WUSER" -m 0700 "$BASE/log"
 as_witness() {
   /usr/bin/sudo -u "$WUSER" /usr/bin/env -i HOME=/var/empty PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$ROOT" \
@@ -157,8 +161,16 @@ line=$(as_witness witness signers)
 [ -n "$line" ] || fail "the witness printed no signers line"
 echo "MINDS-SIGNERS $line"
 
-# 5. The system service, under the witness user.
+# 5. The system service — one per host, under the witness user: it runs a
+#    witness per home under the base and takes registrations. Services of
+#    earlier setups (one per repository) give way to it; their homes stay
+#    and the service adopts them. (Re)started so that it runs this binary.
 root_dir /Library/LaunchDaemons
+for old in /Library/LaunchDaemons/dev.minds.witness.*.plist; do
+  [ -e "$old" ] || continue
+  /bin/launchctl bootout "system/$(/usr/bin/basename "$old" .plist)" >/dev/null 2>&1 || true
+  /bin/rm -f "$old"
+done
 printf '%s\n' {{SERVICE_CONTENT}} > "$PLIST.minds-tmp"
 /usr/sbin/chown root:wheel "$PLIST.minds-tmp"
 /bin/chmod 0644 "$PLIST.minds-tmp"
@@ -171,9 +183,9 @@ until /bin/launchctl bootstrap system "$PLIST" 2>/dev/null; do
   /bin/sleep 0.3
 done
 
-# 6. Managed settings for Claude Code: deny rules only, and only if none
-#    exist; our own file from an earlier run (also another repository's) is
-#    merged. Its directory was checked first.
+# 6. Managed settings for Claude Code: deny rules only, machine-wide (no
+#    rule per repository), and only if none exist; our own file from an
+#    earlier run is merged. Its directory was checked first.
 tmp=$(/usr/bin/mktemp "$MDIR/.minds.XXXXXX")
 printf '%s\n' {{MANAGED_CONTENT}} > "$tmp"
 /bin/chmod 0644 "$tmp"

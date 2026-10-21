@@ -382,9 +382,9 @@ pub(crate) fn default(
     store: &minds_store::StoreConfig,
     mode: LocalMode,
     verbose: bool,
-) -> Option<String> {
+) -> std::io::Result<Option<String>> {
     if mode == LocalMode::Off {
-        return None;
+        return Ok(None);
     }
     #[cfg(unix)]
     if crate::hook::witness::socket_path().is_none() && mode != LocalMode::Print {
@@ -415,7 +415,7 @@ pub(crate) fn default(
                 }
                 // Seine Signer-Zeile steht seit der Einrichtung in der
                 // Vertrauensdatei; sein Home ist von hier nicht lesbar.
-                return None;
+                return Ok(None);
             }
             // Eingerichtet, aber stumm: Die Hooks fänden ihn zuerst und
             // schrieben dann ins lokale Journal — das soll man sehen.
@@ -429,6 +429,15 @@ pub(crate) fn default(
         }
         let protected = match mode {
             LocalMode::Protected => true,
+            // Läuft der Witness-Dienst des Rechners schon (mit diesem
+            // Binary), braucht ein weiteres Repo weder Rechte noch eine
+            // Rückfrage: Es meldet sich an.
+            LocalMode::Ask
+                if crate::enable_protected::host_running()
+                    && !crate::enable_protected::binary_differs() =>
+            {
+                true
+            }
             LocalMode::Ask => {
                 crate::enable_protected::interactive() && crate::enable_protected::ask()
             }
@@ -437,7 +446,18 @@ pub(crate) fn default(
         if protected {
             match crate::enable_protected::install(root, store, verbose) {
                 Ok(installed) => {
-                    return report_protected(&installed);
+                    return Ok(report_protected(&installed));
+                }
+                // Ausdrücklich verlangt (`MINDS_WITNESS=protected`): kein
+                // Rückfall — ein lokaler Witness daneben hieße A1 und ein
+                // halb eingerichteter geschützter, den `intent sign` stumm
+                // fände. Der Fehler steht, `enable` scheitert.
+                Err(err) if mode == LocalMode::Protected => {
+                    return Err(std::io::Error::other(format!(
+                        "protected witness not set up: {} — nothing else was set up; fix the \
+                         cause and rerun `MINDS_WITNESS=protected minds enable`",
+                        crate::text::sanitize(&err.to_string())
+                    )));
                 }
                 Err(err) => crate::text::warn(&format!(
                     "protected witness not set up: {} — setting up the unprotected witness \
@@ -451,7 +471,7 @@ pub(crate) fn default(
         LocalMode::Ask | LocalMode::Protected => LocalMode::On,
         mode => mode,
     };
-    local(root, store, mode, verbose)
+    Ok(local(root, store, mode, verbose))
 }
 
 /// Was nach der geschützten Einrichtung zu sagen ist: wo er läuft, die

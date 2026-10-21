@@ -46,14 +46,16 @@ the witness under its own user — the only setup that can reach A2:
    (`ssh-keygen -l` at creation), **not** with the `.pub` next to it — the Git config and that
    file are writable for the agent; a key pinned earlier is kept;
    afterwards `enable` prints `intent key at the witness: …`, computed by the witness user —
-   the line to compare), `keygen` and `signers` as that user; installs and starts a system service (`/Library/LaunchDaemons/dev.minds.witness.<repo-id>.plist`,
-   its stderr in `<witness home>/log/witness.err`,
-   or `/etc/systemd/system/minds-witness-<repo-id>.service` with `NoNewPrivileges`,
-   `ProtectSystem=strict`; umask 007); and writes Claude Code managed settings with deny rules
-   only (`minds witness`, `Edit` of `.git/refs/minds`, `Read`/`Edit` of the witness home — Claude
-   Code checks file access only against `Read(…)`/`Edit(…)`, and `Edit` covers every
-   file-writing tool; a file minds installed earlier, in exactly its own form, is merged — the
-   rules of other repositories stay and only accumulate; delete the file by hand to clean up) — only
+   the line to compare), `keygen` and `signers` as that user; installs and (re)starts **one
+   system service per host** (`/Library/LaunchDaemons/dev.minds.witness.plist`, its stderr in
+   `<base>/log/witness.err`, or `/etc/systemd/system/minds-witness.service` with
+   `NoNewPrivileges`; umask 007): `minds witness serve --base <base>` as the witness user runs
+   a witness per home under the base and adopts the home just created (services of earlier
+   setups, one per repository, are removed; their homes stay and are adopted); and writes
+   Claude Code managed settings with deny rules only, machine-wide (`minds witness`, `Read`/`Edit`
+   of the witness base, `Edit` of `.git/refs/minds/**` in any project — Claude Code checks file
+   access only against `Read(…)`/`Edit(…)`, and `Edit` covers every file-writing tool; a file
+   minds installed earlier, in exactly its own form, is merged; `minds disable` removes it) — only
    if no
    `managed-settings.json` exists or it is minds' own; any other file gets a
    `managed-settings.minds-proposed.json` next to it.
@@ -64,6 +66,17 @@ the witness under its own user — the only setup that can reach A2:
    is recorded in your trusted signers file (below); an auditor keeps it in a file of
    their own and passes that to `minds verify --signers`.
 
+**Every further repository needs no administrator rights.** When the host service runs (its
+base belongs to the witness user, root's chain above it, and `<base>/run/control.sock`
+answers) and runs this `minds` binary, `enable` shares the repository with the witness group
+as you (the ACL entries, group and modes of step 2, `enable_protected::share_repo`) and sends
+`register` over the socket — the group is enough to reach it; the service creates the home
+(`witness init --profile user --socket-group`, with your `minds.intentKey` when it is a
+security key), the key and the witness, and answers with the signers line, which `enable`
+records as usual. On Linux this works from your next login on (the group); before that, or
+with a newer binary (`MINDS_WITNESS=protected`), the `sudo` script runs again. `minds witness
+register --repo <root>` does the registration by hand.
+
 Hooks find the protected witness at its fixed place without `MINDS_WITNESS_SOCKET` — only if
 every directory above it belongs to root, its home to a user other than you, and the socket's
 peer is exactly that user. A later `enable` keeps a running protected witness and says so
@@ -72,7 +85,10 @@ when it runs another `minds` binary than the one you call (rerun with
 writes with umask 002 when it writes into the store under `.git` (`hook`, `checkpoint`,
 `sync`, `forget`, `import`, `intent`, `spec`, `review`, `sign`, `anchor`, `reinterpret` — not
 `enable` or exports), so what it creates stays writable for the witness group. No (or no
-terminal, or a failed setup) sets up the local witness below, with a warning. `minds
+terminal, or a failed setup) sets up the local witness below, with a warning — except with
+`MINDS_WITNESS=protected`, where a failed protected setup fails `enable` (nothing else is set up;
+a local witness next to a half-set-up protected one would be A1, and `intent sign` would find
+the protected one silent). `minds
 disable` takes it back again (below).
 
 **The trusted signers file and your intent key.** Every `enable` (unless
@@ -195,13 +211,16 @@ mark), the minds blocks of the Git hooks (a hook with only shebang and comments 
 disappears), the local witness (its user service is stopped and disabled, the service
 file and the witness home removed — only a home owned by you that pins this repository)
 and the protected witness of this repository: one `sudo` runs a script minds generates
-(`templates/witness/disable-*.sh`) that stops the system service and removes its file,
-removes the witness home under the protected base and takes this repository's rules
-(its `refs/minds`, its witness home) out of minds' own `managed-settings.json` — the
-file only if it is still exactly the one minds read a moment ago; when only the
-path-less `Bash(…)` rules remain, the file goes. `--all` removes every protected witness
-of this machine, the managed settings (if minds' own) and the root-owned binary
-(`/usr/local/libexec/minds/minds`); outside a repository it does only that. What
+(`templates/witness/disable-*.sh`) that asks the host service, as the witness user, to
+unregister the repository (`minds witness unregister`: witness stopped, home removed —
+without a running service root removes the home itself), removes a service of an earlier
+setup (one per repository) and, when no registered home is left, the host service itself,
+and takes this repository's rules of an earlier setup (its `refs/minds`, its witness home)
+out of minds' own `managed-settings.json` — the file only if it is still exactly the one
+minds read a moment ago; with the last repository the file goes. `--all` removes the host
+service, every service of earlier setups, the whole witness base, the managed settings (if
+minds' own) and the root-owned binary (`/usr/local/libexec/minds/minds`); outside a
+repository it does only that. What
 stays: the store (`refs/minds/*`) and the store config in `.git/config` — data, not
 setup, `minds show` keeps reading them —, the witness user and group, and the trusted
 signers file and intent key of your user (they serve every repository). Agents must
@@ -439,7 +458,20 @@ minds witness run --home /private/witness --follow
 minds witness status --home /private/witness
 ```
 
-The Unix-only daemon owns one repository. `init` creates a schema-version-2
+The Unix-only daemon owns one repository. The protected setup runs them under **one** host
+service (`minds witness serve --base <base>`, see `minds enable`): it runs `witness run
+--home <base>/<repo-id>` as a child process per home it finds under the base (rescanned every
+5 s), restarts one that exits (with backoff), and takes `Ping`, `Status` (`serving N
+repositories (M running)`, shown by `minds doctor` as `witness daemon`), `Register` and
+`Unregister` frames over `<base>/run/control.sock` (mode 0660, group of the witness).
+`minds witness register --repo <root> [--intent-key <pub>]` registers a repository whose
+`.git` the witness user can already write (it is shared with the witness group by `enable`):
+the service runs `init` (profile `user`, socket group, idempotent) and `keygen`, starts the
+witness and prints `registered|running|restarted <id>`, `signers <line>`, `socket <path>`,
+`answering yes|no` and the pinned intent key. `minds witness unregister --repo <root>` stops
+the witness and removes its home — accepted only when the peer is the witness user (so an
+agent under your user ID cannot delete a journal before its seal); `minds disable` runs it
+elevated. `init` creates a schema-version-2
 `witness.json` and private journal, epoch, key, ledger, log and runtime directories.
 Without `--profile`, omitting `--path-map` selects `user` and a map selects
 `container`; `container` requires a map, `user` and `managed` refuse one, and

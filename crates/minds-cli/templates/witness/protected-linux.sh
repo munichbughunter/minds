@@ -78,6 +78,9 @@ usermod -aG "$WUSER" "$DEVUSER"
 #    these paths; sudo -u gives you the new group at once): it may pass your
 #    directories above the repository (an ACL entry, search only) and list
 #    the root; the parts of .git it writes (prepared by you) move to its group.
+#    (minds does the same without sudo for every further repository —
+#    enable_protected::share_repo — once the service runs and your login
+#    carries the group.)
 command -v setfacl >/dev/null || fail "setfacl is missing — install the acl package"
 as_dev() { sudo -u "$DEVUSER" "$@"; }
 dir=$(dirname "$ROOT")
@@ -104,12 +107,14 @@ sudo -u "$WUSER" test -w "$ROOT/.git" -a -w "$ROOT/.git/objects" -a -w "$ROOT/.g
   || fail "the witness user cannot write $ROOT/.git"
 
 # 4. Its home: the base belongs to the witness, its group may only traverse
-#    it to the socket.
+#    it to the sockets. The service (step 5) adopts the home; a later
+#    repository is registered over the service's socket instead.
 root_dirs "$(dirname "$BASE")"
 if [ -e "$BASE" ] || [ -L "$BASE" ]; then
   { [ -d "$BASE" ] && [ ! -L "$BASE" ]; } || fail "$BASE is not a plain directory"
 fi
 install -d -o "$WUSER" -g "$WUSER" -m 0710 "$BASE"
+install -d -o "$WUSER" -g "$WUSER" -m 0700 "$BASE/log"
 as_witness() {
   sudo -u "$WUSER" env -i HOME=/nonexistent PATH=/usr/bin:/bin:/usr/sbin:/sbin \
     GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$ROOT" \
@@ -130,8 +135,16 @@ line=$(as_witness witness signers)
 [ -n "$line" ] || fail "the witness printed no signers line"
 echo "MINDS-SIGNERS $line"
 
-# 5. The system service, under the witness user.
+# 5. The system service — one per host, under the witness user: it runs a
+#    witness per home under the base and takes registrations. Units of
+#    earlier setups (one per repository) give way to it; their homes stay
+#    and the service adopts them. Restarted so that it runs this binary.
 root_dir /etc/systemd/system
+for old in /etc/systemd/system/minds-witness-*.service; do
+  [ -e "$old" ] || continue
+  systemctl disable --now "$(basename "$old")" >/dev/null 2>&1 || true
+  rm -f "$old"
+done
 printf '%s\n' {{SERVICE_CONTENT}} > "$UNIT_FILE.minds-tmp"
 chown root:root "$UNIT_FILE.minds-tmp"
 chmod 0644 "$UNIT_FILE.minds-tmp"
@@ -141,9 +154,9 @@ systemctl enable "$UNIT" >/dev/null
 systemctl restart "$UNIT"
 echo "MINDS-NOTE log out and back in once — your membership in $WUSER takes effect with your next login"
 
-# 6. Managed settings for Claude Code: deny rules only, and only if none
-#    exist; our own file from an earlier run (also another repository's) is
-#    merged. Its directory was checked first.
+# 6. Managed settings for Claude Code: deny rules only, machine-wide (no
+#    rule per repository), and only if none exist; our own file from an
+#    earlier run is merged. Its directory was checked first.
 tmp=$(mktemp "$MDIR/.minds.XXXXXX")
 printf '%s\n' {{MANAGED_CONTENT}} > "$tmp"
 chmod 0644 "$tmp"

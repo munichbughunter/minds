@@ -1777,10 +1777,10 @@ fn enable_sets_up_the_protected_witness_with_one_elevation() {
     );
 }
 
-/// Scheitert die Erhöhung (falsches Passwort, abgebrochen), bleibt es beim
-/// ungeschützten Witness — mit Warnung.
+/// Scheitert die Erhöhung (falsches Passwort, abgebrochen) bei ausdrücklich
+/// verlangtem Schutz, scheitert `enable` — kein lokaler Witness daneben.
 #[test]
-fn enable_falls_back_when_the_elevation_fails() {
+fn enable_fails_when_the_requested_protected_setup_fails() {
     let f = Fixture::new();
     let stub = elevation_stub(&f, "sudo.sh", 1);
     let manager = f.manager_stub("manager.sh", "");
@@ -1795,12 +1795,20 @@ fn enable_falls_back_when_the_elevation_fails() {
             ),
         ],
     );
-    assert!(out.status.success(), "{}", text(&out));
+    assert!(!out.status.success(), "{}", text(&out));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("the protected setup stopped"), "{stderr}");
     assert!(
-        stderr.contains("setting up the unprotected witness instead"),
+        stderr.contains("nothing else was set up; fix the cause and rerun"),
         "{stderr}"
+    );
+    assert!(
+        !stderr.contains("setting up the unprotected witness instead"),
+        "{stderr}"
+    );
+    assert!(
+        !f.path("state").join("minds-witness").exists(),
+        "kein lokaler Witness daneben"
     );
 }
 

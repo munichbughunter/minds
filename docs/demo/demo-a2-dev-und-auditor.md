@@ -75,11 +75,17 @@ neu an, dann nur mit dem Demo-Repo.
 sh ~/dev/minds/docs/demo/bootstrap-demo-a2.sh
 ```
 
+(Ein zweiter Durchlauf: `DEMO_RESET=1 sh …/bootstrap-demo-a2.sh` — nimmt mit
+`minds disable` die Einrichtung des alten Demo-Repos zurück, löscht Repo und
+Remote und legt alles neu an; nichts von Hand.)
+
 Legt `~/dev/minds-demo-a2` an: ein Python-Projekt (uv, pytest als Dev-Abhängigkeit,
 `uv.lock` schon committet, damit der Agent später nur `src/` und `tests/`
 anfasst), die Anforderung `anforderung/LOG-2417.md` mit sechs
 Akzeptanzkriterien, von denen AC5 (stabil) und AC6 (nach Schweregrad) sich
-widersprechen, ein Commit `chore: Projektgerüst und Anforderung LOG-2417`, das
+widersprechen, die Hook-Registrierung `.claude/settings.json` (`minds enable`
+ohne Witness, damit sie im Gerüst-Commit liegt und nicht im Commit des
+Agenten), ein Commit `chore: Projektgerüst und Anforderung LOG-2417`, das
 Bare-Remote und `~/audit/trust/`.
 
 Der Pfad ist neu: unter `~/.claude/projects/` liegen noch Transkripte der alten
@@ -116,13 +122,14 @@ minds doctor
 Erwartet von `minds doctor` (noch nichts eingerichtet):
 
 ```text
-fail  agent hooks: ".claude/settings.json" carries no minds registration — no event is captured — `minds enable`
-fail  git hooks: post-commit, prepare-commit-msg are missing in ".git/hooks"
+ok    agent hooks: registered for claude-code
+ok    git hooks: installed in ".git/hooks"
 ok    store: in-repo, refs/minds/context
 warn  witness: not configured — sessions are recorded as A1 (`minds enable` sets up a local witness)
 ```
 
-**Was man sieht:** ein gewöhnliches Repo, nichts aufgezeichnet.
+**Was man sieht:** die Hooks stehen (aus dem Gerüst), aber kein Witness —
+nichts wird bezeugt.
 
 ### 1.2 Repo scharf schalten, Witness geschützt einrichten
 
@@ -134,7 +141,8 @@ MINDS_WITNESS=protected minds enable --agent claude-code
 
 (Ohne die Variable fragt `enable` auf dem Terminal `Set up the witness protected
 (administrator rights, once)? [Y/n]`, Enter heißt ja. Mit der Variable läuft es
-ohne Rückfrage und tauscht auch das alte Witness-Binary aus.)
+ohne Rückfrage, tauscht auch das alte Witness-Binary aus und bricht ab, statt
+auf den lokalen Witness zurückzufallen, wenn die Einrichtung scheitert.)
 
 Ablauf und erwartete Zeilen (sinngemäß):
 
@@ -154,8 +162,12 @@ minds: minds.signers set to ~/.config/minds/allowed_signers — minds verify and
 Was das eine `sudo` tut: Binary root-eigen kopieren, Nutzer und Gruppe `_minds`
 anlegen (Mitglieder: `_minds` und `pd`), `.git/objects`, `refs/`, `logs/` dieser
 Gruppe geben, Witness-Home unter `/private/var/db/minds-witness/<repo-id>`
-anlegen, Schlüssel erzeugen, LaunchDaemon `dev.minds.witness.<repo-id>` starten,
-Managed Settings mit Deny-Regeln schreiben.
+anlegen, Schlüssel erzeugen, den **einen** LaunchDaemon `dev.minds.witness`
+des Rechners (neu) starten — er hält je Repo einen Witness —, Managed Settings
+mit Deny-Regeln schreiben (rechnerweit, keine Regel je Repo).
+
+Das war das einzige `sudo` der Demo: Jedes weitere Repo meldet `minds enable`
+beim laufenden Dienst an, ohne Passwort (Anhang D).
 
 Die Vertrauensdatei des Entwicklers ist damit vollständig — nichts kopieren:
 
@@ -185,29 +197,25 @@ Erwartet:
 
 ```text
 ok    agent hooks: registered for claude-code
-warn  agent config: ".claude/settings.json" untracked — commit it before binding a scope
 ok    git hooks: installed in ".git/hooks"
 ok    store: in-repo, refs/minds/context
+ok    witness daemon: dev.minds.witness (one per host), serving 1 repositories (1 running)
 ok    witness: protected, runs as _minds, answers ping
 ok    witness home: not readable for you (permission denied)
+ok    witness observer: watching /Users/pd/dev/minds-demo-a2 · 0 frames · last none
 ```
 
 `permission denied` ist hier der Beleg, nicht der Fehler: Der Witness ist vom
 Entwickler getrennt.
 
-Die Warnung `agent config` ist die Scope-Falle: `.claude/settings.json` hat
-`enable` eben geschrieben; bliebe sie uncommittet, läge sie im Commit des
-Agenten — außerhalb des Bereichs `src/**,tests/**`. Also jetzt committen,
-vor dem Binden:
-
-```sh
-git add .claude/settings.json && git commit -qm "chore: minds hooks"
-minds doctor      # ohne die Warnung
-```
-
-(Vergisst man es, zeigt `verify` die Datei später als `tooling … (written by
-minds enable; commit, claim)` statt `out of scope`, und `--require-in-scope`
-scheitert nicht daran — solange der Agent nichts hineinschreibt.)
+Keine Warnung `agent config`: `.claude/settings.json` liegt schon im
+Gerüst-Commit. In einem Repo, in dem `enable` die Datei neu anlegt, warnt
+`doctor` mit `".claude/settings.json" untracked — commit it before binding a
+scope` — die Scope-Falle: uncommittet läge die Datei im Commit des Agenten,
+außerhalb des Bereichs `src/**,tests/**`. (`verify` zeigt sie dann als
+`tooling … (written by minds enable; commit, claim)` statt `out of scope`, und
+`--require-in-scope` scheitert nicht daran — solange der Agent nichts
+hineinschreibt.)
 
 Beleg, dass der Agent nicht an den Witness kommt (die Zeile aus dem Loom-Drehbuch):
 
@@ -418,6 +426,7 @@ Grund; die häufigsten in der Demo:
 | `the session's end` unter `Not proven` (`--limits`: `Not that the session has ended …`) | Commit ohne `/exit` — kein Fehler | Nichts; die Session darf offen bleiben, A2 steht |
 | `intent not bound` / `intent not proven from session start` | `intent sign` nach dem Start von `claude` | Reihenfolge 1.3 → 1.4 → 1.5 |
 | `witness signature not checked — no trusted allowed_signers` | keine Vertrauensdatei (`Signers`-Zeile fehlt) | `minds enable` erneut, oder `--signers` |
+| `no file-system observation window covering the session` | Der Witness wurde **während** der Session (neu) gestartet — seine erste Epoche begann nach dem ersten Event | Nichts; die nächste Session hat ihr Fenster (ein Witness, der vor dem ersten Event lief, reicht — auch Sekunden davor) |
 | `witness isolation not proven` | Signer-Zeile trägt `minds-witness@` statt `minds-witness-user@` | die Zeile aus der `enable`-Ausgabe nehmen, nicht die eines lokalen Witness |
 | Exit 2, `out of scope` | Agent hat README/pyproject angefasst | ohne `--require-in-scope` zeigen und den Befund erklären |
 
@@ -687,7 +696,8 @@ Auditor  clone + fetch refs/minds/* → trust file → verify --require-… → 
 | Store | `refs/minds/context`, `refs/minds/evidence/*`, `refs/minds/intents/*` | ja, lesend; schreibt der Witness |
 | Witness-Home (Journal, Schlüssel, Socket) | `/private/var/db/minds-witness/<repo-id>` | nein (`_minds`) |
 | Witness-Binary | `/usr/local/libexec/minds/minds` | lesen ja, schreiben nein (root) |
-| Dienst | `/Library/LaunchDaemons/dev.minds.witness.<repo-id>.plist` | lesen |
+| Dienst (einer je Rechner, ein Witness je Repo) | `/Library/LaunchDaemons/dev.minds.witness.plist` | lesen |
+| Steuer-Socket des Dienstes | `/private/var/db/minds-witness/run/control.sock` | ja (Gruppe `_minds`): anmelden |
 | Managed Settings | `/Library/Application Support/ClaudeCode/managed-settings.json` | lesen |
 | Vertrauensdatei (Dev) | `~/.config/minds/allowed_signers` (`minds.signers`) | ja (Agent auch) |
 | Intent-Schlüssel (Dev) | `~/.config/minds/intent_ed25519` (`minds.intentKey`) | ja (Agent auch) |
@@ -704,5 +714,31 @@ rm -rf ~/dev/minds-demo-a2 ~/dev/minds-demo-a2-remote.git ~/audit
 (`minds disable --all` räumt jeden geschützten Witness des Rechners ab.
 Vertrauensdatei und Intent-Schlüssel unter `~/.config/minds` bleiben — sie
 gelten für alle Repos.)
+
+### D · Ein zweites Repo (kein Passwort)
+
+Läuft der Dienst, braucht ein weiteres Repo keine Erhöhung mehr:
+
+```sh
+mkdir ~/dev/zweites && cd ~/dev/zweites && git init -q && git commit -qm init --allow-empty
+minds enable --agent claude-code
+```
+
+Erwartet (sinngemäß):
+
+```text
+minds: registering this repository with the witness daemon (dev.minds.witness, user _minds) — no administrator rights needed
+minds: protected witness running for this repository (user _minds, socket "/private/var/db/minds-witness/<repo-id>/run/witness.sock")
+minds: witness signers line — it vouches that this witness runs separated …
+  minds-witness-user@patrick namespaces="minds-witness" ssh-ed25519 AAAA…
+```
+
+`enable` teilt das Repo selbst mit der Gruppe `_minds` (ACL-Einträge,
+Gruppe und Modi unter `.git`) und meldet es über
+`/private/var/db/minds-witness/run/control.sock` an; der Dienst legt Home und
+Schlüssel an und startet den Witness. Derselbe Witness-Schlüssel wie in 1.2
+(ein Schlüssel je Repo — hier ein neuer, die Zeile landet wieder in der
+Vertrauensdatei). `minds doctor` zeigt `ok witness daemon: dev.minds.witness
+(one per host), serving 2 repositories (2 running)`.
 
 Nutzer und Gruppe `_minds` dürfen bleiben; die nächste Demo nutzt sie wieder.

@@ -229,6 +229,27 @@ fn witness_checks(root: Option<&Path>, probe_home: Option<&Path>, checks: &mut V
                     .is_err_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
             })
         && crate::enable_protected::membership_pending();
+    // Der Witness-Dienst des Rechners (einer für alle Repos): antwortet er?
+    let host = crate::enable_protected::host_socket();
+    if std::fs::symlink_metadata(&host).is_ok_and(|meta| {
+        use std::os::unix::fs::FileTypeExt;
+        meta.file_type().is_socket()
+    }) {
+        let service = crate::enable_protected::HOST_SERVICE;
+        checks.push(match crate::witness_cmd::host_status(&host) {
+            Some(Ok(status)) => Check::new(
+                Status::Ok,
+                "witness daemon",
+                format!("{service} (one per host), {status}"),
+            ),
+            Some(Err(reason)) => Check::new(Status::Fail, "witness daemon", reason),
+            None => Check::new(
+                Status::Fail,
+                "witness daemon",
+                format!("{service} does not answer — check its system service"),
+            ),
+        });
+    }
     if socket.is_some() || probe_home.is_some() {
         agent_side(socket.as_deref(), probe_home, default_home, checks);
     } else if let Some((socket, _)) = protected {

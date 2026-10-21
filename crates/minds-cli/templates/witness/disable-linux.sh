@@ -2,13 +2,19 @@
 # Every value below was quoted by minds. Root touches only its own places
 # (system units, the witness base, the managed settings) and removes
 # nothing it did not install: the managed settings only if they are still
-# exactly the file minds read a moment ago.
+# exactly the file minds read a moment ago. A repository's witness is
+# stopped and its home removed by the witness service itself, asked as the
+# witness user — the agent, who shares the developer's user ID, cannot ask
+# that.
 set -eu
 umask 022
 BASE={{BASE}}
 ID={{ID}}
+ROOT={{ROOT}}
 ALL={{ALL}}
 BIN={{BINARY}}
+WUSER={{WUSER}}
+HOST={{HOST_SERVICE}}
 MDIR={{MANAGED_DIR}}
 PREVIOUS={{MANAGED_PREVIOUS}}
 NEXT={{MANAGED_NEXT}}
@@ -24,9 +30,13 @@ remove_service() {
     echo "MINDS-REMOVED service $1"
   fi
 }
+as_witness() {
+  sudo -u "$WUSER" env -i HOME=/nonexistent PATH=/usr/bin:/bin "$BIN" "$@"
+}
 
 if [ "$ALL" = 1 ]; then
-  for unit in /etc/systemd/system/minds-witness*.service; do
+  remove_service "$HOST"
+  for unit in /etc/systemd/system/minds-witness-*.service; do
     [ -e "$unit" ] || continue
     remove_service "$(basename "$unit")"
   done
@@ -39,10 +49,25 @@ if [ "$ALL" = 1 ]; then
     echo "MINDS-REMOVED binary $BIN"
   fi
 else
-  remove_service "minds-witness-$ID.service"
-  if plain_dir "$BASE/$ID"; then
-    rm -rf "$BASE/$ID"
+  # The service stops this repository's witness and removes its home; without
+  # a running service, root removes the home itself.
+  if [ -n "$ROOT" ] && [ -S "$BASE/run/control.sock" ] \
+     && as_witness witness unregister --repo "$ROOT" >/dev/null 2>&1; then
     echo "MINDS-REMOVED home $BASE/$ID"
+  else
+    # A unit of an earlier setup (one per repository) — stopped before its
+    # home goes.
+    remove_service "minds-witness-$ID.service"
+    if plain_dir "$BASE/$ID"; then
+      rm -rf "$BASE/$ID" || rm -rf "$BASE/$ID"
+      echo "MINDS-REMOVED home $BASE/$ID"
+    fi
+  fi
+  remove_service "minds-witness-$ID.service"
+  # The last repository takes the host service and the managed settings with it.
+  if ! ls "$BASE"/*/witness.json >/dev/null 2>&1; then
+    remove_service "$HOST"
+    NEXT=""
   fi
 fi
 systemctl daemon-reload

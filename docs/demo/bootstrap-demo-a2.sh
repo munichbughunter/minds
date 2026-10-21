@@ -3,17 +3,30 @@
 #   - ein neues Git-Repo mit Projektgerüst (Python/uv) und der Anforderung LOG-2417
 #   - ein lokales Bare-Repo als "Forge" (kein Netz nötig)
 #   - ein Verzeichnis für die Vertrauensdatei des Auditors
-# Pfade über Umgebungsvariablen änderbar; bestehende Verzeichnisse werden nie angefasst.
+# Pfade über Umgebungsvariablen änderbar. Bestehende Verzeichnisse werden nur mit
+# DEMO_RESET=1 angefasst: Dann nimmt `minds disable` die Einrichtung des alten
+# Demo-Repos zurück (Hooks, Witness; beim geschützten einmal sudo), und Repo und
+# Remote werden gelöscht — ein wiederholter Durchlauf braucht kein Aufräumen von Hand.
 set -eu
 
 DEMO_ROOT="${DEMO_ROOT:-$HOME/dev/minds-demo-a2}"
 DEMO_REMOTE="${DEMO_REMOTE:-$HOME/dev/minds-demo-a2-remote.git}"
 TRUST_DIR="${TRUST_DIR:-$HOME/audit/trust}"
+DEMO_RESET="${DEMO_RESET:-0}"
 
 for p in "$DEMO_ROOT" "$DEMO_REMOTE"; do
   if [ -e "$p" ]; then
-    echo "bootstrap: $p existiert schon — bitte einen anderen Pfad wählen oder löschen" >&2
-    exit 1
+    if [ "$DEMO_RESET" = 1 ]; then
+      if [ -d "$p/.git" ] && command -v minds >/dev/null; then
+        echo "bootstrap: minds disable in $p"
+        (cd "$p" && minds disable) || true
+      fi
+      rm -rf "$p"
+      echo "bootstrap: $p entfernt"
+    else
+      echo "bootstrap: $p existiert schon — DEMO_RESET=1 räumt es ab (minds disable, dann löschen), oder einen anderen Pfad wählen" >&2
+      exit 1
+    fi
   fi
 done
 command -v uv >/dev/null || { echo "bootstrap: uv fehlt" >&2; exit 1; }
@@ -107,6 +120,11 @@ treffen.
 MD
 
 uv sync -q
+# Die Hook-Registrierung des Agenten gehört ins Gerüst: Nur die Hooks und die
+# Git-Hooks (kein Witness, keine Rückfrage) — so liegt .claude/settings.json
+# im ersten Commit, und `minds doctor` ist nach `minds enable` sofort ohne
+# Warnung. Den Witness richtet `minds enable` in Schritt 1.2 ein.
+MINDS_WITNESS=off minds enable --agent claude-code
 git add -A
 git commit -q -m "chore: Projektgerüst und Anforderung LOG-2417"
 

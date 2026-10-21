@@ -103,16 +103,21 @@ Usage:
         opencode, all.
         Without --witness it always sets up a witness for the repo. On
         a terminal it asks once whether to set it up protected
-        (administrator rights, once): its own user, a root-owned binary,
-        a system service, deny-only Claude Code managed settings (only
-        if none exist) — the only setup that can reach A2. Otherwise
+        (administrator rights, once per machine): its own user, a
+        root-owned binary, one system service per host that runs a
+        witness per repository, deny-only Claude Code managed settings
+        (only if none exist) — the only setup that can reach A2. Every
+        further repository registers with the running service without
+        administrator rights (the repository is shared with the witness
+        group as you). Otherwise
         (no, no terminal, or a failed setup) profile local: same user
         ID, witness home + key, a user service, with a warning that it
         runs unprotected (A1). Hooks find either at its default socket.
         MINDS_WITNESS=protected sets up the protected one without
-        asking, =local (or on) the local one, =print prints its start
-        command, =off skips the witness. A failure is a warning, never
-        a failed enable.
+        asking — and fails enable when that setup fails (no local
+        witness instead); =local (or on) the local one, =print prints
+        its start command, =off skips the witness. Otherwise a witness
+        failure is a warning, never a failed enable.
         --child-repo puts the context into a separate repo instead of
         in-repo; it is created (bare) or cloned from --child-remote.
         --recall (Claude Code): SessionStart hook that puts the context
@@ -165,6 +170,19 @@ Usage:
         Home: --home, MINDS_WITNESS_HOME, or the repository's XDG state path.
   minds witness signers [--home <directory>]
         Prints the allowed_signers line of the existing witness key.
+  minds witness serve [--base <directory>]
+        The witness service of the host (run as the witness user by the
+        system service minds enable installs): runs a witness per home
+        under the base, adopts homes that appear, and takes
+        registrations over <base>/run/control.sock (witness group).
+  minds witness register --repo <root> [--intent-key <pub>]
+        Registers a repository with the running service (witness home,
+        key, witness); prints state, signers line and socket. The
+        repository must already be shared with the witness group
+        (minds enable does both).
+  minds witness unregister --repo <root>
+        Stops the repository's witness and removes its home — accepted
+        from the witness user only (minds disable runs it elevated).
 
   minds show [<commit>] [--full]
         Shows intent and attribution of the session(s) behind a commit
@@ -563,6 +581,7 @@ const SPECS: &[Spec] = &[
             "--policy-rev",
             "--intent-key",
             "--replace-intent-key",
+            "--base",
         ],
         &["--follow"],
         1,

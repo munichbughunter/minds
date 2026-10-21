@@ -28,6 +28,18 @@
 //!    dieses Repos anhalten (die Hooks finden ab jetzt den geschützten), die
 //!    Signer-Zeile ausgeben.
 //!
+//! **Ein Witness-Dienst je Rechner.** Der Systemdienst ist einer
+//! ([`HOST_SERVICE`]): `minds witness serve --base <base>` als Witness-Nutzer
+//! hält je Repo einen Witness als Kindprozess und nimmt über
+//! `<base>/run/control.sock` (Gruppe des Witness) Registrierungen an.
+//! Läuft er schon — und mit diesem Binary —, braucht jedes weitere Repo
+//! keine Erhöhung ([`host_running`]): `enable` teilt das Repo als
+//! Entwickler mit der Gruppe ([`share_repo`]) und meldet es an
+//! ([`register_with_host`]); der Dienst richtet das Home ein und startet
+//! den Witness. Die Managed Settings gelten rechnerweit (keine Regel je
+//! Repo). Das Skript mit `sudo` bleibt für den ersten Lauf und für ein
+//! neues Binary.
+//!
 //! Die Hooks finden den geschützten Witness ohne Variable ([`discover`]):
 //! am festen Ort unter [`base`], nur wenn dessen Verzeichniskette root
 //! gehört und das Home einem anderen Nutzer als dem Agenten — und beim
@@ -56,6 +68,12 @@ const MANAGED_DIR: &str = "/Library/Application Support/ClaudeCode";
 #[cfg(not(target_os = "macos"))]
 const MANAGED_DIR: &str = "/etc/claude-code";
 
+/// Der Systemdienst des Witness — einer je Rechner.
+#[cfg(target_os = "macos")]
+pub(crate) const HOST_SERVICE: &str = "dev.minds.witness";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const HOST_SERVICE: &str = "minds-witness.service";
+
 /// Das Programm für die eine Erhöhung.
 const ELEVATE: &str = "/usr/bin/sudo";
 
@@ -78,6 +96,37 @@ pub(crate) fn base() -> PathBuf {
 /// Das Home des geschützten Witness für `root` (kanonisch).
 pub(crate) fn home_of(root: &Path) -> PathBuf {
     base().join(crate::enable_witness::repo_id(root))
+}
+
+/// Der Steuer-Socket des Witness-Dienstes des Rechners.
+pub(crate) fn host_socket() -> PathBuf {
+    base().join(crate::witness_cmd::HOST_SOCKET)
+}
+
+/// Ob der Witness-Dienst des Rechners läuft: Die Basis liegt an einem
+/// vertrauenswürdigen Ort (Kette root, die Basis dem Witness-Nutzer — nicht
+/// dem Agenten, nicht root — und für niemanden sonst beschreibbar), und
+/// sein Socket antwortet.
+pub(crate) fn host_running() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(witness) = witness_uid() else {
+        return false;
+    };
+    let base = base();
+    let Ok(meta) = std::fs::symlink_metadata(&base) else {
+        return false;
+    };
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    let place = Place {
+        chain: base.parent().is_some_and(root_chain),
+        base_dir: meta.is_dir(),
+        base_uid: meta.uid(),
+        base_mode: meta.mode(),
+        home_dir: true,
+        home_uid: meta.uid(),
+    };
+    place.trusted(euid, witness) && crate::witness_cmd::ping(&host_socket())
 }
 
 /// Was die Einrichtung ergab.
@@ -125,7 +174,7 @@ pub(crate) fn interactive() -> bool {
 }
 
 /// Die Kennung des Witness-Nutzers, falls es ihn gibt.
-fn witness_uid() -> Option<u32> {
+pub(crate) fn witness_uid() -> Option<u32> {
     let name = std::ffi::CString::new(WITNESS_USER).ok()?;
     // SAFETY: `name` ist NUL-terminiert; getpwnam liefert NULL oder einen
     // Zeiger auf eine statische Struktur, aus der sofort kopiert wird.
@@ -292,6 +341,18 @@ pub(crate) fn install(
     let user = developer()?;
     prepare_repo(&root, verbose)?;
     let intent_key = intent_key(&root);
+    // Ein Witness-Dienst je Rechner: Läuft er schon, und mit diesem Binary,
+    // braucht ein weiteres Repo keine Erhöhung.
+    if host_running() && !binary_differs() {
+        match register_with_host(&root, &intent_key, verbose) {
+            Ok(installed) => return Ok(installed),
+            Err(err) => eprintln!(
+                "minds: registering with the running witness daemon did not work ({}) — \
+                 setting up with administrator rights instead",
+                crate::text::sanitize(&err.to_string())
+            ),
+        }
+    }
     let script = script(&Values {
         source: &source,
         root: &root,
@@ -307,31 +368,7 @@ pub(crate) fn install(
         "minds: setting up the protected witness — it runs as {WITNESS_USER} from {BINARY}; \
          you are asked for your password once"
     );
-    // Der volle Fingerabdruck, mit einem `ssh-keygen` außerhalb von allem,
-    // was der Agent ablegen kann. Vergleichen mit dem des eigenen
-    // Sicherheitsschlüssels — nicht mit der `.pub` daneben: Die und
-    // `user.signingkey` kann der Agent geschrieben haben.
-    match &intent_key {
-        IntentKey::Key(key) => {
-            let shown = crate::verify_cmd::conformance::spec_program(&root)
-                .map(|program| crate::witness_cmd::key_display_with(&program, key))
-                .unwrap_or_else(|| "(fingerprint unavailable)".to_owned());
-            eprintln!(
-                "  intent key (from minds.intentKey): {} — once pinned, a touch of it activates \
-                 an intent at the witness. Compare this fingerprint with your security key's \
-                 before you enter your password; a key pinned earlier is kept",
-                crate::text::sanitize(&shown)
-            );
-        }
-        IntentKey::NotSet => {
-            eprintln!("  no minds.intentKey set — intents are activated with your password")
-        }
-        IntentKey::Unusable(path) => eprintln!(
-            "  minds.intentKey ({}) is a software key (or has no security key's .pub next to \
-             it) — nothing pinned; intents are activated with your password",
-            crate::text::sanitize(&crate::trust::tilde(Path::new(path)))
-        ),
-    }
+    announce_intent_key(&root, &intent_key);
     let output = elevate(&script, "minds-protected-setup")?;
     let mut signers = None;
     let mut managed = None;
@@ -379,6 +416,211 @@ pub(crate) fn install(
         notes,
         intent_key: intent_keys,
     })
+}
+
+/// Meldet `root` beim laufenden Witness-Dienst des Rechners an — ohne
+/// Erhöhung: Das Repo für die Gruppe des Witness teilen kann der
+/// Entwickler selbst ([`share_repo`]); Home, Schlüssel und Witness richtet
+/// der Dienst als Witness-Nutzer ein und nennt die Signer-Zeile.
+fn register_with_host(
+    root: &Path,
+    intent_key: &IntentKey,
+    verbose: bool,
+) -> std::io::Result<Installed> {
+    let witness = witness_uid().ok_or_else(|| other("the witness user does not exist"))?;
+    share_repo(root, verbose)?;
+    eprintln!(
+        "minds: registering this repository with the witness daemon ({HOST_SERVICE}, user          {WITNESS_USER}) — no administrator rights needed"
+    );
+    announce_intent_key(root, intent_key);
+    let registered =
+        crate::witness_cmd::register(&host_socket(), Some(witness), root, intent_key.line())
+            .map_err(other)?;
+    if verbose {
+        for part in &registered.parts {
+            eprintln!("  witness daemon: {part}");
+        }
+    }
+    Ok(Installed {
+        socket: registered
+            .socket
+            .unwrap_or_else(|| home_of(root).join("run").join("witness.sock")),
+        answering: registered.answering,
+        signers: registered.signers,
+        managed: None,
+        notes: Vec::new(),
+        intent_key: registered.intent_key,
+    })
+}
+
+/// Teilt das Repo mit der Gruppe des Witness — als Entwickler, ohne
+/// Rechte, genau wie Schritt 3 des Einrichtungsskripts
+/// (`templates/witness/protected-*.sh`): ACL-Einträge zum Durchqueren der
+/// Verzeichnisse darüber und zum Listen der Wurzel; `.git`, `.git/minds`,
+/// `objects/`, `refs/` und `logs/` bekommen die Gruppe (erst die Gruppe,
+/// dann die Modi — nichts wird für eine andere Gruppe schreibbar);
+/// Verzeichnisse gruppenschreibbar (`.git` dazu sticky), Dateien
+/// gruppenlesbar und -schreibbar. Nur Einträge, die dem Entwickler
+/// gehören; Symlinks werden nicht verfolgt. Scheitert das (Linux: die
+/// Gruppe gilt erst nach dem nächsten Anmelden), bleibt das Skript mit
+/// `sudo`.
+pub(crate) fn share_repo(root: &Path, verbose: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let gid = witness_gid().ok_or_else(|| other("the witness group does not exist yet"))?;
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    let mut above = root.parent();
+    while let Some(dir) = above {
+        if dir == Path::new("/") {
+            break;
+        }
+        if std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.uid() == euid) {
+            grant_traversal(dir, false)?;
+        }
+        above = dir.parent();
+    }
+    grant_traversal(root, true)?;
+    let git = root.join(".git");
+    let mine = |path: &Path| -> std::io::Result<Option<std::fs::Metadata>> {
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok((meta.uid() == euid).then_some(meta))
+    };
+    // Gruppe und Modus eines Eintrags, der dem Entwickler gehört.
+    let share = |path: &Path, meta: &std::fs::Metadata| -> std::io::Result<()> {
+        std::os::unix::fs::lchown(path, None, Some(gid))?;
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mode = meta.mode() & 0o7777;
+        let wanted = if meta.is_dir() {
+            let setgid = if cfg!(target_os = "linux") { 0o2000 } else { 0 };
+            mode | 0o070 | setgid
+        } else {
+            mode | 0o060
+        };
+        if wanted != mode {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(wanted))?;
+        }
+        Ok(())
+    };
+    let Some(git_meta) = mine(&git)? else {
+        return Err(other("the repository's .git does not belong to you"));
+    };
+    if !git_meta.is_dir() {
+        return Err(other(
+            "the protected witness needs a plain repository (.git is a directory)",
+        ));
+    }
+    let mut entries = 0usize;
+    for sub in ["objects", "refs", "logs"] {
+        let mut stack = vec![git.join(sub)];
+        while let Some(path) = stack.pop() {
+            entries += 1;
+            if entries > MAX_SHARED_ENTRIES {
+                return Err(other(
+                    "the repository's .git holds too many entries to share",
+                ));
+            }
+            let Some(meta) = mine(&path)? else {
+                continue;
+            };
+            share(&path, &meta)?;
+            if meta.is_dir() {
+                for entry in std::fs::read_dir(&path)? {
+                    stack.push(entry?.path());
+                }
+            }
+        }
+    }
+    if let Some(meta) = mine(&git.join("minds"))? {
+        share(&git.join("minds"), &meta)?;
+    }
+    share(&git, &git_meta)?;
+    let sticky = (git_meta.mode() & 0o7777) | 0o1070;
+    std::fs::set_permissions(&git, std::fs::Permissions::from_mode(sticky))?;
+    if verbose {
+        eprintln!("  repository shared with the witness group ({entries} entries)");
+    }
+    Ok(())
+}
+
+/// Höchstens so viele Einträge unter `.git` werden geteilt.
+const MAX_SHARED_ENTRIES: usize = 1_000_000;
+
+/// Ein ACL-Eintrag, der den Witness-Nutzer `dir` durchqueren (und mit
+/// `list` auch listen) lässt — idempotent, mit den Programmen des Systems.
+fn grant_traversal(dir: &Path, list: bool) -> std::io::Result<()> {
+    let run = |program: &str, args: &[&str]| -> std::io::Result<std::process::Output> {
+        std::process::Command::new(program)
+            .args(args)
+            .arg(dir)
+            .stdin(std::process::Stdio::null())
+            .output()
+    };
+    if cfg!(target_os = "macos") {
+        let wanted = if list {
+            format!("user:{WITNESS_USER} allow list,search")
+        } else {
+            format!("user:{WITNESS_USER} allow search")
+        };
+        let listing = run("/bin/ls", &["-led"])?;
+        if String::from_utf8_lossy(&listing.stdout).contains(&wanted) {
+            return Ok(());
+        }
+        let out = run("/bin/chmod", &["-h", "+a", &wanted])?;
+        if !out.status.success() {
+            return Err(other(format!(
+                "cannot grant the witness traversal of {}: {}",
+                crate::text::sanitize(&dir.display().to_string()),
+                crate::text::sanitize(String::from_utf8_lossy(&out.stderr).trim())
+            )));
+        }
+        Ok(())
+    } else {
+        let entry = format!("u:{WITNESS_USER}:{}", if list { "rx" } else { "x" });
+        let program = ["/usr/bin/setfacl", "/bin/setfacl"]
+            .into_iter()
+            .find(|path| Path::new(path).is_file())
+            .ok_or_else(|| other("setfacl is missing — install the acl package"))?;
+        let out = run(program, &["-m", &entry])?;
+        if !out.status.success() {
+            return Err(other(format!(
+                "cannot grant the witness traversal of {}: {}",
+                crate::text::sanitize(&dir.display().to_string()),
+                crate::text::sanitize(String::from_utf8_lossy(&out.stderr).trim())
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Zeigt vor der Freigabe, welcher Schlüssel am Witness festgehalten wird.
+/// Der volle Fingerabdruck, mit einem `ssh-keygen` außerhalb von allem,
+/// was der Agent ablegen kann. Vergleichen mit dem des eigenen
+/// Sicherheitsschlüssels — nicht mit der `.pub` daneben: Die und
+/// `user.signingkey` kann der Agent geschrieben haben.
+fn announce_intent_key(root: &Path, intent_key: &IntentKey) {
+    match intent_key {
+        IntentKey::Key(key) => {
+            let shown = crate::verify_cmd::conformance::spec_program(root)
+                .map(|program| crate::witness_cmd::key_display_with(&program, key))
+                .unwrap_or_else(|| "(fingerprint unavailable)".to_owned());
+            eprintln!(
+                "  intent key (from minds.intentKey): {} — once pinned, a touch of it activates \
+                 an intent at the witness. Compare this fingerprint with your security key's \
+                 before you enter your password; a key pinned earlier is kept",
+                crate::text::sanitize(&shown)
+            );
+        }
+        IntentKey::NotSet => {
+            eprintln!("  no minds.intentKey set — intents are activated with your password")
+        }
+        IntentKey::Unusable(path) => eprintln!(
+            "  minds.intentKey ({}) is a software key (or has no security key's .pub next to \
+             it) — nothing pinned; intents are activated with your password",
+            crate::text::sanitize(&crate::trust::tilde(Path::new(path)))
+        ),
+    }
 }
 
 /// Die Werte, die in das Skript eingesetzt werden.
@@ -460,38 +702,35 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         return Err(other("the developer's user name is not a plain word"));
     }
     let home_text = text(&home)?;
+    let base_text = text(&base())?;
     let (template, label, service_file, service) = if cfg!(target_os = "macos") {
-        let label = format!("dev.minds.witness.{id}");
-        let file = format!("/Library/LaunchDaemons/{label}.plist");
-        let service = launch_daemon(&label, &home_text)?;
+        let file = format!("/Library/LaunchDaemons/{HOST_SERVICE}.plist");
+        let service = launch_daemon(HOST_SERVICE, &base_text)?;
         (
             include_str!("../templates/witness/protected-macos.sh"),
-            label,
+            HOST_SERVICE.to_owned(),
             file,
             service,
         )
     } else {
-        let unit = format!("minds-witness-{id}.service");
-        let file = format!("/etc/systemd/system/{unit}");
-        let service = system_unit(&id, &home_text, &text(values.root)?)?;
+        let file = format!("/etc/systemd/system/{HOST_SERVICE}");
+        let service = system_unit(&base_text)?;
         (
             include_str!("../templates/witness/protected-linux.sh"),
-            unit,
+            HOST_SERVICE.to_owned(),
             file,
             service,
         )
     };
-    let managed = managed_plan(
-        managed_rules(values.root, &home)?,
-        values.managed.as_deref(),
-    )?;
+    let _ = id;
+    let managed = managed_plan(managed_rules()?, values.managed.as_deref())?;
     let pairs: [(&str, String); 15] = [
         ("SOURCE", quote(&text(values.source)?)),
         ("BINARY", quote(BINARY)),
         ("WUSER", quote(WITNESS_USER)),
         ("DEVUSER", quote(values.user)),
         ("DEVUID", quote(&values.uid.to_string())),
-        ("BASE", quote(&text(&base())?)),
+        ("BASE", quote(&base_text)),
         ("HOME", quote(&home_text)),
         ("ROOT", quote(&text(values.root)?)),
         ("LABEL", quote(&label)),
@@ -542,13 +781,13 @@ fn word(text: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
-/// Der LaunchDaemon: unter dem Witness-Nutzer, Umask 007 — was er in
-/// `.git` anlegt, bleibt für die Gruppe schreibbar; sein Home legt er mit
-/// eigenen, engeren Modi an. Sein stderr (Start und Fehler des
-/// Datei-Beobachters, Panics) landet in `<home>/log/witness.err` — neben
-/// `witness.log`, das der Witness selbst schreibt; ohne die Datei wäre ein
-/// Beobachter, der nie startete, nur über `minds doctor` zu sehen.
-fn launch_daemon(label: &str, home: &str) -> std::io::Result<String> {
+/// Der LaunchDaemon des Rechners: `minds witness serve --base <base>` unter
+/// dem Witness-Nutzer, Umask 007 — was seine Witnesses in `.git` anlegen,
+/// bleibt für die Gruppe schreibbar; ihre Homes legen sie mit eigenen,
+/// engeren Modi an. Sein stderr (Start und Scheitern der Witnesses) landet
+/// in `<base>/log/witness.err`; jeder Witness schreibt seines nach
+/// `<home>/log/witness.err`.
+fn launch_daemon(label: &str, base: &str) -> std::io::Result<String> {
     let xml = |text: &str| {
         text.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -569,9 +808,9 @@ fn launch_daemon(label: &str, home: &str) -> std::io::Result<String> {
 	<array>
 		<string>{binary}</string>
 		<string>witness</string>
-		<string>run</string>
-		<string>--home</string>
-		<string>{home}</string>
+		<string>serve</string>
+		<string>--base</string>
+		<string>{base}</string>
 	</array>
 	<key>EnvironmentVariables</key>
 	<dict>
@@ -586,7 +825,7 @@ fn launch_daemon(label: &str, home: &str) -> std::io::Result<String> {
 		<false/>
 	</dict>
 	<key>StandardErrorPath</key>
-	<string>{home}/log/witness.err</string>
+	<string>{base}/log/witness.err</string>
 	<key>Umask</key>
 	<integer>7</integer>
 </dict>
@@ -594,29 +833,29 @@ fn launch_daemon(label: &str, home: &str) -> std::io::Result<String> {
         label = xml(label),
         user = xml(WITNESS_USER),
         binary = xml(BINARY),
-        home = xml(home),
+        base = xml(base),
     ))
 }
 
-/// Die systemd-Unit: unter dem Witness-Nutzer, Umask 007 (siehe
-/// [`launch_daemon`]), gehärtet: keine neuen Rechte, das System nur lesend
-/// bis auf sein Home und das `.git` des Repos.
-fn system_unit(id: &str, home: &str, root: &str) -> std::io::Result<String> {
-    for path in [home, root] {
-        if path
-            .chars()
-            .any(|c| c.is_whitespace() || c == '%' || c == '"' || c == '\\' || c == '\'')
-        {
-            return Err(other("a path cannot be written into a systemd unit"));
-        }
+/// Die systemd-Unit des Rechners: `minds witness serve --base <base>` unter
+/// dem Witness-Nutzer, Umask 007 (siehe [`launch_daemon`]), ohne neue
+/// Rechte. Kein `ProtectSystem=strict`: Die Witnesses schreiben in die
+/// `.git` aller angemeldeten Repos, die erst zur Laufzeit dazukommen — was
+/// sie dürfen, bestimmt die Gruppe des Witness.
+fn system_unit(base: &str) -> std::io::Result<String> {
+    if base
+        .chars()
+        .any(|c| c.is_whitespace() || c == '%' || c == '"' || c == '\\' || c == '\'')
+    {
+        return Err(other("a path cannot be written into a systemd unit"));
     }
     Ok(format!(
-        "[Unit]\nDescription=Minds witness ({id}, protected)\nAfter=network.target\n\n\
+        "[Unit]\nDescription=Minds witness (protected, one per host)\nAfter=network.target\n\n\
          [Service]\nType=simple\nUser={WITNESS_USER}\nGroup={WITNESS_USER}\n\
-         ExecStart={BINARY} witness run --home {home}\n\
+         ExecStart={BINARY} witness serve --base {base}\n\
          Environment=PATH=/usr/bin:/bin:/usr/sbin:/sbin\nRestart=on-failure\nRestartSec=5\n\
-         UMask=0007\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=strict\n\
-         ReadWritePaths={home} {root}/.git\n\n[Install]\nWantedBy=multi-user.target"
+         UMask=0007\nNoNewPrivileges=yes\nPrivateTmp=yes\n\n\
+         [Install]\nWantedBy=multi-user.target"
     ))
 }
 
@@ -624,41 +863,38 @@ fn system_unit(id: &str, home: &str, root: &str) -> std::io::Result<String> {
 const MANAGED_MARKER: &str =
     "Installed by `minds enable` (protected witness): deny rules only. Remove this file to undo.";
 
-/// Die Deny-Regeln für dieses Repo und diesen Witness — nur Deny-Regeln,
-/// keine Sandbox, keine Einschränkung eigener Hooks oder Regeln (die Datei
-/// gilt für jede Claude-Code-Sitzung auf dem Rechner).
-fn managed_rules(root: &Path, home: &Path) -> std::io::Result<Vec<String>> {
-    let text = |path: &Path| -> std::io::Result<String> {
-        let text = path
-            .to_str()
-            .ok_or_else(|| other("a path is not valid UTF-8"))?
-            .to_owned();
-        // Glob-Zeichen ergäben eine Regel, die den Pfad selbst nicht trifft.
-        if text.chars().any(|c| {
-            c.is_control() || matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\\')
-        }) {
-            return Err(other(format!(
-                "{} contains glob or rule metacharacters — the managed settings could not \
-                 protect it",
-                crate::text::sanitize(&path.display().to_string())
-            )));
-        }
-        Ok(text)
-    };
-    let refs = format!("{}/.git/refs/minds", text(root)?);
-    let home = text(home)?;
-    let mut deny = vec![
-        "Bash(minds witness:*)".to_owned(),
-        format!("Bash({BINARY} witness:*)"),
-    ];
+/// Die Deny-Regeln — rechnerweit, nicht je Repo (ein Witness-Dienst je
+/// Rechner): `minds witness` als Kommando, die Basis aller Witness-Homes,
+/// `refs/minds` in jedem Repo. Nur Deny-Regeln, keine Sandbox, keine
+/// Einschränkung eigener Hooks oder Regeln (die Datei gilt für jede
+/// Claude-Code-Sitzung auf dem Rechner) — und nichts, was bei jedem
+/// weiteren Repo eine Erhöhung bräuchte.
+fn managed_rules() -> std::io::Result<Vec<String>> {
+    let base = base();
+    let base = base
+        .to_str()
+        .ok_or_else(|| other("the witness base is not valid UTF-8"))?;
+    // Glob-Zeichen ergäben eine Regel, die den Pfad selbst nicht trifft.
+    if base.chars().any(|c| {
+        c.is_control() || matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '(' | ')' | '\\')
+    }) {
+        return Err(other(format!(
+            "{} contains glob or rule metacharacters — the managed settings could not protect it",
+            crate::text::sanitize(base)
+        )));
+    }
     // Claude Code prüft Dateizugriffe nur gegen `Read(…)` und `Edit(…)` —
     // `Edit` deckt jedes schreibende Werkzeug ab; eine `Write(…)`-Regel
-    // ignoriert es mit einer Warnung bei jedem Start.
-    deny.push(format!("Edit(/{refs}/**)"));
-    for verb in ["Read", "Edit"] {
-        deny.push(format!("{verb}(/{home}/**)"));
-    }
-    Ok(deny)
+    // ignoriert es mit einer Warnung bei jedem Start. Pfade ohne `//` sind
+    // relativ zum Projekt: `refs/minds` jedes Repos, auch verschachtelt.
+    Ok(vec![
+        "Bash(minds witness:*)".to_owned(),
+        format!("Bash({BINARY} witness:*)"),
+        format!("Read(/{base}/**)"),
+        format!("Edit(/{base}/**)"),
+        "Edit(.git/refs/minds/**)".to_owned(),
+        "Edit(**/.git/refs/minds/**)".to_owned(),
+    ])
 }
 
 fn render_managed(deny: &[String]) -> std::io::Result<String> {
@@ -1125,11 +1361,15 @@ pub(crate) fn uninstall(root: Option<&Path>, all: bool) -> std::io::Result<Vec<S
         include_str!("../templates/witness/disable-linux.sh")
     };
     let (previous, next) = managed.unwrap_or_default();
-    let pairs: [(&str, String); 7] = [
+    let root_text = root.as_deref().map(text).transpose()?.unwrap_or_default();
+    let pairs: [(&str, String); 10] = [
         ("BASE", quote(&text(&base())?)),
         ("ID", quote(&id)),
+        ("ROOT", quote(&root_text)),
         ("ALL", quote(if all { "1" } else { "0" })),
         ("BINARY", quote(BINARY)),
+        ("WUSER", quote(WITNESS_USER)),
+        ("HOST_SERVICE", quote(HOST_SERVICE)),
         ("MANAGED_DIR", quote(MANAGED_DIR)),
         ("MANAGED_PREVIOUS", quote(&previous)),
         ("MANAGED_NEXT", quote(&next)),
@@ -1299,6 +1539,19 @@ mod tests {
         assert!(!script.contains("{{"), "{script}");
         assert!(script.contains("DEVUID='501'"), "{script}");
         assert!(script.contains("--profile user --socket-group \"$WUSER\""));
+        // Ein Dienst je Rechner: der feste Name, die Basis — kein Repo im
+        // Dienst, und die Dienste früherer Einrichtungen räumt es ab.
+        assert!(script.contains(&format!("='{HOST_SERVICE}'")), "{script}");
+        assert!(
+            script.contains("witness</string>\n\t\t<string>serve</string>")
+                || script.contains("witness serve --base"),
+            "{script}"
+        );
+        assert!(
+            script.contains("dev.minds.witness.*.plist")
+                || script.contains("minds-witness-*.service"),
+            "{script}"
+        );
         let out = std::process::Command::new("/bin/sh")
             .args(["-n", "-c", &script])
             .output()
@@ -1312,23 +1565,23 @@ mod tests {
         let mut bad = values(&root, Path::new("/opt/minds"));
         bad.user = "dev; rm -rf /";
         assert!(super::script(&bad).is_err());
-        // Unter Linux lehnt die Unit Pfade ab, die systemd zerlegen würde.
-        if !cfg!(target_os = "macos") {
-            let spaced = dir.path().join("it's a repo");
-            std::fs::create_dir(&spaced).unwrap();
-            assert!(super::script(&values(&spaced, Path::new("/opt/minds"))).is_err());
-        }
     }
 
-    /// Der LaunchDaemon schreibt sein stderr in das Log-Verzeichnis des
-    /// Witness-Homes — XML-sicher, auch bei einem Home mit Sonderzeichen.
+    /// Der LaunchDaemon des Rechners startet den Dienst mit der Basis und
+    /// schreibt sein stderr in deren Log-Verzeichnis — XML-sicher, auch bei
+    /// einer Basis mit Sonderzeichen.
     #[test]
-    fn the_launch_daemon_writes_stderr_into_the_witness_home() {
-        let plist =
-            launch_daemon("dev.minds.witness.x", "/private/var/db/minds-witness/x").unwrap();
+    fn the_launch_daemon_serves_the_base_and_logs_there() {
+        let plist = launch_daemon("dev.minds.witness", "/private/var/db/minds-witness").unwrap();
         assert!(
             plist.contains(
-                "\t<key>StandardErrorPath</key>\n\t<string>/private/var/db/minds-witness/x/log/witness.err</string>\n"
+                "\t\t<string>serve</string>\n\t\t<string>--base</string>\n\t\t<string>/private/var/db/minds-witness</string>\n"
+            ),
+            "{plist}"
+        );
+        assert!(
+            plist.contains(
+                "\t<key>StandardErrorPath</key>\n\t<string>/private/var/db/minds-witness/log/witness.err</string>\n"
             ),
             "{plist}"
         );
@@ -1337,6 +1590,12 @@ mod tests {
             odd.contains("<string>/tmp/a&amp;b&lt;c&gt;/log/witness.err</string>"),
             "{odd}"
         );
+        assert!(
+            system_unit("/var/lib/minds-witness")
+                .unwrap()
+                .contains("witness serve --base /var/lib/minds-witness")
+        );
+        assert!(system_unit("/var/lib/minds witness").is_err());
     }
 
     /// Beide Vorlagen nennen nur Platzhalter, die `script` kennt — auch die
@@ -1434,18 +1693,24 @@ mod tests {
         assert!(!shared_with(&deep, || None));
     }
 
-    /// Die Managed Settings tragen nur Deny-Regeln für dieses Repo und
-    /// diesen Witness — keine Sandbox, keine Einschränkung eigener Hooks.
+    /// Die Regeln je Repo, wie Einrichtungen vor dem Dienst je Rechner sie
+    /// schrieben — `disable` nimmt sie noch heraus.
+    fn legacy_rules(repo: &str, home: &str) -> Vec<String> {
+        vec![
+            "Bash(minds witness:*)".to_owned(),
+            format!("Bash({BINARY} witness:*)"),
+            format!("Edit(/{repo}/.git/refs/minds/**)"),
+            format!("Read(/{home}/**)"),
+            format!("Edit(/{home}/**)"),
+        ]
+    }
+
+    /// Die Managed Settings tragen nur Deny-Regeln — rechnerweit: das
+    /// Kommando, die Basis der Homes, `refs/minds` jedes Repos; keine
+    /// Sandbox, keine Einschränkung eigener Hooks.
     #[test]
     fn the_managed_settings_only_deny() {
-        let text = render_managed(
-            &managed_rules(
-                Path::new("/Users/dev/repo"),
-                Path::new("/private/var/db/minds-witness/0123456789abcdef"),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let text = render_managed(&managed_rules().unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let keys: Vec<&str> = value
             .as_object()
@@ -1456,14 +1721,18 @@ mod tests {
         assert_eq!(keys, ["$comment", "permissions"]);
         let deny = value["permissions"]["deny"].as_array().unwrap();
         assert!(deny.iter().any(|r| r == "Bash(minds witness:*)"));
+        assert!(deny.iter().any(|r| r == "Edit(.git/refs/minds/**)"));
+        assert!(deny.iter().any(|r| r == "Edit(**/.git/refs/minds/**)"));
+        let base = base().display().to_string();
         assert!(
-            deny.iter()
-                .any(|r| r == "Edit(//Users/dev/repo/.git/refs/minds/**)")
+            deny.iter().any(|r| *r == format!("Read(/{base}/**)")),
+            "{deny:?}"
         );
         assert!(
-            deny.iter()
-                .any(|r| r == "Read(//private/var/db/minds-witness/0123456789abcdef/**)")
+            deny.iter().any(|r| *r == format!("Edit(/{base}/**)")),
+            "{deny:?}"
         );
+        assert!(!text.contains("/Users/"), "keine Regel je Repo: {text}");
         assert!(value["permissions"].get("allow").is_none());
         // Nur Regeln, die Claude Code für Dateien auswertet.
         assert!(
@@ -1471,7 +1740,6 @@ mod tests {
                 .all(|r| !r.as_str().unwrap().starts_with("Write(")),
             "{deny:?}"
         );
-        assert!(managed_rules(Path::new("/Users/dev/re[p]o"), Path::new("/x")).is_err());
     }
 
     /// Eine eigene Datei (genau unsere Form) wird zur Vereinigung — die Regeln
@@ -1479,13 +1747,8 @@ mod tests {
     /// andere bleibt unberührt (Vorschlag).
     #[test]
     fn the_managed_settings_merge_only_into_our_own_file() {
-        let rules = |repo: &str| {
-            managed_rules(
-                Path::new(repo),
-                Path::new("/private/var/db/minds-witness/0123456789abcdef"),
-            )
-            .unwrap()
-        };
+        let rules =
+            |repo: &str| legacy_rules(repo, "/private/var/db/minds-witness/0123456789abcdef");
         // Keine Datei: neu.
         let fresh = managed_plan(rules("/Users/dev/a"), None).unwrap();
         assert!(fresh.previous.is_empty());
@@ -1716,8 +1979,8 @@ mod tests {
     /// Datei. `--all` nimmt sie immer; eine fremde Datei bleibt.
     #[test]
     fn disable_takes_only_this_repositorys_rules_out_of_the_managed_settings() {
-        let a = managed_rules(Path::new("/repo/a"), Path::new("/base/aaaa")).unwrap();
-        let b = managed_rules(Path::new("/repo/b"), Path::new("/base/bbbb")).unwrap();
+        let a = legacy_rules("/repo/a", "/base/aaaa");
+        let b = legacy_rules("/repo/b", "/base/bbbb");
         let both = managed_plan(b.clone(), Some(&render_managed(&a).unwrap()))
             .unwrap()
             .content;
@@ -1765,11 +2028,14 @@ mod tests {
         } else {
             include_str!("../templates/witness/disable-linux.sh")
         };
-        let pairs: [(&str, String); 7] = [
+        let pairs: [(&str, String); 10] = [
             ("BASE", quote("/base")),
             ("ID", quote("abcd")),
+            ("ROOT", quote("/repo/it's")),
             ("ALL", quote("0")),
             ("BINARY", quote(BINARY)),
+            ("WUSER", quote(WITNESS_USER)),
+            ("HOST_SERVICE", quote(HOST_SERVICE)),
             ("MANAGED_DIR", quote(MANAGED_DIR)),
             ("MANAGED_PREVIOUS", quote("it's {\"a\": 1}")),
             ("MANAGED_NEXT", quote("")),

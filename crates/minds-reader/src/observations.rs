@@ -497,12 +497,16 @@ const MAX_CHAIN: usize = 100_000;
 ///   zurück, bis sie vollständig ist: an einer Epoche, die **vor** dem
 ///   Fensterbeginn endet, oder an ihrem Anfang (`previous = None`, der erste
 ///   Checkpoint nach einem Witness-Start), wenn dessen Objekt belegt, dass
-///   die Epoche **nicht nach** dem Fensterbeginn begann (`started_at`,
-///   EA-08a — über die Objekt-Id im Seal mitsigniert). Nur die Beobachtungen
-///   der Epochen dazwischen (samt Anfang) zählen. Begann der Anfang später
-///   (Neustart während der Session) oder trägt sein Objekt keinen Beginn
-///   (Schema 1), ist nicht belegt, dass die Kette vor dem Commit begann —
-///   kein Fenster; die Session steht wie ohne Witness da.
+///   die Epoche **nicht nach dem frühesten Zeitpunkt der Session** begann
+///   (`started_at`, EA-08a — über die Objekt-Id im Seal mitsigniert): Ein
+///   Witness, der lief, bevor die Session ihr erstes Event hatte, sah jede
+///   ihrer Dateiänderungen — der Spielraum des Fensters ist hier kein
+///   Maßstab, sonst bliebe jede Session, die kurz nach `minds enable`
+///   beginnt, ohne Fenster. Nur die Beobachtungen der Epochen dazwischen
+///   (samt Anfang) zählen. Begann der Anfang später (Neustart während der
+///   Session) oder trägt sein Objekt keinen Beginn (Schema 1), ist nicht
+///   belegt, dass die Kette vor dem Commit begann — kein Fenster; die
+///   Session steht wie ohne Witness da.
 /// - **Beginn:** der früheste Zeitpunkt der Session, minus [`WINDOW_SLACK`]
 ///   — vom Witness gestempelt.
 ///
@@ -624,7 +628,10 @@ pub fn witness_windows(
                 break;
             };
             if epoch.previous.is_none() {
-                complete = began_by(store, object, from);
+                // Der früheste Zeitpunkt der Session selbst (das Fenster
+                // beginnt [`WINDOW_SLACK`] davor).
+                let earliest = from.checked_add(WINDOW_SLACK).unwrap_or(from);
+                complete = began_by(store, object, earliest);
                 chain.insert(seal_id);
                 break;
             }
@@ -648,19 +655,19 @@ pub fn witness_windows(
 }
 
 /// Ob die Epoche mit dem Observation-Objekt `object` belegt spätestens um
-/// `from` begann: Das Objekt liegt vor, besteht die Hash-Prüfung des Stores,
-/// hat genau Schema 2 und trägt einen lesbaren `started_at <= from`.
+/// `by` begann: Das Objekt liegt vor, besteht die Hash-Prüfung des Stores,
+/// hat genau Schema 2 und trägt einen lesbaren `started_at <= by`.
 /// Alles andere verankert nicht — Schema 1 (kein Beginn) ebenso wie ein
 /// künftiges Schema, dessen Bedeutung von `started_at` dieses Binary nicht
 /// kennt (fail-closed; wer das Schema anhebt, nimmt es hier auf).
-fn began_by(store: &dyn ContextStore, object: &str, from: Timestamp) -> bool {
+fn began_by(store: &dyn ContextStore, object: &str, by: Timestamp) -> bool {
     let Ok(id) = object.parse::<ContentHash>() else {
         return false;
     };
     let Ok(Some(object)) = store.get_observations(&id) else {
         return false;
     };
-    object.schema == 2 && object.started_at().is_some_and(|start| start <= from)
+    object.schema == 2 && object.started_at().is_some_and(|start| start <= by)
 }
 
 /// Was der Witness in den Epochen der Fenster über sich festhielt — je

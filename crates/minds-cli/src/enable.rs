@@ -231,7 +231,7 @@ pub fn run(
             Some(profile) => crate::enable_witness::run(&paths.root, profile, store)?,
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
             // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
-            None => crate::enable_witness::default(&paths.root, store, local_mode, verbose),
+            None => crate::enable_witness::default(&paths.root, store, local_mode, verbose)?,
         };
         // Die Signer-Zeile des Witness in die Vertrauensdatei — niemand
         // kopiert sie mehr von Hand.

@@ -6,7 +6,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-static STOP: AtomicBool = AtomicBool::new(false);
+pub(super) static STOP: AtomicBool = AtomicBool::new(false);
 /// Verbindungen der Agent-Seite.
 pub(super) const MAX_CLIENTS: usize = 128;
 /// Verbindungen über den Steuer-Socket — ein eigenes Budget: Die Agent-Seite
@@ -22,9 +22,9 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-struct Signals(Vec<(libc::c_int, libc::sigaction)>);
+pub(super) struct Signals(Vec<(libc::c_int, libc::sigaction)>);
 impl Signals {
-    fn install() -> Fallible<Self> {
+    pub(super) fn install() -> Fallible<Self> {
         STOP.store(false, Ordering::Relaxed);
         let mut guard = Self(Vec::new());
         for signal in [libc::SIGTERM, libc::SIGINT] {
@@ -55,8 +55,8 @@ impl Drop for Signals {
     }
 }
 
-struct Socket {
-    listener: UnixListener,
+pub(super) struct Socket {
+    pub(super) listener: UnixListener,
     path: PathBuf,
     inode: u64,
     device: u64,
@@ -82,7 +82,7 @@ impl Socket {
         Self::bind_at(path, None, 0o600)
     }
 
-    fn bind_at(path: PathBuf, group: Option<u32>, mode: u32) -> Fallible<Self> {
+    pub(super) fn bind_at(path: PathBuf, group: Option<u32>, mode: u32) -> Fallible<Self> {
         match fs::symlink_metadata(&path) {
             Ok(meta) => {
                 if !meta.file_type().is_socket() {
