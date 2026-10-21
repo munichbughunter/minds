@@ -48,6 +48,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::decision::DecisionEvent;
 use crate::intent_anchor::IntentEvent;
 use crate::lineage::{ContentHash, Edge, Effect, Lineage};
 
@@ -103,6 +104,17 @@ pub struct Session {
     /// Additiv: leer wird nicht geschrieben.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub intent_events: Vec<IntentEvent>,
+
+    /// Welche Entscheidungs-Records (`refs/minds/decisions/`) in dieser
+    /// Session aufgenommen wurden, in Journal-Reihenfolge: je ein Eintrag
+    /// für ein beobachtetes Tool-Event, dessen Antwort die Id eines
+    /// `minds decide`-Aufrufs nannte ([`DecisionEvent`]). Eine Beobachtung
+    /// wie `intent_events`; ob der Record existiert und noch gilt, rechnet
+    /// der Reader (W2).
+    ///
+    /// Additiv: leer wird nicht geschrieben.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decision_events: Vec<DecisionEvent>,
 }
 
 impl Session {
@@ -127,6 +139,7 @@ impl Session {
             edges: Vec::new(),
             intent_anchor: None,
             intent_events: Vec::new(),
+            decision_events: Vec::new(),
         }
     }
 }
@@ -623,7 +636,15 @@ mod tests {
         let s = sample();
         let json = crate::to_canonical_string(&s).unwrap();
 
-        for key in ["lineage", "edges", "parent", "at", "effect"] {
+        for key in [
+            "lineage",
+            "edges",
+            "parent",
+            "at",
+            "effect",
+            "intent_events",
+            "decision_events",
+        ] {
             assert!(
                 !json.contains(&format!("\"{key}\"")),
                 "unbelegtes M5-Feld {key:?} darf nicht serialisiert werden"
@@ -670,6 +691,23 @@ mod tests {
     /// Eine Session, wie ein Binary **vor** EA-18a sie kanonisch schrieb —
     /// mit Capture-Stempel und Effekt, aber ohne `outcome`/`note`.
     const LEGACY_CANONICAL: &str = r#"{"agent":{"name":"claude-code","version":"2.1.282"},"intent":{"constraints":[],"discarded":[],"request":"Tests laufen lassen"},"model":{"id":"claude-opus-4","provider":"anthropic"},"produced":{"files":[]},"redaction":{"applied":true,"counts":{"pii":0,"secrets":0}},"schema_version":2,"turns":[{"role":"assistant","text":"","tool_calls":[{"arguments":"{\"command\":\"cargo test\"}","capture":{"adapter":"claude-code","adapter_version":2,"status":"interpreted"},"effect":{"kind":"exec"},"name":"Bash"}]}],"usage":{"input_tokens":0,"output_tokens":0}}"#;
+
+    /// Die kanonische Form eines Entscheidungs-Verweises — Teil der Id
+    /// jeder Session, die eine Entscheidung nennt.
+    #[test]
+    fn decision_events_canonical_form() {
+        let mut s: Session = serde_json::from_str(LEGACY_CANONICAL).unwrap();
+        s.decision_events.push(DecisionEvent {
+            seq: 7,
+            decision_id: ContentHash::from_bytes([3; 32]),
+        });
+        let json = crate::to_canonical_string(&s).unwrap();
+        assert!(json.contains(
+            r#""decision_events":[{"decision_id":"b3-0303030303030303030303030303030303030303030303030303030303030303","seq":7}]"#
+        ));
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
 
     #[test]
     fn outcome_additive_serialization() {

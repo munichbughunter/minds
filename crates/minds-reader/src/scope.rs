@@ -413,6 +413,22 @@ impl Glob {
         (budget.get() > 0).then_some(hit)
     }
 
+    /// Wie [`matches_checked`](Self::matches_checked), aber gegen ein
+    /// Budget des Aufrufers, das über viele Pfade geteilt wird (die
+    /// Proben der Entscheidungen, `crate::decisions`): Die Schritte werden
+    /// von `budget` abgezogen, je Pfad höchstens [`MATCH_BUDGET`]; `None`,
+    /// wenn das Budget dabei zur Neige ging.
+    pub fn matches_within(&self, path: &str, budget: &Cell<u64>) -> Option<bool> {
+        if path.len() > MAX_PATH || budget.get() == 0 {
+            return None;
+        }
+        let granted = budget.get().min(MATCH_BUDGET);
+        let local = Cell::new(granted);
+        let hit = self.matches_parts(&split(path), &local);
+        budget.set(budget.get() - (granted - local.get()));
+        (local.get() > 0).then_some(hit)
+    }
+
     fn matches_parts(&self, parts: &[Vec<char>], budget: &Cell<u64>) -> bool {
         self.forms
             .iter()
@@ -601,6 +617,37 @@ mod tests {
                 "glob {glob:?} against {path:?}"
             );
         }
+    }
+
+    /// `matches_within`: Schritte gehen vom Budget des Aufrufers ab, je
+    /// Pfad höchstens `MATCH_BUDGET`; erschöpft heißt `None`, nie „trifft
+    /// nicht".
+    #[test]
+    fn matches_within_charges_the_callers_budget() {
+        let cheap = Glob::new("src/**");
+        let budget = Cell::new(100);
+        assert_eq!(cheap.matches_within("src/lib.rs", &budget), Some(true));
+        assert!(budget.get() < 100 && budget.get() > 0);
+        assert_eq!(cheap.matches_within("docs/x.md", &budget), Some(false));
+
+        let costly = Glob::new(&format!("*{}b", "a".repeat(2_048)));
+        let budget = Cell::new(MATCH_BUDGET * 2);
+        assert_eq!(costly.matches_within(&"a".repeat(MAX_PATH), &budget), None);
+        assert_eq!(budget.get(), MATCH_BUDGET);
+        assert_eq!(
+            costly.matches_within(&"a".repeat(MAX_PATH - 1), &budget),
+            None
+        );
+        assert_eq!(budget.get(), 0);
+        // Leer: nichts wird mehr geprüft, auch nicht ein billiger Pfad.
+        assert_eq!(cheap.matches_within("src/lib.rs", &budget), None);
+        // Ein Pfad über `MAX_PATH` ist nicht entscheidbar.
+        let budget = Cell::new(MATCH_BUDGET);
+        assert_eq!(
+            cheap.matches_within(&"a".repeat(MAX_PATH + 1), &budget),
+            None
+        );
+        assert_eq!(budget.get(), MATCH_BUDGET);
     }
 
     #[test]

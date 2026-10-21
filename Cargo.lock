@@ -1812,6 +1812,7 @@ dependencies = [
  "minds-metrics",
  "minds-redact",
  "minds-store",
+ "regex",
  "serde_json",
  "tempfile",
  "thiserror",

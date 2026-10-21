@@ -71,6 +71,10 @@ pub mod changes;
 
 pub mod overview;
 
+/// Gilt eine Entscheidung noch? Proben gegen den Worktree, Stand je
+/// Record, `supersedes`-Ketten — zur Lesezeit (W2/W5).
+pub mod decisions;
+
 /// Die Session als Schrittliste (C11): Verb, Ziel, Ergebnis, Zeit seit Start.
 pub mod story;
 
