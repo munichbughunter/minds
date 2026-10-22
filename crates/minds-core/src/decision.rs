@@ -283,9 +283,10 @@ pub struct DecisionRecord {
     pub supersedes: Option<ContentHash>,
 }
 
-/// Warum ein Record nicht in sich stimmig ist. Nennt Feld und Kennung
-/// (Kennungen sind kurz und auf `A-Z a-z 0-9 _ -` beschränkt — oder genau
-/// deshalb abgelehnt, dann gekürzt und escapt), zitiert nie einen Text.
+/// Warum ein Record nicht in sich stimmig ist. Nennt Feld und **Position**
+/// (`assumptions[2]`, `alternatives[0].rejected_because`, Kante 1), nie
+/// einen Wert: Auch eine Kennung, die ihre Form hat, kann ein Token sein
+/// — und die Meldung landet in der Tool-Antwort des Agenten.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecisionError {
     /// `kind` ist nicht [`DECISION_KIND`].
@@ -312,21 +313,23 @@ pub enum DecisionError {
     /// Mehr als [`MAX_ITEMS`] Annahmen oder Alternativen.
     #[error("a decision has at most {MAX_ITEMS} {0}")]
     TooMany(&'static str),
-    /// Eine Annahmen-Kennung ist leer, zu lang, trägt andere Zeichen als
-    /// `A-Z a-z 0-9 _ -` oder kommt doppelt vor.
+    /// Die Kennung von `assumptions[i]` ist leer, zu lang, trägt andere
+    /// Zeichen als `A-Z a-z 0-9 _ -` oder kommt schon vor.
     #[error(
-        "assumption id {0:?} is empty, too long, has other characters than A-Z a-z 0-9 _ -, or is not unique"
+        "the id of assumptions[{0}] is empty, too long, has other characters than A-Z a-z 0-9 _ -, or is not unique"
     )]
-    AssumptionId(String),
-    /// Eine Kante nennt eine Annahme, die es nicht gibt.
-    #[error("reason refers to unknown assumption {0:?}")]
-    UnknownAssumption(String),
-    /// Eine Liste von Kanten nennt dieselbe Annahme zweimal.
-    #[error("assumption {0:?} is named twice in one list of reasons")]
-    DuplicateReason(String),
-    /// Eine Probe ist unvollständig oder widersprüchlich.
-    #[error("probe of assumption {0:?} is invalid: {1}")]
-    Probe(String, &'static str),
+    AssumptionId(usize),
+    /// Die Kante `{1}` in der Liste `{0}` nennt eine Annahme, die es nicht
+    /// gibt.
+    #[error("reason {1} in {0} refers to an assumption id that is not declared")]
+    UnknownAssumption(String, usize),
+    /// Die Kante `{1}` in der Liste `{0}` nennt eine Annahme ein zweites
+    /// Mal.
+    #[error("reason {1} in {0} names an assumption that the list already names")]
+    DuplicateReason(String, usize),
+    /// Die Probe von `assumptions[i]` ist unvollständig oder widersprüchlich.
+    #[error("the probe of assumptions[{0}] is invalid: {1}")]
+    Probe(usize, &'static str),
     /// Ein Scope-Glob ist leer, zu lang oder verlässt das Repository.
     #[error("scope globs are non-empty, at most {MAX_GLOB} bytes and repo-relative")]
     Scope,
@@ -387,41 +390,47 @@ impl DecisionRecord {
         }
 
         let mut ids: BTreeSet<&str> = BTreeSet::new();
-        for assumption in &self.assumptions {
+        for (i, assumption) in self.assumptions.iter().enumerate() {
             let id = assumption.id.as_str();
             if !is_id(id) || !ids.insert(id) {
-                return Err(DecisionError::AssumptionId(clip_id(id)));
+                return Err(DecisionError::AssumptionId(i));
             }
             text(&assumption.statement, "assumption.statement")?;
             if let Some(probe) = &assumption.probe {
-                check_probe(probe).map_err(|why| DecisionError::Probe(id.to_owned(), why))?;
+                check_probe(probe).map_err(|why| DecisionError::Probe(i, why))?;
             }
         }
 
-        let reasons = |list: &[Reason]| -> Result<(), DecisionError> {
+        let reasons = |list: &[Reason], name: &str| -> Result<(), DecisionError> {
             let mut seen: BTreeSet<&str> = BTreeSet::new();
-            for reason in list {
+            for (i, reason) in list.iter().enumerate() {
                 let id = reason.assumption.as_str();
                 if !ids.contains(id) {
-                    return Err(DecisionError::UnknownAssumption(clip_id(id)));
+                    return Err(DecisionError::UnknownAssumption(name.to_owned(), i));
                 }
                 if !seen.insert(id) {
-                    return Err(DecisionError::DuplicateReason(id.to_owned()));
+                    return Err(DecisionError::DuplicateReason(name.to_owned(), i));
                 }
             }
             Ok(())
         };
         if let Some(chosen) = &self.chosen {
             text(&chosen.approach, "chosen.approach")?;
-            reasons(&chosen.rests_on)?;
+            reasons(&chosen.rests_on, "chosen.rests_on")?;
         }
-        for alternative in &self.alternatives {
+        for (i, alternative) in self.alternatives.iter().enumerate() {
             text(&alternative.approach, "alternative.approach")?;
             if self.open && !alternative.rejected_because.is_empty() {
                 return Err(DecisionError::OpenWithRejection);
             }
-            reasons(&alternative.rejected_because)?;
-            reasons(&alternative.rests_on)?;
+            reasons(
+                &alternative.rejected_because,
+                &format!("alternatives[{i}].rejected_because"),
+            )?;
+            reasons(
+                &alternative.rests_on,
+                &format!("alternatives[{i}].rests_on"),
+            )?;
         }
         for glob in &self.scope {
             if !is_glob(glob) {
@@ -447,12 +456,6 @@ fn is_id(id: &str) -> bool {
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// Eine abgelehnte Kennung für die Fehlermeldung: gekürzt — escapt wird sie
-/// durch `{:?}`.
-fn clip_id(id: &str) -> String {
-    id.chars().take(MAX_ID).collect()
 }
 
 /// Ein Glob, der im Repository bleibt: belegt, höchstens [`MAX_GLOB`]
@@ -578,6 +581,173 @@ fn check_probe(probe: &Probe) -> Result<(), &'static str> {
                 .ok_or("blob is not a lowercase hex object id")
         }
     }
+}
+
+/// Ist `command` ein Aufruf von `minds decide` — und nur das?
+///
+/// Die Regel, nach der der Checkpoint die Tool-Antwort liest und die Story
+/// den Schritt zeigt; eng, damit kein **anderes** Kommando im selben
+/// Aufruf die Zeile `decision b3-…` drucken kann:
+///
+/// - Die erste Zeile enthält kein `;`, `&`, `||`, keinen Backtick, kein
+///   `$(`, `<(`, `>(` und endet nicht auf `\` (keine Fortsetzung); der
+///   Aufruf selbst hat keine Umleitung mit `>` (ein `2>/dev/null` nähme
+///   die Fehlerzeile weg, die sonst vor einer geschmuggelten stünde).
+/// - Weitere Zeilen gibt es nur als Heredoc: Die erste Zeile öffnet eines
+///   mit `<<`, und die **letzte** Zeile ist genau sein Begrenzer — genau
+///   einmal, nichts dahinter (ein Begrenzer mitten im Text beendete das
+///   Heredoc dort, und was folgte, wären Kommandos). Der Begrenzer ist ein
+///   schlichtes Wort (`[A-Za-z0-9_-]`, ganz oder gar nicht in Quotes), mit
+///   Leerzeichen oder Tab als Grenze — wie die Shell es liest; außerhalb
+///   des Begrenzer-Worts steht kein Quote und kein `#` in der Zeile.
+/// - Höchstens eine Pipe, und links davon nur `cat <datei>` oder
+///   `cat <<BEGRENZER` — ein Kommando, das nichts auf stderr druckt, das
+///   Claude Code in `stdout` mischen könnte.
+/// - Das letzte Glied beginnt mit `minds decide` — `minds` als Wort oder
+///   als `…/minds` (ein gebautes `target/debug/minds` ist ein Aufruf).
+///
+/// `minds decide < d.json`, `cat d.json | minds decide`, `minds decide
+/// --human <<'EOF' … EOF` sind Aufrufe; `cd a && minds decide`, `minds
+/// decide < d.json & echo …`, `echo … >&2 | minds decide`, ein Heredoc mit
+/// einem Kommando nach dem Begrenzer und ein Heredoc, in dessen Text die
+/// Wörter stehen, sind keine. Fail-closed: Ein Aufruf hinter `&&` wird
+/// nicht verknüpft — besser als eine fremde Zeile. Was die Regel nicht
+/// sehen kann: ein anderes Programm namens `minds` im `PATH` oder unter
+/// `…/minds`. Die Verknüpfung ist darum eine Beobachtung der Tool-Antwort
+/// des Agenten, kein Beleg, dass der Record von ihm stammt — ob er
+/// existiert und was er sagt, rechnet der Reader aus dem Store.
+pub fn names_decide(command: &str) -> bool {
+    let mut lines = command.lines();
+    // ` 2>&1` am Aufruf mischt nur das eigene stderr von `minds` ein — auf
+    // einem Erfolg leer; ein Fehler stünde dann vor der Zeile (fail-closed).
+    let first = lines
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('\r')
+        .replace(" 2>&1", " ");
+    let first = first.as_str();
+    const FORBIDDEN: [&str; 8] = [";", "&", "||", "`", "$(", "<(", ">(", "#"];
+    if FORBIDDEN.iter().any(|f| first.contains(f)) || first.trim_end().ends_with('\\') {
+        return false;
+    }
+    let rest: Vec<&str> = lines.collect();
+    if !rest.is_empty() {
+        let Some((delimiter, dash, token)) = heredoc_delimiter(first) else {
+            return false;
+        };
+        // Außerhalb des Begrenzer-Worts kein Anführungszeichen: In Quotes
+        // wäre `<<` Text, und die Folgezeilen Kommandos.
+        if first.replacen(token, " ", 1).contains(['\'', '"']) {
+            return false;
+        }
+        // Der Begrenzer genau einmal, als letzte Zeile: Stünde er schon
+        // davor, endete das Heredoc dort, und was folgt, wären Kommandos.
+        // Bei `<<-` nimmt die Shell führende Tabs vor dem Vergleich weg.
+        fn strip(l: &str, dash: bool) -> &str {
+            let l = l.trim_end_matches('\r');
+            if dash { l.trim_start_matches('\t') } else { l }
+        }
+        let mut body = rest.iter().map(|l| strip(l, dash));
+        if body.next_back() != Some(delimiter.as_str()) || body.any(|l| l == delimiter) {
+            return false;
+        }
+    }
+    let mut segments = first.split('|');
+    let (left, call) = match (segments.next(), segments.next(), segments.next()) {
+        (Some(only), None, _) => (None, only),
+        (Some(left), Some(right), None) => (Some(left), right),
+        _ => return false,
+    };
+    if let Some(left) = left {
+        // Links nur, was auf stdout in die Pipe schreibt und nichts
+        // umleitet: `cat <datei>`, `cat <<X`, `echo …`, `printf …`.
+        let words: Vec<&str> = left.split_whitespace().collect();
+        let program = words.first().copied().unwrap_or("");
+        let ok = match program {
+            "cat" => {
+                let file = words.get(1).copied().unwrap_or("");
+                let plain =
+                    !file.is_empty() && !file.starts_with('-') && !file.contains(['<', '>']);
+                let heredoc =
+                    file.starts_with("<<") && file.len() > 2 && !file[2..].contains(['<', '>']);
+                words.len() == 2 && (plain || heredoc)
+            }
+            "echo" | "printf" => words.len() > 1 && !left.contains(['<', '>']),
+            _ => false,
+        };
+        if !ok {
+            return false;
+        }
+    }
+    // Keine Ausgabe-Umleitung am Aufruf: `2>/dev/null` verschöbe die
+    // Fehlerzeile, die Claude Code sonst vor eine geschmuggelte stellte.
+    if call.contains('>') {
+        return false;
+    }
+    let mut words = call
+        .split(|c: char| c.is_whitespace() || matches!(c, '<' | '(' | ')'))
+        .filter(|w| !w.is_empty());
+    let program = words.next().unwrap_or("");
+    (program == "minds" || program.ends_with("/minds")) && words.next() == Some("decide")
+}
+
+/// Der Begrenzer des ersten Heredocs einer Zeile (`<<EOF`, `<<-EOF`,
+/// `<<'EOF'`, `<< "EOF"`) — ohne Anführungszeichen —, ob es die
+/// `<<-`-Form ist (führende Tabs der Zeilen zählen dann nicht) und das
+/// ganze Wort in der Zeile (`<<'EOF'`), um es herauszunehmen. Ein Wort,
+/// das die Shell anders läse als wir — Quote nur an einer Seite, ein
+/// Quote mitten im Wort, ein Backslash, ein Umleitungs- oder Pipe-Zeichen
+/// —, ist kein Begrenzer: `None`, der Aufruf wird nicht verknüpft.
+fn heredoc_delimiter(line: &str) -> Option<(String, bool, &str)> {
+    let start = line.find("<<")?;
+    let after = &line[start + 2..];
+    let dash = after.starts_with('-');
+    let after = after.strip_prefix('-').unwrap_or(after);
+    // Wortgrenzen wie die Shell: nur Leerzeichen und Tab — kein
+    // Unicode-Leerraum, der für Bash Teil des Wortes wäre.
+    let after = after.trim_start_matches([' ', '\t']);
+    let len = after.find([' ', '\t']).unwrap_or(after.len());
+    let word = &after[..len];
+    if word.is_empty() {
+        return None;
+    }
+    let delimiter = match word.as_bytes()[0] {
+        q @ (b'\'' | b'"') => {
+            let inner = word.get(1..word.len() - 1)?;
+            if word.len() < 3 || word.as_bytes()[word.len() - 1] != q {
+                return None;
+            }
+            inner
+        }
+        _ => word,
+    };
+    // Nur ein schlichtes Wort als Begrenzer: Alles andere (Quotes mitten
+    // drin, Backslash, Umleitung, Steuer- oder Unicode-Zeichen) liest die
+    // Shell womöglich anders als wir.
+    if delimiter.is_empty()
+        || !delimiter
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    let token_end = line.len() - after.len() + len;
+    Some((delimiter.to_owned(), dash, &line[start..token_end]))
+}
+
+/// Die Zeile `decision b3-<64 hex>`, wie `minds decide` sie als erste
+/// druckt — genau diese Form (Kleinbuchstaben), sonst nichts.
+pub fn decision_line(line: &str) -> Option<ContentHash> {
+    let id = line.trim_end().strip_prefix("decision ")?;
+    let hex = id.strip_prefix("b3-")?;
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    id.parse().ok()
 }
 
 /// Die Beobachtung im gespeicherten Envelope: In dieser Session wurde ein
@@ -774,38 +944,51 @@ mod tests {
         record.alternatives[0].rejected_because[0].assumption = "a9".into();
         assert_eq!(
             record.check(),
-            Err(DecisionError::UnknownAssumption("a9".into()))
+            Err(DecisionError::UnknownAssumption(
+                "alternatives[0].rejected_because".into(),
+                0
+            ))
         );
         let mut record = sample();
         record.chosen.as_mut().unwrap().rests_on[0].assumption = "nope".into();
         assert_eq!(
             record.check(),
-            Err(DecisionError::UnknownAssumption("nope".into()))
+            Err(DecisionError::UnknownAssumption(
+                "chosen.rests_on".into(),
+                0
+            ))
         );
         let mut record = sample();
         let twice = record.chosen.as_ref().unwrap().rests_on[0].clone();
         record.chosen.as_mut().unwrap().rests_on.push(twice);
         assert_eq!(
             record.check(),
-            Err(DecisionError::DuplicateReason("a1".into()))
+            Err(DecisionError::DuplicateReason("chosen.rests_on".into(), 1))
         );
-        // Eine überlange unbekannte Kennung wird gekürzt genannt.
+        // Kein Fehler nennt einen Wert — auch keine token-förmige Kennung.
         let mut record = sample();
-        record.alternatives[0].rejected_because[0].assumption = "x".repeat(500);
-        assert_eq!(
-            record.check(),
-            Err(DecisionError::UnknownAssumption("x".repeat(MAX_ID)))
-        );
+        record.alternatives[0].rejected_because[0].assumption =
+            "ghp_u8jzPde0IgxLd6GncfBAepfJBd0Kh8oOOL8d".into();
+        let err = record.check().unwrap_err();
+        assert!(!err.to_string().contains("ghp_"), "{err}");
+        let mut record = sample();
+        record.assumptions[1].id = "ghp_u8jzPde0IgxLd6GncfBAepfJBd0Kh8oOOL8d".into();
+        record.assumptions[1].probe = Some(Probe::Pattern {
+            path: Some("a.rs".into()),
+            glob: Some("*".into()),
+            must_match: Some("x".into()),
+            must_not_match: None,
+        });
+        let err = record.check().unwrap_err();
+        assert_eq!(err, DecisionError::Probe(1, "exactly one of path and glob"));
+        assert!(!err.to_string().contains("ghp_"), "{err}");
     }
 
     #[test]
     fn assumption_ids_are_short_plain_and_unique() {
         let mut record = sample();
         record.assumptions[1].id = "a1".into();
-        assert_eq!(
-            record.check(),
-            Err(DecisionError::AssumptionId("a1".into()))
-        );
+        assert_eq!(record.check(), Err(DecisionError::AssumptionId(1)));
         for bad in ["a 1", "", "ä", "a/b", "a.b", &"a".repeat(MAX_ID + 1)] {
             let mut record = sample();
             record.assumptions[0].id = bad.into();
@@ -956,6 +1139,108 @@ mod tests {
         let json = r#"{"schema":1,"topic":"t","decided_by":"human","at":"2026-10-21T13:09:00Z","chosen":{"approach":"x"}}"#;
         let record: DecisionRecord = serde_json::from_str(json).unwrap();
         assert_eq!(record.check(), Err(DecisionError::Kind));
+    }
+
+    /// Die Regel für den eigenen `minds decide`-Aufruf: Pipe und Heredoc
+    /// davor, nichts danach — und nie ein anderes Kommando in derselben
+    /// Zeile.
+    #[test]
+    fn a_decide_call_is_recognized_narrowly() {
+        for yes in [
+            "minds decide",
+            "minds decide --human",
+            "minds decide < decision.json",
+            "cat d.json | minds decide",
+            "cat <<'EOF' | minds decide\n{}\nEOF",
+            "./target/debug/minds decide <<'EOF'\n{\"topic\":\"x\"}\nEOF",
+            "minds decide --supersedes b3-aa <<EOF\nminds decisions ; echo\nEOF",
+            "minds decide <<-EOF\n{}\n\tEOF\r",
+            "minds decide << \"END\"\n{}\nEND",
+            "minds decide < d.json 2>&1",
+            "minds decide <<EOF\n\tEOF\n{}\nEOF",
+            "echo '{}' | minds decide",
+            "printf '%s' '{}' | minds decide --human",
+        ] {
+            assert!(names_decide(yes), "{yes:?}");
+        }
+        for no in [
+            "minds decisions",
+            "minds decided",
+            "reminds decide",
+            "cd a && minds decide",
+            "minds decisions b3-aa ; minds decide --template",
+            "minds decide --template || true",
+            "echo decision | tee x",
+            "cargo run -- decide",
+            "",
+            // Eine zweite Zeile ohne Heredoc, ein Kommando nach dem Begrenzer.
+            "minds decide < bad.json\necho decision b3-x",
+            "minds decide <<'EOF'\n{}\nEOF\necho decision b3-x",
+            "minds decide <<'EOF'\n{}\n",
+            // Hintergrund, Substitution, Fortsetzung.
+            "minds decide < d.json & echo decision b3-x",
+            "minds decide $(echo) < d.json",
+            "minds decide `echo` < d.json",
+            "minds decide < <(cat d.json)",
+            "minds decide \\\n|| echo decision b3-x",
+            // Der Begrenzer schon vor der letzten Zeile: Das Heredoc endet
+            // dort, dahinter laufen Kommandos (`:` und `true` sind No-ops).
+            "minds decide 2>/dev/null <<:\n:\necho decision b3-x\n:",
+            "minds decide <<true\ntrue\necho decision b3-x\ntrue",
+            "minds decide <<EOF\nEOF\necho decision b3-x\nEOF",
+            // Ein Begrenzer, den die Shell anders liest: Quote mit
+            // Leerzeichen, `<<` im Kommentar oder in Quotes, ` 2>&1` im Wort.
+            "minds decide <<\"true x\"\ntrue x\necho decision b3-x\ntrue",
+            "minds decide #<<true\necho decision b3-x\ntrue",
+            "minds decide --supersedes '<<true'\necho decision b3-x\ntrue",
+            "minds decide <<\"x 2>&1\"\nx 2>&1\necho decision b3-x\nx",
+            "minds decide <<'EOF\n{}\nEOF",
+            "minds decide <<EO'F'\n{}\nEOF",
+            "minds decide <<E\\OF\n{}\nEOF",
+            "echo '<<X' | minds decide\necho decision b3-x\nX",
+            "minds decide # x",
+            // Leerraum, der für Bash Teil des Begrenzer-Worts ist (FF, VT,
+            // NBSP): Das Heredoc endet früher, als wir dachten.
+            "minds decide <<\u{0c}true\n\u{0c}true\necho decision b3-x\ntrue",
+            "minds decide <<\u{a0}true\n\u{a0}true\necho decision b3-x\ntrue",
+            "minds decide <<\u{0b}EOF\n\u{0b}EOF\necho decision b3-x\nEOF",
+            "minds decide <<EOF\u{a0}x\nEOF\necho decision b3-x\nEOF\u{a0}x",
+            "minds decide <<E.F\n{}\nE.F",
+            "minds decide <<-EOF\n\tEOF\necho decision b3-x\nEOF",
+            // Umleitungen am Aufruf.
+            "minds decide 2>/dev/null < d.json",
+            "minds decide 2>&1 1>/dev/null <<'EOF'\n{}\nEOF\necho decision b3-x",
+            "minds decide 2>&1 1>/dev/null <<'EOF'\n{}\nEOF",
+            "minds decide < d.json > out",
+            // Links der Pipe nur `cat <datei>` / `cat <<X`.
+            "echo decision b3-x >&2 | minds decide < d.json",
+            "cat d.json e.json | minds decide",
+            "cat -A d.json | minds decide",
+            "cat < d.json | minds decide",
+            "cat d.json | tee x | minds decide",
+            "echo x >&2 | minds decide",
+            "echo | minds decide",
+            "printf x > f | minds decide",
+            "minds decide |& tee x",
+        ] {
+            assert!(!names_decide(no), "{no:?}");
+        }
+        let hex = "f1d311757e0f65b9852d2d5ad873beaf6ab3caf9e1e1caafe6252cfaeb9c7b53";
+        assert_eq!(
+            decision_line(&format!("decision b3-{hex}")).unwrap().hex(),
+            hex
+        );
+        assert_eq!(
+            decision_line(&format!("decision b3-{hex}  ")).map(|_| ()),
+            Some(())
+        );
+        assert_eq!(decision_line(&format!("decision {hex}")), None);
+        assert_eq!(decision_line("decision b3-abc"), None);
+        assert_eq!(decision_line(&format!(" decision b3-{hex}")), None);
+        assert_eq!(
+            decision_line(&format!("decision b3-{}", hex.to_ascii_uppercase())),
+            None
+        );
     }
 
     #[test]

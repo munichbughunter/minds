@@ -272,6 +272,8 @@ fn build_with_transcript(
         intent_events: Vec::new(),
         decision_events: Vec::new(),
     };
+    let mut session = session;
+    session.decision_events = decision_events(&session, events, &call_events, key.agent());
     (session, call_events)
 }
 
@@ -378,6 +380,69 @@ pub fn checkpoint_witness(
     }
     session.intent_events = intent_events(events);
     session
+}
+
+/// Die Entscheidungen, die der Agent in dieser Session aufgenommen hat —
+/// aus der Antwort seines eigenen `minds decide`-Aufrufs, nie aus einem
+/// Journal-Schreiber: Das Kommando druckt als erste Zeile `decision <id>`,
+/// und die steht in der Tool-Antwort des `PostToolUse`-Events, das die
+/// Hooks (A1) oder der Witness (A2) wie jedes andere gesehen haben.
+///
+/// Das Tor ist eng, damit die Zeile nicht aus einem anderen Kommando
+/// stammen kann: Das Kommando ist ein `minds decide`-Aufruf und sonst
+/// nichts ([`minds_core::decision::names_decide`] — kein `;`, `&&`, `||`
+/// in seiner ersten Zeile, `minds decide` als letztes Glied der Pipe), und
+/// nur die **erste Zeile** der Antwort zählt. Gekürzte oder unterbrochene
+/// Antworten liefert der Adapter nicht (`exec_report`); dann fehlt die
+/// Verknüpfung, ehrlich. Was die Id bedeutet — ob der Record existiert und
+/// noch gilt —, rechnet der Reader (W2).
+fn decision_events(
+    session: &Session,
+    events: &[JournalEvent],
+    call_events: &[usize],
+    agent: &str,
+) -> Vec<minds_core::decision::DecisionEvent> {
+    use minds_core::decision::{DecisionEvent, decision_line, names_decide};
+    let Some(adapter) = normalize::adapter_for(agent) else {
+        return Vec::new();
+    };
+    // Die Post-Events erst zerlegen, wenn ein Aufruf das verlangt — der
+    // Index kostet einen Durchlauf über das Journal.
+    let mut posts: Option<PostIndex<'_>> = None;
+    let mut out: Vec<DecisionEvent> = Vec::new();
+    let calls = session.turns.iter().flat_map(|t| &t.tool_calls);
+    for (call, &pre_index) in calls.zip(call_events) {
+        if call.effect.as_ref().map(|e| e.kind) != Some(EffectKind::Exec) {
+            continue;
+        }
+        let Some(command) = command_str(&call.arguments) else {
+            continue;
+        };
+        if !names_decide(&command) {
+            continue;
+        }
+        let posts = posts.get_or_insert_with(|| PostIndex::new(adapter, events));
+        let Some(post) = posts.post_for(events.get(pre_index)) else {
+            continue;
+        };
+        let Some(report) = adapter.exec_report(post, &command) else {
+            continue;
+        };
+        // Ein gescheiterter Aufruf hat keinen Record abgelegt — was seine
+        // Ausgabe nennt, ist nicht seiner.
+        if report.exit_code.is_some_and(|code| code != 0) {
+            continue;
+        }
+        if let Some(id) = report.output.lines().next().and_then(decision_line)
+            && !out.iter().any(|e| e.decision_id == id)
+        {
+            out.push(DecisionEvent {
+                seq: post.seq,
+                decision_id: id,
+            });
+        }
+    }
+    out
 }
 
 /// Die vom Witness verketteten Intent-Events eines Bereichs (EA-14) — eine
@@ -1460,6 +1525,109 @@ mod tests {
 
     fn key() -> SessionKey {
         SessionKey::new("claude-code", "31f3f224").unwrap()
+    }
+
+    /// Die Verknüpfung Session ↔ Entscheidung kommt aus der Tool-Antwort
+    /// des eigenen `minds decide`-Aufrufs: Kommando nennt es, Antwort trägt
+    /// die Zeile — beides, sonst nichts.
+    #[test]
+    fn a_minds_decide_call_links_the_session_to_the_record() {
+        let hex = "f1d311757e0f65b9852d2d5ad873beaf6ab3caf9e1e1caafe6252cfaeb9c7b53";
+        let pre = |seq, id: &str, command: &str| {
+            ev(
+                seq,
+                EventKind::ToolPre,
+                "PreToolUse",
+                "t1",
+                &serde_json::json!({"tool_name":"Bash","tool_input":{"command":command},"tool_use_id":id})
+                    .to_string(),
+            )
+        };
+        let post = |seq, id: &str, command: &str, stdout: &str| {
+            ev(
+                seq,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t2",
+                &serde_json::json!({"tool_name":"Bash","tool_input":{"command":command},
+                    "tool_response":{"stdout":stdout,"stderr":"","interrupted":false},"tool_use_id":id})
+                    .to_string(),
+            )
+        };
+        let heredoc = "minds decide <<'EOF'\n{\"topic\":\"x\"}\nEOF";
+        let stdout = format!("decision b3-{hex}\n  topic       x\n");
+        let other = "0000000000000000000000000000000000000000000000000000000000000001";
+        let smuggle = "minds decisions b3-aa ; minds decide --template";
+        let events = [
+            ev(0, EventKind::Prompt, "UserPromptSubmit", "t0", r#"{"prompt":"x"}"#),
+            pre(1, "a", heredoc),
+            post(2, "a", heredoc, &stdout),
+            // Dieselbe Zeile aus einem anderen Kommando: keine Entscheidung.
+            pre(3, "b", "cat notes.txt"),
+            post(4, "b", "cat notes.txt", &stdout),
+            // `minds decide` ohne gültige Id-Zeile: nichts.
+            pre(5, "c", "cat d.json | minds decide"),
+            post(6, "c", "cat d.json | minds decide", "minds decide: not valid JSON\n"),
+            // Ein anderes Wort: nichts.
+            pre(7, "d", "echo minds decided"),
+            post(8, "d", "echo minds decided", &stdout),
+            // Ein anderes Kommando in derselben Zeile, dessen Ausgabe eine
+            // fremde Id nennt: nichts — das Tor ist der Aufruf allein.
+            pre(9, "e", smuggle),
+            post(10, "e", smuggle, &format!("decision b3-{other}\n{{\n")),
+            // Die Zeile erst als zweite: nichts.
+            pre(11, "f", "minds decide < d.json"),
+            post(12, "f", "minds decide < d.json", &format!("note\ndecision b3-{other}\n")),
+            // Gescheitert (Exit-Code ≠ 0), auch wenn die Ausgabe die Zeile
+            // nennt: nichts — der Aufruf hat keinen Record abgelegt.
+            pre(13, "g", "minds decide < d.json"),
+            ev(
+                14,
+                EventKind::ToolPost,
+                "PostToolUseFailure",
+                "t2",
+                &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"minds decide < d.json"},
+                    "error":format!("Exit code 1\ndecision b3-{other}"),"is_interrupt":false,"tool_use_id":"g"})
+                    .to_string(),
+            ),
+            // Ein zweites Kommando in der zweiten Zeile, hinter `&`, links
+            // der Pipe oder nach dem Heredoc-Begrenzer: nichts — das Tor
+            // ist der Aufruf allein, und Claude Code mischt stderr in stdout.
+            pre(19, "j", "minds decide --template >/dev/null\necho decision b3-x"),
+            post(20, "j", "minds decide --template >/dev/null\necho decision b3-x", &format!("decision b3-{other}\n")),
+            pre(21, "k", "minds decide --template >/dev/null & echo decision b3-x"),
+            post(22, "k", "minds decide --template >/dev/null & echo decision b3-x", &format!("decision b3-{other}\n")),
+            pre(23, "l", "echo decision b3-x >&2 | minds decide < d.json"),
+            post(24, "l", "echo decision b3-x >&2 | minds decide < d.json", &format!("decision b3-{other}\n{stdout}")),
+            pre(25, "m", "minds decide <<'EOF'\n{}\nEOF\necho decision b3-x"),
+            post(26, "m", "minds decide <<'EOF'\n{}\nEOF\necho decision b3-x", &format!("decision b3-{other}\n")),
+            // Der Begrenzer als No-op-Kommando mitten im Text, stderr
+            // weggeleitet, Exit 0: nichts.
+            pre(27, "n", "minds decide 2>/dev/null <<:\n:\necho decision b3-x\n:"),
+            post(28, "n", "minds decide 2>/dev/null <<:\n:\necho decision b3-x\n:", &format!("decision b3-{other}\n")),
+            // Unterbrochen: nichts.
+            pre(15, "h", "minds decide < d.json"),
+            ev(
+                16,
+                EventKind::ToolPost,
+                "PostToolUse",
+                "t2",
+                &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"minds decide < d.json"},
+                    "tool_response":{"stdout":stdout,"stderr":"","interrupted":true},"tool_use_id":"h"})
+                    .to_string(),
+            ),
+            // Dieselbe Id ein zweites Mal: einmal genannt.
+            pre(17, "i", heredoc),
+            post(18, "i", heredoc, &stdout),
+        ];
+        let session = build_one(&key(), &events);
+        assert_eq!(
+            session.decision_events,
+            vec![minds_core::decision::DecisionEvent {
+                seq: 2,
+                decision_id: format!("b3-{hex}").parse().unwrap(),
+            }]
+        );
     }
 
     /// EA-14: Projiziert wird nur genau die Form, die der Witness schreibt
