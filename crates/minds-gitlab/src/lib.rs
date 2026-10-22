@@ -290,8 +290,12 @@ impl Project {
     /// Nutzer schreiben — `trace-ascii` schriebe den Token in eine Datei,
     /// `location` schickte ihn einem Umleitungsziel hinterher, `proxy` mit
     /// `insecure` ließe einen fremden Server ein „passendes" Issue liefern.
-    /// `--proto` nennt nur das Schema der Basis-URL, `--proto-redir -all`
-    /// schließt jede Umleitung aus, auch wenn eine Option sie doch erlaubte.
+    /// `--proto` nennt nur das Schema der Basis-URL, `--max-redirs 0`
+    /// schließt jede Umleitung aus, auch wenn eine Option sie doch erlaubte
+    /// (`--location` scheitert dann an der ersten Umleitung, statt ihr zu
+    /// folgen). Früher stand hier `--proto-redir -all`; curl ab 8.1x lehnt
+    /// eine leere Protokollmenge als „badly used" ab, und der Aufruf kam
+    /// gar nicht erst zum Server.
     /// `SSLKEYLOGFILE` fällt weg: Damit ließe sich TLS mitlesen.
     ///
     /// Die übrige Umgebung (Proxy-, CA-Variablen) ist die des Menschen und
@@ -317,7 +321,7 @@ impl Project {
             } else {
                 &self.token_env
             })
-            .args(["--proto", proto, "--proto-redir", "-all"])
+            .args(["--proto", proto, "--max-redirs", "0"])
             .args(["--silent", "--show-error"])
             .args(["--connect-timeout", CONNECT_TIMEOUT])
             .args(["--max-time", MAX_TIME])
