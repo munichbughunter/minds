@@ -763,9 +763,14 @@ fn evaluate_in(probe: Option<&Probe>, run: &Run<'_>, record: &Budget) -> ProbeRe
     }
 }
 
+/// Übersetzt ein Probenmuster: `^` und `$` gelten je Zeile, wie bei
+/// `grep` — ein Muster `^dependencies = \[\]` meint die Zeile, nicht den
+/// Dateianfang. Kein Unicode (Klassen bleiben ASCII, das Muster klein),
+/// und beide Größengrenzen gedeckelt.
 fn compile(pattern: &str) -> Result<regex::bytes::Regex, &'static str> {
     regex::bytes::RegexBuilder::new(pattern)
         .unicode(false)
+        .multi_line(true)
         .size_limit(REGEX_SIZE_LIMIT)
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .build()
@@ -1897,6 +1902,26 @@ mod tests {
         );
         assert_eq!(
             evaluate(Some(&pattern("*.rs", Some("gamma"), None)), &tree),
+            ProbeResult::Fails
+        );
+        // `^` und `$` je Zeile, wie grep: Die zweite Zeile zählt.
+        let lines = MemoryTree::new().with("pyproject.toml", b"[project]\ndependencies = []\n");
+        assert_eq!(
+            evaluate(
+                Some(&pattern(
+                    "pyproject.toml",
+                    Some("^dependencies = \\[\\]$"),
+                    None
+                )),
+                &lines
+            ),
+            ProbeResult::Holds
+        );
+        assert_eq!(
+            evaluate(
+                Some(&pattern("pyproject.toml", Some("^project]$"), None)),
+                &lines
+            ),
             ProbeResult::Fails
         );
         // must_not_match: in keiner.
