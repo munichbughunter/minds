@@ -937,6 +937,61 @@ fn commit_detail(
         lines.push(Line::raw(""));
     }
 
+    // DECISIONS — was die Sessions dieses Commits aufgenommen haben: je
+    // eine Zeile mit Thema und Stand (sobald geholt), als Aussage. Die
+    // Zahlen der Übersicht zählen nichts davon — die gehören dem
+    // Decisions-Tab.
+    // Reihenfolge der Sessions, jede Id einmal — zwei Sessions, die
+    // denselben Record nennen, zählen ihn nicht doppelt.
+    let mut decisions: Vec<minds_core::ContentHash> = Vec::new();
+    for id in row
+        .sessions
+        .iter()
+        .flat_map(|sid| crate::decision::named_decisions(&app.inspection, *sid))
+    {
+        if !decisions.contains(&id) {
+            decisions.push(id);
+        }
+    }
+    if !decisions.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("DECISIONS ({})", decisions.len()),
+            theme::title(),
+        )));
+        let (claim_glyph, _, claim_style) = theme::claim();
+        for id in decisions.iter().take(4) {
+            let mut spans = vec![Span::styled(
+                format!("{claim_glyph} ⚖ {}  ", anchor_short(id)),
+                claim_style,
+            )];
+            match app.decision_record(id) {
+                Some(a) => {
+                    spans.push(Span::styled(
+                        crate::view::clip(&a.topic, inner.saturating_sub(44).max(12)),
+                        claim_style,
+                    ));
+                    let (glyph, headline, style) = match app.decision(id) {
+                        Some(fresh) => {
+                            let (g, _, s) = theme::standing(fresh.standing);
+                            (g, crate::view::clip(&fresh.headline(), 40), s)
+                        }
+                        None => ("?", "rechecking…".to_owned(), theme::dim()),
+                    };
+                    spans.push(Span::styled(format!("  {glyph} {headline}"), style));
+                }
+                None => spans.push(Span::styled(app.decision_absent(id), theme::dim())),
+            }
+            lines.push(Line::from(spans));
+        }
+        if decisions.len() > 4 {
+            lines.push(Line::from(Span::styled(
+                format!("  … {} more — D opens Decisions", decisions.len() - 4),
+                theme::dim(),
+            )));
+        }
+        lines.push(Line::raw(""));
+    }
+
     // PROMPT — der Auftrag des Menschen als eigener Abschnitt (C3.6), vor
     // den Sessions, je Session in Session-Reihenfolge. Als Claim
     // gekennzeichnet: aufgezeichnet, nicht belegt. Volltext, umgebrochen,

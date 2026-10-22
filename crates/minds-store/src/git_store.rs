@@ -249,6 +249,21 @@ const REPLAY_SIG_FILE: &str = "record.sig";
 /// Höchstgröße eines Records, geprüft am Objekt-Header vor dem Lesen.
 const REPLAY_MAX: u64 = minds_core::replay::MAX_RECORD as u64;
 
+/// Entscheidungs-Records: ein Ref je Record, elternloser Commit, Baum
+/// `record` (kanonisches JSON).
+const DECISION_REF_PREFIX: &str = "refs/minds/decisions/";
+
+/// Der Record im Baum des Entscheidungs-Refs.
+const DECISION_FILE: &str = "record";
+
+/// So viel liest der Store von einem Entscheidungs-Record zurück.
+const DECISION_MAX: u64 = minds_core::decision::MAX_RECORD as u64;
+
+/// So viele Entscheidungs-Refs listet der Store höchstens — der Namensraum
+/// ist agentseitig beschreibbar, und `minds brief` liest beim Start jeder
+/// Session. Mehr als das zählt der Leser als „nicht gelistet".
+pub const MAX_LISTED_DECISIONS: usize = 2048;
+
 /// Namensraum der Erstsicht-Gegenzeichnungen (EA-19): ein elternloser
 /// Commit je Seal, adressiert über die volle `seal_id` (wie die Seals unter
 /// `refs/minds/evidence/`). Die erste Sicht gewinnt — geschrieben wird nur,
@@ -1166,6 +1181,18 @@ fn replay_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
     (id.hex() == hex).then_some(id)
 }
 
+/// Der Ref eines Entscheidungs-Records.
+fn decision_ref(id: &minds_core::ContentHash) -> String {
+    format!("{DECISION_REF_PREFIX}{}", id.hex())
+}
+
+/// Die Id hinter einem Entscheidungs-Ref — `None` für Fremdes.
+fn decision_id_of_ref(name: &str) -> Option<minds_core::ContentHash> {
+    let hex = name.strip_prefix(DECISION_REF_PREFIX)?;
+    let id: minds_core::ContentHash = hex.parse().ok()?;
+    (id.hex() == hex).then_some(id)
+}
+
 /// Der Ref der Erstsicht-Gegenzeichnung eines Seals.
 fn first_sight_ref(seal: &minds_core::ContentHash) -> String {
     format!("{FIRST_SIGHT_REF_PREFIX}{}", seal.hex())
@@ -1788,6 +1815,100 @@ impl ContextStore for GitStore {
 
     fn replay_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
         self.replay_file(id, REPLAY_FILE, REPLAY_MAX)
+    }
+
+    fn put_decision(
+        &self,
+        record: &minds_redact::RedactedDecision,
+    ) -> Result<minds_core::ContentHash> {
+        let bytes = record.bytes();
+        // Nicht größer, als `get_decision` zurückliest — sonst wäre die Id
+        // für immer gesperrt.
+        if bytes.len() as u64 > DECISION_MAX {
+            return Err(StoreError::backend(std::io::Error::other(
+                "decision record is larger than the store reads back",
+            )));
+        }
+        let id = record.id().clone();
+        let reference = decision_ref(&id);
+        // Content-adressiert: Liegt etwas unter dem Ref, muss es genau dieser
+        // Record sein — ein fremd vorbelegter Ref fällt als Mismatch auf.
+        if self.get_decision(&id)?.is_some() {
+            return Ok(id);
+        }
+        if self
+            .repo
+            .commit_at(&reference)
+            .map_err(StoreError::backend)?
+            .is_some()
+        {
+            return Err(StoreError::backend(std::io::Error::other(
+                "the decision ref is occupied without a readable decision record",
+            )));
+        }
+        let write = || -> minds_git::Result<()> {
+            let blob = self.repo.write_blob(bytes)?;
+            let tree = self.repo.write_tree(None, [(DECISION_FILE, blob)])?;
+            self.repo.commit_tree_onto_expected(
+                &reference,
+                tree,
+                None,
+                &format!("minds: decision {id}"),
+            )?;
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(id),
+            Err(GitError::RefRaced { .. }) => match self.get_decision(&id)? {
+                Some(_) => Ok(id),
+                None => Err(StoreError::backend(std::io::Error::other(
+                    "the decision ref moved but carries no decision record",
+                ))),
+            },
+            Err(err) => Err(StoreError::backend(err)),
+        }
+    }
+
+    fn decision_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        let Some(commit) = self
+            .repo
+            .commit_at(&decision_ref(id))
+            .map_err(StoreError::backend)?
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .repo
+            .read_blob_bounded(commit, DECISION_FILE, DECISION_MAX)
+            .map_err(StoreError::backend)?
+            .map(|(_, bytes)| bytes))
+    }
+
+    fn list_decisions(&self) -> Result<crate::DecisionListing> {
+        // Gedeckelt: ein Namensraum, den jeder Schreiber des Repos füllen
+        // kann, bestimmt sonst, wie lange ein Session-Start dauert. Was der
+        // Deckel oder ein kaputter Ref auslässt, steht in der Antwort.
+        let under = self
+            .repo
+            .refs_under_max(DECISION_REF_PREFIX, MAX_LISTED_DECISIONS)
+            .map_err(StoreError::backend)?;
+        let mut skipped = under.skipped;
+        let ids = under
+            .refs
+            .iter()
+            .filter_map(|(name, _)| {
+                let id = decision_id_of_ref(name);
+                if id.is_none() {
+                    skipped += 1;
+                }
+                id
+            })
+            .collect();
+        Ok(crate::DecisionListing {
+            ids,
+            more: under.more,
+            skipped,
+        })
     }
 
     fn list_replays(&self) -> Result<Vec<minds_core::ContentHash>> {
@@ -3208,6 +3329,111 @@ mod tests {
             store.put_replay_signature(&id, "free text"),
             Err(StoreError::ReplaySignatureMalformed { .. })
         ));
+    }
+
+    /// Ein Entscheidungs-Record, wie ihn die Pipeline zum Ablegen freigibt.
+    fn redacted_decision(topic: &str) -> minds_redact::RedactedDecision {
+        use minds_core::decision::{
+            Assumption, Choice, DECISION_KIND, DECISION_SCHEMA, DecidedBy, DecisionRecord, Probe,
+            Reason, Weight,
+        };
+        let record = DecisionRecord {
+            kind: DECISION_KIND.into(),
+            schema: DECISION_SCHEMA,
+            topic: topic.into(),
+            decided_by: DecidedBy::Agent,
+            at: "2026-10-21T13:09:00Z".into(),
+            chosen: Some(Choice {
+                approach: "flock on a lock file".into(),
+                rests_on: vec![Reason {
+                    assumption: "fork".into(),
+                    weight: Weight::LoadBearing,
+                }],
+            }),
+            open: false,
+            alternatives: Vec::new(),
+            assumptions: vec![Assumption {
+                id: "fork".into(),
+                statement: "daemon.rs forks".into(),
+                probe: Some(Probe::Pattern {
+                    path: Some("src/lib.rs".into()),
+                    glob: None,
+                    must_match: Some("fn main".into()),
+                    must_not_match: None,
+                }),
+            }],
+            scope: Vec::new(),
+            supersedes: None,
+        };
+        minds_redact::RedactionConfig::default()
+            .pipeline()
+            .unwrap()
+            .redact_decision(record)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_decision_record_roundtrips_idempotently_and_fsck_stays_clean() {
+        let (fixture, store) = fresh_store();
+        let redacted = redacted_decision("lock for the witness socket");
+        let id = store.put_decision(&redacted).unwrap();
+        assert_eq!(&id, redacted.id());
+        let (back, bytes) = store.get_decision(&id).unwrap().unwrap();
+        assert_eq!(&back, redacted.record());
+        assert_eq!(bytes, redacted.bytes());
+        let listing = store.list_decisions().unwrap();
+        assert_eq!(listing.ids, vec![id.clone()]);
+        assert!(!listing.more);
+        assert_eq!(listing.skipped, 0);
+        // Idempotent je Id: kein zweiter Commit.
+        assert_eq!(store.put_decision(&redacted).unwrap(), id);
+        let reference = decision_ref(&id);
+        assert_eq!(reference, format!("refs/minds/decisions/{}", id.hex()));
+        assert_eq!(
+            fixture.git(&["rev-list", "--count", &reference]).trim(),
+            "1"
+        );
+        // Ein zweiter Record ist ein zweiter Ref.
+        let other = store
+            .put_decision(&redacted_decision("retry policy"))
+            .unwrap();
+        assert_ne!(other, id);
+        assert_eq!(store.list_decisions().unwrap().ids.len(), 2);
+        fixture.git(&["fsck", "--strict", "--no-progress"]);
+
+        let absent = minds_core::ContentHash::from_bytes([0; 32]);
+        assert!(store.get_decision(&absent).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_tampered_decision_record_is_caught_on_read() {
+        let (fixture, store) = fresh_store();
+        let redacted = redacted_decision("lock for the witness socket");
+        let id = store.put_decision(&redacted).unwrap();
+        // Derselbe Record mit anderem gewähltem Weg unter der alten Id: Die
+        // Bytes hashen nicht mehr auf sie.
+        let forged = String::from_utf8(redacted.bytes().to_vec())
+            .unwrap()
+            .replace("flock on a lock file", "a Unix socket after all");
+        let path = fixture.path().join("forged-decision");
+        std::fs::write(&path, forged).unwrap();
+        let blob = fixture.git(&["hash-object", "-w", path.to_str().unwrap()]);
+        let tree = fixture.git_with_stdin(
+            &["mktree"],
+            &format!("100644 blob {}\t{DECISION_FILE}\n", blob.trim()),
+        );
+        let commit = fixture.git(&["commit-tree", tree.trim(), "-m", "forged"]);
+        fixture.git(&["update-ref", &decision_ref(&id), commit.trim()]);
+        assert!(matches!(
+            store.get_decision(&id),
+            Err(StoreError::DecisionMismatch { .. })
+        ));
+        assert!(store.put_decision(&redacted).is_err());
+        // Fremdes im Namensraum ist kein Record — aber gezählt.
+        fixture.git(&["update-ref", "refs/minds/decisions/kaputt", commit.trim()]);
+        let listing = store.list_decisions().unwrap();
+        assert_eq!(listing.ids, vec![id]);
+        assert_eq!(listing.skipped, 1, "der fremde Ref ist übersprungen");
     }
 
     #[test]

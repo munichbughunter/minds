@@ -220,6 +220,40 @@ pub enum RedactionError {
         field: Field,
     },
 
+    /// Der Entscheidungs-Record besteht [`minds_core::decision::DecisionRecord::check`]
+    /// nicht — es gibt keinen Record.
+    #[error("decision record refused: {0}")]
+    Decision(#[from] minds_core::decision::DecisionError),
+
+    /// Ein Verweis im Entscheidungs-Record (Kennung, Pfad, Glob, Muster,
+    /// Blob-Id, Zeit) trüge etwas, das die Policy entfernt. Ein Platzhalter
+    /// darin wäre ein anderer Verweis — und ein Muster mit Platzhalter
+    /// prüfte etwas anderes als gemeint. Es gibt keinen Record.
+    #[error(
+        "decision record refused: {field} contains content the redaction policy removes — \
+         rewrite it without the secret"
+    )]
+    DecisionFieldRedacted {
+        /// Wo im Record.
+        field: Field,
+    },
+
+    /// Der Record ließ sich nicht kanonisch serialisieren.
+    #[error("decision record could not be serialized canonically")]
+    DecisionNotCanonical,
+
+    /// Ein Platzhalter der Redaction hat einen Text über
+    /// [`minds_core::decision::MAX_TEXT`] hinaus verlängert.
+    #[error(
+        "decision record refused: a text grew past the limit when the redaction policy \
+         replaced a secret in it — shorten the text"
+    )]
+    DecisionRedactedTooLong,
+
+    /// Der Record ist größer als der Store zurückliest.
+    #[error("decision record is larger than the store reads back")]
+    DecisionTooLarge,
+
     /// Die Anforderungsdatei enthält etwas, das die Policy entfernt. Ihre
     /// Blob-SHA (`source=file:…@<blob>`) ist ein Hash über die rohen Bytes —
     /// neben dem redigierten Snapshot ein Orakel für das Entfernte. Es gibt
@@ -423,6 +457,22 @@ pub enum Field {
     SpecValue(usize),
     /// Die ganze kanonische Form des Solls.
     Spec,
+    /// `topic` eines Entscheidungs-Records.
+    DecisionTopic,
+    /// `chosen.approach` eines Entscheidungs-Records.
+    DecisionChosen,
+    /// `alternatives[i].approach`.
+    DecisionAlternative(usize),
+    /// `assumptions[i].statement`.
+    DecisionAssumption(usize),
+    /// `assumptions[i].id` — nur geprüft.
+    DecisionAssumptionId(usize),
+    /// Eine Angabe der Probe `assumptions[i].probe` — nur geprüft.
+    DecisionProbe(usize),
+    /// `scope[i]` eines Entscheidungs-Records — nur geprüft.
+    DecisionScope(usize),
+    /// `at` eines Entscheidungs-Records — nur geprüft.
+    DecisionAt,
 }
 
 impl fmt::Display for Field {
@@ -503,6 +553,14 @@ impl fmt::Display for Field {
             Field::IntentIssueDescription => f.write_str("intent.issue.description"),
             Field::SpecValue(i) => write!(f, "spec.value[{i}]"),
             Field::Spec => f.write_str("spec"),
+            Field::DecisionTopic => f.write_str("decision.topic"),
+            Field::DecisionChosen => f.write_str("decision.chosen.approach"),
+            Field::DecisionAlternative(i) => write!(f, "decision.alternatives[{i}].approach"),
+            Field::DecisionAssumption(i) => write!(f, "decision.assumptions[{i}].statement"),
+            Field::DecisionAssumptionId(i) => write!(f, "decision.assumptions[{i}].id"),
+            Field::DecisionProbe(i) => write!(f, "decision.assumptions[{i}].probe"),
+            Field::DecisionScope(i) => write!(f, "decision.scope[{i}]"),
+            Field::DecisionAt => f.write_str("decision.at"),
         }
     }
 }

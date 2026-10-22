@@ -23,6 +23,7 @@ use crate::theme;
 pub mod activity;
 mod banner;
 pub mod changes;
+mod decision;
 pub mod evidence;
 pub mod help;
 mod intent;
@@ -113,6 +114,14 @@ fn draw_inner(frame: &mut Frame, app: &mut App) {
     }
     if app.tab == Tab::Requirements {
         intent::draw(frame, app, body);
+        footer(frame, app, foot);
+        if app.help {
+            app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
+        }
+        return;
+    }
+    if app.tab == Tab::Decisions {
+        decision::draw(frame, app, body);
         footer(frame, app, foot);
         if app.help {
             app.help_scroll = help::draw(frame, frame.area(), app.tab, app.help_scroll);
@@ -351,6 +360,27 @@ fn footer(frame: &mut Frame, app: &App, area: Rect) {
     }
     if app.tab == Tab::Requirements {
         // Zeile 1 (C1): Bindungen an einen Anker sind aufgezeichnet — Aussagen.
+        let status = explain("claim");
+        let mut keys = vec![
+            freshness(app),
+            Span::raw("  "),
+            Span::styled(actions(app).join("  "), theme::dim()),
+        ];
+        if let Some(closed) = &app.closed {
+            keys.push(Span::styled(format!("  · {closed}"), theme::dim()));
+        }
+        frame.render_widget(
+            Paragraph::new(vec![
+                status_line(with_context(app, status, area.width), area.width),
+                pinned(Line::from(keys), area.width, app.searching),
+            ]),
+            area,
+        );
+        return;
+    }
+    if app.tab == Tab::Decisions {
+        // Zeile 1 (C1): Entscheidungen sind Aussagen des Agenten; ihr Stand
+        // ist eine Ableitung zur Lesezeit, kein Beleg.
         let status = explain("claim");
         let mut keys = vec![
             freshness(app),
@@ -625,6 +655,13 @@ fn fixed_actions(app: &App) -> Vec<&'static str> {
             "PgUp PgDn scroll",
             "/ filter",
         ],
+        Tab::Decisions => vec![
+            "↑↓ decision",
+            "Enter story",
+            "Space technical",
+            "PgUp PgDn scroll",
+            "/ filter",
+        ],
     }
 }
 
@@ -675,6 +712,18 @@ fn context(app: &App, wide: bool) -> Vec<Span<'static>> {
             format!("{} ", &commit.to_string()[..7]),
             Style::default().fg(theme::CHANGE),
         ));
+    }
+    if app.tab == Tab::Decisions
+        && let Some(a) = app.decisions.as_ref().and_then(|d| d.selected())
+    {
+        // Kurz-Id, dann der Stand in Wörtern — wie die Fußzeile der
+        // Anforderungen (C2).
+        let stale = app.decisions.as_ref().is_some_and(|d| d.stale);
+        spans.push(Span::styled(
+            format!("⚖ {} · ", overview::anchor_short(&a.id)),
+            theme::title(),
+        ));
+        spans.push(Span::raw(format!("{}  ", decision::status_words(a, stale))));
     }
     if app.tab == Tab::Requirements
         && let Some(anchor) = app.intent.as_ref().and_then(|i| i.selected())

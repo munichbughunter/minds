@@ -33,13 +33,15 @@
 //! **gespeicherten Bytes**, nicht gegen das, was wir daraus wieder machen
 //! würden.
 
+use minds_core::decision::DecisionRecord;
 use minds_core::first_sight::FirstSight;
 use minds_core::intent_anchor::IntentAnchor;
 use minds_core::observation::Observations;
 use minds_core::replay::ReplayRecord;
 use minds_core::{ContentHash, EvidenceMark, Session, SessionId};
 use minds_redact::{
-    RedactedIntent, RedactedObservations, RedactedSession, RedactedSpec, ScannedReplayRecord,
+    RedactedDecision, RedactedIntent, RedactedObservations, RedactedSession, RedactedSpec,
+    ScannedReplayRecord,
 };
 
 use crate::bytes::SessionBytes;
@@ -198,6 +200,20 @@ impl Forget {
             Forget::Absent(_) => &[],
         }
     }
+}
+
+/// Was das Listen der Entscheidungs-Refs ergab. Der Namensraum ist einer,
+/// den jeder Schreiber des Repos füllen kann; die Liste ist deshalb
+/// gedeckelt — und sagt, wenn sie nicht vollständig ist, damit ein Gate
+/// (`minds decisions --check`) nicht auf einer Teilmenge „grün" sagt.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DecisionListing {
+    /// Die Ids, nach Ref-Name.
+    pub ids: Vec<ContentHash>,
+    /// Ob es mehr Refs gab, als angesehen wurden (Deckel oder Budget).
+    pub more: bool,
+    /// Angesehene Refs ohne lesbaren Commit oder ohne Id als Namen.
+    pub skipped: usize,
 }
 
 /// Ein Speicher für Sessions, adressiert über ihre [`SessionId`].
@@ -671,6 +687,62 @@ pub trait ContextStore {
             id: id.clone(),
             reason: format!("{:?}", err.classify()).to_lowercase(),
         })?;
+        Ok(Some((record, bytes)))
+    }
+
+    /// Legt einen Entscheidungs-Record ab und gibt seine Id zurück:
+    /// `blake3` der kanonischen Bytes, ein elternloser Commit je Record
+    /// unter `refs/minds/decisions/<64 hex>`, Baum `record`.
+    ///
+    /// Dass hier [`RedactedDecision`] verlangt wird, ist dieselbe
+    /// fail-closed-Zusage in Typform wie bei [`put`](Self::put): Ein Record,
+    /// der nicht durch die Redaction ging, kann den Store nicht erreichen.
+    /// Idempotent je Id; der Default lehnt ab, statt still zu verlieren.
+    fn put_decision(&self, _record: &RedactedDecision) -> Result<ContentHash> {
+        Err(StoreError::backend(std::io::Error::other(
+            "this backend does not store decision records",
+        )))
+    }
+
+    /// Die rohen Bytes eines Entscheidungs-Records — **ungeprüft**.
+    fn decision_bytes(&self, _id: &ContentHash) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    /// Die abgelegten Entscheidungs-Records — gedeckelt, und ehrlich
+    /// darüber, was die Liste nicht enthält. Ein Backend ohne Records
+    /// meldet `more: true`: Es hat nicht „nichts", es kann nicht listen —
+    /// und ein Gate darauf bleibt zu.
+    fn list_decisions(&self) -> Result<DecisionListing> {
+        Ok(DecisionListing {
+            ids: Vec::new(),
+            more: true,
+            skipped: 0,
+        })
+    }
+
+    /// Der Entscheidungs-Record unter `id` samt seiner gespeicherten Bytes
+    /// — `None`, wenn er hier nicht liegt. Geprüft wird gegen die
+    /// **gespeicherten Bytes**; gelesen wird tolerant. Ob der Record die
+    /// Prüfung besteht, sagt der Reader (`check()` läuft dort vor jeder
+    /// Probe) — ein Dokument, das keine Entscheidung ist, wird hier nicht
+    /// verschwiegen, sondern als solches gezeigt.
+    fn get_decision(&self, id: &ContentHash) -> Result<Option<(DecisionRecord, Vec<u8>)>> {
+        let Some(bytes) = self.decision_bytes(id)? else {
+            return Ok(None);
+        };
+        let actual = DecisionRecord::id_of_bytes(&bytes);
+        if actual != *id {
+            return Err(StoreError::DecisionMismatch {
+                requested: id.clone(),
+                actual,
+            });
+        }
+        let record =
+            serde_json::from_slice(&bytes).map_err(|err| StoreError::MalformedDecision {
+                id: id.clone(),
+                reason: format!("{:?}", err.classify()).to_lowercase(),
+            })?;
         Ok(Some((record, bytes)))
     }
 

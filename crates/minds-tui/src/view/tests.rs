@@ -2152,15 +2152,15 @@ mod changes_tab {
         let (_dir, repo) = repo();
         let mut app = App::new(filled(), &repo, None);
         let out = render(&mut app);
-        // C12.2 (Klasse 2): vier Tabs in Workflow-Reihenfolge — der
+        // C12.2 (Klasse 2): die Tabs in Workflow-Reihenfolge — der
         // Verify-Tab ist in der Übersicht aufgegangen, Intent heißt
-        // Requirements.
+        // Requirements, Decisions steht zuletzt.
         assert!(out.contains("F1 Overview"), "{out}");
         assert!(out.contains("F2 Changes"), "{out}");
         assert!(out.contains("F3 Sessions"), "{out}");
         assert!(out.contains("F4 Requirements"), "{out}");
+        assert!(out.contains("F5 Decisions"), "{out}");
         assert!(!out.contains("Verify"), "{out}");
-        assert!(!out.contains("F5"), "{out}");
         app.reduce(Action::CycleTab(true));
         assert_eq!(app.tab, Tab::Requirements);
         // Ohne lesbaren Commit (leeres Repo) öffnet der Tab trotzdem — mit
@@ -3801,5 +3801,6 @@ mod overview_tab {
 
 mod c11;
 mod c121;
+mod decision_tab;
 mod tamper;
 mod ux;

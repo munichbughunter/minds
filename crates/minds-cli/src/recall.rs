@@ -39,16 +39,67 @@ fn recall(target: &str) -> Fallible<()> {
     if let Some(note) = skipped.note() {
         eprintln!("minds recall: {note}");
     }
-    let (label, sessions) = resolved?;
-    let markdown =
+    // Die Entscheidungen dazu: die, die eine der Sessions aufgenommen hat,
+    // und die, deren Scope den Pfad betrifft — vollständig, ohne Deckel.
+    // Eine Entscheidung ist Kontext auch dort, wo noch keine Session die
+    // Datei berührt hat: Dann steht der Brief nur aus ihr.
+    let path = split_file_line(target)
+        .map(|(path, _)| path)
+        .or_else(|| (ctx.resolve_rev(target).is_none()).then_some(target));
+    let paths: Vec<String> = path.map(str::to_owned).into_iter().collect();
+    let decisions = |sessions: &[Session]| -> String {
+        match crate::decide_cmd::Assessed::load(&ctx) {
+            Ok(assessed) => {
+                let heads: Vec<minds_reader::decisions::Assessment> = assessed
+                    .for_sessions(sessions, &paths)
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                minds_reader::brief::render_decisions(&heads, None)
+            }
+            Err(err) => {
+                eprintln!(
+                    "minds recall: decisions left out: {}",
+                    crate::text::sanitize(&err.to_string())
+                );
+                String::new()
+            }
+        }
+    };
+    let (label, sessions) = match resolved? {
+        Some(resolved) => resolved,
+        // Kein Kontext — kein Fehler: Dann steht der Brief aus den
+        // Entscheidungen, oder es gibt ihn nicht.
+        None => {
+            let section = decisions(&[]);
+            if section.is_empty() {
+                return Err(format!(
+                    "no context for {target:?} — no line, commit, file or decision with captured context"
+                )
+                .into());
+            }
+            let markdown = format!(
+                "# Context brief — {}\n\n_No session has touched this target yet; the decisions concerning it:_\n\n{section}",
+                crate::text::sanitize(target)
+            );
+            print!("{}", terminal_markdown(&markdown, terminal_width()));
+            return Ok(());
+        }
+    };
+    let mut markdown =
         minds_reader::brief::render_full_intents(&format!("Context brief — {label}"), &sessions);
-    let width = terminal_size::terminal_size()
+    markdown.push_str(&decisions(&sessions));
+    print!("{}", terminal_markdown(&markdown, terminal_width()));
+    Ok(())
+}
+
+/// Die Breite des Terminals: gemessen, sonst `COLUMNS`, sonst 80.
+fn terminal_width() -> usize {
+    terminal_size::terminal_size()
         .map(|(terminal_size::Width(width), _)| usize::from(width))
         .or_else(|| std::env::var("COLUMNS").ok()?.parse().ok())
         .filter(|width| *width > 0)
-        .unwrap_or(80);
-    print!("{}", terminal_markdown(&markdown, width));
-    Ok(())
+        .unwrap_or(80)
 }
 
 /// Originale Zeilen erhalten, fremden Text vor dem Umbruch entschärfen und
@@ -87,19 +138,19 @@ fn resolve_target(
     ctx: &Context,
     target: &str,
     skipped: &mut Skipped,
-) -> Fallible<(String, Vec<Session>)> {
+) -> Fallible<Option<(String, Vec<Session>)>> {
     if let Some((path, line)) = split_file_line(target) {
         if let Some(commit) = ctx.blame_commit(path, line)? {
             let (sessions, s) = ctx.sessions_of_commit(commit)?;
             skipped.merge(s);
-            return Ok((format!("{path}:{line} → commit {commit}"), sessions));
+            return Ok(Some((format!("{path}:{line} → commit {commit}"), sessions)));
         }
     }
 
     if let Some(commit) = ctx.resolve_rev(target) {
         let (sessions, s) = ctx.sessions_of_commit(commit)?;
         skipped.merge(s);
-        return Ok((format!("commit {commit}"), sessions));
+        return Ok(Some((format!("commit {commit}"), sessions)));
     }
 
     let (mut behind, s) = ctx.sessions_of_file(target)?;
@@ -112,13 +163,11 @@ fn resolve_target(
         }
     }
     if !behind.is_empty() {
-        return Ok((format!("file {target}"), behind));
+        return Ok(Some((format!("file {target}"), behind)));
     }
-
-    Err(
-        format!("no context for {target:?} — no line, commit, or file with captured context")
-            .into(),
-    )
+    // Kein Kontext ist kein Betriebsfehler: Der wäre oben mit `?`
+    // durchgereicht worden.
+    Ok(None)
 }
 
 /// Zerlegt `<datei>:<zeile>` — am **letzten** Doppelpunkt, wie `why`. Kein

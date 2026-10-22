@@ -95,11 +95,33 @@ fn brief(paths: &[String], hook: bool) -> Fallible<()> {
     } else {
         paths.join(", ")
     };
-    let markdown = minds_reader::brief::render(
+    let mut markdown = minds_reader::brief::render(
         &format!("Context for the agent — {label}"),
         &sessions,
         Some(CAP),
     );
+    // Die Entscheidungen zu diesen Pfaden (ohne Pfade: alle Spitzen), mit
+    // dem Stand ihrer Annahmen heute — was neu zu bewerten ist, zuerst.
+    // Ein unlesbarer Index nimmt dem Brief nur diesen Abschnitt, nicht den
+    // Rest; der Grund steht im Log bzw. auf stderr.
+    match crate::decide_cmd::Assessed::load(&ctx) {
+        Ok(assessed) => {
+            let heads: Vec<minds_reader::decisions::Assessment> =
+                assessed.concerning(paths).into_iter().cloned().collect();
+            markdown.push_str(&minds_reader::brief::render_decisions(&heads, Some(CAP)));
+        }
+        Err(err) => {
+            let note = format!(
+                "decisions left out: {}",
+                crate::text::sanitize(&err.to_string())
+            );
+            if hook {
+                hooklog::log(Source::Brief, &note);
+            } else {
+                eprintln!("minds brief: {note}");
+            }
+        }
+    }
 
     // Der Hinweis kommt vor der Ausgabe — auch ein leerer Brief erklärt sich
     // dann (#83). Im Hook-Fall geht er ins Log, stdout trägt nur das Envelope.

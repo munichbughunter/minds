@@ -188,19 +188,22 @@ fn everything_above_scope_checked(app: &mut App, commits: &[CommitId], cli: Comm
 // C12.2-AC1 · Tabs in Workflow-Reihenfolge, kein Verify-Tab
 // ---------------------------------------------------------------------
 
-/// `1 Overview · 2 Changes · 3 Sessions · 4 Requirements` — F1–F4, `1`–`4`,
+/// `1 Overview · 2 Changes · 3 Sessions · 4 Requirements · 5 Decisions` — F1–F5, `1`–`5`,
 /// Tab/Shift-Tab; der Verify-Tab ist weg, der Intent-Tab heißt Requirements.
 #[test]
 fn c122_tabs_are_in_workflow_order_and_verify_is_gone() {
     let (_dir, repo, _, inspection) = history();
     let mut app = opened(&repo, inspection);
+    // Klasse 2: Seit den Entscheidungen fünf Tabs — Decisions zuletzt, als
+    // Gegenstück zu Requirements (was verlangt war · was gewählt wurde).
     assert_eq!(
         Tab::ALL,
         [
             Tab::Overview,
             Tab::Changes,
             Tab::Sessions,
-            Tab::Requirements
+            Tab::Requirements,
+            Tab::Decisions
         ]
     );
     let out = text_at(&mut app, 160, 40);
@@ -210,57 +213,63 @@ fn c122_tabs_are_in_workflow_order_and_verify_is_gone() {
         "F2 Changes",
         "F3 Sessions",
         "F4 Requirements",
+        "F5 Decisions",
     ] {
         assert!(head.contains(label), "{head}");
     }
     assert!(!head.contains("Verify"), "{head}");
     assert!(!head.contains("Intent"), "{head}");
-    assert!(!head.contains("F5"), "{head}");
     // Unter 100 Spalten die Kurzlabels, in derselben Reihenfolge.
     let out = text_at(&mut app, 80, 24);
     let head = out.lines().next().unwrap();
-    for label in ["F1 Ovw", "F2 Chg", "F3 Ses", "F4 Req"] {
+    for label in ["F1 Ovw", "F2 Chg", "F3 Ses", "F4 Req", "F5 Dec"] {
         assert!(head.contains(label), "{head}");
     }
     assert!(!head.contains("F3 Ver"), "{head}");
-    // Die Ziffern folgen der Reihenfolge; eine fünfte gibt es nicht.
+    // Die Ziffern folgen der Reihenfolge.
     app.reduce(Action::TabTo(1));
     assert_eq!(app.tab, Tab::Changes);
     app.reduce(Action::TabTo(2));
     assert_eq!(app.tab, Tab::Sessions);
     app.reduce(Action::TabTo(3));
     assert_eq!(app.tab, Tab::Requirements);
-    app.reduce(Action::TabTo(4));
-    assert_eq!(app.tab, Tab::Requirements, "no fifth tab");
     // Der Breadcrumb nennt den Tab Requirements.
     let out = text_at(&mut app, 160, 40);
     let crumb = out.lines().nth(1).unwrap();
     assert!(crumb.contains("Requirements"), "{crumb}");
     assert!(!crumb.contains("Intent"), "{crumb}");
-    // Tab/Shift-Tab laufen im Kreis über die vier.
+    app.reduce(Action::TabTo(4));
+    assert_eq!(app.tab, Tab::Decisions);
+    // Tab/Shift-Tab laufen im Kreis über die fünf.
     app.reduce(Action::CycleTab(true));
     assert_eq!(app.tab, Tab::Overview);
     app.reduce(Action::CycleTab(false));
-    assert_eq!(app.tab, Tab::Requirements);
+    assert_eq!(app.tab, Tab::Decisions);
     app.reduce(Action::CycleTab(false));
-    assert_eq!(app.tab, Tab::Sessions);
+    assert_eq!(app.tab, Tab::Requirements);
 }
 
-/// Hilfe und Fußzeile kennen vier Tabs; `v` steht in der Übersicht.
+/// Hilfe und Fußzeile kennen die fünf Tabs; `v` steht in der Übersicht.
 #[test]
-fn c122_the_help_and_the_footer_name_four_tabs() {
+fn c122_the_help_and_the_footer_name_the_tabs() {
     let (_dir, repo, _, inspection) = history();
     let mut app = opened(&repo, inspection);
     app.reduce(Action::Help);
     let out = text_at(&mut app, 160, 40);
-    assert!(out.contains("1 … 4"), "{out}");
+    assert!(out.contains("1 … 5"), "{out}");
+    assert!(!out.contains("1 … 4"), "{out}");
+    assert_eq!(Tab::ALL.len(), 5);
     assert!(
-        out.contains("Overview · Changes · Sessions · Requirements"),
+        out.contains("Overview · Changes · Sessions · Requirements · Decisions"),
         "{out}"
     );
     assert!(!out.contains("Verify:"), "{out}");
     assert!(!out.contains("Intent:"), "{out}");
+    // Die übrigen Tabs stehen nach der Legende — eine Seite weiter.
+    app.reduce(Action::PageDown);
+    let out = text_at(&mut app, 160, 40);
     assert!(out.contains("Requirements:"), "{out}");
+    assert!(out.contains("Decisions:"), "{out}");
     app.reduce(Action::Back);
     let out = text_at(&mut app, 160, 40);
     let keys = out.lines().last().unwrap();

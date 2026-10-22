@@ -31,6 +31,8 @@
 //!   sind auf [`COMMAND_MAX`] Zeichen gekappt und sagen, wie viel fehlt.
 
 use jiff::Timestamp;
+use minds_core::ContentHash;
+use minds_core::decision::names_decide;
 use minds_core::{
     CaptureNote, CaptureStatus, EdgeKind, EffectKind, Endpoint, ExecClass, Role, Session,
     SessionId, WrittenUnavailable,
@@ -186,6 +188,11 @@ pub struct Step {
     /// Bei `delegated`: die Kind-Session, wenn sie sich eindeutig zuordnen
     /// lässt (siehe [`Story::of`]).
     pub child: Option<SessionId>,
+    /// Die Entscheidungen, die dieser Aufruf aufgenommen hat — ein
+    /// `minds decide`-Kommando, dessen Antwort der Checkpoint gelesen hat
+    /// (`Session::decision_events`), der Reihe nach zugeordnet. Leer für
+    /// jeden anderen Schritt.
+    pub decisions: Vec<ContentHash>,
     /// Schlüssel/Wert-Details für die Detailbox, entschärft — das Kommando
     /// vollständig, der Pfad, Runner und Ergebnis, der Capture-Status.
     pub detail: Vec<(String, String)>,
@@ -229,6 +236,10 @@ pub struct Story {
     pub turns: Vec<StoryTurn>,
     /// Gestartete Sub-Agents, soweit im Index auflösbar, in Kanten-Reihenfolge.
     pub subagents: Vec<SessionId>,
+    /// Die Entscheidungen, die die Session aufgenommen hat
+    /// (`Session::decision_events`), in Journal-Reihenfolge — auch die, die
+    /// sich keinem Schritt zuordnen ließen.
+    pub decisions: Vec<ContentHash>,
 }
 
 /// Ein Lauf gleichartiger Schritte für die Zusammenfassung (Zoom *Summary*):
@@ -302,6 +313,40 @@ impl Story {
             .collect();
         let subagents: Vec<SessionId> = spawned.iter().flatten().copied().collect();
 
+        // Die Entscheidungen der Session, der Reihe nach an die
+        // `minds decide`-Aufrufe vergeben — beide stehen in Journal-Reihenfolge.
+        // Nur, wenn die Zahlen übereinstimmen: Ein Aufruf ohne Record (abgebrochen,
+        // gescheitert) würde sonst die Zuordnung aller folgenden verschieben.
+        // Dann bleiben die Ids an der Story, die Schritte tragen keine.
+        let decisions: Vec<ContentHash> = session
+            .decision_events
+            .iter()
+            .map(|e| e.decision_id.clone())
+            .collect();
+        // Dasselbe Prädikat wie in der Schleife unten: ein gedeuteter
+        // Exec-Aufruf, dessen Kommando `minds decide` nennt.
+        let decide_calls = session
+            .turns
+            .iter()
+            .flat_map(|t| t.tool_calls.iter())
+            .filter(|c| {
+                let uninterpreted = c
+                    .capture
+                    .as_ref()
+                    .is_some_and(|c| c.status == CaptureStatus::Uninterpreted);
+                !uninterpreted
+                    && c.effect
+                        .as_ref()
+                        .is_some_and(|e| e.kind == EffectKind::Exec)
+                    && raw_command(&c.arguments).is_some_and(|c| names_decide(&c))
+            })
+            .count();
+        let mut pending: std::collections::VecDeque<ContentHash> =
+            if decide_calls == decisions.len() {
+                decisions.iter().cloned().collect()
+            } else {
+                std::collections::VecDeque::new()
+            };
         let mut steps: Vec<Step> = Vec::new();
         let mut turns: Vec<StoryTurn> = Vec::with_capacity(session.turns.len());
         for (turn_index, turn) in session.turns.iter().enumerate() {
@@ -418,6 +463,18 @@ impl Story {
                 if let Some(outcome) = outcome {
                     detail.push(("Result".into(), outcome_words(outcome)));
                 }
+                // Dasselbe Prädikat wie bei der Zählung oben: das rohe
+                // Kommando, nicht das mit versteckten Pfaden.
+                let decide_call = command.is_some()
+                    && raw_command(&call.arguments).is_some_and(|c| names_decide(&c));
+                let step_decisions: Vec<ContentHash> = if decide_call {
+                    pending.pop_front().into_iter().collect()
+                } else {
+                    Vec::new()
+                };
+                for id in &step_decisions {
+                    detail.push(("Decision".into(), id.to_string()));
+                }
                 steps.push(Step {
                     number: steps.len() + 1,
                     turn: turn_index,
@@ -431,6 +488,7 @@ impl Story {
                     at: at.clone(),
                     offset_secs,
                     child: None,
+                    decisions: step_decisions,
                     detail,
                 });
             }
@@ -464,6 +522,7 @@ impl Story {
             steps,
             turns,
             subagents,
+            decisions,
         }
     }
 }

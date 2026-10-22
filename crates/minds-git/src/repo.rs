@@ -20,6 +20,7 @@ use std::fmt;
 use std::path::Path;
 
 use crate::error::{GitError, Result, Source};
+use crate::oid::BlobId;
 
 /// Feste Fristen für Ref-Locks, gesetzt über der Repo-Konfiguration.
 ///
@@ -150,6 +151,53 @@ impl Repo {
         )
         .map(Self::from_gix)
         .map_err(|err| GitError::open(git_dir, err))
+    }
+
+    /// Die Einträge des Index, je Pfad die Blob-Id einer regulären Datei
+    /// (Stufe 0, `100644`/`100755`) — oder `None` für alles, was gelistet,
+    /// aber nicht lesbar sein soll: Symlinks, Submodule, Pfade im
+    /// Merge-Konflikt (nur Stufen 1–3), `git add -N`-Einträge. Ein Sparse-
+    /// Index (zusammengefaltete Verzeichnisse) wird abgelehnt (`None` für
+    /// den ganzen Aufruf): Er nennt nicht jede Datei. Dieselbe Größengrenze
+    /// wie [`tracked_paths`](Self::tracked_paths); ein Name, der kein UTF-8
+    /// ist, wird verlustbehaftet gelistet und ist unlesbar — die Datei ist
+    /// da, eine Probe kann sie nicht bewerten, und ein Glob, der sie
+    /// betrifft, sieht sie. Dazu die Einteilung nach Modus und Stufe. Der
+    /// Inhalt hinter einer Id
+    /// kommt über [`read_blob_verified`](Self::read_blob_verified) — aus der
+    /// Objektdatenbank, nie von der Platte: Die Proben der Entscheidungen
+    /// lesen so nie einen Symlink und verketten nie einen Namen mit einem
+    /// Pfad.
+    pub fn index_blobs(&self, max_bytes: u64) -> Option<Vec<(String, Option<BlobId>)>> {
+        use gix::index::entry::{Flags, Mode, Stage};
+        match std::fs::symlink_metadata(self.inner.index_path()) {
+            Ok(meta) if meta.is_file() && meta.len() <= max_bytes => {}
+            Ok(_) => return None,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
+        }
+        let index = self.inner.open_index().ok()?;
+        if index.entries().iter().any(|entry| entry.mode == Mode::DIR) {
+            return None;
+        }
+        let mut out: Vec<(String, Option<BlobId>)> = Vec::new();
+        for entry in index.entries() {
+            let (path, utf8) = match std::str::from_utf8(entry.path(&index)) {
+                Ok(path) => (std::borrow::Cow::Borrowed(path), true),
+                Err(_) => (String::from_utf8_lossy(entry.path(&index)), false),
+            };
+            let regular = utf8
+                && entry.stage() == Stage::Unconflicted
+                && (entry.mode == Mode::FILE || entry.mode == Mode::FILE_EXECUTABLE)
+                && !entry.flags.contains(Flags::INTENT_TO_ADD);
+            let id = regular.then(|| BlobId::from_gix(entry.id));
+            // Mehrere Stufen desselben Pfads: Einmal gelistet, unlesbar.
+            match out.last_mut() {
+                Some((last, last_id)) if *last == path => *last_id = last_id.and(id),
+                _ => out.push((path.into_owned(), id)),
+            }
+        }
+        Some(out)
     }
 
     /// Die repo-relativen Pfade im Index — was `git ls-files` liefert, ohne
@@ -520,6 +568,138 @@ mod tests {
             Some(vec!["a.txt".to_owned()])
         );
         assert_eq!(repo.tracked_paths(8), None, "über der Grenze");
+    }
+
+    #[test]
+    fn index_blobs_lists_regular_files_with_their_ids_and_marks_the_rest_unreadable() {
+        let fixture = TempRepo::init();
+        let repo = Repo::open_pinned(fixture.path().join(".git")).unwrap();
+        assert_eq!(repo.index_blobs(1024), Some(Vec::new()), "kein Index");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(fixture.path())
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        std::fs::write(fixture.path().join("a.txt"), "a").unwrap();
+        std::fs::write(fixture.path().join("run.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::write(fixture.path().join("later.txt"), "").unwrap();
+        git(&["add", "a.txt", "run.sh"]);
+        git(&["update-index", "--chmod=+x", "run.sh"]);
+        git(&["add", "-N", "later.txt"]);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("a.txt", fixture.path().join("link")).unwrap();
+            git(&["add", "link"]);
+        }
+        let expected_a = git(&["hash-object", "a.txt"]);
+        let blobs = repo.index_blobs(1024 * 1024).unwrap();
+        let find = |name: &str| blobs.iter().find(|(p, _)| p == name).map(|(_, id)| *id);
+        assert_eq!(
+            find("a.txt").unwrap().unwrap().to_string(),
+            expected_a.trim()
+        );
+        assert!(find("run.sh").unwrap().is_some(), "100755 ist regulär");
+        assert_eq!(find("later.txt"), Some(None), "intent-to-add ist unlesbar");
+        #[cfg(unix)]
+        assert_eq!(
+            find("link"),
+            Some(None),
+            "ein Symlink ist gelistet, nie lesbar"
+        );
+        assert_eq!(repo.index_blobs(8), None, "über der Grenze");
+
+        // Ein Submodul (Gitlink, 160000): gelistet, unlesbar — ohne ein
+        // zweites Repo, nur der Index-Eintrag.
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,vendor/sub",
+        ]);
+        let blobs = repo.index_blobs(1024 * 1024).unwrap();
+        let find = |name: &str| blobs.iter().find(|(p, _)| p == name).map(|(_, id)| *id);
+        assert_eq!(find("vendor/sub"), Some(None), "ein Submodul ist unlesbar");
+        // Ein Name, der kein UTF-8 ist: verlustbehaftet gelistet, unlesbar.
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut arg = b"100644,".to_vec();
+            arg.extend_from_slice(expected_a.trim().as_bytes());
+            arg.extend_from_slice(b",raw-\xff.txt");
+            let arg = std::ffi::OsString::from_vec(arg);
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(fixture.path())
+                .args(["update-index", "--add", "--cacheinfo"])
+                .arg(arg)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let blobs = repo.index_blobs(1024 * 1024).unwrap();
+            let raw = blobs
+                .iter()
+                .find(|(p, _)| p.starts_with("raw-"))
+                .expect("verlustbehaftet gelistet");
+            assert_eq!(raw.0, "raw-\u{FFFD}.txt");
+            assert_eq!(raw.1, None, "ohne Id");
+        }
+        git(&["rm", "-q", "--cached", "vendor/sub"]);
+        #[cfg(unix)]
+        {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(fixture.path())
+                .args(["rm", "-q", "--cached", "raw-*"])
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        // Ein Konflikt: nur Stufen 1–3 — gelistet, unlesbar.
+        git(&["commit", "-q", "-m", "base", "--", "a.txt", "run.sh"]);
+        git(&["checkout", "-q", "-b", "other"]);
+        std::fs::write(fixture.path().join("a.txt"), "other").unwrap();
+        git(&["commit", "-q", "-am", "other"]);
+        git(&["checkout", "-q", "-"]);
+        std::fs::write(fixture.path().join("a.txt"), "mine").unwrap();
+        git(&["commit", "-q", "-am", "mine"]);
+        let merge = std::process::Command::new("git")
+            .arg("-C")
+            .arg(fixture.path())
+            .args(["merge", "-q", "other"])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(!merge.status.success(), "der Merge hat einen Konflikt");
+        let blobs = repo.index_blobs(1024 * 1024).unwrap();
+        let conflicted: Vec<&(String, Option<BlobId>)> =
+            blobs.iter().filter(|(p, _)| p == "a.txt").collect();
+        assert_eq!(conflicted.len(), 1, "einmal gelistet");
+        assert_eq!(conflicted[0].1, None, "im Konflikt unlesbar");
     }
 
     #[test]

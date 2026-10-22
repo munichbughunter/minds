@@ -27,7 +27,7 @@ fn trust_words(tab: Tab) -> &'static [&'static str] {
     match tab {
         Tab::Overview => &["sealed", "unsealed", "incomplete", "TAMPERED", "legacy"],
         Tab::Sessions => &["sealed", "legacy", "TAMPERED"],
-        Tab::Changes | Tab::Requirements => &[],
+        Tab::Changes | Tab::Requirements | Tab::Decisions => &[],
     }
 }
 

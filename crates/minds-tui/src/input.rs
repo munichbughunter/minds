@@ -39,6 +39,9 @@ pub enum Action {
     Diff,
     /// `i` — die Anforderung (Intent-Anker) der Session unter dem Fokus.
     Intent,
+    /// `D` — die Entscheidungen der Session oder des Commits unter dem
+    /// Fokus, im Decisions-Tab.
+    Decisions,
     /// `c` — im Changes-Tab die Spalte „Why this line?“ ein/aus.
     Context,
     /// Suche beginnen.
@@ -113,15 +116,16 @@ pub fn map(key: KeyEvent, searching: bool) -> Action {
         KeyCode::Char('w') => Action::None,
         KeyCode::Char('e') => Action::Evidence,
         // B4: Ziffern wählen den Tab, `z` / `Z` zoomen, die Objekt-Verben
-        // sind in jedem Tab dieselben. Seit C12.2 sind es vier Tabs — `5`
-        // bleibt belegt, ohne Aktion (nichts verschwindet stillschweigend).
-        KeyCode::Char(c @ '1'..='4') => Action::TabTo(c as u8 - b'1'),
-        KeyCode::Char('5') => Action::None,
+        // sind in jedem Tab dieselben. Fünf Tabs: `5` ist Decisions.
+        KeyCode::Char(c @ '1'..='5') => Action::TabTo(c as u8 - b'1'),
         KeyCode::Char('z') => Action::ZoomStep(true),
         KeyCode::Char('Z') => Action::ZoomStep(false),
         KeyCode::Char('v') => Action::Verify,
         KeyCode::Char('d') => Action::Diff,
         KeyCode::Char('i') => Action::Intent,
+        // `D` (groß, `d` ist der Diff): die Entscheidungen der Session oder
+        // des Commits unter dem Fokus.
+        KeyCode::Char('D') => Action::Decisions,
         KeyCode::Char('c') => Action::Context,
         KeyCode::Char('r') => Action::Reload,
         KeyCode::Tab => Action::CycleTab(true),
@@ -175,7 +179,8 @@ mod tests {
             ('2', Action::TabTo(1)),
             ('3', Action::TabTo(2)),
             ('4', Action::TabTo(3)),
-            ('5', Action::None),
+            ('5', Action::TabTo(4)),
+            ('D', Action::Decisions),
             ('z', Action::ZoomStep(true)),
             ('Z', Action::ZoomStep(false)),
             ('v', Action::Verify),

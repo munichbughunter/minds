@@ -16,12 +16,12 @@ g / G              start / end
 Enter / l          open, descend
 Esc / h            back: close, clear the search, return — never quits
 
-/                  filter in every tab: sessions, commits, files, anchors (AND)
+/                  filter in every tab: sessions, commits, files, anchors, decisions (AND)
 e                  evidence of the session — one sentence per axis, the verdict of minds verify (v: check now), Space: technical
-v / d / i          verify · diff · requirement of the commit or session in focus
+v / d / i / D      verify · diff · requirement · decisions of the commit or session in focus
 z / Z              zoom: summary (runs) · steps · steps with the agent's text
 r                  reload now (it also reloads by itself when the store changes)
-1 … 4 / Tab / F1   switch tab: Overview · Changes · Sessions · Requirements
+1 … 5 / Tab / F1   tab: Overview · Changes · Sessions · Requirements · Decisions
 ?                  this help (↑↓ PgUp PgDn scroll it)
 q / Ctrl-C         quit";
 
@@ -39,6 +39,9 @@ fn section(tab: Tab) -> &'static str {
         }
         Tab::Requirements => {
             "Requirements: ↑↓ requirement · Enter story of a session naming it · Space technical details · PgUp PgDn scroll\n          ✓ proven and signed · ◦ proven, not signed · ✗ snapshot does not match · ? not checked · ! not readable"
+        }
+        Tab::Decisions => {
+            "Decisions: ↑↓ decision · Enter story of the session that recorded it · Space technical (probes, ids) · PgUp PgDn scroll · / filter\n          ◦ open for a human · ✗ re-evaluate (a load-bearing assumption fell — behind the chosen path or a rejection) · ~ re-check · ? unchecked · ✓ in force\n          probes run against the index at read time; every standing is derived from the agent's claims, never a proof"
         }
     }
 }

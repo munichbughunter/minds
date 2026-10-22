@@ -289,14 +289,22 @@ impl RedactionPipeline {
     }
 
     /// Prüft, dass die Policy in `value` nichts findet.
-    fn unchanged(
+    /// Der Wert muss die Redaction unverändert passieren — sonst der zum
+    /// Feld passende Fehler (Intent-Anker oder Entscheidungs-Record).
+    pub(crate) fn unchanged(
         &self,
         field: Field,
         value: &str,
         audit: &mut RedactionAudit,
     ) -> Result<(), RedactionError> {
         if self.redact_field(field, value.to_owned(), audit)? != value {
-            return Err(RedactionError::IntentFieldRedacted { field });
+            return Err(match field {
+                Field::DecisionAssumptionId(_)
+                | Field::DecisionProbe(_)
+                | Field::DecisionScope(_)
+                | Field::DecisionAt => RedactionError::DecisionFieldRedacted { field },
+                _ => RedactionError::IntentFieldRedacted { field },
+            });
         }
         Ok(())
     }
