@@ -83,8 +83,11 @@ peer is exactly that user. A later `enable` keeps a running protected witness an
 when it runs another `minds` binary than the one you call (rerun with
 `MINDS_WITNESS=protected` to update it). In a repository shared this way, `minds` itself
 writes with umask 002 when it writes into the store under `.git` (`hook`, `checkpoint`,
-`sync`, `forget`, `import`, `intent`, `spec`, `review`, `sign`, `anchor`, `reinterpret` — not
-`enable` or exports), so what it creates stays writable for the witness group. No (or no
+`sync`, `forget`, `import`, `intent`, `spec`, `review`, `sign`, `anchor`, `reinterpret`,
+`decide` — not `enable` or exports), so what it creates stays writable for the witness group.
+This matters most for `decide`: the agent runs it from its own environment (umask 022),
+and a decision record written without the group bit would leave an object directory the
+witness cannot write into — its next checkpoint would store a seal it cannot sign. No (or no
 terminal, or a failed setup) sets up the local witness below, with a warning — except with
 `MINDS_WITNESS=protected`, where a failed protected setup fails `enable` (nothing else is set up;
 a local witness next to a half-set-up protected one would be A1, and `intent sign` would find
