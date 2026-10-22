@@ -280,6 +280,104 @@ impl Worktree for MemoryTree {
     }
 }
 
+/// So groß darf der Index sein, den [`IndexTree`] liest.
+pub const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Der Worktree aus dem Git-Index: Dateiliste und Blob-Ids aus dem Index,
+/// Inhalt aus der Objektdatenbank — nie von der Platte. Damit sind alle
+/// Zusagen des [`Worktree`]-Vertrags erfüllt: kein Symlink wird gelesen,
+/// kein Name mit einem Pfad verkettet, „fehlt" und „nicht lesbar" sind
+/// getrennt, und eine zu große Datei bleibt ungelesen. Die Proben sehen den
+/// **Stand des Index** (das Eingecheckte bzw. Gestagte), nicht ungestagte
+/// Änderungen. Ein Symlink, ein Submodul, ein Pfad im Merge-Konflikt und
+/// ein `git add -N`-Eintrag sind gelistet, aber nicht lesbar (ihre Proben
+/// sind unentscheidbar); ein Sparse-Index ist als Ganzes nicht lesbar
+/// (`minds_git::Repo::index_blobs`).
+pub struct IndexTree<'a> {
+    repo: &'a minds_git::Repo,
+    entries: BTreeMap<String, Option<minds_git::BlobId>>,
+}
+
+impl<'a> IndexTree<'a> {
+    /// Liest den Index. `Err`, wenn er nicht lesbar oder größer als
+    /// [`MAX_INDEX_BYTES`] ist.
+    pub fn open(repo: &'a minds_git::Repo) -> Result<Self, ReadError> {
+        let entries = repo
+            .index_blobs(MAX_INDEX_BYTES)
+            .ok_or(ReadError::Unreadable)?
+            .into_iter()
+            .collect();
+        Ok(Self { repo, entries })
+    }
+}
+
+impl Worktree for IndexTree<'_> {
+    fn files(&self) -> Result<Vec<String>, ReadError> {
+        Ok(self.entries.keys().cloned().collect())
+    }
+
+    fn read(&self, path: &str, max: usize) -> Result<Vec<u8>, ReadError> {
+        // Gelistet ohne Id — Symlink, Submodul, Konflikt, `git add -N`:
+        // da, aber nicht lesbar.
+        let id = self
+            .entries
+            .get(path)
+            .ok_or(ReadError::Missing)?
+            .ok_or(ReadError::Unreadable)?;
+        self.repo
+            .read_blob_verified(id, max as u64)
+            .map_err(|err| match err {
+                minds_git::GitError::TooLarge { .. } => ReadError::TooLarge,
+                _ => ReadError::Unreadable,
+            })
+    }
+
+    fn blob_id(&self, path: &str) -> Result<String, ReadError> {
+        self.entries
+            .get(path)
+            .ok_or(ReadError::Missing)?
+            .map(|id| id.to_string())
+            .ok_or(ReadError::Unreadable)
+    }
+}
+
+/// Wer entschieden hat, als Wort — `human` ist ein Flag, das jeder
+/// Schreiber setzen kann, und trägt das, bis eine Signatur es belegt.
+pub fn by_word(by: minds_core::decision::DecidedBy) -> &'static str {
+    match by {
+        minds_core::decision::DecidedBy::Agent => "agent",
+        minds_core::decision::DecidedBy::Human => "human (unsigned)",
+    }
+}
+
+/// Der Tag eines Record-Zeitstempels — nur aus einem geparsten; der
+/// Record ist roh, und ein Ref im Store kann jeder schreiben. Sonst
+/// „unknown date".
+pub fn day_of(at: &str) -> String {
+    at.parse::<jiff::Timestamp>()
+        .ok()
+        .map(|ts| ts.strftime("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown date".to_owned())
+}
+
+/// Prüft, was [`DecisionRecord::check`] nicht prüfen kann (minds-core kennt
+/// keine regulären Ausdrücke): Die Muster einer Probe kompilieren unter den
+/// Grenzen des Readers. Für `minds decide`, bevor ein Record abgelegt wird
+/// — ein ungültiges Muster wäre sonst für immer „nicht geprüft".
+pub fn validate_probe(probe: &Probe) -> Result<(), &'static str> {
+    if let Probe::Pattern {
+        must_match,
+        must_not_match,
+        ..
+    } = probe
+    {
+        for pattern in [must_match, must_not_match].into_iter().flatten() {
+            compile(pattern)?;
+        }
+    }
+    Ok(())
+}
+
 /// Was eine Probe ergab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeResult {
@@ -1144,12 +1242,33 @@ fn at_of(record: &DecisionRecord) -> Timestamp {
 /// Repository. Erschöpft ein Glob sein Budget, gilt „betrifft" — die
 /// Entscheidung wird lieber einmal zu viel gezeigt als verschwiegen.
 pub fn concerns(record: &DecisionRecord, path: &str) -> bool {
-    record.scope.is_empty()
-        || record.scope.len() > minds_core::decision::MAX_ITEMS
-        || record
-            .scope
+    concerns_any(record, std::iter::once(path))
+}
+
+/// Ob der Scope eines Records einen der Pfade betrifft — die Globs einmal
+/// übersetzt, nicht je Pfad (ein Verzeichnis-Argument bringt tausende).
+/// Ohne Scope, mit zu vielen oder einem ungültigen Glob: betroffen —
+/// lieber eine Entscheidung zu viel gezeigt als eine zu wenig.
+pub fn concerns_any<'p>(record: &DecisionRecord, paths: impl Iterator<Item = &'p str>) -> bool {
+    if record.scope.is_empty() || record.scope.len() > minds_core::decision::MAX_ITEMS {
+        return true;
+    }
+    let mut globs = Vec::with_capacity(record.scope.len());
+    for glob in &record.scope {
+        if !is_glob(glob) {
+            return true;
+        }
+        globs.push(Glob::new(glob));
+    }
+    let mut paths = paths.peekable();
+    if paths.peek().is_none() {
+        return false;
+    }
+    paths.any(|path| {
+        globs
             .iter()
-            .any(|glob| !is_glob(glob) || Glob::new(glob).matches_checked(path).unwrap_or(true))
+            .any(|glob| glob.matches_checked(path).unwrap_or(true))
+    })
 }
 
 #[cfg(test)]
@@ -1516,7 +1635,7 @@ mod tests {
             "unchecked: the record does not pass the check"
         );
         assert!(
-            a.notes[0].starts_with("record does not pass the check: probe of assumption \"a2\"")
+            a.notes[0].starts_with("record does not pass the check: the probe of assumptions[1]")
         );
         // Auch `open` hebt ihn nicht an die Spitze.
         let mut open = record;

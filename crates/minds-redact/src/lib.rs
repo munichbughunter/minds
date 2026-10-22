@@ -55,6 +55,7 @@
 
 mod assignment;
 mod config;
+mod decision;
 mod intent;
 mod observations;
 mod pii;
@@ -70,6 +71,7 @@ pub use assignment::{
     KeyValueRedactor, ShortFlagRedactor, Tier, UrlCredentialRedactor, has_credential_shape,
 };
 pub use config::{AllowList, ConfigError, DenyListRedactor, HighEntropyConfig, RedactionConfig};
+pub use decision::RedactedDecision;
 pub use intent::{IssueRef, RedactedIntent};
 pub use observations::RedactedObservations;
 pub use pii::EmailRedactor;

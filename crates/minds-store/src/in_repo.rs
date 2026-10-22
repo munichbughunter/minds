@@ -172,6 +172,21 @@ impl ContextStore for InRepoStore {
         self.0.replay_signature(id)
     }
 
+    fn put_decision(
+        &self,
+        record: &minds_redact::RedactedDecision,
+    ) -> Result<minds_core::ContentHash> {
+        self.0.put_decision(record)
+    }
+
+    fn decision_bytes(&self, id: &minds_core::ContentHash) -> Result<Option<Vec<u8>>> {
+        self.0.decision_bytes(id)
+    }
+
+    fn list_decisions(&self) -> Result<crate::DecisionListing> {
+        self.0.list_decisions()
+    }
+
     fn put_first_sight(
         &self,
         anchor: &minds_core::first_sight::FirstSight,

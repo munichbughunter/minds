@@ -344,6 +344,13 @@ sanitized and wrapped to the terminal width (`COLUMNS` or 80 columns as a fallba
 minds recall src/lib.rs:42
 ```
 
+The brief ends with the **decisions** behind the target: those a linked session
+recorded with `minds decide`, and those whose scope concerns the file — first the
+ones to re-check (a load-bearing assumption no longer holds, the rejected
+alternative is named), then the ones on record — in force, open or unchecked —
+each with its assumptions and their standing today. A file no session has touched
+yet still yields its decisions.
+
 ## Agent context
 
 ### minds brief
@@ -352,7 +359,7 @@ minds recall src/lib.rs:42
 minds brief [<file>...]
 ```
 
-Emits a size-capped context block for the start of an agent session. Without paths it covers the whole repository.
+Emits a size-capped context block for the start of an agent session. Without paths it covers the whole repository. The block ends with the decisions concerning the paths (without paths: all current ones): what is to re-check first, uncapped, then the decisions on record, capped like every section — see `minds decisions`.
 
 ```
 minds brief src/lib.rs src/main.rs
@@ -364,7 +371,7 @@ minds brief src/lib.rs src/main.rs
 minds distill [--path <directory>] [--out <file>]
 ```
 
-Condenses the history of the repository (or of a path) into an `AGENTS.md` draft: commands, hot files, dead ends, corrections. Without `--out` it writes to stdout.
+Condenses the history of the repository (or of a path) into an `AGENTS.md` draft: commands, hot files, dead ends, corrections — and the decisions on record with the assumptions they rest on, uncapped. Without `--out` it writes to stdout.
 
 ```
 minds distill --path crates/minds-cli --out AGENTS.md
@@ -381,6 +388,129 @@ Prints a machine-readable command map as JSON — meant for agents, not humans.
 ```
 minds agent-help | jq .
 ```
+
+## Decisions
+
+### minds decide
+
+```
+minds decide [--supersedes <id>] [--human] [--template] < decision.json
+```
+
+Records a decision as a Git object under `refs/minds/decisions/<id>` (synced like
+everything under `refs/minds/`): the chosen path, the rejected alternatives and
+the **assumptions** the reasoning rests on. The weight sits on the edge between an
+alternative and an assumption — `load-bearing` or `marginal` — because the same
+assumption can carry one rejection and only touch another. An assumption may carry
+a deterministic probe: a `pattern` that must (or must not) match in a file or a
+glob, a `path` that is (or is not) tracked, or a `blob` that is unchanged since the
+decision. An assumption without a probe is shown as not checkable, never as fallen.
+
+`--template` prints the JSON form. Without `chosen` and with `"open": true` the
+record hands the choice to a human and lists the options; the human answers later
+with a new record and `--supersedes <id>`, so the hand-over is part of the history.
+`--human` marks a record a person writes at the terminal (`decided_by`); it is a
+statement, not proof, and every reader shows it as `human (unsigned)`. The command sets kind, schema, time, `decided_by` and
+`supersedes` itself — the JSON cannot carry them.
+
+Free text (topic, statements, approaches) is redacted with the repository's policy
+before the id is formed; a probe pattern, path, glob, id or scope the policy would
+change is refused — a pattern with a placeholder would check something else than
+meant. A pattern that does not compile under the reader's limits is refused too.
+
+The first output line is the contract with the checkpoint:
+
+```
+$ minds decide < decision.json
+decision b3-f1d311757e0f65b9852d2d5ad873beaf6ab3caf9e1e1caafe6252cfaeb9c7b53
+  topic       lock for the witness socket on macOS
+  chosen      flock on a lock file
+  rejected    Unix socket as the lock
+  assumptions 3 (2 with a probe)
+  scope       src/**
+  by          agent · 2026-10-21T13:09:00Z
+```
+
+The checkpoint links a session to the records its own `minds decide` calls produced:
+it reads the **first** stdout line of a Bash call whose command is a plain `minds
+decide` invocation — nothing else in the same call. The rule is strict so that no
+other command can print that line: the first line carries no `;`, `&`, `||`,
+backtick, `$(`, `<(`, `>(`, no trailing `\` and no `>` redirect on the call (` 2>&1`
+is tolerated); further lines exist only as a heredoc whose delimiter is the last
+line and appears nowhere else; at most one pipe, with only `cat <file>`, `cat <<X`,
+`echo …` or `printf …` on its left. `minds decide < d.json`, `cat d.json | minds
+decide` and `minds decide --human <<'EOF' … EOF` link; `cd a && minds decide` does
+not (fail-closed: no link, never a foreign one). A call that failed or was
+interrupted links nothing. The link is an observation of the agent's tool output,
+not proof of authorship: a different program named `minds` in the `PATH` is not
+something the rule can see, and what the record says is read from the store.
+
+### minds decisions
+
+```
+minds decisions [<path>|<id>] [--check]
+```
+
+Lists the decisions with their standing **today**. Probes run against the index
+(the committed or staged content), never against the working tree: no symlink is
+followed, no file outside the listing is read, and a file the policy ignores is
+invisible to a probe. The standing is computed at read time and never stored:
+
+- `◦ open` — waiting for a human, options recorded.
+- `✗ re-evaluate` — a load-bearing assumption no longer holds. If it was behind the
+  rejection of an alternative, that alternative is back on the table and named; if
+  the chosen path rests on it, the decision itself is to review.
+- `~ re-check` — a load-bearing assumption changed since the decision (a blob probe);
+  whether it still holds, the machine cannot say.
+- `? unchecked` — a load-bearing probe could not run (file not readable, pattern
+  invalid, budget exhausted) or the record does not pass the check. Never shown as
+  in force.
+- `✓ in force` — every load-bearing probe passed: no assumption fell, changed or
+  went unchecked. A fallen marginal assumption is noted, not escalated. The glyph
+  says what the probes found, not that the decision was right.
+
+Only the head of a `supersedes` chain is listed; superseded records are history,
+reachable from the detail of their successor (`supersedes <id>`) and shown with
+`superseded by` in their own detail. With a path, only decisions whose scope
+concerns it are shown; a directory concerns a decision when any indexed file under
+it does (`minds decisions src` finds a scope of `src/**`; `.` is the whole repository;
+a path that is not repo-relative — `..`, a leading `/`, `//` — is an error, never a
+silent "no decision concerns"). With an id (or at least 8
+hex characters of it) one decision is shown in detail: every assumption with its
+probe and result, the reasons behind each rejection with their weight, the scope,
+and the chain. `--check` exits 2 when any listed decision (or the one shown by id)
+is to re-evaluate, re-check or **unchecked**, and also when a record could not be
+read or not every record was read — a gate for CI that does not pass what it could
+not assess: a symlink where the probed file was, a path in a merge conflict, a
+record under `refs/minds/decisions/` that does not hash to its id, a store with more
+records than the run reads. With a path, only the decisions concerning it are gated
+by standing; missing records always close the gate. An open decision passes: it
+waits for a human, it has not drifted. With an id, the gate judges the head of that
+record's chain, not the historical standing of a superseded record. A record that
+is not readable is named on stderr with its id and the reason (altered, malformed,
+no record under the ref), never with its content; stdout carries the count. Exit
+codes: 0, 2 with `--check` on a hit, 1 operational failure (an unreadable index, an
+ambiguous id prefix, an id that matches nothing).
+
+What the gate is: a check against **unnoticed** drift — a load-bearing assumption
+fell and nobody looked. What it is not: a check against a writer of the store.
+Anyone who can run `minds decide --supersedes <id>` retires a decision, including a
+fallen one, with a record that rests on nothing; `supersedes` is taken as written,
+and `decided_by: human` is a flag the writer sets (`--human`), shown as
+`human (unsigned)` until a signature backs it. Read the chain (`minds decisions
+<id>`) before trusting a green gate on a contested decision.
+
+The index is what the probes see: a tracked symlink, a submodule, a path in a merge
+conflict and an intent-to-add entry are listed but unreadable (their probes are
+undecidable, never "holds"); a file whose name is not UTF-8 is listed with the name
+replaced lossily and is unreadable too; a sparse index is refused as unreadable;
+untracked and ignored files do not exist for a probe.
+
+Budgets bound the run: the store lists at most 2048 records and the run reads at
+most 1024 of them (more closes the gate), at most 512 records are probed (heads
+first, then the youngest), each pattern probe reads at most 8 MiB, a record 16 MiB,
+a run 32 MiB and 3 seconds; what exceeds a budget is `unchecked` with its reason,
+never in force.
 
 ## Reviews
 

@@ -20,6 +20,7 @@ use std::fmt::Write as _;
 
 use minds_core::{Extract, ReworkKind, Session};
 
+use crate::decisions::{Assessment, Standing};
 use crate::summary::headline;
 
 /// Wie lang die Überschrift einer Absicht höchstens wird.
@@ -38,6 +39,142 @@ pub fn render(title: &str, sessions: &[Session], cap: Option<usize>) -> String {
 /// Wie [`render`], aber mit den vollständigen, mehrzeiligen Absichten für `recall`.
 pub fn render_full_intents(title: &str, sessions: &[Session]) -> String {
     render_inner(title, sessions, None, true)
+}
+
+/// Die Entscheidungen im Brief: zuerst, was der nächste Agent **neu
+/// bewerten** muss, dann, was **in Kraft** ist — mit den Annahmen, unter
+/// denen es entschieden wurde, und ihrem Stand heute. Leere Abschnitte
+/// fallen weg, wie überall im Brief.
+///
+/// `assessments` sind die Spitzen ihrer Ketten (abgelöste Records werden
+/// übergangen); `cap` deckelt den In-Kraft-Abschnitt (die jüngsten zuerst
+/// — so liefert [`crate::decisions::assess_all`]), nie den
+/// Re-Check-Abschnitt: Was zurück auf den Tisch gehört, wird nicht
+/// gekappt. Jeder Text stammt aus dem entschärften [`Assessment`] oder ist
+/// aus dem Record **geparst** (das Datum, die Gewichte); die Ids sind
+/// gekürzt.
+pub fn render_decisions(assessments: &[Assessment], cap: Option<usize>) -> String {
+    let heads: Vec<&Assessment> = assessments.iter().filter(|a| a.is_head()).collect();
+    let attention: Vec<&&Assessment> = heads
+        .iter()
+        .filter(|a| matches!(a.standing, Standing::Review | Standing::ReCheck))
+        .collect();
+    let rest: Vec<&&Assessment> = heads
+        .iter()
+        .filter(|a| !matches!(a.standing, Standing::Review | Standing::ReCheck))
+        .collect();
+    let mut out = String::new();
+    if !attention.is_empty() {
+        let _ = writeln!(
+            out,
+            "## Decisions to re-check\n\n_Probes evaluated against the index now — 0 tokens. A load-bearing assumption behind these no longer holds or changed._\n"
+        );
+        for a in &attention {
+            decision_entry(&mut out, a, true);
+        }
+        out.push('\n');
+    }
+    if !rest.is_empty() {
+        let take = cap.map_or(rest.len(), |c| c.min(rest.len()));
+        let _ = writeln!(
+            out,
+            "## Decisions on record\n\n_In force, open or unchecked — recorded with the assumptions they rest on; each assumption with its standing today._\n"
+        );
+        for a in rest.iter().take(take) {
+            decision_entry(&mut out, a, false);
+        }
+        if take < rest.len() {
+            let _ = writeln!(out, "- … (+{} more — minds decisions)", rest.len() - take);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// Ein Eintrag: Thema, Stand, dann die Annahmen und die Alternativen mit
+/// ihren Gründen — alles, was der Agent braucht, um die Entscheidung unter
+/// den **damaligen** Umständen zu verstehen und den heutigen Stand zu
+/// sehen.
+fn decision_entry(out: &mut String, a: &Assessment, attention: bool) {
+    let r = &a.record;
+    let glyph = match a.standing {
+        Standing::Open => "◦",
+        Standing::Review => "✗",
+        Standing::ReCheck => "~",
+        Standing::Unchecked => "?",
+        Standing::InForce => "✓",
+    };
+    // Das Datum nur aus einem lesbaren Zeitstempel — der Record ist roh,
+    // und ein Ref im Store kann jeder schreiben.
+    let day = crate::decisions::day_of(&r.at);
+    let _ = writeln!(
+        out,
+        "- {glyph} {} (b3-{}, {day}, {})",
+        a.topic,
+        &a.id.hex()[..8],
+        crate::decisions::by_word(r.decided_by)
+    );
+    let _ = writeln!(out, "  {}", a.headline());
+    match &a.chosen {
+        Some(chosen) => {
+            let _ = writeln!(out, "  chosen: {chosen}");
+        }
+        None => {
+            let _ = writeln!(out, "  options: {}", a.alternatives.join(" · "));
+        }
+    }
+    if !a.assumptions.is_empty() {
+        let list: Vec<String> = a
+            .assumptions
+            .iter()
+            .map(|s| format!("{} {} [{}]", s.id, s.statement, s.result.as_str()))
+            .collect();
+        let _ = writeln!(out, "  assumptions: {}", list.join(" · "));
+    }
+    if r.chosen.is_some() && !r.alternatives.is_empty() {
+        let list: Vec<String> = r
+            .alternatives
+            .iter()
+            .zip(&a.alternatives)
+            .map(|(alt, approach)| {
+                let because: Vec<String> = alt
+                    .rejected_because
+                    .iter()
+                    .map(|reason| {
+                        format!(
+                            "{} {}",
+                            crate::text::sanitize(&reason.assumption),
+                            reason.weight.as_str()
+                        )
+                    })
+                    .collect();
+                if because.is_empty() {
+                    approach.clone()
+                } else {
+                    format!("{approach} (because {})", because.join(", "))
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "  rejected: {}", list.join(" · "));
+    }
+    if attention {
+        for reconsider in &a.reconsider {
+            let _ = writeln!(
+                out,
+                "  → reconsider: {} — {} no longer {}",
+                reconsider.alternative,
+                reconsider.fallen.join(", "),
+                if reconsider.fallen.len() == 1 {
+                    "holds"
+                } else {
+                    "hold"
+                }
+            );
+        }
+    }
+    for note in &a.notes {
+        let _ = writeln!(out, "  note: {note}");
+    }
 }
 
 fn render_inner(
@@ -348,6 +485,163 @@ mod tests {
     /// R.7 — der Brief ist Byte für Byte stabil. Ändert sich das Format
     /// versehentlich, schlägt genau dieser Test an; ändert es sich absichtlich,
     /// aktualisiert man den Golden-String hier bewusst.
+    /// Die Entscheidungen im Brief, eingefroren: ein Record, der neu zu
+    /// bewerten ist (mit der Alternative, die zurückkommt), einer in Kraft,
+    /// ein offener — und ein abgelöster, der nicht erscheint.
+    #[test]
+    fn golden_decisions_sections_are_byte_stable() {
+        use crate::decisions::{MemoryTree, assess_all};
+        use minds_core::ContentHash;
+        use minds_core::decision::{
+            Alternative, Assumption, Choice, DECISION_KIND, DECISION_SCHEMA, DecidedBy,
+            DecisionRecord, Probe, Reason, Weight,
+        };
+        let id = |n: u8| ContentHash::from_bytes([n; 32]);
+        let lock = DecisionRecord {
+            kind: DECISION_KIND.into(),
+            schema: DECISION_SCHEMA,
+            topic: "lock for the witness socket on macOS".into(),
+            decided_by: DecidedBy::Agent,
+            at: "2026-10-21T13:09:00Z".into(),
+            chosen: Some(Choice {
+                approach: "flock on a lock file".into(),
+                rests_on: vec![Reason {
+                    assumption: "local-fs".into(),
+                    weight: Weight::LoadBearing,
+                }],
+            }),
+            open: false,
+            alternatives: vec![Alternative {
+                approach: "Unix socket as the lock".into(),
+                rejected_because: vec![
+                    Reason {
+                        assumption: "fork".into(),
+                        weight: Weight::LoadBearing,
+                    },
+                    Reason {
+                        assumption: "no-windows".into(),
+                        weight: Weight::Marginal,
+                    },
+                ],
+                rests_on: Vec::new(),
+            }],
+            assumptions: vec![
+                Assumption {
+                    id: "local-fs".into(),
+                    statement: "the lock file lives on a local file system".into(),
+                    probe: None,
+                },
+                Assumption {
+                    id: "fork".into(),
+                    statement: "daemon.rs forks".into(),
+                    probe: Some(Probe::Pattern {
+                        path: Some("src/daemon.rs".into()),
+                        glob: None,
+                        must_match: Some(r"\bfork\(".into()),
+                        must_not_match: None,
+                    }),
+                },
+                Assumption {
+                    id: "no-windows".into(),
+                    statement: "no Windows support is needed".into(),
+                    probe: Some(Probe::Pattern {
+                        path: None,
+                        glob: Some("crates/*/Cargo.toml".into()),
+                        must_match: None,
+                        must_not_match: Some("windows-sys".into()),
+                    }),
+                },
+            ],
+            scope: vec!["src/**".into()],
+            supersedes: None,
+        };
+        let mut refs = lock.clone();
+        refs.topic = "one ref per session".into();
+        refs.at = "2026-07-29T10:00:00Z".into();
+        refs.chosen = Some(Choice {
+            approach: "one ref per session".into(),
+            rests_on: Vec::new(),
+        });
+        refs.alternatives.clear();
+        refs.assumptions.clear();
+        refs.scope.clear();
+        let mut old = refs.clone();
+        old.topic = "one ref for everything".into();
+        old.at = "2026-07-01T10:00:00Z".into();
+        refs.supersedes = Some(id(3));
+        let mut open = lock.clone();
+        open.topic = "retry policy for the mirror".into();
+        open.at = "2026-10-20T09:00:00Z".into();
+        open.chosen = None;
+        open.open = true;
+        open.alternatives = vec![
+            Alternative {
+                approach: "exponential backoff".into(),
+                rejected_because: Vec::new(),
+                rests_on: Vec::new(),
+            },
+            Alternative {
+                approach: "fail fast".into(),
+                rejected_because: Vec::new(),
+                rests_on: Vec::new(),
+            },
+        ];
+        open.assumptions.clear();
+        open.scope.clear();
+
+        // Ein Record mit rohem Zeitstempel — für die Probe unten, dass nur
+        // ein geparstes Datum den Brief erreicht.
+        let mut raw = lock.clone();
+        raw.at = "yesterday\u{1b}[2J".into();
+        // Der Daemon forkt nicht mehr.
+        let tree = MemoryTree::new()
+            .with("src/daemon.rs", b"fn main() { spawn() }")
+            .with("crates/a/Cargo.toml", b"[dependencies]\n");
+        let all = assess_all(
+            vec![(id(1), lock), (id(2), refs), (id(3), old), (id(4), open)],
+            &tree,
+        );
+        let out = render_decisions(&all, Some(8));
+        let expected = [
+            "## Decisions to re-check",
+            "",
+            "_Probes evaluated against the index now — 0 tokens. A load-bearing assumption behind these no longer holds or changed._",
+            "",
+            "- ✗ lock for the witness socket on macOS (b3-01010101, 2026-10-21, agent)",
+            "  re-evaluate: fork no longer holds → reconsider Unix socket as the lock",
+            "  chosen: flock on a lock file",
+            "  assumptions: local-fs the lock file lives on a local file system [not checkable] · fork daemon.rs forks [no longer holds] · no-windows no Windows support is needed [holds]",
+            "  rejected: Unix socket as the lock (because fork load-bearing, no-windows marginal)",
+            "  → reconsider: Unix socket as the lock — fork no longer holds",
+            "",
+            "## Decisions on record",
+            "",
+            "_In force, open or unchecked — recorded with the assumptions they rest on; each assumption with its standing today._",
+            "",
+            "- ◦ retry policy for the mirror (b3-04040404, 2026-10-20, agent)",
+            "  open — waiting for a human · 2 options",
+            "  options: exponential backoff · fail fast",
+            "- ✓ one ref per session (b3-02020202, 2026-07-29, agent)",
+            "  in force",
+            "  chosen: one ref per session",
+            "",
+            "",
+        ]
+        .join("\n");
+        assert_eq!(out, expected);
+        // Der Deckel gilt nur dem In-Kraft-Abschnitt.
+        let capped = render_decisions(&all, Some(1));
+        assert!(capped.contains("- … (+1 more — minds decisions)"));
+        assert!(capped.contains("→ reconsider"));
+        // Nichts → nichts.
+        assert_eq!(render_decisions(&[], None), "");
+        // Ein roher Zeitstempel erreicht den Brief nie — nur ein geparster.
+        let all = assess_all(vec![(id(9), raw)], &tree);
+        let out = render_decisions(&all, None);
+        assert!(out.contains("unknown date"), "{out}");
+        assert!(!out.contains('\u{1b}'), "{out}");
+    }
+
     #[test]
     fn golden_brief_is_byte_stable() {
         let mut s = session("Fix the retry test.");

@@ -43,6 +43,7 @@ mod brief_cmd;
 mod checkpoint;
 mod config;
 mod context;
+mod decide_cmd;
 mod disable;
 mod distill;
 mod doctor;
@@ -446,6 +447,32 @@ Usage:
         Exit codes: 0 anchored, mirrored or nothing new,
         4 operational failure.
 
+  minds decide [--supersedes <id>] [--human] [--template] < decision.json
+        Records a decision as a Git object (refs/minds/decisions): the
+        chosen path, the rejected alternatives and the assumptions the
+        reasoning rests on — each with a weight (load-bearing or marginal)
+        on the edge between alternative and assumption, and optionally a
+        probe (a pattern in a file or glob, a tracked path, an unchanged
+        blob). An open decision (without chosen) hands the choice to a human
+        with its options. --template prints the JSON form. Free text is
+        redacted; a probe, path, glob or id the policy would change is
+        refused. Prints `decision <id>` first — the line the checkpoint
+        reads from the tool call to link the session to the record.
+
+  minds decisions [<path>|<id>] [--check]
+        The decisions and their standing today, probes evaluated against
+        the index: open, re-evaluate (a load-bearing assumption no longer
+        holds — the alternative it rejected is back on the table),
+        re-check (changed since), unchecked, in force. With a path only
+        those whose scope concerns it; with an id (or 8+ hex of it) one
+        decision in detail with every assumption, probe and its history.
+        Exit: 0; with --check 2 when any listed (or the one shown) is to
+        re-evaluate, re-check or unchecked, or a record could not be read
+        — what the gate cannot assess does not pass; an open decision
+        passes. A gate against unnoticed drift, not against a writer of
+        the store (minds decide --supersedes retires a decision); 1
+        operational failure.
+
   minds review <subject> --approve|--reject|--needs-work [--summary <text>]
                           [--sign] [--key <path>]
         Creates a review verdict as a Git object (refs/minds/reviews).
@@ -654,6 +681,8 @@ const SPECS: &[Spec] = &[
         1,
     ),
     spec("reviews", &["--signers", "--identity"], &[], 1),
+    spec("decide", &["--supersedes"], &["--template", "--human"], 0),
+    spec("decisions", &[], &["--check"], 1),
     spec("comment", &["--on"], &[], 2),
     spec("sync", &["--remote"], &["-v", "--verbose", "--detach"], 0),
     spec("stack", &["--base"], &[], 0),
@@ -1098,6 +1127,14 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.value("--signers"),
             parsed.value("--identity"),
         ),
+
+        "decide" => decide_cmd::run_decide(
+            parsed.has("--template"),
+            parsed.has("--human"),
+            parsed.value("--supersedes"),
+        ),
+
+        "decisions" => decide_cmd::run_decisions(parsed.positional(0), parsed.has("--check")),
 
         "fsck" => fsck::run(fsck::Options {
             require_review: parsed.has("--require-review"),

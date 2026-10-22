@@ -38,7 +38,22 @@ fn distill(path: Option<&str>, out: Option<&str>) -> Fallible<()> {
         Some(path) => format!("AGENTS.md draft — {path}"),
         None => "AGENTS.md draft".to_string(),
     };
-    let markdown = minds_reader::brief::render(&title, &sessions, None);
+    let mut markdown = minds_reader::brief::render(&title, &sessions, None);
+    // Die Entscheidungen gehören in den AGENTS.md-Entwurf: ungekappt, mit
+    // dem Stand ihrer Annahmen — der nächste Agent soll sie lesen, bevor er
+    // eine davon unwissentlich umstößt.
+    match crate::decide_cmd::Assessed::load(&ctx) {
+        Ok(assessed) => {
+            let paths: Vec<String> = path.map(str::to_owned).into_iter().collect();
+            let heads: Vec<minds_reader::decisions::Assessment> =
+                assessed.concerning(&paths).into_iter().cloned().collect();
+            markdown.push_str(&minds_reader::brief::render_decisions(&heads, None));
+        }
+        Err(err) => eprintln!(
+            "minds distill: decisions left out: {}",
+            crate::text::sanitize(&err.to_string())
+        ),
+    }
 
     if let Some(note) = skipped.note() {
         eprintln!("minds distill: {note}");

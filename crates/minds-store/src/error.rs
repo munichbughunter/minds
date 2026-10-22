@@ -216,6 +216,26 @@ pub enum StoreError {
         actual: ContentHash,
     },
 
+    /// Unter der Id liegen Bytes, die auf eine andere Id hashen — der
+    /// Entscheidungs-Record wurde nachträglich verändert.
+    #[error("decision record at {requested} hashes to {actual} — it has been altered")]
+    DecisionMismatch {
+        /// Die angefragte Id.
+        requested: ContentHash,
+        /// Die Id der abgelegten Bytes.
+        actual: ContentHash,
+    },
+
+    /// Die Bytes hashen korrekt, sind aber kein lesbarer Entscheidungs-Record.
+    #[error("decision record at {id} is not readable: {reason}")]
+    MalformedDecision {
+        /// Die Id.
+        id: ContentHash,
+        /// Die Fehlerkategorie des Parsers (`syntax`, `data`, `eof`) — nie
+        /// sein Text, der Werte zitieren könnte.
+        reason: String,
+    },
+
     /// Die Bytes hashen korrekt, sind aber kein lesbarer Replay-Record.
     #[error("replay record at {id} is not readable: {reason}")]
     MalformedReplay {
