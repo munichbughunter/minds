@@ -352,6 +352,47 @@ fn a1_every_epistemic_glyph_has_exactly_one_meaning() {
         "agent",
         "agent badge".into(),
     );
+    // Entscheidungen: der Gegenstand trägt `⚖`; Stand und Probenergebnis
+    // sind Ableitungen über Aussagen und tragen die Prüf-Glyphen — `✓`
+    // heißt „jede tragende Probe bestanden", nie „die Entscheidung war
+    // richtig".
+    add(
+        theme::decision().0,
+        Structural,
+        "decision",
+        "decision".into(),
+    );
+    {
+        use minds_reader::decisions::{ProbeResult, Standing};
+        for (standing, meaning) in [
+            (Standing::Open, "not observed"),
+            (Standing::Review, "failed"),
+            (Standing::ReCheck, "partial"),
+            (Standing::Unchecked, "unchecked"),
+            (Standing::InForce, "passed"),
+        ] {
+            add(
+                theme::standing(standing).0,
+                Epistemic,
+                meaning,
+                format!("standing {standing:?}"),
+            );
+        }
+        for (result, meaning) in [
+            (ProbeResult::Holds, "passed"),
+            (ProbeResult::Fails, "failed"),
+            (ProbeResult::Stale, "partial"),
+            (ProbeResult::Unverifiable, "none"),
+            (ProbeResult::Unknown("x"), "unchecked"),
+        ] {
+            add(
+                theme::probe(result).0,
+                Epistemic,
+                meaning,
+                format!("probe {result:?}"),
+            );
+        }
+    }
     add(
         theme::COMMIT_GLYPH,
         Structural,

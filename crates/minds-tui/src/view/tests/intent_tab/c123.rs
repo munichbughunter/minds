@@ -194,7 +194,7 @@ fn c123_sessions_name_agent_model_and_the_request_as_a_claim() {
     inspection =
         Inspection::from_index(Index::from_parts(index_sessions, commits), Vec::new(), "t");
     let mut app = App::new(inspection, &repo, None);
-    app.reduce(Action::TabTo(4));
+    app.reduce(Action::TabTo(3));
     app.fill_intents(&source);
     let out = render(&mut app);
     assert!(!out.contains("unknown"), "{out}");

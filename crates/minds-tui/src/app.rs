@@ -26,6 +26,7 @@ use minds_reader::model::{EvidenceReport, SessionCard};
 use minds_reader::story::Story;
 
 use crate::changes::{ChangesState, Focus};
+use crate::decision::{DecisionTab, named_decisions, naming_sessions};
 use crate::filter;
 use crate::input::{self, Action};
 use crate::intent::{IntentTab, bound_sessions, named_anchors};
@@ -116,15 +117,18 @@ pub enum Tab {
     Sessions,
     /// Die Anforderungen (Intent-Anker) und wer sich an sie gebunden nennt.
     Requirements,
+    /// Die Entscheidungen (`refs/minds/decisions/`) mit ihrem Stand heute.
+    Decisions,
 }
 
 impl Tab {
     /// Alle Tabs, in Reihenfolge.
-    pub const ALL: [Tab; 4] = [
+    pub const ALL: [Tab; 5] = [
         Tab::Overview,
         Tab::Changes,
         Tab::Sessions,
         Tab::Requirements,
+        Tab::Decisions,
     ];
 
     /// Das Kurzlabel im Kopf, wenn der Platz nicht reicht (A6).
@@ -134,6 +138,7 @@ impl Tab {
             Tab::Changes => "Chg",
             Tab::Sessions => "Ses",
             Tab::Requirements => "Req",
+            Tab::Decisions => "Dec",
         }
     }
 
@@ -144,6 +149,7 @@ impl Tab {
             Tab::Changes => "Changes",
             Tab::Sessions => "Sessions",
             Tab::Requirements => "Requirements",
+            Tab::Decisions => "Decisions",
         }
     }
 }
@@ -211,6 +217,8 @@ pub struct App<'a> {
     pub changes: Option<ChangesState>,
     /// Der Requirements-Tab — erst beim ersten Öffnen gebaut.
     pub intent: Option<IntentTab>,
+    /// Der Decisions-Tab, sobald er einmal geöffnet oder gebraucht wurde.
+    pub decisions: Option<DecisionTab>,
     /// Der Overview-Tab — erst beim ersten Öffnen gebaut.
     pub overview: Option<OverviewState>,
     /// Ob Nerd-Font-Glyphen gezeichnet werden (runde Pillen, Icons).
@@ -289,6 +297,8 @@ pub struct NavEntry {
     pub changes: Option<ChangesState>,
     /// …
     pub intent: Option<IntentTab>,
+    /// Der Decisions-Tab beim Sprung.
+    pub decisions: Option<DecisionTab>,
     /// Der aktive Commit beim Sprung.
     pub active_commit: Option<CommitId>,
     /// Wohin der Sprung führte.
@@ -368,6 +378,7 @@ impl<'a> App<'a> {
             tab: Tab::Sessions,
             changes: None,
             intent: None,
+            decisions: None,
             overview: None,
             nerd: false,
             tamper: None,
@@ -478,6 +489,11 @@ impl<'a> App<'a> {
         // Die Anker neu holen (Signatur, Beleg) — gedrosselt wie das
         // Urteil, außer nach `r`.
         if let Some(state) = self.intent.as_mut() {
+            state.invalidate(full);
+        }
+        // Die Entscheidungen neu bewerten (die Proben laufen gegen den
+        // Index, der sich geändert haben kann) — gedrosselt wie die Anker.
+        if let Some(state) = self.decisions.as_mut() {
             state.invalidate(full);
         }
         // Die Historie neu: ein begrenzter Walk in-process, kein `git` —
@@ -814,6 +830,152 @@ impl<'a> App<'a> {
         self.tab = Tab::Requirements;
     }
 
+    /// Öffnet den Decisions-Tab — auf der Entscheidung `want`, wenn es
+    /// sie gibt.
+    pub fn open_decisions(&mut self, want: Option<ContentHash>) {
+        match self.decisions.as_mut() {
+            Some(state) => {
+                if let Some(id) = &want
+                    && !state.select(id)
+                {
+                    // Bekannt abwesend: sagen, nicht suchen.
+                    self.closed = Some(format!("decision {} not in this store", &id.hex()[..8]));
+                    return;
+                }
+                if state.pending {
+                    state.urgent = true;
+                }
+            }
+            None => self.decisions = Some(DecisionTab::new(want)),
+        }
+        self.tab = Tab::Decisions;
+    }
+
+    /// Ob die Entscheidungen gerade gebraucht werden: im Decisions-Tab,
+    /// in einer Story mit `minds decide`-Schritten, im Overview-Detail
+    /// eines Commits, dessen Sessions welche aufgenommen haben.
+    pub fn decisions_wanted(&self) -> bool {
+        match self.tab {
+            Tab::Decisions => true,
+            Tab::Sessions => match self.top() {
+                Some(View::Story { story, .. }) => !story.decisions.is_empty(),
+                _ => false,
+            },
+            Tab::Overview => self
+                .overview
+                .as_ref()
+                .and_then(|s| s.agent_commit())
+                .is_some_and(|row| {
+                    row.sessions
+                        .iter()
+                        .any(|sid| !named_decisions(&self.inspection, *sid).is_empty())
+                }),
+            _ => false,
+        }
+    }
+
+    /// Holt die Entscheidungen, wenn sie ausstehen und gebraucht werden
+    /// (die Proben lesen Blobs aus dem Index — nicht ungefragt).
+    /// `true`, wenn geholt wurde.
+    pub fn fill_decisions(&mut self, source: &dyn Source) -> bool {
+        if !self.decisions_wanted() {
+            return false;
+        }
+        let state = self.decisions.get_or_insert_with(|| DecisionTab::new(None));
+        if !state.pending {
+            return false;
+        }
+        let answer = source.decisions();
+        state.fill(answer);
+        true
+    }
+
+    /// Die Bewertung einer Entscheidung, sofern geholt und frisch: Nach
+    /// einem Neuladen gilt der alte Stand nirgends mehr, auch nicht in der
+    /// Story oder der Übersicht — bis neu gerechnet ist.
+    pub fn decision(&self, id: &ContentHash) -> Option<&minds_reader::decisions::Assessment> {
+        let state = self.decisions.as_ref()?;
+        if state.stale {
+            return None;
+        }
+        state.by_id(id)
+    }
+
+    /// Der Record einer Entscheidung, sofern geholt — auch nach einem
+    /// Neuladen: Thema, Optionen und Alternativen sind Inhalt des Records,
+    /// keine Ableitung; nur der Stand (`decision`) wartet auf die Proben.
+    pub fn decision_record(
+        &self,
+        id: &ContentHash,
+    ) -> Option<&minds_reader::decisions::Assessment> {
+        self.decisions.as_ref()?.by_id(id)
+    }
+
+    /// Warum eine Entscheidung keine Bewertung hat — das Wort neben der Id,
+    /// wo sonst Thema und Stand stünden.
+    pub fn decision_absent(&self, id: &ContentHash) -> &'static str {
+        match self.decisions.as_ref() {
+            Some(state) if state.stale => "rechecking…",
+            Some(state) => match &state.entries {
+                Some(Err(_)) => "decisions not readable",
+                // Nicht gelesen heißt nicht „nicht da": Der Store war
+                // größer, als ein Lauf liest.
+                Some(Ok(_)) if state.truncated && state.by_id(id).is_none() => {
+                    "not read (store truncated)"
+                }
+                Some(Ok(_)) if state.by_id(id).is_none() => "not in this store",
+                _ => "… reading",
+            },
+            None => "… reading",
+        }
+    }
+
+    /// Die Tasten des Decisions-Tabs.
+    fn reduce_decision(&mut self, action: Action) {
+        let Some(state) = self.decisions.as_mut() else {
+            return;
+        };
+        let at = state.cursor;
+        match action {
+            Action::Up | Action::Down | Action::Home => {
+                state.cursor = crate::filter::step(&state.shown(), state.cursor, &action, 1);
+            }
+            // Ans Ende der **gezeigten** Liste — nicht hinter den Filter.
+            Action::End => state.cursor = state.shown().last().copied().unwrap_or(0),
+            Action::PageUp => {
+                state.scroll = state.scroll.min(state.max_scroll.get()).saturating_sub(10);
+            }
+            Action::PageDown => {
+                state.scroll = state.scroll.saturating_add(10).min(state.max_scroll.get());
+            }
+            Action::Back => {}
+            Action::Space => state.toggle_technical(),
+            Action::Enter => {
+                // Die Session, die die Entscheidung aufgenommen hat: ihre
+                // Story im Sessions-Tab.
+                let first = state
+                    .selected()
+                    .and_then(|a| naming_sessions(&self.inspection, &a.id).first().copied());
+                match first {
+                    Some(id) if self.inspection.story(id).is_some() => {
+                        self.tab = Tab::Sessions;
+                        self.query.clear();
+                        self.refilter_keeping(Some(id));
+                        self.push_story(id);
+                    }
+                    Some(_) => self.closed = Some("that session is not readable".into()),
+                    None => self.closed = Some("no session names this decision".into()),
+                }
+                return;
+            }
+            _ => {}
+        }
+        if state.cursor != at {
+            state.scroll = 0;
+            state.technical_open = false;
+        }
+    }
+
     /// Holt die Anker, wenn sie ausstehen — nur bei sichtbarem Tab (die
     /// Signaturprüfung startet ssh-keygen).
     pub fn fill_intents(&mut self, source: &dyn Source) {
@@ -1051,6 +1213,8 @@ impl<'a> App<'a> {
             }
         } else if tab == Tab::Requirements {
             self.open_intent(None);
+        } else if tab == Tab::Decisions {
+            self.open_decisions(None);
         } else if tab == Tab::Overview {
             self.open_overview();
             if let (Some(commit), Some(state)) = (active, self.overview.as_mut()) {
@@ -1622,7 +1786,12 @@ impl<'a> App<'a> {
             // dann lohnt der Schnappschuss.
             let origin = matches!(
                 action,
-                Action::Enter | Action::Evidence | Action::Verify | Action::Diff | Action::Intent
+                Action::Enter
+                    | Action::Evidence
+                    | Action::Verify
+                    | Action::Diff
+                    | Action::Intent
+                    | Action::Decisions
             )
             .then(|| self.snapshot());
             let tab_key = matches!(action, Action::TabTo(_) | Action::CycleTab(_));
@@ -1671,7 +1840,7 @@ impl<'a> App<'a> {
                 _ => None,
             },
             Tab::Changes => self.changes.as_ref().and_then(|s| s.commit()),
-            Tab::Sessions | Tab::Requirements => None,
+            Tab::Sessions | Tab::Requirements | Tab::Decisions => None,
         };
         if shown.is_some() {
             self.active_commit = shown;
@@ -1717,6 +1886,14 @@ impl<'a> App<'a> {
                             .first()
                             .map(|(id, _)| *id)
                     })
+                });
+                (session, session.and_then(commit_of))
+            }
+            Tab::Decisions => {
+                let session = self.decisions.as_ref().and_then(|state| {
+                    state
+                        .selected()
+                        .and_then(|a| naming_sessions(&self.inspection, &a.id).first().copied())
                 });
                 (session, session.and_then(commit_of))
             }
@@ -1768,6 +1945,31 @@ impl<'a> App<'a> {
                     }
                 }
             }
+            Action::Decisions => {
+                // Im Tab selbst: Die gewählte Entscheidung ist schon die.
+                if self.tab == Tab::Decisions {
+                    return;
+                }
+                // Die Entscheidungen der Session unter dem Fokus — sonst die
+                // der Sessions des Commits.
+                let mut ids: Vec<ContentHash> = session
+                    .map(|id| named_decisions(&self.inspection, id))
+                    .unwrap_or_default();
+                if ids.is_empty()
+                    && let Some(commit) = commit
+                {
+                    for sid in self.inspection.index().sessions_of(commit) {
+                        ids.extend(named_decisions(&self.inspection, *sid));
+                    }
+                }
+                match ids.first().cloned() {
+                    Some(id) => self.open_decisions(Some(id)),
+                    None => {
+                        self.closed =
+                            Some("D: no decision recorded here — Decisions (5) lists all".into())
+                    }
+                }
+            }
             Action::Evidence => match session {
                 Some(id) => {
                     self.tab = Tab::Sessions;
@@ -1791,6 +1993,7 @@ impl<'a> App<'a> {
             Tab::Overview => self.overview.as_ref().map(|s| s.filter.as_str()),
             Tab::Changes => self.changes.as_ref().map(|s| s.filter.as_str()),
             Tab::Requirements => self.intent.as_ref().map(|s| s.filter.as_str()),
+            Tab::Decisions => self.decisions.as_ref().map(|s| s.filter.as_str()),
             Tab::Sessions => None,
         }
     }
@@ -1800,6 +2003,7 @@ impl<'a> App<'a> {
             Tab::Overview => self.overview.as_mut().map(|s| &mut s.filter),
             Tab::Changes => self.changes.as_mut().map(|s| &mut s.filter),
             Tab::Requirements => self.intent.as_mut().map(|s| &mut s.filter),
+            Tab::Decisions => self.decisions.as_mut().map(|s| &mut s.filter),
             Tab::Sessions => None,
         }
     }
@@ -1830,6 +2034,11 @@ impl<'a> App<'a> {
                     state.cursor = crate::filter::refit(&state.shown(), state.cursor);
                 }
             }
+            Tab::Decisions => {
+                if let Some(state) = self.decisions.as_mut() {
+                    state.cursor = crate::filter::refit(&state.shown(), state.cursor);
+                }
+            }
             Tab::Sessions => {}
         }
     }
@@ -1849,6 +2058,11 @@ impl<'a> App<'a> {
             }
             Tab::Requirements => {
                 if let Some(state) = self.intent.as_mut() {
+                    state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
+                }
+            }
+            Tab::Decisions => {
+                if let Some(state) = self.decisions.as_mut() {
                     state.cursor = crate::filter::step(&state.shown(), state.cursor, action, 1);
                 }
             }
@@ -1894,6 +2108,9 @@ impl<'a> App<'a> {
             intent: (self.tab == Tab::Requirements)
                 .then(|| self.intent.clone())
                 .flatten(),
+            decisions: (self.tab == Tab::Decisions)
+                .then(|| self.decisions.clone())
+                .flatten(),
             active_commit: self.active_commit,
             target: self.tab,
             base: 0,
@@ -1928,7 +2145,7 @@ impl<'a> App<'a> {
                 .changes
                 .as_ref()
                 .is_none_or(|s| s.focus == Focus::Files || (s.landed && !s.why_layer)),
-            Tab::Requirements => true,
+            Tab::Requirements | Tab::Decisions => true,
         }
     }
 
@@ -1958,6 +2175,11 @@ impl<'a> App<'a> {
             Tab::Requirements => {
                 if entry.intent.is_some() {
                     self.intent = entry.intent;
+                }
+            }
+            Tab::Decisions => {
+                if entry.decisions.is_some() {
+                    self.decisions = entry.decisions;
                 }
             }
         }
@@ -2150,7 +2372,7 @@ impl<'a> App<'a> {
         // Die Objekt-Verben (B4): `v d i` überall, `e` dort, wo der Tab es
         // nicht selbst trägt.
         let verb = match (action.clone(), self.tab) {
-            (Action::Verify | Action::Diff | Action::Intent, _) => true,
+            (Action::Verify | Action::Diff | Action::Intent | Action::Decisions, _) => true,
             (Action::Evidence, Tab::Overview | Tab::Changes | Tab::Requirements) => true,
             (Action::Context, tab) => tab != Tab::Changes,
             _ => false,
@@ -2198,6 +2420,10 @@ impl<'a> App<'a> {
         }
         if self.tab == Tab::Requirements {
             self.reduce_intent(action);
+            return;
+        }
+        if self.tab == Tab::Decisions {
+            self.reduce_decision(action);
             return;
         }
         if self.tab == Tab::Overview {
@@ -2470,6 +2696,7 @@ impl<'a> App<'a> {
             .checked_sub(VERIFY_EVERY)
             .unwrap_or_else(Instant::now);
         let mut anchored = verified;
+        let mut decided = verified;
         // Prüfungen im Worker, wenn die Quelle das anbietet (B6) — sonst
         // synchron wie bisher.
         let mut worker = source.background().map(Worker::spawn);
@@ -2517,6 +2744,16 @@ impl<'a> App<'a> {
             if self.tab == Tab::Requirements && due {
                 self.fill_intents(source);
                 anchored = Instant::now();
+                continue;
+            }
+            // Die Entscheidungen, wo sie gebraucht werden — gedrosselt wie
+            // die Anker, außer vom Nutzer verlangt (Tab gezeigt, `D`).
+            let decisions_due = self
+                .decisions
+                .as_ref()
+                .is_none_or(|d| d.due(decided.elapsed(), VERIFY_EVERY));
+            if decisions_due && self.fill_decisions(source) {
+                decided = Instant::now();
                 continue;
             }
             if event::poll(TICK)? {

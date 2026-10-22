@@ -293,6 +293,40 @@ fn intro_lines(
         }
         lines.push(Line::from(spans));
     }
+    // DECISIONS: was die Session aufgenommen hat — Kurz-Id und, sobald
+    // geholt, Thema und Stand. Als Aussage gekennzeichnet.
+    for (i, id) in story.decisions.iter().take(SECTION_MAX).enumerate() {
+        let mut spans = vec![if i == 0 { label("DECISIONS") } else { indent() }];
+        spans.push(Span::styled(format!("{claim_glyph} "), claim_style));
+        match app.decision_record(id) {
+            Some(a) => {
+                spans.push(Span::styled(
+                    clip(&a.topic, room.saturating_sub(16)),
+                    claim_style,
+                ));
+                let (glyph, word, style) = standing_or_waiting(app, id, a);
+                spans.push(Span::styled(format!("  {glyph} {word}"), style));
+            }
+            None => spans.push(Span::styled(
+                format!(
+                    "⚖ {} · {}",
+                    crate::view::overview::anchor_short(id),
+                    app.decision_absent(id)
+                ),
+                claim_style,
+            )),
+        }
+        lines.push(Line::from(spans));
+    }
+    if story.decisions.len() > SECTION_MAX {
+        lines.push(Line::from(vec![
+            indent(),
+            Span::styled(
+                format!("  … {} more", story.decisions.len() - SECTION_MAX),
+                theme::dim(),
+            ),
+        ]));
+    }
     lines.push(Line::raw(""));
     // STEPS (n), rechts der Start.
     let mut heading = vec![Span::styled(
@@ -321,7 +355,7 @@ fn row_spans(
     let (claim_glyph, _, claim_style) = theme::claim();
     match &row.kind {
         RowKind::Step(i) => match story.steps.get(*i) {
-            Some(step) => step_spans(step, format!("{:>3}", step.number), width),
+            Some(step) => step_spans(app, step, format!("{:>3}", step.number), width),
             None => Vec::new(),
         },
         RowKind::Run {
@@ -462,12 +496,61 @@ fn row_spans(
 
 /// Eine Schrittzeile: Nummer, Glyph und Verb, Ziel, rechts Ergebnis oder
 /// Evidenzzustand, ganz rechts die Zeit seit Start.
-fn step_spans(step: &Step, number: String, width: usize) -> Vec<Span<'static>> {
+fn step_spans(app: &App, step: &Step, number: String, width: usize) -> Vec<Span<'static>> {
+    // Ein `minds decide`-Aufruf, dessen Antwort eine Entscheidung nannte:
+    // `⚖ decided` mit dem Thema — oder `⚖ asked you`, wenn die Wahl beim
+    // Menschen liegt. Das Thema steht erst, wenn die Entscheidungen geholt
+    // sind; bis dahin die Kurz-Id.
+    if let Some(id) = step.decisions.first() {
+        let assessment = app.decision_record(id);
+        let (glyph, word, style) = decided_verb(assessment);
+        let target = assessment
+            .map(|a| a.topic.clone())
+            .unwrap_or_else(|| format!("decision {}", crate::view::overview::anchor_short(id)));
+        let right = assessment
+            .map(|a| {
+                let (g, w, _) = standing_or_waiting(app, id, a);
+                format!("{g} {w}")
+            })
+            .unwrap_or_else(|| "◌ recorded".to_owned());
+        let right_style = assessment
+            .map(|a| theme::standing(a.standing).2)
+            .unwrap_or_else(|| theme::claim().2);
+        let time = step.offset_secs.map(plus).unwrap_or_default();
+        let left = format!("{number}  {glyph} {word:<10}");
+        return columns(left, style, &target, right, right_style, time, width);
+    }
     let (glyph, word, style) = theme::verb(step.verb);
     let (right, right_style) = right_of(step);
     let time = step.offset_secs.map(plus).unwrap_or_default();
     let left = format!("{number}  {glyph} {word:<10}");
     columns(left, style, &step.target, right, right_style, time, width)
+}
+
+/// Der Stand einer Entscheidung, wenn er frisch ist — sonst `?
+/// rechecking`, denn der Record ist da, die Proben noch nicht.
+fn standing_or_waiting(
+    app: &App,
+    id: &minds_core::ContentHash,
+    record: &minds_reader::decisions::Assessment,
+) -> (&'static str, &'static str, Style) {
+    match app.decision(id) {
+        Some(fresh) => theme::standing(fresh.standing),
+        None => {
+            let _ = record;
+            ("?", "rechecking", theme::dim())
+        }
+    }
+}
+
+/// Glyph, Wort und Stil eines Entscheidungs-Schritts — das Glyph aus dem
+/// Register, das Wort `asked you`, wenn die Wahl beim Menschen liegt.
+fn decided_verb(
+    assessment: Option<&minds_reader::decisions::Assessment>,
+) -> (&'static str, &'static str, Style) {
+    let (glyph, word, style) = theme::decision();
+    let open = assessment.is_some_and(|a| a.record.open);
+    (glyph, if open { "asked you" } else { word }, style)
 }
 
 /// Die Spalten einer Zeile: links Nummer, Glyph und Verb; das Ziel bekommt
@@ -549,6 +632,10 @@ fn plus(secs: i64) -> String {
 fn detail_title(story: &Story, row: &Row) -> (String, Style) {
     match &row.kind {
         RowKind::Step(i) => match story.steps.get(*i) {
+            Some(step) if !step.decisions.is_empty() => (
+                format!("STEP {} · decided", step.number),
+                Style::default().fg(theme::CHANGE),
+            ),
             Some(step) => {
                 let (_, _, style) = theme::verb(step.verb);
                 (
@@ -597,6 +684,60 @@ fn detail(
                     text.push_str(&format!(" · {} after start", plus(secs)));
                 }
                 lines.push(Line::from(vec![key("Time"), Span::raw(text)]));
+            }
+            // Die Entscheidung dieses Schritts: Thema, Stand, der gewählte
+            // Weg und die Alternativen — als Aussage; `D` öffnet sie im
+            // Decisions-Tab.
+            for id in &step.decisions {
+                let (claim_glyph, _, claim_style) = theme::claim();
+                match app.decision_record(id) {
+                    Some(a) => {
+                        lines.push(Line::from(vec![
+                            key("Decision"),
+                            Span::styled(format!("{claim_glyph} "), claim_style),
+                            Span::styled(a.topic.clone(), claim_style),
+                        ]));
+                        let (glyph, headline, style) = match app.decision(id) {
+                            Some(fresh) => {
+                                let (g, _, s) = theme::standing(fresh.standing);
+                                (g, fresh.headline(), s)
+                            }
+                            None => ("?", "rechecking…".to_owned(), theme::dim()),
+                        };
+                        lines.push(Line::from(vec![
+                            key("Standing"),
+                            Span::styled(format!("{glyph} {headline}"), style),
+                        ]));
+                        if let Some(chosen) = &a.chosen {
+                            lines.push(Line::from(vec![key("Chosen"), Span::raw(chosen.clone())]));
+                        }
+                        for (i, alternative) in a.alternatives.iter().enumerate() {
+                            lines.push(Line::from(vec![
+                                key(if i == 0 {
+                                    if a.record.open { "Options" } else { "Rejected" }
+                                } else {
+                                    ""
+                                }),
+                                Span::raw(alternative.clone()),
+                            ]));
+                        }
+                    }
+                    None => lines.push(Line::from(vec![
+                        key("Decision"),
+                        Span::styled(
+                            format!(
+                                "⚖ {} · {}",
+                                crate::view::overview::anchor_short(id),
+                                app.decision_absent(id)
+                            ),
+                            theme::dim(),
+                        ),
+                    ])),
+                }
+                lines.push(Line::from(vec![
+                    key(""),
+                    Span::styled("D: open in Decisions", theme::dim()),
+                ]));
             }
             // Der Evidenzzustand einer Schreibung mit seinem Satz (C9.3) —
             // vor dem Text des Agenten: Evidenz vor Aussage, auch im Platz.

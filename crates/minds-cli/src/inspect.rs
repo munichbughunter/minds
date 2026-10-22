@@ -121,6 +121,16 @@ impl Source for Live<'_> {
             .map_err(|err| minds_reader::sanitize(&err.to_string()))
     }
 
+    fn decisions(&self) -> Result<minds_tui::DecisionList, String> {
+        crate::decide_cmd::Assessed::load(self.ctx)
+            .map(|assessed| minds_tui::DecisionList {
+                unreadable: assessed.missing(),
+                truncated: assessed.truncated,
+                entries: assessed.all,
+            })
+            .map_err(|err| minds_reader::sanitize(&err.to_string()))
+    }
+
     fn background(&self) -> Option<Box<dyn minds_tui::Background>> {
         // Die Verify-Prüfung im Worker (B6): nur das festgehaltene Binary
         // und der Pfad — den Kontext öffnet sie dort selbst.

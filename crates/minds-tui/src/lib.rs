@@ -34,6 +34,7 @@ use minds_reader::Inspection;
 mod app;
 mod changes;
 mod copy;
+mod decision;
 mod filter;
 mod input;
 mod intent;
@@ -156,6 +157,14 @@ pub trait Source {
         Err("not available".into())
     }
 
+    /// Die Entscheidungen des Stores, bewertet wie `minds decisions`:
+    /// Proben gegen den Index, zur Lesezeit. `Err`: nicht lesbar, mit
+    /// Grund (etwa ein unlesbarer Index — dann läuft keine Probe, und
+    /// nichts gilt als in Kraft).
+    fn decisions(&self) -> Result<DecisionList, String> {
+        Err("not available".into())
+    }
+
     /// Die Conformance von `commit` gegen das signierte Soll, wie
     /// `minds verify` sie rechnet (Signaturen gegen die vertrauenswürdigen
     /// Signer). `None`: kein Soll — oder nicht bestimmbar.
@@ -178,6 +187,21 @@ pub trait Source {
 pub trait Background: Send {
     /// Das Urteil von `minds verify` über `commit` — wie [`Source::verify`].
     fn verify(&mut self, commit: minds_git::CommitId) -> Result<CommitVerify, String>;
+}
+
+/// Die Entscheidungen eines Durchgangs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionList {
+    /// Die Bewertungen, sortiert wie `minds_reader::decisions::assess_all`
+    /// — Spitzen zuerst nach Dringlichkeit, dann die jüngste; abgelöste
+    /// Records danach.
+    pub entries: Vec<minds_reader::decisions::Assessment>,
+    /// Records, die sich nicht lesen ließen (gezählt; `minds decisions`
+    /// nennt sie).
+    pub unreadable: usize,
+    /// Ob nicht jeder Record gelesen wurde (Deckel des Stores oder des
+    /// Laufs).
+    pub truncated: bool,
 }
 
 /// Die Anker eines Durchgangs.

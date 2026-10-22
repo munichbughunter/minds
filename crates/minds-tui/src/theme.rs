@@ -134,7 +134,12 @@ pub const REGISTER: &[Glyph] = &[
     ),
     // Prüfergebnis
     glyph("✓", GlyphClass::Epistemic, "passed", "check passed"),
-    glyph("~", GlyphClass::Epistemic, "partial", "partially checked"),
+    glyph(
+        "~",
+        GlyphClass::Epistemic,
+        "partial",
+        "partially checked / changed since",
+    ),
     glyph("?", GlyphClass::Epistemic, "unchecked", "not checked"),
     glyph(
         "✗",
@@ -204,7 +209,59 @@ pub const REGISTER: &[Glyph] = &[
         "pending",
         "session without a commit",
     ),
+    glyph(
+        "⚖",
+        GlyphClass::Structural,
+        "decision",
+        "a decision the agent recorded (minds decide)",
+    ),
 ];
+
+/// Glyph, Wort und Stil des Stands einer Entscheidung
+/// ([`minds_reader::decisions::Standing`]) — aus dem Register, eine
+/// Bedeutung je Glyph: `◦` offen (nicht beobachtet: noch nicht
+/// entschieden), `✗` eine tragende Annahme gilt nicht mehr (Prüfung
+/// gescheitert), `~` verändert (teilweise geprüft), `?` nicht geprüft, `✓`
+/// in Kraft (jede tragende Probe bestanden). Der Stand ist eine Ableitung
+/// über Aussagen — das Glyph sagt, was die Proben ergaben, nicht, dass die
+/// Entscheidung richtig war.
+pub fn standing(
+    standing: minds_reader::decisions::Standing,
+) -> (&'static str, &'static str, Style) {
+    use minds_reader::decisions::Standing;
+    match standing {
+        Standing::Open => ("◦", "open", Style::default().fg(HUMAN)),
+        Standing::Review => ("✗", "re-evaluate", Style::default().fg(DELETE)),
+        Standing::ReCheck => ("~", "re-check", Style::default().fg(EDIT)),
+        Standing::Unchecked => ("?", "unchecked", Style::default().fg(DIM)),
+        Standing::InForce => ("✓", "in force", Style::default().fg(OK)),
+    }
+}
+
+/// Glyph, Wort und Stil einer Entscheidung als Gegenstand (Schritt in der
+/// Story, Block in der Übersicht, Kopf im Tab).
+pub fn decision() -> (&'static str, &'static str, Style) {
+    ("⚖", "decided", Style::default().fg(CHANGE))
+}
+
+/// Glyph, Wort und Stil eines Probenergebnisses
+/// ([`minds_reader::decisions::ProbeResult`]): `✓` gilt, `✗` gilt nicht
+/// mehr, `~` verändert, `·` nicht prüfbar (keine Probe), `?` nicht geprüft
+/// (mit Grund).
+pub fn probe(result: minds_reader::decisions::ProbeResult) -> (&'static str, String, Style) {
+    use minds_reader::decisions::ProbeResult;
+    match result {
+        ProbeResult::Holds => ("✓", "holds".into(), Style::default().fg(OK)),
+        ProbeResult::Fails => ("✗", "no longer holds".into(), Style::default().fg(DELETE)),
+        ProbeResult::Stale => ("~", "changed since".into(), Style::default().fg(EDIT)),
+        ProbeResult::Unverifiable => ("·", "not checkable".into(), Style::default().fg(DIM)),
+        ProbeResult::Unknown(why) => (
+            "?",
+            format!("not checked — {why}"),
+            Style::default().fg(DIM),
+        ),
+    }
+}
 
 /// Glyph, Wort und Stil einer Evidenz-Klasse; `None` heißt „mit keinem
 /// Commit verbunden".
