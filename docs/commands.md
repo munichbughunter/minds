@@ -405,7 +405,9 @@ alternative and an assumption — `load-bearing` or `marginal` — because the s
 assumption can carry one rejection and only touch another. An assumption may carry
 a deterministic probe: a `pattern` that must (or must not) match in a file or a
 glob, a `path` that is (or is not) tracked, or a `blob` that is unchanged since the
-decision. An assumption without a probe is shown as not checkable, never as fallen.
+decision. In a pattern, `^` and `$` match at line boundaries, as in `grep`, and
+character classes are ASCII. An assumption without a probe is shown as not
+checkable, never as fallen.
 
 `--template` prints the JSON form. Without `chosen` and with `"open": true` the
 record hands the choice to a human and lists the options; the human answers later
