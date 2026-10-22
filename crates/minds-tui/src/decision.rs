@@ -235,3 +235,75 @@ pub fn named_decisions(inspection: &Inspection, session: SessionId) -> Vec<Conte
         })
         .unwrap_or_default()
 }
+
+/// Ob eine Nennung zu ihrem Aufruf passt: Der Record entstand im Zeitfenster
+/// des Aufrufs (`minds_reader::decisions::named_within_call`). Solange die
+/// Records nicht geholt sind, gilt die Nennung als noch nicht prüfbar und
+/// bleibt stehen („… reading"); eine Id, die nach vollständigem Lesen kein
+/// Record ist, fällt weg ([`unknown_counts`]).
+fn event_fits(
+    session: &minds_core::Session,
+    event: &minds_core::decision::DecisionEvent,
+    tab: Option<&DecisionTab>,
+) -> bool {
+    // Ohne Zug und Aufruf ist die Nennung nie prüfbar — nicht erst, wenn
+    // der Record da ist.
+    if event.turn.is_none() || event.call.is_none() {
+        return false;
+    }
+    match tab.and_then(|t| t.by_id(&event.decision_id)) {
+        Some(a) => minds_reader::decisions::named_within_call(session, event, &a.record.at),
+        None => unknown_counts(tab),
+    }
+}
+
+/// Ob eine genannte Id ohne Record noch zählt: solange die Records nicht
+/// geholt oder veraltet sind, ja — „… reading". Danach ist eine Id, die
+/// kein gelesener Record ist, keine Entscheidung dieser Session: Ein
+/// Kommando neben `minds decide` hat sie gedruckt — oder der Store ist
+/// über dem Deckel, und auch dann gilt nur, was gelesen ist (ein Agent
+/// kann den Store über den Deckel schreiben). Die CLI (`recall`) lässt
+/// sie ebenso weg.
+pub(crate) fn unknown_counts(tab: Option<&DecisionTab>) -> bool {
+    match tab {
+        Some(t) => t.stale || !matches!(t.entries, Some(Ok(_))),
+        None => true,
+    }
+}
+
+/// [`named_decisions`], ohne die Nennungen, die nicht zu ihrem Aufruf passen
+/// (eine fremde Id, die ein Kommando neben `minds decide` druckte).
+pub fn linked_decisions(
+    inspection: &Inspection,
+    tab: Option<&DecisionTab>,
+    session: SessionId,
+) -> Vec<ContentHash> {
+    let Some(s) = inspection.index().session(session) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ContentHash> = Vec::new();
+    for event in s.decision_events.iter().filter(|e| event_fits(s, e, tab)) {
+        if !out.contains(&event.decision_id) {
+            out.push(event.decision_id.clone());
+        }
+    }
+    out
+}
+
+/// [`naming_sessions`], nur mit Sessions, deren Nennung zu ihrem Aufruf passt.
+pub fn sessions_naming(
+    inspection: &Inspection,
+    tab: Option<&DecisionTab>,
+    id: &ContentHash,
+) -> Vec<SessionId> {
+    naming_sessions(inspection, id)
+        .into_iter()
+        .filter(|sid| {
+            inspection.index().session(*sid).is_some_and(|s| {
+                s.decision_events
+                    .iter()
+                    .any(|e| &e.decision_id == id && event_fits(s, e, tab))
+            })
+        })
+        .collect()
+}

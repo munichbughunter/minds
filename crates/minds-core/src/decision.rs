@@ -583,156 +583,53 @@ fn check_probe(probe: &Probe) -> Result<(), &'static str> {
     }
 }
 
-/// Ist `command` ein Aufruf von `minds decide` — und nur das?
+/// Nennt `command` `minds decide` als Kommando?
 ///
-/// Die Regel, nach der der Checkpoint die Tool-Antwort liest und die Story
-/// den Schritt zeigt; eng, damit kein **anderes** Kommando im selben
-/// Aufruf die Zeile `decision b3-…` drucken kann:
+/// Die Regel, nach der der Checkpoint die Tool-Antwort nach
+/// `decision`-Zeilen durchsucht und die Story den Schritt zeigt. Ein Glied
+/// der Kette genügt: Das Kommando wird an Zeilenenden, `;`, `|`, `&` und
+/// `(` in Glieder zerlegt; beginnt ein Glied mit `minds decide` oder
+/// `…/minds decide` (ein gebautes `target/debug/minds` ist ein Aufruf), ist
+/// es einer. `cd a && minds decide < d.json`, `cat d.json | minds decide;
+/// minds decisions` und ein Heredoc `minds decide <<'EOF' … EOF` sind
+/// Aufrufe; `minds decisions`, `echo minds decided` und `cargo run --
+/// decide` nicht.
 ///
-/// - Die erste Zeile enthält kein `;`, `&`, `||`, keinen Backtick, kein
-///   `$(`, `<(`, `>(` und endet nicht auf `\` (keine Fortsetzung); der
-///   Aufruf selbst hat keine Umleitung mit `>` (ein `2>/dev/null` nähme
-///   die Fehlerzeile weg, die sonst vor einer geschmuggelten stünde).
-/// - Weitere Zeilen gibt es nur als Heredoc: Die erste Zeile öffnet eines
-///   mit `<<`, und die **letzte** Zeile ist genau sein Begrenzer — genau
-///   einmal, nichts dahinter (ein Begrenzer mitten im Text beendete das
-///   Heredoc dort, und was folgte, wären Kommandos). Der Begrenzer ist ein
-///   schlichtes Wort (`[A-Za-z0-9_-]`, ganz oder gar nicht in Quotes), mit
-///   Leerzeichen oder Tab als Grenze — wie die Shell es liest; außerhalb
-///   des Begrenzer-Worts steht kein Quote und kein `#` in der Zeile.
-/// - Höchstens eine Pipe, und links davon nur `cat <datei>` oder
-///   `cat <<BEGRENZER` — ein Kommando, das nichts auf stderr druckt, das
-///   Claude Code in `stdout` mischen könnte.
-/// - Das letzte Glied beginnt mit `minds decide` — `minds` als Wort oder
-///   als `…/minds` (ein gebautes `target/debug/minds` ist ein Aufruf).
+/// Vor dem Programm dürfen Zuweisungen (`FOO=1 minds decide`) und die
+/// üblichen Einleitungen stehen (`time`, `exec`, `if`, `!`, `{` …); ein
+/// Aufruf in `$(…)` gilt über die Klammer ebenfalls. Nicht erkannt wird
+/// eine Fortsetzung mit `\` über Zeilen — fail-closed, keine Verknüpfung.
+/// Ein Treffer zu viel schadet nicht: Ohne `decision`-Zeile in der Antwort
+/// entsteht kein Event, und eine fremde Zeile scheitert am Zeitfenster. Wer
+/// die Regel weitet, lese dennoch zuerst das Bedrohungsmodell dort.
 ///
-/// `minds decide < d.json`, `cat d.json | minds decide`, `minds decide
-/// --human <<'EOF' … EOF` sind Aufrufe; `cd a && minds decide`, `minds
-/// decide < d.json & echo …`, `echo … >&2 | minds decide`, ein Heredoc mit
-/// einem Kommando nach dem Begrenzer und ein Heredoc, in dessen Text die
-/// Wörter stehen, sind keine. Fail-closed: Ein Aufruf hinter `&&` wird
-/// nicht verknüpft — besser als eine fremde Zeile. Was die Regel nicht
-/// sehen kann: ein anderes Programm namens `minds` im `PATH` oder unter
-/// `…/minds`. Die Verknüpfung ist darum eine Beobachtung der Tool-Antwort
-/// des Agenten, kein Beleg, dass der Record von ihm stammt — ob er
-/// existiert und was er sagt, rechnet der Reader aus dem Store.
+/// Die Regel ist bewusst weit — sie sagt nur, **wo** der Checkpoint nach
+/// der Zeile sucht. Dass die Zeile von genau diesem Aufruf stammt, belegt
+/// sie nicht (ein `echo` daneben könnte sie drucken, ein anderes Programm
+/// namens `minds` auch): Das prüft der Reader über die Zeit des Records,
+/// die innerhalb des Aufrufs liegen muss ([`DecisionEvent`]).
 pub fn names_decide(command: &str) -> bool {
-    let mut lines = command.lines();
-    // ` 2>&1` am Aufruf mischt nur das eigene stderr von `minds` ein — auf
-    // einem Erfolg leer; ein Fehler stünde dann vor der Zeile (fail-closed).
-    let first = lines
-        .next()
-        .unwrap_or("")
-        .trim_end_matches('\r')
-        .replace(" 2>&1", " ");
-    let first = first.as_str();
-    const FORBIDDEN: [&str; 8] = [";", "&", "||", "`", "$(", "<(", ">(", "#"];
-    if FORBIDDEN.iter().any(|f| first.contains(f)) || first.trim_end().ends_with('\\') {
-        return false;
+    /// Wörter, die vor dem Programm stehen dürfen: Zuweisungen (`FOO=1`)
+    /// und die Shell-Wörter, mit denen Agenten einen Aufruf einleiten.
+    fn is_prefix(word: &str) -> bool {
+        const PREFIXES: [&str; 12] = [
+            "time", "exec", "command", "nohup", "if", "then", "else", "do", "!", "{", "sudo", "env",
+        ];
+        PREFIXES.contains(&word)
+            || word.split_once('=').is_some_and(|(name, _)| {
+                !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
     }
-    let rest: Vec<&str> = lines.collect();
-    if !rest.is_empty() {
-        let Some((delimiter, dash, token)) = heredoc_delimiter(first) else {
-            return false;
-        };
-        // Außerhalb des Begrenzer-Worts kein Anführungszeichen: In Quotes
-        // wäre `<<` Text, und die Folgezeilen Kommandos.
-        if first.replacen(token, " ", 1).contains(['\'', '"']) {
-            return false;
-        }
-        // Der Begrenzer genau einmal, als letzte Zeile: Stünde er schon
-        // davor, endete das Heredoc dort, und was folgt, wären Kommandos.
-        // Bei `<<-` nimmt die Shell führende Tabs vor dem Vergleich weg.
-        fn strip(l: &str, dash: bool) -> &str {
-            let l = l.trim_end_matches('\r');
-            if dash { l.trim_start_matches('\t') } else { l }
-        }
-        let mut body = rest.iter().map(|l| strip(l, dash));
-        if body.next_back() != Some(delimiter.as_str()) || body.any(|l| l == delimiter) {
-            return false;
-        }
-    }
-    let mut segments = first.split('|');
-    let (left, call) = match (segments.next(), segments.next(), segments.next()) {
-        (Some(only), None, _) => (None, only),
-        (Some(left), Some(right), None) => (Some(left), right),
-        _ => return false,
-    };
-    if let Some(left) = left {
-        // Links nur, was auf stdout in die Pipe schreibt und nichts
-        // umleitet: `cat <datei>`, `cat <<X`, `echo …`, `printf …`.
-        let words: Vec<&str> = left.split_whitespace().collect();
-        let program = words.first().copied().unwrap_or("");
-        let ok = match program {
-            "cat" => {
-                let file = words.get(1).copied().unwrap_or("");
-                let plain =
-                    !file.is_empty() && !file.starts_with('-') && !file.contains(['<', '>']);
-                let heredoc =
-                    file.starts_with("<<") && file.len() > 2 && !file[2..].contains(['<', '>']);
-                words.len() == 2 && (plain || heredoc)
-            }
-            "echo" | "printf" => words.len() > 1 && !left.contains(['<', '>']),
-            _ => false,
-        };
-        if !ok {
-            return false;
-        }
-    }
-    // Keine Ausgabe-Umleitung am Aufruf: `2>/dev/null` verschöbe die
-    // Fehlerzeile, die Claude Code sonst vor eine geschmuggelte stellte.
-    if call.contains('>') {
-        return false;
-    }
-    let mut words = call
-        .split(|c: char| c.is_whitespace() || matches!(c, '<' | '(' | ')'))
-        .filter(|w| !w.is_empty());
-    let program = words.next().unwrap_or("");
-    (program == "minds" || program.ends_with("/minds")) && words.next() == Some("decide")
-}
-
-/// Der Begrenzer des ersten Heredocs einer Zeile (`<<EOF`, `<<-EOF`,
-/// `<<'EOF'`, `<< "EOF"`) — ohne Anführungszeichen —, ob es die
-/// `<<-`-Form ist (führende Tabs der Zeilen zählen dann nicht) und das
-/// ganze Wort in der Zeile (`<<'EOF'`), um es herauszunehmen. Ein Wort,
-/// das die Shell anders läse als wir — Quote nur an einer Seite, ein
-/// Quote mitten im Wort, ein Backslash, ein Umleitungs- oder Pipe-Zeichen
-/// —, ist kein Begrenzer: `None`, der Aufruf wird nicht verknüpft.
-fn heredoc_delimiter(line: &str) -> Option<(String, bool, &str)> {
-    let start = line.find("<<")?;
-    let after = &line[start + 2..];
-    let dash = after.starts_with('-');
-    let after = after.strip_prefix('-').unwrap_or(after);
-    // Wortgrenzen wie die Shell: nur Leerzeichen und Tab — kein
-    // Unicode-Leerraum, der für Bash Teil des Wortes wäre.
-    let after = after.trim_start_matches([' ', '\t']);
-    let len = after.find([' ', '\t']).unwrap_or(after.len());
-    let word = &after[..len];
-    if word.is_empty() {
-        return None;
-    }
-    let delimiter = match word.as_bytes()[0] {
-        q @ (b'\'' | b'"') => {
-            let inner = word.get(1..word.len() - 1)?;
-            if word.len() < 3 || word.as_bytes()[word.len() - 1] != q {
-                return None;
-            }
-            inner
-        }
-        _ => word,
-    };
-    // Nur ein schlichtes Wort als Begrenzer: Alles andere (Quotes mitten
-    // drin, Backslash, Umleitung, Steuer- oder Unicode-Zeichen) liest die
-    // Shell womöglich anders als wir.
-    if delimiter.is_empty()
-        || !delimiter
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        return None;
-    }
-    let token_end = line.len() - after.len() + len;
-    Some((delimiter.to_owned(), dash, &line[start..token_end]))
+    command
+        .split(['\n', '\r', ';', '|', '&', '(', '`'])
+        .any(|segment| {
+            let mut words = segment
+                .split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | ')'))
+                .filter(|w| !w.is_empty())
+                .skip_while(|w| is_prefix(w));
+            let program = words.next().unwrap_or("");
+            (program == "minds" || program.ends_with("/minds")) && words.next() == Some("decide")
+        })
 }
 
 /// Die Zeile `decision b3-<64 hex>`, wie `minds decide` sie als erste
@@ -748,6 +645,18 @@ pub fn decision_line(line: &str) -> Option<ContentHash> {
         return None;
     }
     id.parse().ok()
+}
+
+/// Alle `decision b3-…`-Zeilen einer Tool-Ausgabe, in Reihenfolge, jede Id
+/// einmal — die Ausgabe einer Kette trägt sie irgendwo, nicht zuerst.
+pub fn decision_lines(output: &str) -> Vec<ContentHash> {
+    let mut out: Vec<ContentHash> = Vec::new();
+    for id in output.lines().filter_map(decision_line) {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Die Beobachtung im gespeicherten Envelope: In dieser Session wurde ein
@@ -767,6 +676,16 @@ pub struct DecisionEvent {
     pub seq: u64,
     /// Die Record-Id.
     pub decision_id: ContentHash,
+    /// Der Zug in [`Session::turns`](crate::Session::turns), dessen Aufruf
+    /// die Id nannte — damit der Reader die Zeit des Records gegen das
+    /// Fenster des Aufrufs hält (Anfang des `PreToolUse`, Ende des
+    /// `PostToolUse`). Fehlt es (Records älterer Binaries), ist die Nennung
+    /// nicht prüfbar und wird nicht gezeigt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<usize>,
+    /// Der Aufruf in `turns[turn].tool_calls`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<usize>,
 }
 
 #[cfg(test)]
@@ -1141,25 +1060,32 @@ mod tests {
         assert_eq!(record.check(), Err(DecisionError::Kind));
     }
 
-    /// Die Regel für den eigenen `minds decide`-Aufruf: Pipe und Heredoc
-    /// davor, nichts danach — und nie ein anderes Kommando in derselben
-    /// Zeile.
+    /// Die Regel für den eigenen `minds decide`-Aufruf: ein Glied der Kette
+    /// genügt, Zuweisungen und Einleitungen davor sind erlaubt — die Zeile
+    /// in der Antwort zählt überall, die Prüfung macht der Reader am
+    /// Zeitfenster.
     #[test]
-    fn a_decide_call_is_recognized_narrowly() {
+    fn a_decide_call_is_recognized_as_a_link_of_a_chain() {
         for yes in [
             "minds decide",
             "minds decide --human",
             "minds decide < decision.json",
             "cat d.json | minds decide",
-            "cat <<'EOF' | minds decide\n{}\nEOF",
+            "cd a && minds decide < d.json",
+            "S=/tmp/x && sed 's/a/b/' $S/d.json > $S/e.json && minds decide < $S/e.json; minds decisions",
             "./target/debug/minds decide <<'EOF'\n{\"topic\":\"x\"}\nEOF",
-            "minds decide --supersedes b3-aa <<EOF\nminds decisions ; echo\nEOF",
-            "minds decide <<-EOF\n{}\n\tEOF\r",
-            "minds decide << \"END\"\n{}\nEND",
-            "minds decide < d.json 2>&1",
-            "minds decide <<EOF\n\tEOF\n{}\nEOF",
-            "echo '{}' | minds decide",
-            "printf '%s' '{}' | minds decide --human",
+            "minds decide --template >/dev/null; echo done",
+            "(minds decide < d.json)",
+            "minds decide < d.json 2>&1 | tail -3",
+            "minds decide < d.json\r\nminds decisions\r\n",
+            "FOO=1 BAR=x minds decide < d.json",
+            "{ minds decide < d.json; }",
+            "time minds decide < d.json",
+            "if minds decide < d.json; then echo ok; fi",
+            "! minds decide < d.json",
+            "exec minds decide < d.json",
+            "echo `minds decide < d.json`",
+            "minds decide --template >/dev/null; sleep 115; minds decisions",
         ] {
             assert!(names_decide(yes), "{yes:?}");
         }
@@ -1167,61 +1093,15 @@ mod tests {
             "minds decisions",
             "minds decided",
             "reminds decide",
-            "cd a && minds decide",
-            "minds decisions b3-aa ; minds decide --template",
-            "minds decide --template || true",
+            "echo minds decide",
             "echo decision | tee x",
             "cargo run -- decide",
+            "minds agent-help | grep decide",
+            // Eine Umformung allein öffnet kein Fenster.
+            "minds decisions | sed 's/^/decision /'",
+            // Fortsetzung über Zeilen: kein Aufruf (fail-closed).
+            "minds \\\ndecide < d.json",
             "",
-            // Eine zweite Zeile ohne Heredoc, ein Kommando nach dem Begrenzer.
-            "minds decide < bad.json\necho decision b3-x",
-            "minds decide <<'EOF'\n{}\nEOF\necho decision b3-x",
-            "minds decide <<'EOF'\n{}\n",
-            // Hintergrund, Substitution, Fortsetzung.
-            "minds decide < d.json & echo decision b3-x",
-            "minds decide $(echo) < d.json",
-            "minds decide `echo` < d.json",
-            "minds decide < <(cat d.json)",
-            "minds decide \\\n|| echo decision b3-x",
-            // Der Begrenzer schon vor der letzten Zeile: Das Heredoc endet
-            // dort, dahinter laufen Kommandos (`:` und `true` sind No-ops).
-            "minds decide 2>/dev/null <<:\n:\necho decision b3-x\n:",
-            "minds decide <<true\ntrue\necho decision b3-x\ntrue",
-            "minds decide <<EOF\nEOF\necho decision b3-x\nEOF",
-            // Ein Begrenzer, den die Shell anders liest: Quote mit
-            // Leerzeichen, `<<` im Kommentar oder in Quotes, ` 2>&1` im Wort.
-            "minds decide <<\"true x\"\ntrue x\necho decision b3-x\ntrue",
-            "minds decide #<<true\necho decision b3-x\ntrue",
-            "minds decide --supersedes '<<true'\necho decision b3-x\ntrue",
-            "minds decide <<\"x 2>&1\"\nx 2>&1\necho decision b3-x\nx",
-            "minds decide <<'EOF\n{}\nEOF",
-            "minds decide <<EO'F'\n{}\nEOF",
-            "minds decide <<E\\OF\n{}\nEOF",
-            "echo '<<X' | minds decide\necho decision b3-x\nX",
-            "minds decide # x",
-            // Leerraum, der für Bash Teil des Begrenzer-Worts ist (FF, VT,
-            // NBSP): Das Heredoc endet früher, als wir dachten.
-            "minds decide <<\u{0c}true\n\u{0c}true\necho decision b3-x\ntrue",
-            "minds decide <<\u{a0}true\n\u{a0}true\necho decision b3-x\ntrue",
-            "minds decide <<\u{0b}EOF\n\u{0b}EOF\necho decision b3-x\nEOF",
-            "minds decide <<EOF\u{a0}x\nEOF\necho decision b3-x\nEOF\u{a0}x",
-            "minds decide <<E.F\n{}\nE.F",
-            "minds decide <<-EOF\n\tEOF\necho decision b3-x\nEOF",
-            // Umleitungen am Aufruf.
-            "minds decide 2>/dev/null < d.json",
-            "minds decide 2>&1 1>/dev/null <<'EOF'\n{}\nEOF\necho decision b3-x",
-            "minds decide 2>&1 1>/dev/null <<'EOF'\n{}\nEOF",
-            "minds decide < d.json > out",
-            // Links der Pipe nur `cat <datei>` / `cat <<X`.
-            "echo decision b3-x >&2 | minds decide < d.json",
-            "cat d.json e.json | minds decide",
-            "cat -A d.json | minds decide",
-            "cat < d.json | minds decide",
-            "cat d.json | tee x | minds decide",
-            "echo x >&2 | minds decide",
-            "echo | minds decide",
-            "printf x > f | minds decide",
-            "minds decide |& tee x",
         ] {
             assert!(!names_decide(no), "{no:?}");
         }
@@ -1241,6 +1121,16 @@ mod tests {
             decision_line(&format!("decision b3-{}", hex.to_ascii_uppercase())),
             None
         );
+        // Alle Zeilen, in Reihenfolge, jede Id einmal.
+        let other = "0000000000000000000000000000000000000000000000000000000000000001";
+        let out =
+            format!("note\ndecision b3-{hex}\n  topic x\ndecision b3-{other}\ndecision b3-{hex}\n");
+        let ids: Vec<String> = decision_lines(&out)
+            .iter()
+            .map(|id| id.hex().to_owned())
+            .collect();
+        assert_eq!(ids, vec![hex.to_owned(), other.to_owned()]);
+        assert!(decision_lines("nothing here\n").is_empty());
     }
 
     #[test]

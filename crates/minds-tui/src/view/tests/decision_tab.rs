@@ -175,7 +175,7 @@ fn deciding() -> Inspection {
             },
             ToolCall {
                 at: Some("2026-07-25T14:12:00Z".into()),
-                ended_at: None,
+                ended_at: Some("2026-07-25T14:12:05Z".into()),
                 outcome: None,
                 capture: None,
                 name: "Bash".into(),
@@ -193,9 +193,13 @@ fn deciding() -> Inspection {
         parent: None,
         at: Some("2026-07-25T14:11:00Z".into()),
     });
+    // Die Nennung zeigt auf den zweiten Aufruf des letzten Zugs; der Record
+    // (14:12:00) liegt in dessen Fenster (14:12:00–14:12:05).
     a.decision_events.push(DecisionEvent {
         seq: 7,
         decision_id: id(1),
+        turn: Some(a.turns.len() - 1),
+        call: Some(1),
     });
     // Session b legt die offene Entscheidung dem Menschen vor.
     let mut b = session("Add exponential backoff", "2026-07-25T13:41:00Z");
@@ -203,8 +207,8 @@ fn deciding() -> Inspection {
         role: Role::Assistant,
         text: "I leave the retry policy to you.".into(),
         tool_calls: vec![ToolCall {
-            at: Some("2026-07-25T13:42:00Z".into()),
-            ended_at: None,
+            at: Some("2026-07-25T14:19:58Z".into()),
+            ended_at: Some("2026-07-25T14:20:03Z".into()),
             outcome: None,
             capture: None,
             name: "Bash".into(),
@@ -219,11 +223,13 @@ fn deciding() -> Inspection {
             }),
         }],
         parent: None,
-        at: Some("2026-07-25T13:42:00Z".into()),
+        at: Some("2026-07-25T14:19:58Z".into()),
     });
     b.decision_events.push(DecisionEvent {
         seq: 3,
         decision_id: id(2),
+        turn: Some(b.turns.len() - 1),
+        call: Some(0),
     });
     let mut sessions = BTreeMap::new();
     sessions.insert(sid('a'), a);
@@ -507,19 +513,25 @@ fn a_named_decision_the_store_lacks_says_so_in_the_story() {
     inspection = Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t");
     let mut app = App::new(inspection, &repo, None);
     app.reduce(Action::Enter);
+    // Vor dem Lesen: genannt, „… reading".
+    let before = render(&mut app);
+    assert!(before.contains("09090909"), "{before}");
+    assert!(before.contains("… reading"), "{before}");
     assert!(app.fill_decisions(&source));
     let out = render(&mut app);
-    assert!(out.contains("⚖ decided"), "{out}");
-    assert!(out.contains("09090909"), "{out}");
+    // Nach dem vollständigen Lesen ist eine Id ohne Record keine
+    // Entscheidung: kein Schritt, keine Kopfzeile, kein Sprung.
+    assert!(!out.contains("⚖ decided"), "{out}");
+    assert!(!out.contains("09090909"), "{out}");
     assert_eq!(app.decision_absent(&id(9)), "not in this store");
-    // `D` auf die fehlende Entscheidung sagt das — und holt nicht neu.
+    assert!(app.linked_decisions(sid('a')).is_empty());
     let asked = source.asked.get();
     app.reduce(Action::Decisions);
     assert_eq!(app.tab, Tab::Sessions);
     assert!(
         app.closed
             .as_deref()
-            .is_some_and(|c| c.contains("decision 09090909 not in this store")),
+            .is_some_and(|c| c.contains("no decision recorded")),
         "{:?}",
         app.closed
     );
@@ -529,6 +541,140 @@ fn a_named_decision_the_store_lacks_says_so_in_the_story() {
     app.decisions.as_mut().unwrap().invalidate(true);
     assert!(app.fill_decisions(&source));
     assert_eq!(app.decision_absent(&id(9)), "decisions not readable");
+}
+
+/// Eine Nennung, deren Record nicht im Zeitfenster ihres Aufrufs liegt —
+/// eine fremde Id, die ein Kommando neben `minds decide` druckte —, wird
+/// nirgends als Entscheidung dieser Session gezeigt: nicht in der Story,
+/// nicht im Tab unter SESSIONS, nicht beim Sprung mit `D`. Solange die
+/// Records nicht geholt sind, gilt sie als noch nicht prüfbar.
+#[test]
+fn a_named_id_outside_the_calls_window_is_not_this_sessions_decision() {
+    let (_dir, repo) = repo();
+    let source = source();
+    let mut inspection = deciding();
+    let mut sessions = BTreeMap::new();
+    for (sid_, s) in inspection.index().sessions() {
+        let mut s = s.clone();
+        if *sid_ == sid('a') {
+            // Dieselbe Stelle wie die echte Nennung, aber der offene Record
+            // (14:20:00) liegt außerhalb von 14:12:00–14:12:05.
+            let genuine = s.decision_events[0].clone();
+            s.decision_events.push(DecisionEvent {
+                seq: 7,
+                decision_id: id(2),
+                turn: genuine.turn,
+                call: genuine.call,
+            });
+        }
+        sessions.insert(*sid_, s);
+    }
+    let mut commits = BTreeMap::new();
+    commits.insert(commit('1'), vec![sid('a')]);
+    inspection = Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t");
+    let mut app = App::new(inspection, &repo, None);
+    // Vor dem Holen: beide genannt, keine prüfbar — die Story zeigt die
+    // Kurz-Ids mit „… reading".
+    assert_eq!(app.linked_decisions(sid('a')), vec![id(1), id(2)]);
+    app.reduce(Action::Enter);
+    let before = render(&mut app);
+    assert!(before.contains("… reading"), "{before}");
+    assert!(app.fill_decisions(&source));
+    assert_eq!(app.linked_decisions(sid('a')), vec![id(1)]);
+    assert_eq!(app.sessions_naming(&id(2)), vec![sid('b')]);
+    assert_eq!(app.sessions_naming(&id(1)), vec![sid('a')]);
+    let out = render(&mut app);
+    assert!(
+        out.contains("lock for the witness socket on macOS"),
+        "{out}"
+    );
+    assert!(!out.contains("retry policy for the mirror"), "{out}");
+    // Die Story-Zeile des Aufrufs trägt nur die passende Entscheidung.
+    assert!(out.contains("⚖ decided"), "{out}");
+    assert!(!out.contains("⚖ asked you"), "{out}");
+}
+
+/// `D` springt auf die Entscheidung mit Record, auch wenn eine ungeprüfte
+/// Nennung (ein `cat notes.md` in derselben Kette) davor steht; und eine
+/// Nennung ohne Zug und Aufruf (älterer Record) zählt nie.
+#[test]
+fn d_prefers_a_decision_with_a_record_and_legacy_names_never_count() {
+    let (_dir, repo) = repo();
+    let source = source();
+    let mut inspection = deciding();
+    let mut sessions = BTreeMap::new();
+    for (sid_, s) in inspection.index().sessions() {
+        let mut s = s.clone();
+        if *sid_ == sid('a') {
+            let genuine = s.decision_events[0].clone();
+            s.decision_events.insert(
+                0,
+                DecisionEvent {
+                    seq: 7,
+                    decision_id: id(9),
+                    turn: genuine.turn,
+                    call: genuine.call,
+                },
+            );
+            s.decision_events.push(DecisionEvent {
+                seq: 8,
+                decision_id: id(2),
+                turn: None,
+                call: None,
+            });
+        }
+        sessions.insert(*sid_, s);
+    }
+    let mut commits = BTreeMap::new();
+    commits.insert(commit('1'), vec![sid('a')]);
+    inspection = Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t");
+    let mut app = App::new(inspection, &repo, None);
+    assert_eq!(app.linked_decisions(sid('a')), vec![id(9), id(1)]);
+    app.reduce(Action::Enter);
+    assert!(app.fill_decisions(&source));
+    assert_eq!(app.linked_decisions(sid('a')), vec![id(1)]);
+    app.reduce(Action::Decisions);
+    assert_eq!(app.tab, Tab::Decisions);
+    assert!(render(&mut app).contains("DECISION  ⚖ 01010101"));
+}
+
+/// Das Fenster eines Schritts ist das seines Aufrufs, nicht das des ganzen
+/// Zugs: Ein Record aus einem früheren Aufruf desselben Zugs gehört nicht
+/// zum späteren `minds decide`-Schritt.
+#[test]
+fn the_steps_window_is_the_calls_not_the_turns() {
+    let (_dir, repo) = repo();
+    let source = source();
+    let mut inspection = deciding();
+    let mut sessions = BTreeMap::new();
+    for (sid_, s) in inspection.index().sessions() {
+        let mut s = s.clone();
+        if *sid_ == sid('a') {
+            // Zug ab 14:11:30: Aufruf 1 (`cargo test`) 14:11:30–14:14:00,
+            // Aufruf 2 (`minds decide`) 14:19:58–14:20:03. Der Record lock()
+            // (14:12:00) liegt im Zug, aber nicht im zweiten Aufruf.
+            let turn = s.turns.last_mut().unwrap();
+            turn.at = Some("2026-07-25T14:11:30Z".into());
+            turn.tool_calls[0].at = Some("2026-07-25T14:11:30Z".into());
+            turn.tool_calls[0].ended_at = Some("2026-07-25T14:14:00Z".into());
+            turn.tool_calls[1].at = Some("2026-07-25T14:19:58Z".into());
+            turn.tool_calls[1].ended_at = Some("2026-07-25T14:20:03Z".into());
+        }
+        sessions.insert(*sid_, s);
+    }
+    let mut commits = BTreeMap::new();
+    commits.insert(commit('1'), vec![sid('a')]);
+    inspection = Inspection::from_index(Index::from_parts(sessions, commits), Vec::new(), "t");
+    let mut app = App::new(inspection, &repo, None);
+    app.reduce(Action::Enter);
+    assert!(app.fill_decisions(&source));
+    assert!(app.linked_decisions(sid('a')).is_empty());
+    let out = text_at(&mut app, 200, 60);
+    assert!(!out.contains("⚖ decided"), "{out}");
+    assert!(
+        !out.contains("lock for the witness socket on macOS"),
+        "{out}"
+    );
 }
 
 /// Die Übersicht: der Commit mit Session a zeigt DECISIONS (1) mit Thema

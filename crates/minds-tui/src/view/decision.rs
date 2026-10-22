@@ -16,7 +16,7 @@ use minds_core::decision::{Probe, Reason};
 use minds_reader::decisions::{Assessment, Standing};
 
 use crate::app::App;
-use crate::decision::{DecisionTab, naming_sessions};
+use crate::decision::DecisionTab;
 use crate::theme;
 use crate::view::overview::anchor_short;
 
@@ -368,7 +368,7 @@ pub(crate) fn detail_lines(
     }
 
     // SESSIONS — wer die Entscheidung aufgenommen hat (Record).
-    let sessions = naming_sessions(&app.inspection, &a.id);
+    let sessions = app.sessions_naming(&a.id);
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled(
         format!("SESSIONS ({})", sessions.len()),

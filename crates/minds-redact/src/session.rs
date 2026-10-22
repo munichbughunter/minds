@@ -2400,10 +2400,14 @@ mod tests {
         s.decision_events.push(DecisionEvent {
             seq: 7,
             decision_id: hash(3),
+            turn: Some(0),
+            call: Some(1),
         });
         s.decision_events.push(DecisionEvent {
             seq: 9,
             decision_id: hash(4),
+            turn: None,
+            call: None,
         });
 
         let out = pipeline().redact_session(s.clone()).unwrap();

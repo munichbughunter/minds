@@ -388,21 +388,28 @@ pub fn checkpoint_witness(
 /// und die steht in der Tool-Antwort des `PostToolUse`-Events, das die
 /// Hooks (A1) oder der Witness (A2) wie jedes andere gesehen haben.
 ///
-/// Das Tor ist eng, damit die Zeile nicht aus einem anderen Kommando
-/// stammen kann: Das Kommando ist ein `minds decide`-Aufruf und sonst
-/// nichts ([`minds_core::decision::names_decide`] — kein `;`, `&&`, `||`
-/// in seiner ersten Zeile, `minds decide` als letztes Glied der Pipe), und
-/// nur die **erste Zeile** der Antwort zählt. Gekürzte oder unterbrochene
-/// Antworten liefert der Adapter nicht (`exec_report`); dann fehlt die
-/// Verknüpfung, ehrlich. Was die Id bedeutet — ob der Record existiert und
-/// noch gilt —, rechnet der Reader (W2).
+/// Das Tor sagt nur, wo gesucht wird: Das Kommando nennt `minds decide`
+/// als Glied seiner Kette ([`minds_core::decision::names_decide`]), und
+/// jede `decision`-Zeile der Antwort zählt (höchstens
+/// [`MAX_DECISIONS_PER_CALL`]). Gekürzte
+/// oder unterbrochene Antworten liefert der Adapter nicht (`exec_report`);
+/// dann fehlt die Verknüpfung, ehrlich. Das Event trägt Zug und Aufruf
+/// (`turn`/`call`): Ob die Zeile zu **diesem** Aufruf gehört — der Record
+/// also in dessen Zeitfenster entstand — und was die Id bedeutet, rechnet
+/// der Reader (W2).
+/// So viele Ids nimmt der Checkpoint je Aufruf höchstens aus der Antwort —
+/// ein Aufruf nimmt eine Entscheidung auf, selten zwei; eine Ausgabe mit
+/// hunderten Zeilen (`minds decisions` in der Kette) soll das Envelope nicht
+/// füllen.
+const MAX_DECISIONS_PER_CALL: usize = 8;
+
 fn decision_events(
     session: &Session,
     events: &[JournalEvent],
     call_events: &[usize],
     agent: &str,
 ) -> Vec<minds_core::decision::DecisionEvent> {
-    use minds_core::decision::{DecisionEvent, decision_line, names_decide};
+    use minds_core::decision::{DecisionEvent, decision_lines, names_decide};
     let Some(adapter) = normalize::adapter_for(agent) else {
         return Vec::new();
     };
@@ -410,36 +417,49 @@ fn decision_events(
     // Index kostet einen Durchlauf über das Journal.
     let mut posts: Option<PostIndex<'_>> = None;
     let mut out: Vec<DecisionEvent> = Vec::new();
-    let calls = session.turns.iter().flat_map(|t| &t.tool_calls);
-    for (call, &pre_index) in calls.zip(call_events) {
-        if call.effect.as_ref().map(|e| e.kind) != Some(EffectKind::Exec) {
-            continue;
-        }
-        let Some(command) = command_str(&call.arguments) else {
-            continue;
-        };
-        if !names_decide(&command) {
-            continue;
-        }
-        let posts = posts.get_or_insert_with(|| PostIndex::new(adapter, events));
-        let Some(post) = posts.post_for(events.get(pre_index)) else {
-            continue;
-        };
-        let Some(report) = adapter.exec_report(post, &command) else {
-            continue;
-        };
-        // Ein gescheiterter Aufruf hat keinen Record abgelegt — was seine
-        // Ausgabe nennt, ist nicht seiner.
-        if report.exit_code.is_some_and(|code| code != 0) {
-            continue;
-        }
-        if let Some(id) = report.output.lines().next().and_then(decision_line)
-            && !out.iter().any(|e| e.decision_id == id)
-        {
-            out.push(DecisionEvent {
-                seq: post.seq,
-                decision_id: id,
-            });
+    let mut call_events = call_events.iter();
+    for (turn_index, turn) in session.turns.iter().enumerate() {
+        for (call_index, call) in turn.tool_calls.iter().enumerate() {
+            let Some(&pre_index) = call_events.next() else {
+                return out;
+            };
+            if call.effect.as_ref().map(|e| e.kind) != Some(EffectKind::Exec) {
+                continue;
+            }
+            let Some(command) = command_str(&call.arguments) else {
+                continue;
+            };
+            if !names_decide(&command) {
+                continue;
+            }
+            let posts = posts.get_or_insert_with(|| PostIndex::new(adapter, events));
+            let Some(post) = posts.post_for(events.get(pre_index)) else {
+                continue;
+            };
+            // Unterbrochen oder gekürzt: kein Report, keine Verknüpfung. Ein
+            // Exit-Code ≠ 0 schließt nicht aus — in einer Kette kann `minds
+            // decide` gelungen und ein späteres Glied gescheitert sein; ob die
+            // Zeile zu diesem Aufruf gehört, entscheidet der Reader am
+            // Zeitfenster.
+            let Some(report) = adapter.exec_report(post, &command) else {
+                continue;
+            };
+            // Erst die schon genannten weglassen, dann deckeln: Detailblöcke
+            // bekannter Ids vor dem `minds decide` in derselben Kette dürfen
+            // die neue Id nicht verdrängen.
+            let fresh: Vec<ContentHash> = decision_lines(&report.output)
+                .into_iter()
+                .filter(|id| !out.iter().any(|e| &e.decision_id == id))
+                .take(MAX_DECISIONS_PER_CALL)
+                .collect();
+            for id in fresh {
+                out.push(DecisionEvent {
+                    seq: post.seq,
+                    decision_id: id,
+                    turn: Some(turn_index),
+                    call: Some(call_index),
+                });
+            }
         }
     }
     out
@@ -1528,11 +1548,16 @@ mod tests {
     }
 
     /// Die Verknüpfung Session ↔ Entscheidung kommt aus der Tool-Antwort
-    /// des eigenen `minds decide`-Aufrufs: Kommando nennt es, Antwort trägt
-    /// die Zeile — beides, sonst nichts.
+    /// eines Aufrufs, dessen Kommando `minds decide` nennt — als Glied einer
+    /// Kette genügt —, mit jeder `decision`-Zeile der Antwort und dem Zug
+    /// und Aufruf, aus dem sie stammt. Ob der Record in dessen Zeitfenster
+    /// liegt, prüft der Reader.
     #[test]
     fn a_minds_decide_call_links_the_session_to_the_record() {
         let hex = "f1d311757e0f65b9852d2d5ad873beaf6ab3caf9e1e1caafe6252cfaeb9c7b53";
+        let other = "0000000000000000000000000000000000000000000000000000000000000001";
+        let third = "0000000000000000000000000000000000000000000000000000000000000002";
+        let fourth = "0000000000000000000000000000000000000000000000000000000000000003";
         let pre = |seq, id: &str, command: &str| {
             ev(
                 seq,
@@ -1556,77 +1581,107 @@ mod tests {
         };
         let heredoc = "minds decide <<'EOF'\n{\"topic\":\"x\"}\nEOF";
         let stdout = format!("decision b3-{hex}\n  topic       x\n");
-        let other = "0000000000000000000000000000000000000000000000000000000000000001";
-        let smuggle = "minds decisions b3-aa ; minds decide --template";
+        let chain = "cd src && minds decide < d.json; uv run pytest -q";
+        let chain_out = format!("decision b3-{other}\n  topic       y\n...\n3 passed\n");
+        let read_pre = ev(
+            100,
+            EventKind::ToolPre,
+            "PreToolUse",
+            "t1",
+            &serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"/home/anna/projects/minds/d.json"},"tool_use_id":"r"})
+                .to_string(),
+        );
+        let read_post = ev(
+            101,
+            EventKind::ToolPost,
+            "PostToolUse",
+            "t1",
+            &serde_json::json!({"tool_name":"Read","tool_input":{"file_path":"/home/anna/projects/minds/d.json"},
+                "tool_response":{"file":{"content":"{}"}},"tool_use_id":"r"})
+                .to_string(),
+        );
         let events = [
             ev(0, EventKind::Prompt, "UserPromptSubmit", "t0", r#"{"prompt":"x"}"#),
-            pre(1, "a", heredoc),
-            post(2, "a", heredoc, &stdout),
-            // Dieselbe Zeile aus einem anderen Kommando: keine Entscheidung.
-            pre(3, "b", "cat notes.txt"),
-            post(4, "b", "cat notes.txt", &stdout),
+            // Ein Aufruf ohne Exec davor: zählt als Aufruf 0, verknüpft nichts.
+            JournalEvent { seq: 1, ..read_pre.clone() },
+            JournalEvent { seq: 2, ..read_post.clone() },
+            pre(3, "a", heredoc),
+            post(4, "a", heredoc, &stdout),
+            // Dieselbe Zeile aus einem Kommando, das `minds decide` nicht
+            // nennt: nichts.
+            pre(5, "b", "cat notes.txt"),
+            post(6, "b", "cat notes.txt", &stdout),
             // `minds decide` ohne gültige Id-Zeile: nichts.
-            pre(5, "c", "cat d.json | minds decide"),
-            post(6, "c", "cat d.json | minds decide", "minds decide: not valid JSON\n"),
+            pre(7, "c", "cat d.json | minds decide"),
+            post(8, "c", "cat d.json | minds decide", "minds decide: not valid JSON\n"),
             // Ein anderes Wort: nichts.
-            pre(7, "d", "echo minds decided"),
-            post(8, "d", "echo minds decided", &stdout),
-            // Ein anderes Kommando in derselben Zeile, dessen Ausgabe eine
-            // fremde Id nennt: nichts — das Tor ist der Aufruf allein.
-            pre(9, "e", smuggle),
-            post(10, "e", smuggle, &format!("decision b3-{other}\n{{\n")),
-            // Die Zeile erst als zweite: nichts.
-            pre(11, "f", "minds decide < d.json"),
-            post(12, "f", "minds decide < d.json", &format!("note\ndecision b3-{other}\n")),
-            // Gescheitert (Exit-Code ≠ 0), auch wenn die Ausgabe die Zeile
-            // nennt: nichts — der Aufruf hat keinen Record abgelegt.
-            pre(13, "g", "minds decide < d.json"),
+            pre(9, "d", "echo minds decided"),
+            post(10, "d", "echo minds decided", &stdout),
+            // Eine Kette, die Zeile mitten in der Ausgabe: verknüpft.
+            pre(11, "e", chain),
+            post(12, "e", chain, &chain_out),
+            // Unterbrochen: nichts.
+            pre(13, "f", "minds decide < d.json"),
             ev(
                 14,
-                EventKind::ToolPost,
-                "PostToolUseFailure",
-                "t2",
-                &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"minds decide < d.json"},
-                    "error":format!("Exit code 1\ndecision b3-{other}"),"is_interrupt":false,"tool_use_id":"g"})
-                    .to_string(),
-            ),
-            // Ein zweites Kommando in der zweiten Zeile, hinter `&`, links
-            // der Pipe oder nach dem Heredoc-Begrenzer: nichts — das Tor
-            // ist der Aufruf allein, und Claude Code mischt stderr in stdout.
-            pre(19, "j", "minds decide --template >/dev/null\necho decision b3-x"),
-            post(20, "j", "minds decide --template >/dev/null\necho decision b3-x", &format!("decision b3-{other}\n")),
-            pre(21, "k", "minds decide --template >/dev/null & echo decision b3-x"),
-            post(22, "k", "minds decide --template >/dev/null & echo decision b3-x", &format!("decision b3-{other}\n")),
-            pre(23, "l", "echo decision b3-x >&2 | minds decide < d.json"),
-            post(24, "l", "echo decision b3-x >&2 | minds decide < d.json", &format!("decision b3-{other}\n{stdout}")),
-            pre(25, "m", "minds decide <<'EOF'\n{}\nEOF\necho decision b3-x"),
-            post(26, "m", "minds decide <<'EOF'\n{}\nEOF\necho decision b3-x", &format!("decision b3-{other}\n")),
-            // Der Begrenzer als No-op-Kommando mitten im Text, stderr
-            // weggeleitet, Exit 0: nichts.
-            pre(27, "n", "minds decide 2>/dev/null <<:\n:\necho decision b3-x\n:"),
-            post(28, "n", "minds decide 2>/dev/null <<:\n:\necho decision b3-x\n:", &format!("decision b3-{other}\n")),
-            // Unterbrochen: nichts.
-            pre(15, "h", "minds decide < d.json"),
-            ev(
-                16,
                 EventKind::ToolPost,
                 "PostToolUse",
                 "t2",
                 &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"minds decide < d.json"},
-                    "tool_response":{"stdout":stdout,"stderr":"","interrupted":true},"tool_use_id":"h"})
+                    "tool_response":{"stdout":format!("decision b3-{third}\n"),"stderr":"","interrupted":true},"tool_use_id":"f"})
+                    .to_string(),
+            ),
+            // Gescheitert (Exit ≠ 0), die Zeile aber da: verknüpft — ob sie
+            // zu diesem Aufruf gehört, entscheidet das Zeitfenster.
+            pre(15, "g", "minds decide < d.json && false"),
+            ev(
+                16,
+                EventKind::ToolPost,
+                "PostToolUseFailure",
+                "t2",
+                &serde_json::json!({"tool_name":"Bash","tool_input":{"command":"minds decide < d.json && false"},
+                    "error":format!("Exit code 1\ndecision b3-{third}\n"),"is_interrupt":false,"tool_use_id":"g"})
                     .to_string(),
             ),
             // Dieselbe Id ein zweites Mal: einmal genannt.
-            pre(17, "i", heredoc),
-            post(18, "i", heredoc, &stdout),
+            pre(17, "h", heredoc),
+            post(18, "h", heredoc, &stdout),
+            // Ein zweiter Zug nach dem Stop: eigener Index.
+            ev(19, EventKind::TurnEnd, "Stop", "t3", "{}"),
+            ev(20, EventKind::Prompt, "UserPromptSubmit", "t4", r#"{"prompt":"y"}"#),
+            pre(21, "i", "minds decide --human < open.json"),
+            post(22, "i", "minds decide --human < open.json", &format!("decision b3-{fourth}\n")),
         ];
         let session = build_one(&key(), &events);
+        let id = |hex: &str| -> minds_core::ContentHash { format!("b3-{hex}").parse().unwrap() };
         assert_eq!(
             session.decision_events,
-            vec![minds_core::decision::DecisionEvent {
-                seq: 2,
-                decision_id: format!("b3-{hex}").parse().unwrap(),
-            }]
+            vec![
+                minds_core::decision::DecisionEvent {
+                    seq: 4,
+                    decision_id: id(hex),
+                    turn: Some(1),
+                    call: Some(1),
+                },
+                minds_core::decision::DecisionEvent {
+                    seq: 12,
+                    decision_id: id(other),
+                    turn: Some(1),
+                    call: Some(5),
+                },
+                minds_core::decision::DecisionEvent {
+                    seq: 16,
+                    decision_id: id(third),
+                    turn: Some(1),
+                    call: Some(7),
+                },
+                minds_core::decision::DecisionEvent {
+                    seq: 22,
+                    decision_id: id(fourth),
+                    turn: Some(3),
+                    call: Some(0),
+                },
+            ]
         );
     }
 

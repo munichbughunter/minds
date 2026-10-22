@@ -32,7 +32,6 @@
 
 use jiff::Timestamp;
 use minds_core::ContentHash;
-use minds_core::decision::names_decide;
 use minds_core::{
     CaptureNote, CaptureStatus, EdgeKind, EffectKind, Endpoint, ExecClass, Role, Session,
     SessionId, WrittenUnavailable,
@@ -183,16 +182,21 @@ pub struct Step {
     pub uninterpreted: bool,
     /// Der Zeitpunkt des Zugs, RFC 3339, falls erfasst.
     pub at: Option<String>,
+    /// Der Anfang **dieses Aufrufs** (`PreToolUse`), RFC 3339, falls erfasst
+    /// — das Zeitfenster einer Entscheidung beginnt hier, nicht am Zug.
+    pub call_at: Option<String>,
     /// Sekunden seit Session-Start, falls beide Zeiten lesbar sind.
     pub offset_secs: Option<i64>,
     /// Bei `delegated`: die Kind-Session, wenn sie sich eindeutig zuordnen
     /// lässt (siehe [`Story::of`]).
     pub child: Option<SessionId>,
-    /// Die Entscheidungen, die dieser Aufruf aufgenommen hat — ein
-    /// `minds decide`-Kommando, dessen Antwort der Checkpoint gelesen hat
-    /// (`Session::decision_events`), der Reihe nach zugeordnet. Leer für
-    /// jeden anderen Schritt.
+    /// Die Entscheidungen, deren Id die Antwort dieses Aufrufs nannte
+    /// (`Session::decision_events` mit `turn`/`call`). Ob der Record im
+    /// Zeitfenster des Aufrufs (`at` bis `ended_at`) entstand, prüft der
+    /// Leser mit dem Record. Leer für jeden anderen Schritt.
     pub decisions: Vec<ContentHash>,
+    /// Das Ende des Aufrufs (`PostToolUse`), RFC 3339, falls erfasst.
+    pub ended_at: Option<String>,
     /// Schlüssel/Wert-Details für die Detailbox, entschärft — das Kommando
     /// vollständig, der Pfad, Runner und Ergebnis, der Capture-Status.
     pub detail: Vec<(String, String)>,
@@ -236,9 +240,10 @@ pub struct Story {
     pub turns: Vec<StoryTurn>,
     /// Gestartete Sub-Agents, soweit im Index auflösbar, in Kanten-Reihenfolge.
     pub subagents: Vec<SessionId>,
-    /// Die Entscheidungen, die die Session aufgenommen hat
-    /// (`Session::decision_events`), in Journal-Reihenfolge — auch die, die
-    /// sich keinem Schritt zuordnen ließen.
+    /// Die Entscheidungen, die die Session nennt (`Session::decision_events`),
+    /// in Journal-Reihenfolge — auch die ohne Aufruf (ältere Records). Was
+    /// davon im Zeitfenster seines Aufrufs liegt, sagt der Leser mit dem
+    /// Record.
     pub decisions: Vec<ContentHash>,
 }
 
@@ -313,40 +318,26 @@ impl Story {
             .collect();
         let subagents: Vec<SessionId> = spawned.iter().flatten().copied().collect();
 
-        // Die Entscheidungen der Session, der Reihe nach an die
-        // `minds decide`-Aufrufe vergeben — beide stehen in Journal-Reihenfolge.
-        // Nur, wenn die Zahlen übereinstimmen: Ein Aufruf ohne Record (abgebrochen,
-        // gescheitert) würde sonst die Zuordnung aller folgenden verschieben.
-        // Dann bleiben die Ids an der Story, die Schritte tragen keine.
+        // Die Entscheidungen der Session: alle genannten Ids, und je
+        // Aufruf (`turn`/`call` am Event) die, die seine Antwort nannte.
+        // Ob der Record im Zeitfenster des Aufrufs entstand, prüft, wer den
+        // Record hat (`decisions::named_within_call`) — die Story kennt nur
+        // die Session.
         let decisions: Vec<ContentHash> = session
             .decision_events
             .iter()
             .map(|e| e.decision_id.clone())
             .collect();
-        // Dasselbe Prädikat wie in der Schleife unten: ein gedeuteter
-        // Exec-Aufruf, dessen Kommando `minds decide` nennt.
-        let decide_calls = session
-            .turns
-            .iter()
-            .flat_map(|t| t.tool_calls.iter())
-            .filter(|c| {
-                let uninterpreted = c
-                    .capture
-                    .as_ref()
-                    .is_some_and(|c| c.status == CaptureStatus::Uninterpreted);
-                !uninterpreted
-                    && c.effect
-                        .as_ref()
-                        .is_some_and(|e| e.kind == EffectKind::Exec)
-                    && raw_command(&c.arguments).is_some_and(|c| names_decide(&c))
-            })
-            .count();
-        let mut pending: std::collections::VecDeque<ContentHash> =
-            if decide_calls == decisions.len() {
-                decisions.iter().cloned().collect()
-            } else {
-                std::collections::VecDeque::new()
-            };
+        let mut by_call: std::collections::BTreeMap<(usize, usize), Vec<ContentHash>> =
+            std::collections::BTreeMap::new();
+        for event in &session.decision_events {
+            if let (Some(turn), Some(call)) = (event.turn, event.call) {
+                by_call
+                    .entry((turn, call))
+                    .or_default()
+                    .push(event.decision_id.clone());
+            }
+        }
         let mut steps: Vec<Step> = Vec::new();
         let mut turns: Vec<StoryTurn> = Vec::with_capacity(session.turns.len());
         for (turn_index, turn) in session.turns.iter().enumerate() {
@@ -463,15 +454,9 @@ impl Story {
                 if let Some(outcome) = outcome {
                     detail.push(("Result".into(), outcome_words(outcome)));
                 }
-                // Dasselbe Prädikat wie bei der Zählung oben: das rohe
-                // Kommando, nicht das mit versteckten Pfaden.
-                let decide_call = command.is_some()
-                    && raw_command(&call.arguments).is_some_and(|c| names_decide(&c));
-                let step_decisions: Vec<ContentHash> = if decide_call {
-                    pending.pop_front().into_iter().collect()
-                } else {
-                    Vec::new()
-                };
+                let step_decisions: Vec<ContentHash> = by_call
+                    .remove(&(turn_index, call_index))
+                    .unwrap_or_default();
                 for id in &step_decisions {
                     detail.push(("Decision".into(), id.to_string()));
                 }
@@ -486,6 +471,8 @@ impl Story {
                     claim,
                     uninterpreted,
                     at: at.clone(),
+                    call_at: call.at.clone(),
+                    ended_at: call.ended_at.clone(),
                     offset_secs,
                     child: None,
                     decisions: step_decisions,
@@ -1019,6 +1006,51 @@ mod tests {
             effect,
             outcome: None,
         }
+    }
+
+    /// Entscheidungen hängen über `turn`/`call` am Schritt, mit dem Fenster
+    /// des Aufrufs (`call_at`, `ended_at`); ein Event ohne Indizes steht in
+    /// `Story.decisions`, aber an keinem Schritt.
+    #[test]
+    fn decisions_hang_on_their_call_with_its_window() {
+        let mut s = base("decide");
+        let mut first = exec("cargo test");
+        first.at = Some("2026-07-25T14:11:30Z".into());
+        first.ended_at = Some("2026-07-25T14:11:40Z".into());
+        let mut second = exec("minds decide < d.json");
+        second.at = Some("2026-07-25T14:12:00Z".into());
+        second.ended_at = Some("2026-07-25T14:12:05Z".into());
+        let t = s.turns.len();
+        s.turns.push(turn(
+            Role::Assistant,
+            "",
+            "2026-07-25T14:11:30Z",
+            vec![first, second],
+        ));
+        let event = |seq, n, turn, call| minds_core::decision::DecisionEvent {
+            seq,
+            decision_id: hash(n),
+            turn,
+            call,
+        };
+        s.decision_events.push(event(2, 1, Some(t), Some(1)));
+        s.decision_events.push(event(4, 2, Some(t), Some(0)));
+        s.decision_events.push(event(6, 3, None, None));
+        s.decision_events.push(event(8, 4, Some(99), Some(0)));
+        let story = Story::of(sid('a'), &s, &index_with_child(&s));
+        assert_eq!(story.decisions.len(), 4);
+        let steps: Vec<&Step> = story.steps.iter().filter(|st| st.turn == t).collect();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].decisions, vec![hash(2)]);
+        assert_eq!(steps[0].call_at.as_deref(), Some("2026-07-25T14:11:30Z"));
+        assert_eq!(steps[0].ended_at.as_deref(), Some("2026-07-25T14:11:40Z"));
+        assert_eq!(steps[1].decisions, vec![hash(1)]);
+        assert_eq!(steps[1].call_at.as_deref(), Some("2026-07-25T14:12:00Z"));
+        assert_eq!(steps[1].ended_at.as_deref(), Some("2026-07-25T14:12:05Z"));
+        // Der Zug trägt die Zeit des Zugs, der Aufruf seine eigene.
+        assert_eq!(steps[1].at.as_deref(), Some("2026-07-25T14:11:30Z"));
+        let placed: usize = story.steps.iter().map(|st| st.decisions.len()).sum();
+        assert_eq!(placed, 2, "ohne Indizes oder außerhalb: an keinem Schritt");
     }
 
     fn exec(command: &str) -> ToolCall {

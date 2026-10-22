@@ -142,7 +142,7 @@ pub fn draw(
     if detail_h > 0
         && let (Some(row), Some(lines)) = (focused, detail_lines)
     {
-        let (title, style) = detail_title(story, row);
+        let (title, style) = detail_title(app, story, row);
         frame.render_widget(
             Paragraph::new(lines).wrap(Wrap { trim: false }).block(
                 Block::bordered()
@@ -294,8 +294,10 @@ fn intro_lines(
         lines.push(Line::from(spans));
     }
     // DECISIONS: was die Session aufgenommen hat — Kurz-Id und, sobald
-    // geholt, Thema und Stand. Als Aussage gekennzeichnet.
-    for (i, id) in story.decisions.iter().take(SECTION_MAX).enumerate() {
+    // geholt, Thema und Stand. Als Aussage gekennzeichnet. Nur Nennungen,
+    // die zu ihrem Aufruf passen (Zeitfenster) oder noch nicht prüfbar sind.
+    let session_decisions = app.linked_decisions(id);
+    for (i, id) in session_decisions.iter().take(SECTION_MAX).enumerate() {
         let mut spans = vec![if i == 0 { label("DECISIONS") } else { indent() }];
         spans.push(Span::styled(format!("{claim_glyph} "), claim_style));
         match app.decision_record(id) {
@@ -318,11 +320,11 @@ fn intro_lines(
         }
         lines.push(Line::from(spans));
     }
-    if story.decisions.len() > SECTION_MAX {
+    if session_decisions.len() > SECTION_MAX {
         lines.push(Line::from(vec![
             indent(),
             Span::styled(
-                format!("  … {} more", story.decisions.len() - SECTION_MAX),
+                format!("  … {} more", session_decisions.len() - SECTION_MAX),
                 theme::dim(),
             ),
         ]));
@@ -501,7 +503,11 @@ fn step_spans(app: &App, step: &Step, number: String, width: usize) -> Vec<Span<
     // `⚖ decided` mit dem Thema — oder `⚖ asked you`, wenn die Wahl beim
     // Menschen liegt. Das Thema steht erst, wenn die Entscheidungen geholt
     // sind; bis dahin die Kurz-Id.
-    if let Some(id) = step.decisions.first() {
+    if let Some(id) = step
+        .decisions
+        .iter()
+        .find(|d| app.decision_fits_step(step, d))
+    {
         let assessment = app.decision_record(id);
         let (glyph, word, style) = decided_verb(assessment);
         let target = assessment
@@ -629,13 +635,20 @@ fn plus(secs: i64) -> String {
 }
 
 /// Titel und Stil der Detailbox.
-fn detail_title(story: &Story, row: &Row) -> (String, Style) {
+fn detail_title(app: &App, story: &Story, row: &Row) -> (String, Style) {
     match &row.kind {
         RowKind::Step(i) => match story.steps.get(*i) {
-            Some(step) if !step.decisions.is_empty() => (
-                format!("STEP {} · decided", step.number),
-                Style::default().fg(theme::CHANGE),
-            ),
+            Some(step)
+                if step
+                    .decisions
+                    .iter()
+                    .any(|d| app.decision_fits_step(step, d)) =>
+            {
+                (
+                    format!("STEP {} · decided", step.number),
+                    Style::default().fg(theme::CHANGE),
+                )
+            }
             Some(step) => {
                 let (_, _, style) = theme::verb(step.verb);
                 (
@@ -688,7 +701,11 @@ fn detail(
             // Die Entscheidung dieses Schritts: Thema, Stand, der gewählte
             // Weg und die Alternativen — als Aussage; `D` öffnet sie im
             // Decisions-Tab.
-            for id in &step.decisions {
+            for id in step
+                .decisions
+                .iter()
+                .filter(|d| app.decision_fits_step(step, d))
+            {
                 let (claim_glyph, _, claim_style) = theme::claim();
                 match app.decision_record(id) {
                     Some(a) => {

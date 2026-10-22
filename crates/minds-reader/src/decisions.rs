@@ -341,6 +341,60 @@ impl Worktree for IndexTree<'_> {
     }
 }
 
+/// Spielraum des Zeitfensters in Sekunden: Die Zeit des Records setzt
+/// `minds decide` mit seiner Uhr, die des Aufrufs der Hook mit seiner —
+/// dieselbe Maschine, aber zwei Prozesse und Millisekunden.
+pub const LINK_SLACK_SECS: i64 = 1;
+
+/// So lang darf das Fenster eines Aufrufs höchstens sein, damit eine
+/// Nennung darin zählt. Die Länge bestimmt der Agent (`sleep 590; minds
+/// decisions` druckte minutenlang fremde Ids); ein Record, den ein Mensch
+/// währenddessen in einem anderen Terminal anlegt, fiele sonst in das
+/// Fenster. Zwei Minuten reichen für `minds decide` samt Testlauf in
+/// derselben Kette; was länger läuft, gilt als nicht prüfbar.
+pub const LINK_WINDOW_MAX_SECS: i64 = 120;
+
+/// Ob die Zeit eines Records in das Fenster eines Tool-Aufrufs fällt:
+/// vom `PreToolUse` (`from`) bis zum `PostToolUse` (`until`), mit
+/// [`LINK_SLACK_SECS`] Spielraum, und das Fenster höchstens
+/// [`LINK_WINDOW_MAX_SECS`] lang. Fehlt eine der drei Zeiten oder lässt sie
+/// sich nicht lesen: `false` — eine Nennung ohne Fenster ist nicht prüfbar.
+/// Beide Uhren sind die der Maschine des Agenten (Hook und `minds decide`);
+/// eine verstellte Uhr trifft nur seine eigenen Records.
+pub fn within_window(record_at: &str, from: Option<&str>, until: Option<&str>) -> bool {
+    let parse = |at: Option<&str>| at.and_then(|at| at.parse::<jiff::Timestamp>().ok());
+    let (Some(at), Some(from), Some(until)) = (parse(Some(record_at)), parse(from), parse(until))
+    else {
+        return false;
+    };
+    let length = until.duration_since(from);
+    if length.is_negative() || length > jiff::SignedDuration::from_secs(LINK_WINDOW_MAX_SECS) {
+        return false;
+    }
+    let slack = jiff::SignedDuration::from_secs(LINK_SLACK_SECS);
+    from.checked_sub(slack).is_ok_and(|lo| lo <= at)
+        && until.checked_add(slack).is_ok_and(|hi| at <= hi)
+}
+
+/// Ob eine Nennung ([`DecisionEvent`]) zu ihrem Aufruf passt: Der Record
+/// mit `record_at` entstand im Zeitfenster von `turns[turn].tool_calls[call]`.
+/// Ohne `turn`/`call` (Records älterer Binaries) oder ohne den Aufruf:
+/// `false`. So kann ein `echo` neben dem Aufruf keine fremde, ältere Id
+/// unterschieben — die Zeit des Records setzt `minds decide` selbst.
+pub fn named_within_call(
+    session: &minds_core::Session,
+    event: &minds_core::decision::DecisionEvent,
+    record_at: &str,
+) -> bool {
+    let (Some(turn), Some(call)) = (event.turn, event.call) else {
+        return false;
+    };
+    let Some(call) = session.turns.get(turn).and_then(|t| t.tool_calls.get(call)) else {
+        return false;
+    };
+    within_window(record_at, call.at.as_deref(), call.ended_at.as_deref())
+}
+
 /// Wer entschieden hat, als Wort — `human` ist ein Flag, das jeder
 /// Schreiber setzen kann, und trägt das, bis eine Signatur es belegt.
 pub fn by_word(by: minds_core::decision::DecidedBy) -> &'static str {
@@ -1285,6 +1339,129 @@ mod tests {
 
     fn id(n: u8) -> ContentHash {
         ContentHash::from_bytes([n; 32])
+    }
+
+    /// Das Zeitfenster: Pre bis Post, eine Sekunde Spielraum; ohne eine der
+    /// Zeiten nicht prüfbar — `false`.
+    #[test]
+    fn a_record_counts_only_inside_the_calls_window() {
+        let from = Some("2026-07-25T14:12:00Z");
+        let until = Some("2026-07-25T14:12:05Z");
+        assert!(within_window("2026-07-25T14:12:02.500Z", from, until));
+        assert!(within_window("2026-07-25T14:12:00Z", from, until));
+        assert!(
+            within_window("2026-07-25T14:11:59.200Z", from, until),
+            "Spielraum vorn"
+        );
+        assert!(
+            within_window("2026-07-25T14:12:05.900Z", from, until),
+            "Spielraum hinten"
+        );
+        assert!(!within_window("2026-07-25T14:11:58Z", from, until));
+        assert!(!within_window("2026-07-25T14:12:07Z", from, until));
+        assert!(!within_window("2026-07-25T14:12:02Z", None, until));
+        assert!(!within_window("2026-07-25T14:12:02Z", from, None));
+        assert!(!within_window("gestern", from, until));
+        assert!(!within_window("2026-07-25T14:12:02Z", Some("x"), until));
+        // Ein Fenster, das der Agent lang hält (`sleep 590; …`): nicht prüfbar.
+        assert!(!within_window(
+            "2026-07-25T14:17:30Z",
+            from,
+            Some("2026-07-25T14:22:00Z")
+        ));
+        assert!(within_window(
+            "2026-07-25T14:13:30Z",
+            from,
+            Some("2026-07-25T14:13:59Z")
+        ));
+        // Genau zwei Minuten: ja; eine Sekunde (und 120,5 s) mehr: nein.
+        assert!(within_window(
+            "2026-07-25T14:13:30Z",
+            from,
+            Some("2026-07-25T14:14:00Z")
+        ));
+        assert!(!within_window(
+            "2026-07-25T14:13:30Z",
+            from,
+            Some("2026-07-25T14:14:01Z")
+        ));
+        assert!(!within_window(
+            "2026-07-25T14:13:30Z",
+            from,
+            Some("2026-07-25T14:14:00.500Z")
+        ));
+        // Ende vor Anfang: nicht prüfbar.
+        assert!(!within_window("2026-07-25T14:12:02Z", until, from));
+        // Zeitzonen-Offsets: dieselbe Zeit, anders geschrieben.
+        assert!(within_window("2026-07-25T16:12:02.250+02:00", from, until));
+        assert!(!within_window("2026-07-25T14:12:02+02:00", from, until));
+        assert!(within_window(
+            "2026-07-25T14:12:02Z",
+            Some("2026-07-25T16:12:00+02:00"),
+            Some("2026-07-25T10:12:05-04:00")
+        ));
+
+        let mut session = minds_core::Session::new(
+            minds_core::Agent {
+                name: "claude-code".into(),
+                version: "1".into(),
+            },
+            minds_core::Model {
+                provider: "anthropic".into(),
+                id: "claude".into(),
+            },
+            minds_core::Intent {
+                request: "x".into(),
+                constraints: Vec::new(),
+                discarded: Vec::new(),
+            },
+        );
+        session.turns.push(minds_core::Turn {
+            role: minds_core::Role::Assistant,
+            text: String::new(),
+            tool_calls: vec![minds_core::ToolCall {
+                at: from.map(str::to_owned),
+                ended_at: until.map(str::to_owned),
+                outcome: None,
+                capture: None,
+                name: "Bash".into(),
+                arguments: "{}".into(),
+                effect: None,
+            }],
+            parent: None,
+            at: from.map(str::to_owned),
+        });
+        let event = |turn, call| minds_core::decision::DecisionEvent {
+            seq: 2,
+            decision_id: id(1),
+            turn,
+            call,
+        };
+        assert!(named_within_call(
+            &session,
+            &event(Some(0), Some(0)),
+            "2026-07-25T14:12:03Z"
+        ));
+        assert!(!named_within_call(
+            &session,
+            &event(Some(0), Some(0)),
+            "2026-07-25T14:20:00Z"
+        ));
+        assert!(!named_within_call(
+            &session,
+            &event(None, None),
+            "2026-07-25T14:12:03Z"
+        ));
+        assert!(!named_within_call(
+            &session,
+            &event(Some(0), Some(3)),
+            "2026-07-25T14:12:03Z"
+        ));
+        assert!(!named_within_call(
+            &session,
+            &event(Some(2), Some(0)),
+            "2026-07-25T14:12:03Z"
+        ));
     }
 
     fn reason(assumption: &str, weight: Weight) -> Reason {
