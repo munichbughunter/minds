@@ -26,7 +26,7 @@ use minds_reader::model::{EvidenceReport, SessionCard};
 use minds_reader::story::Story;
 
 use crate::changes::{ChangesState, Focus};
-use crate::decision::{DecisionTab, named_decisions, naming_sessions};
+use crate::decision::{DecisionTab, linked_decisions, named_decisions, sessions_naming};
 use crate::filter;
 use crate::input::{self, Action};
 use crate::intent::{IntentTab, bound_sessions, named_anchors};
@@ -911,6 +911,38 @@ impl<'a> App<'a> {
         self.decisions.as_ref()?.by_id(id)
     }
 
+    /// Die Entscheidungen, die eine Session nennt und die zu ihrem Aufruf
+    /// passen (Zeitfenster) — oder noch nicht prüfbar sind.
+    pub fn linked_decisions(&self, session: SessionId) -> Vec<ContentHash> {
+        linked_decisions(&self.inspection, self.decisions.as_ref(), session)
+    }
+
+    /// Die Sessions, deren Nennung einer Entscheidung zu ihrem Aufruf passt.
+    pub fn sessions_naming(&self, id: &ContentHash) -> Vec<SessionId> {
+        sessions_naming(&self.inspection, self.decisions.as_ref(), id)
+    }
+
+    /// Ob eine Entscheidung in das Zeitfenster eines Schritts fällt — oder
+    /// noch nicht prüfbar ist (Record nicht geholt, nicht im Store).
+    pub fn decision_fits_step(&self, step: &minds_reader::story::Step, id: &ContentHash) -> bool {
+        match self.decision_record(id) {
+            Some(a) => minds_reader::decisions::within_window(
+                &a.record.at,
+                step.call_at.as_deref(),
+                step.ended_at.as_deref(),
+            ),
+            None => self.decision_unknown_counts(),
+        }
+    }
+
+    /// Ob eine Id ohne Record noch als Nennung gilt: ja, solange die
+    /// Records nicht (vollständig) gelesen sind — danach ist eine Id, die
+    /// kein Record ist, keine Entscheidung, sondern Text in einer
+    /// Tool-Ausgabe, und wird nicht gezeigt.
+    fn decision_unknown_counts(&self) -> bool {
+        crate::decision::unknown_counts(self.decisions.as_ref())
+    }
+
     /// Warum eine Entscheidung keine Bewertung hat — das Wort neben der Id,
     /// wo sonst Thema und Stand stünden.
     pub fn decision_absent(&self, id: &ContentHash) -> &'static str {
@@ -953,9 +985,11 @@ impl<'a> App<'a> {
             Action::Enter => {
                 // Die Session, die die Entscheidung aufgenommen hat: ihre
                 // Story im Sessions-Tab.
-                let first = state
-                    .selected()
-                    .and_then(|a| naming_sessions(&self.inspection, &a.id).first().copied());
+                let first = state.selected().and_then(|a| {
+                    sessions_naming(&self.inspection, Some(&*state), &a.id)
+                        .first()
+                        .copied()
+                });
                 match first {
                     Some(id) if self.inspection.story(id).is_some() => {
                         self.tab = Tab::Sessions;
@@ -1893,7 +1927,7 @@ impl<'a> App<'a> {
                 let session = self.decisions.as_ref().and_then(|state| {
                     state
                         .selected()
-                        .and_then(|a| naming_sessions(&self.inspection, &a.id).first().copied())
+                        .and_then(|a| self.sessions_naming(&a.id).first().copied())
                 });
                 (session, session.and_then(commit_of))
             }
@@ -1953,16 +1987,23 @@ impl<'a> App<'a> {
                 // Die Entscheidungen der Session unter dem Fokus — sonst die
                 // der Sessions des Commits.
                 let mut ids: Vec<ContentHash> = session
-                    .map(|id| named_decisions(&self.inspection, id))
+                    .map(|id| self.linked_decisions(id))
                     .unwrap_or_default();
                 if ids.is_empty()
                     && let Some(commit) = commit
                 {
                     for sid in self.inspection.index().sessions_of(commit) {
-                        ids.extend(named_decisions(&self.inspection, *sid));
+                        ids.extend(self.linked_decisions(*sid));
                     }
                 }
-                match ids.first().cloned() {
+                // Lieber eine Entscheidung mit Record als eine ungeprüfte
+                // Nennung davor (ein `cat notes.md` in derselben Kette).
+                let target = ids
+                    .iter()
+                    .find(|id| self.decision_record(id).is_some())
+                    .or(ids.first())
+                    .cloned();
+                match target {
                     Some(id) => self.open_decisions(Some(id)),
                     None => {
                         self.closed =

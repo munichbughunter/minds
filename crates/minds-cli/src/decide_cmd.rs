@@ -30,7 +30,7 @@ use minds_core::ContentHash;
 use minds_core::decision::{DECISION_KIND, DECISION_SCHEMA, DecisionRecord, MAX_RECORD, Probe};
 use minds_reader::decisions::{
     Assessment, IndexTree, ProbeResult, Standing, Worktree, assess_all, concerns, concerns_any,
-    validate_probe,
+    named_within_call, validate_probe,
 };
 
 use crate::context::Context;
@@ -403,10 +403,23 @@ impl Assessed {
         sessions: &[minds_core::Session],
         paths: &[String],
     ) -> Vec<&'a Assessment> {
+        // Nur Nennungen, die zu ihrem Aufruf passen: Der Record entstand im
+        // Zeitfenster des `minds decide`-Aufrufs — eine fremde Id, die ein
+        // Kommando daneben druckte, fällt hier heraus. Eine Id ohne Record
+        // ebenso — auch über dem Deckel (`truncated`): Es zählt nur, was
+        // gelesen ist; wie viele Nennungen so wegfielen, sagt niemand
+        // (Folge-Arbeit: in `report_missing` zählen).
         let named: std::collections::BTreeSet<ContentHash> = sessions
             .iter()
-            .flat_map(|s| s.decision_events.iter().map(|e| e.decision_id.clone()))
-            .map(|id| self.head_of(id))
+            .flat_map(|s| {
+                s.decision_events.iter().filter(move |e| {
+                    self.all
+                        .iter()
+                        .find(|a| a.id == e.decision_id)
+                        .is_some_and(|a| named_within_call(s, e, &a.record.at))
+                })
+            })
+            .map(|e| self.head_of(e.decision_id.clone()))
             .collect();
         let queries: Vec<PathQuery<'_>> = paths.iter().map(|p| self.query(p)).collect();
         self.all

@@ -438,18 +438,33 @@ decision b3-f1d311757e0f65b9852d2d5ad873beaf6ab3caf9e1e1caafe6252cfaeb9c7b53
 ```
 
 The checkpoint links a session to the records its own `minds decide` calls produced:
-it reads the **first** stdout line of a Bash call whose command is a plain `minds
-decide` invocation — nothing else in the same call. The rule is strict so that no
-other command can print that line: the first line carries no `;`, `&`, `||`,
-backtick, `$(`, `<(`, `>(`, no trailing `\` and no `>` redirect on the call (` 2>&1`
-is tolerated); further lines exist only as a heredoc whose delimiter is the last
-line and appears nowhere else; at most one pipe, with only `cat <file>`, `cat <<X`,
-`echo …` or `printf …` on its left. `minds decide < d.json`, `cat d.json | minds
-decide` and `minds decide --human <<'EOF' … EOF` link; `cd a && minds decide` does
-not (fail-closed: no link, never a foreign one). A call that failed or was
-interrupted links nothing. The link is an observation of the agent's tool output,
-not proof of authorship: a different program named `minds` in the `PATH` is not
-something the rule can see, and what the record says is read from the store.
+for every Bash call whose command names `minds decide` as a command — alone or as a
+link of a chain (`cd a && minds decide < d.json; uv run pytest`, `cat d.json | minds
+decide`, a heredoc) — it takes every `decision b3-…` line of the tool's output and
+records the id with the turn and call it came from (at most 8 ids per call).
+Assignments (`FOO=1 minds decide`) and the usual lead-ins (`time`, `exec`, `if`,
+`!`, `{`, `sudo`, `env`) before the program are skipped; an interrupted or
+truncated call links nothing, and a line continued with `\` is not recognised and
+links nothing either (fail-closed). What makes the link
+trustworthy is not the command text but the **time window**: `recall`, the story,
+the overview and the Decisions tab accept a named id only when the record's own
+timestamp — set by `minds decide` from the machine's clock, never by the agent's
+input — lies between the call's `PreToolUse` and `PostToolUse` (one second of
+slack), and only when that window is at most two minutes long (a call the agent
+keeps open with `sleep` would otherwise catch a decision a human records
+meanwhile). A foreign, older id that an `echo` next to the call prints is recorded
+as named but never shown as this session's decision; an id without turn and call
+(records of older binaries) is not checkable and not shown; an id that is no
+record at all is listed as `… reading` until the records are read, then dropped.
+What remains: every call opens its own window, so while the agent is running, a
+record that a human or another agent writes into the same store and that one of
+the agent's chains prints (`minds decisions` at its end) counts as named by that
+session. The window tells "produced or printed during this call" apart from
+"older", not "produced" from "polled". The link is an observation of the agent's
+tool output, not proof of authorship: a different program named `minds` in the
+`PATH` is not something the rule can see either, and what the record says is read
+from the store. Binding authorship — `minds decide` carrying something the hook
+can corroborate — is the next step, not this one.
 
 ### minds decisions
 

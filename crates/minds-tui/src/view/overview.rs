@@ -947,7 +947,7 @@ fn commit_detail(
     for id in row
         .sessions
         .iter()
-        .flat_map(|sid| crate::decision::named_decisions(&app.inspection, *sid))
+        .flat_map(|sid| app.linked_decisions(*sid))
     {
         if !decisions.contains(&id) {
             decisions.push(id);

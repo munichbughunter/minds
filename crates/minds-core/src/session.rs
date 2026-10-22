@@ -695,13 +695,33 @@ mod tests {
     /// Die kanonische Form eines Entscheidungs-Verweises — Teil der Id
     /// jeder Session, die eine Entscheidung nennt.
     #[test]
+    fn decision_events_canonical_form_with_call() {
+        let mut s: Session = serde_json::from_str(LEGACY_CANONICAL).unwrap();
+        s.decision_events.push(DecisionEvent {
+            seq: 7,
+            decision_id: ContentHash::from_bytes([3; 32]),
+            turn: Some(1),
+            call: Some(2),
+        });
+        let json = crate::to_canonical_string(&s).unwrap();
+        assert!(json.contains(
+            r#""decision_events":[{"call":2,"decision_id":"b3-0303030303030303030303030303030303030303030303030303030303030303","seq":7,"turn":1}]"#
+        ));
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.decision_events, s.decision_events);
+    }
+
+    #[test]
     fn decision_events_canonical_form() {
         let mut s: Session = serde_json::from_str(LEGACY_CANONICAL).unwrap();
         s.decision_events.push(DecisionEvent {
             seq: 7,
             decision_id: ContentHash::from_bytes([3; 32]),
+            turn: None,
+            call: None,
         });
         let json = crate::to_canonical_string(&s).unwrap();
+        // Ohne Zug und Aufruf dieselben Bytes wie zuvor — die Felder sind additiv.
         assert!(json.contains(
             r#""decision_events":[{"decision_id":"b3-0303030303030303030303030303030303030303030303030303030303030303","seq":7}]"#
         ));
