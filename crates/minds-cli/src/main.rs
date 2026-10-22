@@ -900,6 +900,7 @@ fn main() -> ExitCode {
                     "comment",
                     "gitlab",
                     "prepare-commit-msg",
+                    "decide",
                 ]
                 .contains(&command.as_str())
             }))
