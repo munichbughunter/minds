@@ -740,9 +740,12 @@ impl RedactionPipeline {
             // Ungescannt **wegen ihres Typs** wie `effect.content` (siehe
             // `redact_effect`): Anker-Ids sind [`ContentHash`], die Nummern
             // `u64`, `opens_session` ein `bool` — kein Platz für Freitext. Der
-            // Ankertext selbst steht nie im Envelope (EA-14).
+            // Ankertext selbst steht nie im Envelope (EA-14). Dasselbe gilt
+            // für `decision_events`: Nummer und Record-Id, der Record selbst
+            // liegt unter `refs/minds/decisions/` und wird dort redigiert.
             intent_anchor,
             intent_events,
+            decision_events,
         } = session;
 
         let mut audit = RedactionAudit::default();
@@ -933,6 +936,7 @@ impl RedactionPipeline {
             },
             intent_anchor,
             intent_events,
+            decision_events,
         };
 
         Ok(RedactedSession { session, audit })
@@ -2318,6 +2322,38 @@ mod tests {
                 .to_string()
                 .starts_with("1 Secret, 0 PII in 1 von ")
         );
+    }
+
+    #[test]
+    fn typed_link_fields_pass_through_unchanged() {
+        // `intent_events` und `decision_events` tragen nur Nummern und
+        // Hashes — die Pipeline reicht sie unverändert durch, und der
+        // Audit zählt dort nichts.
+        use minds_core::decision::DecisionEvent;
+        use minds_core::intent_anchor::IntentEvent;
+        let hash = |n: u8| minds_core::ContentHash::from_bytes([n; 32]);
+        let mut s = session();
+        s.intent_anchor = Some(hash(1));
+        s.intent_events.push(IntentEvent {
+            seq: 0,
+            anchor_id: hash(2),
+            opens_session: true,
+        });
+        s.decision_events.push(DecisionEvent {
+            seq: 7,
+            decision_id: hash(3),
+        });
+        s.decision_events.push(DecisionEvent {
+            seq: 9,
+            decision_id: hash(4),
+        });
+
+        let out = pipeline().redact_session(s.clone()).unwrap();
+        assert_eq!(out.session().intent_anchor, s.intent_anchor);
+        assert_eq!(out.session().intent_events, s.intent_events);
+        assert_eq!(out.session().decision_events, s.decision_events);
+        assert_eq!(out.audit().counts().secrets, 0);
+        assert_eq!(out.audit().counts().pii, 0);
     }
 
     // --- Herausgabe -----------------------------------------------------------

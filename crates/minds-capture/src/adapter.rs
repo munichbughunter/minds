@@ -270,6 +270,7 @@ fn build_with_transcript(
         edges: Vec::new(),
         intent_anchor: None,
         intent_events: Vec::new(),
+        decision_events: Vec::new(),
     };
     (session, call_events)
 }

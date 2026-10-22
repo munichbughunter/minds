@@ -44,6 +44,10 @@ pub mod first_sight;
 /// Das Soll: ein vom Menschen signiertes Regelwerk für die Conformance.
 pub mod spec;
 
+/// Die Entscheidung als Record: gewählter Weg, verworfene Alternativen und
+/// die Annahmen, unter denen die Begründung gilt.
+pub mod decision;
+
 mod attribution;
 pub use attribution::{Attribution, AttributionError};
 
