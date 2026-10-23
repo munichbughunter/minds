@@ -17,6 +17,18 @@ versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-10-23 — "The Decision Has a Record"
+
+*Minds proves what evidence existed at the time of a decision — and whether
+it was altered afterwards. This release lets the decision itself become
+evidence: `minds decide` records a decision with its assumptions and probes,
+the capture links decisions to the tool calls they were made in, and the
+witness attributes shell writes to the Bash call that made them. Setup is a
+single `minds enable` against one protected witness daemon per host. The TUI
+gets an overview, evidence tabs, requirements, and a story that explains
+why a line is there. A MINOR version: the store gains decision objects and
+the `enable`/`disable` surface replaces the old setup commands.*
+
 ### Added
 
 - **Shell writes are attributed to the Bash call that made them — when a
