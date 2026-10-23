@@ -1735,7 +1735,7 @@ dependencies = [
 
 [[package]]
 name = "minds-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "blake3",
  "jiff",
