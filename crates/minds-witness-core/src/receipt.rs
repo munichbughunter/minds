@@ -87,6 +87,11 @@ pub struct Signer {
 
 impl Signer {
     /// `valid_from` ist der Beginn der Gültigkeit dieses Schlüssels; der Adapter liest ihn aus der Schlüsseldatei (Schritt 3), Tests setzen ihn fest.
+    ///
+    /// Der Adapter übergibt einen `Signer` nur, wenn der Schlüssel zum
+    /// tatsächlichen Signierzeitpunkt noch zur Signierung autorisiert ist
+    /// (nicht widerrufen, nicht abgelaufen). Der Kern hat keine Uhr; er prüft
+    /// nur die Gültigkeit zum attestierten Serverzeitpunkt (`post_receive`).
     pub fn from_seed(seed: [u8; 32], valid_from: Timestamp) -> Self {
         Self {
             key: SigningKey::from_bytes(&seed),

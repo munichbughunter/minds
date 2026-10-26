@@ -150,7 +150,11 @@ pub trait ReceiptStore {
     fn get(&self, key: &ReceiptKey) -> Result<Option<Vec<u8>>, StoreError>;
     /// Alle Quittungen zu einem Commit, aufsteigend nach `id` sortiert.
     fn list(&self, commit: &CommitId) -> Result<Vec<ReceiptKey>, StoreError>;
-    /// Die bekannte Schlüsselliste.
+    /// Die bekannte Schlüsselliste, einschließlich aller Widerrufe
+    /// (`valid_until`). Die Post-Phase liest sie nach der Registrierung und
+    /// signiert nur, wenn jeder Eintrag des Signierschlüssels den
+    /// Serverzeitpunkt des Befunds zulässt; ein Fehler hier verhindert jede
+    /// Signatur des Aufrufs.
     fn public_keys(&self) -> Result<Vec<PublicKeyEntry>, StoreError>;
     /// Ein Eintrag mit gleichem `key` und gleichem `valid_from` wird nicht doppelt angelegt und nicht verändert (`Ok`).
     /// Ein Eintrag mit gleichem `key`, aber anderem `valid_from`: `Err(StoreError::Conflict)`.

@@ -1,13 +1,17 @@
 //! Post-Phase: baut aus jedem `Finding` genau eine signierte Quittung und
 //! legt sie im `ReceiptStore` ab. Sie trifft keine Entscheidung und kennt
 //! keine Policy; der Adapter ruft sie nur nach `Accept`. Fehler werden zu
-//! Zählern und Ereignissen, nie zu einem Fehler nach außen.
+//! Zählern und Ereignissen, nie zu einem Fehler nach außen. Signiert wird
+//! nur, wenn der Schlüssel zum attestierten Serverzeitpunkt nach jedem
+//! Eintrag der Schlüsselliste gültig war; ob er zum tatsächlichen
+//! Signierzeitpunkt noch signieren darf, prüft der Adapter.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use crate::RECEIPT_SCHEMA;
 use crate::events::{LogEvent, LogLevel};
 use crate::finding::Finding;
+use crate::ids::Timestamp;
 use crate::receipt::{
     PublicKeyEntry, ReceiptBody, ReceiptKey, Signer, WitnessIdentity, receipt_id,
 };
@@ -41,6 +45,15 @@ fn len_u32(n: usize) -> u32 {
 }
 
 /// Baut, signiert und speichert die Quittungen (Abschnitt 8).
+///
+/// Vertrag zur Schlüsselgültigkeit (v1.4): Der Kern prüft, ob `signer` zum
+/// Serverzeitpunkt jedes Befunds gültig war, und zwar gegen `signer.valid_from()`
+/// und gegen jeden Eintrag desselben Schlüssels in `store.public_keys()`.
+/// Ob der Schlüssel *jetzt*, zum tatsächlichen Signierzeitpunkt, noch
+/// signieren darf, kann der Kern ohne Uhr nicht wissen: Der Adapter übergibt
+/// nur einen `Signer`, dessen Signierberechtigung er unmittelbar vor dem
+/// Aufruf geprüft hat. Sonst könnte ein abgelaufener Schlüssel nachträglich
+/// neue Quittungen über alte Ereignisse ausstellen.
 pub fn post_receive(
     findings: &[Finding],
     identity: &WitnessIdentity,
@@ -129,22 +142,43 @@ fn run(
         return;
     }
 
+    // Schritt 2a: Schlüsselliste lesen, genau einmal, nach der Registrierung
+    // und vor dem ersten `put`. Ohne Liste wird nichts signiert.
+    let entries: Vec<PublicKeyEntry> = match store.public_keys() {
+        Ok(keys) => keys.into_iter().filter(|k| k.key == identity.key).collect(),
+        Err(e) => {
+            events.push(LogEvent::new(
+                LogLevel::Error,
+                "store_failed",
+                "Die Schlüsselliste konnte nicht gelesen werden; es wird nichts signiert.",
+                &[("error", e.to_string())],
+            ));
+            counters.failed = total;
+            return;
+        }
+    };
+
     // Schritt 3: Quittung je Finding.
     for finding in findings {
         let commit = finding.commit.as_str().to_owned();
         let ref_name = finding.push.ref_name.clone();
-        if finding.server.time < *signer.valid_from() {
+        if let Some(refusal) = key_refusal(&finding.server.time, signer, &entries) {
             counters.failed = counters.failed.saturating_add(1);
+            let mut fields = vec![
+                ("commit", commit),
+                ("ref", ref_name),
+                ("time", finding.server.time.as_str().to_owned()),
+                ("valid_from", refusal.valid_from.as_str().to_owned()),
+                ("reason", refusal.reason.to_owned()),
+            ];
+            if let Some(until) = refusal.valid_until {
+                fields.push(("valid_until", until.as_str().to_owned()));
+            }
             events.push(LogEvent::new(
                 LogLevel::Error,
                 "key_not_valid_at",
-                "Der Befund liegt vor dem Gültigkeitsbeginn des Signierschlüssels und wird nicht signiert.",
-                &[
-                    ("commit", commit),
-                    ("ref", ref_name),
-                    ("time", finding.server.time.as_str().to_owned()),
-                    ("valid_from", signer.valid_from().as_str().to_owned()),
-                ],
+                "Der Signierschlüssel war zum Serverzeitpunkt des Befunds nicht gültig; der Befund wird nicht signiert.",
+                &fields,
             ));
             continue;
         }
@@ -214,4 +248,62 @@ fn run(
             }
         }
     }
+}
+
+/// Warum ein Befund nicht signiert wird, mit der Grenze, die gegriffen hat.
+struct Refusal<'a> {
+    /// `before_valid_from`, `not_listed` oder `revoked`.
+    reason: &'static str,
+    /// Maßgebliches `valid_from`: das des Eintrags bzw. Signers, der den
+    /// Zeitpunkt ausschließt; sonst das des Signers.
+    valid_from: &'a Timestamp,
+    /// Maßgebliches `valid_until`, nur bei `revoked`.
+    valid_until: Option<&'a Timestamp>,
+}
+
+/// Grund, aus dem ein Befund zum Serverzeitpunkt `time` nicht signiert wird,
+/// oder `None`. Bewusst streng: Jeder Eintrag des Schlüssels muss `time`
+/// zulassen. Widersprechen sich Einträge (etwa einer offen, einer mit
+/// `valid_until`), gewinnt der einschränkendste; der Kern wählt nie den
+/// günstigsten. Damit verifiziert jede ausgestellte Quittung gegen die Liste,
+/// wie sie beim Signieren war (`verify_receipt` nimmt den ersten passenden
+/// Eintrag, und hier passt jeder). Ein einmal zurückgezogener Schlüssel wird
+/// dadurch nie wieder signierfähig, auch nicht durch einen weiteren Eintrag;
+/// Reaktivierung heißt neuer Schlüssel.
+fn key_refusal<'a>(
+    time: &Timestamp,
+    signer: &'a Signer,
+    entries: &'a [PublicKeyEntry],
+) -> Option<Refusal<'a>> {
+    if time < signer.valid_from() {
+        return Some(Refusal {
+            reason: "before_valid_from",
+            valid_from: signer.valid_from(),
+            valid_until: None,
+        });
+    }
+    if let Some(e) = entries.iter().find(|e| *time < e.valid_from) {
+        return Some(Refusal {
+            reason: "before_valid_from",
+            valid_from: &e.valid_from,
+            valid_until: None,
+        });
+    }
+    if entries.is_empty() {
+        return Some(Refusal {
+            reason: "not_listed",
+            valid_from: signer.valid_from(),
+            valid_until: None,
+        });
+    }
+    entries.iter().find_map(|e| {
+        e.valid_until
+            .as_ref()
+            .filter(|u| time >= *u)
+            .map(|u| Refusal {
+                reason: "revoked",
+                valid_from: &e.valid_from,
+                valid_until: Some(u),
+            })
+    })
 }
