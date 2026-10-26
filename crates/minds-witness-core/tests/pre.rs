@@ -417,7 +417,9 @@ fn t16_panic_is_fail_open() {
     assert_eq!(out.decision, Decision::Accept);
     assert!(out.findings.is_empty());
     let ev = only_event(&out.events, "panic");
-    assert_eq!(ev.fields["message"], "fault");
+    // v1.4: kein Panic-Payload im Ereignis.
+    assert!(ev.fields.is_empty());
+    assert!(!ev.message.contains("fault"));
 
     let out = pre(&a, &policy_enforce_main());
     assert_eq!(reason(&out.decision), Some(RejectReason::InternalError));
@@ -585,5 +587,95 @@ fn t41_seal_bound_to_other_repo() {
         } else {
             assert_eq!(reason(&out.decision), Some(RejectReason::PolicyFail));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.4: reservierte Ref-Namen und Panic-Payload (t49, t50)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t49_reserved_namespace_names_rejected() {
+    for name in ["refs/minds/witness", "refs/minds"] {
+        for (old, new) in [(0u8, 2u8), (1, 2), (2, 0)] {
+            for policy in [policy_observe(), policy_enforce_main()] {
+                let mut a = single_commit_push();
+                a.ctx.updates.push(update(old, new, name));
+                a.fault = Fault::CommitErr;
+                let out = pre(&a, &policy);
+                assert_eq!(
+                    reason(&out.decision),
+                    Some(RejectReason::WitnessNamespace),
+                    "{name} {old}->{new}"
+                );
+                assert_eq!(
+                    message(&out.decision),
+                    format!(
+                        "minds-witness: Ref {name} ist reserviert, weil er den Witness-Namensraum refs/minds/witness/ blockieren würde"
+                    )
+                );
+                assert!(out.findings.is_empty());
+                assert_eq!(out.events.len(), 1);
+                assert_eq!(
+                    only_event(&out.events, "push_rejected_namespace").fields["ref"],
+                    name
+                );
+            }
+        }
+    }
+    // Nachbarn sind nicht reserviert: kein Namensraum-Reject, keine Bewertung.
+    for name in [
+        "refs/minds/witnessx",
+        "refs/mindsx",
+        "refs/minds/evidence/abc",
+        "refs/minds/context",
+    ] {
+        let mut a = single_commit_push();
+        a.ctx.updates = vec![update(0, 2, name)];
+        let out = pre(&a, &policy_enforce_main());
+        assert_eq!(out.decision, Decision::Accept, "{name}");
+        assert!(out.events.is_empty(), "{name}");
+    }
+}
+
+/// Objektsicht, die beim Pfad-Diff mit einem Text panict, der wie ein
+/// Objektinhalt aussieht.
+struct LeakyPanic<'a>(&'a MemoryAdapter);
+
+impl ObjectAccess for LeakyPanic<'_> {
+    fn commit(&self, id: &CommitId) -> Result<CommitInfo, ObjectError> {
+        self.0.commit(id)
+    }
+    fn new_commits(
+        &self,
+        old: Option<&CommitId>,
+        new: &CommitId,
+        limit: u32,
+    ) -> Result<CommitRange, ObjectError> {
+        self.0.new_commits(old, new, limit)
+    }
+    fn changed_paths(
+        &self,
+        _id: &CommitId,
+    ) -> Result<std::collections::BTreeSet<String>, ObjectError> {
+        panic!("SECRET-PAYLOAD aws_secret_access_key=abc123 in src/creds.env");
+    }
+    fn seal_for_commit(&self, id: &CommitId) -> Result<Option<SealBlob>, ObjectError> {
+        self.0.seal_for_commit(id)
+    }
+}
+
+#[test]
+fn t50_panic_payload_never_logged() {
+    let a = single_commit_push();
+    for policy in [policy_observe(), policy_enforce_main()] {
+        let out = pre_receive(&a.ctx, &policy, &LeakyPanic(&a), &a);
+        let ev = only_event(&out.events, "panic");
+        assert!(ev.fields.is_empty());
+        for e in &out.events {
+            assert!(!e.message.contains("SECRET"));
+            assert!(e.fields.values().all(|v| !v.contains("SECRET")));
+        }
+        assert!(!message(&out.decision).contains("SECRET"));
     }
 }

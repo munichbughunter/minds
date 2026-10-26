@@ -68,7 +68,9 @@ pub struct CommitRange {
 /// Rohes Seal, wie es der Host gefunden hat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealBlob {
-    /// Ref, unter dem das Seal liegt (`refs/minds/seals/…`).
+    /// Ref, unter dem das Seal liegt. Welcher Namensraum das ist, legt der
+    /// Adapter fest (im Bestand `refs/minds/evidence/<seal_id>`); der Kern
+    /// wertet den Namen nur als Kennung aus.
     pub ref_name: String,
     /// Inhalt des Seal-Blobs; verlässt den Kern nie in Ereignissen.
     pub bytes: Vec<u8>,

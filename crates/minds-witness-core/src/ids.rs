@@ -29,7 +29,7 @@ fn is_lower_hex(s: &str) -> bool {
 }
 
 /// Prüft `prefix` + genau `hex_len` Zeichen Kleinbuchstaben-Hex.
-// SPEC-GAP: Reihenfolge Präfix, Länge, Zeichenvorrat; `BadLength` meldet die
+// Spec S1 v1.4 §4: Reihenfolge Präfix, Länge, Zeichenvorrat; `BadLength` meldet die
 // Länge des Hex-Teils nach dem Präfix, weil nur dieser eine feste Länge hat.
 fn check_prefixed_hex(s: &str, prefix: &str, hex_len: usize) -> Result<(), IdError> {
     let rest = s.strip_prefix(prefix).ok_or(IdError::BadPrefix)?;
@@ -51,7 +51,7 @@ pub struct CommitId(String);
 impl CommitId {
     /// Akzeptiert nur Kleinbuchstaben-Hex der Länge 40 oder 64.
     pub fn parse(s: &str) -> Result<Self, IdError> {
-        // SPEC-GAP: Prüfreihenfolge nicht festgelegt; zuerst Länge, dann
+        // Spec S1 v1.4 §4: zuerst Länge, dann
         // Zeichenvorrat, analog zur Reihenfolge der IdError-Varianten.
         if s.len() != 40 && s.len() != 64 {
             return Err(IdError::BadLength(s.len()));

@@ -128,7 +128,7 @@ pub struct ReceiptKey {
     pub id: HashStr,
 }
 
-// SPEC-GAP: `ReceiptKey` soll `PartialOrd`/`Ord` implementieren, `HashStr`
+// Spec S1 v1.4 §4: `ReceiptKey` soll `PartialOrd`/`Ord` implementieren, `HashStr`
 // hat laut Signatur aber kein `Ord`. Statt die Derive-Liste von `HashStr` zu
 // erweitern, ordnet `ReceiptKey` manuell nach (commit, id als String). Das ist
 // dieselbe Ordnung, die ein Derive ergäbe.
@@ -291,7 +291,7 @@ pub fn verify_receipt(
             time: time.as_str().to_owned(),
         })?
         .clone();
-    // SPEC-GAP: Ein formal gültiger Schlüssel-String, der kein Punkt auf der
+    // Spec S1 v1.4 §9: Ein formal gültiger Schlüssel-String, der kein Punkt auf der
     // Kurve ist, kann keine Signatur tragen; er ergibt `BadSignature`.
     let verifying =
         VerifyingKey::from_bytes(&entry.key.to_bytes()).map_err(|_| VerifyError::BadSignature)?;

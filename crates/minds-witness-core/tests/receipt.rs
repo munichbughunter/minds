@@ -69,7 +69,7 @@ fn t24_tamper_detected() {
     );
 
     // (e) commit-Wert in Großbuchstaben.
-    // SPEC-GAP: Die Standard-Quittung hat `commit = id(2)` =
+    // Spec S1 v1.4 §12 (t24 e): Die Standard-Quittung hat `commit = id(2)` =
     // "000…0002"; diese Id enthält keine Hex-Buchstaben, ihre
     // Großbuchstabenform ist also byteidentisch und der Fall wäre wörtlich
     // genommen leer. Der Test prüft die Absicht (Großbuchstaben-Hex wird bei

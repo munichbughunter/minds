@@ -89,21 +89,17 @@ pub fn pre_receive(
     }));
     let decision = match result {
         Ok(decision) => decision,
-        Err(payload) => {
-            let message = payload
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| payload.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unbekannt".to_owned());
-            // SPEC-GAP: Ereignisse vor dem Panic bleiben erhalten (sie sind
-            // passiert); die Findings werden verworfen, wie Abschnitt 7 es
-            // für den Panic-Fall verlangt.
+        Err(_payload) => {
+            // Spec S1 v1.4 §7: Ereignisse vor dem Panic bleiben erhalten (sie
+            // sind passiert); die Findings werden verworfen. Der Payload wird
+            // nie übernommen: er ist unkontrollierter Text eines Adapters und
+            // kann Objektinhalte tragen (§10). Das Ereignis hat keine Felder.
             findings.clear();
             events.push(LogEvent::new(
                 LogLevel::Error,
                 "panic",
                 "Die Pre-Phase ist mit einem Panic abgebrochen.",
-                &[("message", message)],
+                &[],
             ));
             fail_open(&policy.mode, "minds-witness: interner Fehler")
         }
@@ -124,24 +120,25 @@ fn run(
     findings: &mut Vec<Finding>,
 ) -> Decision {
     // Schritt 1: Namensraum schützen, vor jeder anderen Prüfung.
-    if let Some(u) = ctx
-        .updates
-        .iter()
-        .find(|u| u.ref_name.starts_with(WITNESS_NAMESPACE))
-    {
+    if let Some(u) = ctx.updates.iter().find(|u| is_protected_ref(&u.ref_name)) {
         events.push(LogEvent::new(
             LogLevel::Warn,
             "push_rejected_namespace",
             "Push abgelehnt, weil er in den Witness-Namensraum schreibt.",
             &[("ref", u.ref_name.clone())],
         ));
-        return reject(
-            RejectReason::WitnessNamespace,
+        let message = if u.ref_name.starts_with(WITNESS_NAMESPACE) {
             format!(
                 "minds-witness: Refs unter refs/minds/witness/ schreibt nur der Server (Ref: {})",
                 u.ref_name
-            ),
-        );
+            )
+        } else {
+            format!(
+                "minds-witness: Ref {} ist reserviert, weil er den Witness-Namensraum refs/minds/witness/ blockieren würde",
+                u.ref_name
+            )
+        };
+        return reject(RejectReason::WitnessNamespace, message);
     }
 
     // Schritt 2: Policy validieren.
@@ -175,7 +172,7 @@ fn run(
     // Schritt 4: Pusher ableiten.
     let pusher = derive_pusher(&ctx.pusher, policy);
 
-    // SPEC-GAP: Abschnitt 5 sagt zu, dass `inspect` höchstens einmal pro
+    // Spec S1 v1.4 §5/§7: Abschnitt 5 sagt zu, dass `inspect` höchstens einmal pro
     // Commit gerufen wird; Abschnitt 7 bewertet denselben Commit unter zwei
     // Refs aber zweimal (t22). Beides gilt, weil Seal-Suche und Inspektion je
     // Commit und `pre_receive`-Aufruf genau einmal laufen und ihr Ergebnis
@@ -202,7 +199,7 @@ fn run(
         };
         if let Err(error) = env.evaluate(update) {
             findings.truncate(start);
-            // SPEC-GAP: bereits erzeugte `finding_created`-Ereignisse des
+            // Spec S1 v1.4 §7: bereits erzeugte `finding_created`-Ereignisse des
             // verworfenen Refs bleiben stehen; Ereignisse werden in
             // Entstehungsreihenfolge zurückgegeben und nie zurückgenommen.
             events.push(LogEvent::new(
@@ -212,7 +209,7 @@ fn run(
                 &[("ref", update.ref_name.clone()), ("error", error)],
             ));
             if policy.mode == Mode::Enforce && policy.is_enforced(&update.ref_name) {
-                // SPEC-GAP: Findings bereits vollständig bewerteter Refs
+                // Spec S1 v1.4 §7: Findings bereits vollständig bewerteter Refs
                 // bleiben für die Protokollierung erhalten (Schritt 9).
                 return reject(
                     RejectReason::InternalError,
@@ -230,10 +227,10 @@ fn run(
         if !policy.is_enforced(&f.push.ref_name) {
             continue;
         }
-        // SPEC-GAP: `<status>` erscheint wie serialisiert (snake_case, etwa
+        // Spec S1 v1.4 §7: `<status>` erscheint wie serialisiert (snake_case, etwa
         // `absent`), analog `result` (`pass`/`fail`) und `truncated`
         // (`true`/`false`) in den Ereignisfeldern.
-        // SPEC-GAP: Trifft beides zu, gewinnt `truncated`: eine unvollständige
+        // Spec S1 v1.4 §7: Trifft beides zu, gewinnt `truncated`: eine unvollständige
         // Prüfung ist der grundsätzlichere Grund, und die Meldung bleibt wahr.
         let (grund, message) = if f.push.truncated {
             (
@@ -271,6 +268,17 @@ fn run(
         return reject(RejectReason::PolicyFail, message);
     }
     Decision::Accept
+}
+
+/// Ref-Namen, die als Datei den Witness-Namensraum als Verzeichnis
+/// blockieren würden (D/F-Konflikt bei Ref-Ablage als Dateien): jeder echte
+/// Präfix von `refs/minds/witness/` unterhalb von `refs/`.
+const RESERVED_REFS: [&str; 2] = ["refs/minds", "refs/minds/witness"];
+
+/// `true`, wenn ein Push diesen Ref weder anlegen, ändern noch löschen darf
+/// (Spec S1 v1.4 §7, Schritt 1).
+fn is_protected_ref(ref_name: &str) -> bool {
+    ref_name.starts_with(WITNESS_NAMESPACE) || RESERVED_REFS.contains(&ref_name)
 }
 
 fn derive_pusher(pusher: &Pusher, policy: &Policy) -> Pusher {
