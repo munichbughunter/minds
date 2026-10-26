@@ -498,3 +498,157 @@ impl Evidence<'_> {
         self.binding_with(commit, PROJECT, seals, Some((self.key, self.public)))
     }
 }
+
+// ---------------------------------------------------------------------
+// Hook und echter Push (Spec S2 §11, §12, §13 Ebene 2 Push).
+// ---------------------------------------------------------------------
+
+pub const HOOK_BIN: &str = env!("CARGO_BIN_EXE_minds-witness-hook");
+
+/// Ein installierter Hook: Konfiguration, Ausgabeverzeichnis.
+#[derive(Debug, Clone)]
+pub struct Hook {
+    pub config: PathBuf,
+    pub out: PathBuf,
+}
+
+/// Ergebnis eines `git push`.
+#[derive(Debug)]
+pub struct PushOutcome {
+    pub exit: i32,
+    /// Vollständiges stderr des Clients.
+    pub stderr: String,
+    /// Nur die Zeilen von minds (`remote: minds-witness: …`), ohne Präfix,
+    /// am Ende ohne Leerraum.
+    pub minds: Vec<String>,
+}
+
+/// Eine Policy für `refs/heads/*` mit Modus, erzwungenen Refs und Schwelle.
+pub fn policy(
+    mode: minds_witness_core::Mode,
+    enforce: &[&str],
+    threshold: u8,
+) -> minds_witness_core::Policy {
+    minds_witness_core::Policy {
+        mode,
+        enforce_refs: enforce.iter().map(|s| (*s).to_owned()).collect(),
+        coverage_threshold_percent: threshold,
+        ..minds_witness_core::Policy::default()
+    }
+}
+
+fn canonical(p: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&p).unwrap_or(p)
+}
+
+impl GitTestFixture {
+    /// Seed-Datei, nur für den Eigentümer lesbar.
+    pub fn seed_file(&self) -> PathBuf {
+        let p = self.dir.path().join("seed.hex");
+        if !p.exists() {
+            std::fs::write(&p, format!("{}\n", "42".repeat(32))).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        p
+    }
+
+    /// Eine gültige Konfiguration für `policy` als JSON-Wert.
+    pub fn hook_config(&self, policy: &minds_witness_core::Policy) -> serde_json::Value {
+        serde_json::json!({
+            "operation": "test",
+            "project": PROJECT,
+            "signers_file": self.signers_file(),
+            "allowed_witness_principals": [PRINCIPAL],
+            "ssh_keygen": canonical(ssh_keygen()),
+            "git": canonical(git_program()),
+            "policy": policy,
+            "seed_file": self.seed_file(),
+            "key_valid_from": "2026-01-01T00:00:00Z",
+            "out_dir": self.dir.path().join("out"),
+        })
+    }
+
+    /// Schreibt eine Konfiguration und liefert ihren Pfad.
+    pub fn write_config(&self, name: &str, value: &serde_json::Value) -> PathBuf {
+        let p = self.dir.path().join(name);
+        std::fs::write(&p, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+        p
+    }
+
+    /// Installiert `minds-witness-hook` als pre-receive-Hook von `server`.
+    pub fn install_hook(&self, server: &Repo, value: &serde_json::Value) -> Hook {
+        let config = self.write_config("hook.json", value);
+        let hook = server.git_dir.join("hooks").join("pre-receive");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nexec '{}' '{}'\n", HOOK_BIN, config.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        Hook {
+            config,
+            out: PathBuf::from(value["out_dir"].as_str().unwrap()),
+        }
+    }
+}
+
+impl Hook {
+    /// Die Quittungen unter `<out>/<commit>/`.
+    pub fn receipts(&self, commit: &str) -> Vec<Vec<u8>> {
+        let dir = self.out.join(commit);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let mut names: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
+        names.sort();
+        names
+            .into_iter()
+            .map(|p| std::fs::read(p).unwrap())
+            .collect()
+    }
+
+    /// `<out>/keys.json`.
+    pub fn keys(&self) -> Vec<minds_witness_core::PublicKeyEntry> {
+        serde_json::from_slice(&std::fs::read(self.out.join("keys.json")).unwrap()).unwrap()
+    }
+
+    /// `<out>/log.jsonl` als Text (leer, wenn nicht vorhanden).
+    pub fn log(&self) -> String {
+        std::fs::read_to_string(self.out.join("log.jsonl")).unwrap_or_default()
+    }
+}
+
+impl Repo {
+    /// `git push` mit den Argumenten; liefert Exit, stderr und minds-Zeilen.
+    pub fn push(&self, args: &[&str]) -> PushOutcome {
+        let mut all = vec!["push", "--porcelain"];
+        all.extend_from_slice(args);
+        let out = self.try_git(&all, None);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let minds = stderr
+            .lines()
+            .filter_map(|l| l.strip_prefix("remote: "))
+            .filter(|l| l.starts_with("minds-witness:"))
+            .map(|l| l.trim_end().to_owned())
+            .collect();
+        PushOutcome {
+            exit: out.status.code().unwrap_or(-1),
+            stderr,
+            minds,
+        }
+    }
+
+    /// Ein Ref-Update als Refspec `<target>:<name>`.
+    pub fn spec(p: &Pending) -> String {
+        format!("{}:{}", p.target, p.name)
+    }
+}
