@@ -12,9 +12,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod access;
 pub mod binding;
 pub mod budget;
 pub mod candidates;
+pub mod fsck;
+pub mod guard;
 pub mod inspector;
+pub mod limits;
 pub mod trust;
 pub mod view;

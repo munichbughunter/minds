@@ -1975,6 +1975,8 @@ dependencies = [
  "hex",
  "minds-attest",
  "minds-core",
+ "minds-git",
+ "minds-store",
  "minds-witness-core",
  "serde",
  "serde_json",

@@ -365,6 +365,12 @@ impl ServerRepo {
         Ok(None)
     }
 
+    /// Größe des Objekts `oid`, `None` wenn es fehlt.
+    pub fn size(&self, oid: &str) -> Result<Option<u64>> {
+        let id = parse_oid(oid)?;
+        Ok(self.header(&id)?.map(|h| h.size))
+    }
+
     /// Bytes des Blobs `oid`, `None` wenn er größer als `max` ist.
     pub fn blob_bytes(&self, oid: &str, max: u64) -> Result<Option<Vec<u8>>> {
         let id = parse_oid(oid)?;

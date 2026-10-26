@@ -85,6 +85,12 @@ impl Budget {
         Ok(())
     }
 
+    /// Restzeit bis zur Deadline, `None` ohne Deadline.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
     /// Bisher gestartete Prozesse.
     pub fn processes(&self) -> u32 {
         self.processes.get()
