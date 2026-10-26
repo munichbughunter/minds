@@ -28,12 +28,20 @@ pub enum HostError {
 }
 
 /// Lesesicht auf Objekte im Vorzustand des Pushes.
+///
+/// Spec S1 v1.5 §5 (V4): Die Sicht muss kein atomarer Schnappschuss sein, darf
+/// sich aber innerhalb eines `pre_receive`-Aufrufs nicht ändern. Push-weite
+/// Budgets oder eine Deadline des Adapters wirken nur als
+/// `ObjectError::Internal`.
 pub trait ObjectAccess {
     /// Commit-Metadaten. Fehlt der Commit: `ObjectError::NotFound`.
     fn commit(&self, id: &CommitId) -> Result<CommitInfo, ObjectError>;
-    /// Neue Commits (Abschnitt 2), höchstens `limit` Stück, ältester zuerst.
-    /// `truncated == true`, wenn mehr als `limit` existieren; die Liste enthält dann
-    /// die `limit` ältesten. `old == None` steht für die Null-Id.
+    /// Neue Commits `M` (Abschnitt 2). `old == None` steht für die Null-Id.
+    /// `truncated == false`: die vollständige Menge `M`, topologisch, ältester zuerst.
+    /// `truncated == true` genau dann, wenn `|M| > limit`; zugesichert ist dann nur
+    /// `commits.len() == limit` und jedes Element ∈ `M` ohne Doppelte, nicht welche
+    /// und nicht in welcher Reihenfolge (Spec S1 v1.5, V7). Der Kern nutzt dann nur
+    /// die Länge.
     fn new_commits(
         &self,
         old: Option<&CommitId>,
@@ -42,8 +50,11 @@ pub trait ObjectAccess {
     ) -> Result<CommitRange, ObjectError>;
     /// Geänderte Pfade (Abschnitt 2): für Nicht-Merges gegenüber dem ersten Elternteil, für Merges die mergeeigenen Änderungen.
     fn changed_paths(&self, id: &CommitId) -> Result<BTreeSet<String>, ObjectError>;
-    /// Das dem Commit zugeordnete Seal, sofern vorhanden. Mehrere Seals: das mit dem
-    /// lexikografisch kleinsten `ref_name`.
+    /// Das dem Commit zugeordnete Seal, sofern vorhanden. Mehrere einzelne Seals: das mit
+    /// dem lexikografisch kleinsten `ref_name`. Zusätzlich zulässig (Spec S1 v1.5, V3):
+    /// eine Kandidatenmenge als **ein** Blob; `ref_name` ist dann ein Präfix mit `/` am
+    /// Ende und kein gültiger Ref-Name, der Inspektor vereinigt über die akzeptierten
+    /// Elemente.
     fn seal_for_commit(&self, id: &CommitId) -> Result<Option<SealBlob>, ObjectError>;
 }
 
@@ -59,18 +70,21 @@ pub struct CommitInfo {
 /// Antwort von `ObjectAccess::new_commits`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitRange {
-    /// Neue Commits, ältester zuerst, höchstens `limit` Stück.
+    /// Neue Commits. Bei `truncated == false` alle, ältester zuerst; bei
+    /// `truncated == true` genau `limit` verschiedene Elemente der Menge in beliebiger Auswahl
+    /// und Reihenfolge (Spec S1 v1.5, V7).
     pub commits: Vec<CommitId>,
-    /// `true`, wenn mehr als `limit` neue Commits existieren.
+    /// `true` genau dann, wenn mehr als `limit` neue Commits existieren.
     pub truncated: bool,
 }
 
 /// Rohes Seal, wie es der Host gefunden hat.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealBlob {
-    /// Ref, unter dem das Seal liegt. Welcher Namensraum das ist, legt der
-    /// Adapter fest (im Bestand `refs/minds/evidence/<seal_id>`); der Kern
-    /// wertet den Namen nur als Kennung aus.
+    /// Ref, unter dem das Seal liegt, oder bei einer Kandidatenmenge deren Präfix mit
+    /// `/` am Ende (Spec S1 v1.5, V3). Welcher Namensraum das ist, legt der Adapter
+    /// fest (im Bestand `refs/minds/evidence/<seal_id>`); der Kern wertet den Namen
+    /// nur als Kennung aus und übernimmt ihn unverändert in die Quittung.
     pub ref_name: String,
     /// Inhalt des Seal-Blobs; verlässt den Kern nie in Ereignissen.
     pub bytes: Vec<u8>,
@@ -98,7 +112,11 @@ pub enum ObjectError {
 
 /// Deutet ein Seal, ohne dass der Kern sein Format kennt.
 pub trait SealInspector {
-    /// Fasst `blob` zusammen; Vertrag siehe Abschnitt 5 der Spec.
+    /// Fasst `blob` zusammen; Vertrag siehe Abschnitt 5 der Spec. Das Ergebnis hängt
+    /// nur von `blob`, `expected` und der für einen `pre_receive`-Aufruf festen Sicht
+    /// des Adapters ab, nie vom bewerteten Ref, von der Policy oder anderem
+    /// Push-Zustand des Kerns; Budgets und Deadline wirken nur als
+    /// `SealError::Internal` (Spec S1 v1.5, V4).
     fn inspect(
         &self,
         blob: &SealBlob,
@@ -109,7 +127,8 @@ pub trait SealInspector {
 /// Signaturzustand eines Seals laut Inspektor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SealSignature {
-    /// Signatur verifiziert, Schlüssel als lokaler Witness-Schlüssel anerkannt.
+    /// Signatur der Evidence (Seal oder Binding-Attestation, Spec S1 v1.5, V1)
+    /// verifiziert, Signierer als lokaler Witness-Schlüssel anerkannt.
     Valid,
     /// Signatur falsch oder Schlüssel nicht anerkannt.
     Invalid,
@@ -120,15 +139,24 @@ pub enum SealSignature {
 /// Zusammenfassung eines Seals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SealSummary {
-    /// Hash des Seal-Inhalts, wie `minds verify` ihn berechnet (Adapter-Sache).
+    /// Hash, der die Quittung an die geprüfte Evidence bindet und den ein Verifizierer
+    /// aus dem Repository nachrechnet (Adapter-Sache); für Bindungsmengen nach S2 §8.4
+    /// (Spec S1 v1.5, V5).
     pub hash: HashStr,
     /// Signaturzustand.
     pub signature: SealSignature,
-    /// Commit, an den das Seal kryptografisch gebunden ist; aus dem signierten Inhalt des Seals gelesen, nie aus `expected` übernommen.
+    /// Commit, an den die Evidence gebunden ist. Bei `signature == Valid` ausschließlich
+    /// aus signiertem Inhalt (Seal oder Binding-Attestation); bei `Invalid`/`Unsigned`
+    /// darf der Inspektor `expected.commit` übernehmen (Spec S1 v1.5, V1). Der Kern prüft
+    /// die Bindung vor der Signatur.
     pub bound_commit: CommitId,
-    /// Repository-Kennung aus dem signierten Inhalt des Seals, falls das Seal-Format eine trägt; `None` heißt: keine Repo-Bindung vorhanden.
+    /// Repository-Kennung der Bindung, falls das Format eine trägt; `None` heißt: keine
+    /// Repo-Bindung vorhanden. Herkunft wie `bound_commit` (Spec S1 v1.5, V1); bei
+    /// `Valid` ohne Repo-Kennung im Format bleibt es `None`, nie `expected.repo`.
     pub bound_repo: Option<String>,
-    /// Pfade, die die Evidence-Kette des Seals berührt (Abschnitt 2, Form "Pfad").
+    /// Pfade, deren committeten Zustand die geprüfte Evidence inhaltsgebunden belegt
+    /// (Spec S1 v1.5, V2; Abschnitt 2, Form "Pfad"); nie ein Pfad der Form
+    /// `"\0nonutf8:…"` (V6).
     pub touched_paths: BTreeSet<String>,
 }
 
