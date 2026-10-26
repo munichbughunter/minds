@@ -54,6 +54,7 @@ pub(crate) fn root_owned_program(candidate: &Path, name: &str) -> Option<std::pa
         .then_some(real)
 }
 
+#[cfg(unix)]
 pub(crate) use minds_attest::{carries_acl, root_owned_chain};
 
 /// Was der minds-Graph über den Commit weiß: Sessions aus Trailer bzw.
