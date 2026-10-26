@@ -10,10 +10,12 @@
 
 mod events;
 mod ids;
+mod policy;
 mod push;
 
 pub use events::{LogEvent, LogLevel};
 pub use ids::{CommitId, HashStr, IdError, KeyStr, SigStr, Timestamp};
+pub use policy::{Mode, Policy, PolicyError, PusherMode, covers, matches_pattern};
 pub use push::{PushContext, Pusher, RefUpdate, ServerInfo, ServerKind};
 
 /// Präfix des Witness-Namensraums; Refs darunter schreibt nur der Server.
