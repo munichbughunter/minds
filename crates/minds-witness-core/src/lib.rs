@@ -12,6 +12,7 @@ mod events;
 mod finding;
 mod ids;
 mod policy;
+mod post;
 mod pre;
 mod push;
 mod receipt;
@@ -26,6 +27,7 @@ pub use finding::{
 };
 pub use ids::{CommitId, HashStr, IdError, KeyStr, SigStr, Timestamp};
 pub use policy::{Mode, Policy, PolicyError, PusherMode, covers, matches_pattern};
+pub use post::{PostOutcome, post_receive};
 pub use pre::{Decision, PreOutcome, RejectReason, pre_receive};
 pub use push::{PushContext, Pusher, RefUpdate, ServerInfo, ServerKind};
 pub use receipt::{
