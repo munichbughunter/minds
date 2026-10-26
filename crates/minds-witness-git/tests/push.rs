@@ -855,3 +855,26 @@ fn s2_41_panic_payload_not_on_stderr() {
         }
     }
 }
+
+/// Ablehnungsmeldungen des Kerns über einen echten Push: Ein Ref-Name mit
+/// einem 8-Bit-Steuerzeichen (U+009B, von Git erlaubt) erscheint escaped,
+/// nie roh auf dem Terminal des Pushers.
+#[test]
+fn reject_message_escapes_ref_name_on_the_wire() {
+    let w = world();
+    w.hook(&policy(Mode::Enforce, &["refs/heads/*"], 100));
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    let evil = "refs/heads/x\u{9b}2J";
+    let out = w.push(&c, evil, &[]);
+    assert_ne!(out.exit, 0);
+    // Ref-Anlage: der erste unbelegte Commit der Historie ist die Basis.
+    assert_eq!(
+        out.minds,
+        vec![format!(
+            "minds-witness: Push auf refs/heads/x\\xc2\\x9b2J abgelehnt: Commit {} (0/2 Pfade abgedeckt, Seal absent)",
+            w.base
+        )]
+    );
+    assert!(!out.stderr.contains('\u{9b}'), "{:?}", out.stderr);
+    assert_eq!(w.server_ref(evil), None);
+}

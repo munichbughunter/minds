@@ -43,13 +43,11 @@ impl GuardError {
 /// Höchstlänge einer stdin-Zeile von receive-pack.
 pub const MAX_STDIN_LINE: usize = 4096;
 
-/// Ref-Name für Meldungen: druckbares ASCII, sonst `<ref>`.
+/// Ref-Name für Meldungen an den Client: dieselbe Regel wie im Kern
+/// ([`minds_witness_core::display_ref`]): druckbares ASCII bleibt, alles
+/// andere erscheint escaped, die Länge ist begrenzt.
 pub fn shown(name: &str) -> String {
-    if !name.is_empty() && name.bytes().all(|b| (0x21..0x7f).contains(&b)) {
-        name.to_owned()
-    } else {
-        "<ref>".to_owned()
-    }
+    minds_witness_core::display_ref(name)
 }
 
 fn reject(reason: &str, name: &str) -> GuardError {

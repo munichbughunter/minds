@@ -15,7 +15,7 @@ use crate::finding::{
 };
 use crate::ids::{CommitId, HashStr};
 use crate::policy::{Mode, Policy, PusherMode};
-use crate::push::{PushContext, Pusher, RefUpdate};
+use crate::push::{PushContext, Pusher, RefUpdate, display_ref};
 use crate::traits::{
     ObjectAccess, SealBlob, SealError, SealExpectation, SealInspector, SealSignature, SealSummary,
 };
@@ -130,12 +130,12 @@ fn run(
         let message = if u.ref_name.starts_with(WITNESS_NAMESPACE) {
             format!(
                 "minds-witness: Refs unter refs/minds/witness/ schreibt nur der Server (Ref: {})",
-                u.ref_name
+                display_ref(&u.ref_name)
             )
         } else {
             format!(
                 "minds-witness: Ref {} ist reserviert, weil er den Witness-Namensraum refs/minds/witness/ blockieren würde",
-                u.ref_name
+                display_ref(&u.ref_name)
             )
         };
         return reject(RejectReason::WitnessNamespace, message);
@@ -213,7 +213,10 @@ fn run(
                 // bleiben für die Protokollierung erhalten (Schritt 9).
                 return reject(
                     RejectReason::InternalError,
-                    format!("minds-witness: interner Fehler bei {}", update.ref_name),
+                    format!(
+                        "minds-witness: interner Fehler bei {}",
+                        display_ref(&update.ref_name)
+                    ),
                 );
             }
         }
@@ -237,7 +240,8 @@ fn run(
                 "truncated",
                 format!(
                     "minds-witness: Push auf {} abgelehnt: mehr als {} neue Commits, vollständige Prüfung nicht möglich",
-                    f.push.ref_name, policy.max_commits_per_push
+                    display_ref(&f.push.ref_name),
+                    policy.max_commits_per_push
                 ),
             )
         } else if f.policy.result == PolicyVerdict::Fail {
@@ -245,7 +249,7 @@ fn run(
                 "fail",
                 format!(
                     "minds-witness: Push auf {} abgelehnt: Commit {} ({}/{} Pfade abgedeckt, Seal {})",
-                    f.push.ref_name,
+                    display_ref(&f.push.ref_name),
                     f.commit.as_str(),
                     f.coverage.paths_covered,
                     f.coverage.paths_in_diff,
@@ -642,4 +646,97 @@ mod tests {
             }
         ));
     }
+
+    /// Ablehnungsmeldungen gehen als `remote:`-Zeilen an den Client: Ein
+    /// Ref-Name mit (8-Bit-)Steuerzeichen oder Überlänge erscheint
+    /// escaped und begrenzt, in allen vier Meldungen mit Ref-Namen.
+    #[test]
+    fn reject_messages_escape_and_bound_ref_names() {
+        let evil = format!("refs/heads/x\u{9b}[2J\u{1b}]0;{}", "y".repeat(400));
+        let ctx_for = |name: &str| PushContext {
+            repo: "acme/payments".to_owned(),
+            updates: vec![RefUpdate {
+                old: cid(1),
+                new: cid(2),
+                ref_name: name.to_owned(),
+            }],
+            pusher: Pusher {
+                id: "u".to_owned(),
+                username: "u".to_owned(),
+            },
+            server: ServerInfo {
+                host: "h".to_owned(),
+                kind: ServerKind::Memory,
+                time: Timestamp::parse("2026-10-25T10:00:00Z").unwrap(),
+            },
+        };
+        let enforce = Policy {
+            mode: Mode::Enforce,
+            enforce_refs: vec!["refs/heads/*".to_owned()],
+            max_commits_per_push: 1,
+            ..Policy::default()
+        };
+        let check = |out: &PreOutcome, name: &str| {
+            let Decision::Reject { message, .. } = &out.decision else {
+                panic!("kein Reject: {:?}", out.decision);
+            };
+            // Keine Steuerzeichen, auch keine C1-Zeichen (U+0080 bis U+009F);
+            // der feste deutsche Text darf Umlaute tragen.
+            assert!(!message.chars().any(char::is_control), "{message:?}");
+            assert!(message.contains(&display_ref(name)), "{message}");
+            assert!(message.len() < 200 + MAX_REF_DISPLAY_SLACK, "{message}");
+            // Das Log behält den Namen unverändert.
+            assert!(
+                out.events
+                    .iter()
+                    .any(|e| e.fields.get("ref").map(String::as_str) == Some(name))
+            );
+        };
+
+        // Fail ohne Seal.
+        let ctx = ctx_for(&evil);
+        let mut a = MemoryAdapter::new(ctx.clone());
+        a.add_commit(cid(1), vec![], BTreeSet::new()).add_commit(
+            cid(2),
+            vec![cid(1)],
+            ["x".to_owned()].into(),
+        );
+        check(&pre_receive(&ctx, &enforce, &a, &a), &evil);
+
+        // Truncated: zwei neue Commits bei max_commits_per_push = 1.
+        let created = PushContext {
+            updates: vec![RefUpdate {
+                old: CommitId::null_of_len(40).unwrap(),
+                new: cid(2),
+                ref_name: evil.clone(),
+            }],
+            ..ctx.clone()
+        };
+        let mut a = MemoryAdapter::new(created.clone());
+        a.add_commit(cid(1), vec![], BTreeSet::new()).add_commit(
+            cid(2),
+            vec![cid(1)],
+            ["x".to_owned()].into(),
+        );
+        check(&pre_receive(&created, &enforce, &a, &a), &evil);
+
+        // Interner Fehler auf erzwungenem Ref.
+        let mut a = MemoryAdapter::new(ctx.clone());
+        a.add_commit(cid(1), vec![], BTreeSet::new()).add_commit(
+            cid(2),
+            vec![cid(1)],
+            ["x".to_owned()].into(),
+        );
+        a.fault = crate::memory::Fault::SealInternal;
+        check(&pre_receive(&ctx, &enforce, &a, &a), &evil);
+
+        // Witness-Namensraum.
+        let witness = format!("refs/minds/witness/\u{9b}{}", "z".repeat(400));
+        let ctx = ctx_for(&witness);
+        let a = MemoryAdapter::new(ctx.clone());
+        check(&pre_receive(&ctx, &enforce, &a, &a), &witness);
+    }
+
+    /// Längster fester Text einer Ablehnungsmeldung mit Ref-Namen, großzügig.
+    const MAX_REF_DISPLAY_SLACK: usize = 200;
 }
