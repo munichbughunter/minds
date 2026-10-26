@@ -167,6 +167,7 @@ fn t38_key_valid_from_after_finding() {
     let out = post_receive(&pre_out.findings, &ident, &late, &mut a);
     assert_eq!(counts(&out), (0, 0, 1));
     let ev = only_event(&out.events, "key_not_valid_at");
+    assert_eq!(ev.fields["reason"], "before_valid_from");
     assert_eq!(ev.fields["time"], "2026-10-25T10:00:00Z");
     assert_eq!(ev.fields["valid_from"], "2027-01-01T00:00:00Z");
     assert_eq!(a.receipt_count(), 0);
@@ -201,4 +202,270 @@ fn t39_receipt_id_is_content_address() {
             HashStr::of_bytes(&canonical_bytes(&r.body()))
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1.4: Schlüsselgültigkeit gegen die Schlüsselliste (t44 bis t48)
+// ---------------------------------------------------------------------------
+
+/// Store, der alles an den `MemoryAdapter` weiterreicht, nur `public_keys`
+/// liefert einen festen Wert (Fehler oder leere Liste).
+struct KeysOverride<'a> {
+    inner: &'a mut MemoryAdapter,
+    keys: Result<Vec<PublicKeyEntry>, &'static str>,
+    panic: bool,
+}
+
+impl ReceiptStore for KeysOverride<'_> {
+    fn put(&mut self, key: &ReceiptKey, bytes: &[u8]) -> Result<PutResult, StoreError> {
+        self.inner.put(key, bytes)
+    }
+    fn get(&self, key: &ReceiptKey) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.get(key)
+    }
+    fn list(&self, commit: &CommitId) -> Result<Vec<ReceiptKey>, StoreError> {
+        self.inner.list(commit)
+    }
+    fn public_keys(&self) -> Result<Vec<PublicKeyEntry>, StoreError> {
+        assert!(!self.panic, "fault");
+        self.keys
+            .clone()
+            .map_err(|e| StoreError::Internal(e.to_owned()))
+    }
+    fn register_public_key(&mut self, entry: &PublicKeyEntry) -> Result<(), StoreError> {
+        self.inner.register_public_key(entry)
+    }
+}
+
+fn entry(valid_from: &str, valid_until: Option<&str>) -> PublicKeyEntry {
+    PublicKeyEntry {
+        key: identity().key,
+        valid_from: ts(valid_from),
+        valid_until: valid_until.map(ts),
+    }
+}
+
+fn foreign_entry(valid_until: Option<&str>) -> PublicKeyEntry {
+    PublicKeyEntry {
+        key: Signer::from_seed([9u8; 32], ts("2026-01-01T00:00:00Z")).public_key(),
+        valid_from: ts("2026-01-01T00:00:00Z"),
+        valid_until: valid_until.map(ts),
+    }
+}
+
+/// Zwei Findings zu `id(2)` unter `main` und `feature`.
+fn two_findings() -> (MemoryAdapter, Vec<Finding>) {
+    let mut a = single_commit_push();
+    a.ctx.updates = vec![
+        update(1, 2, "refs/heads/main"),
+        update(1, 2, "refs/heads/feature"),
+    ];
+    let findings = pre(&a, &policy_observe()).findings;
+    assert_eq!(findings.len(), 2);
+    (a, findings)
+}
+
+#[test]
+fn t44_revoked_key_not_signed() {
+    let mut a = single_commit_push();
+    // Zurückgezogen vor dem Serverzeitpunkt 2026-10-25T10:00:00Z; gleiches
+    // valid_from wie der Signer, die Registrierung ist also kein Konflikt.
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", Some("2026-06-01T00:00:00Z")));
+    let (_, out) = run_standard(&mut a);
+    assert_eq!(counts(&out), (0, 0, 1));
+    let ev = only_event(&out.events, "key_not_valid_at");
+    assert_eq!(ev.fields["reason"], "revoked");
+    assert_eq!(ev.fields["valid_until"], "2026-06-01T00:00:00Z");
+    assert_eq!(a.receipt_count(), 0);
+    // Die Registrierung hat den Widerruf weder entfernt noch verschoben.
+    assert_eq!(
+        a.keys(),
+        vec![entry("2026-01-01T00:00:00Z", Some("2026-06-01T00:00:00Z"))]
+    );
+}
+
+#[test]
+fn t45_valid_until_boundary() {
+    // valid_until == Serverzeit: ausschließliche Grenze, nicht signiert.
+    let mut a = single_commit_push();
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", Some("2026-10-25T10:00:00Z")));
+    let (_, out) = run_standard(&mut a);
+    assert_eq!(counts(&out), (0, 0, 1));
+    assert_eq!(
+        only_event(&out.events, "key_not_valid_at").fields["reason"],
+        "revoked"
+    );
+
+    // Eine Sekunde später: gültig, und die Quittung verifiziert.
+    let mut a = single_commit_push();
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", Some("2026-10-25T10:00:01Z")));
+    let (_, out) = run_standard(&mut a);
+    assert_eq!(counts(&out), (1, 0, 0));
+    assert!(verify_receipt(&a.receipts_for(&id(2))[0], &a.keys()).is_ok());
+
+    // valid_from == Serverzeit: einschließliche Grenze, signiert.
+    let mut a = single_commit_push();
+    let at = Signer::from_seed([7u8; 32], ts("2026-10-25T10:00:00Z"));
+    let pre_out = pre(&a, &policy_observe());
+    let out = post_receive(&pre_out.findings, &identity(), &at, &mut a);
+    assert_eq!(counts(&out), (1, 0, 0));
+    assert!(verify_receipt(&a.receipts_for(&id(2))[0], &a.keys()).is_ok());
+
+    // Entscheidung je Finding: eines vor, eines nach valid_until.
+    let mut a = single_commit_push();
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", Some("2026-10-25T10:00:00Z")));
+    let mut early = a.ctx.clone();
+    early.server.time = ts("2026-10-25T09:59:59Z");
+    let mut findings = pre_receive(&early, &policy_observe(), &a, &a).findings;
+    findings.extend(pre(&a, &policy_observe()).findings);
+    let out = post_receive(&findings, &identity(), &signer(), &mut a);
+    assert_eq!(counts(&out), (1, 0, 1));
+    let ev = only_event(&out.events, "key_not_valid_at");
+    assert_eq!(ev.fields["time"], "2026-10-25T10:00:00Z");
+    assert_eq!(a.receipt_count(), 1);
+}
+
+#[test]
+fn t46_public_keys_error_signs_nothing() {
+    let mut a = single_commit_push();
+    let pre_out = pre(&a, &policy_observe());
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Err("fault"),
+        panic: false,
+    };
+    let out = post_receive(&pre_out.findings, &identity(), &signer(), &mut store);
+    assert_eq!(counts(&out), (0, 0, 1));
+    let ev = only_event(&out.events, "store_failed");
+    assert!(ev.fields["error"].contains("fault"));
+    assert!(!codes(&out.events).contains(&"receipt_stored"));
+    assert_eq!(a.receipt_count(), 0);
+
+    // Mehrere Findings: alle failed, keines signiert.
+    let (mut a, findings) = two_findings();
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Err("fault"),
+        panic: false,
+    };
+    let out = post_receive(&findings, &identity(), &signer(), &mut store);
+    assert_eq!(counts(&out), (0, 0, 2));
+    assert_eq!(a.receipt_count(), 0);
+
+    // Panic in public_keys: fail-open nach außen, failed = alle.
+    let (mut a, findings) = two_findings();
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Ok(vec![]),
+        panic: true,
+    };
+    let out = post_receive(&findings, &identity(), &signer(), &mut store);
+    assert_eq!(counts(&out), (0, 0, 2));
+    only_event(&out.events, "panic");
+    assert_eq!(a.receipt_count(), 0);
+}
+
+#[test]
+fn t47_conflicting_entries_most_restrictive_wins() {
+    // Zwei Einträge desselben Schlüssels: einer offen, einer zurückgezogen.
+    // Der Kern wählt nicht den günstigeren.
+    let mut a = single_commit_push();
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", None));
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", Some("2026-03-01T00:00:00Z")));
+    let (_, out) = run_standard(&mut a);
+    assert_eq!(counts(&out), (0, 0, 1));
+    assert_eq!(
+        only_event(&out.events, "key_not_valid_at").fields["reason"],
+        "revoked"
+    );
+    assert_eq!(a.receipt_count(), 0);
+
+    // Ein späteres valid_from in einem zweiten Eintrag verhindert ebenso.
+    let mut a = single_commit_push();
+    a.seed_public_key(entry("2026-01-01T00:00:00Z", None));
+    a.seed_public_key(entry("2026-12-01T00:00:00Z", None));
+    let (_, out) = run_standard(&mut a);
+    assert_eq!(counts(&out), (0, 0, 1));
+    let ev = only_event(&out.events, "key_not_valid_at");
+    assert_eq!(ev.fields["reason"], "before_valid_from");
+    assert_eq!(ev.fields["valid_from"], "2026-12-01T00:00:00Z");
+
+    // Bei `revoked` nennt das Ereignis valid_from und valid_until des
+    // Eintrags, der gegriffen hat, nicht das valid_from des Signers.
+    let mut a = single_commit_push();
+    let pre_out = pre(&a, &policy_observe());
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Ok(vec![entry(
+            "2025-06-01T00:00:00Z",
+            Some("2026-03-01T00:00:00Z"),
+        )]),
+        panic: false,
+    };
+    let out = post_receive(&pre_out.findings, &identity(), &signer(), &mut store);
+    assert_eq!(counts(&out), (0, 0, 1));
+    let ev = only_event(&out.events, "key_not_valid_at");
+    assert_eq!(ev.fields["reason"], "revoked");
+    assert_eq!(ev.fields["valid_from"], "2025-06-01T00:00:00Z");
+    assert_eq!(ev.fields["valid_until"], "2026-03-01T00:00:00Z");
+}
+
+#[test]
+fn t48_only_entries_of_the_own_key_count() {
+    let mut a = single_commit_push();
+    let pre_out = pre(&a, &policy_observe());
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Ok(vec![]),
+        panic: false,
+    };
+    let out = post_receive(&pre_out.findings, &identity(), &signer(), &mut store);
+    assert_eq!(counts(&out), (0, 0, 1));
+    assert_eq!(
+        only_event(&out.events, "key_not_valid_at").fields["reason"],
+        "not_listed"
+    );
+    assert_eq!(a.receipt_count(), 0);
+
+    // Nur ein fremder Schlüssel in der Liste: der eigene fehlt → not_listed.
+    let mut a = single_commit_push();
+    let pre_out = pre(&a, &policy_observe());
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Ok(vec![foreign_entry(None)]),
+        panic: false,
+    };
+    let out = post_receive(&pre_out.findings, &identity(), &signer(), &mut store);
+    assert_eq!(counts(&out), (0, 0, 1));
+    assert_eq!(
+        only_event(&out.events, "key_not_valid_at").fields["reason"],
+        "not_listed"
+    );
+
+    // Der Signer selbst ist erst später gültig, auch wenn die Liste (gegen
+    // den Vertrag) nur einen früheren Eintrag führt: nicht signiert.
+    let mut a = single_commit_push();
+    let pre_out = pre(&a, &policy_observe());
+    let late = Signer::from_seed([7u8; 32], ts("2027-01-01T00:00:00Z"));
+    let ident = WitnessIdentity {
+        binary: identity().binary,
+        key: late.public_key(),
+    };
+    let mut store = KeysOverride {
+        inner: &mut a,
+        keys: Ok(vec![entry("2026-01-01T00:00:00Z", None)]),
+        panic: false,
+    };
+    let out = post_receive(&pre_out.findings, &ident, &late, &mut store);
+    assert_eq!(counts(&out), (0, 0, 1));
+    let ev = only_event(&out.events, "key_not_valid_at");
+    assert_eq!(ev.fields["reason"], "before_valid_from");
+    assert_eq!(ev.fields["valid_from"], "2027-01-01T00:00:00Z");
+
+    // Ein widerrufener fremder Schlüssel blockiert den eigenen nicht.
+    let mut a = single_commit_push();
+    a.seed_public_key(foreign_entry(Some("2026-02-01T00:00:00Z")));
+    let (_, out) = run_standard(&mut a);
+    assert_eq!(counts(&out), (1, 0, 0));
+    assert!(verify_receipt(&a.receipts_for(&id(2))[0], &a.keys()).is_ok());
 }
