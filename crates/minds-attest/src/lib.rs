@@ -20,6 +20,14 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+mod chain;
+mod signers;
+
+#[cfg(unix)]
+pub use chain::{carries_acl, root_owned_chain};
+pub use signers::{SignerLine, principal_lines, restricted_keys, restricted_to};
+
 /// Der ssh-sig-Namespace — trennt Minds-Signaturen von anderen ssh-sig-Domänen.
 pub const NS_DEFAULT: &str = "minds";
 /// Witness seals, separate from human reviews and attributions.

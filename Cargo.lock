@@ -1811,6 +1811,7 @@ dependencies = [
 name = "minds-attest"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tempfile",
  "thiserror",
 ]
@@ -1963,6 +1964,21 @@ dependencies = [
  "hex",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "minds-witness-git"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "minds-attest",
+ "minds-core",
+ "minds-witness-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
 ]
 
