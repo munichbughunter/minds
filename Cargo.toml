@@ -13,6 +13,10 @@ repository = "https://github.com/munichbughunter/minds"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
+# Signatur der Witness-Quittungen (minds-witness-core). Ohne `rand`-Feature:
+# Schlüssel kommen als fester Seed von außen.
+ed25519-dalek = { version = "2", features = ["std"] }
+hex = "0.4"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 thiserror = "2"
 anyhow = "1"

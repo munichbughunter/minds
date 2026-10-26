@@ -3824,6 +3824,7 @@ mod tests {
             "minds-attest",
             "minds-gitlab",
             "minds-metrics",
+            "minds-witness-core",
         ];
         const NOT_STORED: &[(&str, &str)] = &[
             ("minds-cli", "Datei für Datei unten gescannt"),

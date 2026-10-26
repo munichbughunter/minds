@@ -1,0 +1,21 @@
+[package]
+name = "minds-witness-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Prüf- und Quittungslogik des minds Server-Witness als reine Bibliothek ohne I/O"
+
+[lib]
+name = "minds_witness_core"
+
+[dependencies]
+# Niemals `serde_json/preserve_order` aktivieren: die kanonische Form der
+# Quittung entsteht aus der Felddeklaration und BTreeMap/BTreeSet.
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
