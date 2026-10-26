@@ -159,6 +159,13 @@ impl TrustConfig {
         })
     }
 
+    /// Ob der öffentliche Schlüssel `key` (`<typ> <base64>`) den
+    /// Rust-Vorfilter besteht (Spec S2 §7.0 Regel 5, §7.5): Er steht in
+    /// einer Zeile eines erlaubten Principals, der anerkannt werden kann.
+    pub fn recognizes(&self, key: &str) -> bool {
+        public_key_blob(key).is_some_and(|blob| self.principal_for(&blob).is_some())
+    }
+
     /// Der Principal, dessen beschränkte Zeile genau diesen Schlüssel
     /// (SSH-Wire-Format) trägt, sofern er anerkannt werden kann.
     fn principal_for(&self, key: &[u8]) -> Option<&str> {

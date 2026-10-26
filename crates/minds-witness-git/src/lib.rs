@@ -1,4 +1,4 @@
-//! Git-Adapter des minds Server-Witness (Spec S2 v0.4).
+//! Git-Adapter des minds Server-Witness (Spec S2 v0.4.1).
 //!
 //! Das Crate verbindet den I/O-freien Kern `minds-witness-core` mit echter
 //! minds-Evidence: das Format `minds-commit-binding-v1` ([`binding`]), die
@@ -8,13 +8,21 @@
 //! inhaltsgebundener Abdeckung ([`inspector`]) über einer Objektsicht
 //! ([`view`]). Es kennt keine Assurance-Stufen und hängt nicht von
 //! `minds-reader` ab (W2).
+//!
+//! [`hook`] enthält das Test-Hook-Binary `minds-witness-hook` (§11) mit
+//! der sicheren Warnungsausgabe für den Observe-Modus (ADR-PRODUCT-001).
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod access;
 pub mod binding;
 pub mod budget;
 pub mod candidates;
+pub mod fsck;
+pub mod guard;
+pub mod hook;
 pub mod inspector;
+pub mod limits;
 pub mod trust;
 pub mod view;

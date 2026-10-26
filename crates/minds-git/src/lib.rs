@@ -66,6 +66,7 @@ mod head;
 pub mod ignore;
 mod objects;
 mod oid;
+pub mod quarantine;
 mod refs;
 mod repo;
 mod trailer;

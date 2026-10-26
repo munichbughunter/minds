@@ -832,3 +832,29 @@ fn s2_37_receipt_hash_golden() {
     assert_eq!(s.signature, SealSignature::Unsigned);
     assert_eq!(s.hash, h("rejected_bindings", &c, &[&b.id()]));
 }
+
+/// s2_23 (Teil Inspektor): `expected.repo ≠ project` ist ein technischer
+/// Fehler, kein Urteil über Evidence.
+#[test]
+fn s2_23_expected_repo_must_match_project() {
+    let mut w = World::new();
+    let (_, c) = base(&mut w);
+    let seal = w.evidence(&observations(
+        &[("src/a.rs", Obs::Content(b"a1"))],
+        Some(separated()),
+    ));
+    bind(&mut w, &c, &[seal]);
+    let trust = w.trust();
+    let budget = Budget::unlimited();
+    let verifier = Verifier::new(&trust, &budget);
+    let inspector =
+        GitSealInspector::new(&w.view, &verifier, &budget, InspectorConfig::new(PROJECT));
+    let blob = w.blob_for(&c).unwrap();
+    let expected = minds_witness_core::SealExpectation {
+        repo: "git.test/project-43".to_owned(),
+        commit: minds_witness_core::CommitId::parse(&c).unwrap(),
+    };
+    let r = minds_witness_core::SealInspector::inspect(&inspector, &blob, &expected);
+    assert!(matches!(r, Err(SealError::Internal(_))), "{r:?}");
+    assert_eq!(budget.processes(), 0);
+}

@@ -142,8 +142,6 @@ pub struct GitSealInspector<'a, V: EvidenceView + ?Sized> {
     seals: RefCell<HashMap<(String, String), Option<SealOk>>>,
     /// Memo je (Observation-Id, Ref-Ziel).
     observations: RefCell<HashMap<(String, String), Observed>>,
-    /// Blob-Oids, deren Bytes schon im Budget gezählt sind.
-    counted: RefCell<std::collections::HashSet<String>>,
 }
 
 impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
@@ -163,7 +161,6 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
             diagnostics: RefCell::new(Vec::new()),
             seals: RefCell::new(HashMap::new()),
             observations: RefCell::new(HashMap::new()),
-            counted: RefCell::new(std::collections::HashSet::new()),
         }
     }
 
@@ -193,11 +190,9 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
         let Some(bytes) = self.view.blob(oid, max).map_err(internal)? else {
             return Ok(None);
         };
-        if self.counted.borrow_mut().insert(oid.to_owned()) {
-            self.budget
-                .take_bytes(bytes.len() as u64)
-                .map_err(|e| SealError::Internal(e.to_string()))?;
-        }
+        self.budget
+            .take_object_bytes(oid, bytes.len() as u64)
+            .map_err(|e| SealError::Internal(e.to_string()))?;
         Ok(Some(bytes))
     }
 

@@ -1973,8 +1973,11 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "hex",
+ "jiff",
  "minds-attest",
  "minds-core",
+ "minds-git",
+ "minds-store",
  "minds-witness-core",
  "serde",
  "serde_json",

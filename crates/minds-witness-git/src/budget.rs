@@ -5,7 +5,8 @@
 //! `Internal`), nie ein Urteil über Evidence; die Deadline ist eine harte
 //! Obergrenze, kein erwarteter Normalbetrieb.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Welches Budget erschöpft ist.
@@ -29,6 +30,9 @@ pub struct Budget {
     processes: Cell<u32>,
     max_bytes: u64,
     bytes: Cell<u64>,
+    /// Objekt-Oids, deren Bytes schon gezählt sind (§9: je Oid einmal,
+    /// gemeinsam für Vorprüfung, Kandidatenauswahl und Inspektor).
+    charged: RefCell<HashSet<String>>,
     deadline: Option<Instant>,
 }
 
@@ -41,6 +45,7 @@ impl Budget {
             processes: Cell::new(0),
             max_bytes,
             bytes: Cell::new(0),
+            charged: RefCell::new(HashSet::new()),
             deadline,
         }
     }
@@ -85,6 +90,24 @@ impl Budget {
         Ok(())
     }
 
+    /// Verbraucht die `n` Bytes des Objekts `oid`, je Oid und Budget
+    /// höchstens einmal (Spec S2 §9).
+    pub fn take_object_bytes(&self, oid: &str, n: u64) -> Result<(), BudgetError> {
+        self.check_deadline()?;
+        if self.charged.borrow().contains(oid) {
+            return Ok(());
+        }
+        self.take_bytes(n)?;
+        self.charged.borrow_mut().insert(oid.to_owned());
+        Ok(())
+    }
+
+    /// Restzeit bis zur Deadline, `None` ohne Deadline.
+    pub fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(Instant::now()))
+    }
+
     /// Bisher gestartete Prozesse.
     pub fn processes(&self) -> u32 {
         self.processes.get()
@@ -93,5 +116,20 @@ impl Budget {
     /// Bisher gezählte Bytes.
     pub fn bytes(&self) -> u64 {
         self.bytes.get()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_bytes_count_once_per_oid() {
+        let b = Budget::new(0, 10, None);
+        b.take_object_bytes("a", 6).unwrap();
+        b.take_object_bytes("a", 6).unwrap();
+        assert_eq!(b.bytes(), 6);
+        assert_eq!(b.take_object_bytes("b", 6), Err(BudgetError::Bytes));
+        assert_eq!(b.bytes(), 6);
     }
 }

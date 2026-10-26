@@ -10,13 +10,23 @@ description = "Git-Adapter des minds Server-Witness: Commit-Binding, SealInspect
 [lib]
 name = "minds_witness_git"
 
+[[bin]]
+name = "minds-witness-hook"
+path = "src/bin/minds-witness-hook.rs"
+test = false
+
 [dependencies]
 minds-witness-core = { path = "../minds-witness-core" }
 minds-core = { path = "../minds-core" }
 minds-attest = { path = "../minds-attest" }
+minds-git = { path = "../minds-git" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+minds-store = { path = "../minds-store" }
