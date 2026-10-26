@@ -5,7 +5,7 @@
 mod fixtures;
 
 use fixtures::*;
-use minds_witness_core::memory::{Fault, MemoryAdapter};
+use minds_witness_core::memory::{Fault, MemoryAdapter, SealOutcome};
 use minds_witness_core::*;
 
 fn counts(o: &PostOutcome) -> (u32, u32, u32) {
@@ -473,4 +473,77 @@ fn t48_only_entries_of_the_own_key_count() {
     let (_, out) = run_standard(&mut a);
     assert_eq!(counts(&out), (1, 0, 0));
     assert!(verify_receipt(&a.receipts_for(&id(2))[0], &a.keys()).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Neu in Spec S1 v1.5: Regressionstests zu V3 und V6.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t52_candidate_set_ref_passes_through() {
+    let prefix = format!("refs/minds/bindings/{}/", id(2).as_str());
+
+    let mut a = single_commit_push();
+    a.remove_seal(&id(2)).add_seal(
+        id(2),
+        &prefix,
+        b"kandidaten".to_vec(),
+        valid_seal(2, &["src/lib.rs", "src/pay.rs"]),
+    );
+    let (pre_out, out) = run_standard(&mut a);
+    let f = &pre_out.findings[0];
+    assert_eq!(f.seal.ref_name.as_deref(), Some(prefix.as_str()));
+    assert_eq!(f.seal.status, SealState::Valid);
+    assert_eq!(counts(&out), (1, 0, 0));
+    let receipts = a.receipts_for(&id(2));
+    let v = verify_receipt(&receipts[0], &a.keys()).unwrap();
+    assert_eq!(v.receipt.seal.ref_name.as_deref(), Some(prefix.as_str()));
+
+    let bytes = b"kandidaten-unlesbar".to_vec();
+    let mut b = single_commit_push();
+    b.remove_seal(&id(2))
+        .add_seal(id(2), &prefix, bytes.clone(), SealOutcome::Malformed);
+    let out = pre(&b, &policy_observe());
+    let seal = &out.findings[0].seal;
+    assert_eq!(seal.status, SealState::Invalid);
+    assert_eq!(seal.hash, Some(HashStr::of_bytes(&bytes)));
+    assert_eq!(seal.ref_name.as_deref(), Some(prefix.as_str()));
+}
+
+#[test]
+fn t54_nonutf8_path_form() {
+    let marker = "\0nonutf8:ff";
+    let mut a = MemoryAdapter::new(ctx(vec![update(1, 2, "refs/heads/main")]));
+    a.add_commit(id(1), vec![], paths(&["README.md"]))
+        .add_commit(id(2), vec![id(1)], paths(&[marker, "src/lib.rs"]))
+        .add_seal(
+            id(2),
+            "refs/minds/seals/s1",
+            b"seal-2".to_vec(),
+            valid_seal(2, &["src/lib.rs"]),
+        );
+    let (pre_out, out) = run_standard(&mut a);
+    assert_eq!(
+        pre_out.findings[0].coverage,
+        Coverage {
+            paths_covered: 1,
+            paths_in_diff: 2,
+            status: CoverageStatus::Computed,
+            uncovered: vec![marker.to_owned()],
+            uncovered_truncated: false,
+        }
+    );
+    assert_eq!(counts(&out), (1, 0, 0));
+    let receipts = a.receipts_for(&id(2));
+    let text = String::from_utf8(receipts[0].clone()).unwrap();
+    assert!(
+        text.contains(r#""uncovered":["\u0000nonutf8:ff"]"#),
+        "{text}"
+    );
+    verify_receipt(&receipts[0], &a.keys()).unwrap();
+    let back = Receipt::from_bytes(&receipts[0]).unwrap();
+    assert_eq!(back.coverage.uncovered, vec![marker.to_owned()]);
+
+    let enforce = pre(&a, &policy_enforce_main());
+    assert_eq!(reason(&enforce.decision), Some(RejectReason::PolicyFail));
 }

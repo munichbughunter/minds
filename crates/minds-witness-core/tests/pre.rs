@@ -679,3 +679,315 @@ fn t50_panic_payload_never_logged() {
         assert!(!message(&out.decision).contains("SECRET"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Neu in Spec S1 v1.5: Regressionstests zu den Vertragsänderungen V1 bis V8.
+// ---------------------------------------------------------------------------
+
+/// Standard-Push, dessen Seal für `id(2)` den Ausgang `s` hat.
+fn push_with_summary(s: SealSummary) -> MemoryAdapter {
+    let mut a = single_commit_push();
+    a.add_seal(
+        id(2),
+        "refs/minds/seals/s1",
+        b"seal-2".to_vec(),
+        SealOutcome::Summary(s),
+    );
+    a
+}
+
+#[test]
+fn t51_binding_check_precedes_signature() {
+    let touched = ["src/lib.rs", "src/pay.rs"];
+    let with = |signature: SealSignature, bound: u8, repo: Option<&str>| SealSummary {
+        signature,
+        bound_commit: id(bound),
+        bound_repo: repo.map(str::to_owned),
+        ..summary(2, true, &touched)
+    };
+    let cases = [
+        // (a) Inspektor übernimmt die Erwartung bei ungültiger Signatur.
+        (
+            with(SealSignature::Invalid, 2, Some("acme/payments")),
+            SealState::Invalid,
+            "invalid",
+        ),
+        // (b) dasselbe ohne Signatur.
+        (
+            with(SealSignature::Unsigned, 2, Some("acme/payments")),
+            SealState::Unsigned,
+            "unsigned",
+        ),
+        // (c) verfehlte Repo-Bindung, sonst wie (a).
+        (
+            with(SealSignature::Invalid, 2, Some("acme/other")),
+            SealState::Mismatched,
+            "mismatched",
+        ),
+        // (d) verfehlte Commit-Bindung ohne Signatur.
+        (
+            with(SealSignature::Unsigned, 3, None),
+            SealState::Mismatched,
+            "mismatched",
+        ),
+    ];
+    for (s, state, word) in cases {
+        let a = push_with_summary(s);
+        let out = pre(&a, &policy_observe());
+        assert_eq!(out.decision, Decision::Accept);
+        assert_eq!(out.findings.len(), 1);
+        let f = &out.findings[0];
+        assert_eq!(f.seal.status, state);
+        assert_eq!(f.coverage.status, CoverageStatus::Computed);
+        assert_eq!(f.policy.result, PolicyVerdict::Fail);
+
+        let out = pre(&a, &policy_enforce_main());
+        assert_eq!(reason(&out.decision), Some(RejectReason::PolicyFail));
+        assert!(
+            message(&out.decision).contains(&format!("Seal {word})")),
+            "{:?}",
+            out.decision
+        );
+    }
+}
+
+/// Inspektor, der an den `MemoryAdapter` weiterreicht und ab dem
+/// `budget + 1`-ten Aufruf wie ein erschöpftes push-weites Budget
+/// `SealError::Internal` liefert.
+struct BudgetInspector<'a> {
+    inner: &'a MemoryAdapter,
+    budget: u32,
+    calls: std::cell::Cell<u32>,
+}
+
+impl<'a> BudgetInspector<'a> {
+    fn new(inner: &'a MemoryAdapter, budget: u32) -> Self {
+        Self {
+            inner,
+            budget,
+            calls: std::cell::Cell::new(0),
+        }
+    }
+}
+
+impl SealInspector for BudgetInspector<'_> {
+    fn inspect(
+        &self,
+        blob: &SealBlob,
+        expected: &SealExpectation,
+    ) -> Result<SealSummary, SealError> {
+        let n = self.calls.get() + 1;
+        self.calls.set(n);
+        if n > self.budget {
+            return Err(SealError::Internal("budget".to_owned()));
+        }
+        self.inner.inspect(blob, expected)
+    }
+}
+
+/// `id(2)` und `id(3)` zweigen von `id(1)` ab, jeder mit eigenem, voll
+/// abdeckendem Seal.
+fn fork_push(updates: Vec<RefUpdate>) -> MemoryAdapter {
+    let mut a = MemoryAdapter::new(ctx(updates));
+    a.add_commit(id(1), vec![], paths(&["README.md"]))
+        .add_commit(id(2), vec![id(1)], paths(&["a"]))
+        .add_commit(id(3), vec![id(1)], paths(&["b"]))
+        .add_seal(
+            id(2),
+            "refs/minds/seals/s2",
+            b"seal-2".to_vec(),
+            valid_seal(2, &["a"]),
+        )
+        .add_seal(
+            id(3),
+            "refs/minds/seals/s3",
+            b"seal-3".to_vec(),
+            valid_seal(3, &["b"]),
+        );
+    a
+}
+
+fn pre_with_budget(a: &MemoryAdapter, policy: &Policy) -> PreOutcome {
+    pre_receive(&a.ctx, policy, a, &BudgetInspector::new(a, 1))
+}
+
+fn assert_same(x: &PreOutcome, y: &PreOutcome) {
+    assert_eq!(x.decision, y.decision);
+    assert_eq!(x.findings, y.findings);
+    assert_eq!(x.events, y.events);
+}
+
+#[test]
+fn t53_budget_exhaustion_is_internal_and_deterministic() {
+    // (a) feature zuerst: das Budget reicht nur für `id(2)`.
+    let a = fork_push(vec![
+        update(1, 2, "refs/heads/feature"),
+        update(1, 3, "refs/heads/main"),
+    ]);
+    let out = pre_with_budget(&a, &policy_enforce_main());
+    assert_eq!(reason(&out.decision), Some(RejectReason::InternalError));
+    assert_eq!(
+        message(&out.decision),
+        "minds-witness: interner Fehler bei refs/heads/main"
+    );
+    let failed = only_event(&out.events, "ref_evaluation_failed");
+    assert_eq!(failed.fields["ref"], "refs/heads/main");
+    assert!(failed.fields["error"].contains("budget"));
+    assert_eq!(out.findings.len(), 1);
+    assert_eq!(out.findings[0].push.ref_name, "refs/heads/feature");
+    assert_same(&out, &pre_with_budget(&a, &policy_enforce_main()));
+
+    let out = pre_with_budget(&a, &policy_observe());
+    assert_eq!(out.decision, Decision::Accept);
+    assert_eq!(out.findings.len(), 1);
+    assert_eq!(out.findings[0].push.ref_name, "refs/heads/feature");
+    assert_same(&out, &pre_with_budget(&a, &policy_observe()));
+
+    // (b) main zuerst: `main` wird bewertet, `feature` verworfen.
+    let b = fork_push(vec![
+        update(1, 3, "refs/heads/main"),
+        update(1, 2, "refs/heads/feature"),
+    ]);
+    let out = pre_with_budget(&b, &policy_enforce_main());
+    assert_eq!(out.decision, Decision::Accept);
+    assert_eq!(out.findings.len(), 1);
+    let f = &out.findings[0];
+    assert_eq!(f.push.ref_name, "refs/heads/main");
+    assert_eq!(f.commit, id(3));
+    assert_eq!(f.policy.result, PolicyVerdict::Pass);
+    let failed = only_event(&out.events, "ref_evaluation_failed");
+    assert_eq!(failed.fields["ref"], "refs/heads/feature");
+    assert_same(&out, &pre_with_budget(&b, &policy_enforce_main()));
+}
+
+/// Objektsicht, die bei `truncated == true` eine andere zulässige Auswahl in
+/// anderer Reihenfolge liefert und jede Commit-Id protokolliert, für die
+/// `commit`, `changed_paths` oder `seal_for_commit` aufgerufen wird.
+struct SubsetRange<'a> {
+    inner: &'a MemoryAdapter,
+    subset: Vec<CommitId>,
+    seen: std::cell::RefCell<Vec<CommitId>>,
+}
+
+impl ObjectAccess for SubsetRange<'_> {
+    fn commit(&self, id: &CommitId) -> Result<CommitInfo, ObjectError> {
+        self.seen.borrow_mut().push(id.clone());
+        self.inner.commit(id)
+    }
+    fn new_commits(
+        &self,
+        old: Option<&CommitId>,
+        new: &CommitId,
+        limit: u32,
+    ) -> Result<CommitRange, ObjectError> {
+        let range = self.inner.new_commits(old, new, limit)?;
+        if range.truncated {
+            return Ok(CommitRange {
+                commits: self.subset.clone(),
+                truncated: true,
+            });
+        }
+        Ok(range)
+    }
+    fn changed_paths(
+        &self,
+        id: &CommitId,
+    ) -> Result<std::collections::BTreeSet<String>, ObjectError> {
+        self.seen.borrow_mut().push(id.clone());
+        self.inner.changed_paths(id)
+    }
+    fn seal_for_commit(&self, id: &CommitId) -> Result<Option<SealBlob>, ObjectError> {
+        self.seen.borrow_mut().push(id.clone());
+        self.inner.seal_for_commit(id)
+    }
+}
+
+#[test]
+fn t55_truncated_uses_only_new_and_length() {
+    let a = chain_push();
+    for base in [policy_observe(), policy_enforce_main()] {
+        let policy = Policy {
+            max_commits_per_push: 3,
+            ..base
+        };
+        let reference = pre(&a, &policy);
+        let subset = SubsetRange {
+            inner: &a,
+            subset: vec![id(5), id(3), id(4)],
+            seen: std::cell::RefCell::new(Vec::new()),
+        };
+        let out = pre_receive(&a.ctx, &policy, &subset, &a);
+        assert_eq!(out.decision, reference.decision);
+        assert_eq!(out.findings, reference.findings);
+        assert_eq!(out.findings.len(), 1);
+        let f = &out.findings[0];
+        assert_eq!(f.commit, id(6));
+        assert_eq!(f.push.new_commits, 3);
+        assert!(f.push.truncated);
+        let seen = subset.seen.borrow();
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|c| *c == id(6)), "{seen:?}");
+        if policy.mode == Mode::Enforce {
+            assert_eq!(reason(&out.decision), Some(RejectReason::PolicyFail));
+            let ev = only_event(&out.events, "push_rejected_policy");
+            assert_eq!(ev.fields["grund"], "truncated");
+        } else {
+            assert_eq!(out.decision, Decision::Accept);
+        }
+    }
+}
+
+/// Kette `id(1)` ← `id(2)` ← `id(3)` mit Seals unter `refs/minds/seals/s<n>`,
+/// angelegt als neuer Ref `refs/heads/main`.
+fn creation_push() -> MemoryAdapter {
+    let mut a = MemoryAdapter::new(ctx(vec![update(0, 3, "refs/heads/main")]));
+    for n in 1..=3u8 {
+        let parents = if n == 1 { vec![] } else { vec![id(n - 1)] };
+        let p = format!("f{n}");
+        a.add_commit(id(n), parents, paths(&[p.as_str()]));
+        a.add_seal(
+            id(n),
+            &format!("refs/minds/seals/s{n}"),
+            format!("seal-{n}").into_bytes(),
+            valid_seal(n, &[p.as_str()]),
+        );
+    }
+    a
+}
+
+#[test]
+fn t56_ref_creation_evaluates_all_reachable() {
+    // (a) alle drei erreichbaren Commits, ältester zuerst.
+    let a = creation_push();
+    let out = pre(&a, &policy_enforce_main());
+    assert_eq!(out.decision, Decision::Accept);
+    let commits: Vec<CommitId> = out.findings.iter().map(|f| f.commit.clone()).collect();
+    assert_eq!(commits, vec![id(1), id(2), id(3)]);
+    for f in &out.findings {
+        assert!(f.push.old.is_null());
+        assert_eq!(f.push.new_commits, 3);
+        assert!(!f.push.truncated);
+    }
+
+    // (b) gekürzt: nur `new` bewertet, erzwungener Ref abgelehnt.
+    let policy = Policy {
+        max_commits_per_push: 2,
+        ..policy_enforce_main()
+    };
+    let out = pre(&a, &policy);
+    assert_eq!(reason(&out.decision), Some(RejectReason::PolicyFail));
+    assert!(message(&out.decision).contains("mehr als 2 neue Commits"));
+    assert_eq!(out.findings.len(), 1);
+    assert_eq!(out.findings[0].commit, id(3));
+    let ev = only_event(&out.events, "push_rejected_policy");
+    assert_eq!(ev.fields["grund"], "truncated");
+
+    // (c) auch der älteste erreichbare Commit braucht Evidence.
+    let mut c = creation_push();
+    c.remove_seal(&id(1));
+    let out = pre(&c, &policy_enforce_main());
+    assert_eq!(reason(&out.decision), Some(RejectReason::PolicyFail));
+    let ev = only_event(&out.events, "push_rejected_policy");
+    assert_eq!(ev.fields["grund"], "fail");
+    assert_eq!(ev.fields["commit"], id(1).as_str());
+}
