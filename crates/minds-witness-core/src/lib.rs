@@ -11,12 +11,25 @@
 mod events;
 mod ids;
 mod policy;
+mod pre;
 mod push;
+mod receipt;
+mod traits;
+
+#[doc(hidden)]
+pub mod memory;
 
 pub use events::{LogEvent, LogLevel};
 pub use ids::{CommitId, HashStr, IdError, KeyStr, SigStr, Timestamp};
 pub use policy::{Mode, Policy, PolicyError, PusherMode, covers, matches_pattern};
+pub use pre::{Decision, RejectReason};
 pub use push::{PushContext, Pusher, RefUpdate, ServerInfo, ServerKind};
+pub use receipt::{PublicKeyEntry, ReceiptKey};
+pub use traits::{
+    CommitInfo, CommitRange, HostError, HostEvents, ObjectAccess, ObjectError, PutResult,
+    ReceiptStore, SealBlob, SealError, SealExpectation, SealInspector, SealSignature, SealSummary,
+    StoreError,
+};
 
 /// Präfix des Witness-Namensraums; Refs darunter schreibt nur der Server.
 /// Nicht konfigurierbar.
