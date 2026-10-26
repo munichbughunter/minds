@@ -26,7 +26,7 @@ mod signers;
 
 #[cfg(unix)]
 pub use chain::{carries_acl, root_owned_chain};
-pub use signers::{restricted_keys, restricted_to};
+pub use signers::{SignerLine, principal_lines, restricted_keys, restricted_to};
 
 /// Der ssh-sig-Namespace — trennt Minds-Signaturen von anderen ssh-sig-Domänen.
 pub const NS_DEFAULT: &str = "minds";

@@ -117,6 +117,75 @@ pub fn restricted_to(allowed_signers: &str, principal: &str, namespace: &str) ->
             .all(|line| line.restricted)
 }
 
+/// Eine Zeile der Signer-Datei, wie [`principal_lines`] sie liefert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignerLine {
+    /// Index der Zeile in der Datei (0-basiert, Kommentare mitgezählt).
+    pub index: usize,
+    /// Das Principal-Feld, roh (mit Anführungszeichen, Kommas, Mustern).
+    pub principals: String,
+    /// Das Optionsfeld, roh, falls vorhanden.
+    pub options: Option<String>,
+    /// Der Schlüssel als `<typ> <base64>`, falls die Zeile einen trägt.
+    pub key: Option<String>,
+    /// Ob das Principal-Feld ein Muster oder Anführungszeichen enthält
+    /// (`*`, `?`, `!`, `"`).
+    pub pattern: bool,
+}
+
+/// Alle Zeilen, die `principal` nennen oder nennen **könnten** (Muster),
+/// und alle Zeilen, die einen Schlüssel einer solchen Zeile tragen — genau
+/// die Zeilen, auf die [`restricted_to`] seine Regel anwendet. Für Prüfer,
+/// die über [`restricted_to`] hinaus Bedingungen an diese Zeilen stellen
+/// (Spec S2 §9, Trust-Datei-Regeln).
+pub fn principal_lines(allowed_signers: &str, principal: &str) -> Vec<SignerLine> {
+    let mut lines = Vec::new();
+    for (index, line) in allowed_signers.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let tokens = tokens(line);
+        let Some(principals) = tokens.first() else {
+            continue;
+        };
+        let (options, rest) = match tokens.get(1) {
+            Some(token) if !is_key_type(token) => (Some(token.clone()), &tokens[2..]),
+            _ => (None, &tokens[1.min(tokens.len())..]),
+        };
+        let key = match rest {
+            [kind, blob, ..] if is_key_type(kind) => Some(format!("{kind} {blob}")),
+            _ => None,
+        };
+        let pattern = principals.contains(['*', '?', '!', '"']);
+        lines.push(SignerLine {
+            index,
+            principals: principals.clone(),
+            options,
+            key,
+            pattern,
+        });
+    }
+    let names = |line: &SignerLine| {
+        line.principals == principal
+            || line
+                .principals
+                .trim_matches('"')
+                .split(',')
+                .map(|p| p.trim_start_matches('!'))
+                .any(|pattern| glob(pattern.as_bytes(), principal.as_bytes()))
+    };
+    let keys: Vec<String> = lines
+        .iter()
+        .filter(|line| names(line))
+        .filter_map(|line| line.key.clone())
+        .collect();
+    lines
+        .into_iter()
+        .filter(|line| names(line) || line.key.as_ref().is_some_and(|key| keys.contains(key)))
+        .collect()
+}
+
 /// `*` und `?` wie in OpenSSH-Principal-Mustern.
 fn glob(pattern: &[u8], text: &[u8]) -> bool {
     match (pattern.first(), text.first()) {
@@ -195,6 +264,22 @@ mod tests {
             "w@host",
             ns
         ));
+    }
+
+    #[test]
+    fn principal_lines_cover_names_patterns_and_shared_keys() {
+        let file = format!(
+            "# c\nw@host namespaces=\"minds-witness\" {KEY}\nhuman@x {KEY}\nw@* {OTHER}\nother@y {OTHER}\nz@z ssh-ed25519 AAAAZ"
+        );
+        let lines = principal_lines(&file, "w@host");
+        let idx: Vec<usize> = lines.iter().map(|l| l.index).collect();
+        assert_eq!(idx, vec![1, 2, 3, 4]);
+        assert!(!lines[0].pattern && lines[2].pattern);
+        assert_eq!(
+            lines[0].options.as_deref(),
+            Some("namespaces=\"minds-witness\"")
+        );
+        assert_eq!(lines[1].key.as_deref(), Some(KEY));
     }
 
     /// Der Vorfilter liefert nur Schlüssel aus Zeilen, die auf genau den

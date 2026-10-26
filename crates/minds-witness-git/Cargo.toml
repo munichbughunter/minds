@@ -1,0 +1,22 @@
+[package]
+name = "minds-witness-git"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git-Adapter des minds Server-Witness: Commit-Binding, SealInspector und Objektzugriff (Spec S2)"
+
+[lib]
+name = "minds_witness_git"
+
+[dependencies]
+minds-witness-core = { path = "../minds-witness-core" }
+minds-core = { path = "../minds-core" }
+minds-attest = { path = "../minds-attest" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }

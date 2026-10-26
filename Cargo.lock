@@ -1968,6 +1968,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "minds-witness-git"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "minds-attest",
+ "minds-core",
+ "minds-witness-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
