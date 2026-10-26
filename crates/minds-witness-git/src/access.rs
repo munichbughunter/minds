@@ -166,7 +166,7 @@ impl<'a> GitObjectAccess<'a> {
             return Ok(false);
         };
         self.budget
-            .take_bytes(bytes.len() as u64)
+            .take_object_bytes(&e.oid, bytes.len() as u64)
             .map_err(|_| ReceiveError::Limit("evidence bytes"))?;
         Ok(
             CommitBinding::parse(&bytes, self.limits.max_seals_per_binding)

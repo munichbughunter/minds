@@ -14,7 +14,7 @@ use minds_git::quarantine::{ReceiveEnv, ServerRepo};
 use minds_witness_core::{
     CommitId, CommitInfo, CommitRange, Decision, HashStr, LogEvent, Mode, ObjectAccess,
     ObjectError, PostOutcome, PushContext, Pusher, SealBlob, ServerInfo, ServerKind, Signer,
-    Timestamp, WitnessIdentity, post_receive, pre_receive,
+    Timestamp, WitnessIdentity, matches_pattern, post_receive, pre_receive,
 };
 use serde::Serialize;
 
@@ -263,7 +263,8 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
             return EXIT_REJECT;
         }
     };
-    match crate::fsck::effective(&config.git, repo.git_dir()) {
+    let fsck_time = budget.remaining().unwrap_or(limits.deadline);
+    match crate::fsck::effective_within(&config.git, repo.git_dir(), fsck_time) {
         Ok(true) => {}
         Ok(false) | Err(_) if mode == Mode::Enforce => {
             say(&[MSG_FSCK.to_owned()]);
@@ -360,29 +361,56 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
         return EXIT_REJECT;
     }
 
-    // Schritt 7: Quittungen, Warnungen.
-    let post = match identity(&signer) {
-        Some(identity) => {
-            let mut store = DirReceiptStore::new(config.out_dir.clone());
-            let post = post_receive(&pre.findings, &identity, &signer, &mut store);
-            for e in &post.events {
-                log.event("post", e);
+    // Schritt 7: Quittungen, Warnungen. Ein Panic hier endet im Observe-
+    // Modus nicht mit einer Blockade (§10), im Enforce-Modus fail-closed.
+    let after = catch_unwind(AssertUnwindSafe(|| {
+        let post = match identity(&signer) {
+            Some(identity) => {
+                let mut store = DirReceiptStore::new(config.out_dir.clone());
+                let post = post_receive(&pre.findings, &identity, &signer, &mut store);
+                for e in &post.events {
+                    log.event("post", e);
+                }
+                Some(post)
             }
-            Some(post)
+            None => Some(PostOutcome {
+                stored: 0,
+                skipped_existing: 0,
+                failed: u32::try_from(pre.findings.len()).unwrap_or(u32::MAX),
+                events: Vec::new(),
+            }),
+        };
+        let evaluated: Vec<String> = updates
+            .iter()
+            .filter(|u| {
+                !u.new.is_null()
+                    && config
+                        .policy
+                        .evaluate_refs
+                        .iter()
+                        .any(|p| matches_pattern(p, &u.ref_name))
+            })
+            .map(|u| u.ref_name.clone())
+            .collect();
+        warn::lines(
+            &pre,
+            post.as_ref(),
+            config.policy.coverage_threshold_percent,
+            config.policy.max_commits_per_push,
+            &evaluated,
+        )
+    }));
+    let lines = match after {
+        Ok(lines) => lines,
+        Err(_) if mode == Mode::Observe => vec![
+            "minds-witness: Warnung: Prüfung nicht abgeschlossen (Unknown)".to_owned(),
+            "minds-witness: Push wird von minds nicht blockiert. Nachweis unvollständig; Details in der Quittung.".to_owned(),
+        ],
+        Err(_) => {
+            say(&[MSG_INTERNAL.to_owned()]);
+            return EXIT_REJECT;
         }
-        None => Some(PostOutcome {
-            stored: 0,
-            skipped_existing: 0,
-            failed: u32::try_from(pre.findings.len()).unwrap_or(u32::MAX),
-            events: Vec::new(),
-        }),
     };
-    let lines = warn::lines(
-        &pre,
-        post.as_ref(),
-        config.policy.coverage_threshold_percent,
-        config.policy.max_commits_per_push,
-    );
     say(&lines);
     0
 }

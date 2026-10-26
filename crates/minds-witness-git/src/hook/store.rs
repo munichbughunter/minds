@@ -38,26 +38,28 @@ fn io(_: std::io::Error) -> StoreError {
 impl ReceiptStore for DirReceiptStore {
     fn put(&mut self, key: &ReceiptKey, bytes: &[u8]) -> Result<PutResult, StoreError> {
         let path = self.path(key);
-        if let Ok(existing) = std::fs::read(&path) {
-            return if existing == bytes {
-                Ok(PutResult::AlreadyExists)
-            } else {
-                Err(StoreError::Conflict(key.id.as_str().to_owned()))
-            };
-        }
-        std::fs::create_dir_all(
-            path.parent()
-                .ok_or_else(|| StoreError::Internal("path".to_owned()))?,
-        )
-        .map_err(io)?;
+        let dir = path
+            .parent()
+            .ok_or_else(|| StoreError::Internal("path".to_owned()))?;
+        std::fs::create_dir_all(dir).map_err(io)?;
+        // Vollständig in eine Temp-Datei schreiben und dann ohne
+        // Überschreiben verlinken: Ein Leser sieht nie eine halbe
+        // Quittung, und ein paralleler Schreiber gewinnt genau einmal.
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(io)?;
         use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(io)?;
-        f.write_all(bytes).map_err(io)?;
-        Ok(PutResult::Stored)
+        tmp.write_all(bytes).map_err(io)?;
+        tmp.as_file().sync_all().map_err(io)?;
+        match std::fs::hard_link(tmp.path(), &path) {
+            Ok(()) => Ok(PutResult::Stored),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if std::fs::read(&path).map_err(io)? == bytes {
+                    Ok(PutResult::AlreadyExists)
+                } else {
+                    Err(StoreError::Conflict(key.id.as_str().to_owned()))
+                }
+            }
+            Err(e) => Err(io(e)),
+        }
     }
 
     fn get(&self, key: &ReceiptKey) -> Result<Option<Vec<u8>>, StoreError> {
@@ -113,6 +115,12 @@ impl ReceiptStore for DirReceiptStore {
         std::fs::create_dir_all(&self.root).map_err(io)?;
         let bytes =
             serde_json::to_vec(&keys).map_err(|_| StoreError::Internal("keys".to_owned()))?;
-        std::fs::write(self.keys_path(), bytes).map_err(io)
+        // Atomar ersetzen (nur Test-Ablage: parallele Registrierungen sind
+        // nicht serialisiert, Spec S2 §11).
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.root).map_err(io)?;
+        use std::io::Write;
+        tmp.write_all(&bytes).map_err(io)?;
+        tmp.persist(self.keys_path()).map_err(|e| io(e.error))?;
+        Ok(())
     }
 }

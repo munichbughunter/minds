@@ -920,6 +920,14 @@ fn s2_34_binding_discovery() {
 #[test]
 fn s2_42_effective_fsck_config() {
     let fx = GitTestFixture::new();
+    // Hermetisch: keine globale oder systemweite Konfiguration des Hosts.
+    let missing = fx.dir.path().join("no-such-config");
+    let missing = missing.to_str().unwrap();
+    let iso = [
+        ("GIT_CONFIG_GLOBAL", missing),
+        ("GIT_CONFIG_SYSTEM", missing),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ];
     let cases: Vec<(&[(&str, &str)], bool)> = vec![
         (&[("receive.fsckObjects", "true")], true),
         (&[("transfer.fsckObjects", "true")], true),
@@ -973,33 +981,37 @@ fn s2_42_effective_fsck_config() {
         for (k, v) in settings {
             repo.git(&["config", k, v]);
         }
-        let got = fsck::effective(&git_program(), &repo.git_dir).unwrap();
+        let got = fsck::effective_with(&git_program(), &repo.git_dir, &iso).unwrap();
         assert_eq!(got, expected, "{settings:?}");
     }
-    // Systemkonfiguration true, Repository false: der letzte Wert gewinnt.
+    // Systemkonfiguration true: wirkt allein; Repository false schlägt
+    // sie (der letzte Wert gewinnt).
     let repo = fx.server_named("fsck-sys.git");
+    repo.git(&["config", "--unset", "receive.fsckObjects"]);
     let system = fx.dir.path().join("system.gitconfig");
     std::fs::write(&system, "[receive]\n\tfsckObjects = true\n").unwrap();
-    repo.git(&["config", "receive.fsckObjects", "false"]);
     let sys = system.to_str().unwrap();
     let g = git_program();
-    assert!(
-        !fsck::effective_with(
-            &g,
-            &repo.git_dir,
-            &[("GIT_CONFIG_SYSTEM", sys), ("GIT_CONFIG_NOSYSTEM", "0")]
-        )
-        .unwrap()
-    );
+    let with_system = [
+        ("GIT_CONFIG_GLOBAL", missing),
+        ("GIT_CONFIG_SYSTEM", sys),
+        ("GIT_CONFIG_NOSYSTEM", "0"),
+    ];
+    assert!(fsck::effective_with(&g, &repo.git_dir, &with_system).unwrap());
+    repo.git(&["config", "receive.fsckObjects", "false"]);
+    assert!(!fsck::effective_with(&g, &repo.git_dir, &with_system).unwrap());
     // `receive.fsckObjects=false` über GIT_CONFIG_COUNT (wie `-c` von
     // receive-pack) schlägt die Repository-Konfiguration.
     let on = fx.server_named("fsck-count.git");
-    assert!(fsck::effective(&g, &on.git_dir).unwrap());
+    assert!(fsck::effective_with(&g, &on.git_dir, &iso).unwrap());
     assert!(
         !fsck::effective_with(
             &g,
             &on.git_dir,
             &[
+                iso[0],
+                iso[1],
+                iso[2],
                 ("GIT_CONFIG_COUNT", "1"),
                 ("GIT_CONFIG_KEY_0", "receive.fsckObjects"),
                 ("GIT_CONFIG_VALUE_0", "false")
@@ -1010,5 +1022,5 @@ fn s2_42_effective_fsck_config() {
     // Ein ungültiger Wert ist ein Fehler, kein „aus“.
     let bad = fx.server_named("fsck-bad.git");
     bad.git(&["config", "receive.fsckObjects", "vielleicht"]);
-    assert!(fsck::effective(&g, &bad.git_dir).is_err());
+    assert!(fsck::effective_with(&g, &bad.git_dir, &iso).is_err());
 }

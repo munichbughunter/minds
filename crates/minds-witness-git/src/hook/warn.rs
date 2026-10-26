@@ -88,14 +88,37 @@ fn counts(f: &Finding, threshold: u8) -> String {
     }
 }
 
-/// Die Zeilen für stderr nach `Accept`.
+fn unknown(ref_name: &str) -> String {
+    format!(
+        "minds-witness: Warnung: {}: Prüfung nicht abgeschlossen (Unknown)",
+        shown(ref_name)
+    )
+}
+
+/// Die Zeilen für stderr nach `Accept`. `evaluated` sind die bewerteten
+/// Refs des Pushes (für die `Unknown`-Zeilen nach einem Panic).
+/// `Unknown`-Zeilen stehen vorn und fallen nie unter den Deckel.
 pub fn lines(
     pre: &PreOutcome,
     post: Option<&PostOutcome>,
     threshold: u8,
     limit: u32,
+    evaluated: &[String],
 ) -> Vec<String> {
     let mut out = Vec::new();
+    let mut unknown_lines = Vec::new();
+    for e in &pre.events {
+        match e.code.as_str() {
+            "ref_evaluation_failed" => {
+                unknown_lines.push(unknown(e.fields.get("ref").map_or("", String::as_str)));
+            }
+            "panic" if evaluated.is_empty() => unknown_lines
+                .push("minds-witness: Warnung: Prüfung nicht abgeschlossen (Unknown)".to_owned()),
+            "panic" => unknown_lines.extend(evaluated.iter().map(|r| unknown(r))),
+            _ => {}
+        }
+    }
+    unknown_lines.dedup();
     for f in &pre.findings {
         let pass = f.policy.result == PolicyVerdict::Pass;
         let full = f.coverage.paths_covered >= f.coverage.paths_in_diff
@@ -104,7 +127,7 @@ pub fn lines(
             continue;
         }
         let head = format!("{} {}", shown(&f.push.ref_name), &f.commit.as_str()[..12]);
-        let policy = if pass {
+        let policy = if pass && !f.push.truncated {
             format!("Evidence-Policy erfüllt (Schwelle {threshold} %)")
         } else {
             format!("Evidence-Policy nicht erfüllt (Schwelle {threshold} %)")
@@ -129,23 +152,14 @@ pub fn lines(
         };
         out.push(line);
     }
-    for e in &pre.events {
-        match e.code.as_str() {
-            "ref_evaluation_failed" => out.push(format!(
-                "minds-witness: Warnung: {}: Prüfung nicht abgeschlossen (Unknown)",
-                shown(e.fields.get("ref").map_or("", String::as_str))
-            )),
-            "panic" => {
-                out.push("minds-witness: Warnung: Prüfung nicht abgeschlossen (Unknown)".to_owned())
-            }
-            _ => {}
-        }
-    }
-    if out.len() > MAX_LINES {
-        let more = out.len() - MAX_LINES;
-        out.truncate(MAX_LINES);
+    let room = MAX_LINES.saturating_sub(unknown_lines.len());
+    if out.len() > room {
+        let more = out.len() - room;
+        out.truncate(room);
         out.push(format!("minds-witness: … und {more} weitere Befunde"));
     }
+    unknown_lines.append(&mut out);
+    let mut out = unknown_lines;
     if !out.is_empty() {
         out.push(
             "minds-witness: Push wird von minds nicht blockiert. Nachweis unvollständig; Details in der Quittung."
@@ -182,8 +196,8 @@ mod tests {
     }
 
     use minds_witness_core::{
-        CommitId, Coverage, Decision, Mode, PolicyResult, PushInfo, Pusher, SealStatus, ServerInfo,
-        ServerKind, Timestamp,
+        CommitId, Coverage, Decision, LogEvent, Mode, PolicyResult, PushInfo, Pusher, SealStatus,
+        ServerInfo, ServerKind, Timestamp,
     };
 
     const C: &str = "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2";
@@ -263,6 +277,7 @@ mod tests {
             None,
             100,
             200,
+            &[],
         );
         assert_eq!(
             out,
@@ -294,6 +309,7 @@ mod tests {
             None,
             66,
             200,
+            &[],
         );
         assert_eq!(
             out[0],
@@ -313,6 +329,7 @@ mod tests {
             None,
             100,
             200,
+            &[],
         );
         assert!(full.is_empty());
     }
@@ -367,7 +384,7 @@ mod tests {
             failed: 2,
             events: Vec::new(),
         };
-        let out = lines(&pre(fs), Some(&post), 100, 200);
+        let out = lines(&pre(fs), Some(&post), 100, 200, &[]);
         assert!(
             out[0].contains(
                 "refs/heads/a c2c2c2c2c2c2: Unverified, 0/2 Dateien nachgewiesen (0,0 %)"
@@ -401,9 +418,75 @@ mod tests {
                 )
             })
             .collect();
-        let out = lines(&pre(many), None, 100, 200);
+        let out = lines(&pre(many), None, 100, 200, &[]);
         assert_eq!(out.len(), 22);
         assert_eq!(out[20], "minds-witness: … und 5 weitere Befunde");
         assert_eq!(out[21], CLOSE);
+    }
+
+    #[test]
+    fn unknown_lines_lead_and_truncation_never_claims_the_policy() {
+        let mut many: Vec<Finding> = (0..25)
+            .map(|_| {
+                finding(
+                    "refs/heads/m",
+                    SealState::Absent,
+                    0,
+                    1,
+                    PolicyVerdict::Fail,
+                    false,
+                )
+            })
+            .collect();
+        many.push(finding(
+            "refs/heads/t",
+            SealState::Valid,
+            1,
+            1,
+            PolicyVerdict::Pass,
+            true,
+        ));
+        let mut p = pre(many);
+        p.events.push(LogEvent {
+            level: minds_witness_core::LogLevel::Error,
+            code: "panic".to_owned(),
+            message: String::new(),
+            fields: Default::default(),
+        });
+        let out = lines(
+            &p,
+            None,
+            100,
+            200,
+            &["refs/heads/a".to_owned(), "refs/heads/\u{7}b".to_owned()],
+        );
+        assert_eq!(
+            out[0],
+            "minds-witness: Warnung: refs/heads/a: Prüfung nicht abgeschlossen (Unknown)"
+        );
+        assert_eq!(
+            out[1],
+            "minds-witness: Warnung: <ref>: Prüfung nicht abgeschlossen (Unknown)"
+        );
+        assert_eq!(out.len(), 22);
+        assert_eq!(out[20], "minds-witness: … und 8 weitere Befunde");
+        let t = lines(
+            &pre(vec![finding(
+                "refs/heads/t",
+                SealState::Valid,
+                1,
+                1,
+                PolicyVerdict::Pass,
+                true,
+            )]),
+            None,
+            100,
+            2,
+            &[],
+        );
+        assert!(
+            t[0].ends_with("Evidence-Policy nicht erfüllt (Schwelle 100 %)"),
+            "{t:?}"
+        );
     }
 }

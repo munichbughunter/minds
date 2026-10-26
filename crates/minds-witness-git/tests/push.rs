@@ -140,7 +140,14 @@ impl World {
     fn push_refs(&self, specs: &[String]) -> PushOutcome {
         let mut args = vec!["--atomic", "origin"];
         args.extend(specs.iter().map(String::as_str));
-        self.client.push(&args)
+        let out = self.client.push(&args);
+        // §11: Auf dem Push-Kanal steht nur, was minds schreibt.
+        assert!(
+            out.foreign.is_empty(),
+            "fremde remote-Zeilen: {:?}",
+            out.foreign
+        );
+        out
     }
 
     /// `git push --atomic origin <c>:<branch> <refs…>`.
@@ -586,7 +593,7 @@ fn s2_44_warning_output_is_safe() {
     let out = w.push(&format!("+{ce}"), "refs/heads/main", &[]);
     assert_eq!(
         out.minds[0],
-        "minds-witness: Warnung: Prüfung nicht abgeschlossen (Unknown)"
+        "minds-witness: Warnung: refs/heads/main: Prüfung nicht abgeschlossen (Unknown)"
     );
     results.push((out, "Unknown"));
 
@@ -721,8 +728,13 @@ fn s2_46_evidence_push_failure_does_not_block_code() {
     let (_, p_seal, _) = e.seal(&text, None);
     let out = w.push_refs(&[Repo::spec(&p_obs), Repo::spec(&p_seal)]);
     assert_ne!(out.exit, 0);
-    assert_eq!(out.minds.len(), 1, "{:?}", out.minds);
-    assert!(!out.minds[0].contains("Warnung"), "{:?}", out.minds);
+    assert_eq!(
+        out.minds,
+        vec![format!(
+            "minds-witness: Witness-Seals sind nur signiert anlegbar (Ref: {})",
+            p_seal.name
+        )]
+    );
     assert_eq!(w.server_ref(&p_seal.name), None);
     assert_eq!(w.server_ref(&p_obs.name), None);
 
@@ -770,17 +782,31 @@ fn s2_40_protected_refs_rejected_by_push() {
     w.server.symref("refs/heads/alias", "refs/heads/main");
     w.hook(&policy(Mode::Observe, &[], 100));
     let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
-    for target in [
-        "refs/minds/witness/x",
-        "refs/minds/witness",
-        "refs/minds/bindings",
-        "refs/heads/alias",
-        "refs/replace/x",
+    for (target, message) in [
+        (
+            "refs/minds/witness/x",
+            "Refs unter refs/minds/witness/ schreibt nur der Server (Ref: refs/minds/witness/x)",
+        ),
+        (
+            "refs/minds/witness",
+            "Ref refs/minds/witness ist reserviert, weil er den Witness-Namensraum refs/minds/witness/ blockieren würde",
+        ),
+        (
+            "refs/minds/bindings",
+            "unzulässige Form eines Evidence-Refs (Ref: refs/minds/bindings)",
+        ),
+        (
+            "refs/heads/alias",
+            "Update eines symbolischen Refs ist unzulässig (Ref: refs/heads/alias)",
+        ),
+        (
+            "refs/replace/x",
+            "refs/replace/ ist unzulässig (Ref: refs/replace/x)",
+        ),
     ] {
         let out = w.push_refs(&[format!("{c}:refs/heads/feature"), format!("{c}:{target}")]);
         assert_ne!(out.exit, 0, "{target}: {}", out.stderr);
-        assert_eq!(out.minds.len(), 1, "{target}: {:?}", out.minds);
-        assert!(out.minds[0].starts_with("minds-witness: "));
+        assert_eq!(out.minds, vec![format!("minds-witness: {message}")]);
         assert_eq!(w.server_ref("refs/heads/feature"), None, "{target}");
         assert_eq!(
             w.server_ref("refs/heads/main").as_deref(),
@@ -815,7 +841,9 @@ fn s2_41_panic_payload_not_on_stderr() {
                 assert_eq!(
                     out.minds,
                     vec![
-                        "minds-witness: Warnung: Prüfung nicht abgeschlossen (Unknown)".to_owned(),
+                        format!(
+                            "minds-witness: Warnung: {branch}: Prüfung nicht abgeschlossen (Unknown)"
+                        ),
                         CLOSE.to_owned()
                     ]
                 );

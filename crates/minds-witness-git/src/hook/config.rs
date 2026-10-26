@@ -99,12 +99,24 @@ impl HookConfig {
     /// Liest und prüft die Konfiguration.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let bytes = std::fs::read(path).map_err(|_| ConfigError::Unreadable)?;
-        let config: Self = serde_json::from_slice(&bytes).map_err(|_| ConfigError::Unreadable)?;
+        let mut config: Self =
+            serde_json::from_slice(&bytes).map_err(|_| ConfigError::Unreadable)?;
+        // Ausgeführt wird genau der geprüfte Pfad: kanonisch (ohne
+        // Symlinks), danach die root-eigene Kette in `validate`.
+        if config.ssh_keygen.is_absolute() {
+            config.ssh_keygen = std::fs::canonicalize(&config.ssh_keygen)
+                .map_err(|_| ConfigError::Field("ssh_keygen"))?;
+        }
+        if config.git.is_absolute() {
+            config.git =
+                std::fs::canonicalize(&config.git).map_err(|_| ConfigError::Field("git"))?;
+        }
         config.validate()?;
         Ok(config)
     }
 
-    /// Die Regeln aus Spec S2 §9 und §11.
+    /// Die Regeln aus Spec S2 §9 und §11. `ssh_keygen` und `git` müssen
+    /// kanonisch sein ([`HookConfig::load`] sorgt dafür).
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.operation != "test" {
             return Err(ConfigError::NotTest);
@@ -138,7 +150,7 @@ impl HookConfig {
         #[cfg(unix)]
         for (name, p) in [("ssh_keygen", &self.ssh_keygen), ("git", &self.git)] {
             let real = std::fs::canonicalize(p).map_err(|_| ConfigError::Field(name))?;
-            if !minds_attest::root_owned_chain(&real) {
+            if real != *p || !minds_attest::root_owned_chain(&real) {
                 return Err(ConfigError::Field(name));
             }
         }

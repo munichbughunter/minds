@@ -188,7 +188,9 @@ impl<'a> Guard<'a> {
         let Some(bytes) = self.repo.blob_bytes(oid, max).map_err(tech)? else {
             return Ok(None);
         };
-        self.budget.take_bytes(bytes.len() as u64).map_err(tech)?;
+        self.budget
+            .take_object_bytes(oid, bytes.len() as u64)
+            .map_err(tech)?;
         Ok(Some(bytes))
     }
 

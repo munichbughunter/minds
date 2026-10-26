@@ -521,6 +521,9 @@ pub struct PushOutcome {
     /// Nur die Zeilen von minds (`remote: minds-witness: …`), ohne Präfix,
     /// am Ende ohne Leerraum.
     pub minds: Vec<String>,
+    /// Alle anderen nicht leeren `remote:`-Zeilen (erwartet: keine; §11
+    /// erlaubt auf dem Push-Kanal nur die Zeilen von minds).
+    pub foreign: Vec<String>,
 }
 
 /// Eine Policy für `refs/heads/*` mit Modus, erzwungenen Refs und Schwelle.
@@ -634,16 +637,20 @@ impl Repo {
         all.extend_from_slice(args);
         let out = self.try_git(&all, None);
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        let minds = stderr
+        let remote: Vec<String> = stderr
             .lines()
-            .filter_map(|l| l.strip_prefix("remote: "))
-            .filter(|l| l.starts_with("minds-witness:"))
-            .map(|l| l.trim_end().to_owned())
+            .filter_map(|l| l.strip_prefix("remote:"))
+            .map(|l| l.trim().to_owned())
+            .filter(|l| !l.is_empty())
             .collect();
+        let (minds, foreign) = remote
+            .into_iter()
+            .partition(|l| l.starts_with("minds-witness:"));
         PushOutcome {
             exit: out.status.code().unwrap_or(-1),
             stderr,
             minds,
+            foreign,
         }
     }
 

@@ -546,6 +546,9 @@ impl ServerRepo {
         }
         cmd.env("GIT_DIR", self.repo.git_dir())
             .env("GIT_NO_LAZY_FETCH", "1")
+            // Grafts änderten die Elternlisten gegenüber der eigenen
+            // Commit-Prüfung (§7.3); eine leere Graft-Datei schaltet sie ab.
+            .env("GIT_GRAFT_FILE", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .args([
                 "--no-replace-objects",
@@ -665,21 +668,28 @@ fn hfs_ignorable(c: char) -> bool {
 
 /// Ob `name` eine der Formen von `.git` ist, die `git fsck` ablehnt
 /// (ASCII-case-insensitiv, NTFS-Kurzname, NTFS-Punkte und -Leerzeichen am
-/// Ende, HFS+-ignorierbare Zeichen).
+/// Ende, NTFS-Streams und Backslash, HFS+-ignorierbare Zeichen).
 fn is_dotgit(name: &[u8]) -> bool {
+    // Wie Gits `is_ntfs_dotgit`: `.git` oder `git~1`, danach nur Punkte
+    // und Leerzeichen bis zum Ende oder bis Backslash bzw. `:` (NTFS-Streams).
     let lower = name.to_ascii_lowercase();
-    if lower == b".git" || lower == b"git~1" {
-        return true;
-    }
-    let trimmed: &[u8] = {
-        let mut end = lower.len();
-        while end > 0 && matches!(lower[end - 1], b'.' | b' ') {
-            end -= 1;
+    let rest = lower
+        .strip_prefix(b".git")
+        .or_else(|| lower.strip_prefix(b"git~1"));
+    if let Some(rest) = rest {
+        let mut ntfs = true;
+        for c in rest {
+            if matches!(c, b'\\' | b':') {
+                break;
+            }
+            if !matches!(c, b'.' | b' ') {
+                ntfs = false;
+                break;
+            }
         }
-        &lower[..end]
-    };
-    if trimmed == b".git" {
-        return true;
+        if ntfs {
+            return true;
+        }
     }
     if let Ok(s) = std::str::from_utf8(name) {
         let folded: String = s.chars().filter(|c| !hfs_ignorable(*c)).collect();
@@ -805,5 +815,34 @@ mod tests {
             parse_commit(b"parent x\n", 64),
             Err(ReceiveError::MalformedCommit)
         );
+    }
+
+    #[test]
+    fn dotgit_forms_match_git_fsck() {
+        for n in [
+            &b".git"[..],
+            b".GIT",
+            b"git~1",
+            b"GIT~1",
+            b".git.",
+            b".git . ",
+            b"git~1 .",
+            b".git:x",
+            b"git~1::$INDEX_ALLOCATION",
+            b".git\\x",
+            ".g\u{200c}it".as_bytes(),
+        ] {
+            assert!(is_dotgit(n), "{:?}", String::from_utf8_lossy(n));
+        }
+        for n in [
+            &b".gitx"[..],
+            b"git~2",
+            b"git",
+            b".gitignore",
+            b"x.git",
+            b"git~1x",
+        ] {
+            assert!(!is_dotgit(n), "{:?}", String::from_utf8_lossy(n));
+        }
     }
 }
