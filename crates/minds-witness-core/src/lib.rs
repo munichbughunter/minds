@@ -28,7 +28,10 @@ pub use ids::{CommitId, HashStr, IdError, KeyStr, SigStr, Timestamp};
 pub use policy::{Mode, Policy, PolicyError, PusherMode, covers, matches_pattern};
 pub use pre::{Decision, PreOutcome, RejectReason, pre_receive};
 pub use push::{PushContext, Pusher, RefUpdate, ServerInfo, ServerKind};
-pub use receipt::{PublicKeyEntry, ReceiptKey};
+pub use receipt::{
+    PublicKeyEntry, Receipt, ReceiptBody, ReceiptKey, Signer, VerifiedReceipt, VerifyError,
+    WitnessIdentity, canonical_bytes, receipt_id, verify_receipt,
+};
 pub use traits::{
     CommitInfo, CommitRange, HostError, HostEvents, ObjectAccess, ObjectError, PutResult,
     ReceiptStore, SealBlob, SealError, SealExpectation, SealInspector, SealSignature, SealSummary,

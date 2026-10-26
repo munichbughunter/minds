@@ -158,6 +158,10 @@ impl KeyStr {
             .expect("validiert bei Konstruktion");
         out
     }
+
+    pub(crate) fn from_key_bytes(bytes: &[u8; 32]) -> Self {
+        Self(format!("ed25519:{}", hex::encode(bytes)))
+    }
 }
 
 impl TryFrom<String> for KeyStr {
@@ -196,6 +200,10 @@ impl SigStr {
         hex::decode_to_slice(&self.0["ed25519:".len()..], &mut out)
             .expect("validiert bei Konstruktion");
         out
+    }
+
+    pub(crate) fn from_sig_bytes(bytes: &[u8; 64]) -> Self {
+        Self(format!("ed25519:{}", hex::encode(bytes)))
     }
 }
 
@@ -298,5 +306,13 @@ mod tests {
         assert!(CommitId::null_of_len(64).unwrap().is_null());
         assert_eq!(CommitId::null_of_len(41), Err(IdError::BadLength(41)));
         assert!(!CommitId::parse(&"1".repeat(40)).unwrap().is_null());
+    }
+
+    #[test]
+    fn key_and_sig_roundtrip_bytes() {
+        let k = KeyStr::from_key_bytes(&[0xab; 32]);
+        assert_eq!(k.to_bytes(), [0xab; 32]);
+        let s = SigStr::from_sig_bytes(&[0x01; 64]);
+        assert_eq!(s.to_bytes(), [0x01; 64]);
     }
 }
