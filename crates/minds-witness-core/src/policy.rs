@@ -121,6 +121,18 @@ impl Policy {
         }
         Ok(())
     }
+
+    pub(crate) fn is_evaluated(&self, ref_name: &str) -> bool {
+        self.evaluate_refs
+            .iter()
+            .any(|p| matches_pattern(p, ref_name))
+    }
+
+    pub(crate) fn is_enforced(&self, ref_name: &str) -> bool {
+        self.enforce_refs
+            .iter()
+            .any(|p| matches_pattern(p, ref_name))
+    }
 }
 
 /// `true`, wenn `pattern` den `ref_name` trifft: Gleichheit, oder `pattern`

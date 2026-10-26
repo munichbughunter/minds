@@ -9,6 +9,7 @@
 #![deny(missing_docs)]
 
 mod events;
+mod finding;
 mod ids;
 mod policy;
 mod pre;
@@ -20,9 +21,12 @@ mod traits;
 pub mod memory;
 
 pub use events::{LogEvent, LogLevel};
+pub use finding::{
+    Coverage, CoverageStatus, Finding, PolicyResult, PolicyVerdict, PushInfo, SealState, SealStatus,
+};
 pub use ids::{CommitId, HashStr, IdError, KeyStr, SigStr, Timestamp};
 pub use policy::{Mode, Policy, PolicyError, PusherMode, covers, matches_pattern};
-pub use pre::{Decision, RejectReason};
+pub use pre::{Decision, PreOutcome, RejectReason, pre_receive};
 pub use push::{PushContext, Pusher, RefUpdate, ServerInfo, ServerKind};
 pub use receipt::{PublicKeyEntry, ReceiptKey};
 pub use traits::{

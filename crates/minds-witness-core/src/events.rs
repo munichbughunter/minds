@@ -31,3 +31,22 @@ pub struct LogEvent {
     /// Genau die für den Code festgelegten Felder, alle als String.
     pub fields: BTreeMap<String, String>,
 }
+
+impl LogEvent {
+    pub(crate) fn new(
+        level: LogLevel,
+        code: &str,
+        message: &str,
+        fields: &[(&str, String)],
+    ) -> Self {
+        Self {
+            level,
+            code: code.to_owned(),
+            message: message.to_owned(),
+            fields: fields
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        }
+    }
+}
