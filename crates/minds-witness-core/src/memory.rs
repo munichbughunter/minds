@@ -137,7 +137,8 @@ impl MemoryAdapter {
         self
     }
 
-    /// Nur für Konflikt-Tests: legt einen Schlüsseleintrag direkt ab.
+    /// Nur für Tests (Konflikte, Widerrufe, widersprüchliche Einträge): legt
+    /// einen Schlüsseleintrag direkt ab.
     pub fn seed_public_key(&mut self, entry: PublicKeyEntry) -> &mut Self {
         self.keys.push(entry);
         self
@@ -336,7 +337,7 @@ impl ReceiptStore for MemoryAdapter {
         if self.fault == Fault::RegisterErr {
             return Err(StoreError::Internal("fault".to_owned()));
         }
-        // SPEC-GAP: Bei mehreren Einträgen desselben Schlüssels genügt einer
+        // Spec S1 v1.4 §11: Bei mehreren Einträgen desselben Schlüssels genügt einer
         // mit gleichem `valid_from`; nur wenn keiner passt, ist es ein Konflikt.
         let same_key: Vec<&PublicKeyEntry> =
             self.keys.iter().filter(|k| k.key == entry.key).collect();

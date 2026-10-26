@@ -350,6 +350,8 @@ fn t46_public_keys_error_signs_nothing() {
     };
     let out = post_receive(&findings, &identity(), &signer(), &mut store);
     assert_eq!(counts(&out), (0, 0, 2));
+    only_event(&out.events, "store_failed");
+    assert!(!codes(&out.events).contains(&"receipt_stored"));
     assert_eq!(a.receipt_count(), 0);
 
     // Panic in public_keys: fail-open nach außen, failed = alle.
@@ -361,7 +363,10 @@ fn t46_public_keys_error_signs_nothing() {
     };
     let out = post_receive(&findings, &identity(), &signer(), &mut store);
     assert_eq!(counts(&out), (0, 0, 2));
-    only_event(&out.events, "panic");
+    let ev = only_event(&out.events, "panic");
+    // v1.4: kein Panic-Payload im Ereignis.
+    assert!(ev.fields.is_empty());
+    assert!(!ev.message.contains("fault"));
     assert_eq!(a.receipt_count(), 0);
 }
 
