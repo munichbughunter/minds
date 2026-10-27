@@ -6,9 +6,7 @@
 mod support;
 
 use minds_core::evidence::{SCOPE_WITNESS_FS_V1, SealOutcome};
-use minds_witness_core::{
-    CoverageStatus, Mode, Policy, PolicyVerdict, Receipt, SealState, verify_receipt,
-};
+use minds_witness_core::{CoverageStatus, Mode, Policy, PolicyVerdict, Receipt, SealState};
 use support::*;
 
 const CLOSE: &str = "minds-witness: Push wird von minds nicht blockiert. Nachweis unvollständig; Details in der Quittung.";
@@ -201,7 +199,7 @@ fn h(kind: &str, commit: &str, ids: &[String]) -> String {
 fn receipt(hook: &Hook, commit: &str) -> Receipt {
     let all = hook.receipts(commit);
     assert_eq!(all.len(), 1, "Quittungen für {commit}");
-    verify_receipt(&all[0], &hook.keys()).unwrap().receipt
+    hook.verify(&all[0])
 }
 
 fn c12(c: &str) -> &str {
@@ -275,7 +273,11 @@ fn s2_36_reject_leaves_ref_unchanged() {
         Some(w.base.as_str())
     );
     assert!(!w.server_has(&c), "Quarantäne-Objekt übernommen");
-    assert!(!hook.out.join(&c).exists(), "Quittung trotz Ablehnung");
+    assert!(hook.receipts(&c).is_empty(), "Quittung trotz Ablehnung");
+    assert!(
+        hook.handoff("pending").is_empty(),
+        "Datensatz trotz Ablehnung"
+    );
 
     // s2_42 im Hook: Ohne wirksames receive.fsckObjects lehnt Enforce vor
     // dem Kern ab; Observe vermerkt es nur in der Diagnose.
@@ -902,4 +904,510 @@ fn witness_store_refs_are_server_only() {
         );
         assert_eq!(w.server_ref(&target), None);
     }
+}
+
+// ---------------------------------------------------------------------
+// Spec S3 §3 (Commit 3): Quittung erst nach dem Ref-Update.
+// ---------------------------------------------------------------------
+
+use minds_witness_core::{HashStr, RefUpdate, TrustSnapshot};
+use minds_witness_git::hook::pending::{CONFIRMED_SCHEMA, Confirmation, Handoff, PendingRecord};
+
+fn write_hook(server: &Repo, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = server.git_dir.join("hooks").join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn witness_refs(server: &Repo) -> Vec<String> {
+    server
+        .git(&["for-each-ref", "--format=%(refname)", "refs/minds/witness/"])
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Ruft das Binary direkt auf, wie receive-pack es täte (cwd = Bare-Repo,
+/// `GIT_DIR=.`); der Elternprozess ist dann dieser Testprozess.
+fn run_bin(sub: &str, hook: &Hook, stdin: &str) -> (i32, String) {
+    use std::io::Write;
+    let mut child = std::process::Command::new(HOOK_BIN)
+        .arg(sub)
+        .arg(&hook.config)
+        .current_dir(&hook.server.git_dir)
+        .env("GIT_DIR", ".")
+        .env("HOME", &hook.server.home)
+        .env("GIT_CONFIG_GLOBAL", hook.server.home.join("no-such-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned() + &String::from_utf8_lossy(&out.stdout),
+    )
+}
+
+fn handoff(w: &World, hook: &Hook) -> Handoff {
+    let _ = w;
+    let mut seed = [0u8; 32];
+    hex::decode_to_slice("42".repeat(32), &mut seed).unwrap();
+    Handoff::new(&hook.state, &seed)
+}
+
+/// Kriterium 2: Nur tatsächlich ausgeführte Updates werden bestätigt.
+#[test]
+fn s3_02_post_receive_only_for_performed_updates() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    // Git verweigert `feature` nach dem pre-receive (update-Hook).
+    write_hook(
+        &w.server,
+        "update",
+        r#"[ "$1" = "refs/heads/feature" ] && exit 1; exit 0"#,
+    );
+    let c1 = w.commit(&w.base, &[("src/a.rs", b"main")]);
+    let c2 = w.commit(&w.base, &[("src/a.rs", b"feature")]);
+    let out = w.client.push(&[
+        "origin",
+        &format!("{c1}:refs/heads/main"),
+        &format!("{c2}:refs/heads/feature"),
+    ]);
+    assert_ne!(out.exit, 0, "feature wurde verweigert");
+    assert_eq!(
+        w.server_ref("refs/heads/main").as_deref(),
+        Some(c1.as_str())
+    );
+    assert_eq!(w.server_ref("refs/heads/feature"), None);
+    assert_eq!(hook.receipts(&c1).len(), 1);
+    assert!(
+        hook.receipts(&c2).is_empty(),
+        "Quittung für ein verweigertes Update"
+    );
+    let r = hook.verify(&hook.receipts(&c1)[0]);
+    assert_eq!(r.push.ref_name, "refs/heads/main");
+    assert_eq!(r.server.kind, minds_witness_core::ServerKind::Git);
+    assert!(hook.handoff("pending").is_empty() && hook.handoff("confirmed").is_empty());
+}
+
+/// Kriterium 3: Ablage scheitert → Bestätigung bleibt; `reconcile` holt nach,
+/// idempotent; Absturz zwischen Bestätigung und Ablage verliert nichts.
+#[test]
+fn s3_03_reconcile_is_idempotent() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    // Verwaiste Sperre der Schlüsselliste (abgebrochener früherer Prozess).
+    let lock = w.server.git_dir.join("refs/minds/witness/keys.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    let out = w.push(&c, "refs/heads/main", &[]);
+    assert_eq!(out.exit, 0, "{}", out.stderr);
+    assert_eq!(w.server_ref("refs/heads/main").as_deref(), Some(c.as_str()));
+    assert!(
+        out.minds
+            .iter()
+            .any(|l| l
+                == "minds-witness: Warnung: 1 Quittung(en) nicht abgelegt; werden nachgeholt."),
+        "{:?}",
+        out.minds
+    );
+    assert!(hook.receipts(&c).is_empty());
+    assert_eq!(hook.handoff("confirmed").len(), 1);
+    // Zu jung: `reconcile` lässt die Sperre (vielleicht lebt ein Prozess).
+    let (code, text) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 2, "{text}");
+    assert!(lock.exists());
+    // Nachweislich verwaist: entfernt, Quittung abgelegt.
+    std::fs::File::options()
+        .write(true)
+        .open(&lock)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+        .unwrap();
+    let (code, text) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 0, "{text}");
+    assert_eq!(hook.receipts(&c).len(), 1);
+    assert!(hook.handoff("confirmed").is_empty());
+    assert!(hook.log().contains("stale_lock_removed"));
+    let refs = witness_refs(&w.server);
+    let (code, _) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 0);
+    assert_eq!(witness_refs(&w.server), refs, "Wiederholung ohne neue Refs");
+
+    // Absturz zwischen Bestätigung und Ablage: Die Bestätigung liegt vor,
+    // Quittungen fehlen. `reconcile` legt genau diese ab, zweimal dasselbe.
+    let c2 = w.commit(&c, &[("src/a.rs", b"a2")]);
+    write_hook(&w.server, "post-receive", "cat >/dev/null; exit 0");
+    let out = w.push(&c2, "refs/heads/main", &[]);
+    assert_eq!(out.exit, 0, "{}", out.stderr);
+    let h = handoff(&w, &hook);
+    let (pid_name, record) = {
+        let names = hook.handoff("pending");
+        assert_eq!(names.len(), 1, "{names:?}");
+        let r = h.read_pending(&names[0]).unwrap();
+        (names[0].clone(), r)
+    };
+    let pending_file = hook.state.join("pending").join(&pid_name);
+    let pending_bytes = std::fs::read(&pending_file).unwrap();
+    // Kriterium 4: Die Quittung nennt das Binary des pre-receive, auch wenn
+    // inzwischen ein anderes läuft (hier: anderer Hash im Datensatz).
+    let mut record = record;
+    let checked_by = HashStr::of_bytes(b"binary at pre-receive");
+    record.witness_binary = checked_by.clone();
+    let conf = Confirmation {
+        confirmed_at: "2026-10-27T12:00:00Z".to_owned(),
+        confirmed_updates: record.updates.clone(),
+        pending: record,
+        schema: CONFIRMED_SCHEMA.to_owned(),
+    };
+    assert!(h.confirm(&pid_name, &conf).unwrap());
+    // Absturz vor dem Entfernen des Datensatzes: Bestätigung und Datensatz
+    // liegen beide vor.
+    std::fs::write(&pending_file, &pending_bytes).unwrap();
+    assert!(hook.receipts(&c2).is_empty());
+    let (code, text) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 0, "{text}");
+    let first = hook.receipts(&c2);
+    assert_eq!(first.len(), 1);
+    assert_eq!(hook.verify(&first[0]).witness.binary, checked_by);
+    let (code, _) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 0);
+    assert_eq!(hook.receipts(&c2), first);
+    // Der verbliebene Datensatz erzeugt nichts: `reconcile` liest nur
+    // Bestätigungen; zuordnen könnte ihn nur derselbe receive-pack (PID und
+    // Startzeit), dessen post-receive bereits lief. Er verfällt.
+    assert!(hook.handoff("pending").contains(&pid_name));
+    let (code, _) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 0);
+    assert_eq!(hook.receipts(&c2), first, "genau eine Quittung");
+}
+
+/// Kriterium 1: pre-receive signiert nie; ohne post-receive verfällt der
+/// Datensatz, und es entsteht nie eine Quittung.
+#[test]
+fn s3_04_pending_expiry_never_signs() {
+    let w = world();
+    let hook = w.hook_with(&policy(Mode::Observe, &[], 100), |v| {
+        v["pending_ttl_secs"] = serde_json::json!(1);
+    });
+    write_hook(&w.server, "update", "exit 1");
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    // Gits eigene Ablehnung (`update`-Hook) erscheint als fremde Zeile;
+    // daher direkt `git push`.
+    let out = w.client.push(&["origin", &format!("{c}:refs/heads/main")]);
+    assert_ne!(out.exit, 0);
+    // pre-receive hat nur gewarnt (Zustand, nie „angenommen“).
+    assert!(
+        out.minds.iter().all(|l| !l.contains("angenommen")),
+        "{:?}",
+        out.minds
+    );
+    // pre-receive hat angenommen und nur den Datensatz geschrieben.
+    assert_eq!(hook.handoff("pending").len(), 1);
+    assert!(
+        witness_refs(&w.server).is_empty(),
+        "pre-receive schrieb Refs"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let (code, text) = run_bin("reconcile", &hook, "");
+    assert_eq!(code, 0, "{text}");
+    assert!(hook.handoff("pending").is_empty());
+    assert!(hook.log().contains("pending_expired"));
+    assert!(witness_refs(&w.server).is_empty());
+}
+
+/// Kriterium 4: Signer-Datei zwischen pre- und post-receive geändert → die
+/// Quittung trägt den Snapshot des pre-receive, und genau der liegt ab.
+#[test]
+fn s3_06_trust_snapshot_written_only_after_update() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    let signers = w.fx.dir.path().join("allowed_signers");
+    let original = std::fs::read_to_string(&signers).unwrap();
+    let (_, other) = keypair(w.fx.dir.path(), "other");
+    // Läuft nach pre-receive und vor post-receive.
+    write_hook(
+        &w.server,
+        "update",
+        &format!(
+            "printf '%s\\n' 'other@test {other}' >> '{}'; exit 0",
+            signers.display()
+        ),
+    );
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    let b = w.bind(&c, &[("src/a.rs", b"a1")]);
+    let out = w.push(&c, "refs/heads/main", &b.refs);
+    assert_eq!(out.exit, 0, "{}", out.stderr);
+    assert_ne!(std::fs::read_to_string(&signers).unwrap(), original);
+    let r = hook.verify(&hook.receipts(&c)[0]);
+    let snap = hook.trust(r.trust.as_ref().unwrap()).unwrap();
+    let parsed = TrustSnapshot::from_bytes(&snap).unwrap();
+    assert_eq!(
+        parsed.signers, original,
+        "Snapshot aus den pre-receive-Bytes"
+    );
+    assert_eq!(r.seal.status, SealState::Valid);
+    // Ein abgelehnter Push schreibt nichts unter refs/minds/witness/.
+    let w2 = world();
+    w2.hook(&policy(Mode::Enforce, &["refs/heads/main"], 100));
+    let c2 = w2.commit(&w2.base, &[("src/a.rs", b"x")]);
+    assert_ne!(w2.push(&c2, "refs/heads/main", &[]).exit, 0);
+    assert!(witness_refs(&w2.server).is_empty());
+}
+
+/// Laufzeitmessung ohne Inhalte; `stats` wertet aus.
+#[test]
+fn s3_08_push_stats_without_content() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    let path = format!("src/{MARKER}.rs");
+    let c = w.commit(&w.base, &[(path.as_str(), MARKER.as_bytes())]);
+    let b = w.bind(&c, &[(path.as_str(), MARKER.as_bytes())]);
+    assert_eq!(w.push(&c, "refs/heads/main", &b.refs).exit, 0);
+    let stats: Vec<serde_json::Value> = hook
+        .log()
+        .lines()
+        .filter(|l| l.contains("push_stats"))
+        .map(|l| {
+            assert!(!l.contains(MARKER) && !l.contains("src/"), "{l}");
+            serde_json::from_str(l).unwrap()
+        })
+        .collect();
+    assert_eq!(stats.len(), 1);
+    let s = &stats[0]["push_stats"];
+    let procs = s["ssh_keygen_processes"].as_u64().unwrap();
+    assert!(procs >= 2, "Bindung und Seal geprüft: {s}");
+    assert_eq!(s["ssh_keygen_us"].as_array().unwrap().len() as u64, procs);
+    assert!(s["total_us"].as_u64().unwrap() > 0);
+    let out = std::process::Command::new(HOOK_BIN)
+        .arg("stats")
+        .arg(hook.state.join("log.jsonl"))
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.status.success() && text.contains("P50=") && text.contains("P99="),
+        "{text}"
+    );
+}
+
+/// Kriterium 2: Nie fremde Befunde bestätigen; Mehrdeutigkeit → keine
+/// Quittung; Altlasten derselben PID werden nie verwendet.
+#[test]
+fn s3_09_parallel_pushes_never_cross_attest() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    let h = handoff(&w, &hook);
+    let me = std::process::id();
+    let my_start = minds_witness_git::process::start_time(me);
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    // Objekte auf den Server, ohne Hooks (Ref später von Hand).
+    let hooks_off = w.server.git_dir.join("hooks.off");
+    std::fs::rename(w.server.git_dir.join("hooks"), &hooks_off).unwrap();
+    assert_eq!(w.push(&c, "refs/heads/tmp", &[]).exit, 0);
+    std::fs::rename(&hooks_off, w.server.git_dir.join("hooks")).unwrap();
+
+    // Ein echter Befund für `c` aus einem pre-receive (Pusher alice).
+    let base_update = format!("{} {c} refs/heads/main\n", w.base);
+    let template = {
+        let (code, text) = run_bin_env(
+            "pre-receive",
+            &hook,
+            &base_update,
+            &[("GL_USERNAME", "alice")],
+        );
+        assert_eq!(code, 0, "{text}");
+        let mut c = h.candidates(me, my_start.as_deref()).unwrap();
+        assert_eq!(c.len(), 1);
+        c.remove(0)
+    };
+    let (alice_name, alice) = template;
+    assert_eq!(alice.findings[0].pusher.username, "alice");
+    // (a) Datensatz eines anderen Pushes (andere PID, Pusher mallory) mit
+    // demselben Tripel: wird nie verwendet.
+    let mut mallory = alice.clone();
+    mallory.rp_pid = me + 1;
+    mallory.nonce = "ff".repeat(16);
+    for f in &mut mallory.findings {
+        f.pusher.username = "mallory".to_owned();
+    }
+    h.write_pending(&mallory).unwrap();
+    w.server.update_ref("refs/heads/main", &c);
+    let (code, _) = run_bin("post-receive", &hook, &base_update);
+    assert_eq!(code, 0);
+    let receipts = hook.receipts(&c);
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(hook.verify(&receipts[0]).pusher.username, "alice");
+    let _ = alice_name;
+
+    // (b) Zwei Datensätze derselben PID: mehrdeutig → keine Quittung.
+    let c2 = w.commit(&c, &[("src/a.rs", b"a2")]);
+    std::fs::rename(w.server.git_dir.join("hooks"), &hooks_off).unwrap();
+    assert_eq!(w.push(&c2, "refs/heads/tmp2", &[]).exit, 0);
+    std::fs::rename(&hooks_off, w.server.git_dir.join("hooks")).unwrap();
+    let upd = format!("{c} {c2} refs/heads/main\n");
+    let (code, _) = run_bin("pre-receive", &hook, &upd);
+    assert_eq!(code, 0);
+    let mut twin = h.candidates(me, my_start.as_deref()).unwrap().remove(0).1;
+    twin.nonce = "ee".repeat(16);
+    h.write_pending(&twin).unwrap();
+    w.server.update_ref("refs/heads/main", &c2);
+    let (code, _) = run_bin("post-receive", &hook, &upd);
+    assert_eq!(code, 0);
+    assert!(hook.receipts(&c2).is_empty());
+    assert!(hook.log().contains("pending_ambiguous"));
+    // Beide aus `pending/` genommen (nach `stale/`, dort von `reconcile`
+    // verworfen), nie bestätigt.
+    let mine = format!("{me}-");
+    assert!(
+        hook.handoff("pending")
+            .iter()
+            .all(|n| !n.starts_with(&mine)),
+        "{:?}",
+        hook.handoff("pending")
+    );
+    assert!(hook.handoff("confirmed").is_empty());
+
+    // (c) + (e) Altlast derselben PID ohne Startzeit: Ein späterer
+    // pre-receive (leerer Push) verschiebt sie, bevor er seinen eigenen
+    // Datensatz schreibt; post-receive findet nur den leeren.
+    let c3 = w.commit(&c2, &[("src/a.rs", b"a3")]);
+    let mut old = alice.clone();
+    old.rp_start = None;
+    old.nonce = "dd".repeat(16);
+    old.updates = vec![RefUpdate {
+        old: minds_witness_core::CommitId::parse(&c2).unwrap(),
+        new: minds_witness_core::CommitId::parse(&c3).unwrap(),
+        ref_name: "refs/heads/main".to_owned(),
+    }];
+    for f in &mut old.findings {
+        f.push.old = old.updates[0].old.clone();
+        f.push.new = old.updates[0].new.clone();
+    }
+    h.write_pending(&old).unwrap();
+    let (code, _) = run_bin("pre-receive", &hook, "");
+    assert_eq!(code, 0);
+    assert!(hook.log().contains("pending_stale"));
+    std::fs::rename(w.server.git_dir.join("hooks"), &hooks_off).unwrap();
+    assert_eq!(w.push(&c3, "refs/heads/main", &[]).exit, 0);
+    std::fs::rename(&hooks_off, w.server.git_dir.join("hooks")).unwrap();
+    let (code, _) = run_bin(
+        "post-receive",
+        &hook,
+        &format!("{c2} {c3} refs/heads/main\n"),
+    );
+    assert_eq!(code, 0);
+    assert!(
+        hook.receipts(&c3).is_empty(),
+        "Befund einer Altlast signiert"
+    );
+    let _ = HashStr::of_bytes(b"");
+    let _: Option<PendingRecord> = None;
+}
+
+fn run_bin_env(sub: &str, hook: &Hook, stdin: &str, env: &[(&str, &str)]) -> (i32, String) {
+    use std::io::Write;
+    let mut cmd = std::process::Command::new(HOOK_BIN);
+    cmd.arg(sub)
+        .arg(&hook.config)
+        .current_dir(&hook.server.git_dir)
+        .env("GIT_DIR", ".")
+        .env("HOME", &hook.server.home)
+        .env("GIT_CONFIG_GLOBAL", hook.server.home.join("no-such-config"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Kriterium 2 mit echtem Doppel-Push: zwei Pushes desselben Tripels
+/// gleichzeitig, nur einer gewinnt → genau eine Quittung, mit dessen Pusher.
+#[test]
+fn s3_09_real_double_push_yields_one_receipt() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    let barrier = w.fx.dir.path().join("arrived");
+    std::fs::create_dir_all(&barrier).unwrap();
+    // Beide pre-receive sind durch, bevor eines der Updates läuft.
+    write_hook(
+        &w.server,
+        "update",
+        &format!(
+            "touch '{d}/'$PPID; i=0; while [ $(ls '{d}' | wc -l) -lt 2 ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; exit 0",
+            d = barrier.display()
+        ),
+    );
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    let pushes: Vec<_> = ["alice", "bob"]
+        .into_iter()
+        .map(|who| {
+            let client = w.client.clone();
+            let spec = format!("{c}:refs/heads/main");
+            std::thread::spawn(move || {
+                let mut cmd = client.command();
+                cmd.env("GL_USERNAME", who)
+                    .args(["push", "origin", &spec])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                (who, cmd.status().unwrap().success())
+            })
+        })
+        .collect();
+    let results: Vec<_> = pushes.into_iter().map(|h| h.join().unwrap()).collect();
+    let winners: Vec<&str> = results.iter().filter(|r| r.1).map(|r| r.0).collect();
+    assert_eq!(winners.len(), 1, "genau ein Push gewinnt: {results:?}");
+    assert_eq!(w.server_ref("refs/heads/main").as_deref(), Some(c.as_str()));
+    let receipts = hook.receipts(&c);
+    assert_eq!(receipts.len(), 1, "{results:?}");
+    let pusher = hook.verify(&receipts[0]).pusher.username;
+    assert!(
+        winners.contains(&pusher.as_str()),
+        "{pusher} nicht unter {winners:?}"
+    );
+}
+
+/// Ein Hook ohne `exec` (Elternprozess ist eine Shell): post-receive findet
+/// keinen Datensatz, es entsteht keine Quittung.
+#[test]
+fn s3_10_hook_without_exec_signs_nothing() {
+    let w = world();
+    let hook = w.hook(&policy(Mode::Observe, &[], 100));
+    write_hook(
+        &w.server,
+        "post-receive",
+        &format!(
+            "'{HOOK_BIN}' post-receive '{}'; exit 0",
+            hook.config.display()
+        ),
+    );
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    assert_eq!(w.push(&c, "refs/heads/main", &[]).exit, 0);
+    assert!(hook.receipts(&c).is_empty());
+    assert!(hook.log().contains("receipt_without_pending"));
 }

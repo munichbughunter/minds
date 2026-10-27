@@ -12,7 +12,7 @@ use minds_witness_core::{
     CommitId, HashStr, KeyStr, Policy, PublicKeyEntry, PutResult, ReceiptKey, ReceiptStore,
     StoreError, Timestamp, TrustSnapshot,
 };
-use minds_witness_git::receipt_store::{GitReceiptStore, KEYS_REF, STALE_LOCK_AGE, TRUST_PREFIX};
+use minds_witness_git::receipt_store::{GitReceiptStore, KEYS_REF, MIN_ORPHAN_AGE, TRUST_PREFIX};
 use support::*;
 
 fn store(server: &Repo) -> GitReceiptStore {
@@ -335,6 +335,32 @@ fn s3_05_strict_refs_are_never_repaired() {
     assert_eq!(s.get(&k).unwrap().as_deref(), Some(&b"packed"[..]));
 }
 
+fn age(path: &std::path::Path, by: Duration) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - by)
+        .unwrap();
+}
+
+fn old_lock(server: &Repo, name: &str) -> std::path::PathBuf {
+    let lock = server.git_dir.join(format!("{name}.lock"));
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"").unwrap();
+    age(&lock, 2 * MIN_ORPHAN_AGE);
+    lock
+}
+
+fn coord_token(server: &Repo, sub: &str, file: &str, pid: u32) -> std::path::PathBuf {
+    let dir = server.git_dir.join("minds-witness").join(sub);
+    std::fs::create_dir_all(&dir).unwrap();
+    let start = minds_witness_git::process::start_time(pid).unwrap_or_else(|| "-".to_owned());
+    let path = dir.join(file);
+    std::fs::write(&path, format!("{pid} {start}\n")).unwrap();
+    path
+}
+
 #[test]
 fn s3_05_stale_lock_is_recoverable() {
     let fx = GitTestFixture::new();
@@ -344,21 +370,288 @@ fn s3_05_stale_lock_is_recoverable() {
     let name = GitReceiptStore::receipt_ref(&k);
     let lock = server.git_dir.join(format!("{name}.lock"));
     std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-    let f = std::fs::File::create(&lock).unwrap();
+    std::fs::write(&lock, b"").unwrap();
     // Abgebrochener Prozess: Die Sperre bleibt und blockiert die Ablage.
     assert!(matches!(s.put(&k, b"r"), Err(StoreError::Internal(_))));
-    // Frische Sperren bleiben (ein lebender Prozess könnte sie halten).
-    assert!(s.clear_stale_locks(STALE_LOCK_AGE).unwrap().is_empty());
-    assert!(lock.exists());
-    // Verwaiste Sperren werden entfernt; danach gelingt die Wiederholung.
-    f.set_modified(std::time::SystemTime::now() - 2 * STALE_LOCK_AGE)
-        .unwrap();
-    drop(f);
+    // Zu junge Sperren bleiben, auch ohne lebenden Ablageprozess.
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
     assert_eq!(
-        s.clear_stale_locks(STALE_LOCK_AGE).unwrap(),
-        vec![name.clone()]
+        (r.busy, r.removed.len(), r.kept_young.clone()),
+        (false, 0, vec![name.clone()])
     );
+    assert!(lock.exists());
+    // Nachweislich verwaist (kein lebender Ablageprozess, bekannter Name,
+    // alt genug): entfernt; danach gelingt die Wiederholung.
+    age(&lock, 2 * MIN_ORPHAN_AGE);
+    let r = s.clear_stale_locks(Duration::from_secs(0)).unwrap();
+    assert_eq!(r.removed, vec![name.clone()]);
     assert_eq!(s.put(&k, b"r").unwrap(), PutResult::Stored);
+}
+
+/// Freigabe 27.10.2026: nie die Sperre eines lebenden Prozesses entfernen;
+/// unbekannte Sperren bleiben und werden gemeldet; Aufräumen und Ablage
+/// entsperren sich nicht gegenseitig.
+#[test]
+fn s3_05_lock_recovery_never_unlocks_a_live_process() {
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let s = store(&server);
+    let name = GitReceiptStore::receipt_ref(&key(40, 1));
+    let lock = old_lock(&server, &name);
+
+    // (a) Ein lebender Git-Kindprozess der Ablage (simuliert mit `sleep`):
+    // nichts wird entfernt, solange er lebt.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let token = coord_token(&server, "children", "live", child.id());
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert!(r.busy, "{r:?}");
+    assert!(r.removed.is_empty());
+    assert!(lock.exists());
+    assert!(token.exists());
+    child.kill().unwrap();
+    child.wait().unwrap();
+    // Danach ist er tot: Token weg, Sperre entfernt.
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!((r.busy, r.removed.clone()), (false, vec![name.clone()]));
+    assert!(!token.exists());
+
+    // (b) Ein lebender Schreiber (dieser Prozess): nichts entfernt.
+    let lock = old_lock(&server, &name);
+    let token = coord_token(&server, "writers", "me", std::process::id());
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert!(r.busy && lock.exists());
+    std::fs::remove_file(&token).unwrap();
+
+    // (c) Ein laufender anderer Aufräumer (Marke eines lebenden Prozesses):
+    // nichts tun; die Marke eines toten Prozesses wird übernommen.
+    let marker = coord_token(&server, "", "clearing", std::process::id());
+    assert!(s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap().busy);
+    assert!(lock.exists());
+    let mut gone = std::process::Command::new("true").spawn().unwrap();
+    let gone_pid = gone.id();
+    gone.wait().unwrap();
+    let scope = minds_witness_git::process::scope();
+    std::fs::write(&marker, format!("{gone_pid} {scope}|0\n")).unwrap();
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!((r.busy, r.removed.clone()), (false, vec![name.clone()]));
+    assert!(!marker.exists());
+
+    // (d) Unbekannte Sperren (fremder Name, Verzeichnis) bleiben erhalten
+    // und werden gemeldet; sie sind nie „verwaist“.
+    let foreign = old_lock(&server, "refs/minds/witness/foreign");
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!(
+        r.kept_unknown,
+        vec!["refs/minds/witness/foreign".to_owned()]
+    );
+    assert!(foreign.exists());
+    // Eine Altersangabe unter MIN_ORPHAN_AGE wird nie angewendet.
+    let young = server.git_dir.join("refs/minds/witness/keys.lock");
+    std::fs::write(&young, b"").unwrap();
+    let r = s.clear_stale_locks(Duration::from_secs(0)).unwrap();
+    assert_eq!(r.kept_young, vec![KEYS_REF.to_owned()]);
+    assert!(young.exists());
+    std::fs::remove_file(&young).unwrap();
+    std::fs::remove_file(&foreign).unwrap();
+
+    // (e) Eine Marke aus einem anderen Geltungsbereich (anderer Container)
+    // ist nicht prüfbar: nie übernommen.
+    let lock = old_lock(&server, &name);
+    std::fs::write(&marker, format!("{gone_pid} fremd|0\n")).unwrap();
+    age(&marker, 2 * MIN_ORPHAN_AGE);
+    assert!(s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap().busy);
+    assert!(lock.exists() && marker.exists());
+    std::fs::remove_file(&marker).unwrap();
+}
+
+/// Leere oder unlesbare Marken und Tokens (abgebrochenes Schreiben,
+/// Fremdeingriff): jung als lebend behandelt und gemeldet, nach
+/// `UNREADABLE_TOKEN_AGE` als tot. Nie blockieren sie dauerhaft.
+#[test]
+fn s3_05_empty_marker_and_token_do_not_block_forever() {
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let mut s = store(&server);
+    let k = key(41, 1);
+    let name = GitReceiptStore::receipt_ref(&k);
+    let lock = old_lock(&server, &name);
+    let coord = server.git_dir.join("minds-witness");
+
+    // Leere, junge Marke: Aufräumen hält sich zurück, Ablage bleibt möglich
+    // (die Ablage selbst wartet nicht auf die Marke bis in alle Ewigkeit).
+    std::fs::create_dir_all(&coord).unwrap();
+    let marker = coord.join("clearing");
+    std::fs::write(&marker, b"").unwrap();
+    assert!(s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap().busy);
+    assert!(lock.exists());
+    // Gealtert: übernommen, Sperre entfernt, Marke weg.
+    age(&marker, Duration::from_secs(31));
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!((r.busy, r.removed.clone()), (false, vec![name.clone()]));
+    assert!(!marker.exists());
+
+    // Leerer, junger Schreiber-Token: belegt nicht „verwaist“; die Sperre
+    // bleibt und wird als nicht belegbar gemeldet.
+    let lock = old_lock(&server, &name);
+    let writers = coord.join("writers");
+    std::fs::create_dir_all(&writers).unwrap();
+    let token = writers.join("1-empty");
+    std::fs::write(&token, b"").unwrap();
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert!(r.busy, "{r:?}");
+    assert_eq!(r.kept_busy, vec![name.clone()]);
+    assert!(lock.exists());
+    // Gealtert: als tot behandelt, Token und Sperre entfernt; danach
+    // gelingt die Ablage.
+    age(&token, Duration::from_secs(31));
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!((r.busy, r.removed.clone()), (false, vec![name.clone()]));
+    assert!(!token.exists());
+    assert_eq!(s.put(&k, b"r").unwrap(), PutResult::Stored);
+}
+
+/// Stromausfall während Ablage und Aufräumen: Token, Marke und Sperre aus
+/// einem früheren Systemstart blockieren nach dem Neustart nicht für immer.
+/// Eine andere Boot-Id mit jüngerer Datei (anderer Rechner möglich) bleibt
+/// dagegen unangetastet.
+#[cfg(target_os = "linux")]
+#[test]
+fn s3_05_tokens_from_a_previous_boot_are_dead() {
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let mut s = store(&server);
+    let k = key(43, 1);
+    let name = GitReceiptStore::receipt_ref(&k);
+    let scope = minds_witness_git::process::scope();
+    let ns = scope.split_once('/').unwrap().1.to_owned();
+    let old_boot = format!("00000000-0000-0000-0000-000000000000/{ns}");
+    let coord = server.git_dir.join("minds-witness");
+    std::fs::create_dir_all(coord.join("writers")).unwrap();
+    let before_boot = Duration::from_secs(10 * 365 * 24 * 3600);
+
+    // Fremde Boot-Id, aber jung: nicht prüfbar, nichts entfernt.
+    let lock = old_lock(&server, &name);
+    let token = coord.join("writers").join("1-old");
+    std::fs::write(&token, format!("{} {old_boot}|5\n", std::process::id())).unwrap();
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert!(r.busy && lock.exists() && token.exists(), "{r:?}");
+    // Vor dem aktuellen Systemstart geschrieben: tot; Sperre entfernt.
+    age(&token, before_boot);
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!((r.busy, r.removed.clone()), (false, vec![name.clone()]));
+    assert!(!token.exists());
+
+    // Marke eines Aufräumers aus dem früheren Start: übernommen.
+    let lock = old_lock(&server, &name);
+    let marker = coord.join("clearing");
+    std::fs::write(&marker, format!("{} {old_boot}|5\n", std::process::id())).unwrap();
+    age(&marker, before_boot);
+    let r = s.clear_stale_locks(MIN_ORPHAN_AGE).unwrap();
+    assert_eq!((r.busy, r.removed.clone()), (false, vec![name.clone()]));
+    assert!(!marker.exists() && !lock.exists());
+    assert_eq!(s.put(&k, b"r").unwrap(), PutResult::Stored);
+}
+
+/// Freigabe 27.10.2026, gezielter Test: eine aktiv gehaltene Sperre und
+/// gleichzeitiges Aufräumen ohne Altersgrenze. Belegt allein durch das
+/// Token-Protokoll, nicht durch das Alter.
+#[test]
+fn s3_05_held_lock_survives_concurrent_recovery_without_age_floor() {
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cleaner = {
+        let s = store(&server);
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut runs = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let r = s.clear_stale_locks_without_age_floor().unwrap();
+                assert!(r.removed.is_empty(), "{r:?}");
+                runs += 1;
+            }
+            runs
+        })
+    };
+    // Aktiv gehaltene Sperre: ein lebender Schreiber mit Token.
+    let name = GitReceiptStore::receipt_ref(&key(42, 1));
+    let held = old_lock(&server, &name);
+    let token = coord_token(&server, "writers", "held", std::process::id());
+    let writers: Vec<_> = (0..4u8)
+        .map(|w| {
+            let mut s = store(&server);
+            std::thread::spawn(move || {
+                for i in 0..25u8 {
+                    let k = key(210 + w, i);
+                    assert_eq!(s.put(&k, &[w, i]).unwrap(), PutResult::Stored);
+                }
+            })
+        })
+        .collect();
+    for h in writers {
+        h.join().unwrap();
+    }
+    assert!(held.exists(), "gehaltene Sperre entfernt");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(cleaner.join().unwrap() > 0);
+    let s = store(&server);
+    for w in 0..4u8 {
+        for i in 0..25u8 {
+            assert_eq!(s.get(&key(210 + w, i)).unwrap(), Some(vec![w, i]));
+        }
+    }
+    // Ohne Schreiber: nun nachweislich verwaist.
+    std::fs::remove_file(&token).unwrap();
+    let r = s.clear_stale_locks_without_age_floor().unwrap();
+    assert_eq!(r.removed, vec![name]);
+}
+
+/// Ablage und Aufräumen gleichzeitig: Keine Ablage scheitert, keine wird
+/// überschrieben, und das Aufräumen entfernt keine lebende Sperre.
+#[test]
+fn s3_05_store_and_lock_recovery_run_concurrently() {
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cleaner = {
+        let s = store(&server);
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut runs = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let r = s.clear_stale_locks(Duration::from_secs(0)).unwrap();
+                assert!(r.removed.is_empty(), "{r:?}");
+                runs += 1;
+            }
+            runs
+        })
+    };
+    let writers: Vec<_> = (0..4u8)
+        .map(|w| {
+            let mut s = store(&server);
+            std::thread::spawn(move || {
+                for i in 0..25u8 {
+                    let k = key(200 + w, i);
+                    assert_eq!(s.put(&k, &[w, i]).unwrap(), PutResult::Stored);
+                    assert_eq!(s.put(&k, &[w, i]).unwrap(), PutResult::AlreadyExists);
+                }
+            })
+        })
+        .collect();
+    for h in writers {
+        h.join().unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(cleaner.join().unwrap() > 0);
+    let s = store(&server);
+    for w in 0..4u8 {
+        for i in 0..25u8 {
+            assert_eq!(s.get(&key(200 + w, i)).unwrap(), Some(vec![w, i]));
+        }
+    }
 }
 
 #[test]
@@ -463,42 +756,4 @@ fn s3_05_identical_parallel_puts_never_report_broken() {
             assert!(list.is_ok(), "round {round}: {list:?}");
         }
     }
-}
-
-/// Nachprüfung Commit 2: Die Aufräumung ist gegen sich selbst serialisiert
-/// und entfernt nie eine junge Sperre.
-#[test]
-fn s3_05_stale_lock_cleanup_is_serialized() {
-    let fx = GitTestFixture::new();
-    let server = fx.server();
-    let s = store(&server);
-    let name = GitReceiptStore::receipt_ref(&key(40, 1));
-    let lock = server.git_dir.join(format!("{name}.lock"));
-    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
-    let f = std::fs::File::create(&lock).unwrap();
-    f.set_modified(std::time::SystemTime::now() - 2 * STALE_LOCK_AGE)
-        .unwrap();
-    // Ein laufender anderer Aufräumer (frische Wächterdatei): nichts tun.
-    let guard = server.git_dir.join("minds-witness-clear-locks.lock");
-    std::fs::write(&guard, b"").unwrap();
-    assert!(s.clear_stale_locks(STALE_LOCK_AGE).unwrap().is_empty());
-    assert!(lock.exists());
-    // Eine verwaiste Wächterdatei wird übernommen.
-    std::fs::File::options()
-        .write(true)
-        .open(&guard)
-        .unwrap()
-        .set_modified(std::time::SystemTime::now() - 2 * STALE_LOCK_AGE)
-        .unwrap();
-    assert_eq!(s.clear_stale_locks(STALE_LOCK_AGE).unwrap(), vec![name]);
-    assert!(!guard.exists());
-    // Ein kürzeres Alter als STALE_LOCK_AGE wird nie angewendet.
-    let fresh = server.git_dir.join("refs/minds/witness/keys.lock");
-    std::fs::write(&fresh, b"").unwrap();
-    assert!(
-        s.clear_stale_locks(Duration::from_secs(0))
-            .unwrap()
-            .is_empty()
-    );
-    assert!(fresh.exists());
 }

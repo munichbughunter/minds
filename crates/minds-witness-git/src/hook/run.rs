@@ -1,7 +1,18 @@
-//! Ablauf des Hook-Binarys (Spec S2 §11). Auf stderr steht nur die feste
-//! Ablehnungsmeldung oder die Warnungsausgabe aus [`super::warn`], nie ein
-//! Ereignis, eine Diagnose, ein Fehlertext oder ein Panic-Payload.
-//! Ereignisse und Diagnosen gehen als JSON-Zeilen nach `<out>/log.jsonl`.
+//! Ablauf des Hook-Binarys (Spec S2 §11, Spec S3 §3). Unterbefehle:
+//!
+//! - `pre-receive <config>`: prüft (S2-Prüfkette), signiert **nie** und
+//!   schreibt keinen Ref; nach `Accept` legt er den Übergabe-Datensatz an.
+//! - `post-receive <config>`: bestätigt nur die Ref-Updates, die Git laut
+//!   stdin ausgeführt hat, und nur für den Datensatz desselben
+//!   receive-pack-Prozesses; erst dann Quittungen. Exit immer 0.
+//! - `reconcile <config>`: verwaiste Sperren, offene Bestätigungen, Ablauf.
+//! - `install <config>`: schreibt beide Hooks (mit `exec`).
+//! - `stats <log.jsonl>`: Laufzeitmessung (Spec S3 §3.4).
+//!
+//! Auf stderr steht nur die feste Ablehnungsmeldung oder die
+//! Warnungsausgabe aus [`super::warn`], nie ein Ereignis, eine Diagnose, ein
+//! Fehlertext oder ein Panic-Payload. Ereignisse und Diagnosen gehen als
+//! JSON-Zeilen nach `<state_dir>/log.jsonl`.
 
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -13,13 +24,13 @@ use std::time::Instant;
 use minds_git::quarantine::{ReceiveEnv, ServerRepo};
 use minds_witness_core::{
     CommitId, CommitInfo, CommitRange, Decision, HashStr, LogEvent, Mode, ObjectAccess,
-    ObjectError, PostOutcome, PushContext, Pusher, SealBlob, ServerInfo, ServerKind, Signer,
-    Timestamp, WitnessIdentity, matches_pattern, post_receive, pre_receive,
+    ObjectError, PushContext, Pusher, SealBlob, ServerInfo, Signer, Timestamp, TrustSnapshot,
+    WitnessIdentity, matches_pattern, pre_receive,
 };
 use serde::Serialize;
 
 use super::config::HookConfig;
-use super::store::DirReceiptStore;
+use super::pending::{Handoff, PENDING_SCHEMA, PendingRecord};
 use super::warn;
 use crate::access::GitObjectAccess;
 use crate::budget::Budget;
@@ -34,28 +45,47 @@ const MSG_CONFIG: &str = "minds-witness: Konfiguration ungültig";
 const MSG_REPO: &str = "minds-witness: Repository erfüllt die Voraussetzungen nicht";
 const MSG_FSCK: &str = "minds-witness: receive.fsckObjects ist nicht wirksam";
 const MSG_INTERNAL: &str = "minds-witness: interner Fehler";
+const MSG_USAGE: &str = "minds-witness: Aufruf: minds-witness-hook pre-receive|post-receive|reconcile|install <config> | stats <log>";
+const MSG_HANDOFF: &str = "minds-witness: Warnung: Quittung kann nicht vorbereitet werden.";
 
-/// Einstieg: `args[1]` ist der Pfad der Konfiguration. Jeder Panic außerhalb
-/// des Kerns endet mit dem festen Satz und Exit 1.
+/// Einstieg: `args[1]` ist der Unterbefehl, `args[2]` der Pfad der
+/// Konfiguration (bzw. bei `stats` der Log-Datei). Ein Panic außerhalb des
+/// Kerns endet im pre-receive mit dem festen Satz und Exit 1, im
+/// post-receive und in `reconcile` mit Exit 0 (beide können einen Push
+/// nicht mehr ablehnen).
 pub fn main_with(args: &[String]) -> i32 {
-    // Schritt 1: Der Panic-Hook schreibt nichts. Panics im Kern meldet die
+    // Der Panic-Hook schreibt nichts. Panics im Kern meldet die
     // Warnungsausgabe als `Unknown`, alle anderen der feste Satz unten.
     std::panic::set_hook(Box::new(|_| {}));
-    let Some(path) = args.get(1) else {
-        say(&[MSG_CONFIG.to_owned()]);
+    let (Some(sub), Some(path)) = (args.get(1), args.get(2)) else {
+        say(&[MSG_USAGE.to_owned()]);
         return EXIT_REJECT;
     };
     let path = Path::new(path).to_owned();
-    match catch_unwind(AssertUnwindSafe(|| run(&path))) {
-        Ok(code) => code,
-        Err(_) => {
-            say(&[MSG_INTERNAL.to_owned()]);
+    match sub.as_str() {
+        "pre-receive" => match catch_unwind(AssertUnwindSafe(|| pre_receive_main(&path))) {
+            Ok(code) => code,
+            Err(_) => {
+                say(&[MSG_INTERNAL.to_owned()]);
+                EXIT_REJECT
+            }
+        },
+        "post-receive" => {
+            let _ = catch_unwind(AssertUnwindSafe(|| super::post::post_receive_main(&path)));
+            0
+        }
+        "reconcile" => catch_unwind(AssertUnwindSafe(|| super::post::reconcile_main(&path)))
+            .unwrap_or(EXIT_REJECT),
+        "install" => super::post::install_main(&path),
+        "stats" => super::stats::stats_main(&path),
+        _ => {
+            say(&[MSG_USAGE.to_owned()]);
             EXIT_REJECT
         }
     }
 }
 
-fn say(lines: &[String]) {
+pub(crate) fn say(lines: &[String]) {
     let mut err = std::io::stderr().lock();
     for l in lines {
         let _ = writeln!(err, "{l}");
@@ -85,12 +115,12 @@ enum LogBody<'a> {
     },
 }
 
-struct Log {
-    lines: Vec<String>,
+pub(crate) struct Log {
+    pub(crate) lines: Vec<String>,
 }
 
 impl Log {
-    fn event(&mut self, phase: &str, e: &LogEvent) {
+    pub(crate) fn event(&mut self, phase: &str, e: &LogEvent) {
         if let Ok(s) = serde_json::to_string(&LogLine {
             phase,
             body: LogBody::Event(e),
@@ -99,7 +129,7 @@ impl Log {
         }
     }
 
-    fn diag(
+    pub(crate) fn diag(
         &mut self,
         phase: &str,
         reason: &str,
@@ -120,7 +150,38 @@ impl Log {
         }
     }
 
-    fn flush(&self, out: &Path) {
+    /// Laufzeitmessung eines pre-receive (Spec S3 §3.4): Zähler und Dauern,
+    /// keine Pfade, keine Inhalte.
+    fn push_stats(
+        &mut self,
+        budget: &Budget,
+        started: Instant,
+        guard: std::time::Duration,
+        pre: std::time::Duration,
+        updates: &[minds_witness_core::RefUpdate],
+    ) {
+        let times: Vec<u64> = budget
+            .process_times()
+            .iter()
+            .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
+            .collect();
+        let line = serde_json::json!({
+            "phase": "pre",
+            "push_stats": {
+                "deadline_used_permille": budget.deadline_used_permille(),
+                "evidence_bytes": budget.bytes(),
+                "guard_us": u64::try_from(guard.as_micros()).unwrap_or(u64::MAX),
+                "pre_receive_us": u64::try_from(pre.as_micros()).unwrap_or(u64::MAX),
+                "ref_updates": updates.len(),
+                "ssh_keygen_processes": budget.processes(),
+                "ssh_keygen_us": times,
+                "total_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            }
+        });
+        self.lines.push(line.to_string());
+    }
+
+    pub(crate) fn flush(&self, out: &Path) {
         if self.lines.is_empty() {
             return;
         }
@@ -180,7 +241,7 @@ impl ObjectAccess for Panicking<'_> {
     }
 }
 
-fn now() -> Option<Timestamp> {
+pub(crate) fn now() -> Option<Timestamp> {
     let secs = jiff::Timestamp::now().as_second();
     let ts = jiff::Timestamp::from_second(secs).ok()?;
     Timestamp::parse(&ts.to_string()).ok()
@@ -193,28 +254,57 @@ fn env_or(name: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_owned())
 }
 
-fn identity(signer: &Signer) -> Option<WitnessIdentity> {
+/// Hash des laufenden Binarys (Feld `witness.binary`).
+pub(crate) fn binary_hash() -> Option<HashStr> {
     let exe = std::env::current_exe().ok()?;
     let bytes = std::fs::read(exe).ok()?;
-    Some(WitnessIdentity {
-        binary: HashStr::of_bytes(&bytes),
-        key: signer.public_key(),
-    })
+    Some(HashStr::of_bytes(&bytes))
 }
 
-fn run(path: &Path) -> i32 {
-    // Schritt 2: Konfiguration.
+/// Zeugen-Identität aus dem im pre-receive festgehaltenen Binary-Hash: Die
+/// Quittung nennt das Binary, das geprüft hat, auch wenn bis zur Ablage
+/// ein anderes installiert wurde.
+pub(crate) fn identity(signer: &Signer, binary: &HashStr) -> WitnessIdentity {
+    WitnessIdentity {
+        binary: binary.clone(),
+        key: signer.public_key(),
+    }
+}
+
+fn pre_receive_main(path: &Path) -> i32 {
+    let started = Instant::now();
+    // Konfiguration.
     let Ok(config) = HookConfig::load(path) else {
         say(&[MSG_CONFIG.to_owned()]);
         return EXIT_REJECT;
     };
     let mut log = Log { lines: Vec::new() };
-    let code = run_with(&config, &mut log);
-    log.flush(&config.out_dir);
+    let code = run_with(&config, &mut log, started);
+    log.flush(&config.state_dir);
     code
 }
 
-fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
+/// Der receive-pack-Prozess dieses Hooks (Push-Kennung, Spec S3 §3.1).
+pub(crate) fn push_identity() -> (u32, Option<String>) {
+    #[cfg(unix)]
+    let pid = std::os::unix::process::parent_id();
+    #[cfg(not(unix))]
+    let pid = 0;
+    (pid, crate::process::start_time(pid))
+}
+
+/// `GIT_DIR` des Hooks muss das konfigurierte Repository sein.
+pub(crate) fn same_repository(config: &HookConfig, git_dir: &Path) -> bool {
+    match (
+        std::fs::canonicalize(git_dir),
+        std::fs::canonicalize(&config.repository),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn run_with(config: &HookConfig, log: &mut Log, started: Instant) -> i32 {
     let limits = config.limits();
     let budget = Budget::new(
         limits.max_ssh_keygen_processes,
@@ -227,7 +317,29 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
         say(&[MSG_CONFIG.to_owned()]);
         return EXIT_REJECT;
     };
-    let signer = Signer::from_seed(seed, valid_from);
+    let _ = valid_from;
+    let handoff = Handoff::new(&config.state_dir, &seed);
+    // Erster Schritt der Übergabe: Altlasten derselben PID beiseite (sie
+    // stammen von einem früheren, beendeten receive-pack).
+    let (rp_pid, rp_start) = push_identity();
+    // Ohne vollständiges Aussortieren könnte ein alter Datensatz derselben
+    // PID neben dem neuen liegen; dann wird kein neuer geschrieben.
+    let handoff_usable = match handoff.move_stale(rp_pid) {
+        Ok(moved) => {
+            for m in moved {
+                log.diag("handoff", "pending_stale", None, Some(&m), None);
+            }
+            true
+        }
+        Err(_) if mode == Mode::Enforce => {
+            say(&[MSG_INTERNAL.to_owned()]);
+            return EXIT_REJECT;
+        }
+        Err(_) => {
+            log.diag("handoff", "handoff_unavailable", None, None, None);
+            false
+        }
+    };
     let Some(time) = now() else {
         say(&[MSG_INTERNAL.to_owned()]);
         return EXIT_REJECT;
@@ -240,6 +352,10 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
     };
     if config.test_switches.skip_quarantine {
         env.quarantine = None;
+    }
+    if !same_repository(config, &env.git_dir) {
+        say(&[MSG_CONFIG.to_owned()]);
+        return EXIT_REJECT;
     }
     let repo = match ServerRepo::open_for_receive(&env, limits.repo_limits()) {
         Ok(r) => r,
@@ -291,12 +407,14 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
         }
     };
     let verifier = Verifier::new(&trust, &budget);
+    let guard_started = Instant::now();
     if let Err(e) =
         Guard::new(&repo, &verifier, &budget, &trust, &limits, &config.project).check(&updates)
     {
         say(&[e.message()]);
         return EXIT_REJECT;
     }
+    let guard_time = guard_started.elapsed();
 
     // Schritt 4: PushContext.
     let host = config
@@ -313,8 +431,8 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
         },
         server: ServerInfo {
             host,
-            kind: ServerKind::Memory,
-            time,
+            kind: config.server_kind(),
+            time: time.clone(),
         },
     };
 
@@ -338,7 +456,9 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
         }
         None => &access,
     };
+    let pre_started = Instant::now();
     let pre = pre_receive(&ctx, &config.policy, objects, &inspector);
+    let pre_time = pre_started.elapsed();
     for e in &pre.events {
         log.event("pre", e);
     }
@@ -357,29 +477,62 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
 
     // Schritt 6: Reject.
     if let Decision::Reject { message, .. } = &pre.decision {
+        log.push_stats(&budget, started, guard_time, pre_time, &updates);
         say(std::slice::from_ref(message));
         return EXIT_REJECT;
     }
 
-    // Schritt 7: Quittungen, Warnungen. Ein Panic hier endet im Observe-
-    // Modus nicht mit einer Blockade (§10), im Enforce-Modus fail-closed.
-    let after = catch_unwind(AssertUnwindSafe(|| {
-        let post = match identity(&signer) {
-            Some(identity) => {
-                let mut store = DirReceiptStore::new(config.out_dir.clone());
-                let post = post_receive(&pre.findings, &identity, &signer, &mut store);
-                for e in &post.events {
-                    log.event("post", e);
-                }
-                Some(post)
+    // Schritt 7 (Spec S3 §3.1): Übergabe-Datensatz statt Quittung. Der
+    // Trust-Snapshot entsteht aus genau den Bytes, mit denen geprüft wurde.
+    let snapshot = TrustSnapshot::new(
+        config.allowed_witness_principals.clone(),
+        &config.policy,
+        &config.project,
+        config.require_separated_witness,
+        trust.signers_text(),
+    );
+    let snapshot_bytes = snapshot.to_bytes();
+    let binary = binary_hash();
+    let record = binary.map(|witness_binary| PendingRecord {
+        created: time.as_str().to_owned(),
+        findings: pre.findings.clone(),
+        nonce: nonce(),
+        rp_pid,
+        rp_start,
+        schema: PENDING_SCHEMA.to_owned(),
+        trust: HashStr::of_bytes(&snapshot_bytes),
+        trust_snapshot: String::from_utf8(snapshot_bytes).unwrap_or_default(),
+        updates: updates.clone(),
+        witness_binary,
+    });
+    let handoff_ok = match record {
+        _ if !handoff_usable => false,
+        None => {
+            log.diag("handoff", "identity_unavailable", None, None, None);
+            false
+        }
+        Some(record) => match handoff.write_pending(&record) {
+            Ok(name) => {
+                log.diag("handoff", "pending_written", None, Some(&name), None);
+                true
             }
-            None => Some(PostOutcome {
-                stored: 0,
-                skipped_existing: 0,
-                failed: u32::try_from(pre.findings.len()).unwrap_or(u32::MAX),
-                events: Vec::new(),
-            }),
-        };
+            Err(_) => {
+                log.diag("handoff", "pending_failed", None, None, None);
+                false
+            }
+        },
+    };
+    log.push_stats(&budget, started, guard_time, pre_time, &updates);
+    if !handoff_ok && mode == Mode::Enforce {
+        // Ohne Datensatz entstünde für ein angenommenes Update nie eine
+        // Quittung: im Enforce-Modus fail-closed.
+        say(&[MSG_INTERNAL.to_owned()]);
+        return EXIT_REJECT;
+    }
+
+    // Schritt 8: Warnungen. Ein Panic hier endet im Observe-Modus nicht mit
+    // einer Blockade (§10), im Enforce-Modus fail-closed.
+    let after = catch_unwind(AssertUnwindSafe(|| {
         let evaluated: Vec<String> = updates
             .iter()
             .filter(|u| {
@@ -392,13 +545,17 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
             })
             .map(|u| u.ref_name.clone())
             .collect();
-        warn::lines(
+        let mut lines = warn::lines(
             &pre,
-            post.as_ref(),
+            None,
             config.policy.coverage_threshold_percent,
             config.policy.max_commits_per_push,
             &evaluated,
-        )
+        );
+        if !handoff_ok {
+            lines.push(MSG_HANDOFF.to_owned());
+        }
+        lines
     }));
     let lines = match after {
         Ok(lines) => lines,
@@ -413,4 +570,20 @@ fn run_with(config: &HookConfig, log: &mut Log) -> i32 {
     };
     say(&lines);
     0
+}
+
+fn nonce() -> String {
+    let mut seed = Vec::new();
+    seed.extend_from_slice(&std::process::id().to_le_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    seed.extend_from_slice(&now.as_nanos().to_le_bytes());
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let mut buf = [0u8; 16];
+        if f.read_exact(&mut buf).is_ok() {
+            seed.extend_from_slice(&buf);
+        }
+    }
+    blake3::hash(&seed).to_hex()[..32].to_owned()
 }

@@ -34,6 +34,10 @@ pub struct Budget {
     /// gemeinsam für Vorprüfung, Kandidatenauswahl und Inspektor).
     charged: RefCell<HashSet<String>>,
     deadline: Option<Instant>,
+    /// Laufzeiten der gestarteten Prozesse (Messung, Spec S3 §3.4).
+    durations: RefCell<Vec<Duration>>,
+    /// Zeitpunkt der Konstruktion (für den Deadline-Verbrauch).
+    started: Instant,
 }
 
 impl Budget {
@@ -47,6 +51,8 @@ impl Budget {
             bytes: Cell::new(0),
             charged: RefCell::new(HashSet::new()),
             deadline,
+            durations: RefCell::new(Vec::new()),
+            started: Instant::now(),
         }
     }
 
@@ -100,6 +106,27 @@ impl Budget {
         self.take_bytes(n)?;
         self.charged.borrow_mut().insert(oid.to_owned());
         Ok(())
+    }
+
+    /// Hält die Laufzeit eines gestarteten Prozesses fest.
+    pub fn record_process_time(&self, d: Duration) {
+        self.durations.borrow_mut().push(d);
+    }
+
+    /// Laufzeiten aller festgehaltenen Prozesse in Startreihenfolge.
+    pub fn process_times(&self) -> Vec<Duration> {
+        self.durations.borrow().clone()
+    }
+
+    /// Verbrauchter Anteil der Deadline in Promille (`None` ohne Deadline).
+    pub fn deadline_used_permille(&self) -> Option<u32> {
+        let deadline = self.deadline?;
+        let total = deadline
+            .saturating_duration_since(self.started)
+            .as_millis()
+            .max(1);
+        let used = self.started.elapsed().as_millis();
+        Some(u32::try_from(used * 1000 / total).unwrap_or(u32::MAX))
     }
 
     /// Restzeit bis zur Deadline, `None` ohne Deadline.

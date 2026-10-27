@@ -1,10 +1,14 @@
-//! Das Hook-Binary `minds-witness-hook` (Spec S2 §11): nur für Tests und
-//! den Durchstich. Es startet nur mit `"operation": "test"`. Konfiguration
-//! ([`config`]), Quittungsablage im Verzeichnis ([`store`]), die sichere
-//! Warnungsausgabe auf dem Push-Kanal ([`warn`]) und der Ablauf ([`run`]).
-//! Den Produktionsbetrieb regeln S3 und S4.
+//! Das Hook-Binary `minds-witness-hook` (Spec S2 §11, Spec S3 §3): für
+//! Tests (`"operation": "test"`) und den Pilotbetrieb auf einem eigenen
+//! Git-Server (`"operation": "pilot"`). Konfiguration ([`config`]),
+//! Übergabe zwischen pre- und post-receive ([`pending`]), die sichere
+//! Warnungsausgabe ([`warn`]), der pre-receive ([`run`]), post-receive,
+//! `reconcile` und `install` ([`post`]) sowie die Laufzeitmessung
+//! ([`stats`]). Den Produktionsbetrieb regelt S4.
 
 pub mod config;
+pub mod pending;
+pub mod post;
 pub mod run;
-pub mod store;
+pub mod stats;
 pub mod warn;
