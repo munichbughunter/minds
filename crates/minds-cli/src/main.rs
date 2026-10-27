@@ -52,6 +52,7 @@ mod enable;
 #[cfg(unix)]
 mod enable_protected;
 mod enable_witness;
+mod evidence_cmd;
 mod forget_cmd;
 mod fsck;
 mod gitlab_cmd;
@@ -65,6 +66,7 @@ mod intent_issue;
 mod intent_proof;
 mod metrics;
 mod prepare_commit_msg;
+mod prepush;
 mod recall;
 mod recap;
 mod reinterpret_cmd;
@@ -153,6 +155,15 @@ Usage:
   minds hook --agent <name> [--event <name>]
         Accepts an agent hook event on stdin and stores it in the local
         journal. Always exits 0.
+  minds hook pre-push <remote> <url>
+        The pre-push orchestrator, run by the pre-push hook minds enable
+        writes (an existing foreign pre-push runs before it as
+        pre-push.minds-chained, with the same input): reads the push refs
+        from stdin once, binds the commits (minds bind, only with
+        minds.project set), transfers their bindings, seals and
+        observations before the code push, then starts the background
+        sync. Never blocks the push: warnings only, always exits 0; with
+        MINDS_SYNCING set it does nothing.
 
   minds checkpoint [--commit <id>]
         Interprets the journal, redacts (policy optionally from
@@ -511,6 +522,12 @@ Usage:
         append-only log of content-addressed entries — two reviewers
         offline yield no conflict but a union.
 
+  minds sync --evidence [<rev-range>] [--remote <name>]
+        Transfers the evidence of the commits (as minds bind counts them):
+        their bindings, the seals they name and those seals' observations,
+        in this order, without --force, skipping refs the remote already
+        has with the same content. The pre-push hook does the same before
+        every push; this repeats it by hand. Exit 1 if not transferred.
   minds sync [--remote <name>] [--detach] [-v]
         Sends context and reviews to the remote — all due refs in one
         connection, never with --force; the only exception is the transfer
@@ -617,7 +634,7 @@ const SPECS: &[Spec] = &[
         positionals: 0,
     },
     spec("disable", &[], &["--all", "-v", "--verbose"], 0),
-    spec("hook", &["--agent", "--event"], &[], 0),
+    spec("hook", &["--agent", "--event"], &[], 3),
     spec("checkpoint", &["--commit"], &[], 0),
     spec("bind", &["--remote"], &["--dry-run"], 1),
     spec(
@@ -709,7 +726,12 @@ const SPECS: &[Spec] = &[
     spec("decide", &["--supersedes"], &["--template", "--human"], 0),
     spec("decisions", &[], &["--check"], 1),
     spec("comment", &["--on"], &[], 2),
-    spec("sync", &["--remote"], &["-v", "--verbose", "--detach"], 0),
+    spec(
+        "sync",
+        &["--remote"],
+        &["-v", "--verbose", "--detach", "--evidence"],
+        1,
+    ),
     spec("stack", &["--base"], &[], 0),
     spec(
         "gitlab",
@@ -1066,6 +1088,12 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
             parsed.has("-v") || parsed.has("--verbose"),
         ),
 
+        // Spec S3 §6.2: der pre-push-Orchestrator.
+        "hook" if parsed.positional(0) == Some("pre-push") => prepush::run(parsed.positional(1)),
+        "hook" if parsed.positional(0).is_some() => {
+            eprintln!("minds hook: unknown hook; expected `minds hook pre-push <remote> <url>`");
+            ExitCode::from(2)
+        }
         "hook" => hook::run(parsed.value("--agent"), parsed.value("--event")),
 
         "checkpoint" => checkpoint::run(parsed.value("--commit")),
@@ -1225,6 +1253,21 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
 
         "render" => render_cmd::run(parsed.value("--out")),
 
+        "sync" if parsed.has("--evidence") => {
+            if parsed.has("--detach") {
+                eprintln!("minds sync: --evidence runs in the foreground; drop --detach");
+                ExitCode::from(2)
+            } else {
+                evidence_cmd::run(
+                    parsed.positional(0),
+                    parsed.value("--remote").unwrap_or("origin"),
+                )
+            }
+        }
+        "sync" if parsed.positional(0).is_some() => {
+            eprintln!("minds sync: a range needs --evidence");
+            ExitCode::from(2)
+        }
         "sync" => sync::run(
             parsed.value("--remote"),
             parsed.has("-v") || parsed.has("--verbose"),
