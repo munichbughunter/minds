@@ -102,6 +102,15 @@ impl Change {
     }
 }
 
+/// Was `minds enable` zum Witness genannt bekam: `--witness` und
+/// `--project` (Spec S3 §6.1).
+pub struct WitnessArgs<'a> {
+    /// Das Isolationsprofil (`--witness`).
+    pub profile: Option<&'a str>,
+    /// Das Projekt, das der Witness festhält (`--project`).
+    pub project: Option<&'a str>,
+}
+
 /// Führt `minds enable` aus: Hooks registrieren **und** die Store-Config
 /// schreiben — das eine Setup-Kommando, das ein Repo Minds-fähig macht. Fehler
 /// melden über den Rückgabewert; anders als `minds hook` ist das hier ein
@@ -113,8 +122,12 @@ pub fn run(
     verbose: bool,
     recall: bool,
     global_hooks: bool,
-    witness: Option<&str>,
+    witness: WitnessArgs<'_>,
 ) -> ExitCode {
+    let WitnessArgs {
+        profile: witness,
+        project,
+    } = witness;
     let paths = match locate() {
         Ok(paths) => paths,
         Err(err) => {
@@ -183,6 +196,23 @@ pub fn run(
             return ExitCode::FAILURE;
         }
     };
+    // Spec S3 §6.1: das Projekt, das der Witness festhält — vor jedem
+    // Schreibzugriff geprüft.
+    if let Some(project) = project {
+        if !minds_witness_git::binding::is_project_id(project) {
+            eprintln!("minds enable: --project must have the form <instance>/project-<id>");
+            return ExitCode::FAILURE;
+        }
+        if profile == Some(crate::enable_witness::Profile::Managed)
+            || (profile.is_none() && local_mode == crate::enable_witness::LocalMode::Off)
+        {
+            eprintln!(
+                "minds enable: --project pins the project of a witness — it does not apply \
+                 without one or to --witness managed"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     if profile.is_some() && !crate::enable_witness::supported() {
         eprintln!("minds enable: --witness is not supported on this platform");
         return ExitCode::FAILURE;
@@ -228,10 +258,12 @@ pub fn run(
             crate::trust::report_intent_key(&paths.root);
         }
         let signers = match profile {
-            Some(profile) => crate::enable_witness::run(&paths.root, profile, store)?,
+            Some(profile) => crate::enable_witness::run(&paths.root, profile, store, project)?,
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
             // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
-            None => crate::enable_witness::default(&paths.root, store, local_mode, verbose)?,
+            None => {
+                crate::enable_witness::default(&paths.root, store, local_mode, verbose, project)?
+            }
         };
         // Die Signer-Zeile des Witness in die Vertrauensdatei — niemand
         // kopiert sie mehr von Hand.

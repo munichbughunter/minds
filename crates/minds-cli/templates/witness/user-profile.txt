@@ -47,7 +47,7 @@ them, then run them as an administrator (Linux with systemd):
 4. Witness home (owned by minds-witness; minds-agents may only traverse to
    the socket, mode 0710)
    sudo -u minds-witness env MINDS_WITNESS_HOME=/var/lib/minds-witness/{{REPO_ID}} \
-        /usr/local/bin/minds witness init --repo {{ROOT}} --profile user --socket-group minds-agents
+        /usr/local/bin/minds witness init --repo {{ROOT}} --profile user --socket-group minds-agents{{PROJECT_ARG}}
    sudo -u minds-witness env MINDS_WITNESS_HOME=/var/lib/minds-witness/{{REPO_ID}} \
         /usr/local/bin/minds witness keygen
    keygen prints the allowed_signers line with the principal

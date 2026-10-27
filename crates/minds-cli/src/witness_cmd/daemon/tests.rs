@@ -1,6 +1,7 @@
 use super::*;
 use minds_store::ContextStore;
 
+mod bind_tests;
 mod intent_tests;
 mod observer_tests;
 
@@ -99,6 +100,7 @@ impl Fixture {
                 policy_rev: None,
                 intent_key: None,
                 replace_intent_key: false,
+                project: None,
             },
         )
         .unwrap();
@@ -1388,6 +1390,7 @@ fn witness_policy_is_pinned_at_init() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap();
@@ -1480,6 +1483,7 @@ fn witness_init_is_idempotent_and_never_overwrites() {
         policy_rev: None,
         intent_key: None,
         replace_intent_key: false,
+        project: None,
     };
     let before = fs::read(f.home.join("witness.json")).unwrap();
     // Auch „unverändert" nennt die Pins, die gelten.
@@ -1549,6 +1553,7 @@ fn witness_loads_a_schema_1_config_with_defaults() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap();
@@ -1825,6 +1830,7 @@ fn witness_ignores_a_symlinked_policy_directory() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap();
@@ -1858,6 +1864,7 @@ fn witness_init_refuses_an_unstable_policy() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap_err();
@@ -1889,6 +1896,7 @@ fn witness_init_pins_a_child_repo_only_when_named() {
         policy_rev: None,
         intent_key: None,
         replace_intent_key: false,
+        project: None,
     };
     let err = init_config(&f._dir.path().join("h1"), &request(None)).unwrap_err();
     assert!(err.to_string().contains("pass --child-repo"), "{err}");
@@ -2113,6 +2121,7 @@ fn witness_init_names_a_differing_store() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap_err();
@@ -2145,6 +2154,7 @@ fn witness_init_reads_the_policy_from_the_named_revision() {
         policy_rev,
         intent_key: None,
         replace_intent_key: false,
+        project: None,
     };
 
     let Initialized::Created(pins) =
@@ -2252,6 +2262,7 @@ fn witness_init_unchanged_names_the_stored_policy_source() {
         policy_rev: None,
         intent_key: None,
         replace_intent_key: false,
+        project: None,
     };
     assert!(matches!(
         init_config(&home, &request).unwrap(),
@@ -2293,6 +2304,7 @@ fn witness_init_refuses_replace_refs() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap_err();
@@ -2317,6 +2329,7 @@ fn witness_init_on_an_unborn_head_pins_the_default() {
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project: None,
         },
     )
     .unwrap() else {

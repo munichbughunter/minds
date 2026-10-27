@@ -91,7 +91,7 @@ pub(crate) fn configured_key(root: &Path) -> Option<String> {
 }
 
 /// Ein Wert aus der Git-Konfiguration des Repos (`git config <name>`).
-fn git_config_value(root: &Path, name: &str) -> Option<String> {
+pub(crate) fn git_config_value(root: &Path, name: &str) -> Option<String> {
     // Genau dieses Repo: Ein geerbtes `GIT_DIR` (etwa aus einem Git-Hook)
     // ginge `-C` vor.
     let output = Command::new("git")

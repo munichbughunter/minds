@@ -22,6 +22,7 @@ use crate::checkpoint::core::{
     CheckpointEnv, CheckpointGuard, EvidenceSource, SealSigner, run_checkpoint_guarded,
 };
 
+mod bind;
 mod facts;
 
 /// Ob der Witness in `home` getrennt läuft ([`facts::separated_here`]).
@@ -124,6 +125,13 @@ pub(crate) struct Config {
     /// aktiviert nur der Steuer-Socket.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     intent_key: Option<String>,
+    /// Das Projekt, für das dieser Witness Commits bindet (Spec S3 §6.1),
+    /// `<instanz>/project-<id>` (Spec S2 §4.2). Nie aus der `.git/config` des
+    /// beobachteten Repos: Die Agent-Seite nennt bei `bind` nur den
+    /// erwarteten Wert, der Witness vergleicht. Ohne Pin bindet er nichts.
+    /// Festgehalten wird es nur, wo noch keines gilt; ersetzt nie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 /// Die Schema-Version, die `init` schreibt. Gelesen wird auch 1 (ohne Pins).
@@ -149,6 +157,13 @@ impl Config {
         self.intent_key
             .as_deref()
             .filter(|line| intent_key_line(line).is_ok_and(|parsed| parsed == *line))
+    }
+
+    /// Das festgehaltene Projekt (Spec S3 §6.1), nur in gültiger Form.
+    pub(crate) fn project(&self) -> Option<&str> {
+        self.project
+            .as_deref()
+            .filter(|p| minds_witness_git::binding::is_project_id(p))
     }
 
     /// Die Repo-Wurzel, für die dieser Witness eingerichtet ist.
@@ -182,6 +197,87 @@ impl Config {
             .clone()
             .unwrap_or_default()
             .floored_at_default()
+    }
+}
+
+impl Config {
+    /// Das festgehaltene Repository, geöffnet und geprüft wie für jeden
+    /// Checkpoint (EA-10) — ohne Includes, ohne Ref-Namespace, mit eigenem
+    /// `.git`.
+    pub(super) fn pinned_repo(&self) -> Fallible<minds_git::Repo> {
+        let root = &self.repo_root;
+        // Ohne Pins wüsste der Witness Policy und Store nur aus Dateien, die
+        // der Agent schreiben kann — oder aus Standards, die die Extras des
+        // Teams (`deny_secrets`, `secret_keys`) still fallen ließen.
+        // Fail-closed: erst nach einem erneuten `minds witness init`.
+        if !self.pinned() {
+            return Err(UNPINNED.into());
+        }
+        // Der Worktree gehört dem Agenten; seit EA-06d kann er diesen Lauf
+        // jederzeit auslösen. Was er dort ändern kann, darf den Witness nicht
+        // umlenken (00-conventions: „Nothing in `.git/config` may influence
+        // trust decisions") — geprüft, bevor gix oder git etwas daraus lesen.
+        plain_repo_layout(root)?;
+        // Das Git-Verzeichnis aus `witness.json`, einmal geöffnet, ohne
+        // Includes: Ein `include.path` auf ein FIFO oder eine fremde Datei
+        // erreicht den Witness nicht (EA-10).
+        let git_dir = self.git_dir();
+        let dot_git = root.join(".git").canonicalize()?;
+        if dot_git != git_dir {
+            return Err("witness git directory moved; checkpoint deferred".into());
+        }
+        let repo = minds_git::Repo::open_pinned(&git_dir)?;
+        // Ein Ref-Namespace aus der Konfiguration des Agenten verschöbe alle
+        // Schreibzugriffe unter `refs/namespaces/<ns>/…` — heraus aus
+        // `refs/minds/`.
+        if repo.has_ref_namespace() {
+            return Err("refs namespaces are not supported; checkpoint deferred".into());
+        }
+        if repo.git_dir().canonicalize()? != dot_git || repo.common_dir().canonicalize()? != dot_git
+        {
+            return Err(
+                "witness repository must own its .git directory; checkpoint deferred".into(),
+            );
+        }
+        Ok(repo)
+    }
+
+    /// Der festgehaltene Store auf `repo` (EA-10): Backend, Ref und
+    /// Child-Pfad aus `witness.json`, nie aus der `.git/config` des Agenten.
+    pub(super) fn open_pinned_store(
+        &self,
+        repo: &minds_git::Repo,
+    ) -> Fallible<Box<dyn minds_store::ContextStore>> {
+        let store: Box<dyn minds_store::ContextStore> = match self.store() {
+            PinnedStore::InRepo { context_ref } => {
+                Box::new(minds_store::InRepoStore::from_repo(repo.clone()).with_ref(context_ref))
+            }
+            PinnedStore::ChildRepo {
+                context_ref,
+                child_path,
+            } => {
+                // Dieselbe Layout-Prüfung wie für das beobachtete Repo: Ein
+                // Symlink, `commondir` oder `alternates` im Child lenkte die
+                // Schreibzugriffe des Workers sonst an einen anderen Ort.
+                let child_git = if fs::symlink_metadata(child_path.join(".git"))
+                    .is_ok_and(|meta| meta.is_dir())
+                {
+                    child_path.join(".git")
+                } else {
+                    child_path.clone()
+                };
+                plain_git_dir_within(&child_git, MAX_GIT_ENTRIES)?;
+                let child = minds_git::Repo::open_pinned(&child_git)?;
+                if child.has_ref_namespace() {
+                    return Err(
+                        "refs namespaces are not supported in the child repository; checkpoint deferred"
+                            .into(),
+                    );
+                }
+                Box::new(minds_store::ChildRepoStore::from_repo(child).with_ref(context_ref))
+            }
+        };
+        Ok(store)
     }
 }
 
@@ -258,6 +354,10 @@ pub(crate) struct Pins {
     pub(crate) intent_key_refused: Option<String>,
     /// Ob `init` den Freigabe-Schlüssel eben (neu) festgehalten hat.
     pub(crate) intent_key_new: bool,
+    /// Das festgehaltene Projekt (Spec S3 §6.1), falls eines gilt.
+    pub(crate) project: Option<String>,
+    /// Ob `init` das Projekt eben festgehalten hat.
+    pub(crate) project_new: bool,
 }
 
 impl Pins {
@@ -278,6 +378,8 @@ impl Pins {
             intent_key: config.intent_key().map(key_display),
             intent_key_refused: None,
             intent_key_new: false,
+            project: config.project().map(str::to_owned),
+            project_new: false,
         }
     }
 
@@ -296,6 +398,17 @@ impl Pins {
             } else {
                 lines.push(format!("intent key:     {key}"));
             }
+        }
+        match (&self.project, self.project_new) {
+            (Some(project), true) => lines.push(format!(
+                "pinned project: {project} (newly pinned — bindings use it at once)"
+            )),
+            (Some(project), false) => lines.push(format!("pinned project: {project}")),
+            (None, _) => lines.push(
+                "project:        not pinned — the witness binds no commits until \
+                 `minds witness init --project <instance>/project-<id>` pins one"
+                    .to_owned(),
+            ),
         }
         if let Some(key) = &self.intent_key_refused {
             lines.push(format!(
@@ -376,6 +489,10 @@ pub(crate) struct InitRequest<'a> {
     /// (`--replace-intent-key`) — nie still: Die Einrichtung liest den
     /// Schlüssel aus einer Konfiguration, die auch der Agent schreibt.
     pub(crate) replace_intent_key: bool,
+    /// Das Projekt, für das der Witness binden soll (`--project`, Spec S3
+    /// §6.1). Festgehalten nur, wo noch keines gilt; ein anderes, schon
+    /// festgehaltenes wird nie ersetzt — `init` bricht dann ab.
+    pub(crate) project: Option<&'a str>,
 }
 
 pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
@@ -392,8 +509,13 @@ pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
             lines.push("Witness configuration pinned (schema 2).".to_owned());
             lines.extend(pins.lines());
         }
-        Initialized::Unchanged(pins) if pins.intent_key_new => {
-            lines.push("Witness configuration unchanged; intent key pinned.".to_owned());
+        Initialized::Unchanged(pins) if pins.intent_key_new || pins.project_new => {
+            let what = match (pins.intent_key_new, pins.project_new) {
+                (true, true) => "intent key and project pinned",
+                (true, false) => "intent key pinned",
+                _ => "project pinned",
+            };
+            lines.push(format!("Witness configuration unchanged; {what}."));
             lines.extend(pins.lines());
         }
         Initialized::Unchanged(pins) => {
@@ -429,18 +551,20 @@ pub fn init(home: &Path, request: &InitRequest<'_>) -> Fallible<String> {
 ///   würde instabil und vertagt), wird abgelehnt.
 pub(crate) fn init_config(home: &Path, request: &InitRequest<'_>) -> Fallible<Initialized> {
     let mut note = (None, false);
+    let mut project_new = false;
     // Ein eingerichtetes Home prüft `load` als Ganzes — die Log-Datei des
     // Dienstes vorher zurechtrücken, sonst scheiterte gerade das `init`,
     // das sie reparieren soll. Ein neues Home entsteht erst unten.
     if fs::symlink_metadata(home.join("witness.json")).is_ok() {
         settle_stderr_log(home)?;
     }
-    let mut initialized = init_config_noting(home, request, &mut note)?;
+    let mut initialized = init_config_noting(home, request, &mut note, &mut project_new)?;
     settle_stderr_log(home)?;
     let (Initialized::Created(pins) | Initialized::Unchanged(pins) | Initialized::Pinned(pins)) =
         &mut initialized;
     pins.intent_key_refused = note.0;
     pins.intent_key_new = note.1;
+    pins.project_new = project_new;
     Ok(initialized)
 }
 
@@ -450,7 +574,14 @@ fn init_config_noting(
     home: &Path,
     request: &InitRequest<'_>,
     note: &mut (Option<String>, bool),
+    project_new: &mut bool,
 ) -> Fallible<Initialized> {
+    // Spec S3 §6.1: nur die strenge Form aus S2 §4.2.
+    if let Some(project) = request.project {
+        if !minds_witness_git::binding::is_project_id(project) {
+            return Err("--project must have the form <instance>/project-<id>".into());
+        }
+    }
     let home: PathBuf = home.components().collect();
     // Die Wurzel über das Dateisystem, nicht über `git rev-parse`: Das
     // folgte `core.worktree` aus der `.git/config` des Agenten und hielte
@@ -536,6 +667,14 @@ fn init_config_noting(
                 }
             }
         }
+        // Spec S3 §6.1: Ein festgehaltenes Projekt wird nie ersetzt — sonst
+        // könnte ein späteres `enable` den Witness still zum Signierdienst
+        // eines anderen Projekts machen.
+        if let (Some(wanted), Some(pinned)) = (request.project, existing.project.as_deref()) {
+            if wanted != pinned {
+                differs.push("project");
+            }
+        }
         if !differs.is_empty() {
             return Err(format!(
                 "witness home already holds a different configuration ({} differ); \
@@ -555,6 +694,10 @@ fn init_config_noting(
         // (heute) ungültiger Eintrag gilt zur Laufzeit nicht — ersetzt wird
         // er trotzdem nur ausdrücklich. Geschrieben wird er erst, wenn
         // nichts anderes mehr scheitern kann (unten, auf jedem Weg).
+        if let (Some(project), None) = (request.project, &existing.project) {
+            existing.project = Some(project.to_owned());
+            *project_new = true;
+        }
         if let Some(key) = intent_key.filter(|key| existing.intent_key.as_ref() != Some(key)) {
             if existing.intent_key.is_none() || request.replace_intent_key {
                 existing.intent_key = Some(key);
@@ -604,7 +747,7 @@ fn init_config_noting(
                 .as_deref()
                 .map(crate::text::sanitize)
                 .unwrap_or_else(|| "pinned earlier (source not recorded)".to_owned());
-            if note.1 {
+            if note.1 || *project_new {
                 atomic(
                     &home.join("witness.json"),
                     &serde_json::to_vec_pretty(&existing)?,
@@ -676,6 +819,7 @@ fn init_config_noting(
         redaction: Some(pins.2),
         policy_source: Some(source.clone()),
         intent_key,
+        project: request.project.map(str::to_owned),
     };
     let mut file = private_new(&home.join("witness.json"))?;
     file.write_all(&serde_json::to_vec_pretty(&config)?)?;
@@ -991,6 +1135,13 @@ pub(crate) fn load(home: &Path) -> Fallible<Config> {
         .starts_with(minds_git::MINDS_REF_NAMESPACE)
     {
         return Err("pinned context ref outside refs/minds/".into());
+    }
+    if config
+        .project
+        .as_deref()
+        .is_some_and(|p| !minds_witness_git::binding::is_project_id(p))
+    {
+        return Err("invalid pinned project".into());
     }
     if let PinnedStore::ChildRepo { child_path, .. } = &store {
         // Kanonisch wie `repo_root`: Ein Symlink im Pfad lenkte die
@@ -1312,6 +1463,9 @@ struct Writer {
     /// Ende des letzten Checkpoint-Laufs auf Anfrage je Client (Commit),
     /// gleich mit welchem Ausgang (EA-10).
     limits: limits::Limits,
+    /// Ende des letzten `bind`-Laufs je Commit (Spec S3 §6.1), getrennt vom
+    /// Checkpoint: Ein `bind` verschiebt keinen Checkpoint.
+    bind_limits: limits::Limits,
     /// Das Binary, das den Checkpoint als eigenen Prozess ausführt (EA-10).
     /// `None` im Test: Dort läuft er im eigenen Prozess.
     worker: Option<PathBuf>,
@@ -1394,6 +1548,7 @@ impl Writer {
             follow,
             dirty: true,
             limits: limits::Limits::default(),
+            bind_limits: limits::Limits::default(),
             worker: None,
             last_failure: None,
             stream: None,
@@ -1902,6 +2057,68 @@ impl Writer {
         }
     }
 
+    /// `bind` auf Anfrage der Agent-Seite (Spec S3 §6.1). Das Projekt wird
+    /// gegen die **aktuelle** `witness.json` geprüft (ein später ergänztes
+    /// Pin gilt sofort), bevor irgendetwas im Repository gelesen wird; der
+    /// Lauf selbst geschieht wie ein Checkpoint im Worker.
+    ///
+    /// Der Fehler ist der feste Grund für den `Nack`.
+    pub(super) fn bind_requested(
+        &mut self,
+        commit: &str,
+        expected: &str,
+        dry_run: bool,
+        requester_alive: &dyn Fn() -> bool,
+    ) -> Result<String, &'static str> {
+        let config = match load(&self.home) {
+            Ok(config) => config,
+            Err(err) => {
+                self.note_failure(Some(format!("bind failed: {err}")));
+                return Err(bind::BIND_FAILED);
+            }
+        };
+        bind::check_project(&config, expected)?;
+        if !requester_alive() {
+            return Err("requester gone");
+        }
+        if self.bind_limits.blocked(commit, MIN_CHECKPOINT_INTERVAL) {
+            return Err("rate limited");
+        }
+        let result = match self.worker.clone() {
+            Some(exe) => {
+                worker::run_bind(&exe, &self.home, commit, expected, dry_run, requester_alive)
+                    .map_err(|failure| match failure {
+                        worker::Failure::Failed(reason) => reason,
+                        worker::Failure::Aborted(reason) => reason.to_owned(),
+                    })
+            }
+            None => {
+                let home = self.home.clone();
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    bind::bind(&home, &config, commit, expected, dry_run)
+                }))
+                .unwrap_or_else(|_| Err("bind panicked".into()))
+                .map_err(|err| err.to_string())
+            }
+        };
+        match result {
+            Ok(status) => {
+                self.bind_limits.record(commit, None);
+                Ok(status)
+            }
+            Err(reason) => {
+                self.bind_limits.record_failure(commit);
+                match bind::KNOWN.iter().find(|known| **known == reason) {
+                    Some(known) => Err(known),
+                    None => {
+                        self.note_failure(Some(format!("bind failed: {reason}")));
+                        Err(bind::BIND_FAILED)
+                    }
+                }
+            }
+        }
+    }
+
     /// Der Lauf im eigenen Prozess — im Test, und überall dort, wo kein
     /// Worker-Binary feststeht.
     fn checkpoint_in_process(
@@ -2162,83 +2379,15 @@ impl Writer {
         Ok(())
     }
 
-    /// Das festgehaltene Repository, geöffnet und geprüft wie für jeden
-    /// Checkpoint (EA-10) — ohne Includes, ohne Ref-Namespace, mit eigenem
-    /// `.git`.
     fn pinned_repo(&self) -> Fallible<minds_git::Repo> {
-        let root = &self.config.repo_root;
-        // Ohne Pins wüsste der Witness Policy und Store nur aus Dateien, die
-        // der Agent schreiben kann — oder aus Standards, die die Extras des
-        // Teams (`deny_secrets`, `secret_keys`) still fallen ließen.
-        // Fail-closed: erst nach einem erneuten `minds witness init`.
-        if !self.config.pinned() {
-            return Err(UNPINNED.into());
-        }
-        // Der Worktree gehört dem Agenten; seit EA-06d kann er diesen Lauf
-        // jederzeit auslösen. Was er dort ändern kann, darf den Witness nicht
-        // umlenken (00-conventions: „Nothing in `.git/config` may influence
-        // trust decisions") — geprüft, bevor gix oder git etwas daraus lesen.
-        plain_repo_layout(root)?;
-        // Das Git-Verzeichnis aus `witness.json`, einmal geöffnet, ohne
-        // Includes: Ein `include.path` auf ein FIFO oder eine fremde Datei
-        // erreicht den Witness nicht (EA-10).
-        let git_dir = self.config.git_dir();
-        let dot_git = root.join(".git").canonicalize()?;
-        if dot_git != git_dir {
-            return Err("witness git directory moved; checkpoint deferred".into());
-        }
-        let repo = minds_git::Repo::open_pinned(&git_dir)?;
-        // Ein Ref-Namespace aus der Konfiguration des Agenten verschöbe alle
-        // Schreibzugriffe unter `refs/namespaces/<ns>/…` — heraus aus
-        // `refs/minds/`.
-        if repo.has_ref_namespace() {
-            return Err("refs namespaces are not supported; checkpoint deferred".into());
-        }
-        if repo.git_dir().canonicalize()? != dot_git || repo.common_dir().canonicalize()? != dot_git
-        {
-            return Err(
-                "witness repository must own its .git directory; checkpoint deferred".into(),
-            );
-        }
-        Ok(repo)
+        self.config.pinned_repo()
     }
 
-    /// Der festgehaltene Store auf `repo` (EA-10): Backend, Ref und
-    /// Child-Pfad aus `witness.json`, nie aus der `.git/config` des Agenten.
     fn open_pinned_store(
         &self,
         repo: &minds_git::Repo,
     ) -> Fallible<Box<dyn minds_store::ContextStore>> {
-        let store: Box<dyn minds_store::ContextStore> = match self.config.store() {
-            PinnedStore::InRepo { context_ref } => {
-                Box::new(minds_store::InRepoStore::from_repo(repo.clone()).with_ref(context_ref))
-            }
-            PinnedStore::ChildRepo {
-                context_ref,
-                child_path,
-            } => {
-                // Dieselbe Layout-Prüfung wie für das beobachtete Repo: Ein
-                // Symlink, `commondir` oder `alternates` im Child lenkte die
-                // Schreibzugriffe des Workers sonst an einen anderen Ort.
-                let child_git = if fs::symlink_metadata(child_path.join(".git"))
-                    .is_ok_and(|meta| meta.is_dir())
-                {
-                    child_path.join(".git")
-                } else {
-                    child_path.clone()
-                };
-                plain_git_dir_within(&child_git, MAX_GIT_ENTRIES)?;
-                let child = minds_git::Repo::open_pinned(&child_git)?;
-                if child.has_ref_namespace() {
-                    return Err(
-                        "refs namespaces are not supported in the child repository; checkpoint deferred"
-                            .into(),
-                    );
-                }
-                Box::new(minds_store::ChildRepoStore::from_repo(child).with_ref(context_ref))
-            }
-        };
-        Ok(store)
+        self.config.open_pinned_store(repo)
     }
 
     fn checkpoint_sessions(

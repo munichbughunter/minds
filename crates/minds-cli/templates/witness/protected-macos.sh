@@ -19,6 +19,7 @@ PLIST={{SERVICE_FILE}}
 MDIR={{MANAGED_DIR}}
 PREVIOUS={{MANAGED_PREVIOUS}}
 INTENT_KEY={{INTENT_KEY}}
+PROJECT={{PROJECT}}
 
 fail() { echo "minds: $*" >&2; exit 1; }
 owner_of() { /usr/bin/stat -f '%u' "$1"; }
@@ -149,12 +150,13 @@ as_witness() {
 # Your intent key (if minds.intentKey names a security key) is pinned as the key that
 # approves intents: a fresh touch activates one over the witness socket. A key
 # pinned earlier is never replaced here (witness init --replace-intent-key).
-if [ -n "$INTENT_KEY" ]; then
-  out=$(as_witness witness init --repo "$ROOT" --profile user --socket-group "$WUSER" \
-    --intent-key "$INTENT_KEY")
-else
-  out=$(as_witness witness init --repo "$ROOT" --profile user --socket-group "$WUSER")
-fi
+# The project the witness binds commits for (minds enable --project) is pinned
+# only where none is pinned yet; a different pinned project stops the setup.
+set -- witness init --repo "$ROOT" --profile user --socket-group "$WUSER"
+[ -z "$INTENT_KEY" ] || set -- "$@" --intent-key "$INTENT_KEY"
+[ -z "$PROJECT" ] || set -- "$@" --project "$PROJECT"
+out=$(as_witness "$@")
+printf '%s\n' "$out" | /usr/bin/sed -n 's/^pinned project: *\([^ ]*\).*/MINDS-PROJECT \1/p'
 printf '%s\n' "$out" | /usr/bin/sed -n 's/^intent key: */MINDS-INTENT-KEY /p'
 [ -e "$HOME_DIR/key/witness_ed25519" ] || as_witness witness keygen >/dev/null
 line=$(as_witness witness signers)

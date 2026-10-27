@@ -60,13 +60,14 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
                 "--policy-rev",
                 "--intent-key",
                 "--replace-intent-key",
+                "--project",
             ]
             .iter()
             .any(|flag| parsed.value(flag).is_some())
         {
             return Err(
                 "--repo, --path-map, --profile, --socket-group, --child-repo, --policy-rev, \
-                 --intent-key and --replace-intent-key require witness init"
+                 --intent-key, --replace-intent-key and --project require witness init"
                     .into(),
             );
         }
@@ -99,6 +100,7 @@ fn run_unix(parsed: &crate::Parsed) -> ExitCode {
                         .value("--intent-key")
                         .or(parsed.value("--replace-intent-key")),
                     replace_intent_key: parsed.value("--replace-intent-key").is_some(),
+                    project: parsed.value("--project"),
                 },
             ),
             "run" => {
@@ -156,6 +158,7 @@ fn host_command(command: &str, parsed: &crate::Parsed) -> Fallible<String> {
         "--child-repo",
         "--policy-rev",
         "--replace-intent-key",
+        "--project",
     ] {
         if parsed.value(flag).is_some() {
             return Err(format!("{flag} does not apply to witness {command}").into());

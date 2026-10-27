@@ -166,7 +166,7 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Die Frist aus [`TIMEOUT_ENV`]; ungültig, leer oder `0` heißt Standard,
 /// zu groß heißt [`MAX_TIMEOUT`].
-fn timeout() -> Duration {
+pub(crate) fn timeout() -> Duration {
     std::env::var(TIMEOUT_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -177,7 +177,7 @@ fn timeout() -> Duration {
 
 /// Eine Anfrage-Id, die nur eindeutig sein muss, nicht geheim: Sie ordnet die
 /// Antwort der Anfrage zu. Prozess-Id und Uhrzeit, durch blake3 verrührt.
-fn request_id() -> [u8; 16] {
+pub(crate) fn request_id() -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&std::process::id().to_le_bytes());
     let now = std::time::SystemTime::now()
