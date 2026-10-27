@@ -130,6 +130,21 @@ pub enum Frame {
         repo: String,
         request_id: [u8; 16],
     },
+    /// Spec S3 §6.1 (`minds bind`): asks the witness to bind `commit` (a
+    /// full lowercase id) to its own content-bound seals. The request carries
+    /// only the commit and the project the client **expects**; the witness
+    /// binds solely for the project pinned in its `witness.json` and refuses
+    /// a mismatch, builds the binding bytes itself and signs only its own
+    /// seals. With `dry_run` it reports the selection without signing or
+    /// storing. Answered with `Ack` (`bound|unchanged <binding-id>
+    /// <covered>/<total>`, `selected <seals> <covered>/<total>`, `no-evidence
+    /// 0/<total>`) or `Nack` with a fixed reason.
+    Bind {
+        commit: String,
+        expected_project: String,
+        dry_run: bool,
+        request_id: [u8; 16],
+    },
     Ack {
         request_id: [u8; 16],
         status: String,
@@ -261,6 +276,18 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
         Frame::Unregister { repo, request_id } => {
             out.push(0x0c);
             put_short(&mut out, repo);
+            out.extend_from_slice(request_id);
+        }
+        Frame::Bind {
+            commit,
+            expected_project,
+            dry_run,
+            request_id,
+        } => {
+            out.push(0x0d);
+            put_short(&mut out, commit);
+            put_short(&mut out, expected_project);
+            out.push(u8::from(*dry_run));
             out.extend_from_slice(request_id);
         }
         Frame::Ack { request_id, status } => {
@@ -443,6 +470,25 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
                 request_id,
             }
         }
+        0x0d => {
+            let commit = cursor.short_text("commit")?;
+            check_bind_commit(commit)?;
+            let expected_project = cursor.short_text("expected_project")?;
+            check_project(expected_project)?;
+            let dry_run = match cursor.take(1, "dry_run")? {
+                [0] => false,
+                [1] => true,
+                _ => return Err(ProtoError::BadField("dry_run")),
+            };
+            let request_id = cursor.request_id()?;
+            cursor.finish()?;
+            Frame::Bind {
+                commit: commit.to_owned(),
+                expected_project: expected_project.to_owned(),
+                dry_run,
+                request_id,
+            }
+        }
         0x81 | 0x82 => {
             let request_id = cursor.request_id()?;
             let field = if kind == 0x81 { "status" } else { "reason" };
@@ -548,6 +594,15 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_repo(repo)?;
             19 + repo.len()
         }
+        Frame::Bind {
+            commit,
+            expected_project,
+            ..
+        } => {
+            check_bind_commit(commit)?;
+            check_project(expected_project)?;
+            22 + commit.len() + expected_project.len()
+        }
         Frame::Ack { status, .. } => {
             check_line(status, MAX_TEXT, "status")?;
             17 + status.len()
@@ -635,6 +690,30 @@ fn check_repo(value: &str) -> Result<(), ProtoError> {
         return Err(ProtoError::BadField("repo"));
     }
     check_line(value, MAX_REPO, "repo")
+}
+
+/// Longest project a [`Frame::Bind`] may carry.
+pub const MAX_PROJECT: usize = 256;
+
+/// The commit of a [`Frame::Bind`]: a full id in lowercase hex, required.
+fn check_bind_commit(value: &str) -> Result<(), ProtoError> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(ProtoError::BadField("commit"));
+    }
+    Ok(())
+}
+
+/// The expected project of a [`Frame::Bind`]: one short printable word,
+/// required. Its form (`<instance>/project-<id>`) is the witness's check.
+fn check_project(value: &str) -> Result<(), ProtoError> {
+    if value.is_empty() || value.contains(' ') {
+        return Err(ProtoError::BadField("expected_project"));
+    }
+    check_line(value, MAX_PROJECT, "expected_project")
 }
 
 fn check_commit(value: &str) -> Result<(), ProtoError> {

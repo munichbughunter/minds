@@ -536,6 +536,35 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                 return Ok(false);
             }
         }
+        Frame::Bind {
+            commit,
+            expected_project,
+            dry_run,
+            request_id,
+        } => {
+            // Spec S3 §6.1: Ein abgewiesenes oder gescheitertes `bind` beendet
+            // den Schreiber nicht; der Absender bekommt einen festen Grund.
+            let stream = &client.stream;
+            let answer = match writer
+                .bind_requested(&commit, &expected_project, dry_run, &|| !peer_gone(stream))
+            {
+                Ok(status) => Frame::Ack { request_id, status },
+                Err(reason) => Frame::Nack {
+                    request_id,
+                    reason: reason.into(),
+                },
+            };
+            let bytes = witness_proto::encode(&answer).or_else(|_| {
+                log(&writer.home, "bind status not encodable");
+                witness_proto::encode(&Frame::Nack {
+                    request_id,
+                    reason: "status not encodable".into(),
+                })
+            })?;
+            if client.stream.write_all(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
         Frame::IntentActivate {
             anchor,
             signature,

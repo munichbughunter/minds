@@ -16,6 +16,8 @@ minds-reader = { path = "../minds-reader" }
 minds-metrics = { path = "../minds-metrics" }
 minds-gitlab = { path = "../minds-gitlab" }
 minds-attest = { path = "../minds-attest" }
+# Spec S3 §6.1: Bindungsformat und geteilte Seal-Auswahl des Server-Witness.
+minds-witness-git = { path = "../minds-witness-git" }
 minds-tui = { path = "../minds-tui", optional = true }
 
 serde = { workspace = true, features = ["derive"] }
@@ -41,6 +43,8 @@ default = ["tui"]
 tui = ["dep:minds-tui"]
 
 [dev-dependencies]
+# Spec S3 §6.1, s3_14: die Vorschau gegen den Server-Inspektor.
+minds-witness-core = { path = "../minds-witness-core" }
 serde_json.workspace = true
 
 [[bin]]

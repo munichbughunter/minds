@@ -890,6 +890,78 @@ fn enable_witness_user_prints_the_steps_and_runs_nothing() {
     assert!(!f.root.join(".devcontainer").exists());
 }
 
+/// Spec S3 §6.1: `--project` pinnt das Projekt des Witness — im
+/// `container`-Profil gleich bei `init`, im `user`-Profil als Schritt im
+/// Text; eine ungültige Form oder `managed` scheitert, bevor etwas
+/// geschrieben wird.
+#[test]
+fn enable_witness_pins_the_project() {
+    let f = Fixture::new();
+    let out = f.minds(&[
+        "enable",
+        "--agent",
+        "claude-code",
+        "--witness",
+        "user",
+        "--project",
+        "git.test/project-42",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("--socket-group minds-agents --project 'git.test/project-42'"),
+        "{stdout}"
+    );
+
+    let out = f.minds(&[
+        "enable",
+        "--agent",
+        "claude-code",
+        "--witness",
+        "container",
+        "--project",
+        "git.test/project-42",
+    ]);
+    assert!(out.status.success(), "{}", text(&out));
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.home().join("witness.json")).unwrap()).unwrap();
+    assert_eq!(config["project"], "git.test/project-42");
+    // Ein anderes Projekt ersetzt den Pin nie.
+    let out = f.minds(&[
+        "enable",
+        "--agent",
+        "claude-code",
+        "--witness",
+        "container",
+        "--project",
+        "git.test/project-7",
+    ]);
+    assert!(!out.status.success(), "{}", text(&out));
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.home().join("witness.json")).unwrap()).unwrap();
+    assert_eq!(config["project"], "git.test/project-42");
+
+    for (profile, project) in [
+        ("managed", "git.test/project-42"),
+        ("container", "git.test/group/repo"),
+    ] {
+        let g = Fixture::new();
+        let out = g.minds(&[
+            "enable",
+            "--agent",
+            "claude-code",
+            "--witness",
+            profile,
+            "--project",
+            project,
+        ]);
+        assert!(!out.status.success(), "{profile}: {}", text(&out));
+        assert!(text(&out).contains("--project"), "{}", text(&out));
+        assert!(!g.path("state").join("minds-witness").exists());
+        assert!(!g.root.join("managed-settings.minds-proposed.json").exists());
+    }
+}
+
 #[test]
 fn enable_witness_managed_writes_only_the_proposal() {
     let f = Fixture::new();

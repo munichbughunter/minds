@@ -82,6 +82,8 @@ const SIGNERS_MARK: &str = "MINDS-SIGNERS ";
 const MANAGED_MARK: &str = "MINDS-MANAGED ";
 const NOTE_MARK: &str = "MINDS-NOTE ";
 const INTENT_KEY_MARK: &str = "MINDS-INTENT-KEY ";
+/// Die Zeile des Skripts mit dem festgehaltenen Projekt (Spec S3 §6.1).
+const PROJECT_MARK: &str = "MINDS-PROJECT ";
 
 /// Wo die Homes geschützter Witnesses liegen (je Repo `<base>/<repo-id>`).
 /// Nur in Debug-Builds (Tests) über `MINDS_PROTECTED_BASE` verlegbar.
@@ -306,6 +308,7 @@ pub(crate) fn install(
     root: &Path,
     store: &minds_store::StoreConfig,
     verbose: bool,
+    project: Option<&str>,
 ) -> std::io::Result<Installed> {
     if !cfg!(any(target_os = "macos", target_os = "linux")) {
         return Err(other(
@@ -343,7 +346,10 @@ pub(crate) fn install(
     let intent_key = intent_key(&root);
     // Ein Witness-Dienst je Rechner: Läuft er schon, und mit diesem Binary,
     // braucht ein weiteres Repo keine Erhöhung.
-    if host_running() && !binary_differs() {
+    // Ein zu pinnendes Projekt (Spec S3 §6.1) hält nur `witness init` als
+    // Witness-Nutzer fest — über das Skript, nie über die Anmeldung beim
+    // Dienst: Die kann auch die Agent-Seite schicken.
+    if project.is_none() && host_running() && !binary_differs() {
         match register_with_host(&root, &intent_key, verbose) {
             Ok(installed) => return Ok(installed),
             Err(err) => eprintln!(
@@ -360,6 +366,7 @@ pub(crate) fn install(
         uid: euid,
         managed: existing_managed(),
         intent_key: intent_key.line(),
+        project,
     })?;
     if verbose {
         eprintln!("  setup script (run once as root):\n{script}");
@@ -374,6 +381,7 @@ pub(crate) fn install(
     let mut managed = None;
     let mut notes = Vec::new();
     let mut intent_keys = Vec::new();
+    let mut pinned_project = None;
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         if let Some(line) = line.strip_prefix(SIGNERS_MARK) {
             signers = Some(crate::text::sanitize(line.trim()));
@@ -383,6 +391,8 @@ pub(crate) fn install(
             notes.push(crate::text::sanitize(line.trim()));
         } else if let Some(line) = line.strip_prefix(INTENT_KEY_MARK) {
             intent_keys.push(crate::text::sanitize(line.trim()));
+        } else if let Some(line) = line.strip_prefix(PROJECT_MARK) {
+            pinned_project = Some(crate::text::sanitize(line.trim()));
         } else if !line.trim().is_empty() {
             eprintln!("  {}", crate::text::sanitize(line));
         }
@@ -407,6 +417,9 @@ pub(crate) fn install(
     };
     if answering {
         stop_local_service(&root);
+    }
+    if let Some(project) = &pinned_project {
+        eprintln!("minds: protected witness binds commits for project {project}");
     }
     Ok(Installed {
         socket: home_of(&root).join("run").join("witness.sock"),
@@ -634,6 +647,8 @@ struct Values<'a> {
     managed: Option<String>,
     /// Der Freigabe-Schlüssel für Intents ([`intent_key`]), falls einer.
     intent_key: Option<&'a str>,
+    /// Das Projekt, das der Witness festhält (Spec S3 §6.1), falls genannt.
+    project: Option<&'a str>,
 }
 
 /// Der Sicherheitsschlüssel aus `minds.intentKey` als Freigabe-Schlüssel
@@ -724,7 +739,15 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
     };
     let _ = id;
     let managed = managed_plan(managed_rules()?, values.managed.as_deref())?;
-    let pairs: [(&str, String); 15] = [
+    if values
+        .project
+        .is_some_and(|p| !minds_witness_git::binding::is_project_id(p))
+    {
+        return Err(other(
+            "--project must have the form <instance>/project-<id>",
+        ));
+    }
+    let pairs: [(&str, String); 16] = [
         ("SOURCE", quote(&text(values.source)?)),
         ("BINARY", quote(BINARY)),
         ("WUSER", quote(WITNESS_USER)),
@@ -740,6 +763,7 @@ fn script(values: &Values<'_>) -> std::io::Result<String> {
         ("MANAGED_CONTENT", quote(&managed.content)),
         ("MANAGED_PREVIOUS", quote(&managed.previous)),
         ("INTENT_KEY", quote(values.intent_key.unwrap_or_default())),
+        ("PROJECT", quote(values.project.unwrap_or_default())),
     ];
     fill(template, &pairs)
 }
@@ -1515,6 +1539,7 @@ mod tests {
             uid: 501,
             managed: None,
             intent_key: None,
+            project: None,
         }
     }
 
@@ -1602,7 +1627,7 @@ mod tests {
     /// der anderen Plattform, die hier nie gerendert wird.
     #[test]
     fn both_templates_use_only_known_placeholders() {
-        const KNOWN: [&str; 15] = [
+        const KNOWN: [&str; 16] = [
             "SOURCE",
             "BINARY",
             "WUSER",
@@ -1618,6 +1643,7 @@ mod tests {
             "MANAGED_CONTENT",
             "MANAGED_PREVIOUS",
             "INTENT_KEY",
+            "PROJECT",
         ];
         for template in [
             include_str!("../templates/witness/protected-macos.sh"),
@@ -1858,11 +1884,38 @@ mod tests {
         let key = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29t";
         let script = super::script(&Values {
             intent_key: Some(key),
+            project: None,
             ..values(&root, source)
         })
         .unwrap();
         assert!(script.contains(&format!("INTENT_KEY='{key}'")), "{script}");
         assert!(script.contains("--intent-key \"$INTENT_KEY\""), "{script}");
+    }
+
+    /// Spec S3 §6.1: `--project` geht als eingesetzter Wert an `witness
+    /// init --project` — nur, wenn einer genannt ist; eine ungültige Form
+    /// erreicht das Skript nie.
+    #[test]
+    fn the_script_pins_the_project_only_when_there_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        let source = Path::new("/opt/minds/bin/minds");
+        let with = Values {
+            project: Some("git.test/project-42"),
+            ..values(&root, source)
+        };
+        let text = script(&with).unwrap();
+        assert!(text.contains("PROJECT='git.test/project-42'"), "{text}");
+        assert!(text.contains("--project \"$PROJECT\""), "{text}");
+        assert!(text.contains("MINDS-PROJECT"), "{text}");
+        let text = script(&values(&root, source)).unwrap();
+        assert!(text.contains("PROJECT=''"), "{text}");
+        let bad = Values {
+            project: Some("git.test/group/repo"),
+            ..values(&root, source)
+        };
+        assert!(script(&bad).is_err());
     }
 
     /// Der Weg über das Passwort: Die Anfrage geht über stdin an das

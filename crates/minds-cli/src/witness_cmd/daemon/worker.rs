@@ -73,6 +73,16 @@ struct Request {
     /// Die lokale Id des eigenen Stroms (`agent = "witness"`), dessen
     /// Beobachtungs-Epoche dieser Checkpoint schließt.
     stream: Option<String>,
+    /// Statt eines Checkpoints ein `bind` (Spec S3 §6.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bind: Option<BindJob>,
+}
+
+/// Was ein `bind` im Worker braucht.
+#[derive(Serialize, Deserialize)]
+struct BindJob {
+    expected_project: String,
+    dry_run: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,7 +112,33 @@ pub(super) fn run(
     stream: Option<&SessionKey>,
     requester_alive: &dyn Fn() -> bool,
 ) -> Result<Ran, Failure> {
-    run_within(exe, home, commit, stream, requester_alive, DEADLINE)
+    run_within(exe, home, commit, stream, None, requester_alive, DEADLINE)
+}
+
+/// Ein `bind` im Worker (Spec S3 §6.1) — dieselbe Isolation, Frist und
+/// Grenzen wie ein Checkpoint. Liefert die Statuszeile.
+pub(super) fn run_bind(
+    exe: &Path,
+    home: &Path,
+    commit: &str,
+    expected_project: &str,
+    dry_run: bool,
+    requester_alive: &dyn Fn() -> bool,
+) -> Result<String, Failure> {
+    let job = BindJob {
+        expected_project: expected_project.to_owned(),
+        dry_run,
+    };
+    run_within(
+        exe,
+        home,
+        commit,
+        None,
+        Some(&job),
+        requester_alive,
+        DEADLINE,
+    )
+    .map(|ran| ran.status)
 }
 
 fn run_within(
@@ -110,12 +146,17 @@ fn run_within(
     home: &Path,
     commit: &str,
     stream: Option<&SessionKey>,
+    bind: Option<&BindJob>,
     requester_alive: &dyn Fn() -> bool,
     deadline: Duration,
 ) -> Result<Ran, Failure> {
     let request = serde_json::to_string(&Request {
         commit: commit.to_owned(),
         stream: stream.map(|key| key.local_id().to_owned()),
+        bind: bind.map(|job| BindJob {
+            expected_project: job.expected_project.clone(),
+            dry_run: job.dry_run,
+        }),
     })
     .map_err(|_| Failure::Aborted("worker request not encodable"))?;
     let mut command = Command::new(exe);
@@ -383,6 +424,32 @@ pub(crate) fn worker(home: &Path) -> Fallible<()> {
         .read_line(&mut line)?;
     let request: Request = serde_json::from_str(&line)?;
     let config = load(&home)?;
+    if let Some(job) = &request.bind {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::bind::bind(
+                &home,
+                &config,
+                &request.commit,
+                &job.expected_project,
+                job.dry_run,
+            )
+        }));
+        let mut out = std::io::stdout().lock();
+        match result {
+            Ok(Ok(status)) => writeln!(
+                out,
+                "D {}",
+                serde_json::to_string(&Done {
+                    status,
+                    retrofitted: None,
+                })?
+            )?,
+            Ok(Err(err)) => writeln!(out, "E {}", one_line(&err.to_string()))?,
+            Err(_) => writeln!(out, "E bind panicked")?,
+        }
+        out.flush()?;
+        return Ok(());
+    }
     let mut writer = Writer::for_worker(&home, config)?;
     writer.stream = request
         .stream
@@ -497,7 +564,7 @@ mod tests {
     fn run_stub(body: &str, alive: &dyn Fn() -> bool, deadline: Duration) -> Result<Ran, Failure> {
         let dir = tempfile::tempdir().unwrap();
         let exe = stub(dir.path(), body);
-        run_within(&exe, &home(dir.path()), "abc", None, alive, deadline)
+        run_within(&exe, &home(dir.path()), "abc", None, None, alive, deadline)
     }
 
     #[test]
@@ -511,7 +578,7 @@ case "$request" in *'"commit":"abc"'*) ;; *) exit 3 ;; esac
 echo 'L from the worker'
 echo 'D {"status":"witness: 1 range(s) sealed","retrofitted":"def"}'"#,
         );
-        let Ok(ran) = run_within(&exe, &home, "abc", None, &|| true, DEADLINE) else {
+        let Ok(ran) = run_within(&exe, &home, "abc", None, None, &|| true, DEADLINE) else {
             panic!("worker failed");
         };
         assert_eq!(ran.status, "witness: 1 range(s) sealed");
@@ -589,7 +656,7 @@ head -c 70000 /dev/zero | tr '\0' 'a'
 printf 'AKIAIOSFODNN7EXAMPLE\n'
 echo 'D {"status":"sealed","retrofitted":null}'"#,
         );
-        let Ok(ran) = run_within(&exe, &home, "abc", None, &|| true, DEADLINE) else {
+        let Ok(ran) = run_within(&exe, &home, "abc", None, None, &|| true, DEADLINE) else {
             panic!("worker failed");
         };
         assert_eq!(ran.status, "sealed");

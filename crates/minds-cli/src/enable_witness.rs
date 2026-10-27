@@ -98,10 +98,11 @@ pub(crate) fn run(
     root: &Path,
     profile: Profile,
     store: &minds_store::StoreConfig,
+    project: Option<&str>,
 ) -> std::io::Result<Option<String>> {
     #[cfg(not(unix))]
     {
-        let _ = (root, profile, store);
+        let _ = (root, profile, store, project);
         Err(std::io::Error::other(
             "--witness is not supported on this platform",
         ))
@@ -114,8 +115,8 @@ pub(crate) fn run(
             minds_store::Backend::InRepo => None,
         };
         match profile {
-            Profile::Container => container(&root, child_repo),
-            Profile::User => user(&root).map(|()| None),
+            Profile::Container => container(&root, child_repo, project),
+            Profile::User => user(&root, project).map(|()| None),
             Profile::Managed => managed(&root).map(|()| None),
         }
     }
@@ -164,7 +165,11 @@ fn other(err: impl std::fmt::Display) -> std::io::Error {
 }
 
 #[cfg(unix)]
-fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<Option<String>> {
+fn container(
+    root: &Path,
+    child_repo: Option<&Path>,
+    project: Option<&str>,
+) -> std::io::Result<Option<String>> {
     use crate::witness_cmd::{InitRequest, Initialized};
 
     let root_text = utf8(root)?;
@@ -196,6 +201,7 @@ fn container(root: &Path, child_repo: Option<&Path>) -> std::io::Result<Option<S
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project,
         },
     )
     .map_err(other)?;
@@ -382,6 +388,7 @@ pub(crate) fn default(
     store: &minds_store::StoreConfig,
     mode: LocalMode,
     verbose: bool,
+    project: Option<&str>,
 ) -> std::io::Result<Option<String>> {
     if mode == LocalMode::Off {
         return Ok(None);
@@ -395,8 +402,12 @@ pub(crate) fn default(
         match &found {
             // Läuft er, bleibt er — außer `MINDS_WITNESS=protected` verlangt
             // ausdrücklich, ihn neu einzurichten (etwa nach einem Update).
+            // Ein zu pinnendes Projekt braucht die Einrichtung (als
+            // Witness-Nutzer, Spec S3 §6.1) — dann nicht stehen lassen.
             Some((socket, _))
-                if mode != LocalMode::Protected && crate::witness_cmd::ping(socket) =>
+                if mode != LocalMode::Protected
+                    && project.is_none()
+                    && crate::witness_cmd::ping(socket) =>
             {
                 eprintln!(
                     "minds: protected witness running for this repository (user {}, socket {})",
@@ -444,7 +455,7 @@ pub(crate) fn default(
             _ => false,
         };
         if protected {
-            match crate::enable_protected::install(root, store, verbose) {
+            match crate::enable_protected::install(root, store, verbose, project) {
                 Ok(installed) => {
                     return Ok(report_protected(&installed));
                 }
@@ -471,7 +482,7 @@ pub(crate) fn default(
         LocalMode::Ask | LocalMode::Protected => LocalMode::On,
         mode => mode,
     };
-    Ok(local(root, store, mode, verbose))
+    Ok(local(root, store, mode, verbose, project))
 }
 
 /// Was nach der geschützten Einrichtung zu sagen ist: wo er läuft, die
@@ -556,6 +567,7 @@ pub(crate) fn local(
     store: &minds_store::StoreConfig,
     mode: LocalMode,
     verbose: bool,
+    project: Option<&str>,
 ) -> Option<String> {
     if mode == LocalMode::Off {
         return None;
@@ -574,9 +586,15 @@ pub(crate) fn local(
         };
         match root
             .canonicalize()
-            .and_then(|root| local_unix(&root, child_repo, mode, verbose))
+            .and_then(|root| local_unix(&root, child_repo, mode, verbose, project))
         {
             Ok(LocalOutcome::Kept(profile)) => {
+                if project.is_some() {
+                    crate::text::warn(
+                        "--project was not pinned: the witness of this repository has another \
+                         profile — pin it with `minds witness init --project` as its user",
+                    );
+                }
                 crate::text::warn(&format!(
                     "a witness with profile {profile} is set up for this repository — enable \
                      leaves it as it is; hooks outside its isolation record into the local \
@@ -618,7 +636,7 @@ pub(crate) fn local(
     }
     #[cfg(not(unix))]
     {
-        let _ = (root, store, verbose);
+        let _ = (root, store, verbose, project);
         crate::text::warn("no witness on this platform — hooks record into the local journal (A1)");
         None
     }
@@ -630,6 +648,7 @@ fn local_unix(
     child_repo: Option<&Path>,
     mode: LocalMode,
     verbose: bool,
+    project: Option<&str>,
 ) -> std::io::Result<LocalOutcome> {
     use crate::witness_cmd::InitRequest;
 
@@ -696,6 +715,7 @@ fn local_unix(
             policy_rev: None,
             intent_key: None,
             replace_intent_key: false,
+            project,
         },
     )
     .map_err(other)?;
@@ -1473,7 +1493,7 @@ fn xml_escape(text: &str) -> std::io::Result<String> {
 /// Das `user`-Profil: druckt die Schritte samt Service-Unit. Ausgeführt
 /// wird nichts — jeder Schritt braucht Administratorrechte.
 #[cfg(unix)]
-fn user(root: &Path) -> std::io::Result<()> {
+fn user(root: &Path, project: Option<&str>) -> std::io::Result<()> {
     let id = repo_id(root);
     let user = current_user()?;
     if user.chars().any(char::is_control) {
@@ -1483,6 +1503,10 @@ fn user(root: &Path) -> std::io::Result<()> {
         .replace("{{UNIT}}", &USER_UNIT.replace("{{REPO_ID}}", &id))
         .replace("{{REPO_ID}}", &id)
         .replace("{{USER}}", &shell_quote(&user))
+        .replace(
+            "{{PROJECT_ARG}}",
+            &project.map_or_else(String::new, |p| format!(" --project {}", shell_quote(p))),
+        )
         .replace("{{ROOT}}", &shell_quote(utf8(root)?));
     if !cfg!(target_os = "linux") {
         println!(
@@ -1703,6 +1727,7 @@ mod tests {
             .replace("{{UNIT}}", &USER_UNIT.replace("{{REPO_ID}}", id))
             .replace("{{REPO_ID}}", id)
             .replace("{{USER}}", "x")
+            .replace("{{PROJECT_ARG}}", "")
             .replace("{{ROOT}}", "x");
         assert!(!steps.contains("{{"), "{steps}");
         let unit = SYSTEMD_UNIT

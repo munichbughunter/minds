@@ -1847,6 +1847,8 @@ dependencies = [
  "minds-redact",
  "minds-store",
  "minds-tui",
+ "minds-witness-core",
+ "minds-witness-git",
  "notify",
  "serde",
  "serde_json",

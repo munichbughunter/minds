@@ -172,6 +172,18 @@ fn examples() -> Vec<Frame> {
             repo: "/Users/dev/repo".into(),
             request_id: ID,
         },
+        Frame::Bind {
+            commit: "a".repeat(40),
+            expected_project: "git.test/project-42".into(),
+            dry_run: false,
+            request_id: ID,
+        },
+        Frame::Bind {
+            commit: "b".repeat(64),
+            expected_project: "gitlab.example.com:8443/project-1".into(),
+            dry_run: true,
+            request_id: ID,
+        },
     ]
 }
 
@@ -336,10 +348,12 @@ fn frame_golden_vectors() {
     let frames = all[..6]
         .iter()
         .chain([
-            &all[all.len() - 6],
+            // Die beiden `Bind`-Beispiele stehen am Ende (eigene Bytes in
+            // `bind_frames_are_strict`).
+            &all[all.len() - 8],
+            &all[all.len() - 7],
             &all[all.len() - 5],
             &all[all.len() - 3],
-            &all[all.len() - 1],
         ])
         .cloned();
     for (frame, line) in frames.zip(lines) {
@@ -414,7 +428,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=12 | 0x81 | 0x82) {
+        if matches!(kind, 1..=13 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(
@@ -459,6 +473,7 @@ fn complete_payload_with_missing_fields_or_trailing_bytes_is_malformed() {
                 | Frame::IntentActivateProven { .. }
                 | Frame::Register { .. }
                 | Frame::Unregister { .. }
+                | Frame::Bind { .. }
         ) {
             let mut extra = payload.to_vec();
             extra.push(0);
@@ -887,4 +902,68 @@ fn proven_activation_requires_a_lowercase_hex_nonce_and_a_proof() {
         .unwrap();
     bytes[at..at + nonce.len()].copy_from_slice("0A".repeat(32).as_bytes());
     assert_eq!(measured_decode(&bytes), Err(ProtoError::BadField("nonce")));
+}
+
+/// Spec S3 §6.1, s3_15: Die Bindungsanfrage trägt genau Commit, erwartetes
+/// Projekt und den Trockenlauf-Schalter — keine Seals, keine Bytes, keinen
+/// Schlüssel. Alles darüber hinaus ist kein gültiger Frame.
+#[test]
+fn bind_frames_are_strict() {
+    let good = Frame::Bind {
+        commit: "a".repeat(40),
+        expected_project: "git.test/project-42".into(),
+        dry_run: false,
+        request_id: ID,
+    };
+    let bytes = encode(&good).unwrap();
+    assert_eq!(measured_decode(&bytes).unwrap().0, good);
+    // Kind, Commit, Projekt, Schalter, Id: nichts sonst.
+    let mut payload = vec![0x0d];
+    payload.extend(short("a".repeat(40).as_bytes()));
+    payload.extend(short(b"git.test/project-42"));
+    payload.push(0);
+    payload.extend_from_slice(&ID);
+    assert_eq!(wire(&payload), bytes);
+    let mut extra = payload.clone();
+    extra.extend(short(b"b3-seal"));
+    assert_eq!(
+        measured_decode(&wire(&extra)),
+        Err(ProtoError::BadField("trailing bytes"))
+    );
+    // Schalter nur 0 oder 1.
+    let mut flag = payload.clone();
+    let at = flag.len() - 17;
+    flag[at] = 2;
+    assert_eq!(
+        measured_decode(&wire(&flag)),
+        Err(ProtoError::BadField("dry_run"))
+    );
+    // Commit: volle Id in Kleinbuchstaben, Pflicht; Projekt: ein Wort, Pflicht.
+    for (commit, project, field) in [
+        ("A".repeat(40), "git.test/project-1".to_owned(), "commit"),
+        ("a".repeat(39), "git.test/project-1".to_owned(), "commit"),
+        (String::new(), "git.test/project-1".to_owned(), "commit"),
+        ("a".repeat(40), String::new(), "expected_project"),
+        ("a".repeat(40), "a b".to_owned(), "expected_project"),
+        ("a".repeat(40), "x\u{7}".to_owned(), "expected_project"),
+        ("a".repeat(40), "p".repeat(257), "expected_project"),
+    ] {
+        let frame = Frame::Bind {
+            commit: commit.clone(),
+            expected_project: project.clone(),
+            dry_run: false,
+            request_id: ID,
+        };
+        assert_eq!(encode(&frame), Err(ProtoError::BadField(field)), "{field}");
+        let mut payload = vec![0x0d];
+        payload.extend(short(commit.as_bytes()));
+        payload.extend(short(project.as_bytes()));
+        payload.push(0);
+        payload.extend_from_slice(&ID);
+        assert_eq!(
+            measured_decode(&wire(&payload)),
+            Err(ProtoError::BadField(field)),
+            "{field}"
+        );
+    }
 }

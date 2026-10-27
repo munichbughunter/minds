@@ -111,35 +111,7 @@ impl<'a> GitObjectAccess<'a> {
         if let Some(memo) = self.changed.borrow().get(id) {
             return Ok(memo.clone());
         }
-        let c = self.repo.commit_parents(id)?;
-        let mut result: Option<BTreeSet<Vec<u8>>> = None;
-        if c.parents.is_empty() {
-            result = Some(
-                self.repo
-                    .tree_diff(None, Some(&c.tree))?
-                    .into_iter()
-                    .map(|d| d.path)
-                    .collect(),
-            );
-        }
-        for p in &c.parents {
-            let ptree = self.repo.commit_parents(p)?.tree;
-            let set: BTreeSet<Vec<u8>> = self
-                .repo
-                .tree_diff(Some(&ptree), Some(&c.tree))?
-                .into_iter()
-                .map(|d| d.path)
-                .collect();
-            result = Some(match result {
-                None => set,
-                Some(acc) => acc.intersection(&set).cloned().collect(),
-            });
-        }
-        let out: BTreeSet<String> = result
-            .unwrap_or_default()
-            .iter()
-            .map(|p| path_form(p))
-            .collect();
+        let out = changed_paths_of(self.repo, id)?;
         self.changed.borrow_mut().insert(id.to_owned(), out.clone());
         Ok(out)
     }
@@ -252,44 +224,19 @@ impl ObjectAccess for GitObjectAccess<'_> {
             Some(_) => return Err(ObjectError::Internal("target is not a commit".to_owned())),
             None => return Err(ObjectError::NotFound(new.as_str().to_owned())),
         }
-        let nots: Vec<String> = old.map(|o| o.as_str().to_owned()).into_iter().collect();
         let time = self.budget.remaining().unwrap_or(DEFAULT_PROCESS_TIME);
-        let rows = self
-            .repo
-            .rev_list(self.git, new.as_str(), &nots, limit as usize + 1, time)
-            .map_err(internal)?;
-        let truncated = rows.len() > limit as usize;
-        let set: BTreeSet<&str> = rows.iter().map(|(c, _)| c.as_str()).collect();
-        // Jede gelieferte Id als Commit verifizieren.
-        for (c, _) in &rows {
-            self.repo.commit_parents(c).map_err(internal)?;
-        }
-        // Kahn, eingeschränkt auf M, kleinste Id zuerst.
-        let mut indegree: BTreeMap<&str, usize> = rows
-            .iter()
-            .map(|(c, ps)| {
-                (
-                    c.as_str(),
-                    ps.iter().filter(|p| set.contains(p.as_str())).count(),
-                )
-            })
-            .collect();
-        let mut order = Vec::with_capacity(rows.len());
-        while let Some(next) = indegree.iter().find(|(_, n)| **n == 0).map(|(c, _)| *c) {
-            indegree.remove(next);
-            for (c, ps) in &rows {
-                if ps.iter().any(|p| p == next)
-                    && let Some(n) = indegree.get_mut(c.as_str())
-                {
-                    *n -= 1;
-                }
-            }
-            order.push(next);
-        }
-        if order.len() != rows.len() {
-            return Err(ObjectError::Internal("commit graph has a cycle".to_owned()));
-        }
-        order.truncate(limit as usize);
+        let (order, truncated) = commit_set(
+            self.repo,
+            self.git,
+            old.map(CommitId::as_str),
+            new.as_str(),
+            limit as usize,
+            time,
+        )
+        .map_err(|e| match e {
+            CommitSetError::Read(e) => internal(e),
+            CommitSetError::Cycle => ObjectError::Internal("commit graph has a cycle".to_owned()),
+        })?;
         let counted = if truncated { 1 } else { order.len() as u32 };
         let total = self.evaluated.get().saturating_add(counted);
         if total > self.limits.max_total_commits_per_push {
@@ -297,7 +244,7 @@ impl ObjectAccess for GitObjectAccess<'_> {
         }
         self.evaluated.set(total);
         let commits = order
-            .into_iter()
+            .iter()
             .map(|c| CommitId::parse(c).map_err(|_| ObjectError::Internal("commit id".to_owned())))
             .collect::<Result<_, _>>()?;
         Ok(CommitRange { commits, truncated })
@@ -321,35 +268,11 @@ impl EvidenceView for GitObjectAccess<'_> {
     }
 
     fn tree(&self, commit: &str) -> Result<Vec<TreeEntry>, ViewError> {
-        let c = self.repo.commit_parents(commit).map_err(view_err)?;
-        let entries = self.repo.tree_entries(&c.tree).map_err(view_err)?;
-        entries
-            .into_iter()
-            .map(|e| {
-                let size = self.repo.size(&e.oid).map_err(view_err)?.unwrap_or(0);
-                Ok(TreeEntry {
-                    name: String::from_utf8_lossy(&e.name).into_owned(),
-                    mode: e.mode,
-                    oid: e.oid,
-                    size,
-                })
-            })
-            .collect()
+        tree_of(self.repo, commit)
     }
 
     fn entry(&self, commit: &str, path: &str) -> Result<Option<TreeEntry>, ViewError> {
-        let c = self.repo.commit_parents(commit).map_err(view_err)?;
-        let parts: Vec<&[u8]> = path.split('/').map(str::as_bytes).collect();
-        let Some(e) = self.repo.lookup(&c.tree, &parts).map_err(view_err)? else {
-            return Ok(None);
-        };
-        let size = self.repo.size(&e.oid).map_err(view_err)?.unwrap_or(0);
-        Ok(Some(TreeEntry {
-            name: path.to_owned(),
-            mode: e.mode,
-            oid: e.oid,
-            size,
-        }))
+        entry_of(self.repo, commit, path)
     }
 
     fn parents(&self, commit: &str) -> Result<Vec<String>, ViewError> {
@@ -358,6 +281,187 @@ impl EvidenceView for GitObjectAccess<'_> {
 
     fn changed_paths(&self, commit: &str) -> Result<BTreeSet<String>, ViewError> {
         self.changed(commit).map_err(view_err)
+    }
+
+    fn blob(&self, oid: &str, max: u64) -> Result<Option<Vec<u8>>, ViewError> {
+        self.repo.blob_bytes(oid, max).map_err(view_err)
+    }
+}
+
+/// Spec S2 §7.4: die geänderten Pfade von `id` — gegen den leeren Baum ohne
+/// Eltern, sonst die Schnittmenge der Änderungen gegen jeden Elternteil (ein
+/// Moduswechsel zählt), in der Pfadform aus S1 v1.5 V6. Geteilt von Server
+/// ([`GitObjectAccess`]) und Witness ([`RepoView`]).
+pub fn changed_paths_of(repo: &ServerRepo, id: &str) -> Result<BTreeSet<String>, ReceiveError> {
+    let c = repo.commit_parents(id)?;
+    let mut result: Option<BTreeSet<Vec<u8>>> = None;
+    if c.parents.is_empty() {
+        result = Some(
+            repo.tree_diff(None, Some(&c.tree))?
+                .into_iter()
+                .map(|d| d.path)
+                .collect(),
+        );
+    }
+    for p in &c.parents {
+        let ptree = repo.commit_parents(p)?.tree;
+        let set: BTreeSet<Vec<u8>> = repo
+            .tree_diff(Some(&ptree), Some(&c.tree))?
+            .into_iter()
+            .map(|d| d.path)
+            .collect();
+        result = Some(match result {
+            None => set,
+            Some(acc) => acc.intersection(&set).cloned().collect(),
+        });
+    }
+    Ok(result
+        .unwrap_or_default()
+        .iter()
+        .map(|p| path_form(p))
+        .collect())
+}
+
+/// Warum [`commit_set`] scheiterte.
+#[derive(Debug)]
+pub enum CommitSetError {
+    /// Lesen oder `rev-list` scheiterte.
+    Read(ReceiveError),
+    /// Die Elternbeziehung der gelieferten Commits hat einen Zyklus.
+    Cycle,
+}
+
+/// Spec S2 §7.3, S1 „neue Commits“: `rev-list <new> [--not <old>]`,
+/// höchstens `limit` Commits, in Kahn-Ordnung (Eltern vor Kindern, kleinste
+/// Id zuerst), dazu ob abgeschnitten wurde. Jede gelieferte Id wird als
+/// Commit verifiziert. Geteilt vom Server (`new_commits`) und vom Client
+/// (`minds bind`, Spec S3 §6.1): beide bestimmen dieselbe Menge.
+pub fn commit_set(
+    repo: &ServerRepo,
+    git: &Path,
+    old: Option<&str>,
+    new: &str,
+    limit: usize,
+    time: Duration,
+) -> Result<(Vec<String>, bool), CommitSetError> {
+    let nots: Vec<String> = old.map(str::to_owned).into_iter().collect();
+    let rows = repo
+        .rev_list(git, new, &nots, limit + 1, time)
+        .map_err(CommitSetError::Read)?;
+    let truncated = rows.len() > limit;
+    let set: BTreeSet<&str> = rows.iter().map(|(c, _)| c.as_str()).collect();
+    for (c, _) in &rows {
+        repo.commit_parents(c).map_err(CommitSetError::Read)?;
+    }
+    let mut indegree: BTreeMap<&str, usize> = rows
+        .iter()
+        .map(|(c, ps)| {
+            (
+                c.as_str(),
+                ps.iter().filter(|p| set.contains(p.as_str())).count(),
+            )
+        })
+        .collect();
+    let mut order = Vec::with_capacity(rows.len());
+    while let Some(next) = indegree.iter().find(|(_, n)| **n == 0).map(|(c, _)| *c) {
+        indegree.remove(next);
+        for (c, ps) in &rows {
+            if ps.iter().any(|p| p == next)
+                && let Some(n) = indegree.get_mut(c.as_str())
+            {
+                *n -= 1;
+            }
+        }
+        order.push(next.to_owned());
+    }
+    if order.len() != rows.len() {
+        return Err(CommitSetError::Cycle);
+    }
+    order.truncate(limit);
+    Ok((order, truncated))
+}
+
+fn tree_of(repo: &ServerRepo, commit: &str) -> Result<Vec<TreeEntry>, ViewError> {
+    let c = repo.commit_parents(commit).map_err(view_err)?;
+    let entries = repo.tree_entries(&c.tree).map_err(view_err)?;
+    entries
+        .into_iter()
+        .map(|e| {
+            let size = repo.size(&e.oid).map_err(view_err)?.unwrap_or(0);
+            Ok(TreeEntry {
+                name: String::from_utf8_lossy(&e.name).into_owned(),
+                mode: e.mode,
+                oid: e.oid,
+                size,
+            })
+        })
+        .collect()
+}
+
+fn entry_of(repo: &ServerRepo, commit: &str, path: &str) -> Result<Option<TreeEntry>, ViewError> {
+    let c = repo.commit_parents(commit).map_err(view_err)?;
+    let parts: Vec<&[u8]> = path.split('/').map(str::as_bytes).collect();
+    let Some(e) = repo.lookup(&c.tree, &parts).map_err(view_err)? else {
+        return Ok(None);
+    };
+    let size = repo.size(&e.oid).map_err(view_err)?.unwrap_or(0);
+    Ok(Some(TreeEntry {
+        name: path.to_owned(),
+        mode: e.mode,
+        oid: e.oid,
+        size,
+    }))
+}
+
+/// Die Objektsicht über einem lokalen Repository (Witness, `minds bind`):
+/// dieselben Lesewege wie [`GitObjectAccess`], Refs nur direkt aus dem
+/// Repository (keine Push-Updates, Symrefs zählen nicht).
+pub struct RepoView<'a> {
+    repo: &'a ServerRepo,
+    changed: RefCell<HashMap<String, BTreeSet<String>>>,
+}
+
+impl<'a> RepoView<'a> {
+    /// Eine Sicht über `repo`.
+    pub fn new(repo: &'a ServerRepo) -> Self {
+        Self {
+            repo,
+            changed: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl EvidenceView for RepoView<'_> {
+    fn resolve_ref(&self, name: &str) -> Result<Option<String>, ViewError> {
+        Ok(
+            match self.repo.prestate().read_ref(name).map_err(view_err)? {
+                Some(RefTarget::Direct(id)) => Some(id),
+                _ => None,
+            },
+        )
+    }
+
+    fn tree(&self, commit: &str) -> Result<Vec<TreeEntry>, ViewError> {
+        tree_of(self.repo, commit)
+    }
+
+    fn entry(&self, commit: &str, path: &str) -> Result<Option<TreeEntry>, ViewError> {
+        entry_of(self.repo, commit, path)
+    }
+
+    fn parents(&self, commit: &str) -> Result<Vec<String>, ViewError> {
+        Ok(self.repo.commit_parents(commit).map_err(view_err)?.parents)
+    }
+
+    fn changed_paths(&self, commit: &str) -> Result<BTreeSet<String>, ViewError> {
+        if let Some(memo) = self.changed.borrow().get(commit) {
+            return Ok(memo.clone());
+        }
+        let out = changed_paths_of(self.repo, commit).map_err(view_err)?;
+        self.changed
+            .borrow_mut()
+            .insert(commit.to_owned(), out.clone());
+        Ok(out)
     }
 
     fn blob(&self, oid: &str, max: u64) -> Result<Option<Vec<u8>>, ViewError> {

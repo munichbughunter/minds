@@ -38,6 +38,7 @@
 mod agent_help;
 mod anchor_cmd;
 mod audit;
+mod bind_cmd;
 mod blame;
 mod brief_cmd;
 mod checkpoint;
@@ -94,6 +95,7 @@ minds — durable context for agent sessions, in Git.
 
 Usage:
   minds enable [--agent <name>] [--child-repo <path>] [--child-remote <url>] [-v] [--ref <name>] [--recall]
+               [--project <instance>/project-<id>]
         Sets the repo up for Minds: registers the hooks with the agent
         and in the repo and writes the store config to .git/config.
         Runs quietly; -v/--verbose shows every single step.
@@ -133,6 +135,9 @@ Usage:
         steps. managed: writes managed-settings.minds-proposed.json.
         Never runs privileged commands, never overwrites existing files
         (a *.minds-proposed file is written next to them instead).
+        --project <instance>/project-<id>: pins the project the witness
+        binds commits for (minds bind), where none is pinned yet — for a
+        protected witness through the setup with administrator rights.
 
   minds disable [--all] [-v]
         Takes back what enable set up in this repository: the agent hook
@@ -155,13 +160,30 @@ Usage:
         stores the sessions and appends the Minds-Session-Id trailer to
         HEAD. Called by the post-commit hook.
 
+  minds bind [<rev-range>] [--remote <r>] [--dry-run]
+        Asks the witness to bind commits to its own content-bound seals
+        (refs/minds/bindings/<commit>/<id>), for the project in
+        `git config minds.project` — the witness binds only for the
+        project pinned in its witness.json and refuses another. Without
+        a range: HEAD against the upstream (or refs/remotes/<r>/<branch>
+        with --remote); a new branch binds all reachable commits like the
+        server counts them (at most 500). <a>..<b> binds the commits of
+        b not in a; a single rev all commits reachable from it.
+        Prints per commit how many changed files the binding covers —
+        what the server credits only if it trusts this witness's key and
+        has its seals and observations; --dry-run shows the selection
+        without signing anything.
+
   minds witness init --repo <host-path> [--home <directory>] [--path-map <agent>=<host>]
                      [--profile container|user|managed] [--socket-group <group>]
                      [--child-repo <path>] [--policy-rev <rev>]
+                     [--project <instance>/project-<id>]
         init pins git dir, store and redaction policy (.minds/redact.json at
         HEAD or --policy-rev, read without config includes or replace refs)
         in witness.json and prints them with commit and blob id; a
-        child-repo store only with --child-repo. Idempotent; never
+        child-repo store only with --child-repo. --project pins the project
+        the witness binds commits for (minds bind) where none is pinned yet;
+        a different pinned project is never replaced. Idempotent; never
         overwrites a different configuration.
   minds witness run [--home <directory>] [--follow]
   minds witness status [--home <directory>]
@@ -588,6 +610,7 @@ const SPECS: &[Spec] = &[
             "--child-remote",
             "--ref",
             "--witness",
+            "--project",
         ],
         bool_flags: &["-v", "--verbose", "--recall", "--global-hooks"],
         hidden_flags: &[enable::BACKGROUND_IMPORT_FLAG],
@@ -596,6 +619,7 @@ const SPECS: &[Spec] = &[
     spec("disable", &[], &["--all", "-v", "--verbose"], 0),
     spec("hook", &["--agent", "--event"], &[], 0),
     spec("checkpoint", &["--commit"], &[], 0),
+    spec("bind", &["--remote"], &["--dry-run"], 1),
     spec(
         "witness",
         &[
@@ -609,6 +633,7 @@ const SPECS: &[Spec] = &[
             "--intent-key",
             "--replace-intent-key",
             "--base",
+            "--project",
         ],
         &["--follow"],
         1,
@@ -1028,7 +1053,10 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                     parsed.has("-v") || parsed.has("--verbose"),
                     parsed.has("--recall"),
                     parsed.has("--global-hooks"),
-                    parsed.value("--witness"),
+                    enable::WitnessArgs {
+                        profile: parsed.value("--witness"),
+                        project: parsed.value("--project"),
+                    },
                 )
             }
         }
@@ -1041,6 +1069,12 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "hook" => hook::run(parsed.value("--agent"), parsed.value("--event")),
 
         "checkpoint" => checkpoint::run(parsed.value("--commit")),
+
+        "bind" => bind_cmd::run(
+            parsed.positional(0),
+            parsed.value("--remote"),
+            parsed.has("--dry-run"),
+        ),
 
         "show" => show::run(parsed.positional(0), parsed.has("--full")),
 

@@ -1239,6 +1239,7 @@ fn replacing_the_intent_key_needs_neither_the_group_nor_a_valid_old_entry() {
         policy_rev: None,
         intent_key,
         replace_intent_key,
+        project: None,
     };
     let key = fido::key();
     let other = fido::other_key();
@@ -1524,6 +1525,7 @@ fn pin(f: &Fixture, key: &str) {
             policy_rev: None,
             intent_key: Some(key),
             replace_intent_key: true,
+            project: None,
         },
     )
     .unwrap();
