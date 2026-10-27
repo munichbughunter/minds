@@ -1,6 +1,6 @@
 //! Sichere Warnungsausgabe auf dem Push-Kanal (Spec S2 v0.4.1 §11,
 //! ADR-PRODUCT-001). Eine Funktion von `PreOutcome` und `PostOutcome`
-//! allein: feste Sätze, Ref-Namen (nur druckbares ASCII), gekürzte
+//! allein: feste Sätze, Ref-Namen (escaped und begrenzt), gekürzte
 //! Commit-Ids, Zähler, Prozentwerte, Schwelle und Zustandswörter; nie
 //! Pfade, Objektinhalte, Fehlertexte oder Panic-Payloads. Die Ausgabe
 //! behauptet nie eine erfolgreiche Git-Annahme.
@@ -396,7 +396,7 @@ mod tests {
             out[3],
             "minds-witness: Warnung: refs/heads/d c2c2c2c2c2c2: Unverified, unvollständige Prüfung (mehr als 200 neue Commits), Evidence-Policy nicht erfüllt (Schwelle 100 %)"
         );
-        assert!(out[4].starts_with("minds-witness: Warnung: <ref> c2c2c2c2c2c2: "));
+        assert!(out[4].starts_with("minds-witness: Warnung: refs/heads/\\x1b[31mx c2c2c2c2c2c2: "));
         assert_eq!(out[5], CLOSE);
         assert_eq!(
             out[6],
@@ -466,7 +466,7 @@ mod tests {
         );
         assert_eq!(
             out[1],
-            "minds-witness: Warnung: <ref>: Prüfung nicht abgeschlossen (Unknown)"
+            "minds-witness: Warnung: refs/heads/\\x07b: Prüfung nicht abgeschlossen (Unknown)"
         );
         assert_eq!(out.len(), 22);
         assert_eq!(out[20], "minds-witness: … und 8 weitere Befunde");
