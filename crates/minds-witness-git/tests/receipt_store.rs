@@ -562,6 +562,14 @@ fn s3_05_tokens_from_a_previous_boot_are_dead() {
 fn s3_05_held_lock_survives_concurrent_recovery_without_age_floor() {
     let fx = GitTestFixture::new();
     let server = fx.server();
+    // Aktiv gehaltene Sperre: ein lebender Schreiber, der schon in seinem
+    // kritischen Abschnitt ist, also zuerst sein Token, dann die Sperre
+    // (Reihenfolge des Protokolls). Beides besteht, bevor das Aufräumen
+    // beginnt: Dieser simulierte Schreiber prüft die Marke nicht, wie es
+    // ein echter vor dem Sperren tut.
+    let name = GitReceiptStore::receipt_ref(&key(42, 1));
+    let token = coord_token(&server, "writers", "held", std::process::id());
+    let held = old_lock(&server, &name);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cleaner = {
         let s = store(&server);
@@ -576,10 +584,6 @@ fn s3_05_held_lock_survives_concurrent_recovery_without_age_floor() {
             runs
         })
     };
-    // Aktiv gehaltene Sperre: ein lebender Schreiber mit Token.
-    let name = GitReceiptStore::receipt_ref(&key(42, 1));
-    let held = old_lock(&server, &name);
-    let token = coord_token(&server, "writers", "held", std::process::id());
     let writers: Vec<_> = (0..4u8)
         .map(|w| {
             let mut s = store(&server);
