@@ -8,14 +8,14 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::RECEIPT_SCHEMA;
 use crate::events::{LogEvent, LogLevel};
 use crate::finding::Finding;
-use crate::ids::Timestamp;
+use crate::ids::{HashStr, Timestamp};
 use crate::receipt::{
     PublicKeyEntry, ReceiptBody, ReceiptKey, Signer, WitnessIdentity, receipt_id,
 };
 use crate::traits::{PutResult, ReceiptStore, StoreError};
+use crate::{RECEIPT_SCHEMA, RECEIPT_SCHEMA_V2};
 
 /// Ergebnis der Post-Phase. Es gilt immer
 /// `stored + skipped_existing + failed == findings.len()`.
@@ -60,6 +60,30 @@ pub fn post_receive(
     signer: &Signer,
     store: &mut dyn ReceiptStore,
 ) -> PostOutcome {
+    post_phase(findings, identity, signer, store, None)
+}
+
+/// Wie [`post_receive`], aber jede Quittung trägt `trust` und das Schema
+/// `RECEIPT_SCHEMA_V2` (S1 v1.6, Spec S3 §5). `trust` ist der Hash des
+/// Trust-Snapshots, mit dem die Pre-Phase geprüft hat; der Kern prüft ihn
+/// nicht, er signiert ihn mit.
+pub fn post_receive_with_trust(
+    findings: &[Finding],
+    identity: &WitnessIdentity,
+    signer: &Signer,
+    store: &mut dyn ReceiptStore,
+    trust: &HashStr,
+) -> PostOutcome {
+    post_phase(findings, identity, signer, store, Some(trust))
+}
+
+fn post_phase(
+    findings: &[Finding],
+    identity: &WitnessIdentity,
+    signer: &Signer,
+    store: &mut dyn ReceiptStore,
+    trust: Option<&HashStr>,
+) -> PostOutcome {
     let total = len_u32(findings.len());
     let mut counters = Counters::default();
     let mut events = Vec::new();
@@ -69,6 +93,7 @@ pub fn post_receive(
             identity,
             signer,
             store,
+            trust,
             &mut counters,
             &mut events,
         )
@@ -99,6 +124,7 @@ fn run(
     identity: &WitnessIdentity,
     signer: &Signer,
     store: &mut dyn ReceiptStore,
+    trust: Option<&HashStr>,
     counters: &mut Counters,
     events: &mut Vec<LogEvent>,
 ) {
@@ -183,11 +209,28 @@ fn run(
             push: finding.push.clone(),
             pusher: finding.pusher.clone(),
             repo: finding.repo.clone(),
-            schema: RECEIPT_SCHEMA.to_owned(),
+            schema: if trust.is_some() {
+                RECEIPT_SCHEMA_V2
+            } else {
+                RECEIPT_SCHEMA
+            }
+            .to_owned(),
             seal: finding.seal.clone(),
             server: finding.server.clone(),
+            trust: trust.cloned(),
             witness: identity.clone(),
         };
+        // Spec S3 §5: die Schemaregel gilt auch beim Bau.
+        if body.check().is_err() {
+            counters.failed = counters.failed.saturating_add(1);
+            events.push(LogEvent::new(
+                LogLevel::Error,
+                "receipt_schema_invalid",
+                "Der Quittungsinhalt verletzt die Schemaregel; der Befund wird nicht signiert.",
+                &[("commit", commit), ("ref", ref_name)],
+            ));
+            continue;
+        }
         let id = receipt_id(&body);
         let receipt_bytes = body.sign(signer).to_bytes();
         let key = ReceiptKey {

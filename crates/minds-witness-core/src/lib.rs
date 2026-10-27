@@ -17,6 +17,7 @@ mod pre;
 mod push;
 mod receipt;
 mod traits;
+mod trust;
 
 #[doc(hidden)]
 pub mod memory;
@@ -27,25 +28,33 @@ pub use finding::{
 };
 pub use ids::{CommitId, HashStr, IdError, KeyStr, SigStr, Timestamp};
 pub use policy::{Mode, Policy, PolicyError, PusherMode, covers, matches_pattern};
-pub use post::{PostOutcome, post_receive};
+pub use post::{PostOutcome, post_receive, post_receive_with_trust};
 pub use pre::{Decision, PreOutcome, RejectReason, pre_receive};
 pub use push::{
     MAX_REF_DISPLAY, PushContext, Pusher, RefUpdate, ServerInfo, ServerKind, display_ref,
 };
 pub use receipt::{
     PublicKeyEntry, Receipt, ReceiptBody, ReceiptKey, Signer, VerifiedReceipt, VerifyError,
-    WitnessIdentity, canonical_bytes, receipt_id, verify_receipt,
+    WitnessIdentity, canonical_bytes, receipt_id, verify_receipt, verify_receipt_with_trust,
 };
 pub use traits::{
     CommitInfo, CommitRange, HostError, HostEvents, ObjectAccess, ObjectError, PutResult,
     ReceiptStore, SealBlob, SealError, SealExpectation, SealInspector, SealSignature, SealSummary,
     StoreError,
 };
+pub use trust::{TrustPolicy, TrustSnapshot};
 
 /// Präfix des Witness-Namensraums; Refs darunter schreibt nur der Server.
 /// Nicht konfigurierbar.
 pub const WITNESS_NAMESPACE: &str = "refs/minds/witness/";
 
-/// Schema-Kennung jeder Quittung. Wechselt, sobald sich die kanonische Form
-/// ändern würde.
+/// Schema-Kennung einer Quittung ohne Vertrauenskontext (S1). Bytes,
+/// Signatur und Prüfregeln dieser Quittungen bleiben unverändert.
 pub const RECEIPT_SCHEMA: &str = "minds.witness.receipt/1";
+
+/// Schema-Kennung einer Quittung mit Vertrauenskontext (S1 v1.6, Spec S3
+/// §5): `trust` ist Pflicht und bindet die Quittung an einen Trust-Snapshot.
+pub const RECEIPT_SCHEMA_V2: &str = "minds.witness.receipt/2";
+
+/// Schema-Kennung eines Trust-Snapshots (Spec S3 §4.3).
+pub const TRUST_SCHEMA: &str = "minds.witness.trust/1";
