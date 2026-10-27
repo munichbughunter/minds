@@ -69,6 +69,7 @@ mod prepare_commit_msg;
 mod prepush;
 mod recall;
 mod recap;
+mod receipt_cmd;
 mod reinterpret_cmd;
 mod render;
 mod render_cmd;
@@ -436,6 +437,26 @@ Usage:
   minds verify --evidence <seal-id>
         The verdict of a single seal — even without a session
         (redaction block).
+  minds verify --receipt [<rev>] [--remote <r>]
+               [--receipt-key <key> | --receipt-key-file <path>]
+               [--require-state <state>] [--require-protected-anchor]
+        Recomputes the server witness receipts of a commit (default HEAD):
+        signature against refs/minds/witness/keys and the trust anchor,
+        the signed trust snapshot (schema /2; /1 is not recomputable),
+        then seal hash, coverage and policy from the bindings, seals and
+        observations. The server key never comes from the repository:
+        --receipt-key (explicitly given), --receipt-key-file or
+        /etc/minds/receipt-keys (protected only if file and every parent
+        are root-owned and writable by nobody else, no symlinks), else
+        git config --global minds.witness.receiptKey (unprotected, pilot
+        only). --require-protected-anchor accepts only a protected file.
+        With --remote (a named remote, never a URL) everything is fetched
+        into refs/minds/remotes/<r>/ and only those refs are read — a
+        fresh clone suffices. States: Verified, Partial, Unverified,
+        Invalid. Exit codes: 0 Verified, 1 signature, snapshot, anchor or
+        recomputation wrong, 2 state worse than --require-state (default
+        Verified), 3 no receipt, evidence missing or not checkable,
+        4 operational failure (priority: 4 > 1 > 3 > 2 > 0).
 
   minds replay [--commit <rev>] [--unsigned]
         Unix only. In CI, on a checkout of the commit (default HEAD): re-runs the
@@ -608,6 +629,35 @@ const fn spec(
     }
 }
 
+/// Flags, die nur mit `minds verify --receipt` gelten (Spec S3 §6.3).
+const RECEIPT_ONLY: &[&str] = &[
+    "--remote",
+    "--receipt-key",
+    "--receipt-key-file",
+    "--require-state",
+    "--require-protected-anchor",
+];
+
+/// Flags der übrigen Betriebsarten von `minds verify`; mit `--receipt` ein
+/// Fehler statt still ignoriert.
+const NOT_WITH_RECEIPT: &[&str] = &[
+    "--sig",
+    "--signers",
+    "--identity",
+    "--evidence",
+    "--commit",
+    "--require-explained",
+    "--witness-home",
+    "--require-assurance",
+    "--gitlab-url",
+    "--all",
+    "--limits",
+    "--require-in-scope",
+    "--online",
+    "--conformance",
+    "--allow-heuristic",
+];
+
 /// Die Kommando-Tabelle — der Parser prüft strikt dagegen (#11).
 ///
 /// Ein Flag, das hier nicht steht, ist ein **Fehler**, kein Rauschen: `minds
@@ -705,6 +755,11 @@ const SPECS: &[Spec] = &[
             "--witness-home",
             "--require-assurance",
             "--gitlab-url",
+            // Spec S3 §6.3: `--receipt`.
+            "--remote",
+            "--receipt-key",
+            "--receipt-key-file",
+            "--require-state",
         ],
         &[
             "--all",
@@ -713,6 +768,8 @@ const SPECS: &[Spec] = &[
             "--online",
             "--conformance",
             "--allow-heuristic",
+            "--receipt",
+            "--require-protected-anchor",
         ],
         1,
     ),
@@ -782,6 +839,11 @@ impl Parsed {
 
     fn has(&self, name: &str) -> bool {
         self.bools.contains(&name)
+    }
+
+    /// Ob das Flag angegeben ist — mit oder ohne Wert.
+    fn given(&self, name: &str) -> bool {
+        self.has(name) || self.value(name).is_some()
     }
 
     fn positional(&self, index: usize) -> Option<&str> {
@@ -1227,6 +1289,31 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "replay" => replay_cmd::run(parsed.value("--commit"), parsed.has("--unsigned")),
 
         "anchor" => anchor_cmd::run(parsed.has("--mirror")),
+
+        "verify" if parsed.has("--receipt") || RECEIPT_ONLY.iter().any(|f| parsed.given(f)) => {
+            if !parsed.has("--receipt") {
+                eprintln!(
+                    "minds verify: --remote, --receipt-key, --receipt-key-file, --require-state and --require-protected-anchor need --receipt"
+                );
+                return ExitCode::from(4);
+            }
+            if let Some(other) = NOT_WITH_RECEIPT.iter().find(|f| parsed.given(f)) {
+                eprintln!("minds verify: {other} does not combine with --receipt");
+                return ExitCode::from(4);
+            }
+            if parsed.given("--receipt-key") && parsed.given("--receipt-key-file") {
+                eprintln!("minds verify: --receipt-key and --receipt-key-file exclude each other");
+                return ExitCode::from(4);
+            }
+            receipt_cmd::run(&receipt_cmd::Options {
+                rev: parsed.positional(0),
+                remote: parsed.value("--remote"),
+                key: parsed.value("--receipt-key"),
+                key_file: parsed.value("--receipt-key-file"),
+                require_state: parsed.value("--require-state"),
+                require_protected_anchor: parsed.has("--require-protected-anchor"),
+            })
+        }
 
         "verify" => verify_cmd::run(
             parsed.positional(0),

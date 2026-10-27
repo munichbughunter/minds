@@ -564,8 +564,10 @@ fn due(
     let mut updates = Vec::new();
     let mut deferred = Vec::new();
     for (name, commit) in repo.refs_under(prefix)? {
-        // Die eigene Buchhaltung wird nie gepusht.
-        if name.starts_with(TRACKING_PREFIX) {
+        // Die eigene Buchhaltung wird nie gepusht — und nichts unter
+        // `refs/minds/witness/`: Den Namensraum schreibt nur der Server
+        // (Spec S3 §6.3), ein lokaler Ref dort ließe den Push scheitern.
+        if name.starts_with(TRACKING_PREFIX) || is_witness_ref(&name) {
             continue;
         }
         let tracking = tracking_ref(remote, &name);
@@ -628,6 +630,11 @@ fn session_branch(name: &str) -> String {
         Some(hex) => format!("refs/heads/minds/session/{hex}"),
         None => name.to_string(),
     }
+}
+
+/// Ein Ref im Namensraum des Server-Witness.
+fn is_witness_ref(name: &str) -> bool {
+    name.starts_with(minds_witness_core::WITNESS_NAMESPACE)
 }
 
 /// `refs/minds/remotes/<remote>/`.
@@ -1187,6 +1194,14 @@ mod tests {
         // Sonst spiegelte sich die eigene Buchhaltung ins Remote — und beim
         // nächsten Lauf hielte sie sich selbst für zu pushenden Kontext.
         assert!(tracking_ref("origin", "refs/minds/context").starts_with(TRACKING_PREFIX));
+    }
+
+    #[test]
+    fn witness_refs_are_never_pushed() {
+        assert!(is_witness_ref("refs/minds/witness/keys"));
+        assert!(is_witness_ref("refs/minds/witness/receipts/x/y"));
+        assert!(!is_witness_ref("refs/minds/witnessed"));
+        assert!(!is_witness_ref("refs/minds/remotes/origin/witness/keys"));
     }
 
     #[test]

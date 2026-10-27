@@ -3,22 +3,19 @@
 //! nach außen und macht jeden Fehler zu einer Entscheidung plus Ereignis.
 //! Sie signiert und speichert nichts; das ist Aufgabe der Post-Phase.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use serde::{Deserialize, Serialize};
 
 use crate::WITNESS_NAMESPACE;
+use crate::assess::{SealLookup, assess};
 use crate::events::{LogEvent, LogLevel};
-use crate::finding::{
-    Coverage, CoverageStatus, Finding, PolicyResult, PolicyVerdict, PushInfo, SealState, SealStatus,
-};
+use crate::finding::{Finding, PolicyResult, PolicyVerdict, PushInfo};
 use crate::ids::{CommitId, HashStr};
 use crate::policy::{Mode, Policy, PusherMode};
 use crate::push::{PushContext, Pusher, RefUpdate, display_ref};
-use crate::traits::{
-    ObjectAccess, SealBlob, SealError, SealExpectation, SealInspector, SealSignature, SealSummary,
-};
+use crate::traits::{ObjectAccess, SealError, SealExpectation, SealInspector};
 
 /// Grund einer Ablehnung.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,7 +176,7 @@ fn run(
     // (auch ein interner Fehler, ob aus `seal_for_commit` oder `inspect`) für
     // jeden weiteren Ref wiederverwendet wird. Ein transienter Fehler wirkt so
     // auf alle Refs mit diesem Commit: fail-closed und deterministisch.
-    let mut seal_cache: BTreeMap<CommitId, Result<SealLook, String>> = BTreeMap::new();
+    let mut seal_cache: BTreeMap<CommitId, Result<SealLookup, String>> = BTreeMap::new();
 
     // Schritte 5 bis 7: je bewertetem Ref.
     for update in &ctx.updates {
@@ -308,27 +305,6 @@ fn len_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// Abdeckung aus geänderten Pfaden und (optional) den Pfaden des Seals.
-fn coverage(
-    status: CoverageStatus,
-    paths: &BTreeSet<String>,
-    touched: Option<&BTreeSet<String>>,
-    cap: u32,
-) -> Coverage {
-    let uncovered_all: Vec<&String> = paths
-        .iter()
-        .filter(|p| touched.is_none_or(|t| !t.contains(*p)))
-        .collect();
-    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
-    Coverage {
-        paths_covered: len_u32(paths.len() - uncovered_all.len()),
-        paths_in_diff: len_u32(paths.len()),
-        status,
-        uncovered_truncated: uncovered_all.len() > cap,
-        uncovered: uncovered_all.into_iter().take(cap).cloned().collect(),
-    }
-}
-
 /// Alles, was die Bewertung eines Refs braucht.
 struct RefEnv<'a> {
     ctx: &'a PushContext,
@@ -338,18 +314,7 @@ struct RefEnv<'a> {
     pusher: &'a Pusher,
     events: &'a mut Vec<LogEvent>,
     findings: &'a mut Vec<Finding>,
-    seal_cache: &'a mut BTreeMap<CommitId, Result<SealLook, String>>,
-}
-
-/// Ergebnis von Seal-Suche und Inspektion für einen Commit.
-#[derive(Clone)]
-enum SealLook {
-    /// Kein Seal.
-    Absent,
-    /// Seal gefunden und gedeutet.
-    Inspected(SealBlob, SealSummary),
-    /// Seal gefunden, aber nicht lesbar (`SealError::Malformed`).
-    Malformed(SealBlob),
+    seal_cache: &'a mut BTreeMap<CommitId, Result<SealLookup, String>>,
 }
 
 impl RefEnv<'_> {
@@ -417,21 +382,21 @@ impl RefEnv<'_> {
     }
 
     /// Seal-Suche und Inspektion, je Commit höchstens einmal pro Push.
-    fn seal_lookup(&mut self, c: &CommitId) -> Result<SealLook, String> {
+    fn seal_lookup(&mut self, c: &CommitId) -> Result<SealLookup, String> {
         if let Some(cached) = self.seal_cache.get(c) {
             return cached.clone();
         }
         let look = match self.objects.seal_for_commit(c) {
             Err(e) => Err(e.to_string()),
-            Ok(None) => Ok(SealLook::Absent),
+            Ok(None) => Ok(SealLookup::Absent),
             Ok(Some(blob)) => {
                 let expected = SealExpectation {
                     repo: self.ctx.repo.clone(),
                     commit: c.clone(),
                 };
                 match self.seals.inspect(&blob, &expected) {
-                    Ok(summary) => Ok(SealLook::Inspected(blob, summary)),
-                    Err(SealError::Malformed(_)) => Ok(SealLook::Malformed(blob)),
+                    Ok(summary) => Ok(SealLookup::Inspected(blob, summary)),
+                    Err(SealError::Malformed(_)) => Ok(SealLookup::Malformed(blob)),
                     Err(e @ SealError::Internal(_)) => Err(e.to_string()),
                 }
             }
@@ -441,113 +406,45 @@ impl RefEnv<'_> {
     }
 
     fn finding(&mut self, c: &CommitId, push: &PushInfo) -> Result<Finding, String> {
-        let cap = self.policy.uncovered_cap;
         let info = self.objects.commit(c).map_err(|e| e.to_string())?;
         let paths = self.objects.changed_paths(c).map_err(|e| e.to_string())?;
-        let absent = SealStatus {
-            hash: None,
-            ref_name: None,
-            status: SealState::Absent,
-        };
-        let (seal, coverage) = if info.parents.len() >= 2 && paths.is_empty() {
-            (
-                absent,
-                Coverage {
-                    paths_covered: 0,
-                    paths_in_diff: 0,
-                    status: CoverageStatus::MergeCommit,
-                    uncovered: Vec::new(),
-                    uncovered_truncated: false,
-                },
-            )
-        } else {
-            match self.seal_lookup(c)? {
-                SealLook::Absent => (absent, coverage(CoverageStatus::NoSeal, &paths, None, cap)),
-                SealLook::Inspected(blob, summary) => {
-                    let bound_ok = summary.bound_commit == *c
-                        && summary
-                            .bound_repo
-                            .as_ref()
-                            .is_none_or(|r| *r == self.ctx.repo);
-                    let status = if !bound_ok {
-                        SealState::Mismatched
-                    } else {
-                        match summary.signature {
-                            SealSignature::Valid => SealState::Valid,
-                            SealSignature::Invalid => SealState::Invalid,
-                            SealSignature::Unsigned => SealState::Unsigned,
-                        }
-                    };
-                    let cov = coverage(
-                        CoverageStatus::Computed,
-                        &paths,
-                        Some(&summary.touched_paths),
-                        cap,
-                    );
-                    (
-                        SealStatus {
-                            hash: Some(summary.hash),
-                            ref_name: Some(blob.ref_name),
-                            status,
-                        },
-                        cov,
-                    )
-                }
-                SealLook::Malformed(blob) => (
-                    SealStatus {
-                        hash: Some(HashStr::of_bytes(&blob.bytes)),
-                        ref_name: Some(blob.ref_name),
-                        status: SealState::Invalid,
-                    },
-                    coverage(CoverageStatus::NoSeal, &paths, None, cap),
-                ),
-            }
-        };
-        let result = verdict(&seal, &coverage, self.policy.coverage_threshold_percent);
+        let repo = self.ctx.repo.clone();
+        let policy = self.policy;
+        let assessment = assess(
+            c,
+            &repo,
+            info.parents.len(),
+            &paths,
+            || self.seal_lookup(c),
+            policy,
+        )?;
         Ok(Finding {
             commit: c.clone(),
-            coverage,
+            coverage: assessment.coverage,
             policy: PolicyResult {
                 mode: self.policy.mode.clone(),
-                result,
+                result: assessment.result,
                 version: self.policy.version,
             },
             push: push.clone(),
             pusher: self.pusher.clone(),
-            repo: self.ctx.repo.clone(),
-            seal,
+            repo,
+            seal: assessment.seal,
             server: self.ctx.server.clone(),
         })
-    }
-}
-
-/// Verdict, erste zutreffende Regel gewinnt (Abschnitt 7, Schritt 7).
-fn verdict(seal: &SealStatus, coverage: &Coverage, threshold: u8) -> PolicyVerdict {
-    if coverage.status == CoverageStatus::MergeCommit {
-        return PolicyVerdict::Pass;
-    }
-    if seal.status != SealState::Valid {
-        return PolicyVerdict::Fail;
-    }
-    if coverage.paths_in_diff == 0 {
-        return PolicyVerdict::Pass;
-    }
-    let percent = u64::from(coverage.paths_covered) * 100 / u64::from(coverage.paths_in_diff);
-    if percent >= u64::from(threshold) {
-        PolicyVerdict::Pass
-    } else {
-        PolicyVerdict::Fail
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::BTreeSet;
 
     use super::*;
     use crate::ids::Timestamp;
     use crate::memory::{MemoryAdapter, SealOutcome};
     use crate::push::{ServerInfo, ServerKind};
+    use crate::traits::{SealBlob, SealSignature, SealSummary};
 
     /// Zählt `inspect`-Aufrufe und delegiert an den `MemoryAdapter`.
     struct CountingInspector<'a> {

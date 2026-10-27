@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod assess;
 mod events;
 mod finding;
 mod ids;
@@ -22,6 +23,7 @@ mod trust;
 #[doc(hidden)]
 pub mod memory;
 
+pub use assess::{Assessment, SealLookup, assess, judge};
 pub use events::{LogEvent, LogLevel};
 pub use finding::{
     Coverage, CoverageStatus, Finding, PolicyResult, PolicyVerdict, PushInfo, SealState, SealStatus,

@@ -761,3 +761,73 @@ fn s3_05_identical_parallel_puts_never_report_broken() {
         }
     }
 }
+
+/// Spec S3 §6.3: Der Leser über einem Tracking-Namensraum liest Quittungen,
+/// Schlüsselliste und Snapshots streng wie die Ablage, schreibt nie und
+/// sieht nichts aus dem echten Namensraum.
+#[test]
+fn a_reader_sees_only_its_tracking_namespace() {
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let mut s = store(&server);
+    let k = key(3, 1);
+    s.put(&k, b"receipt-a").unwrap();
+    s.register_public_key(&entry(7, "2026-01-01T00:00:00Z"))
+        .unwrap();
+    let (hash, _) = s.put_trust(&snapshot("p")).unwrap();
+    let ns = "refs/minds/remotes/origin/witness/";
+    let git = |dir: &std::path::Path| {
+        GitReceiptStore::reader(&git_program(), dir, Duration::from_secs(10), ns).unwrap()
+    };
+    let mut r = git(&server.git_dir);
+    assert_eq!(
+        r.get(&k).unwrap(),
+        None,
+        "kein Rückgriff auf refs/minds/witness/"
+    );
+    assert!(r.list(&k.commit).unwrap().is_empty());
+    assert!(!r.has_keys().unwrap());
+    assert_eq!(r.trust_bytes(&hash).unwrap(), None);
+    // Kopie in den Tracking-Namensraum (wie `git fetch` es täte).
+    for line in server
+        .git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            "refs/minds/witness/",
+        ])
+        .lines()
+    {
+        let (name, oid) = line.split_once(' ').unwrap();
+        let tracked = name.replacen("refs/minds/witness/", ns, 1);
+        server.update_ref(&tracked, oid);
+    }
+    assert_eq!(r.get(&k).unwrap().as_deref(), Some(&b"receipt-a"[..]));
+    assert_eq!(r.list(&k.commit).unwrap(), vec![k.clone()]);
+    assert!(r.has_keys().unwrap());
+    assert_eq!(
+        r.public_keys().unwrap(),
+        vec![entry(7, "2026-01-01T00:00:00Z")]
+    );
+    assert_eq!(r.trust_bytes(&hash).unwrap(), Some(snapshot("p")));
+    // Schreiben: nie, in keinen Namensraum.
+    assert!(r.put(&key(4, 1), b"x").is_err());
+    assert!(
+        r.register_public_key(&entry(8, "2026-01-01T00:00:00Z"))
+            .is_err()
+    );
+    assert!(r.put_trust(&snapshot("q")).is_err());
+    assert!(s.get(&key(4, 1)).unwrap().is_none());
+    assert_eq!(s.public_keys().unwrap().len(), 1);
+    // Nur Tracking-Namensräume.
+    for bad in [
+        "refs/minds/witness/",
+        "refs/minds/remotes/../witness/",
+        "refs/heads/",
+    ] {
+        assert!(
+            GitReceiptStore::reader(&git_program(), &server.git_dir, Duration::from_secs(1), bad)
+                .is_err(),
+            "{bad}"
+        );
+    }
+}

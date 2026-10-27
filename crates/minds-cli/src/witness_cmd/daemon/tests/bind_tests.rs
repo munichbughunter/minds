@@ -13,10 +13,10 @@ use minds_core::observation::{
 };
 use minds_witness_git::binding::CommitBinding;
 
-const PROJECT: &str = "git.test/project-42";
+pub(super) const PROJECT: &str = "git.test/project-42";
 
 /// Ein Witness mit Schlüssel, optional mit festgehaltenem Projekt.
-fn pinned(project: Option<&str>) -> Fixture {
+pub(super) fn pinned(project: Option<&str>) -> Fixture {
     let f = Fixture::new();
     f.keygen();
     if project.is_some() {
@@ -43,7 +43,7 @@ fn pin(f: &Fixture, project: Option<&str>) -> Fallible<String> {
 }
 
 /// Schreibt Dateien (`None` löscht) und committet; liefert die Commit-Id.
-fn commit(f: &Fixture, files: &[(&str, Option<&[u8]>)], message: &str) -> String {
+pub(super) fn commit(f: &Fixture, files: &[(&str, Option<&[u8]>)], message: &str) -> String {
     for (path, content) in files {
         let full = f.root.join(path);
         match content {
@@ -63,7 +63,7 @@ fn commit(f: &Fixture, files: &[(&str, Option<&[u8]>)], message: &str) -> String
 
 /// Legt Observations (getrennt oder nicht), ein signiertes
 /// `witness-fs/v1`-Seal und die Ledger-Zeile ab; liefert die Seal-Id.
-fn evidence(f: &Fixture, entries: &[(&str, Option<&[u8]>)], separated: bool) -> String {
+pub(super) fn evidence(f: &Fixture, entries: &[(&str, Option<&[u8]>)], separated: bool) -> String {
     static SALT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
     let config = load(&f.home).unwrap();
     let repo = config.pinned_repo().unwrap();
@@ -132,12 +132,12 @@ fn evidence(f: &Fixture, entries: &[(&str, Option<&[u8]>)], separated: bool) -> 
     id.to_string()
 }
 
-fn run(f: &Fixture, c: &str, expected: &str, dry_run: bool) -> Result<String, String> {
+pub(super) fn run(f: &Fixture, c: &str, expected: &str, dry_run: bool) -> Result<String, String> {
     bind::bind(&f.home, &load(&f.home).unwrap(), c, expected, dry_run).map_err(|e| e.to_string())
 }
 
 /// Die Bindungen unter `refs/minds/bindings/<c>/`.
-fn bindings(f: &Fixture, c: &str) -> Vec<CommitBinding> {
+pub(super) fn bindings(f: &Fixture, c: &str) -> Vec<CommitBinding> {
     let refs = git(
         &f.root,
         &[
