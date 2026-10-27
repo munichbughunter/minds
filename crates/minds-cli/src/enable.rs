@@ -287,10 +287,60 @@ pub fn run(
         // Im Regelfall still — den Nutzer interessiert das Setup nicht. `-v`
         // zeigt jeden Schritt; nur echte Fehler kommen immer durch.
         Ok(()) => ExitCode::SUCCESS,
+        // Spec S3 §6.2: ein fremder pre-push in einem gemeinsamen
+        // Hook-Verzeichnis — nichts geschrieben, Exit 2 mit Anleitung.
+        Err(err) if err.get_ref().is_some_and(|e| e.is::<SharedHookConflict>()) => {
+            eprintln!("minds enable: {err}");
+            ExitCode::from(2)
+        }
         Err(err) => {
             eprintln!("minds enable: {err}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Ein fremder `pre-push` in einem gemeinsamen Hook-Verzeichnis (Spec S3
+/// §6.2): `enable` verschiebt dort nichts und schreibt keinen Hook.
+#[derive(Debug)]
+pub(crate) struct SharedHookConflict(String);
+
+impl std::fmt::Display for SharedHookConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SharedHookConflict {}
+
+/// Der Name, unter dem ein fremder `pre-push` neben dem Orchestrator
+/// weiterläuft (Spec S3 §6.2).
+pub(crate) const CHAINED_PRE_PUSH: &str = "pre-push.minds-chained";
+
+/// Ob ein Hook neben unserem Block Fremdes enthält: außer der Shebang-Zeile,
+/// Leerzeilen und Kommentaren irgendeine Zeile.
+pub(crate) fn has_foreign_lines(content: &str) -> bool {
+    let rest = match block_span(content) {
+        Some(span) => format!("{}{}", &content[..span.start], &content[span.end..]),
+        None => content.to_owned(),
+    };
+    rest.lines().enumerate().any(|(i, line)| {
+        let line = line.trim();
+        !(line.is_empty() || line.starts_with('#') || (i == 0 && line.starts_with("#!")))
+    })
+}
+
+/// Der Inhalt ohne unseren Block (ein alter minds-Block in einem fremden
+/// Hook ließe `minds sync --detach` sonst doppelt laufen).
+fn without_block(content: &str) -> String {
+    match block_span(content) {
+        Some(span) => {
+            let mut rest = String::new();
+            rest.push_str(&content[..span.start]);
+            rest.push_str(content[span.end..].trim_start_matches(['\r', '\n']));
+            rest
+        }
+        None => content.to_owned(),
     }
 }
 
@@ -625,9 +675,17 @@ fn enable_agents(
     // mit Agent-Konfiguration und erstem Hook auf der Platte, aber ohne
     // Store-Config. Der Agent journalierte dann, und nichts checkte je ein.
     // (`read_existing_hook` verträgt ein fehlendes Elternverzeichnis.)
+    let scope = hooks_scope(&paths.root, &paths.common_git_dir, &hooks_dir);
     for name in hook_names() {
         let path = hooks_dir.join(name);
         if let Some(content) = read_existing_hook(&path)? {
+            // Spec S3 §6.2: Ein fremder pre-push wird im repo-eigenen
+            // Verzeichnis verkettet (verschoben, nicht ergänzt); in einem
+            // gemeinsamen bricht `enable` hier ab, vor jedem Schreiben.
+            if name == push_hook().0 && has_foreign_lines(&content) {
+                check_chainable(&hooks_dir, &path, scope)?;
+                continue;
+            }
             // Nicht erst beim Schreiben: Ein fremder Hook mit
             // `#!/usr/bin/env python3` an *einer* der drei Stellen ließe den
             // Lauf sonst mitten in der Reihe abbrechen — mit
@@ -881,6 +939,9 @@ fn configure_sync(
     // Der Hook ist für beide Backends derselbe; die Unterscheidung trifft
     // `minds sync` anhand der Store-Config.
     let (name, body) = push_hook();
+    if let Some(moved) = chain_foreign_pre_push(paths, hooks_dir)? {
+        report(verbose, &moved, Change::Updated);
+    }
     let pre_push = enable_git_hook(hooks_dir, name, body)?;
     report(
         verbose,
@@ -902,6 +963,88 @@ fn configure_sync(
         vln(verbose, &format!("  .git/config: fetch refspec {spec} set"));
     }
     Ok(())
+}
+
+/// Spec S3 §6.2, Vorprüfung: Darf ein fremder `pre-push` verkettet werden?
+/// Nur im repo-eigenen Hook-Verzeichnis, und nur, wenn daneben noch kein
+/// verketteter liegt.
+fn check_chainable(hooks_dir: &Path, path: &Path, scope: HooksScope) -> std::io::Result<()> {
+    if scope != HooksScope::GitDir {
+        return Err(std::io::Error::other(SharedHookConflict(format!(
+            "{} is a foreign pre-push hook in a shared hooks directory — minds moves \
+             nothing there and wrote no hook. Make the minds orchestrator the only pre-push \
+             there (run `minds enable` after moving the hook) and put the existing one next \
+             to it as {CHAINED_PRE_PUSH} — without any old `# >>> minds >>>` block in it, \
+             or the sync runs twice; the orchestrator runs it first with the same input",
+            display_path(path)
+        ))));
+    }
+    let chained = hooks_dir.join(CHAINED_PRE_PUSH);
+    // Ein abgebrochener früherer Lauf: Dieselbe Kopie liegt schon dort.
+    let resumable = read_existing_hook(&chained)
+        .ok()
+        .flatten()
+        .is_some_and(|text| {
+            read_existing_hook(path)
+                .ok()
+                .flatten()
+                .is_some_and(|current| without_block(&current) == text)
+        });
+    if fs::symlink_metadata(&chained).is_ok() && !resumable {
+        return Err(std::io::Error::other(format!(
+            "{} is a foreign pre-push hook, and {} already exists — merge the two by hand, \
+             then run minds enable again",
+            display_path(path),
+            display_path(&hooks_dir.join(CHAINED_PRE_PUSH))
+        )));
+    }
+    Ok(())
+}
+
+/// Spec S3 §6.2: Ein fremder `pre-push` im repo-eigenen Hook-Verzeichnis
+/// wird nach [`CHAINED_PRE_PUSH`] verschoben (ein alter minds-Block daraus
+/// entfernt, Modus bleibt); der Orchestrator ruft ihn mit denselben Bytes
+/// auf. Gibt die Berichtszeile zurück, wenn verschoben wurde.
+fn chain_foreign_pre_push(paths: &RepoPaths, hooks_dir: &Path) -> std::io::Result<Option<String>> {
+    let path = hooks_dir.join(push_hook().0);
+    let Some(content) = read_existing_hook(&path)? else {
+        return Ok(None);
+    };
+    if !has_foreign_lines(&content) {
+        return Ok(None);
+    }
+    // Die Vorprüfung lief schon; hier noch einmal, falls jemand diesen Weg
+    // ohne sie erreicht.
+    check_chainable(
+        hooks_dir,
+        &path,
+        hooks_scope(&paths.root, &paths.common_git_dir, hooks_dir),
+    )?;
+    let chained = hooks_dir.join(CHAINED_PRE_PUSH);
+    let rest = without_block(&content);
+    // Erst die Kopie unter dem neuen Namen (ohne alten minds-Block, mit dem
+    // Modus des Originals), dann der Orchestrator an der alten Stelle.
+    // Bricht etwas dazwischen ab, liegt der fremde Hook noch unverändert
+    // als `pre-push`, und ein erneutes `enable` setzt fort
+    // ([`check_chainable`] erkennt die gleiche Kopie).
+    let mode = fs::symlink_metadata(&path)
+        .map_err(|err| with_path(&path, err))?
+        .permissions();
+    if fs::symlink_metadata(&chained).is_err() {
+        write_atomic_no_follow(&chained, &rest, false)?;
+    }
+    fs::set_permissions(&chained, mode).map_err(|err| with_path(&chained, err))?;
+    // Die Kopie liegt: Das Original weicht (auch schreibgeschützt — es
+    // braucht nur das Verzeichnis), dann entsteht der Orchestrator neu.
+    fs::remove_file(&path).map_err(|err| with_path(&path, err))?;
+    write_hook(
+        &path,
+        &format!("#!/bin/sh\n{MARK_BEGIN}\n{}\n{MARK_END}\n", push_hook().1),
+    )?;
+    Ok(Some(format!(
+        "{} (the existing pre-push, chained before minds)",
+        label_for(&paths.root, &chained)
+    )))
 }
 
 /// Löst einen (womöglich relativen) Child-Pfad gegen die Repo-Wurzel auf — genau
@@ -2353,62 +2496,49 @@ const POST_COMMIT_BODY: &str = hook_body!(
 const PREPARE_MSG_BODY: &str =
     hook_body!("\"$MINDS_BIN\" prepare-commit-msg \"$1\" >/dev/null 2>&1 || true");
 
-/// pre-push: `minds sync` schickt den Kontext beim `git push` mit — an dasselbe
-/// Remote, an das gerade gepusht wird (`$1`).
+/// pre-push: der Orchestrator (Spec S3-MVP §6.2, ADR-S3-006). Die Datei
+/// gehört minds allein (ein fremder Hook läuft verkettet als
+/// [`CHAINED_PRE_PUSH`]):
 ///
-/// Warum ein Hook und kein `remote.push`-Refspec: Sobald `remote.<name>.push`
-/// gesetzt ist, pusht `git push` **nur noch** diese Refspecs — der Branch des
-/// Nutzers bliebe liegen. Der Hook lässt den normalen Push unangetastet und
-/// legt den Kontext daneben.
+/// - stdin wird **einmal** in eine Temp-Datei gelesen; der verkettete Hook
+///   (etwa `git lfs pre-push`, der stdin selbst liest) und danach minds
+///   bekommen dieselben Bytes. Scheitert `mktemp`, läuft nur der verkettete
+///   Hook (mit dem echten stdin).
+/// - Endet der verkettete Hook mit ≠ 0, bricht der Push mit genau diesem Code
+///   ab, wie ohne minds; minds läuft dann nicht. Ein nicht ausführbarer wird
+///   übersprungen, wie Git es tut; einen ohne Shebang führt die Shell aus.
+/// - minds selbst entscheidet nie über den Push: `|| true` und `exit 0` —
+///   auch ein fehlendes, veraltetes (ohne `hook pre-push`, Exit 2) oder nicht
+///   startbares Binary (126, 127) lässt den Push durch.
+/// - `minds hook pre-push` bindet, überträgt die Evidence synchron (mit
+///   `--no-verify` und `MINDS_SYNCING`, ohne Rekursion) und startet danach
+///   den bisherigen Hintergrund-Sync ([`crate::prepush`]).
 ///
-/// # Warum hier keine Git-Kommandos mehr stehen
-///
-/// Bis v0.2 rief dieser Hook selbst `git push` auf. Das kostete auf **jedem**
-/// Push den vollen Verbindungsaufbau (gegen gitlab.com ~2,7 s gemessen), auch
-/// wenn es gar nichts Neues gab — die Shell kann nicht wissen, was am Remote
-/// schon steht. `minds sync` weiß es aus den Tracking-Refs, entscheidet ohne
-/// Netz und schickt alle fälligen Refs in *einer* Verbindung. Die Logik gehört
-/// ins Binary, wo sie testbar ist; im Hook bleibt der Aufruf.
-///
-/// `|| true` hält es non-blocking: Ein Sync-Fehler darf den Push des Nutzers nie
-/// verhindern. Beide Backends benutzen denselben Body — welches Repo wohin
-/// gepusht wird, entscheidet `minds sync` anhand der Store-Config.
-///
-/// # Warum stderr hier weggeht
-///
-/// Als einziger der drei Hooks schrieb dieser seine Fehler roh in den
-/// Push-Output — „minds sync: …" mitten zwischen den Zeilen von `git push`, bei
-/// jedem Push, für einen Vorgang, den der Nutzer gar nicht angestoßen hat. Seit
-/// [`crate::hooklog`] geht der Wortlaut in eine Datei, auf die `minds fsck`
-/// verweist; damit ist die Umleitung kein Verschweigen mehr, sondern die
-/// Verlagerung an einen Ort, an dem sie auch morgen noch steht.
-///
-/// **stdout bleibt**: Was `minds sync` dort meldet, ist die Erfolgsmeldung, und
-/// die gehört an den Push, zu dem sie gehört.
-///
-/// # Warum `--detach` — und was es kostet
-///
-/// Regel „kein Netz, wenn nichts neu ist" machte den Push ohne fällige Refs
-/// billig. *Mit* fälligen Refs blieb ein zweiter voller Verbindungsaufbau vor
-/// dem Push des Nutzers: gegen GitHub ~1,5 s gemessen, gegen ein lokales
-/// Bare-Repo 0,01 s — der Preis ist TLS, Auth und Ref-Advertisement, und nach
-/// jeder Arbeitssession fällt er an (#85). In *einen* Transport lassen sich
-/// beide nicht legen: Ein pre-push kann dem laufenden Push keine Refs anhängen,
-/// und `remote.<name>.push` ersetzte dessen Refspecs (oben). Also übergibt
-/// `--detach` den Transport einem losgelösten Prozess; der Hook selbst plant
-/// nur noch lokal und ist in ~0,02 s zurück.
-///
-/// **Der Kontext kommt damit nicht mehr garantiert mit demselben Push an**,
-/// sondern Sekunden danach. Für `fsck --require-review` als CI-Gate heißt das:
-/// Ein Push, dem die Pipeline unmittelbar folgt, kann die Reviews knapp
-/// verpassen — der nächste Lauf sieht sie. Wer die alte Garantie braucht, ruft
-/// `minds sync` vor dem Push von Hand auf; ohne `--detach` läuft er synchron.
-///
-/// Was der Hintergrundprozess nicht kann — Passphrase, Security-Key —, fängt
-/// `sync` selbst: Nach einem gescheiterten Hintergrundlauf läuft der nächste
-/// Hook im Vordergrund, mit Terminal und sichtbarem Fehler (siehe dort).
-const PRE_PUSH_BODY: &str =
-    hook_body!("\"$MINDS_BIN\" sync --remote \"$1\" --detach 2>/dev/null || true");
+/// Das Binary sucht der Hook wie die übrigen über `minds.binary`, sonst über
+/// `PATH`; das Hook-Verzeichnis kennt nur das Skript (`dirname "$0"`).
+const PRE_PUSH_BODY: &str = r#"chained="$(dirname "$0")/pre-push.minds-chained"
+in=$(mktemp "${TMPDIR:-/tmp}/minds-pre-push.XXXXXX") || {
+  if [ -f "$chained" ] && [ -x "$chained" ]; then exec "$chained" "$@"; fi
+  exit 0
+}
+trap 'rm -f "$in"' EXIT
+trap 'exit 130' HUP INT TERM
+if ! cat > "$in"; then
+  if [ -f "$chained" ] && [ -x "$chained" ]; then
+    echo "minds: the push input could not be buffered for pre-push.minds-chained; push stopped" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [ -f "$chained" ] && [ -x "$chained" ]; then
+  "$chained" "$@" < "$in" || exit $?
+fi
+MINDS_BIN=$(git config --local --get minds.binary 2>/dev/null) || true
+[ -f "$MINDS_BIN" ] && [ -x "$MINDS_BIN" ] || MINDS_BIN=$(command -v minds 2>/dev/null) || true
+if [ -n "$MINDS_BIN" ] && [ -x "$MINDS_BIN" ]; then
+  "$MINDS_BIN" hook pre-push "$@" < "$in" || true
+fi
+exit 0"#;
 
 /// **Die** Liste der Git-Hooks, die `minds` schreibt — samt ihrer Rümpfe.
 ///
@@ -3525,6 +3655,9 @@ pub(crate) fn disable_git_hooks(paths: &RepoPaths) -> std::io::Result<Vec<String
     for name in hook_names() {
         let path = hooks_dir.join(name);
         let Some(current) = read_existing_hook(&path)? else {
+            if name == push_hook().0 {
+                restore_chained(paths, &hooks_dir, &mut lines)?;
+            }
             continue;
         };
         let Some(span) = block_span(&current) else {
@@ -3544,6 +3677,9 @@ pub(crate) fn disable_git_hooks(paths: &RepoPaths) -> std::io::Result<Vec<String
         if only_comments {
             fs::remove_file(&path)?;
             lines.push(format!("{} removed", label_for(&paths.root, &path)));
+            if name == push_hook().0 {
+                restore_chained(paths, &hooks_dir, &mut lines)?;
+            }
         } else {
             let rest = rest.trim_end_matches('\n').to_owned() + "\n";
             write_hook(&path, &rest)?;
@@ -3551,9 +3687,45 @@ pub(crate) fn disable_git_hooks(paths: &RepoPaths) -> std::io::Result<Vec<String
                 "{} minds block removed",
                 label_for(&paths.root, &path)
             ));
+            if name == push_hook().0
+                && fs::symlink_metadata(hooks_dir.join(CHAINED_PRE_PUSH)).is_ok()
+            {
+                lines.push(format!(
+                    "{} kept — {} still holds other lines; merge the two by hand",
+                    label_for(&paths.root, &hooks_dir.join(CHAINED_PRE_PUSH)),
+                    label_for(&paths.root, &path)
+                ));
+            }
         }
     }
     Ok(lines)
+}
+
+/// Spec S3 §6.2: Der verkettete fremde `pre-push` kommt an seinen Platz
+/// zurück, sobald dort kein `pre-push` mehr liegt.
+fn restore_chained(
+    paths: &RepoPaths,
+    hooks_dir: &Path,
+    lines: &mut Vec<String>,
+) -> std::io::Result<()> {
+    let chained = hooks_dir.join(CHAINED_PRE_PUSH);
+    let path = hooks_dir.join(push_hook().0);
+    match fs::symlink_metadata(&chained) {
+        Ok(_) if fs::symlink_metadata(&path).is_ok() => {}
+        Ok(meta) if meta.is_file() => {
+            fs::rename(&chained, &path).map_err(|err| with_path(&chained, err))?;
+            lines.push(format!(
+                "{} restored (the chained pre-push)",
+                label_for(&paths.root, &path)
+            ));
+        }
+        Ok(_) => lines.push(format!(
+            "{} kept — not a regular file; restore it by hand",
+            label_for(&paths.root, &chained)
+        )),
+        Err(_) => {}
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4699,10 +4871,12 @@ mod tests {
         let root = dir.path();
         let hooks = root.join(".git/hooks");
         fs::create_dir_all(&hooks).unwrap();
-        // `pre-push` steht in ALL_HOOKS zuletzt — ohne Vorlauf kämen die
-        // beiden Commit-Hooks vorher auf die Platte.
+        // `prepare-commit-msg` steht in ALL_HOOKS nach `post-commit` — ohne
+        // Vorlauf käme post-commit vorher auf die Platte. (Ein fremder
+        // `pre-push` wird seit Spec S3 §6.2 verkettet statt ergänzt, siehe
+        // `a_foreign_pre_push_of_any_language_is_chained`.)
         fs::write(
-            hooks.join("pre-push"),
+            hooks.join("prepare-commit-msg"),
             "#!/usr/bin/env python3\nprint('mein Hook')\n",
         )
         .unwrap();
@@ -4733,6 +4907,134 @@ mod tests {
             !root.join(".claude/settings.json").exists(),
             "nichts halb Eingerichtetes: die Agent-Konfiguration ist entstanden"
         );
+    }
+
+    /// Spec S3 §6.2: Ein fremder `pre-push` im repo-eigenen Verzeichnis wird
+    /// verkettet, gleich in welcher Sprache — minds hängt nichts mehr an ihn
+    /// an, also muss er nicht sh-kompatibel sein.
+    #[test]
+    fn a_foreign_pre_push_of_any_language_is_chained() {
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let foreign = "#!/usr/bin/env python3\nprint('mein Hook')\n";
+        fs::write(hooks.join("pre-push"), foreign).unwrap();
+        let paths = RepoPaths {
+            root: root.to_path_buf(),
+            git_dir: root.join(".git"),
+            common_git_dir: root.join(".git"),
+            hooks: HooksDir::At(hooks.clone()),
+        };
+        enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(hooks.join(CHAINED_PRE_PUSH)).unwrap(),
+            foreign
+        );
+        let ours = fs::read_to_string(hooks.join("pre-push")).unwrap();
+        assert_eq!(block_body(&ours).as_deref(), Some(PRE_PUSH_BODY));
+        assert!(!has_foreign_lines(&ours), "{ours}");
+        // Ein zweites `enable` lässt beide, wie sie sind.
+        enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(hooks.join(CHAINED_PRE_PUSH)).unwrap(),
+            foreign
+        );
+        // Liegt neben einem neuen fremden `pre-push` schon ein verketteter:
+        // Abbruch vor jedem Schreiben.
+        fs::write(hooks.join("pre-push"), "#!/bin/sh\necho second\n").unwrap();
+        fs::remove_file(hooks.join("post-commit")).unwrap();
+        let err = enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("merge the two by hand"), "{err}");
+        assert!(!hooks.join("post-commit").exists());
+    }
+
+    /// Ein schreibgeschützter fremder `pre-push` mit altem minds-Block wird
+    /// vollständig verkettet: Kopie ohne Block, Modus des Originals, dann der
+    /// Orchestrator — kein halber Zustand.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_protected_foreign_pre_push_is_chained_without_its_old_block() {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(dir) = init_repo() else { return };
+        let root = dir.path();
+        let hooks = root.join(".git/hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        let foreign =
+            format!("#!/bin/sh\ngit lfs pre-push \"$@\"\n{MARK_BEGIN}\nalt\n{MARK_END}\n");
+        fs::write(hooks.join("pre-push"), &foreign).unwrap();
+        fs::set_permissions(hooks.join("pre-push"), fs::Permissions::from_mode(0o555)).unwrap();
+        let paths = RepoPaths {
+            root: root.to_path_buf(),
+            git_dir: root.join(".git"),
+            common_git_dir: root.join(".git"),
+            hooks: HooksDir::At(hooks.clone()),
+        };
+        enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        let chained = hooks.join(CHAINED_PRE_PUSH);
+        assert_eq!(
+            fs::read_to_string(&chained).unwrap(),
+            "#!/bin/sh\ngit lfs pre-push \"$@\"\n"
+        );
+        assert_eq!(
+            fs::metadata(&chained).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        let ours = fs::read_to_string(hooks.join("pre-push")).unwrap();
+        assert_eq!(block_body(&ours).as_deref(), Some(PRE_PUSH_BODY));
+        assert!(!has_foreign_lines(&ours));
+        // Abgebrochen zwischen Kopie und Orchestrator: ein erneutes `enable`
+        // setzt fort.
+        fs::write(hooks.join("pre-push"), &foreign).unwrap();
+        enable_agents(
+            &paths,
+            &[Which::ClaudeCode],
+            &StoreConfig::in_repo(),
+            None,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(!has_foreign_lines(
+            &fs::read_to_string(hooks.join("pre-push")).unwrap()
+        ));
     }
 
     /// Die Fehlermeldung trägt fremden Text aus einer eingecheckten Datei —
@@ -5546,27 +5848,31 @@ mod tests {
     }
 
     #[test]
-    fn the_pre_push_hook_only_delegates() {
-        // Die Regression, gegen die dieser Test steht: Solange der Hook selbst
-        // `git push` rief, kostete *jeder* Push den vollen Verbindungsaufbau —
-        // auch wenn es nichts Neues gab. Ob etwas fällig ist, kann nur das
-        // Binary entscheiden (Tracking-Refs), nicht die Shell.
-        assert!(PRE_PUSH_BODY.contains("\"$MINDS_BIN\" sync"));
+    fn the_pre_push_hook_is_the_orchestrator() {
+        // Spec S3 §6.2: Das Skript selbst pusht nie und entscheidet nie über
+        // den Push — das tun ein verketteter fremder Hook und der Server.
         assert!(
             !PRE_PUSH_BODY.contains("git push"),
             "der Hook darf nicht selbst pushen: {PRE_PUSH_BODY}"
         );
-        // Ein Sync-Fehler darf den Push des Nutzers nie scheitern lassen.
-        assert!(PRE_PUSH_BODY.contains("|| true"));
-        // Das Remote, an das gerade gepusht wird, muss durchgereicht werden.
-        assert!(PRE_PUSH_BODY.contains("\"$1\""));
-        // Und der Transport gehört in den Hintergrund (#85): Ohne `--detach`
-        // stünde vor jedem Push mit fälligen Refs ein zweiter voller
-        // Verbindungsaufbau.
-        assert!(
-            PRE_PUSH_BODY.contains("--detach"),
-            "der Hook darf den Push nicht auf den Transport warten lassen: {PRE_PUSH_BODY}"
-        );
+        // stdin genau einmal, in die Temp-Datei; danach lesen beide daraus.
+        assert_eq!(PRE_PUSH_BODY.matches("cat > \"$in\"").count(), 1);
+        let chained = PRE_PUSH_BODY.find("\"$chained\" \"$@\" < \"$in\"").unwrap();
+        let minds = PRE_PUSH_BODY
+            .find("\"$MINDS_BIN\" hook pre-push \"$@\" < \"$in\" || true")
+            .unwrap();
+        assert!(chained < minds, "erst der verkettete Hook, dann minds");
+        // Nur der verkettete Hook kann abbrechen; minds endet immer mit 0.
+        assert!(PRE_PUSH_BODY.contains("|| exit $?"));
+        assert!(PRE_PUSH_BODY.trim_end().ends_with("exit 0"));
+        // Das Binary wie bei den übrigen Hooks über `minds.binary`, sonst PATH.
+        assert!(PRE_PUSH_BODY.contains("git config --local --get minds.binary"));
+        assert!(PRE_PUSH_BODY.contains("command -v minds"));
+        // Weder stdout noch stderr von minds oder dem verketteten Hook gehen
+        // weg: Warnungen und die Ablehnung des Servers bleiben sichtbar.
+        for line in PRE_PUSH_BODY.lines().filter(|l| l.contains("$in")) {
+            assert!(!line.contains("/dev/null"), "{line}");
+        }
     }
 
     #[test]
@@ -5623,26 +5929,6 @@ mod tests {
     }
 
     #[test]
-    fn the_pre_push_hook_redirects_its_stderr_but_keeps_stdout() {
-        // stderr geht weg, weil sie sonst roh im Push-Output landet — der
-        // Wortlaut steht seit #10 in `<git-dir>/minds/hook.log`. Geprüft wird
-        // die **Aufruf-Zeile** (die letzte): Seit der Prelude trägt auch die
-        // `git config`-Zeile ein `2>/dev/null` — ein `contains` über den ganzen
-        // Rumpf bliebe grün, wenn ausgerechnet der sync-Aufruf seins verlöre.
-        let call = PRE_PUSH_BODY.lines().last().unwrap();
-        assert!(
-            call.contains("2>/dev/null"),
-            "stderr gehört ins Log, nicht in den Push-Output: {call}"
-        );
-        // stdout bleibt: Dort steht die Erfolgsmeldung, und die gehört zu dem
-        // Push, bei dem sie entsteht. `>/dev/null` wäre hier ein Verlust.
-        assert!(
-            !PRE_PUSH_BODY.contains(">/dev/null 2>&1") && !PRE_PUSH_BODY.contains("1>/dev/null"),
-            "stdout darf nicht mit umgeleitet werden: {PRE_PUSH_BODY}"
-        );
-    }
-
-    #[test]
     fn the_commit_hooks_discard_their_output_because_the_log_carries_it() {
         // Die Umkehrung: Diese beiden dürfen still sein — sie schreiben in
         // dieselbe Datei. Fiele die Umleitung weg, redete der Rekorder in jeden
@@ -5659,7 +5945,7 @@ mod tests {
         // der Shell — `minds` nackt aufzurufen hieß dort: stiller Totalausfall.
         // Jeder Rumpf löst deshalb zuerst `minds.binary` auf; der PATH ist nur
         // noch die Rückfallebene für den umgezogenen Binary.
-        for (name, body) in ALL_HOOKS {
+        for &(name, body) in commit_hooks() {
             // `--local`: Env, `git -c` und globale Ebenen dürfen den Ort nicht
             // stellen — Hook, `record_binary` und `fsck` fragen dieselbe Quelle.
             assert!(

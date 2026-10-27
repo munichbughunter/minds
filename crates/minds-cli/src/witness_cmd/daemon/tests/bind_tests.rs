@@ -307,12 +307,6 @@ fn s3_13_bind_idempotent_and_capped() {
 /// abgelegte Bindung (mit dem Witness-Schlüssel in der Signer-Datei).
 #[test]
 fn s3_14_bind_preview_matches_server() {
-    use minds_witness_core::{CommitId, SealExpectation, SealInspector};
-    use minds_witness_git::budget::Budget;
-    use minds_witness_git::candidates::{self, Candidate};
-    use minds_witness_git::inspector::{GitSealInspector, InspectorConfig};
-    use minds_witness_git::trust::{TrustConfig, Verifier};
-
     let f = pinned(Some(PROJECT));
     commit(
         &f,
@@ -341,6 +335,21 @@ fn s3_14_bind_preview_matches_server() {
     let status = run(&f, &c, PROJECT, false).unwrap();
     assert!(status.ends_with(" 2/3"), "{status}");
 
+    let touched = server_touched(&f, &f.root.join(".git"), &c);
+    let touched: Vec<&str> = touched.iter().map(String::as_str).collect();
+    assert_eq!(touched, ["gone.rs", "src/a.rs"]);
+    assert_eq!(touched.len(), 2, "Vorschau 2/3 = Server");
+}
+
+/// Was der Server-Inspektor für `c` im Repository `git_dir` anrechnet — mit
+/// dem Schlüssel dieses Witness in der Signer-Datei.
+fn server_touched(f: &Fixture, git_dir: &Path, c: &str) -> std::collections::BTreeSet<String> {
+    use minds_witness_core::{CommitId, SealExpectation, SealInspector};
+    use minds_witness_git::budget::Budget;
+    use minds_witness_git::candidates::{self, Candidate};
+    use minds_witness_git::inspector::{GitSealInspector, InspectorConfig};
+    use minds_witness_git::trust::{TrustConfig, Verifier};
+
     let signers = super::super::super::existing_signers_line(&f.home)
         .unwrap()
         .unwrap();
@@ -356,7 +365,7 @@ fn s3_14_bind_preview_matches_server() {
     .unwrap();
     let server = minds_git::quarantine::ServerRepo::open_for_receive(
         &minds_git::quarantine::ReceiveEnv {
-            git_dir: f.root.join(".git"),
+            git_dir: git_dir.to_path_buf(),
             quarantine: None,
             namespace: false,
         },
@@ -369,23 +378,21 @@ fn s3_14_bind_preview_matches_server() {
     let inspector = GitSealInspector::new(&view, &verifier, &budget, InspectorConfig::new(PROJECT));
     let list: Vec<Candidate> = server
         .prestate()
-        .read_prefix(&candidates::prefix(&c))
+        .read_prefix(&candidates::prefix(c))
         .unwrap()
         .into_iter()
         .map(|(ref_name, target)| Candidate { ref_name, target })
         .collect();
     let summary = inspector
         .inspect(
-            &candidates::to_blob(&c, list),
+            &candidates::to_blob(c, list),
             &SealExpectation {
                 repo: PROJECT.to_owned(),
-                commit: CommitId::parse(&c).unwrap(),
+                commit: CommitId::parse(c).unwrap(),
             },
         )
         .unwrap();
-    let touched: Vec<&str> = summary.touched_paths.iter().map(String::as_str).collect();
-    assert_eq!(touched, ["gone.rs", "src/a.rs"]);
-    assert_eq!(summary.touched_paths.len(), 2, "Vorschau 2/3 = Server");
+    summary.touched_paths
 }
 
 #[test]
@@ -571,5 +578,81 @@ fn bind_never_reports_a_planted_binding_as_its_own() {
     assert_eq!(
         run(&f, &c, PROJECT, false).unwrap(),
         bound.replacen("bound", "unchanged", 1)
+    );
+}
+
+/// Spec S3 §6.2, der Durchstich von Commit 4 bis 6: `bind` legt eine neue
+/// Bindung an, die Evidence-Übertragung schickt **genau** deren Objekte
+/// (Observations, Seals, Bindung — in dieser Reihenfolge, nichts sonst),
+/// und erst danach der Code; der Server-Inspektor findet beim Code-Push die
+/// Evidence vor und rechnet dieselbe Abdeckung an wie die Vorschau.
+#[test]
+fn s3_19_bound_evidence_reaches_the_server_before_the_code() {
+    let f = pinned(Some(PROJECT));
+    let remote = f.root.parent().unwrap().join("remote.git");
+    git(&f.root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+    git(
+        &f.root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let c = commit(
+        &f,
+        &[("src/a.rs", Some(b"x1")), ("src/b.rs", Some(b"y1"))],
+        "change a and b",
+    );
+    let s_a = evidence(&f, &[("src/a.rs", Some(b"x1"))], true);
+    // Ein eigener Seal, der zu diesem Commit nichts beiträgt: bleibt lokal.
+    let s_other = evidence(&f, &[("src/other.rs", Some(b"o"))], true);
+    let status = run(&f, &c, PROJECT, false).unwrap();
+    assert!(
+        status.starts_with("bound ") && status.ends_with(" 1/2"),
+        "{status}"
+    );
+    let binding = bindings(&f, &c).remove(0);
+
+    let view = crate::bind_cmd::open_view(&f.root.join(".git")).unwrap();
+    let refs = crate::evidence_cmd::evidence_refs(&view, std::slice::from_ref(&c));
+    let names: Vec<&str> = refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert!(
+        names[0].starts_with("refs/minds/observations/"),
+        "{names:?}"
+    );
+    assert_eq!(names[1], format!("refs/minds/evidence/{}", &s_a[3..]));
+    assert_eq!(names[2], binding.ref_name());
+    assert!(!names.iter().any(|n| n.contains(&s_other[3..])));
+
+    // Übertragen, dann noch einmal: nichts mehr zu tun.
+    let sent = crate::evidence_cmd::transfer(&f.root, "origin", &refs);
+    assert_eq!(sent, crate::evidence_cmd::Transfer::Sent(3));
+    assert_eq!(
+        crate::evidence_cmd::transfer(&f.root, "origin", &refs),
+        crate::evidence_cmd::Transfer::Nothing
+    );
+    let on_remote = git(
+        &remote,
+        &["for-each-ref", "--format=%(refname)", "refs/minds/"],
+    );
+    let mut on_remote: Vec<&str> = on_remote.lines().collect();
+    on_remote.sort_unstable();
+    let mut wanted = names.clone();
+    wanted.sort_unstable();
+    assert_eq!(on_remote, wanted, "genau die nötigen Objekte");
+
+    // Der Code danach; der Server rechnet an, was die Vorschau meldete.
+    git(
+        &f.root,
+        &[
+            "push",
+            "-q",
+            "--no-verify",
+            "origin",
+            "HEAD:refs/heads/main",
+        ],
+    );
+    let touched = server_touched(&f, &remote, &c);
+    assert_eq!(
+        touched.into_iter().collect::<Vec<_>>(),
+        vec!["src/a.rs".to_owned()]
     );
 }

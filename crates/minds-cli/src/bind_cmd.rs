@@ -20,6 +20,10 @@ use minds_git::quarantine::{Limits, ObjectKind, ReceiveEnv, ServerRepo};
 /// mehr je Commit (S1 `truncated`).
 pub(crate) const MAX_COMMITS_BIND: usize = 500;
 
+/// So lange bindet der pre-push-Hook höchstens (Spec S3 §6.2: minds hält
+/// den Push nicht auf).
+const HOOK_BIND_TIME: Duration = Duration::from_secs(30);
+
 /// Längste Laufzeit von `rev-list` je Ref-Zeile.
 const REV_LIST_TIME: Duration = Duration::from_secs(30);
 
@@ -36,6 +40,32 @@ pub(crate) struct PushLine {
     pub(crate) local_sha: String,
     pub(crate) remote_ref: String,
     pub(crate) remote_sha: String,
+}
+
+/// Liest die pre-push-Eingabe; Zeilen, die nicht genau vier Felder mit zwei
+/// vollen Ids haben, zählen nicht.
+pub(crate) fn parse_push_lines(text: &str) -> Vec<PushLine> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let (Some(local_ref), Some(local_sha), Some(remote_ref), Some(remote_sha), None) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                return None;
+            };
+            let id = |s: &str| minds_witness_git::binding::is_commit_id(s);
+            (id(local_sha) && id(remote_sha)).then(|| PushLine {
+                local_ref: local_ref.to_owned(),
+                local_sha: local_sha.to_owned(),
+                remote_ref: remote_ref.to_owned(),
+                remote_sha: remote_sha.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// Die Lesesicht des Servers über dem lokalen Git-Verzeichnis.
@@ -65,8 +95,13 @@ pub(crate) fn commits_for_push(
     lines: &[PushLine],
 ) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in lines {
-        if is_null(&line.local_sha) {
+        // Löschung — und wie der Server (S2 §7.0 Regel 8): Ein Ziel, das kein
+        // Commit ist (annotierter Tag), wird nicht je Commit bewertet.
+        if is_null(&line.local_sha)
+            || !matches!(repo.kind(&line.local_sha), Ok(Some(ObjectKind::Commit)))
+        {
             continue;
         }
         let old = (!is_null(&line.remote_sha)
@@ -82,7 +117,7 @@ pub(crate) fn commits_for_push(
         )
         .map_err(|err| format!("commits not listable ({err:?})"))?;
         for c in commits {
-            if !out.contains(&c) {
+            if seen.insert(c.clone()) {
                 out.push(c);
             }
         }
@@ -122,7 +157,7 @@ fn commit_of(root: &Path, rev: &str) -> Result<String, String> {
 /// ein einzelner Rev wie eine Anlage (alle erreichbaren, begrenzt); ohne
 /// Angabe HEAD gegen den Remote-Tracking-Ref (`--remote`) bzw. den Upstream,
 /// sonst wie eine Anlage.
-fn lines_for(
+pub(crate) fn lines_for(
     root: &Path,
     range: Option<&str>,
     remote: Option<&str>,
@@ -162,16 +197,23 @@ fn lines_for(
 }
 
 /// Das `git` aus `PATH`, absolut: `rev-list` läuft mit geleerter Umgebung.
-#[cfg(unix)]
-fn which_git() -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+pub(crate) fn which_git() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
     std::env::split_paths(&std::env::var_os("PATH")?)
         .filter(|dir| dir.is_absolute())
-        .map(|dir| dir.join("git"))
-        .find(|path| {
-            std::fs::metadata(path)
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
+        .map(|dir| dir.join(name))
+        .find(|path| std::fs::metadata(path).is_ok_and(|m| m.is_file() && executable(&m)))
+}
+
+#[cfg(unix)]
+fn executable(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn executable(_: &std::fs::Metadata) -> bool {
+    true
 }
 
 /// Was der Witness je Commit geantwortet hat, für die Ausgabe.
@@ -248,8 +290,6 @@ fn bind(_: Option<&str>, _: Option<&str>, _: bool) -> Result<bool, String> {
 
 #[cfg(unix)]
 fn bind(range: Option<&str>, remote: Option<&str>, dry_run: bool) -> Result<bool, String> {
-    use minds_capture::witness_proto::Frame;
-
     let here = std::env::current_dir().map_err(|err| err.to_string())?;
     let root = crate::hook::witness::repo_root(&here).ok_or("not inside a Git worktree")?;
     if let Some(remote) = remote {
@@ -257,31 +297,12 @@ fn bind(range: Option<&str>, remote: Option<&str>, dry_run: bool) -> Result<bool
             return Err("--remote must name a configured remote".into());
         }
     }
-    if !matches!(
-        crate::config::load(&root).backend(),
-        minds_store::Backend::InRepo
-    ) {
-        return Err("bindings need the in-repo store (minds.backend in-repo)".into());
-    }
-    let expected = crate::sign_cmd::git_config_value(&root, "minds.project").ok_or(
+    let project = expected_project(&root)?.ok_or(
         "no project set — `git config minds.project <instance>/project-<id>` names the project \
          the witness should bind for",
     )?;
-    if !minds_witness_git::binding::is_project_id(&expected) {
-        return Err("minds.project must have the form <instance>/project-<id>".into());
-    }
-    let found = crate::hook::witness::discovered_socket(&root)
-        .ok_or("no witness found for this repository — minds enable sets one up")?;
-    // SAFETY: geteuid hat keine Vorbedingungen.
-    let euid = unsafe { libc::geteuid() };
-    if found.root.is_some() && found.peer == Some(euid) {
-        crate::text::warn(
-            "the witness runs under your own user ID — its observations are not separated, so \
-             the server credits none of them; bindings stay empty",
-        );
-    }
-    let git_dir = rev_parse(&root, &["--absolute-git-dir"]).ok_or("no git directory")?;
-    let view = open_view(Path::new(&git_dir))?;
+    let git_dir = git_dir(&root).ok_or("no git directory")?;
+    let view = open_view(&git_dir)?;
     let lines = lines_for(&root, range, remote)?;
     let git = which_git().ok_or("git not found on PATH")?;
     let commits = commits_for_push(&view, &git, &lines)?;
@@ -289,23 +310,104 @@ fn bind(range: Option<&str>, remote: Option<&str>, dry_run: bool) -> Result<bool
         println!("minds: nothing to bind");
         return Ok(true);
     }
+    bind_commits(&root, &project, &commits, dry_run, false)
+}
+
+/// Das erwartete Projekt aus `git config minds.project` — `None`, wenn
+/// keines gesetzt ist (dann bindet `minds` nichts); eine ungültige Form ist
+/// ein Fehler.
+pub(crate) fn expected_project(root: &Path) -> Result<Option<String>, String> {
+    match crate::sign_cmd::git_config_value(root, "minds.project") {
+        None => Ok(None),
+        Some(p) if minds_witness_git::binding::is_project_id(&p) => Ok(Some(p)),
+        Some(_) => Err("minds.project must have the form <instance>/project-<id>".into()),
+    }
+}
+
+/// Das absolute Git-Verzeichnis von `root`.
+pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
+    rev_parse(root, &["--absolute-git-dir"]).map(PathBuf::from)
+}
+
+/// Fragt den Witness je Commit (Spec S3 §6.1) und druckt je Commit eine
+/// Zeile. `Ok(false)`, wenn ein Commit nicht gebunden werden konnte;
+/// `Err`, wenn gar nicht gefragt werden konnte (Store, Witness). Aus dem
+/// pre-push-Hook (`from_hook`) ohne den Hinweis zur Anrechnung, der bei
+/// jedem Push nur Lärm wäre.
+#[cfg(unix)]
+pub(crate) fn bind_commits(
+    root: &Path,
+    expected: &str,
+    commits: &[String],
+    dry_run: bool,
+    from_hook: bool,
+) -> Result<bool, String> {
+    use minds_capture::witness_proto::Frame;
+
+    if !matches!(
+        crate::config::load(root).backend(),
+        minds_store::Backend::InRepo
+    ) {
+        return Err("bindings need the in-repo store (minds.backend in-repo)".into());
+    }
+    let found = crate::hook::witness::discovered_socket(root)
+        .ok_or("no witness found for this repository — minds enable sets one up")?;
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    let euid = unsafe { libc::geteuid() };
+    if !from_hook && found.root.is_some() && found.peer == Some(euid) {
+        crate::text::warn(
+            "the witness runs under your own user ID — its observations are not separated, so \
+             the server credits none of them; bindings stay empty",
+        );
+    }
     let mut all_ok = true;
     let mut covered_any = false;
-    for commit in &commits {
+    // Aus dem Hook bindet minds höchstens so lange, harte Grenze: Der Push des
+    // Nutzers wartet darauf (ein neuer Branch kann Hunderte Commits tragen).
+    // Die jüngsten zuerst — sie brauchen die Evidence, ältere sind meist
+    // schon gebunden.
+    let stop = from_hook.then(|| std::time::Instant::now() + HOOK_BIND_TIME);
+    let ordered: Vec<&String> = if from_hook {
+        commits.iter().rev().collect()
+    } else {
+        commits.iter().collect()
+    };
+    let mut counts = [0usize; 3]; // gebunden, unverändert, ohne Evidence
+    for (done, commit) in ordered.iter().enumerate() {
+        let left = stop.map(|stop| stop.saturating_duration_since(std::time::Instant::now()));
+        if left.is_some_and(|left| left < Duration::from_millis(500)) {
+            println!(
+                "minds: warning: binding stopped after {}s; {} commit(s) not bound — run \
+                 `minds bind` and `minds sync --evidence` to finish",
+                HOOK_BIND_TIME.as_secs(),
+                ordered.len() - done
+            );
+            return Ok(false);
+        }
+        let per_request = left.map_or(crate::checkpoint::delegate::timeout(), |left| {
+            left.min(crate::checkpoint::delegate::timeout())
+        });
+        let commit: &String = commit;
         let request = Frame::Bind {
             commit: commit.clone(),
-            expected_project: expected.clone(),
+            expected_project: expected.to_owned(),
             dry_run,
             request_id: crate::checkpoint::delegate::request_id(),
         };
         let ask = || {
-            let deadline = std::time::Instant::now() + crate::checkpoint::delegate::timeout();
+            let deadline = std::time::Instant::now() + per_request;
             crate::hook::witness::request(&found.socket, found.peer, &request, deadline)
         };
         let mut answer = ask();
         // Der Witness lässt je Commit (und nach einem Fehlschlag) eine
-        // Sekunde Abstand; einmal nachfragen genügt.
-        if matches!(&answer, Ok(Frame::Nack { reason, .. }) if reason == "rate limited") {
+        // Sekunde Abstand; einmal nachfragen genügt — aus dem Hook nur, wenn
+        // die Zeit dafür reicht.
+        let time_for_retry = stop.is_none_or(|stop| {
+            std::time::Instant::now() + Duration::from_millis(1100) + per_request <= stop
+        });
+        if time_for_retry
+            && matches!(&answer, Ok(Frame::Nack { reason, .. }) if reason == "rate limited")
+        {
             std::thread::sleep(Duration::from_millis(1100));
             answer = ask();
         }
@@ -321,18 +423,40 @@ fn bind(range: Option<&str>, remote: Option<&str>, dry_run: bool) -> Result<bool
                 false,
             ),
         };
-        println!("{line}");
+        // Aus dem Hook: Erfolge nur gezählt (eine Zeile am Ende), jede
+        // Störung als eigene Zeile.
+        match &answer {
+            Ok(Frame::Ack { status, .. }) if from_hook => {
+                let at = if status.starts_with("bound") {
+                    0
+                } else if status.starts_with("unchanged") {
+                    1
+                } else {
+                    2
+                };
+                counts[at] += 1;
+            }
+            _ => println!("{line}"),
+        }
         all_ok &= ok;
         covered_any |= matches!(&answer, Ok(Frame::Ack { status, .. })
             if !status.starts_with("no-evidence"));
-        // Ein abweichendes oder fehlendes Projekt gilt für jeden Commit.
+        // Ein abweichendes oder fehlendes Projekt gilt für jeden Commit;
+        // ein unerreichbarer Witness ebenso.
         if matches!(&answer, Ok(Frame::Nack { reason, .. })
             if reason == "project_mismatch" || reason == "project_unpinned")
+            || answer.is_err()
         {
             return Ok(false);
         }
     }
-    if covered_any {
+    if from_hook && counts.iter().sum::<usize>() > 0 {
+        println!(
+            "minds: {} commit(s) bound, {} already bound, {} without evidence",
+            counts[0], counts[1], counts[2]
+        );
+    }
+    if covered_any && !from_hook {
         // Spec S3 §6.1: Die Vorschau ist die Abdeckung des Servers nur, wenn
         // er diese Seals anerkennt.
         println!(
