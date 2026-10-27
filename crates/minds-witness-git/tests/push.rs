@@ -878,3 +878,28 @@ fn reject_message_escapes_ref_name_on_the_wire() {
     assert!(!out.stderr.contains('\u{9b}'), "{:?}", out.stderr);
     assert_eq!(w.server_ref(evil), None);
 }
+
+/// Spec S3 ADR-S3-002 (Commit 2): Die Ablage-Refs des Servers sind für
+/// Clients nie schreibbar, auch nicht im Observe-Modus.
+#[test]
+fn witness_store_refs_are_server_only() {
+    let w = world();
+    w.hook(&policy(Mode::Observe, &[], 100));
+    let c = w.commit(&w.base, &[("src/a.rs", b"a1")]);
+    let hex = "ab".repeat(32);
+    for target in [
+        format!("refs/minds/witness/receipts/{c}/{hex}"),
+        "refs/minds/witness/keys".to_owned(),
+        format!("refs/minds/witness/trust/{hex}"),
+    ] {
+        let out = w.push_refs(&[format!("{c}:{target}")]);
+        assert_ne!(out.exit, 0, "{target}");
+        assert_eq!(
+            out.minds,
+            vec![format!(
+                "minds-witness: Refs unter refs/minds/witness/ schreibt nur der Server (Ref: {target})"
+            )]
+        );
+        assert_eq!(w.server_ref(&target), None);
+    }
+}

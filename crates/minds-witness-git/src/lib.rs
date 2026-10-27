@@ -9,6 +9,9 @@
 //! ([`view`]). Es kennt keine Assurance-Stufen und hängt nicht von
 //! `minds-reader` ab (W2).
 //!
+//! [`receipt_store`] legt Quittungen, Schlüsselliste und Trust-Snapshots
+//! create-only unter `refs/minds/witness/` ab (Spec S3 §4).
+//!
 //! [`hook`] enthält das Test-Hook-Binary `minds-witness-hook` (§11) mit
 //! der sicheren Warnungsausgabe für den Observe-Modus (ADR-PRODUCT-001).
 
@@ -24,5 +27,6 @@ pub mod guard;
 pub mod hook;
 pub mod inspector;
 pub mod limits;
+pub mod receipt_store;
 pub mod trust;
 pub mod view;
