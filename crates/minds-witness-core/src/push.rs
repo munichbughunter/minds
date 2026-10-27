@@ -38,6 +38,8 @@ pub enum ServerKind {
     Scion,
     /// In-Memory-Host für Tests.
     Memory,
+    /// `git receive-pack` ohne Gitaly (S1 v1.6, Spec S3 ADR-S3-004).
+    Git,
 }
 
 /// Angaben zum Server, der den Befund erstellt.

@@ -113,6 +113,8 @@ pub fn body_of(f: &Finding, identity: &WitnessIdentity) -> ReceiptBody {
         schema: RECEIPT_SCHEMA.to_owned(),
         seal: f.seal.clone(),
         server: f.server.clone(),
+        // S1 v1.6: `/1`-Quittungen tragen nie `trust`.
+        trust: None,
         witness: identity.clone(),
     }
 }

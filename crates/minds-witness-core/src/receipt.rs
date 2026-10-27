@@ -9,10 +9,11 @@ use std::fmt;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
-use crate::RECEIPT_SCHEMA;
 use crate::finding::{Coverage, PolicyResult, PushInfo, SealStatus};
 use crate::ids::{CommitId, HashStr, KeyStr, SigStr, Timestamp};
 use crate::push::{Pusher, ServerInfo};
+use crate::trust::TrustSnapshot;
+use crate::{RECEIPT_SCHEMA, RECEIPT_SCHEMA_V2};
 
 /// Identität des Witness, die jede Quittung trägt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,12 +41,15 @@ pub struct ReceiptBody {
     pub pusher: Pusher,
     /// Repository-Kennung.
     pub repo: String,
-    /// Immer `RECEIPT_SCHEMA`.
+    /// `RECEIPT_SCHEMA` (ohne `trust`) oder `RECEIPT_SCHEMA_V2` (mit `trust`).
     pub schema: String,
     /// Seal-Angaben.
     pub seal: SealStatus,
     /// Serverangaben.
     pub server: ServerInfo,
+    /// Hash des Trust-Snapshots; genau bei `RECEIPT_SCHEMA_V2` vorhanden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<HashStr>,
     /// Witness-Identität.
     pub witness: WitnessIdentity,
 }
@@ -74,6 +78,9 @@ pub struct Receipt {
     pub server: ServerInfo,
     /// Ed25519-Signatur über den BLAKE3-Digest der kanonischen Body-Bytes.
     pub signature: SigStr,
+    /// Hash des Trust-Snapshots; genau bei `RECEIPT_SCHEMA_V2` vorhanden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<HashStr>,
     /// Witness-Identität.
     pub witness: WitnessIdentity,
 }
@@ -173,7 +180,29 @@ pub fn receipt_id(body: &ReceiptBody) -> HashStr {
     HashStr::of_bytes(&canonical_bytes(body))
 }
 
+/// Die strikte Schemaregel (Spec S3 §5): `/1` ohne `trust`, `/2` mit
+/// `trust`; jedes andere Schema ist unbekannt.
+pub(crate) fn check_schema(schema: &str, trust: Option<&HashStr>) -> Result<(), VerifyError> {
+    match (schema, trust) {
+        (RECEIPT_SCHEMA, None) | (RECEIPT_SCHEMA_V2, Some(_)) => Ok(()),
+        (RECEIPT_SCHEMA, Some(_)) => Err(VerifyError::Malformed(
+            "Schema /1 trägt kein Feld trust".to_owned(),
+        )),
+        (RECEIPT_SCHEMA_V2, None) => Err(VerifyError::Malformed(
+            "Schema /2 verlangt das Feld trust".to_owned(),
+        )),
+        (other, _) => Err(VerifyError::UnknownSchema(other.to_owned())),
+    }
+}
+
 impl ReceiptBody {
+    /// Prüft die strikte Schemaregel (Spec S3 §5) für diesen Body, bevor er
+    /// signiert wird; `post_receive` und `post_receive_with_trust` rufen das
+    /// vor jeder Signatur auf.
+    pub fn check(&self) -> Result<(), VerifyError> {
+        check_schema(&self.schema, self.trust.as_ref())
+    }
+
     /// Signiert den BLAKE3-Digest der kanonischen Bytes (genau 32 Byte).
     pub fn sign(self, signer: &Signer) -> Receipt {
         let digest = blake3::hash(&canonical_bytes(&self));
@@ -190,6 +219,7 @@ impl ReceiptBody {
             seal: self.seal,
             server: self.server,
             signature,
+            trust: self.trust,
             witness: self.witness,
         }
     }
@@ -213,6 +243,7 @@ impl Receipt {
             schema: self.schema.clone(),
             seal: self.seal.clone(),
             server: self.server.clone(),
+            trust: self.trust.clone(),
             witness: self.witness.clone(),
         }
     }
@@ -222,10 +253,18 @@ impl Receipt {
         canonical_bytes(self)
     }
 
-    /// Liest eine Quittung; jede Abweichung von Schema-Form oder Feldern ist
-    /// `VerifyError::Malformed`.
+    /// Liest eine Quittung streng (Spec S3 §5), erster Fehler gewinnt:
+    /// JSON-Form (`Malformed`), Schema bekannt (`UnknownSchema`), Regel
+    /// Schema/`trust` (`Malformed`), kanonische Bytes (`NotCanonical`; damit
+    /// ist auch `"trust":null` abgelehnt).
     pub fn from_bytes(bytes: &[u8]) -> Result<Receipt, VerifyError> {
-        serde_json::from_slice(bytes).map_err(|e| VerifyError::Malformed(e.to_string()))
+        let receipt: Receipt =
+            serde_json::from_slice(bytes).map_err(|e| VerifyError::Malformed(e.to_string()))?;
+        check_schema(&receipt.schema, receipt.trust.as_ref())?;
+        if receipt.to_bytes() != bytes {
+            return Err(VerifyError::NotCanonical);
+        }
+        Ok(receipt)
     }
 }
 
@@ -244,7 +283,7 @@ pub enum VerifyError {
     /// Bytes sind keine gültige Quittung.
     #[error("Quittung nicht lesbar: {0}")]
     Malformed(String),
-    /// Schema ist nicht `RECEIPT_SCHEMA`.
+    /// Schema ist weder `RECEIPT_SCHEMA` noch `RECEIPT_SCHEMA_V2`.
     #[error("unbekanntes Schema: {0}")]
     UnknownSchema(String),
     /// Schlüssel der Quittung fehlt in der Liste.
@@ -262,21 +301,65 @@ pub enum VerifyError {
     /// Bytes sind nicht die kanonische Form der Quittung.
     #[error("Quittung nicht kanonisch")]
     NotCanonical,
+    /// Eine `/2`-Quittung lässt sich nur mit ihrem Trust-Snapshot prüfen
+    /// (`verify_receipt_with_trust`); kein Rückfall auf `/1`.
+    #[error("Quittung mit Vertrauenskontext braucht den Trust-Snapshot")]
+    TrustSnapshotRequired,
+    /// `verify_receipt_with_trust` auf einer `/1`-Quittung.
+    #[error("Quittung ohne Vertrauenskontext (Schema /1)")]
+    NoTrustContext,
+    /// Der Snapshot ist nicht lesbar oder nicht kanonisch.
+    #[error("Trust-Snapshot ungültig: {0}")]
+    TrustSnapshotMalformed(String),
+    /// Der Hash des Snapshots ist nicht der signierte `trust`-Wert.
+    #[error("Trust-Snapshot passt nicht zur Quittung")]
+    TrustMismatch,
 }
 
 /// Verifiziert Quittungsbytes gegen eine Schlüsselliste (Abschnitt 9,
 /// Schritte 1 bis 7; erster Fehler gewinnt).
+///
+/// Nur für Schema `/1`. Eine `/2`-Quittung ergibt `TrustSnapshotRequired`:
+/// Sie ist ohne ihren Trust-Snapshot nie gültig (Spec S3 §5, kein Rückfall).
 pub fn verify_receipt(
     bytes: &[u8],
     keys: &[PublicKeyEntry],
 ) -> Result<VerifiedReceipt, VerifyError> {
     let receipt = Receipt::from_bytes(bytes)?;
-    if receipt.schema != RECEIPT_SCHEMA {
-        return Err(VerifyError::UnknownSchema(receipt.schema));
+    if receipt.trust.is_some() {
+        return Err(VerifyError::TrustSnapshotRequired);
     }
-    if receipt.to_bytes() != bytes {
-        return Err(VerifyError::NotCanonical);
+    verify_signature(receipt, keys)
+}
+
+/// Verifiziert eine `/2`-Quittung samt Trust-Snapshot: alle Schritte von
+/// [`verify_receipt`], dazu Form des Snapshots (`TrustSnapshot::from_bytes`)
+/// und Hash der Snapshot-Bytes gleich dem signierten `trust`. Eine
+/// `/1`-Quittung ergibt `NoTrustContext`. I/O-frei; woher Snapshot und
+/// Schlüsselliste stammen und wie vertrauenswürdig der Schlüssel ist,
+/// entscheidet der Aufrufer.
+pub fn verify_receipt_with_trust(
+    bytes: &[u8],
+    keys: &[PublicKeyEntry],
+    snapshot: &[u8],
+) -> Result<(VerifiedReceipt, TrustSnapshot), VerifyError> {
+    let receipt = Receipt::from_bytes(bytes)?;
+    let Some(trust) = receipt.trust.clone() else {
+        return Err(VerifyError::NoTrustContext);
+    };
+    let verified = verify_signature(receipt, keys)?;
+    let parsed = TrustSnapshot::from_bytes(snapshot)?;
+    if HashStr::of_bytes(snapshot) != trust {
+        return Err(VerifyError::TrustMismatch);
     }
+    Ok((verified, parsed))
+}
+
+/// Schritte 3 bis 7 aus S1 §9: Schlüssel, Gültigkeit, Signatur.
+fn verify_signature(
+    receipt: Receipt,
+    keys: &[PublicKeyEntry],
+) -> Result<VerifiedReceipt, VerifyError> {
     if !keys.iter().any(|k| k.key == receipt.witness.key) {
         return Err(VerifyError::UnknownKey(
             receipt.witness.key.as_str().to_owned(),
