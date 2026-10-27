@@ -10,8 +10,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use minds_core::evidence::{SCOPE_WITNESS_FS_V1, Seal, SealOutcome};
-use minds_core::observation::{MAX_OBSERVED_BYTES, ObservationReason, Observations};
+use minds_core::evidence::SCOPE_WITNESS_FS_V1;
 use minds_witness_core::{
     CommitId, HashStr, SealBlob, SealError, SealExpectation, SealInspector, SealSignature,
     SealSummary,
@@ -21,8 +20,9 @@ use serde::Serialize;
 use crate::binding::{CommitBinding, DEFAULT_MAX_SEALS};
 use crate::budget::Budget;
 use crate::candidates::{self, Candidate};
+use crate::selection::{self, State, States};
 use crate::trust::{MAX_SIGNATURE_BYTES, SigVerdict, Verifier, VerifyError};
-use crate::view::{EvidenceView, MODE_BLOB, MODE_EXEC, ViewError};
+use crate::view::{EvidenceView, MODE_BLOB, ViewError};
 
 /// Höchstgröße eines Seal-Textes.
 pub const MAX_SEAL_BYTES: u64 = 64 * 1024;
@@ -97,13 +97,6 @@ pub struct Diagnostic {
     pub reason: &'static str,
     /// Principal, falls eine Signatur anerkannt war.
     pub principal: Option<String>,
-}
-
-/// Ein belegter Zustand eines Pfads.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum State {
-    Content(String),
-    Deleted,
 }
 
 /// Belegte Zustände eines Observation-Objekts, `None` wenn verworfen.
@@ -299,15 +292,10 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
         let Ok(text) = std::str::from_utf8(&bytes) else {
             return Ok(None);
         };
-        if Seal::id_of_text(text).as_str() != seal_id {
-            return Ok(None);
-        }
-        let Ok(seal) = Seal::parse(text) else {
+        // Geteilte Lese-Regel (auch für die Auswahl im Witness).
+        let Some((scope, observations)) = selection::seal_observations(seal_id, text) else {
             return Ok(None);
         };
-        if seal.to_text().ok().as_deref() != Some(text) {
-            return Ok(None);
-        }
         let Some(sig) = self.read(&sig_entry.oid, MAX_SIGNATURE_BYTES as u64)? else {
             return Ok(None);
         };
@@ -319,12 +307,8 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
             SigVerdict::Accepted { .. } => {}
             _ => return Ok(None),
         }
-        let observations = match seal.outcome {
-            SealOutcome::ObservationsStored { observations } => Some(observations),
-            _ => None,
-        };
         Ok(Some(SealOk {
-            scope: seal.scope,
+            scope,
             observations,
         }))
     }
@@ -370,44 +354,13 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
         let Some(bytes) = self.read(&entry.oid, self.config.max_observations_bytes)? else {
             return Ok(None);
         };
-        if hex::encode(blake3::hash(&bytes).as_bytes()) != hex {
-            return Ok(None);
-        }
-        let Ok(obs) = serde_json::from_slice::<Observations>(&bytes) else {
-            return Ok(None);
-        };
-        if obs.check().is_err() || obs.canonical_bytes().ok().as_deref() != Some(bytes.as_slice()) {
-            return Ok(None);
-        }
-        let separated = obs
-            .witness
-            .as_ref()
-            .is_some_and(|w| w.profile == "user" && w.isolation.proven());
-        if !separated {
-            return Ok(None);
-        }
-        Ok(Some(
-            obs.observations
-                .iter()
-                .filter_map(|o| match (&o.content, o.reason) {
-                    (Some(h), None) => {
-                        Some((o.path.clone(), State::Content(h.as_str().to_owned())))
-                    }
-                    (None, Some(ObservationReason::Deleted)) => {
-                        Some((o.path.clone(), State::Deleted))
-                    }
-                    _ => None,
-                })
-                .collect(),
-        ))
+        // Geteilte Lese-Regel (auch für die Auswahl im Witness).
+        Ok(selection::observed_states(hex, &bytes))
     }
 
-    /// ADR-S2-003: die abgedeckten Pfade von `c` aus den belegten Zuständen.
-    fn covered(
-        &self,
-        c: &str,
-        states: &BTreeMap<String, BTreeSet<State>>,
-    ) -> Result<BTreeSet<String>, SealError> {
+    /// ADR-S2-003: die abgedeckten Pfade von `c` aus den belegten Zuständen,
+    /// mit derselben Regel wie die Auswahl im Witness ([`selection`]).
+    fn covered(&self, c: &str, states: &States) -> Result<BTreeSet<String>, SealError> {
         let changed = self.view.changed_paths(c).map_err(internal)?;
         let mut out = BTreeSet::new();
         for path in changed.iter().filter(|p| states.contains_key(*p)) {
@@ -415,61 +368,14 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
             self.budget
                 .check_deadline()
                 .map_err(|e| SealError::Internal(e.to_string()))?;
-            // S1 v1.5 V6: Nicht-UTF-8-Pfade sind nie abgedeckt.
-            if path.starts_with('\0') {
-                continue;
-            }
             let seen = &states[path];
-            let covered = match self.view.entry(c, path).map_err(internal)? {
-                None => seen.contains(&State::Deleted),
-                Some(e) if e.mode == MODE_BLOB || e.mode == MODE_EXEC => {
-                    let mode_ok = e.mode == MODE_BLOB || self.exec_inherited(c, path)?;
-                    let wanted: Vec<&String> = seen
-                        .iter()
-                        .filter_map(|s| match s {
-                            State::Content(h) => Some(h),
-                            State::Deleted => None,
-                        })
-                        .collect();
-                    mode_ok
-                        && !wanted.is_empty()
-                        && match self
-                            .view
-                            .blob(&e.oid, MAX_OBSERVED_BYTES)
-                            .map_err(internal)?
-                        {
-                            Some(bytes) => {
-                                let h =
-                                    format!("b3-{}", hex::encode(blake3::hash(&bytes).as_bytes()));
-                                wanted.iter().any(|w| **w == h)
-                            }
-                            None => false,
-                        }
-                }
-                // Symlink, Gitlink, Baum: nie abdeckbar.
-                Some(_) => false,
-            };
-            if covered {
+            let target = selection::target(self.view, c, path, selection::wants_content(seen))
+                .map_err(internal)?;
+            if selection::covers(&target, seen) {
                 out.insert(path.clone());
             }
         }
         Ok(out)
-    }
-
-    /// Modusregel für `100755` (ADR-S2-003 Nr. 2): Es gibt mindestens einen
-    /// Elternteil mit `p`, und in jedem Elternteil, der `p` hat, ist es
-    /// `100755`; ohne Eltern nie.
-    fn exec_inherited(&self, c: &str, path: &str) -> Result<bool, SealError> {
-        let parents = self.view.parents(c).map_err(internal)?;
-        let mut found = false;
-        for p in &parents {
-            match self.view.entry(p, path).map_err(internal)? {
-                Some(e) if e.mode == MODE_EXEC => found = true,
-                Some(_) => return Ok(false),
-                None => {}
-            }
-        }
-        Ok(found)
     }
 
     fn summary(&self, blob: &SealBlob, c: &str) -> Result<SealSummary, SealError> {
@@ -508,7 +414,7 @@ impl<'a, V: EvidenceView + ?Sized> GitSealInspector<'a, V> {
         }
         let project = Some(self.config.project.clone());
         if !accepted.is_empty() {
-            let mut states: BTreeMap<String, BTreeSet<State>> = BTreeMap::new();
+            let mut states: States = BTreeMap::new();
             let mut seal_ids: BTreeSet<&str> = BTreeSet::new();
             for b in &accepted {
                 seal_ids.extend(b.seals().iter().map(String::as_str));
