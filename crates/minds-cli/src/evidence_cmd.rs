@@ -22,7 +22,12 @@ use minds_witness_git::view::{EvidenceView, MODE_BLOB};
 /// Frist für Abgleich und Übertragung zusammen (Spec S3 §6.2 Schritt 5).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Überschreibt die Frist in Millisekunden (Tests, langsame Leitungen).
+/// Vertrauensunwürdige Eingabe: nur die eigene Wartezeit des Clients, immer
+/// in [`TIMEOUT_RANGE`]; nie eine Server-Frist oder Policy.
 pub(crate) const TIMEOUT_ENV: &str = "MINDS_EVIDENCE_TIMEOUT_MS";
+/// Der zulässige Bereich für [`TIMEOUT_ENV`] in Millisekunden (1 s bis
+/// 120 s); Werte außerhalb werden auf die Grenze gesetzt.
+const TIMEOUT_RANGE: std::ops::RangeInclusive<u64> = 1_000..=120_000;
 /// Die Wächtervariable: Ein Push mit ihr löst keinen minds-Ablauf aus.
 pub(crate) const GUARD_ENV: &str = "MINDS_SYNCING";
 
@@ -135,19 +140,23 @@ impl Transfer {
 
 /// Die Frist aus [`TIMEOUT_ENV`], sonst [`DEFAULT_TIMEOUT`].
 fn timeout() -> Duration {
-    std::env::var(TIMEOUT_ENV)
-        .ok()
+    timeout_from(std::env::var(TIMEOUT_ENV).ok().as_deref())
+}
+
+/// Nicht lesbar: Standard; sonst in [`TIMEOUT_RANGE`] begrenzt.
+fn timeout_from(value: Option<&str>) -> Duration {
+    value
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|ms| *ms > 0)
-        .map_or(DEFAULT_TIMEOUT, Duration::from_millis)
-        .min(Duration::from_secs(600))
+        .map_or(DEFAULT_TIMEOUT, |ms| {
+            Duration::from_millis(ms.clamp(*TIMEOUT_RANGE.start(), *TIMEOUT_RANGE.end()))
+        })
 }
 
 /// Ein `git`-Kindprozess bis `deadline`; stdout gesammelt, stderr
 /// durchgereicht (die Ablehnung des Servers bleibt sichtbar), oder
 /// verworfen. `Err(true)` heißt Frist abgelaufen, `Err(false)` nicht
 /// startbar.
-fn run_git(
+pub(crate) fn run_git(
     root: &Path,
     args: &[String],
     deadline: Instant,
@@ -284,5 +293,29 @@ pub(crate) fn run(range: Option<&str>, remote: &str) -> ExitCode {
             eprintln!("minds sync --evidence: {}", crate::text::sanitize(&err));
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Die Frist ist vertrauensunwürdige Eingabe mit festem Bereich.
+    #[test]
+    fn the_timeout_override_stays_in_its_range() {
+        assert_eq!(timeout_from(None), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("abc")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("-5")), DEFAULT_TIMEOUT);
+        assert_eq!(timeout_from(Some("1500")), Duration::from_millis(1500));
+        assert_eq!(timeout_from(Some(" 2000 ")), Duration::from_millis(2000));
+        assert_eq!(timeout_from(Some("0")), Duration::from_secs(1));
+        assert_eq!(timeout_from(Some("10")), Duration::from_secs(1));
+        assert_eq!(timeout_from(Some("999999999")), Duration::from_secs(120));
+        assert_eq!(
+            timeout_from(Some("18446744073709551615")),
+            Duration::from_secs(120)
+        );
+        assert!(TIMEOUT_RANGE.contains(&(DEFAULT_TIMEOUT.as_millis() as u64)));
     }
 }

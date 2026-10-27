@@ -4,6 +4,7 @@ use minds_store::ContextStore;
 mod bind_tests;
 mod intent_tests;
 mod observer_tests;
+mod receipt_tests;
 
 /// Ein Verzeichnis in `.git`, das der Witness betreten, aber nicht auflisten
 /// darf, könnte einen Symlink verbergen, den er beim Öffnen eines bekannten

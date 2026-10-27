@@ -84,6 +84,9 @@ pub struct GitReceiptStore {
     git: PathBuf,
     git_dir: PathBuf,
     timeout: Duration,
+    /// Namensraum der Refs: `refs/minds/witness/`, beim Leser auch ein
+    /// Tracking-Namensraum (`refs/minds/remotes/<r>/witness/`).
+    namespace: String,
 }
 
 struct Run {
@@ -218,7 +221,56 @@ impl GitReceiptStore {
             git: git.to_owned(),
             git_dir: git_dir.to_owned(),
             timeout,
+            namespace: minds_witness_core::WITNESS_NAMESPACE.to_owned(),
         }
+    }
+
+    /// Ein **nur lesender** Zugang zu einer Kopie der Ablage unter
+    /// `namespace` (etwa `refs/minds/remotes/origin/witness/`, Spec S3
+    /// §6.3): dieselben strengen Lesewege, andere Ref-Namen. Jeder
+    /// Schreibversuch ist ein technischer Fehler. `namespace` beginnt mit
+    /// `refs/minds/remotes/` und endet mit `/witness/`.
+    pub fn reader(
+        git: &Path,
+        git_dir: &Path,
+        timeout: Duration,
+        namespace: &str,
+    ) -> Result<Self, StoreError> {
+        if !namespace.starts_with("refs/minds/remotes/")
+            || !namespace.ends_with("/witness/")
+            || namespace.split('/').any(|part| part == "..")
+        {
+            return Err(internal("reader namespace"));
+        }
+        Ok(Self {
+            namespace: namespace.to_owned(),
+            ..Self::new(git, git_dir, timeout)
+        })
+    }
+
+    /// Schreibt diese Ablage in den echten Witness-Namensraum?
+    fn writable(&self) -> Result<(), StoreError> {
+        if self.namespace == minds_witness_core::WITNESS_NAMESPACE {
+            Ok(())
+        } else {
+            Err(internal("read-only store"))
+        }
+    }
+
+    fn keys_ref(&self) -> String {
+        format!("{}keys", self.namespace)
+    }
+
+    fn receipts_prefix(&self, commit: &CommitId) -> String {
+        format!("{}receipts/{}/", self.namespace, commit.as_str())
+    }
+
+    fn receipt_name(&self, key: &ReceiptKey) -> String {
+        format!("{}{}", self.receipts_prefix(&key.commit), hex_of(&key.id))
+    }
+
+    fn trust_name(&self, hash: &HashStr) -> String {
+        format!("{}trust/{}", self.namespace, hex_of(hash))
     }
 
     fn run(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Run, StoreError> {
@@ -443,6 +495,8 @@ impl GitReceiptStore {
     }
 
     fn clear_with_floor(&self, min_age: Duration) -> Result<LockReport, StoreError> {
+        // Ein Leser räumt nie auf (die Sperren gehören dem echten Namensraum).
+        self.writable()?;
         let mut report = LockReport::default();
         let marker = match self.take_clearing_marker()? {
             Some(m) => m,
@@ -675,6 +729,7 @@ impl GitReceiptStore {
         bytes: &[u8],
         conflict: &str,
     ) -> Result<PutResult, StoreError> {
+        self.writable()?;
         if bytes.len() > MAX_BLOB_BYTES {
             return Err(internal("object too large"));
         }
@@ -732,14 +787,14 @@ impl GitReceiptStore {
     pub fn put_trust(&self, bytes: &[u8]) -> Result<(HashStr, PutResult), StoreError> {
         TrustSnapshot::from_bytes(bytes).map_err(|_| internal("trust snapshot invalid"))?;
         let hash = HashStr::of_bytes(bytes);
-        let result = self.put_single(&Self::trust_ref(&hash), TRUST_FILE, bytes, hash.as_str())?;
+        let result = self.put_single(&self.trust_name(&hash), TRUST_FILE, bytes, hash.as_str())?;
         Ok((hash, result))
     }
 
     /// Bytes des Snapshots mit diesem Hash, sofern vorhanden. Die Bytes
     /// müssen zum Hash passen, sonst technischer Fehler.
     pub fn get_trust(&self, hash: &HashStr) -> Result<Option<Vec<u8>>, StoreError> {
-        let bytes = self.get_single(&Self::trust_ref(hash), TRUST_FILE)?;
+        let bytes = self.trust_bytes(hash)?;
         if let Some(b) = &bytes
             && HashStr::of_bytes(b) != *hash
         {
@@ -748,8 +803,20 @@ impl GitReceiptStore {
         Ok(bytes)
     }
 
+    /// Bytes des Snapshots unter dem Namen `hash`, **ohne** Abgleich mit
+    /// dem Hash: Für den Prüfer ist eine Abweichung ein Befund
+    /// (`verify_receipt_with_trust`), kein technischer Fehler.
+    pub fn trust_bytes(&self, hash: &HashStr) -> Result<Option<Vec<u8>>, StoreError> {
+        self.get_single(&self.trust_name(hash), TRUST_FILE)
+    }
+
+    /// Ob die Schlüsselliste existiert.
+    pub fn has_keys(&self) -> Result<bool, StoreError> {
+        Ok(self.resolve(&self.keys_ref())?.is_some())
+    }
+
     fn read_keys(&self) -> Result<(Option<String>, Vec<PublicKeyEntry>), StoreError> {
-        let Some(commit) = self.resolve(KEYS_REF)? else {
+        let Some(commit) = self.resolve(&self.keys_ref())? else {
             return Ok((None, Vec::new()));
         };
         let bytes = self.read_commit(&commit, KEYS_FILE, None)?;
@@ -765,7 +832,7 @@ impl GitReceiptStore {
 impl ReceiptStore for GitReceiptStore {
     fn put(&mut self, key: &ReceiptKey, bytes: &[u8]) -> Result<PutResult, StoreError> {
         self.put_single(
-            &Self::receipt_ref(key),
+            &self.receipt_name(key),
             RECEIPT_FILE,
             bytes,
             key.id.as_str(),
@@ -773,11 +840,11 @@ impl ReceiptStore for GitReceiptStore {
     }
 
     fn get(&self, key: &ReceiptKey) -> Result<Option<Vec<u8>>, StoreError> {
-        self.get_single(&Self::receipt_ref(key), RECEIPT_FILE)
+        self.get_single(&self.receipt_name(key), RECEIPT_FILE)
     }
 
     fn list(&self, commit: &CommitId) -> Result<Vec<ReceiptKey>, StoreError> {
-        let prefix = format!("{RECEIPTS_PREFIX}{}/", commit.as_str());
+        let prefix = self.receipts_prefix(commit);
         // Kaputte Refs übergeht `for-each-ref` still; jeder lose Eintrag
         // unter dem Präfix muss daher auch gelistet sein. Ein paralleler
         // Prozess kann zwischen den Lesungen anlegen: erst nach mehreren
@@ -837,6 +904,7 @@ impl ReceiptStore for GitReceiptStore {
     }
 
     fn register_public_key(&mut self, entry: &PublicKeyEntry) -> Result<(), StoreError> {
+        self.writable()?;
         for _ in 0..CAS_ATTEMPTS {
             let (old, mut keys) = self.read_keys()?;
             // S1 §11: gleicher Schlüssel mit gleichem `valid_from` genügt;
