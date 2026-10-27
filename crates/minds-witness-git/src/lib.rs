@@ -9,6 +9,10 @@
 //! ([`view`]). Es kennt keine Assurance-Stufen und hängt nicht von
 //! `minds-reader` ab (W2).
 //!
+//! [`selection`] ist die geteilte, inhaltsgebundene Seal-Auswahl: dieselbe
+//! Abdeckungsregel für den Inspektor des Servers und für die Bindung im
+//! Witness (Spec S3 §6.1).
+//!
 //! [`receipt_store`] legt Quittungen, Schlüsselliste und Trust-Snapshots
 //! create-only unter `refs/minds/witness/` ab (Spec S3 §4).
 //!
@@ -29,5 +33,6 @@ pub mod inspector;
 pub mod limits;
 pub mod process;
 pub mod receipt_store;
+pub mod selection;
 pub mod trust;
 pub mod view;
