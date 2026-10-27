@@ -93,6 +93,7 @@ pub enum VerifyError {
 #[derive(Debug)]
 pub struct TrustConfig {
     snapshot: tempfile::NamedTempFile,
+    text: String,
     program: PathBuf,
     require_separated_witness: bool,
     timeout: Duration,
@@ -152,11 +153,18 @@ impl TrustConfig {
             .map_err(|_| TrustFileError::Snapshot)?;
         Ok(Self {
             snapshot,
+            text: text.to_owned(),
             program: program.to_owned(),
             require_separated_witness,
             timeout,
             keys,
         })
+    }
+
+    /// Genau der Text des Signer-Snapshots, den jede Signaturprüfung
+    /// dieses Aufrufs verwendet (Spec S3 §4.3: Herkunft des Trust-Snapshots).
+    pub fn signers_text(&self) -> &str {
+        &self.text
     }
 
     /// Ob der öffentliche Schlüssel `key` (`<typ> <base64>`) den
@@ -282,6 +290,7 @@ impl<'a> Verifier<'a> {
             return Ok(verdict(*valid, principal));
         }
         let timeout = self.budget.take_process(self.trust.timeout)?;
+        let started = std::time::Instant::now();
         let valid = minds_attest::ssh_verify_ns_within(
             &self.trust.program,
             payload_text,
@@ -291,7 +300,9 @@ impl<'a> Verifier<'a> {
             NS_WITNESS,
             timeout,
         )
-        .map_err(|_| VerifyError::Process)?;
+        .map_err(|_| VerifyError::Process);
+        self.budget.record_process_time(started.elapsed());
+        let valid = valid?;
         self.cache.borrow_mut().insert(key, valid);
         Ok(verdict(valid, principal))
     }

@@ -21,6 +21,7 @@ struct Run {
 /// `GIT_DIR=.`), mit leerem stdin.
 fn run_hook(server: &Repo, config: &Path) -> Run {
     let mut child = Command::new(HOOK_BIN)
+        .arg("pre-receive")
         .arg(config)
         .current_dir(&server.git_dir)
         .env("GIT_DIR", ".")
@@ -80,7 +81,8 @@ fn s2_23_config_validation() {
         "policy",
         "seed_file",
         "key_valid_from",
-        "out_dir",
+        "repository",
+        "state_dir",
     ] {
         variant(&format!("missing-{field}"), &|v| {
             v.as_object_mut().unwrap().remove(field);
@@ -89,7 +91,14 @@ fn s2_23_config_validation() {
     // Unbekanntes Feld.
     variant("unknown-field", &|v| v["extra"] = serde_json::json!(1));
     // Relative Pfade.
-    for field in ["signers_file", "ssh_keygen", "git", "seed_file", "out_dir"] {
+    for field in [
+        "signers_file",
+        "ssh_keygen",
+        "git",
+        "seed_file",
+        "repository",
+        "state_dir",
+    ] {
         variant(&format!("relative-{field}"), &|v| {
             v[field] = serde_json::json!("relative/path");
         });
@@ -188,4 +197,133 @@ fn s2_23_config_validation() {
         std::fs::write(&signers, text).unwrap();
         assert_config_error(&run_hook(&server, cfg), name);
     }
+}
+
+/// Spec S3 §3 (Commit 3): Regeln der Betriebsart `pilot`.
+#[test]
+fn s3_07_pilot_mode_rules() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = GitTestFixture::new();
+    let server = fx.server();
+    let state = fx.dir.path().join("pilot-state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut good = fx.hook_config(&policy(Mode::Observe, &[], 100));
+    good["operation"] = serde_json::json!("pilot");
+    good["state_dir"] = serde_json::json!(state);
+    let write = |name: &str, v: &serde_json::Value, mode: u32| {
+        let p = fx.write_config(name, v);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    };
+    let ok = run_hook(&server, &write("pilot.json", &good, 0o600));
+    assert_eq!((ok.code, ok.stderr.as_str()), (0, ""));
+
+    let bad = |name: &str, f: &dyn Fn(&mut serde_json::Value), mode: u32| {
+        let mut v = good.clone();
+        f(&mut v);
+        let r = run_hook(&server, &write(name, &v, mode));
+        assert_config_error(&r, name);
+    };
+    bad(
+        "pilot-switch",
+        &|v| v["test_switches"] = serde_json::json!({"skip_quarantine": true}),
+        0o600,
+    );
+    bad(
+        "pilot-memory",
+        &|v| v["server_kind"] = serde_json::json!("memory"),
+        0o600,
+    );
+    bad("pilot-config-writable", &|_| {}, 0o620);
+    // Zustandsverzeichnis für andere zugänglich.
+    let open = fx.dir.path().join("open-state");
+    std::fs::create_dir_all(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bad(
+        "pilot-open-state",
+        &|v| v["state_dir"] = serde_json::json!(open),
+        0o600,
+    );
+    // Fehlendes Zustandsverzeichnis wird im Pilotbetrieb nicht angelegt.
+    let missing = fx.dir.path().join("missing-state");
+    bad(
+        "pilot-missing-state",
+        &|v| v["state_dir"] = serde_json::json!(missing),
+        0o600,
+    );
+    // Repository passt nicht zu GIT_DIR.
+    bad(
+        "pilot-other-repo",
+        &|v| v["repository"] = serde_json::json!(fx.dir.path().join("other.git")),
+        0o600,
+    );
+    // Seed für andere lesbar (gilt in beiden Betriebsarten).
+    let seed = fx.dir.path().join("seed-open.hex");
+    std::fs::write(&seed, "42".repeat(32)).unwrap();
+    std::fs::set_permissions(&seed, std::fs::Permissions::from_mode(0o644)).unwrap();
+    bad(
+        "pilot-seed",
+        &|v| v["seed_file"] = serde_json::json!(seed),
+        0o600,
+    );
+    // Konfiguration für andere lesbar.
+    bad("pilot-config-readable", &|_| {}, 0o640);
+    // Zu kurze Verfallszeit.
+    bad(
+        "pilot-short-ttl",
+        &|v| v["pending_ttl_secs"] = serde_json::json!(59),
+        0o600,
+    );
+    // Trust-Datei für andere beschreibbar.
+    let signers = fx.dir.path().join("signers-open");
+    std::fs::copy(good["signers_file"].as_str().unwrap(), &signers).unwrap();
+    std::fs::set_permissions(&signers, std::fs::Permissions::from_mode(0o666)).unwrap();
+    bad(
+        "pilot-signers-writable",
+        &|v| v["signers_file"] = serde_json::json!(signers),
+        0o600,
+    );
+    // Trust-Datei als Symlink.
+    let link = fx.dir.path().join("signers-link");
+    std::os::unix::fs::symlink(good["signers_file"].as_str().unwrap(), &link).unwrap();
+    bad(
+        "pilot-signers-symlink",
+        &|v| v["signers_file"] = serde_json::json!(link),
+        0o600,
+    );
+    // Seed in einem für andere beschreibbaren Verzeichnis (ohne Sticky-Bit).
+    let shared = fx.dir.path().join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let shared_seed = shared.join("seed.hex");
+    std::fs::copy(good["seed_file"].as_str().unwrap(), &shared_seed).unwrap();
+    std::fs::set_permissions(&shared_seed, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    bad(
+        "pilot-seed-dir-writable",
+        &|v| v["seed_file"] = serde_json::json!(shared_seed),
+        0o600,
+    );
+    // Mit Sticky-Bit (wie /tmp) zulässig.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let mut sticky = good.clone();
+    sticky["seed_file"] = serde_json::json!(shared_seed);
+    let r = run_hook(&server, &write("pilot-sticky.json", &sticky, 0o600));
+    assert_eq!((r.code, r.stderr.as_str()), (0, ""));
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // Konfiguration in einem für andere beschreibbaren Verzeichnis.
+    let open_cfg_dir = fx.dir.path().join("open-cfg");
+    std::fs::create_dir_all(&open_cfg_dir).unwrap();
+    std::fs::set_permissions(&open_cfg_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let cfg = open_cfg_dir.join("pilot.json");
+    std::fs::write(&cfg, serde_json::to_vec(&good).unwrap()).unwrap();
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_config_error(&run_hook(&server, &cfg), "pilot-config-dir-writable");
+    std::fs::set_permissions(&open_cfg_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // Im Testbetrieb ist `memory` erlaubt.
+    let mut test = fx.hook_config(&policy(Mode::Observe, &[], 100));
+    test["server_kind"] = serde_json::json!("memory");
+    let r = run_hook(&server, &write("test-memory.json", &test, 0o644));
+    assert_eq!(r.code, 0, "{}", r.stderr);
 }

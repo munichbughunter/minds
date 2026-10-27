@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::process::{Liveness, liveness, own_pid, start_time};
 use minds_witness_core::{
     CommitId, HashStr, PublicKeyEntry, PutResult, ReceiptKey, ReceiptStore, StoreError,
     TrustSnapshot, canonical_bytes,
@@ -52,13 +53,19 @@ pub const MAX_BLOB_BYTES: usize = 1024 * 1024;
 /// Erwarteter alter Wert „Ref existiert nicht“ für `update-ref`; leer statt
 /// Null-Id, damit es auch in SHA-256-Repositories gilt.
 const MUST_NOT_EXIST: &str = "";
-/// Ab diesem Alter gilt eine Sperrdatei unter `refs/minds/witness/` als
-/// verwaist (weit über jedem Prozess-Timeout).
-pub const STALE_LOCK_AGE: Duration = Duration::from_secs(300);
+/// Mindestalter einer Sperrdatei, bevor `clear_stale_locks` sie entfernen
+/// darf, zusätzlich zum Nachweis, dass kein Ablageprozess mehr lebt (Schutz
+/// gegen fremde, nicht registrierte Git-Prozesse eines Administrators).
+pub const MIN_ORPHAN_AGE: Duration = Duration::from_secs(60);
+/// Verzeichnis im Git-Verzeichnis für die Koordination der Ablageprozesse.
+const COORD_DIR: &str = "minds-witness";
+/// Marke „Aufräumen läuft“ in [`COORD_DIR`].
+const CLEARING: &str = "clearing";
+/// Ab diesem Alter gilt eine unlesbare Token-Datei als Rest eines toten
+/// Prozesses.
+const UNREADABLE_TOKEN_AGE: Duration = Duration::from_secs(30);
 /// Lesungen, bevor ein roh vorhandener, aber unlesbarer Ref als kaputt gilt.
 const RESOLVE_ATTEMPTS: usize = 3;
-/// Sperre, die `clear_stale_locks` gegen sich selbst serialisiert.
-const CLEAR_GUARD: &str = "minds-witness-clear-locks.lock";
 #[cfg(not(windows))]
 const NO_FILE: &str = "/dev/null";
 #[cfg(windows)]
@@ -84,18 +91,133 @@ struct Run {
     stdout: Vec<u8>,
 }
 
+/// Ergebnis von [`GitReceiptStore::clear_stale_locks`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LockReport {
+    /// Ein Ablage- oder Aufräumprozess lebt (oder ist nicht prüfbar): nichts
+    /// wurde entfernt.
+    pub busy: bool,
+    /// Entfernte, nachweislich verwaiste Sperren (Ref-Namen).
+    pub removed: Vec<String>,
+    /// Bekannte Sperren, die jünger als das Mindestalter sind.
+    pub kept_young: Vec<String>,
+    /// Sperren, die nicht zu einem Ref dieser Ablage gehören oder keine
+    /// reguläre Datei sind; sie bleiben erhalten und sind ein Befund.
+    pub kept_unknown: Vec<String>,
+    /// Vorhandene Sperren, während ein Prozess lebte (oder nicht prüfbar
+    /// war): nicht als verwaist nachweisbar, erhalten und gemeldet.
+    pub kept_busy: Vec<String>,
+}
+
+/// Registrierung eines Prozesses als Datei `<pid>-<nonce>` mit Inhalt
+/// `<pid> <startzeit>`; gelöscht beim Verlassen des Gültigkeitsbereichs.
+struct Token {
+    path: PathBuf,
+}
+
+impl Token {
+    fn create(dir: &Path, pid: u32) -> Result<Self, StoreError> {
+        std::fs::create_dir_all(dir).map_err(|_| internal("coordination dir"))?;
+        let nonce: u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64)
+            ^ (u64::from(own_pid()) << 32);
+        Self::create_at(&dir.join(format!("{pid}-{nonce:016x}")), pid)
+    }
+
+    fn create_at(path: &Path, pid: u32) -> Result<Self, StoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|_| internal("coordination dir"))?;
+        }
+        let start = start_time(pid).unwrap_or_else(|| "-".to_owned());
+        // Vollständig schreiben, dann per `link` unter dem Namen anlegen: Ein
+        // Absturz hinterlässt nie eine leere oder halbe Token-Datei.
+        let dir = path.parent().ok_or_else(|| internal("coordination dir"))?;
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(dir).map_err(|_| internal("coordination token"))?;
+        tmp.write_all(format!("{pid} {start}\n").as_bytes())
+            .and_then(|()| tmp.as_file().sync_all())
+            .map_err(|_| internal("coordination token"))?;
+        std::fs::hard_link(tmp.path(), path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                StoreError::Conflict("coordination token exists".to_owned())
+            } else {
+                internal("coordination token")
+            }
+        })?;
+        Ok(Self {
+            path: path.to_owned(),
+        })
+    }
+
+    fn read(path: &Path) -> Option<(u32, Option<String>)> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let (pid, start) = text.trim_end().split_once(' ')?;
+        let pid = pid.parse().ok()?;
+        Some((pid, (start != "-").then(|| start.to_owned())))
+    }
+
+    /// Lebenszustand des Prozesses hinter einer Token-Datei. Unlesbar und
+    /// älter als [`UNREADABLE_TOKEN_AGE`] gilt als tot (Reste von Fremdeingriffen;
+    /// eigene Tokens entstehen nie halb), jünger als unbekannt.
+    fn state(path: &Path) -> Liveness {
+        match Self::read(path) {
+            Some((pid, start)) => match liveness(pid, start.as_deref()) {
+                // Nach einem Neustart (Stromausfall während einer Ablage):
+                // Tokens und Marken eines früheren Systemstarts gehören toten
+                // Prozessen; sonst blockierten sie für immer.
+                Liveness::Unknown
+                    if start.as_deref().is_some_and(|s| {
+                        std::fs::metadata(path)
+                            .and_then(|m| m.modified())
+                            .is_ok_and(|t| crate::process::from_previous_boot(s, t))
+                    }) =>
+                {
+                    Liveness::Dead
+                }
+                l => l,
+            },
+            None if is_older(path, UNREADABLE_TOKEN_AGE) => Liveness::Dead,
+            None => Liveness::Unknown,
+        }
+    }
+}
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Ob `name` ein Ref ist, den diese Ablage schreibt.
+fn is_store_ref(name: &str) -> bool {
+    if name == KEYS_REF {
+        return true;
+    }
+    if let Some(hex) = name.strip_prefix(TRUST_PREFIX) {
+        return is_hex(hex, 64);
+    }
+    if let Some(rest) = name.strip_prefix(RECEIPTS_PREFIX)
+        && let Some((commit, id)) = rest.split_once('/')
+    {
+        return (is_hex(commit, 40) || is_hex(commit, 64)) && is_hex(id, 64);
+    }
+    false
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 impl GitReceiptStore {
     /// Eine Ablage im Repository `git_dir`, geschrieben mit dem Programm
     /// `git` (absoluter Pfad aus der Konfiguration); jeder Prozess endet
     /// spätestens nach `timeout`.
-    /// Der Timeout wird auf höchstens ein Viertel von [`STALE_LOCK_AGE`]
-    /// begrenzt: So stammt eine Sperrdatei, die älter als `STALE_LOCK_AGE`
-    /// ist, sicher von einem beendeten Prozess (`clear_stale_locks`).
     pub fn new(git: &Path, git_dir: &Path, timeout: Duration) -> Self {
         Self {
             git: git.to_owned(),
             git_dir: git_dir.to_owned(),
-            timeout: timeout.min(STALE_LOCK_AGE / 4),
+            timeout,
         }
     }
 
@@ -130,7 +252,28 @@ impl GitReceiptStore {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Schreibende Aufrufe (nur `update-ref` legt Sperrdateien an) laufen
+        // registriert: eigener Token vor dem Start, Token des Kindprozesses
+        // danach. So kann `clear_stale_locks` belegen, dass keine Sperre
+        // einem lebenden Prozess gehört.
+        let writer = if args.first() == Some(&"update-ref") {
+            Some(self.writer_token()?)
+        } else {
+            None
+        };
         let mut child = cmd.spawn().map_err(|_| internal("git not startable"))?;
+        let _child_token = match writer {
+            Some(_) => match self.child_token(child.id()) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // Nie ein laufendes, nicht registriertes Kind hinterlassen.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(e);
+                }
+            },
+            None => None,
+        };
         if let Some(input) = stdin {
             let mut pipe = child.stdin.take().ok_or_else(|| internal("git stdin"))?;
             let data = input.to_vec();
@@ -253,48 +396,156 @@ impl GitReceiptStore {
         }
     }
 
-    /// Entfernt verwaiste Sperrdateien unter `refs/minds/witness/` (älter als
-    /// `max_age`), die ein abgebrochener Ablageprozess hinterlassen hat; sie
-    /// blockierten sonst jede Wiederholung. Liefert die entfernten Ref-Namen.
-    /// Aufgerufen von `reconcile` (Spec S3 §3.3), nie während einer Ablage.
-    pub fn clear_stale_locks(&self, max_age: Duration) -> Result<Vec<String>, StoreError> {
-        // Nie jünger als STALE_LOCK_AGE: Eine jüngere Sperre könnte ein
-        // lebender Prozess halten (Timeout ≤ STALE_LOCK_AGE / 4, siehe `new`).
-        let max_age = max_age.max(STALE_LOCK_AGE);
-        // Gegen sich selbst serialisiert: Zwei gleichzeitige Läufe könnten
-        // sonst beide ein altes Datum sehen, und der zweite entfernte eine
-        // inzwischen frisch angelegte, lebende Sperre.
-        let guard = self.git_dir.join(CLEAR_GUARD);
-        if std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&guard)
-            .is_err()
-        {
-            if is_older(&guard, max_age) {
-                // Ein abgestürzter Lauf hinterließ die Sperre: übernehmen.
-                let _ = std::fs::remove_file(&guard);
-                if std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&guard)
-                    .is_err()
-                {
-                    return Ok(Vec::new());
-                }
-            } else {
-                return Ok(Vec::new());
-            }
-        }
-        let result = self.clear_locked(max_age);
-        let _ = std::fs::remove_file(&guard);
-        result
+    fn coord(&self, sub: &str) -> PathBuf {
+        self.git_dir.join(COORD_DIR).join(sub)
     }
 
-    fn clear_locked(&self, max_age: Duration) -> Result<Vec<String>, StoreError> {
-        let root = self.git_dir.join("refs/minds/witness");
-        let mut out = Vec::new();
-        let mut stack = vec![root];
+    /// Token „ich schreibe gleich“; wartet, solange `clear_stale_locks`
+    /// läuft. Reihenfolge: erst Token anlegen, dann die Marke prüfen
+    /// (spiegelbildlich zu `clear_stale_locks`): Entweder sieht der Schreiber
+    /// die Marke, oder der Aufräumer sieht den Token.
+    fn writer_token(&self) -> Result<Token, StoreError> {
+        let deadline = Instant::now() + self.timeout;
+        loop {
+            let token = Token::create(&self.coord("writers"), own_pid())?;
+            if !self.coord(CLEARING).exists() {
+                return Ok(token);
+            }
+            drop(token);
+            if Instant::now() >= deadline {
+                return Err(internal("store busy: lock recovery running"));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn child_token(&self, pid: u32) -> Result<Token, StoreError> {
+        Token::create(&self.coord("children"), pid)
+    }
+
+    /// Entfernt Sperrdateien unter `refs/minds/witness/`, die **nachweislich
+    /// verwaist** sind (Spec S3 §3.3, Freigabe 27.10.2026):
+    ///
+    /// 1. Die Marke `clearing` wird exklusiv angelegt; neue Schreiber warten
+    ///    dann (`writer_token`). Läuft schon ein Aufräumer, passiert nichts
+    ///    (`busy`); die Marke eines toten Aufräumers wird übernommen.
+    /// 2. Jeder registrierte Schreiber- und Kindprozess wird geprüft (PID
+    ///    plus Startzeit). Lebt einer oder ist es nicht feststellbar, wird
+    ///    **nichts** entfernt (`busy`). Tote Tokens werden gelöscht.
+    /// 3. Erst dann werden Sperrdateien entfernt, und nur, wenn ihr Name zu
+    ///    einem Ref gehört, den diese Ablage schreibt (Quittung, `keys`,
+    ///    Snapshot), wenn sie eine reguläre Datei sind und mindestens
+    ///    `min_age` (nie unter [`MIN_ORPHAN_AGE`]) alt.
+    /// 4. Unbekannte Sperren bleiben erhalten und werden gemeldet
+    ///    (`kept_unknown`), ebenso zu junge (`kept_young`).
+    pub fn clear_stale_locks(&self, min_age: Duration) -> Result<LockReport, StoreError> {
+        self.clear_with_floor(min_age.max(MIN_ORPHAN_AGE))
+    }
+
+    fn clear_with_floor(&self, min_age: Duration) -> Result<LockReport, StoreError> {
+        let mut report = LockReport::default();
+        let marker = match self.take_clearing_marker()? {
+            Some(m) => m,
+            None => {
+                report.busy = true;
+                return Ok(report);
+            }
+        };
+        for sub in ["writers", "children"] {
+            let Ok(entries) = std::fs::read_dir(self.coord(sub)) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                match Token::state(&path) {
+                    Liveness::Dead => {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    Liveness::Alive | Liveness::Unknown => report.busy = true,
+                }
+            }
+        }
+        if report.busy {
+            // Nicht als verwaist nachweisbar: erhalten, aber gemeldet.
+            self.list_locks(&mut report.kept_busy);
+        } else {
+            self.remove_orphaned(min_age, &mut report)?;
+        }
+        drop(marker);
+        report.removed.sort();
+        report.kept_young.sort();
+        report.kept_unknown.sort();
+        Ok(report)
+    }
+
+    fn take_clearing_marker(&self) -> Result<Option<Token>, StoreError> {
+        let path = self.coord(CLEARING);
+        for _ in 0..2 {
+            match Token::create_at(&path, own_pid()) {
+                Ok(t) => return Ok(Some(t)),
+                Err(StoreError::Conflict(_)) => {
+                    if Token::state(&path) != Liveness::Dead {
+                        return Ok(None);
+                    }
+                    // Übernahme ohne Wettlauf: Die tote Marke wird unter
+                    // einen eigenen Namen umbenannt. Nur wer das schafft,
+                    // entfernt sie; ein zweiter Aufräumer findet dann entweder
+                    // keine Marke oder die neue, lebende.
+                    let aside = path.with_extension(format!("dead-{}", own_pid()));
+                    if std::fs::rename(&path, &aside).is_err() {
+                        return Ok(None);
+                    }
+                    if Token::state(&aside) != Liveness::Dead {
+                        // Zwischen Prüfung und Umbenennung wurde die Marke
+                        // ersetzt: zurücklegen, nichts tun.
+                        let _ = std::fs::hard_link(&aside, &path);
+                        let _ = std::fs::remove_file(&aside);
+                        return Ok(None);
+                    }
+                    let _ = std::fs::remove_file(&aside);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    }
+
+    fn list_locks(&self, out: &mut Vec<String>) {
+        let mut stack = vec![self.git_dir.join("refs/minds/witness")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "lock") {
+                    out.push(
+                        path.strip_prefix(&self.git_dir)
+                            .map(|p| p.to_string_lossy().trim_end_matches(".lock").to_owned())
+                            .unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        out.sort();
+    }
+
+    /// Nur für Tests: wie [`Self::clear_stale_locks`], aber ohne
+    /// Mindestalter. So lässt sich prüfen, dass allein der Prozessnachweis
+    /// lebende Sperren schützt.
+    #[doc(hidden)]
+    pub fn clear_stale_locks_without_age_floor(&self) -> Result<LockReport, StoreError> {
+        self.clear_with_floor(Duration::ZERO)
+    }
+
+    fn remove_orphaned(
+        &self,
+        min_age: Duration,
+        report: &mut LockReport,
+    ) -> Result<(), StoreError> {
+        let mut stack = vec![self.git_dir.join("refs/minds/witness")];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -308,21 +559,26 @@ impl GitReceiptStore {
                     stack.push(path);
                     continue;
                 }
-                let is_lock = path.extension().is_some_and(|x| x == "lock");
-                // Das Alter wird unmittelbar vor dem Entfernen erneut geprüft.
-                if is_lock && meta.is_file() && is_older(&path, max_age) {
-                    std::fs::remove_file(&path)
-                        .map_err(|_| internal("stale lock not removable"))?;
-                    let rel = path
-                        .strip_prefix(&self.git_dir)
-                        .map(|p| p.to_string_lossy().trim_end_matches(".lock").to_owned())
-                        .unwrap_or_default();
-                    out.push(rel);
+                if path.extension().is_none_or(|x| x != "lock") {
+                    continue;
                 }
+                let name = path
+                    .strip_prefix(&self.git_dir)
+                    .map(|p| p.to_string_lossy().trim_end_matches(".lock").to_owned())
+                    .unwrap_or_default();
+                if !meta.is_file() || !is_store_ref(&name) {
+                    report.kept_unknown.push(name);
+                    continue;
+                }
+                if !is_older(&path, min_age) {
+                    report.kept_young.push(name);
+                    continue;
+                }
+                std::fs::remove_file(&path).map_err(|_| internal("stale lock not removable"))?;
+                report.removed.push(name);
             }
         }
-        out.sort();
-        Ok(out)
+        Ok(())
     }
 
     /// Commit mit genau einer Datei `file` (Inhalt `bytes`) und den Eltern

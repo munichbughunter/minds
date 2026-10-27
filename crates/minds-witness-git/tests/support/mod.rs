@@ -505,11 +505,12 @@ impl Evidence<'_> {
 
 pub const HOOK_BIN: &str = env!("CARGO_BIN_EXE_minds-witness-hook");
 
-/// Ein installierter Hook: Konfiguration, Ausgabeverzeichnis.
+/// Ein installierter Hook: Konfiguration, Zustandsverzeichnis, Server.
 #[derive(Debug, Clone)]
 pub struct Hook {
     pub config: PathBuf,
-    pub out: PathBuf,
+    pub state: PathBuf,
+    pub server: Repo,
 }
 
 /// Ergebnis eines `git push`.
@@ -571,7 +572,8 @@ impl GitTestFixture {
             "policy": policy,
             "seed_file": self.seed_file(),
             "key_valid_from": "2026-01-01T00:00:00Z",
-            "out_dir": self.dir.path().join("out"),
+            "repository": self.dir.path().join("server.git"),
+            "state_dir": self.dir.path().join("state"),
         })
     }
 
@@ -582,51 +584,100 @@ impl GitTestFixture {
         p
     }
 
-    /// Installiert `minds-witness-hook` als pre-receive-Hook von `server`.
+    /// Installiert `minds-witness-hook` als pre- und post-receive-Hook von
+    /// `server` (über `minds-witness-hook install`).
     pub fn install_hook(&self, server: &Repo, value: &serde_json::Value) -> Hook {
-        let config = self.write_config("hook.json", value);
-        let hook = server.git_dir.join("hooks").join("pre-receive");
-        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
-        std::fs::write(
-            &hook,
-            format!("#!/bin/sh\nexec '{}' '{}'\n", HOOK_BIN, config.display()),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let mut value = value.clone();
+        value["repository"] = serde_json::json!(server.git_dir);
+        let config = self.write_config("hook.json", &value);
+        let out = Command::new(HOOK_BIN)
+            .args(["install"])
+            .arg(&config)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "install: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         Hook {
             config,
-            out: PathBuf::from(value["out_dir"].as_str().unwrap()),
+            state: PathBuf::from(value["state_dir"].as_str().unwrap()),
+            server: server.clone(),
         }
     }
 }
 
 impl Hook {
-    /// Die Quittungen unter `<out>/<commit>/`.
+    /// Die Quittungen unter `refs/minds/witness/receipts/<commit>/`, in
+    /// Ref-Namensordnung.
     pub fn receipts(&self, commit: &str) -> Vec<Vec<u8>> {
-        let dir = self.out.join(commit);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return Vec::new();
-        };
-        let mut names: Vec<PathBuf> = entries.map(|e| e.unwrap().path()).collect();
-        names.sort();
+        let prefix = format!("refs/minds/witness/receipts/{commit}/");
+        let names = self
+            .server
+            .git(&["for-each-ref", "--format=%(refname)", &prefix]);
         names
-            .into_iter()
-            .map(|p| std::fs::read(p).unwrap())
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|r| {
+                self.server
+                    .try_git(&["cat-file", "blob", &format!("{r}:receipt.json")], None)
+                    .stdout
+            })
             .collect()
     }
 
-    /// `<out>/keys.json`.
+    /// Die Schlüsselliste unter `refs/minds/witness/keys`.
     pub fn keys(&self) -> Vec<minds_witness_core::PublicKeyEntry> {
-        serde_json::from_slice(&std::fs::read(self.out.join("keys.json")).unwrap()).unwrap()
+        let out = self.server.try_git(
+            &["cat-file", "blob", "refs/minds/witness/keys:keys.json"],
+            None,
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    /// `<out>/log.jsonl` als Text (leer, wenn nicht vorhanden).
+    /// Bytes des Trust-Snapshots mit diesem Hash.
+    pub fn trust(&self, hash: &minds_witness_core::HashStr) -> Option<Vec<u8>> {
+        let hex = hash.as_str().split_once(':').unwrap().1;
+        let out = self.server.try_git(
+            &[
+                "cat-file",
+                "blob",
+                &format!("refs/minds/witness/trust/{hex}:trust.json"),
+            ],
+            None,
+        );
+        out.status.success().then_some(out.stdout)
+    }
+
+    /// Prüft eine Quittung vollständig (`/2` mit Snapshot aus dem Server).
+    pub fn verify(&self, bytes: &[u8]) -> minds_witness_core::Receipt {
+        let r = minds_witness_core::Receipt::from_bytes(bytes).unwrap();
+        let trust = r.trust.clone().expect("Quittung /2");
+        let snapshot = self.trust(&trust).expect("Trust-Snapshot vorhanden");
+        minds_witness_core::verify_receipt_with_trust(bytes, &self.keys(), &snapshot)
+            .unwrap()
+            .0
+            .receipt
+    }
+
+    /// `<state>/log.jsonl` als Text (leer, wenn nicht vorhanden).
     pub fn log(&self) -> String {
-        std::fs::read_to_string(self.out.join("log.jsonl")).unwrap_or_default()
+        std::fs::read_to_string(self.state.join("log.jsonl")).unwrap_or_default()
+    }
+
+    /// Dateien im Unterverzeichnis `sub` des Zustandsverzeichnisses.
+    pub fn handoff(&self, sub: &str) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(self.state.join(sub))
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out
     }
 }
 

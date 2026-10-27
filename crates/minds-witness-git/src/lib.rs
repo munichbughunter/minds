@@ -27,6 +27,7 @@ pub mod guard;
 pub mod hook;
 pub mod inspector;
 pub mod limits;
+pub mod process;
 pub mod receipt_store;
 pub mod trust;
 pub mod view;
