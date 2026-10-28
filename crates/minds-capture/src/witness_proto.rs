@@ -145,6 +145,14 @@ pub enum Frame {
         dry_run: bool,
         request_id: [u8; 16],
     },
+    /// Asks the witness which project its `witness.json` pins (`minds enable
+    /// --project`, Spec S3 §6.1). Read-only: no repository access, no rate
+    /// limit, nothing changes. Answered with `Ack` `pinned <project>` or
+    /// `unpinned`; the pin itself is only ever set by `witness init` as the
+    /// witness user.
+    Project {
+        request_id: [u8; 16],
+    },
     Ack {
         request_id: [u8; 16],
         status: String,
@@ -288,6 +296,10 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>, ProtoError> {
             put_short(&mut out, commit);
             put_short(&mut out, expected_project);
             out.push(u8::from(*dry_run));
+            out.extend_from_slice(request_id);
+        }
+        Frame::Project { request_id } => {
+            out.push(0x0e);
             out.extend_from_slice(request_id);
         }
         Frame::Ack { request_id, status } => {
@@ -489,6 +501,11 @@ pub fn decode(buf: &[u8]) -> Result<(Frame, usize), ProtoError> {
                 request_id,
             }
         }
+        0x0e => {
+            let request_id = cursor.request_id()?;
+            cursor.finish()?;
+            Frame::Project { request_id }
+        }
         0x81 | 0x82 => {
             let request_id = cursor.request_id()?;
             let field = if kind == 0x81 { "status" } else { "reason" };
@@ -603,6 +620,7 @@ fn encoded_length(frame: &Frame) -> Result<u32, ProtoError> {
             check_project(expected_project)?;
             22 + commit.len() + expected_project.len()
         }
+        Frame::Project { .. } => 17,
         Frame::Ack { status, .. } => {
             check_line(status, MAX_TEXT, "status")?;
             17 + status.len()

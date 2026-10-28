@@ -324,6 +324,60 @@ pub(crate) fn expected_project(root: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Was der Witness dieses Repositorys als Projekt festhält (Korrektur zu
+/// Spec S3 §6.1, 28.10.2026): `Ok(Some(p))` gepinnt, `Ok(None)` ohne Pin,
+/// `Err` nicht erreichbar oder ohne Antwort (etwa ein älteres Binary).
+#[cfg(unix)]
+pub(crate) fn witness_project(root: &Path) -> Result<Option<String>, String> {
+    use minds_capture::witness_proto::Frame;
+    let found = crate::hook::witness::discovered_socket(root).ok_or("no witness found")?;
+    let request = Frame::Project {
+        request_id: crate::checkpoint::delegate::request_id(),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    match crate::hook::witness::request(&found.socket, found.peer, &request, deadline) {
+        Ok(Frame::Ack { status, .. }) if status == "unpinned" => Ok(None),
+        Ok(Frame::Ack { status, .. }) => match status.strip_prefix("pinned ") {
+            Some(p) if minds_witness_git::binding::is_project_id(p) => Ok(Some(p.to_owned())),
+            _ => Err("unexpected answer".into()),
+        },
+        Ok(Frame::Nack { reason, .. }) => Err(crate::text::sanitize(&reason)),
+        Ok(_) => Err("unexpected answer".into()),
+        Err(kind) => Err(kind.to_owned()),
+    }
+}
+
+/// Setzt `minds.project` im Repository auf das bestätigte Projekt — nur,
+/// wenn noch keines gilt; ein abweichender Wert wird nie überschrieben
+/// (`Err` mit Anleitung). Die geschützte Projektidentität bleibt der Pin des
+/// Witness; `minds.project` sagt dem pre-push-Hook nur, welches Projekt er
+/// erwartet.
+pub(crate) fn adopt_project(root: &Path, confirmed: &str) -> Result<bool, String> {
+    match crate::sign_cmd::git_config_value(root, "minds.project") {
+        Some(current) if current == confirmed => Ok(false),
+        Some(current) => Err(format!(
+            "minds.project is {} here, but the witness binds commits for {confirmed} — not \
+             changed; if {confirmed} is right: git config minds.project {confirmed}",
+            crate::text::sanitize(&current)
+        )),
+        None => {
+            let ok = Command::new("git")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .arg("-C")
+                .arg(root)
+                .args(["config", "--local", "minds.project", confirmed])
+                .status()
+                .is_ok_and(|s| s.success());
+            if ok {
+                Ok(true)
+            } else {
+                Err("git config minds.project could not be set".into())
+            }
+        }
+    }
+}
+
 /// Das absolute Git-Verzeichnis von `root`.
 pub(crate) fn git_dir(root: &Path) -> Option<PathBuf> {
     rev_parse(root, &["--absolute-git-dir"]).map(PathBuf::from)

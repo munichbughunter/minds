@@ -656,3 +656,43 @@ fn s3_19_bound_evidence_reaches_the_server_before_the_code() {
         vec!["src/a.rs".to_owned()]
     );
 }
+
+/// Korrektur 28.10.2026: Die Projektabfrage nennt den Pin, ändert nichts und
+/// braucht keinen Commit.
+#[test]
+fn the_witness_reports_its_pinned_project() {
+    let ask = |f: &Fixture| {
+        let mut writer = f.writer();
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = agent_client(ours);
+        let frame = witness_proto::encode(&Frame::Project {
+            request_id: [9; 16],
+        })
+        .unwrap();
+        theirs.write_all(&frame).unwrap();
+        for _ in 0..4 {
+            if !socket::step(&mut client, &mut writer).unwrap() {
+                break;
+            }
+        }
+        theirs
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut answer = vec![0u8; 4096];
+        let n = theirs.read(&mut answer).unwrap();
+        witness_proto::decode(&answer[..n]).unwrap().0
+    };
+    let status = |frame| match frame {
+        Frame::Ack { request_id, status } => {
+            assert_eq!(request_id, [9; 16]);
+            status
+        }
+        other => panic!("{other:?}"),
+    };
+    let f = pinned(Some(PROJECT));
+    assert_eq!(status(ask(&f)), format!("pinned {PROJECT}"));
+    let config = load(&f.home).unwrap();
+    assert_eq!(config.project(), Some(PROJECT), "unverändert");
+    let g = pinned(None);
+    assert_eq!(status(ask(&g)), "unpinned");
+}

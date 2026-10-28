@@ -383,15 +383,33 @@ enum LocalOutcome {
 /// ([`crate::enable_protected`]), und wo der nicht gewählt wird oder
 /// scheitert, der ungeschützte ([`local`]). Gibt die Signer-Zeile des
 /// eingerichteten Witness zurück, soweit sie hier bekannt ist.
+/// Was die Einrichtung des Witness ergab.
+#[derive(Debug, Default)]
+pub(crate) struct Setup {
+    /// Die Signer-Zeile des Witness, soweit hier bekannt.
+    pub(crate) signers: Option<String>,
+    /// Das Projekt, das der Witness bestätigt festhält, soweit hier bekannt.
+    pub(crate) project: Option<String>,
+}
+
+impl From<Option<String>> for Setup {
+    fn from(signers: Option<String>) -> Self {
+        Self {
+            signers,
+            project: None,
+        }
+    }
+}
+
 pub(crate) fn default(
     root: &Path,
     store: &minds_store::StoreConfig,
     mode: LocalMode,
     verbose: bool,
     project: Option<&str>,
-) -> std::io::Result<Option<String>> {
+) -> std::io::Result<Setup> {
     if mode == LocalMode::Off {
-        return Ok(None);
+        return Ok(Setup::default());
     }
     #[cfg(unix)]
     if crate::hook::witness::socket_path().is_none() && mode != LocalMode::Print {
@@ -399,15 +417,43 @@ pub(crate) fn default(
         let found = canonical
             .as_deref()
             .and_then(crate::enable_protected::discover);
+        // Läuft er und soll ein Projekt gelten, fragt `enable` ihn nach
+        // seinem Pin (Korrektur 28.10.2026): derselbe → nichts neu
+        // einrichten; ein anderer → ausdrücklich zurückgewiesen, der Pin
+        // ändert sich nie; keiner → einmal einrichten (nur `witness init`
+        // als Witness-Nutzer pinnt).
+        let running = found
+            .as_ref()
+            .is_some_and(|(socket, _)| crate::witness_cmd::ping(socket));
+        let mut confirmed = None;
+        if let (true, Some(wanted)) = (running && mode != LocalMode::Protected, project) {
+            match crate::bind_cmd::witness_project(root) {
+                Ok(Some(pinned)) if pinned == wanted => confirmed = Some(pinned),
+                Ok(Some(pinned)) => {
+                    return Err(std::io::Error::other(format!(
+                        "the protected witness of this repository binds commits for project \
+                         {pinned}; --project {wanted} differs — its pin never changes, the witness stays \
+                         as it is"
+                    )));
+                }
+                Ok(None) => eprintln!(
+                    "minds: the running protected witness has no project pinned yet — pinning \
+                     {wanted} means setting it up once more (administrator rights)"
+                ),
+                Err(err) => eprintln!(
+                    "minds: the running protected witness does not report its project ({err}) \
+                     — pinning {wanted} means setting it up once more"
+                ),
+            }
+        }
         match &found {
             // Läuft er, bleibt er — außer `MINDS_WITNESS=protected` verlangt
-            // ausdrücklich, ihn neu einzurichten (etwa nach einem Update).
-            // Ein zu pinnendes Projekt braucht die Einrichtung (als
-            // Witness-Nutzer, Spec S3 §6.1) — dann nicht stehen lassen.
+            // ausdrücklich, ihn neu einzurichten (etwa nach einem Update),
+            // oder ein Projekt muss erst gepinnt werden.
             Some((socket, _))
                 if mode != LocalMode::Protected
-                    && project.is_none()
-                    && crate::witness_cmd::ping(socket) =>
+                    && running
+                    && (project.is_none() || confirmed.is_some()) =>
             {
                 eprintln!(
                     "minds: protected witness running for this repository (user {}, socket {})",
@@ -424,10 +470,18 @@ pub(crate) fn default(
                         crate::enable_protected::BINARY
                     ));
                 }
+                if let Some(pinned) = &confirmed {
+                    eprintln!("minds: protected witness binds commits for project {pinned}");
+                }
                 // Seine Signer-Zeile steht seit der Einrichtung in der
                 // Vertrauensdatei; sein Home ist von hier nicht lesbar.
-                return Ok(None);
+                return Ok(Setup {
+                    signers: None,
+                    project: confirmed,
+                });
             }
+            // Läuft, braucht aber noch einen Pin: weiter zur Einrichtung.
+            Some(_) if running && mode != LocalMode::Protected => {}
             // Eingerichtet, aber stumm: Die Hooks fänden ihn zuerst und
             // schrieben dann ins lokale Journal — das soll man sehen.
             Some((socket, _)) if mode != LocalMode::Protected => crate::text::warn(&format!(
@@ -457,7 +511,10 @@ pub(crate) fn default(
         if protected {
             match crate::enable_protected::install(root, store, verbose, project) {
                 Ok(installed) => {
-                    return Ok(report_protected(&installed));
+                    return Ok(Setup {
+                        signers: report_protected(&installed),
+                        project: installed.project.clone(),
+                    });
                 }
                 // Ausdrücklich verlangt (`MINDS_WITNESS=protected`): kein
                 // Rückfall — ein lokaler Witness daneben hieße A1 und ein
@@ -482,7 +539,7 @@ pub(crate) fn default(
         LocalMode::Ask | LocalMode::Protected => LocalMode::On,
         mode => mode,
     };
-    Ok(local(root, store, mode, verbose, project))
+    Ok(local(root, store, mode, verbose, project).into())
 }
 
 /// Was nach der geschützten Einrichtung zu sagen ist: wo er läuft, die

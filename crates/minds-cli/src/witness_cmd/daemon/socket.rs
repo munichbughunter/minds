@@ -565,6 +565,32 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                 return Ok(false);
             }
         }
+        Frame::Project { request_id } => {
+            // Nur lesen: welches Projekt `witness.json` festhält. Ändern kann
+            // es allein `witness init` unter der Kennung des Witness.
+            let answer = match load(&writer.home) {
+                Ok(config) => Frame::Ack {
+                    request_id,
+                    status: match config.project() {
+                        Some(project) => format!("pinned {project}"),
+                        None => "unpinned".to_owned(),
+                    },
+                },
+                Err(_) => Frame::Nack {
+                    request_id,
+                    reason: "configuration unreadable".into(),
+                },
+            };
+            let bytes = witness_proto::encode(&answer).or_else(|_| {
+                witness_proto::encode(&Frame::Nack {
+                    request_id,
+                    reason: "status not encodable".into(),
+                })
+            })?;
+            if client.stream.write_all(&bytes).is_err() {
+                return Ok(false);
+            }
+        }
         Frame::IntentActivate {
             anchor,
             signature,
