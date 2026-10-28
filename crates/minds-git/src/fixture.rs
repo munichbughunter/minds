@@ -138,6 +138,11 @@ impl TempRepo {
         String::from_utf8(self.run(args)).expect("git-Ausgabe ist UTF-8")
     }
 
+    /// Führt `git` mit `stdin` aus; gibt stdout zurück.
+    pub(crate) fn git_stdin(&self, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+        self.run_with_stdin(args, stdin)
+    }
+
     /// Führt `git` aus, ohne etwas auf stdin zu schicken.
     fn run(&self, args: &[&str]) -> Vec<u8> {
         let output = self

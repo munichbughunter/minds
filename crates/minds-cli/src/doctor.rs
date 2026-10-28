@@ -317,10 +317,35 @@ fn protected_side(socket: &Path, checks: &mut Vec<Check>) {
 /// Frame nicht kennt), sonst was er beobachtet — oder warum nicht. Ohne
 /// Beobachter ist nichts bezeugt außer dem, was der Agent meldet: `fail`.
 #[cfg(unix)]
-fn observer_check(status: Option<Result<String, String>>) -> Check {
+fn observer_check(status: Option<Result<String, String>>) -> Vec<Check> {
     match status {
-        Some(Ok(line)) => Check::new(Status::Ok, "witness observer", crate::text::sanitize(&line)),
-        Some(Err(reason)) => Check::new(
+        // Die zweite Zeile (falls da): übersprungene Verzeichnisse — eine
+        // eigene Zeile, getrennt vom Beobachter.
+        Some(Ok(text)) => {
+            // Der Trenner steht nie in einem (escaped) Namen: der letzte.
+            let (observer, skipped) = match text.rsplit_once(crate::witness_cmd::SKIPPED_SEPARATOR)
+            {
+                Some((observer, skipped)) => (observer, Some(skipped)),
+                None => (text.as_str(), None),
+            };
+            let mut checks = vec![Check::new(
+                Status::Ok,
+                "witness observer",
+                crate::text::sanitize(observer),
+            )];
+            if let Some(skipped) = skipped {
+                checks.push(Check::new(
+                    Status::Ok,
+                    "witness skipped",
+                    format!(
+                        "{} — not observed; content there never counts as observed",
+                        crate::text::sanitize(skipped)
+                    ),
+                ));
+            }
+            checks
+        }
+        Some(Err(reason)) => vec![Check::new(
             Status::Fail,
             "witness observer",
             format!(
@@ -328,13 +353,13 @@ fn observer_check(status: Option<Result<String, String>>) -> Check {
                  (log/witness.err) and restart its service",
                 crate::text::sanitize(&reason)
             ),
-        ),
-        None => Check::new(
+        )],
+        None => vec![Check::new(
             Status::Fail,
             "witness observer",
             "no answer — the witness does not report its observer (an older binary?) \
              or stopped answering",
-        ),
+        )],
     }
 }
 
@@ -393,7 +418,7 @@ fn protected_checks(
         });
     }
     if let Some(observer) = observer {
-        checks.push(observer_check(observer));
+        checks.extend(observer_check(observer));
     }
     checks
 }
@@ -420,7 +445,7 @@ fn agent_side(
             ));
             if crate::witness_cmd::ping(path) {
                 checks.push(Check::new(Status::Ok, "witness", "answers ping"));
-                checks.push(observer_check(crate::witness_cmd::observer_status(path)));
+                checks.extend(observer_check(crate::witness_cmd::observer_status(path)));
             } else {
                 checks.push(Check::new(
                     Status::Fail,
@@ -850,7 +875,7 @@ fn host_side(home: &Path, root: Option<&Path>, checks: &mut Vec<Check>) {
     let socket = home.join("run/witness.sock");
     if crate::witness_cmd::ping(&socket) {
         checks.push(Check::new(Status::Ok, "witness", "running, answers ping"));
-        checks.push(observer_check(crate::witness_cmd::observer_status(&socket)));
+        checks.extend(observer_check(crate::witness_cmd::observer_status(&socket)));
     } else {
         checks.push(Check::new(
             Status::Fail,
@@ -1075,9 +1100,26 @@ mod tests {
             status(protected_checks(socket, true, None, false, Some(None))),
             [Status::Ok, Status::Fail]
         );
-        let line = observer_check(Some(Ok("watching /repo · 3 frames · last none".into())));
-        assert_eq!(line.name, "witness observer");
-        assert_eq!(line.reason, "watching /repo · 3 frames · last none");
+        let lines = observer_check(Some(Ok("watching /repo · 3 frames · last none".into())));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].name, "witness observer");
+        assert_eq!(lines[0].reason, "watching /repo · 3 frames · last none");
+        // Übersprungene Verzeichnisse: eine eigene Zeile, nie als beobachtet.
+        let lines = observer_check(Some(Ok(
+            "watching /repo · 3 frames · last none\u{2029}skipped 1 unreadable directory ignored by \
+             Git with nothing tracked: \"data/pg\""
+                .into(),
+        )));
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].reason, "watching /repo · 3 frames · last none");
+        assert!(matches!(lines[1].status, Status::Ok));
+        assert_eq!(lines[1].name, "witness skipped");
+        assert!(
+            lines[1].reason.contains("\"data/pg\"")
+                && lines[1].reason.contains("never counts as observed"),
+            "{}",
+            lines[1].reason
+        );
     }
 
     #[test]

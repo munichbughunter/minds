@@ -430,6 +430,67 @@ impl Repo {
             .is_some_and(|entry| !entry.mode().is_tree()))
     }
 
+    /// Ob im Baum von HEAD unter `path` etwas steht — ein Eintrag gleich
+    /// welcher Art, auch ein Verzeichnis (dann ist darunter etwas
+    /// versioniert), **ohne Rücksicht auf Groß- und Kleinschreibung**
+    /// (ASCII): Auf einem Dateisystem, das sie nicht unterscheidet, ist
+    /// `Data/` im Baum dasselbe Verzeichnis wie `data/` auf der Platte —
+    /// für die Frage „ist hier nichts versioniert?" die strenge Richtung.
+    /// `false` bei ungeborenem HEAD. Gelesen mit Allokationsgrenze und ohne
+    /// Ersatzobjekte (die Objekte kann ein Agent geschrieben haben); mehr
+    /// als [`MAX_CASE_VARIANTS`] gleichnamige Bäume sind ein Fehler.
+    pub fn head_has_path(&self, path: &str) -> Result<bool> {
+        crate::objects::validate_path(path)?;
+        let commit = match self.head()? {
+            crate::Head::Branch { commit, .. } | crate::Head::Detached { commit } => commit,
+            crate::Head::Unborn { .. } => return Ok(false),
+        };
+        let gix = self.bounded(crate::READ_ALLOC_LIMIT)?;
+        let root = gix
+            .find_commit(commit.to_gix())
+            .map_err(|err| GitError::read_object(commit, err))?
+            .tree_id()
+            .map_err(|err| GitError::read_object(commit, err))?
+            .detach();
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut level = vec![root];
+        for (depth, part) in parts.iter().enumerate() {
+            let last = depth + 1 == parts.len();
+            let mut next = Vec::new();
+            for id in level {
+                let tree_id = TreeId::from_gix(id);
+                let tree = gix
+                    .find_tree(id)
+                    .map_err(|err| GitError::read_object(tree_id, err))?;
+                let decoded = tree
+                    .decode()
+                    .map_err(|err| GitError::read_object(tree_id, err))?;
+                for entry in &decoded.entries {
+                    if !entry.filename.eq_ignore_ascii_case(part.as_bytes()) {
+                        continue;
+                    }
+                    if last {
+                        return Ok(true);
+                    }
+                    if entry.mode.is_tree() {
+                        next.push(entry.oid.to_owned());
+                    }
+                }
+            }
+            if next.is_empty() {
+                return Ok(false);
+            }
+            if next.len() > MAX_CASE_VARIANTS {
+                return Err(GitError::read_object(
+                    TreeId::from_gix(root),
+                    std::io::Error::other("too many case variants of one path"),
+                ));
+            }
+            level = next;
+        }
+        Ok(false)
+    }
+
     /// Ob das Repository ein Partial Clone ist — `extensions.partialClone`
     /// (ältere Git-Versionen) oder ein Remote mit `promisor = true`: Dort
     /// fehlen Objekte planmäßig, anderswo ist ein fehlendes Objekt ein
@@ -681,8 +742,34 @@ fn hunk_starts(rest: &str) -> Option<(u32, u32)> {
     Some((old, new))
 }
 
+/// Höchstzahl gleichnamiger Bäume (je Schreibweise einer) auf einer Ebene
+/// in [`Repo::head_has_path`].
+pub const MAX_CASE_VARIANTS: usize = 64;
+
 #[cfg(test)]
 mod tests {
+    /// Die Ausnahme des Dateibeobachters fragt, ob HEAD unter einem
+    /// Verzeichnis etwas versioniert: ungeborener HEAD nichts, ein Eintrag
+    /// (Datei oder Verzeichnis) ja, ein fehlender nein.
+    #[test]
+    fn head_has_path_sees_files_and_directories() {
+        let fixture = TempRepo::init();
+        let repo = Repo::open(fixture.path()).unwrap();
+        assert!(!repo.head_has_path("data").unwrap(), "ungeboren");
+        fixture.write_file("data/pg/schema.sql", "create table t();\n");
+        fixture.commit("schema");
+        let repo = Repo::open(fixture.path()).unwrap();
+        assert!(repo.head_has_path("data").unwrap());
+        assert!(repo.head_has_path("data/pg").unwrap());
+        assert!(repo.head_has_path("data/pg/schema.sql").unwrap());
+        assert!(!repo.head_has_path("target").unwrap());
+        assert!(!repo.head_has_path("data/other").unwrap());
+        assert!(repo.head_has_path("../x").is_err());
+        // Jede Schreibweise: die strenge Richtung.
+        assert!(repo.head_has_path("Data").unwrap());
+        assert!(repo.head_has_path("DATA/Pg").unwrap());
+    }
+
     /// Auch wenn die Replace-Konfiguration verdreht gelesen würde: Ein
     /// Ersatzobjekt kommt nie als das angefragte zurück.
     #[test]

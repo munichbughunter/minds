@@ -501,11 +501,16 @@ fn dispatch(client: &mut Client, frame: Frame, writer: &mut Writer) -> Fallible<
                     reason: reason.into(),
                 },
             };
-            if client
-                .stream
-                .write_all(&witness_proto::encode(&answer)?)
-                .is_err()
-            {
+            // Eine Auskunft, die sich nicht kodieren lässt, beendet nie den
+            // einzigen Schreiber: Dann kommt ein fester Grund.
+            let bytes = match witness_proto::encode(&answer) {
+                Ok(bytes) => bytes,
+                Err(_) => witness_proto::encode(&Frame::Nack {
+                    request_id: [0; 16],
+                    reason: "observer status not encodable".into(),
+                })?,
+            };
+            if client.stream.write_all(&bytes).is_err() {
                 return Ok(false);
             }
         }
@@ -869,7 +874,7 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
             let note = format!("file observer unavailable: {err}");
             log(&home, &note);
             eprintln!("witness observer: {}", crate::hooklog::diagnostic(&note));
-            writer.lifecycle(&key, "fs.gap", serde_json::json!({"reason": "unavailable"}))?;
+            writer.observer_unavailable(&key)?;
         }
     }
     let result = serve(&socket.listener, &control.listener, &mut writer);
