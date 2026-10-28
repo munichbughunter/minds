@@ -253,6 +253,30 @@ mod tests {
         }
     }
 
+    /// Ein gekürzter Befund ist nie `Verified` — auch bestanden und voll
+    /// abgedeckt nicht (Korrektur vor dem Pilot, 28.10.2026).
+    #[test]
+    fn a_truncated_finding_is_never_verified() {
+        let full = finding(
+            "refs/heads/main",
+            SealState::Valid,
+            2,
+            2,
+            PolicyVerdict::Pass,
+            false,
+        );
+        assert_eq!(state(&full), State::Verified);
+        let cut = finding(
+            "refs/heads/main",
+            SealState::Valid,
+            2,
+            2,
+            PolicyVerdict::Pass,
+            true,
+        );
+        assert_eq!(state(&cut), State::Unverified);
+    }
+
     fn pre(findings: Vec<Finding>) -> PreOutcome {
         PreOutcome {
             decision: Decision::Accept,

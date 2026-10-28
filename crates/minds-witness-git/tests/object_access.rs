@@ -240,6 +240,10 @@ fn s2_24_new_commits_match_memory_adapter() {
             assert_eq!(got.truncated, mem.truncated, "{old:?} {new} {limit}");
             if got.truncated {
                 assert_eq!(got.commits.len(), limit as usize);
+                assert!(
+                    got.commits.contains(&cid(new)),
+                    "new fehlt: {old:?} {new} {limit}"
+                );
                 let set: BTreeSet<_> = got.commits.iter().collect();
                 assert_eq!(set.len(), got.commits.len());
                 assert!(got.commits.iter().all(|c| full.commits.contains(c)));
@@ -315,6 +319,24 @@ fn s2_25_new_commits_random_graphs_vs_definition() {
         );
         let got: BTreeSet<String> = got.commits.iter().map(|c| c.as_str().to_owned()).collect();
         assert_eq!(got, expected, "Graph {g}");
+        // Gekürzt (auch bei rückläufigen Daten und Force-Push): `new` bleibt.
+        for limit in 1..expected.len() as u32 {
+            let cut = with(
+                &fx,
+                &repo,
+                &[],
+                &AdapterLimits::default(),
+                Budget::unlimited(),
+                |a, _| {
+                    a.new_commits(old.as_deref().map(cid).as_ref(), &cid(&new), limit)
+                        .unwrap()
+                },
+            );
+            assert!(cut.truncated, "Graph {g} limit {limit}");
+            assert_eq!(cut.commits.len(), limit as usize);
+            assert!(cut.commits.contains(&cid(&new)), "Graph {g} limit {limit}");
+            assert!(cut.commits.iter().all(|c| expected.contains(c.as_str())));
+        }
     }
 }
 
@@ -1023,4 +1045,180 @@ fn s2_42_effective_fsck_config() {
     let bad = fx.server_named("fsck-bad.git");
     bad.git(&["config", "receive.fsckObjects", "vielleicht"]);
     assert!(fsck::effective_with(&g, &bad.git_dir, &iso).is_err());
+}
+
+/// `n` Commits in einer Kette auf `parent` (oder als Wurzel), alle mit
+/// demselben Baum, Datum aufsteigend ab Minute `start` (Kette `tag`).
+fn chain(
+    repo: &Repo,
+    tree: &str,
+    parent: Option<&str>,
+    n: usize,
+    start: usize,
+    tag: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(n);
+    for i in 0..n {
+        let minute = start + i;
+        let date = format!(
+            "2026-10-{:02}T{:02}:{:02}:00Z",
+            1 + minute / 1440,
+            (minute / 60) % 24,
+            minute % 60
+        );
+        let parents: Vec<&str> = match out.last() {
+            Some(p) => vec![p.as_str()],
+            None => parent.into_iter().collect(),
+        };
+        out.push(repo.commit_at(tree, &parents, &date, &format!("{tag}-{i}")));
+    }
+    out
+}
+
+fn selected(
+    fx: &GitTestFixture,
+    repo: &Repo,
+    old: Option<&str>,
+    new: &str,
+    limit: u32,
+) -> (bool, Vec<String>) {
+    let range = with(
+        fx,
+        repo,
+        &[],
+        &AdapterLimits::default(),
+        Budget::unlimited(),
+        |a, _| {
+            a.new_commits(old.map(cid).as_ref(), &cid(new), limit)
+                .unwrap()
+        },
+    );
+    (
+        range.truncated,
+        range
+            .commits
+            .iter()
+            .map(|c| c.as_str().to_owned())
+            .collect(),
+    )
+}
+
+/// Korrektur vor dem Pilot (28.10.2026): Mehr als das Limit neuer Commits —
+/// `update.new` ist immer in der Auswahl, die ältesten fallen weg,
+/// `truncated` bleibt; genau am Limit nichts abgeschnitten. Lineare Historie,
+/// Anlage eines Branches und Update.
+#[test]
+fn commit_limit_keeps_new_and_the_youngest_linear() {
+    let fx = GitTestFixture::new();
+    let repo = fx.server();
+    let tree = repo.files(&[("f", "100644", b"x")]);
+    let c = chain(&repo, &tree, None, 600, 0, "c");
+    let set = |v: &[String]| v.iter().cloned().collect::<BTreeSet<_>>();
+
+    // 500: genau am Limit — alles, Eltern vor Kindern, `new` zuletzt.
+    let (truncated, got) = selected(&fx, &repo, None, &c[499], 500);
+    assert!(!truncated);
+    assert_eq!(got, c[..500].to_vec());
+    // 501: abgeschnitten, `new` dabei, die älteste fehlt.
+    let (truncated, got) = selected(&fx, &repo, None, &c[500], 500);
+    assert!(truncated);
+    assert_eq!(got.len(), 500);
+    assert_eq!(got.last(), Some(&c[500]));
+    assert_eq!(set(&got), set(&c[1..501]));
+    // 600 (Anlage eines Branches): die jüngsten 500.
+    let (truncated, got) = selected(&fx, &repo, None, &c[599], 500);
+    assert!(truncated);
+    assert_eq!(got, c[100..600].to_vec());
+    // Update mit 549 neuen: dieselbe Regel.
+    let (truncated, got) = selected(&fx, &repo, Some(&c[50]), &c[599], 500);
+    assert!(truncated);
+    assert_eq!(got, c[100..600].to_vec());
+    // Deterministisch.
+    assert_eq!(selected(&fx, &repo, None, &c[599], 500).1, got);
+}
+
+/// Dasselbe mit Merge-Historie: zwei Linien, verschränkte Daten, ein Merge
+/// unter `new`. Die Auswahl enthält `new` und den Merge und sonst die
+/// jüngsten beider Linien.
+#[test]
+fn commit_limit_keeps_new_and_the_youngest_with_merges() {
+    let fx = GitTestFixture::new();
+    let repo = fx.server();
+    let tree = repo.files(&[("f", "100644", b"x")]);
+    let root = chain(&repo, &tree, None, 1, 0, "r");
+    // Hauptlinie: gerade Minuten, Seitenlinie: ungerade — verschränkt.
+    let mut main = Vec::new();
+    let mut side = Vec::new();
+    for i in 0..350 {
+        let p = main.last().unwrap_or(&root[0]).clone();
+        main.extend(chain(
+            &repo,
+            &tree,
+            Some(&p),
+            1,
+            2 + 2 * i,
+            &format!("m{i}"),
+        ));
+        let q = side.last().unwrap_or(&root[0]).clone();
+        side.extend(chain(
+            &repo,
+            &tree,
+            Some(&q),
+            1,
+            3 + 2 * i,
+            &format!("s{i}"),
+        ));
+    }
+    let merge = repo.commit_at(
+        &tree,
+        &[main.last().unwrap(), side.last().unwrap()],
+        "2026-10-02T00:00:00Z",
+        "merge",
+    );
+    let after = chain(&repo, &tree, Some(&merge), 3, 1500, "after");
+    let new = after.last().unwrap().clone();
+    // 1 + 350 + 350 + 1 + 3 = 705 neue Commits (Anlage).
+    let (truncated, got) = selected(&fx, &repo, None, &new, 500);
+    assert!(truncated);
+    assert_eq!(got.len(), 500);
+    assert_eq!(got.last(), Some(&new));
+    let picked: BTreeSet<&String> = got.iter().collect();
+    for c in after.iter().chain([&merge]) {
+        assert!(picked.contains(c), "Nachfahren des Merges fehlen");
+    }
+    // Die ältesten fallen weg: alles Ausgewählte ist jünger als alles
+    // Weggelassene; je Linie ein zusammenhängendes jüngstes Stück.
+    let kept_main = main.iter().filter(|c| picked.contains(c)).count();
+    let kept_side = side.iter().filter(|c| picked.contains(c)).count();
+    assert_eq!(kept_main + kept_side, 496);
+    assert!(main[350 - kept_main..].iter().all(|c| picked.contains(c)));
+    assert!(side[350 - kept_side..].iter().all(|c| picked.contains(c)));
+    assert!(
+        kept_main.abs_diff(kept_side) <= 1,
+        "{kept_main}/{kept_side}"
+    );
+    assert!(!picked.contains(&root[0]));
+    // Eltern vor Kindern in der Auswahl.
+    let pos = |x: &String| got.iter().position(|o| o == x).unwrap();
+    assert!(pos(main.last().unwrap()) < pos(&merge));
+    assert!(pos(side.last().unwrap()) < pos(&merge));
+    assert!(pos(&merge) < pos(&after[0]));
+    assert_eq!(selected(&fx, &repo, None, &new, 500).1, got);
+}
+
+/// Rückläufige Daten: `new` ist älter als seine Vorfahren — gekürzt bleibt
+/// es trotzdem in der Auswahl.
+#[test]
+fn commit_limit_keeps_new_with_skewed_dates() {
+    let fx = GitTestFixture::new();
+    let repo = fx.server();
+    let tree = repo.files(&[("f", "100644", b"x")]);
+    let c = chain(&repo, &tree, None, 20, 100, "c");
+    let new = repo.commit_at(&tree, &[c.last().unwrap()], "2026-01-01T00:00:00Z", "alt");
+    for limit in [1u32, 5, 20] {
+        let (truncated, got) = selected(&fx, &repo, None, &new, limit);
+        assert!(truncated);
+        assert_eq!(got.len(), limit as usize);
+        assert!(got.contains(&new), "limit {limit}");
+    }
 }
