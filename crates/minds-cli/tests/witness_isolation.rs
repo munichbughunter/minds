@@ -206,6 +206,50 @@ fn s3_28_receipt_anchor_protected_chain() {
     as_root(&["chmod", "0775", grouped.parent().unwrap().to_str().unwrap()]);
     unprotected(&grouped, "gruppenbeschreibbares Elternverzeichnis");
 
+    // Die Datei selbst gruppen- bzw. für alle beschreibbar.
+    let group_file = tree.file("gfile/receipt-keys", &line);
+    as_root(&["chmod", "0664", group_file.to_str().unwrap()]);
+    unprotected(&group_file, "gruppenbeschreibbare Datei");
+    let world_file = tree.file("wfile/receipt-keys", &line);
+    as_root(&["chmod", "0646", world_file.to_str().unwrap()]);
+    unprotected(&world_file, "für alle beschreibbare Datei");
+
+    // Elternverzeichnis für alle beschreibbar, auch mit Sticky-Bit (wie /tmp).
+    let world_dir = tree.file("wdir/receipt-keys", &line);
+    as_root(&[
+        "chmod",
+        "1777",
+        world_dir.parent().unwrap().to_str().unwrap(),
+    ]);
+    unprotected(
+        &world_dir,
+        "für alle beschreibbares Elternverzeichnis mit Sticky-Bit",
+    );
+
+    // Fremde Gruppe am Elternverzeichnis, ohne Schreibrecht: geschützt
+    // bleibt, was niemand außer root ändern kann.
+    let other_group = tree.file("ogroup/receipt-keys", &line);
+    as_root(&[
+        "chgrp",
+        "65534",
+        other_group.parent().unwrap().to_str().unwrap(),
+    ]);
+    let out = verify(repo.path(), &other_group, true);
+    assert!(
+        text(&out).contains("Vertrauensanker: geschützt ("),
+        "{}",
+        text(&out)
+    );
+
+    // Elternverzeichnis gehört nicht root (fremder Eigentümer).
+    let foreign_dir = tree.file("fdir/receipt-keys", &line);
+    as_root(&[
+        "chown",
+        "65534",
+        foreign_dir.parent().unwrap().to_str().unwrap(),
+    ]);
+    unprotected(&foreign_dir, "Elternverzeichnis mit fremdem Eigentümer");
+
     // Symlink (root-eigen) auf die geschützte Datei.
     let link = tree.0.join("link-keys");
     as_root(&["ln", "-s", good.to_str().unwrap(), link.to_str().unwrap()]);

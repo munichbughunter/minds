@@ -61,6 +61,90 @@ pub(crate) struct Options<'a> {
     pub(crate) key_file: Option<&'a str>,
     pub(crate) require_state: Option<&'a str>,
     pub(crate) require_protected_anchor: bool,
+    /// `--project <instanz>/project-<id>`: das Projekt, das der Prüfer
+    /// prüfen will — aus einer von ihm gewählten Quelle.
+    pub(crate) project: Option<&'a str>,
+}
+
+/// Woher das erwartete Projekt kommt (Entscheidung 28.10.2026).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ProjectSource {
+    /// `--project`: vom Prüfer gewählt, unabhängig vom Repository.
+    Flag(String),
+    /// Nur `git config minds.project`: lokale Repository-Konfiguration,
+    /// die ein Agent ändern kann — Pilotprüfung, so gekennzeichnet.
+    Config(String),
+    /// Weder noch: keine unabhängige Projektbestätigung (Exit 3).
+    Unconfirmed,
+}
+
+/// Bestimmt die Projektquelle. `Err` trägt Meldung und Exit-Code:
+/// `--project` ungültig → 4; `--project` und `minds.project` verschieden → 1.
+pub(crate) fn project_source(
+    flag: Option<&str>,
+    config: Option<String>,
+) -> Result<ProjectSource, (String, u8)> {
+    match (flag, config) {
+        (Some(p), _) if !minds_witness_git::binding::is_project_id(p) => Err((
+            "minds verify --receipt: --project erwartet <instanz>/project-<id>".to_owned(),
+            ERROR,
+        )),
+        (Some(p), Some(c)) if p != c => Err((
+            format!(
+                "Projekt widersprüchlich: --project {p}, minds.project {}",
+                crate::text::sanitize(&c)
+            ),
+            WRONG,
+        )),
+        (Some(p), _) => Ok(ProjectSource::Flag(p.to_owned())),
+        (None, Some(c)) => Ok(ProjectSource::Config(c)),
+        (None, None) => Ok(ProjectSource::Unconfirmed),
+    }
+}
+
+/// Wie das Projekt einer Quittung zur Quelle steht.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectCheck {
+    /// Bestätigt (durch `--project` oder, gekennzeichnet, `minds.project`).
+    Confirmed,
+    /// Anderes Projekt: Exit 1.
+    Wrong,
+    /// Nicht unabhängig bestätigt: höchstens Exit 3.
+    Unconfirmed,
+}
+
+/// Die Zeile `Projekt: …` und das Ergebnis.
+fn project_line(source: &ProjectSource, repo: &str) -> (String, ProjectCheck) {
+    let shown = crate::text::sanitize(repo);
+    match source {
+        ProjectSource::Flag(p) if p == repo => (
+            format!("  Projekt: {shown} (bestätigt durch --project)"),
+            ProjectCheck::Confirmed,
+        ),
+        ProjectSource::Flag(p) => (
+            format!("  Projekt: {shown} — erwartet {p} (--project)"),
+            ProjectCheck::Wrong,
+        ),
+        ProjectSource::Config(p) if p == repo => (
+            format!(
+                "  Projekt: {shown} (wie minds.project — lokale Repository-Konfiguration, nicht unabhängig; --project angeben)"
+            ),
+            ProjectCheck::Confirmed,
+        ),
+        ProjectSource::Config(p) => (
+            format!(
+                "  Projekt: {shown} — erwartet {} (minds.project)",
+                crate::text::sanitize(p)
+            ),
+            ProjectCheck::Wrong,
+        ),
+        ProjectSource::Unconfirmed => (
+            format!(
+                "  Projekt: {shown} — nicht unabhängig bestätigt (weder --project noch minds.project)"
+            ),
+            ProjectCheck::Unconfirmed,
+        ),
+    }
 }
 
 /// Rang eines Zustands; kleiner ist besser.
@@ -156,6 +240,27 @@ pub(crate) fn verify(
             return ERROR;
         }
     };
+    // Das erwartete Projekt: `--project` (vom Prüfer gewählt), sonst
+    // `git config minds.project` (lokal, gekennzeichnet). Eine Quittung für
+    // ein anderes Projekt mit demselben Commit zählt nie.
+    let config = match crate::bind_cmd::expected_project(root) {
+        Ok(p) => p,
+        Err(e) => {
+            say(&format!(
+                "minds verify --receipt: {}",
+                crate::text::sanitize(&e)
+            ));
+            return ERROR;
+        }
+    };
+    let project = match project_source(opts.project, config) {
+        Ok(source) => source,
+        Err((message, code)) => {
+            say(&message);
+            return code;
+        }
+    };
+
     let anchor = match anchor::resolve(sources) {
         Ok(Some(a)) => a,
         Ok(None) => {
@@ -325,19 +430,6 @@ pub(crate) fn verify(
     } else {
         Vec::new()
     };
-    // Das erwartete Projekt (`git config minds.project`, wie beim Binden):
-    // Eine Quittung für ein anderes Projekt mit demselben Commit zählt nie.
-    let project = match crate::bind_cmd::expected_project(root) {
-        Ok(p) => p,
-        Err(e) => {
-            say(&anchor_line);
-            say(&format!(
-                "minds verify --receipt: {}",
-                crate::text::sanitize(&e)
-            ));
-            return ERROR;
-        }
-    };
     let env = Env {
         root,
         anchor: &anchor,
@@ -347,7 +439,7 @@ pub(crate) fn verify(
         repo: &repo,
         view: &view,
         remote: remote.as_ref().map(Remote::name),
-        project: project.as_deref(),
+        project: &project,
         required,
     };
     let mut code = VERIFIED;
@@ -449,8 +541,8 @@ struct Env<'a> {
     repo: &'a minds_git::quarantine::ServerRepo,
     view: &'a Tracked<'a>,
     remote: Option<&'a str>,
-    /// `git config minds.project`, sofern gesetzt.
-    project: Option<&'a str>,
+    /// Das erwartete Projekt und seine Herkunft.
+    project: &'a ProjectSource,
     required: State,
 }
 
@@ -531,8 +623,36 @@ fn signature_line(e: &VerifyError) -> String {
     format!("  Signatur: ungültig ({why})")
 }
 
-/// Prüft eine Quittung; liefert die Ausgabezeilen und den Exit-Code.
+/// Prüft eine Quittung; liefert die Ausgabezeilen und den Exit-Code. Ohne
+/// unabhängige Projektbestätigung ist das Ergebnis höchstens „nicht
+/// prüfbar“ (Exit 3), nie `Verified`.
 fn check(env: &Env<'_>, commit: &CommitId, id: &str, bytes: &[u8]) -> (Vec<String>, u8) {
+    let (lines, code) = check_receipt(env, commit, id, bytes);
+    if *env.project == ProjectSource::Unconfirmed {
+        return unconfirmed(lines, code);
+    }
+    (lines, code)
+}
+
+/// Ohne unabhängige Projektbestätigung: höchstens Exit 3 (1 und 4 bleiben
+/// vorrangig), und keine Zeile nennt einen Zustand — auch nicht `Verified`.
+fn unconfirmed(mut lines: Vec<String>, code: u8) -> (Vec<String>, u8) {
+    if severity(code) >= severity(WRONG) {
+        return (lines, code);
+    }
+    for line in &mut lines {
+        if line.starts_with("  Zustand: ") {
+            *line = "  Zustand: nicht festgestellt (Projekt nicht unabhängig bestätigt)".to_owned();
+        }
+    }
+    lines.push(
+        "  NICHT PRÜFBAR: Projekt nicht unabhängig bestätigt (--project <instanz>/project-<id> angeben)"
+            .to_owned(),
+    );
+    (lines, worst(code, MISSING))
+}
+
+fn check_receipt(env: &Env<'_>, commit: &CommitId, id: &str, bytes: &[u8]) -> (Vec<String>, u8) {
     let mut lines = Vec::new();
     let receipt = match Receipt::from_bytes(bytes) {
         Ok(r) => r,
@@ -560,18 +680,10 @@ fn check(env: &Env<'_>, commit: &CommitId, id: &str, bytes: &[u8]) -> (Vec<Strin
         lines.push("  Signatur: nicht geprüft (Quittung nennt einen anderen Commit)".to_owned());
         return undetermined(lines, WRONG);
     }
-    let shown_project = crate::text::sanitize(&receipt.repo);
-    match env.project {
-        Some(expected) if expected != receipt.repo => {
-            lines.push(format!(
-                "  Projekt: {shown_project} — erwartet {expected} (minds.project)"
-            ));
-            return undetermined(lines, WRONG);
-        }
-        Some(_) => lines.push(format!("  Projekt: {shown_project} (wie minds.project)")),
-        None => lines.push(format!(
-            "  Projekt: {shown_project} (minds.project nicht gesetzt, nicht abgeglichen)"
-        )),
+    let (project_text, project_check) = project_line(env.project, &receipt.repo);
+    lines.push(project_text);
+    if project_check == ProjectCheck::Wrong {
+        return undetermined(lines, WRONG);
     }
     if !env.anchor.keys.contains(receipt.witness.key.as_str()) {
         lines.push(format!(
@@ -655,6 +767,13 @@ fn check(env: &Env<'_>, commit: &CommitId, id: &str, bytes: &[u8]) -> (Vec<Strin
     lines.push(key_line(&verified));
     if receipt.id().as_str() != id {
         lines.push(misplaced());
+        return undetermined(lines, WRONG);
+    }
+    if snapshot.project != receipt.repo {
+        lines.push(format!(
+            "  Vertrauenskontext: {} nennt ein anderes Projekt als die Quittung",
+            trust.as_str()
+        ));
         return undetermined(lines, WRONG);
     }
     lines.push(format!(
@@ -745,6 +864,75 @@ mod tests {
         assert_eq!(worst(MISSING, WRONG), WRONG);
         assert_eq!(worst(WRONG, ERROR), ERROR);
         assert_eq!(worst(ERROR, VERIFIED), ERROR);
+    }
+
+    /// Ohne Projektbestätigung: nie ein Zustand, höchstens Exit 3; 1 und 4
+    /// bleiben.
+    #[test]
+    fn an_unconfirmed_project_is_never_verified() {
+        let lines = vec![
+            "Quittung x".to_owned(),
+            "  Zustand: Verified, 2/2 Dateien nachgewiesen (100,0 %)".to_owned(),
+        ];
+        for (code, want) in [
+            (VERIFIED, MISSING),
+            (BELOW, MISSING),
+            (MISSING, MISSING),
+            (WRONG, WRONG),
+            (ERROR, ERROR),
+        ] {
+            let (out, got) = unconfirmed(lines.clone(), code);
+            assert_eq!(got, want, "{code}");
+            if want == MISSING {
+                assert!(!out.iter().any(|l| l.contains("Verified")), "{out:?}");
+                assert!(out.last().unwrap().contains("NICHT PRÜFBAR"));
+            }
+        }
+    }
+
+    /// Der Projekt-Vertrag vom 28.10.2026, ohne Repository.
+    #[test]
+    fn the_project_needs_an_independent_source() {
+        let p = "git.test/project-42";
+        let q = "git.test/project-7";
+        // Quelle bestimmen.
+        assert_eq!(
+            project_source(Some(p), None),
+            Ok(ProjectSource::Flag(p.into()))
+        );
+        assert_eq!(
+            project_source(Some(p), Some(p.into())),
+            Ok(ProjectSource::Flag(p.into()))
+        );
+        assert_eq!(
+            project_source(Some(p), Some(q.into())).unwrap_err().1,
+            WRONG
+        );
+        assert_eq!(
+            project_source(Some("project-42"), None).unwrap_err().1,
+            ERROR
+        );
+        assert_eq!(
+            project_source(None, Some(p.into())),
+            Ok(ProjectSource::Config(p.into()))
+        );
+        assert_eq!(project_source(None, None), Ok(ProjectSource::Unconfirmed));
+        // Gegen die Quittung.
+        let flag = ProjectSource::Flag(p.into());
+        assert_eq!(project_line(&flag, p).1, ProjectCheck::Confirmed);
+        assert_eq!(project_line(&flag, q).1, ProjectCheck::Wrong);
+        let config = ProjectSource::Config(p.into());
+        let (line, check) = project_line(&config, p);
+        assert_eq!(check, ProjectCheck::Confirmed);
+        assert!(line.contains("lokale Repository-Konfiguration"), "{line}");
+        assert_eq!(project_line(&config, q).1, ProjectCheck::Wrong);
+        assert_eq!(
+            project_line(&ProjectSource::Unconfirmed, p).1,
+            ProjectCheck::Unconfirmed
+        );
+        // Ein Steuerzeichen im signierten Projekt erscheint nie roh.
+        let (line, _) = project_line(&flag, "git.test/\u{1b}[31mproject-42");
+        assert!(!line.contains('\u{1b}'), "{line:?}");
     }
 
     #[test]

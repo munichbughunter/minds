@@ -9,9 +9,17 @@
 //! „getrennter Witness nachgewiesen“ — das zeigt erst der Isolations-Job
 //! (s3_23, Commit 8); hier geht es um die Prüfung der Quittung.
 //!
-//! Das Hook-Binary liegt neben dem Testprogramm im Zielverzeichnis; `cargo
-//! test --workspace` baut es mit. Fehlt es, scheitert der Test mit klarer
-//! Meldung, statt still zu überspringen.
+//! **Manuell, nicht in der Pipeline** (Entscheidung 27.10.2026): Die Tests
+//! sind `#[ignore]` und in jedem Lauf als `ignored` ausgewiesen. Ausführen:
+//!
+//! ```text
+//! cargo build -p minds-witness-git --bin minds-witness-hook
+//! cargo test -p minds-cli --bin minds receipt_tests -- --ignored
+//! ```
+//!
+//! Das Hook-Binary liegt dann neben dem Testprogramm im Zielverzeichnis.
+//! Fehlt es, scheitert der Test mit klarer Meldung, statt still zu
+//! überspringen.
 
 use super::bind_tests::{PROJECT, bindings, commit, evidence, pinned, run};
 use super::*;
@@ -28,8 +36,7 @@ fn hook_bin() -> PathBuf {
         .join("minds-witness-hook");
     assert!(
         bin.is_file(),
-        "{} fehlt — `cargo build -p minds-witness-git --bin minds-witness-hook` \
-         (cargo test --workspace baut es mit)",
+        "{} fehlt — erst `cargo build -p minds-witness-git --bin minds-witness-hook`",
         bin.display()
     );
     bin
@@ -281,9 +288,10 @@ fn git_stdin(dir: &Path, args: &[&str], input: &[u8]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
-/// `minds verify --receipt` im Prozess, mit `key` als `--receipt-key`.
+/// `minds verify --receipt` im Prozess, mit `key` als `--receipt-key` und
+/// `--project` = [`PROJECT`].
 fn check(root: &Path, rev: Option<&str>, remote: Option<&str>, key: &str) -> (u8, String) {
-    check_with(root, rev, remote, key, None)
+    check_with(root, rev, remote, key, None, Some(PROJECT))
 }
 
 fn check_with(
@@ -292,6 +300,7 @@ fn check_with(
     remote: Option<&str>,
     key: &str,
     state: Option<&str>,
+    project: Option<&str>,
 ) -> (u8, String) {
     let opts = Options {
         rev,
@@ -300,6 +309,7 @@ fn check_with(
         key_file: None,
         require_state: state,
         require_protected_anchor: false,
+        project,
     };
     let sources = Sources {
         key: Some(key),
@@ -333,6 +343,7 @@ fn verified(w: &World) -> String {
 }
 
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo build -p minds-witness-git --bin minds-witness-hook && cargo test -p minds-cli --bin minds receipt_tests -- --ignored"]
 fn s3_24_verify_receipt_independent() {
     let w = world(100);
     let c = verified(&w);
@@ -368,23 +379,120 @@ fn s3_24_verify_receipt_independent() {
         "Zustand: Verified, 2/2 Dateien nachgewiesen (100,0 %), Policy erfüllt (observe, Schwelle 100 %)",
     );
 
-    // Das erwartete Projekt (`minds.project`): gleich → genannt, anders →
-    // Exit 1.
+    // Das Projekt (Vertrag vom 28.10.2026).
     has(
         &out,
-        "Projekt: git.test/project-42 (minds.project nicht gesetzt",
+        "Projekt: git.test/project-42 (bestätigt durch --project)",
     );
-    git(&clone, &["config", "minds.project", "git.test/project-7"]);
-    let (code, out) = check(&clone, rev, Some("origin"), &w.key);
+    let project = |state: Option<&str>, p: Option<&str>| {
+        check_with(&clone, rev, Some("origin"), &w.key, state, p)
+    };
+    // --project falsch: Exit 1, nie Verified.
+    let (code, out) = project(None, Some("git.test/project-7"));
     assert_eq!(code, 1, "{out}");
     has(
         &out,
-        "Projekt: git.test/project-42 — erwartet git.test/project-7",
+        "Projekt: git.test/project-42 — erwartet git.test/project-7 (--project)",
     );
+    assert!(!out.contains("Zustand: Verified"), "{out}");
+    // Weder --project noch minds.project: keine unabhängige Bestätigung,
+    // Exit 3 — auch wenn sonst alles stimmt; mit --require-state ebenso.
+    let (code, out) = project(None, None);
+    assert_eq!(code, 3, "{out}");
+    has(
+        &out,
+        "nicht unabhängig bestätigt (weder --project noch minds.project)",
+    );
+    has(&out, "NICHT PRÜFBAR: Projekt nicht unabhängig bestätigt");
+    assert!(!out.contains("Zustand: Verified"), "{out}");
+    assert_eq!(project(Some("Invalid"), None).0, 3);
+    // Nur minds.project: Pilotprüfung, als lokale Konfiguration
+    // gekennzeichnet; anders → Exit 1.
     git(&clone, &["config", "minds.project", PROJECT]);
-    let (code, out) = check(&clone, rev, Some("origin"), &w.key);
+    let (code, out) = project(None, None);
     assert_eq!(code, 0, "{out}");
-    has(&out, "Projekt: git.test/project-42 (wie minds.project)");
+    has(
+        &out,
+        "(wie minds.project — lokale Repository-Konfiguration, nicht unabhängig",
+    );
+    // minds.project zusätzlich: muss mit --project übereinstimmen.
+    assert_eq!(project(None, Some(PROJECT)).0, 0);
+    let (code, out) = project(None, Some("git.test/project-7"));
+    assert_eq!(code, 1, "{out}");
+    has(
+        &out,
+        "Projekt widersprüchlich: --project git.test/project-7, minds.project git.test/project-42",
+    );
+    git(&clone, &["config", "minds.project", "git.test/project-7"]);
+    let (code, out) = project(None, None);
+    assert_eq!(code, 1, "{out}");
+    has(&out, "erwartet git.test/project-7 (minds.project)");
+    assert_eq!(
+        project(None, Some(PROJECT)).0,
+        1,
+        "minds.project ≠ --project"
+    );
+    git(&clone, &["config", "--unset", "minds.project"]);
+    // Ungültige Form: Betriebsfehler.
+    assert_eq!(project(None, Some("project-42")).0, 4);
+
+    // Quittung und Snapshot nennen verschiedene Projekte (signiert, über den
+    // Admin-Weg abgelegt): Exit 1, nie Verified.
+    {
+        let (name, bytes) = w.receipt(&c);
+        let original = w.server_ref(&name);
+        let receipt = minds_witness_core::Receipt::from_bytes(&bytes).unwrap();
+        let hex = receipt
+            .trust
+            .as_ref()
+            .unwrap()
+            .as_str()
+            .split_once(':')
+            .unwrap()
+            .1
+            .to_owned();
+        let snapshot_bytes = Command::new("git")
+            .arg("-C")
+            .arg(&w.server)
+            .args([
+                "cat-file",
+                "blob",
+                &format!("refs/minds/witness/trust/{hex}:trust.json"),
+            ])
+            .output()
+            .unwrap()
+            .stdout;
+        let mut other = minds_witness_core::TrustSnapshot::from_bytes(&snapshot_bytes).unwrap();
+        other.project = "git.test/project-7".into();
+        let other_hash = other.hash();
+        w.plant(
+            &format!(
+                "refs/minds/witness/trust/{}",
+                other_hash.as_str().split_once(':').unwrap().1
+            ),
+            "trust.json",
+            &other.to_bytes(),
+        );
+        let mut body = receipt.body();
+        body.trust = Some(other_hash);
+        let signed = body.sign(&minds_witness_core::Signer::from_seed(
+            SEED,
+            minds_witness_core::Timestamp::parse("2026-01-01T00:00:00Z").unwrap(),
+        ));
+        let forged_name = format!(
+            "refs/minds/witness/receipts/{c}/{}",
+            signed.id().as_str().split_once(':').unwrap().1
+        );
+        git(&w.server, &["update-ref", "-d", &name]);
+        w.plant(&forged_name, "receipt.json", &signed.to_bytes());
+        let (code, out) = check(&clone, rev, Some("origin"), &w.key);
+        assert_eq!(code, 1, "{out}");
+        has(&out, "nennt ein anderes Projekt als die Quittung");
+        assert!(!out.contains("Zustand: Verified"), "{out}");
+        git(&w.server, &["update-ref", "-d", &forged_name]);
+        git(&w.server, &["update-ref", &name, &original]);
+        assert_eq!(check(&clone, rev, Some("origin"), &w.key).0, 0);
+    }
 
     // Falscher Anker: Exit 1.
     let other = format!("ed25519:{}", "11".repeat(32));
@@ -497,6 +605,7 @@ fn s3_24_verify_receipt_independent() {
 }
 
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo build -p minds-witness-git --bin minds-witness-hook && cargo test -p minds-cli --bin minds receipt_tests -- --ignored"]
 fn s3_26_verify_from_fresh_clone() {
     let w = world(100);
     let c = verified(&w);
@@ -677,6 +786,7 @@ fn foreign_key(dir: &Path) -> PathBuf {
 }
 
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo build -p minds-witness-git --bin minds-witness-hook && cargo test -p minds-cli --bin minds receipt_tests -- --ignored"]
 fn s3_27_late_binding_does_not_break_verify() {
     let w = world(100);
     let c = commit(
@@ -769,6 +879,7 @@ fn s3_27_late_binding_does_not_break_verify() {
 /// gültige hinzu: Hinweiszeile, Exit nach Zustand. Ebenso ein Push ganz
 /// ohne Evidence, der später Bindungen bekommt.
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo build -p minds-witness-git --bin minds-witness-hook && cargo test -p minds-cli --bin minds receipt_tests -- --ignored"]
 fn s3_27_rejected_receipt_with_later_candidates() {
     let w = world(100);
     let c = commit(&w.f, &[("src/a.rs", Some(b"x1"))], "change a");
@@ -806,7 +917,14 @@ fn s3_27_rejected_receipt_with_later_candidates() {
     );
     has(&out, "Zustand: Invalid");
     // Mit `--require-state Invalid` genügt der Zustand.
-    let (code, out) = check_with(&clone, rev, Some("origin"), &w.key, Some("Invalid"));
+    let (code, out) = check_with(
+        &clone,
+        rev,
+        Some("origin"),
+        &w.key,
+        Some("Invalid"),
+        Some(PROJECT),
+    );
     assert_eq!(code, 0, "{out}");
 
     // Ohne Evidence gepusht, später gebunden: dasselbe.
