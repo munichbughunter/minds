@@ -1486,6 +1486,14 @@ struct Writer {
     fs_dirty: bool,
     /// Ob ein Scheitern der Ignore-Auswertung schon geloggt wurde.
     ignore_failure_logged: bool,
+    /// Der Beobachter ließ sich beim Start nicht einrichten.
+    observer_unavailable: bool,
+    /// Gründe dauerhafter Unvollständigkeit (`unavailable`,
+    /// `ignore_rules`, `overflow` beim Aufholen), die in der laufenden
+    /// Beobachtungs-Epoche schon als
+    /// `fs.gap` stehen. Solange der Zustand anhält, beginnt jede Epoche mit
+    /// ihrer Lücke — sonst gälte eine spätere Epoche als lückenlos.
+    epoch_gaps: std::collections::BTreeSet<&'static str>,
     /// Klassifizierte Beobachtungen, die noch ins Journal müssen.
     fs_ready: std::collections::VecDeque<observer::Seen>,
     /// Wann je Grund zuletzt ein `fs.gap` angehängt wurde: höchstens eines
@@ -1522,6 +1530,9 @@ struct Writer {
 /// Sekunden, Nanosekunden), Größe.
 pub(super) type FileStamp = (u64, u64, i64, i64, i64, i64, u64);
 
+/// Höchstens so viele nicht lesbare Pfade loggt ein Durchlauf einzeln.
+const DENIED_LOGGED_PER_STEP: usize = 8;
+
 /// Höchstzahl der `fs.observed`-Appends je Durchlauf der Eventloop.
 const FS_APPENDS_PER_STEP: usize = 64;
 
@@ -1557,6 +1568,8 @@ impl Writer {
             fs_last: None,
             fs_dirty: false,
             ignore_failure_logged: false,
+            observer_unavailable: false,
+            epoch_gaps: std::collections::BTreeSet::new(),
             fs_ready: std::collections::VecDeque::new(),
             settled_this_step: false,
             last_gap: std::collections::HashMap::new(),
@@ -1825,7 +1838,13 @@ impl Writer {
     /// Meldungen werden ein `fs.gap`. `Err` ist ausschließlich ein Fehler
     /// des eigenen Speichers.
     fn observe(&mut self, settle: bool) -> Fallible<()> {
-        let (Some(observer), Some(stream)) = (self.observer.as_mut(), self.stream.clone()) else {
+        let Some(stream) = self.stream.clone() else {
+            return Ok(());
+        };
+        let Some(observer) = self.observer.as_mut() else {
+            if self.observer_unavailable {
+                self.note_incomplete(&stream, "unavailable")?;
+            }
             return Ok(());
         };
         // Gebremst wird vor dem Klassifizieren: Wartet schon eine volle
@@ -1848,6 +1867,27 @@ impl Writer {
             observer::Batch::default()
         };
         self.fs_ready.extend(batch.seen);
+        // Unvollständig beobachtet: ins Log (mit dem Verzeichnis bzw. den
+        // Pfaden); die Lücke schreibt [`Self::note_incomplete`] unten, und
+        // `minds doctor` meldet es als Fehler.
+        if let Some(note) = &batch.blind {
+            log(&self.home, note);
+        }
+        for path in batch.denied.iter().take(DENIED_LOGGED_PER_STEP) {
+            log(
+                &self.home,
+                &format!("file observer incomplete: {path:?} of the worktree is not readable"),
+            );
+        }
+        if batch.denied.len() > DENIED_LOGGED_PER_STEP {
+            log(
+                &self.home,
+                &format!(
+                    "file observer incomplete: {} more paths of the worktree are not readable",
+                    batch.denied.len() - DENIED_LOGGED_PER_STEP
+                ),
+            );
+        }
         if batch.overflow {
             self.gap(
                 &stream,
@@ -1865,18 +1905,28 @@ impl Writer {
                     &self.home,
                     "ignore rules not evaluable; observations dropped",
                 );
-                self.lifecycle(
-                    &stream,
-                    "fs.gap",
-                    serde_json::json!({"reason": "ignore_rules"}),
-                )?;
-                self.fs_dirty = true;
+                // Eine neue Fehlerphase ist eine eigene Lücke.
+                self.epoch_gaps.remove("ignore_rules");
                 self.ignore_failure_logged = true;
             }
         } else if batch.classified {
             // Erst eine gelungene Auswertung beendet die Fehlerphase — ein
             // ruhiger Durchlauf ohne Pfade sagt darüber nichts.
             self.ignore_failure_logged = false;
+        }
+        let observer = self.observer.as_ref().expect("observer checked above");
+        let unavailable = observer.blind().is_some() || observer.unreadable();
+        // Nach verlorenen Meldungen, bis der Gang über den Worktree fertig
+        // ist: Auch eine neue Epoche ist nicht lückenlos.
+        let catching_up = observer.catching_up();
+        if unavailable {
+            self.note_incomplete(&stream, "unavailable")?;
+        }
+        if self.ignore_failure_logged {
+            self.note_incomplete(&stream, "ignore_rules")?;
+        }
+        if catching_up {
+            self.note_incomplete(&stream, "overflow")?;
         }
         // Jeder Append fsynct Journal und Fold. Ein Burst von tausend
         // Dateien darf die Hooks nicht sekundenlang warten lassen: höchstens
@@ -1918,13 +1968,44 @@ impl Writer {
         Ok(())
     }
 
+    /// Ein dauerhaft unvollständiger Beobachter: höchstens ein `fs.gap` mit
+    /// `reason` je Beobachtungs-Epoche — aber in jeder, solange es anhält.
+    fn note_incomplete(&mut self, stream: &SessionKey, reason: &'static str) -> Fallible<()> {
+        if self.epoch_gaps.contains(reason) {
+            return Ok(());
+        }
+        self.lifecycle(stream, "fs.gap", serde_json::json!({ "reason": reason }))?;
+        self.fs_dirty = true;
+        self.epoch_gaps.insert(reason);
+        Ok(())
+    }
+
+    /// Der Beobachter ließ sich beim Start nicht einrichten: Lücke jetzt und
+    /// in jeder weiteren Epoche; `minds doctor` meldet „no file observer".
+    fn observer_unavailable(&mut self, stream: &SessionKey) -> Fallible<()> {
+        self.observer_unavailable = true;
+        self.note_incomplete(stream, "unavailable")
+    }
+
     /// Die Auskunft über den Beobachter (`Frame::Status`): was er
     /// beobachtet, wie viele Beobachtungen dieser Lauf anhängte und wann
     /// zuletzt — oder der Grund, warum keiner läuft. Nur die kanonische
     /// Wurzel aus `witness.json`, nie ein beobachteter Pfad.
     pub(super) fn observer_status(&self) -> Result<String, &'static str> {
-        if self.observer.is_none() {
+        let Some(observer) = &self.observer else {
             return Err("no file observer");
+        };
+        // Verzeichnis bzw. Pfade stehen im Log, nicht in der Auskunft.
+        if observer.blind().is_some() {
+            return Err("file observer incomplete: a directory of the worktree is not watchable");
+        }
+        if observer.unreadable() {
+            return Err("file observer incomplete: a file of the worktree is not readable");
+        }
+        if self.ignore_failure_logged {
+            // Solange die Ignore-Regeln nicht auswertbar sind, fällt jede
+            // Beobachtung weg: Das ist kein funktionierender Beobachter.
+            return Err("file observer incomplete: ignore rules not evaluable");
         }
         Ok(format!(
             "watching {} · {} frames · last {}",
@@ -1967,6 +2048,8 @@ impl Writer {
         };
         self.lifecycle(stream, "fs.gap", payload)?;
         self.fs_dirty = true;
+        // Diese Epoche trägt die Lücke schon (siehe `note_incomplete`).
+        self.epoch_gaps.insert(reason);
         Ok(())
     }
 
@@ -2326,11 +2409,29 @@ impl Writer {
         // Gedächtnis: Schreibt jemand danach denselben Inhalt erneut, ist das
         // in ihr eine eigene Beobachtung. Auch eine verbliebene Lücke will
         // versiegelt werden.
-        self.fs_dirty = match &self.stream {
-            Some(stream) => self.journal.read(stream).map_or(true, |read| {
-                read.events.iter().any(|e| e.raw_kind.starts_with("fs."))
-            }),
+        let remaining = self
+            .stream
+            .as_ref()
+            .map(|stream| self.journal.read(stream).map(|read| read.events));
+        self.fs_dirty = match &remaining {
+            Some(Ok(events)) => events.iter().any(|e| e.raw_kind.starts_with("fs.")),
+            Some(Err(_)) => true,
             None => false,
+        };
+        // Welche dauerhaften Lücken die (neue) Epoche schon trägt — was nicht
+        // mehr da ist, schreibt der nächste Durchlauf neu, solange es gilt.
+        self.epoch_gaps = match &remaining {
+            Some(Ok(events)) => events
+                .iter()
+                .filter(|e| e.raw_kind == "fs.gap")
+                .filter_map(|e| {
+                    let payload: serde_json::Value = serde_json::from_str(e.payload.get()).ok()?;
+                    ["unavailable", "ignore_rules", "overflow"]
+                        .into_iter()
+                        .find(|reason| payload["reason"] == *reason)
+                })
+                .collect(),
+            _ => std::collections::BTreeSet::new(),
         };
         if !self.fs_dirty {
             if let Some(observer) = self.observer.as_mut() {

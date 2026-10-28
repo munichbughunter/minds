@@ -843,7 +843,7 @@ pub fn run(home: &Path, follow: bool) -> Fallible<()> {
             let note = format!("file observer unavailable: {err}");
             log(&home, &note);
             eprintln!("witness observer: {}", crate::hooklog::diagnostic(&note));
-            writer.lifecycle(&key, "fs.gap", serde_json::json!({"reason": "unavailable"}))?;
+            writer.observer_unavailable(&key)?;
         }
     }
     let result = serve(&socket.listener, &control.listener, &mut writer);

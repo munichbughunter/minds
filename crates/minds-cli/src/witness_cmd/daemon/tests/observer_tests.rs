@@ -1433,3 +1433,416 @@ fn a_write_claim_minutes_into_the_turn_meets_its_observation() {
         .unwrap();
     assert!(merge.class.explained(), "{:?}", merge.class);
 }
+
+/// Als root greift kein Modus — die Tests der unlesbaren Verzeichnisse
+/// laufen nur ohne root.
+fn is_root() -> bool {
+    // SAFETY: geteuid hat keine Vorbedingungen.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Ein Verzeichnis mit Modus `000` (für den Witness unlesbar, wie ein
+/// privates `0700`-Verzeichnis eines anderen Nutzers); beim Verlassen
+/// wieder `0700`, damit das temporäre Verzeichnis aufgeräumt wird.
+struct Locked(PathBuf);
+impl Locked {
+    fn new(path: PathBuf) -> Self {
+        Self::with_mode(path, 0o000)
+    }
+    fn with_mode(path: PathBuf, mode: u32) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("journal.bin"), b"x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        Self(path)
+    }
+}
+impl Drop for Locked {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+    }
+}
+
+fn wait_observed(writer: &mut Writer, path: &str) -> bool {
+    tick_until(writer, Duration::from_secs(5), |w| {
+        observed(w).iter().any(|(p, _, _)| p == path)
+    });
+    observed(writer).iter().any(|(p, _, _)| p == path)
+}
+
+fn gap_reasons(writer: &Writer) -> Vec<String> {
+    writer
+        .journal
+        .read(&stream())
+        .unwrap()
+        .events
+        .iter()
+        .filter(|e| e.raw_kind == "fs.gap")
+        .map(|e| {
+            let v: serde_json::Value = serde_json::from_str(e.payload.get()).unwrap();
+            v["reason"].as_str().unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// Ein Verzeichnis des Worktrees, das der Witness lesen, aber nicht
+/// durchsuchen kann (`0600`), mit einem Unterverzeichnis darin (oder nur
+/// einer Datei): inotify nimmt die Watch an, was darunter liegt, bleibt
+/// unerreichbar.
+fn unsearchable(path: PathBuf) -> Locked {
+    fs::create_dir_all(path.join("sub")).unwrap();
+    fs::write(path.join("sub/hidden.rs"), b"fn hidden() {}\n").unwrap();
+    Locked::with_mode(path, 0o600)
+}
+
+type LockFn = fn(PathBuf) -> Locked;
+
+fn unsearchable_flat(path: PathBuf) -> Locked {
+    fs::create_dir_all(&path).unwrap();
+    fs::write(path.join("hidden.rs"), b"fn hidden() {}\n").unwrap();
+    Locked::with_mode(path, 0o600)
+}
+
+/// Onboarding: Der Agent lief schon, `.git/minds` hat private Verzeichnisse
+/// (`0700`, für den geschützten Witness unlesbar) — auch das `.git` eines
+/// eingebetteten Repos. Der Beobachter startet trotzdem, beobachtet den
+/// Worktree, und die Auskunft ist vollständig.
+#[test]
+fn fs_observer_starts_despite_private_git_metadata() {
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    let _journal = Locked::new(root.join(".git/minds/journal"));
+    let _evidence = Locked::new(root.join(".git/minds/evidence"));
+    let _nested = Locked::new(root.join("vendor/x/.git/minds/journal"));
+    fs::create_dir(root.join("src")).unwrap();
+    let mut writer = watching(&f);
+    fs::write(root.join("src/lib.rs"), b"pub fn x() {}\n").unwrap();
+    fs::write(root.join("top.rs"), b"fn top() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "src/lib.rs"));
+    assert!(wait_observed(&mut writer, "top.rs"));
+    assert!(
+        writer.observer_status().unwrap().starts_with("watching "),
+        "{:?}",
+        writer.observer_status()
+    );
+    assert!(gap_reasons(&writer).is_empty());
+}
+
+/// Die Sicherheitsgrenze: Ein Verzeichnis des Worktrees, das sich nicht
+/// beobachten oder nicht durchsuchen lässt — auch eines, das `.git` nur
+/// ähnlich heißt —, wird nie still übersprungen; der Beobachter startet
+/// nicht. Eine `.git`-Datei (`gitdir: …`, gehört dem Agenten) nimmt nichts
+/// aus der Beobachtung.
+#[test]
+fn fs_observer_refuses_an_unwatchable_worktree_dir() {
+    if is_root() {
+        return;
+    }
+    for dir in ["private", "src/deep/private", ".github/private", "x.git"] {
+        let variants: [(&str, LockFn); 3] = [
+            ("000", Locked::new),
+            ("0600 mit Unterverzeichnis", unsearchable),
+            ("0600 nur Dateien", unsearchable_flat),
+        ];
+        for (variant, lock) in variants {
+            let f = Fixture::new();
+            let root = canonical_root(&f);
+            let _locked = lock(root.join(dir));
+            assert!(
+                observer::Observer::watch(&root, Box::new(observer::Blake3)).is_err(),
+                "{dir} ({variant}): unbeobachtbares Verzeichnis still übersprungen"
+            );
+        }
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::rename(root.join(".git"), root.join("gitdir.x")).unwrap();
+    fs::write(root.join(".git"), "gitdir: gitdir.x\n").unwrap();
+    let _locked = Locked::new(root.join("gitdir.x/minds/journal"));
+    assert!(observer::Observer::watch(&root, Box::new(observer::Blake3)).is_err());
+}
+
+/// Ein Repo mit `.git`-Datei: Ignore-Regeln und Index liest der Beobachter
+/// nur aus einem `.git`-Verzeichnis. Jede Beobachtung fällt dann weg — als
+/// Lücke, und die Auskunft ist ein Fehler, nie „watching".
+#[test]
+fn fs_observer_with_a_git_file_is_reported_incomplete() {
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::rename(root.join(".git"), root.join("gitdir.x")).unwrap();
+    fs::write(root.join(".git"), "gitdir: gitdir.x\n").unwrap();
+    let mut writer = watching(&f);
+    assert!(writer.observer_status().is_ok());
+    fs::write(root.join("a.rs"), b"fn a() {}\n").unwrap();
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_err()
+    });
+    assert!(observed(&writer).is_empty(), "{:?}", observed(&writer));
+    assert_eq!(gap_reasons(&writer), ["ignore_rules"]);
+    assert_eq!(
+        writer.observer_status(),
+        Err("file observer incomplete: ignore rules not evaluable")
+    );
+}
+
+/// Neue Verzeichnisse — direkt unter der Wurzel, tiefer, hereinbenannt,
+/// umbenannt — werden beobachtet, auch was sofort darin entsteht.
+#[test]
+fn fs_observer_watches_new_dirs() {
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::create_dir(root.join("src")).unwrap();
+    let mut writer = watching(&f);
+    fs::create_dir_all(root.join("fresh/deeper")).unwrap();
+    fs::write(root.join("fresh/deeper/n.rs"), b"fn n() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "fresh/deeper/n.rs"));
+    writer.observer.as_ref().unwrap().walked();
+    fs::write(root.join("fresh/deeper/n2.rs"), b"fn n2() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "fresh/deeper/n2.rs"));
+    let outside = f._dir.path().join("moved");
+    fs::create_dir_all(outside.join("inner")).unwrap();
+    fs::rename(&outside, root.join("src/moved")).unwrap();
+    tick_until(&mut writer, Duration::from_millis(300), |_| false);
+    writer.observer.as_ref().unwrap().walked();
+    fs::write(root.join("src/moved/inner/m.rs"), b"fn m() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "src/moved/inner/m.rs"));
+    fs::rename(root.join("src"), root.join("src2")).unwrap();
+    tick_until(&mut writer, Duration::from_millis(300), |_| false);
+    writer.observer.as_ref().unwrap().walked();
+    fs::write(root.join("src2/moved/inner/r.rs"), b"fn r() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "src2/moved/inner/r.rs"));
+    assert!(writer.observer_status().is_ok());
+}
+
+/// Gehen Meldungen verloren — auch die über ein neues Verzeichnis —, geht
+/// der Beobachter den Worktree erneut durch: Das Verzeichnis bekommt seine
+/// Watch, und die Lücke steht in der Kette.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn fs_observer_rescans_after_lost_events() {
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    let mut writer = watching(&f);
+    fs::create_dir(root.join("fresh")).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    writer.observer.as_ref().unwrap().lose_events();
+    writer.observe(false).unwrap();
+    assert_eq!(
+        gap_reasons(&writer),
+        ["overflow"],
+        "die Meldung ging verloren"
+    );
+    writer.observer.as_ref().unwrap().walked();
+    fs::write(root.join("fresh/n.rs"), b"fn n() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "fresh/n.rs"));
+    assert!(writer.observer_status().is_ok());
+}
+
+/// Entsteht nach dem Start ein unbeobachtbares Verzeichnis im Worktree
+/// (hier: hereinbenannt — direkt unter der Wurzel und tiefer, ohne
+/// Leserecht oder ohne Suchrecht), wird der Beobachter `blind`: eine Lücke
+/// `unavailable`, und die Auskunft für `minds doctor` ist ein Fehler.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn fs_observer_goes_blind_on_an_unwatchable_new_dir() {
+    if is_root() {
+        return;
+    }
+    for (dir, searchable) in [("late", false), ("src/late", false), ("src/late", true)] {
+        let f = Fixture::new();
+        let root = canonical_root(&f);
+        fs::create_dir(root.join("src")).unwrap();
+        let mut writer = watching(&f);
+        let outside = f._dir.path().join("late");
+        // Ohne Leserecht: mit Schreibrecht (das Umbenennen eines
+        // Verzeichnisses schreibt dessen `..`).
+        let _outside = if searchable {
+            unsearchable(outside.clone())
+        } else {
+            Locked::with_mode(outside.clone(), 0o300)
+        };
+        fs::rename(&outside, root.join(dir)).unwrap();
+        let _inside = Locked(root.join(dir));
+        tick_until(&mut writer, Duration::from_secs(5), |w| {
+            w.observer_status().is_err()
+        });
+        assert_eq!(
+            writer.observer_status(),
+            Err("file observer incomplete: a directory of the worktree is not watchable"),
+            "{dir}"
+        );
+        // Einmal je Epoche, nicht bei jedem Durchlauf (dass das Durchsuchen
+        // des Verzeichnisses scheitert, ist eine eigene Lücke).
+        tick_until(&mut writer, Duration::from_millis(100), |_| false);
+        let gaps = gap_reasons(&writer);
+        assert_eq!(
+            gaps.iter().filter(|g| *g == "unavailable").count(),
+            1,
+            "{dir}: {gaps:?}"
+        );
+    }
+}
+
+/// Eine Datei des Worktrees, die der Witness nicht lesen darf, ist eine
+/// Lücke und ein Fehler für `minds doctor` — bis sie lesbar beobachtet ist.
+#[test]
+fn fs_observer_reports_an_unreadable_file() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::create_dir(root.join("src")).unwrap();
+    let mut writer = watching(&f);
+    let file = root.join("src/a.rs");
+    fs::write(&file, b"fn a() {}\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    // Ignoriert und unlesbar: kein Befund.
+    fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+    fs::write(root.join("x.log"), b"log\n").unwrap();
+    fs::set_permissions(root.join("x.log"), fs::Permissions::from_mode(0o000)).unwrap();
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_err()
+    });
+    assert_eq!(
+        writer.observer_status(),
+        Err("file observer incomplete: a file of the worktree is not readable")
+    );
+    assert_eq!(gap_reasons(&writer), ["unavailable"]);
+    assert!(observed(&writer).iter().all(|(p, _, _)| p != "src/a.rs"));
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::write(&file, b"fn a2() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "src/a.rs"));
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_ok()
+    });
+    assert!(
+        writer.observer_status().is_ok(),
+        "{:?}",
+        writer.observer_status()
+    );
+}
+
+/// Solange der Beobachter unvollständig ist, beginnt **jede** Epoche mit
+/// ihrer Lücke — sonst gälte die nächste als lückenlos. Ebenso, wenn er
+/// beim Start gar nicht einzurichten war.
+#[test]
+fn an_incomplete_observer_gaps_every_epoch() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    f.keygen();
+    let root = canonical_root(&f);
+    let mut writer = watching(&f);
+    let file = root.join("a.rs");
+    fs::write(&file, b"fn a() {}\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_err()
+    });
+    assert_eq!(gap_reasons(&writer), ["unavailable"]);
+    writer.checkpoint_now(None).unwrap();
+    assert!(gap_reasons(&writer).is_empty(), "versiegelt");
+    writer.observe(false).unwrap();
+    assert_eq!(gap_reasons(&writer), ["unavailable"], "neue Epoche");
+    writer.observe(false).unwrap();
+    assert_eq!(gap_reasons(&writer), ["unavailable"], "einmal je Epoche");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let f = Fixture::new();
+    f.keygen();
+    let mut writer = f.writer();
+    writer.stream = Some(stream());
+    writer.observer_unavailable(&stream()).unwrap();
+    assert_eq!(gap_reasons(&writer), ["unavailable"]);
+    assert_eq!(writer.observer_status(), Err("no file observer"));
+    writer.checkpoint_now(None).unwrap();
+    assert!(gap_reasons(&writer).is_empty(), "versiegelt");
+    writer.observe(false).unwrap();
+    assert_eq!(gap_reasons(&writer), ["unavailable"], "neue Epoche");
+}
+
+/// Eine nicht lesbare Datei, die wieder verschwindet (etwa eine temporäre
+/// `0600`-Datei eines Werkzeugs), lässt keinen Befund zurück.
+#[test]
+fn an_unreadable_file_that_is_deleted_leaves_no_finding() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    let mut writer = watching(&f);
+    let file = root.join("tmp.Xa1b2");
+    fs::write(&file, b"scratch\n").unwrap();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_err()
+    });
+    assert!(writer.observer_status().is_err());
+    fs::remove_file(&file).unwrap();
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_ok()
+    });
+    assert!(
+        writer.observer_status().is_ok(),
+        "{:?}",
+        writer.observer_status()
+    );
+}
+
+/// Verliert ein beobachtetes Verzeichnis das Suchrecht, sind die Pfade darin
+/// nicht lesbar — ein Befund, der bleibt, auch wenn anderswo gelesen wird
+/// (nicht als Ignore-Fehler, der beim nächsten Erfolg verschwände).
+#[test]
+fn a_dir_that_loses_search_permission_stays_reported() {
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::create_dir_all(root.join("src/lock")).unwrap();
+    let mut writer = watching(&f);
+    fs::write(root.join("src/lock/f.rs"), b"fn f() {}\n").unwrap();
+    // Innerhalb der Entprellung: gelesen wird erst danach.
+    let _locked = Locked(root.join("src/lock"));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(root.join("src/lock"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status().is_err()
+    });
+    // Je nachdem, wer es zuerst sieht: die Datei (nicht lesbar) oder der
+    // Walker (das Verzeichnis ist nicht durchsuchbar).
+    let incomplete = |status: Result<String, &str>| {
+        matches!(
+            status,
+            Err(
+                "file observer incomplete: a file of the worktree is not readable"
+                    | "file observer incomplete: a directory of the worktree is not watchable"
+            )
+        )
+    };
+    assert!(
+        incomplete(writer.observer_status()),
+        "{:?}",
+        writer.observer_status()
+    );
+    fs::write(root.join("src/other.rs"), b"fn other() {}\n").unwrap();
+    assert!(wait_observed(&mut writer, "src/other.rs"));
+    assert!(
+        incomplete(writer.observer_status()),
+        "{:?}",
+        writer.observer_status()
+    );
+    assert!(!gap_reasons(&writer).contains(&"ignore_rules".to_owned()));
+    assert!(gap_reasons(&writer).contains(&"unavailable".to_owned()));
+}

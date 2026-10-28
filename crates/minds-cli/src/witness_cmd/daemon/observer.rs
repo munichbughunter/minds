@@ -4,8 +4,9 @@
 //! # Was beobachtet wird — und was nie (W7)
 //!
 //! - Pfade werden **repo-relativ** gespeichert, nie als Host-Pfad.
-//! - `.git/` und alles, was `.gitignore` / `.git/info/exclude` ausschließt,
-//!   erscheint gar nicht: kein Pfad, kein Hash.
+//! - `.git/` (auch das Git-Verzeichnis einer `.git`-Datei im Worktree) und
+//!   alles, was `.gitignore` / `.git/info/exclude` ausschließt, erscheint gar
+//!   nicht: kein Pfad, kein Hash.
 //! - Secret-Dateien erscheinen mit `reason: "secret_file"` — ohne Hash; es
 //!   wird nicht einmal gelesen.
 //! - Ein Hash entsteht nur über Inhalt, den die Redaction-Pipeline
@@ -29,6 +30,32 @@
 //! abwies (`dropped`); der Sealer trägt sie ins Observation-Objekt, und
 //! `minds verify` nennt sie an jedem Claim, dessen Beobachtung hineinfiel. Neu angelegte Verzeichnisse werden begrenzt
 //! durchsucht: inotify meldet Dateien nicht, die vor ihrer Watch entstanden.
+//!
+//! # Watches: der Worktree, nicht die Git-Metadaten
+//!
+//! Auf Linux bekommt jedes Verzeichnis des Worktrees eine eigene, flache
+//! Watch ([`watch_tree`]) — außer den Git-Metadaten (jede Komponente
+//! `.git`). Private Verzeichnisse darin (`.git/minds/journal` des
+//! Entwicklers, Modus `0700`, für den geschützten Witness unlesbar) legen
+//! den Beobachter so nicht lahm. Eine `.git`-Datei (`gitdir: …`) nimmt
+//! nichts aus: Ihr Inhalt gehört dem Agenten.
+//!
+//! Jedes andere Verzeichnis des Worktrees, das sich nicht beobachten, lesen
+//! oder durchsuchen lässt, ist ein Fehler, nie eine stille Auslassung: Beim
+//! Start scheitert der Beobachter („no file observer"), danach wird er
+//! `blind`. Ebenso eine Datei, die sich nicht lesen lässt (solange, bis sie
+//! gelesen oder gelöscht ist), und Ignore-Regeln, die sich nicht auswerten
+//! lassen. In jedem dieser Fälle meldet `minds doctor` einen Fehler, und
+//! jede Beobachtungs-Epoche trägt ein `fs.gap` (`unavailable` bzw.
+//! `ignore_rules`), solange der Zustand anhält. Gehen Meldungen verloren,
+//! geht der Beobachter den Worktree erneut durch: Ein neues Verzeichnis,
+//! dessen Meldung fehlte, bekommt so seine Watch.
+//!
+//! Auf macOS beobachtet FSEvents die Wurzel als Ganzes; die Verzeichnisse
+//! werden dort beim Start und wenn sie entstehen nur geprüft (lesen und
+//! durchsuchen) — mit derselben Grenze und denselben Fehlern. Ungeprüft auf
+//! einem Mac: ob FSEvents Meldungen aus Verzeichnissen liefert, die der
+//! Witness nicht lesen darf.
 //!
 //! # Ignore-Regeln
 //!
@@ -115,6 +142,13 @@ const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 /// Mindestabstand zwischen zwei Neu-Lesungen eines geänderten Index.
 const INDEX_REREAD: Duration = Duration::from_secs(1);
 
+/// Mindestabstand zwischen zwei Durchgängen über den Worktree nach
+/// verlorenen Meldungen.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Höchstens so viele nicht lesbare Pfade werden einzeln gemerkt.
+const MAX_DENIED: usize = 1024;
+
 /// Identität und Stand einer Datei: Gerät, Inode, Größe, mtime.
 type Stamp = (u64, u64, u64, i64, i64);
 
@@ -174,6 +208,13 @@ pub(super) struct Batch {
     /// Ob überhaupt Pfade klassifiziert wurden — nur dann sagt
     /// `ignore_failed == false` etwas über die Ignore-Auswertung.
     pub(super) classified: bool,
+    /// Der Beobachter wurde in diesem Durchlauf unvollständig (ein
+    /// Verzeichnis des Worktrees ist nicht beobachtbar): der Grund fürs Log,
+    /// genau einmal.
+    pub(super) blind: Option<String>,
+    /// Pfade des Worktrees, die in diesem Durchlauf nicht lesbar waren
+    /// (keine Berechtigung) — fürs Log.
+    pub(super) denied: Vec<String>,
 }
 
 /// Ein wartender Pfad: zuletzt gemeldet um `at`; `fresh`, wenn er neu
@@ -197,7 +238,24 @@ pub(super) struct Observer {
     tx: SyncSender<notify::Result<notify::Event>>,
     /// Meldungen, die der volle Kanal abwies, seit dem letzten Durchlauf.
     dropped: Arc<AtomicUsize>,
-    _watcher: Option<notify::RecommendedWatcher>,
+    /// Hält den Watcher und gibt neuen Verzeichnissen ihre Watches.
+    walker: Option<Walker>,
+    /// Ein Verzeichnis des Worktrees ließ sich nicht beobachten: Der
+    /// Beobachter ist unvollständig — sichtbar als Fehler, nie still.
+    blind: Option<String>,
+    /// Ob `blind` schon in einem [`Batch`] gemeldet wurde.
+    blind_reported: bool,
+    /// Pfade des Worktrees, die zuletzt nicht lesbar waren (keine
+    /// Berechtigung) — bis sie gelesen oder gelöscht sind. Solange einer
+    /// darin steht, ist der Beobachter unvollständig.
+    denied: BTreeSet<String>,
+    /// Mehr nicht lesbare Pfade, als [`MAX_DENIED`] fasst: unvollständig
+    /// bis zum Neustart.
+    denied_overflow: bool,
+    /// Meldungen gingen verloren: Neue Verzeichnisse könnten ohne Watch
+    /// sein — der Worktree wird erneut durchgegangen.
+    rescan_due: bool,
+    last_rescan: Option<Instant>,
     pending: HashMap<PathBuf, Pending>,
     /// Letzter festgehaltener Stand je Pfad: Eine Meldung ohne
     /// Inhaltsänderung (touch, chmod, das eigene Lesen) wird innerhalb einer
@@ -229,10 +287,14 @@ struct Classified {
     found: Vec<PathBuf>,
     /// Ein Verzeichnis hatte mehr Einträge, als durchsucht werden.
     truncated: bool,
+    /// Pfade, die erstmals nicht lesbar waren (keine Berechtigung).
+    denied: Vec<String>,
 }
 
 impl Observer {
-    /// Beobachtet `root` rekursiv. `root` muss kanonisch sein.
+    /// Beobachtet den Worktree unter `root` ohne die Git-Metadaten
+    /// ([`watch_tree`]). `root` muss kanonisch sein. Lässt sich ein
+    /// Verzeichnis des Worktrees nicht beobachten, scheitert der Start.
     pub(super) fn watch(root: &Path, hasher: Box<dyn ContentHasher>) -> Fallible<Self> {
         use notify::Watcher;
         let mut observer = Self::detached(root, hasher)?;
@@ -249,9 +311,192 @@ impl Observer {
         // (und die inotify-Watches aufbrauchen).
         let config = notify::Config::default().with_follow_symlinks(false);
         let mut watcher = notify::RecommendedWatcher::new(handler, config)?;
-        watcher.watch(root, notify::RecursiveMode::Recursive)?;
-        observer._watcher = Some(watcher);
+        watch_root(&mut watcher, root)?;
+        observer.walker = Some(Walker::spawn(watcher, root)?);
         Ok(observer)
+    }
+
+    /// Warum der Beobachter unvollständig ist: Ein Verzeichnis des
+    /// Worktrees ließ sich nach dem Start nicht beobachten. Bleibt bis zum
+    /// Neustart — `minds doctor` meldet es als Fehler.
+    pub(super) fn blind(&self) -> Option<&str> {
+        self.blind.as_deref()
+    }
+
+    /// Ob Pfade des Worktrees nicht lesbar sind (keine Berechtigung) — dann
+    /// ist der Beobachter unvollständig, bis sie gelesen oder gelöscht sind.
+    pub(super) fn unreadable(&self) -> bool {
+        self.denied_overflow || !self.denied.is_empty()
+    }
+
+    /// Ob `path` Git-Metadaten sind oder darin liegt: eine Komponente
+    /// `.git` (lexikalisch, wie Git selbst, in jeder Schreibweise). Nur diese
+    /// Pfade beobachtet der Witness nicht.
+    fn git_metadata(&self, path: &Path) -> bool {
+        path.strip_prefix(&self.root)
+            .is_ok_and(|rel| rel.components().any(|c| is_git_dir_name(c.as_os_str())))
+    }
+
+    /// Ein neu angelegtes (oder hierher umbenanntes) Verzeichnis des
+    /// Worktrees bekommt seine Watches ([`watch_tree`]) — auf jeder Tiefe,
+    /// denn jedes Verzeichnis hat seine eigene, flache Watch. Der Gang
+    /// läuft im [`Walker`]; was sich darin nicht beobachten lässt, macht den
+    /// Beobachter `blind`, die Lücke dafür schreibt der Writer
+    /// (`unavailable`). Nimmt der Walker nichts mehr an, geht der Beobachter
+    /// später den ganzen Worktree durch ([`Self::rescan`]).
+    ///
+    /// Auf macOS beobachtet FSEvents die Wurzel als Ganzes; dort wird das
+    /// Verzeichnis nur geprüft (lesen und durchsuchen).
+    /// `false`: Der Walker nahm nichts mehr an — eine Lücke.
+    fn watch_new_dir(&mut self, path: &Path) -> bool {
+        if !path.starts_with(&self.root) || path == self.root || self.git_metadata(path) {
+            return true;
+        }
+        let Some(walker) = self.walker.as_ref() else {
+            return true;
+        };
+        // Nur Verzeichnisse; was sich nicht prüfen lässt, prüft der Walker
+        // (und meldet es).
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if !meta.is_dir() => return true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return true,
+            _ => {}
+        }
+        match walker.request(Job::New(path.to_path_buf())) {
+            Request::Taken => true,
+            Request::Full => {
+                self.rescan_due = true;
+                false
+            }
+            Request::Stopped => {
+                self.walker_stopped();
+                true
+            }
+        }
+    }
+
+    /// Ob der Beobachter nach verlorenen Meldungen noch aufholt (ein Gang
+    /// über den Worktree steht aus): Bis dahin kann ein neues Verzeichnis
+    /// ohne Watch sein — jede Epoche bis dahin trägt die Lücke.
+    pub(super) fn catching_up(&self) -> bool {
+        self.rescan_due || self.walker.as_ref().is_some_and(Walker::rescanning)
+    }
+
+    /// Gingen Meldungen verloren, kann auch die über ein neues Verzeichnis
+    /// darunter sein: Dann geht der Walker den Worktree erneut durch
+    /// (vorhandene Watches bleiben), höchstens einmal je [`RESCAN_INTERVAL`].
+    fn rescan(&mut self, now: Instant) {
+        if !self.rescan_due
+            || self
+                .last_rescan
+                .is_some_and(|at| now.duration_since(at) < RESCAN_INTERVAL)
+        {
+            return;
+        }
+        let Some(walker) = self.walker.as_ref() else {
+            self.rescan_due = false;
+            return;
+        };
+        self.last_rescan = Some(now);
+        match walker.request(Job::Rescan) {
+            Request::Taken => self.rescan_due = false,
+            Request::Full => {}
+            Request::Stopped => self.walker_stopped(),
+        }
+    }
+
+    /// Was der Walker nicht beobachten konnte, macht den Beobachter blind;
+    /// neue Verzeichnisse mit Watch werden erneut durchsucht. `false`, wenn
+    /// die Sammlung dafür voll war.
+    fn poll_walker(&mut self, now: Instant) -> bool {
+        let Some(walker) = self.walker.as_ref() else {
+            return true;
+        };
+        let found = walker.take_unwatchable();
+        let watched = walker.take_watched();
+        if let Some(unwatchable) = found {
+            self.go_blind(unwatchable);
+        }
+        let mut kept = true;
+        for dir in watched {
+            kept &= self.queue(dir, now, true);
+        }
+        kept
+    }
+
+    fn walker_stopped(&mut self) {
+        self.go_blind(Unwatchable {
+            dir: self.root.clone(),
+            err: "the directory walker stopped".into(),
+        });
+    }
+
+    /// Wartet, bis der Walker alle Aufträge erledigt hat.
+    #[cfg(test)]
+    pub(super) fn walked(&self) {
+        if let Some(walker) = &self.walker {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while walker.busy.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    fn go_blind(&mut self, unwatchable: Unwatchable) {
+        if self.blind.is_some() {
+            return;
+        }
+        let rel = unwatchable
+            .dir
+            .strip_prefix(&self.root)
+            .ok()
+            .and_then(relative_text)
+            .unwrap_or_else(|| ".".into());
+        self.blind = Some(format!(
+            "file observer incomplete: directory {rel:?} of the worktree is not watchable \
+             ({}); restart the witness after fixing it",
+            unwatchable.err
+        ));
+    }
+
+    /// Die nicht lesbaren Pfade unter `path` (Host-Pfad).
+    fn denied_under(&self, path: &Path) -> Vec<String> {
+        if self.denied.is_empty() {
+            return Vec::new();
+        }
+        let prefix = match self.relative(path) {
+            Some(rel) => format!("{rel}/"),
+            None if path == self.root => String::new(),
+            None => return Vec::new(),
+        };
+        self.denied
+            .range(prefix.clone()..)
+            .take_while(|denied| denied.starts_with(&prefix))
+            .take(MAX_DENIED)
+            .cloned()
+            .collect()
+    }
+
+    /// Ein nicht lesbarer Pfad des Worktrees.
+    fn deny(&mut self, rel: String, out: &mut Classified) {
+        if self.denied.contains(&rel) {
+            return;
+        }
+        if self.denied.len() >= MAX_DENIED {
+            self.denied_overflow = true;
+        } else {
+            self.denied.insert(rel.clone());
+        }
+        out.denied.push(rel);
+    }
+
+    /// Simuliert einen vollen Kanal: alle wartenden Meldungen gehen
+    /// verloren.
+    #[cfg(all(test, not(target_os = "macos")))]
+    pub(super) fn lose_events(&self) {
+        while self.rx.try_recv().is_ok() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Ohne Watcher — Meldungen kommen nur über [`Self::note`]. Prüft
@@ -269,7 +514,13 @@ impl Observer {
             rx,
             tx,
             dropped: Arc::new(AtomicUsize::new(0)),
-            _watcher: None,
+            walker: None,
+            blind: None,
+            blind_reported: false,
+            denied: BTreeSet::new(),
+            denied_overflow: false,
+            rescan_due: false,
+            last_rescan: None,
             pending: HashMap::new(),
             last: HashMap::new(),
             known: BTreeSet::new(),
@@ -322,6 +573,17 @@ impl Observer {
             dropped,
             ..Batch::default()
         };
+        if lost {
+            self.rescan_due = true;
+        }
+        self.rescan(now);
+        if !self.poll_walker(now) {
+            batch.overflow = true;
+        }
+        if !self.blind_reported && self.blind.is_some() {
+            self.blind_reported = true;
+            batch.blind = self.blind.clone();
+        }
         // Wurde die Wurzel ausgetauscht (umbenannt, ein Symlink an ihrer
         // Stelle), beziehen sich Meldungen nicht mehr auf das, was der
         // Deskriptor sieht: verwerfen, als Lücke.
@@ -356,6 +618,7 @@ impl Observer {
         let classified = self.classify(paths, &fresh, now, crate::witness_cmd::daemon::now());
         batch.ignore_failed = classified.ignore_failed;
         batch.overflow |= classified.truncated;
+        batch.denied = classified.denied;
         if self.last.len() > MAX_REMEMBERED {
             self.last.clear();
         }
@@ -401,10 +664,7 @@ impl Observer {
     fn queue(&mut self, path: PathBuf, now: Instant, fresh: bool) -> bool {
         // `.git` lexikalisch gleich hier: Ein `git gc` mit zehntausend
         // Objekten soll die Sammlung nicht füllen.
-        if path
-            .strip_prefix(&self.root)
-            .is_ok_and(|rel| rel.components().any(|c| is_git_dir_name(c.as_os_str())))
-        {
+        if self.git_metadata(&path) {
             return true;
         }
         if let Some(pending) = self.pending.get_mut(&path) {
@@ -443,6 +703,22 @@ impl Observer {
                 | notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => true,
                 _ => false,
             };
+            if fresh {
+                for path in &event.paths {
+                    if !self.watch_new_dir(path) {
+                        lost = true;
+                    }
+                }
+            }
+            // Eine Meldung über ein Verzeichnis (etwa `chmod`): Was darin
+            // nicht lesbar war, wird erneut versucht.
+            for path in &event.paths {
+                for denied in self.denied_under(path) {
+                    if !self.queue(self.root.join(denied), now, false) {
+                        lost = true;
+                    }
+                }
+            }
             for path in event.paths {
                 if !self.queue(path, now, fresh) {
                     lost = true;
@@ -476,6 +752,9 @@ impl Observer {
             Dir,
             /// Linktext und Ziel im Repo (`Some`) oder außerhalb.
             Link(Vec<u8>, Option<String>),
+            /// Keine Berechtigung, den Pfad (oder ein Verzeichnis davor) zu
+            /// prüfen: unvollständig, sofern er nicht ignoriert ist.
+            Denied,
         }
         let mut out = Classified::default();
         let mut probes: Vec<(PathBuf, String, Probe)> = Vec::new();
@@ -494,11 +773,20 @@ impl Observer {
             let Some(rel) = self.relative(&path) else {
                 continue;
             };
-            if !unique.insert(rel.clone()) || !self.plain_parents(&rel, &mut plain_dirs) {
+            if !unique.insert(rel.clone()) {
                 continue;
+            }
+            match self.plain_parents(&rel, &mut plain_dirs) {
+                Descent::Plain => {}
+                Descent::NotPlain => continue,
+                Descent::Denied => {
+                    probes.push((path, rel, Probe::Denied));
+                    continue;
+                }
             }
             let probe = match stat_beneath(&self.root_fd, self.root_dev, &rel) {
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => Probe::Deleted,
+                Err(err) if denied(&err) => Probe::Denied,
                 // Nicht feststellbar: eine Lücke, keine stille Auslassung.
                 Err(_) => {
                     out.truncated = true;
@@ -506,12 +794,20 @@ impl Observer {
                 }
                 Ok(stat) => match stat.st_mode & libc::S_IFMT {
                     libc::S_IFLNK => {
-                        let Ok(text) = readlink_beneath(&self.root_fd, self.root_dev, &rel) else {
-                            out.truncated = true;
-                            continue;
+                        let text = match readlink_beneath(&self.root_fd, self.root_dev, &rel) {
+                            Ok(text) => text,
+                            Err(err) if denied(&err) => {
+                                probes.push((path, rel, Probe::Denied));
+                                continue;
+                            }
+                            Err(_) => {
+                                out.truncated = true;
+                                continue;
+                            }
                         };
-                        let target = link_target(&self.root, &rel, &text)
-                            .filter(|target| self.plain_parents(target, &mut plain_dirs));
+                        let target = link_target(&self.root, &rel, &text).filter(|target| {
+                            self.plain_parents(target, &mut plain_dirs) == Descent::Plain
+                        });
                         Probe::Link(text, target)
                     }
                     libc::S_IFREG => Probe::File,
@@ -536,7 +832,7 @@ impl Observer {
             }
         }
         // Regeln und Löschungen sehen **denselben** Stand des Index.
-        let Some((rules, unreadable, tracked)) = self.rules(&asked, now) else {
+        let Some((rules, unreadable, denied_dirs, tracked)) = self.rules(&asked, now) else {
             out.ignore_failed = true;
             return out;
         };
@@ -555,13 +851,27 @@ impl Observer {
         };
         let mut spent = 0u64;
         let mut fanout = 0usize;
+        let mut denials = Vec::new();
         for (path, rel, probe) in probes {
             let is_dir = match probe {
-                Probe::Deleted => None,
+                Probe::Deleted | Probe::Denied => None,
                 Probe::Dir => Some(true),
                 _ => Some(false),
             };
+            // Darunter ist keine `.gitignore` lesbar, weil der Witness das
+            // Verzeichnis nicht durchsuchen darf: unvollständig, nie still.
+            if under_any(&rel, &denied_dirs) {
+                denials.push(rel);
+                continue;
+            }
             if ignored(&rel, is_dir) {
+                // Ignoriert (oder nicht auswertbar, dann ist das die Lücke):
+                // kein Befund „nicht lesbar" mehr.
+                self.denied.remove(&rel);
+                continue;
+            }
+            if let Probe::Denied = probe {
+                denials.push(rel);
                 continue;
             }
             if let Probe::Dir = probe {
@@ -576,6 +886,10 @@ impl Observer {
                 continue;
             }
             let target = match &probe {
+                Probe::Link(_, Some(target)) if under_any(target, &denied_dirs) => {
+                    denials.push(rel);
+                    continue;
+                }
                 Probe::Link(_, Some(target)) if ignored(target, Some(false)) => continue,
                 Probe::Link(_, Some(target)) => Some(target.clone()),
                 _ => None,
@@ -621,6 +935,8 @@ impl Observer {
                         }
                     }
                     fanout += gone.len();
+                    self.denied
+                        .retain(|path| *path != rel && !path.starts_with(&prefix));
                     for path in gone {
                         self.known.remove(&path);
                         out.seen.push(Seen {
@@ -632,8 +948,8 @@ impl Observer {
                     }
                     continue;
                 }
-                // Schon oben durchsucht.
-                Probe::Dir => continue,
+                // Schon oben durchsucht bzw. vermerkt.
+                Probe::Dir | Probe::Denied => continue,
                 Probe::Link(_, None) => (None, Some(ObservationReason::OutsideRepo)),
                 _ if secret => (None, Some(ObservationReason::SecretFile)),
                 // Git committet bei einem Symlink seinen Linktext — genau
@@ -662,9 +978,15 @@ impl Observer {
                         Content::Linked => (None, Some(ObservationReason::OutsideRepo)),
                         Content::Gone if observable => (None, Some(ObservationReason::Deleted)),
                         Content::Gone | Content::Skip => continue,
+                        Content::Denied => {
+                            denials.push(rel);
+                            continue;
+                        }
                     }
                 }
             };
+            // Gelesen (oder gelöscht): nicht mehr unlesbar.
+            self.denied.remove(&rel);
             if reason == Some(ObservationReason::Deleted) {
                 self.known.remove(&rel);
             } else {
@@ -681,6 +1003,9 @@ impl Observer {
             });
         }
         out.ignore_failed |= failed;
+        for rel in denials {
+            self.deny(rel, &mut out);
+        }
         out
     }
 
@@ -703,15 +1028,7 @@ impl Observer {
     /// Verzeichnisse, deren `.gitignore` sich nicht sicher lesen ließ (oder
     /// das Regel-Budget überschritt). `None`, wenn `info/exclude` unlesbar
     /// ist — dann gilt das für alles.
-    fn rules(
-        &mut self,
-        paths: &[String],
-        now: Instant,
-    ) -> Option<(
-        minds_git::ignore::IgnoreRules,
-        Vec<String>,
-        Arc<BTreeSet<String>>,
-    )> {
+    fn rules(&mut self, paths: &[String], now: Instant) -> Option<RuleSet> {
         let mut budget = RULE_BYTES_PER_STEP;
         let exclude = self.rule_file(".git/info/exclude", &mut budget).ok()?;
         let tracked = self.tracked_paths(now);
@@ -727,9 +1044,10 @@ impl Observer {
             }
         }
         let mut unreadable = Vec::new();
+        let mut denied_dirs = Vec::new();
         // Flache Verzeichnisse zuerst: tiefere `.gitignore` gehen vor.
         for (_, dir) in dirs {
-            if under_any(&dir, &unreadable) {
+            if under_any(&dir, &unreadable) || under_any(&dir, &denied_dirs) {
                 continue;
             }
             let file = if dir.is_empty() {
@@ -740,24 +1058,30 @@ impl Observer {
             match self.rule_file(&file, &mut budget) {
                 Ok(Some(bytes)) => rules.add_gitignore(&dir, &bytes),
                 Ok(None) => {}
-                Err(()) => unreadable.push(dir),
+                Err(RuleError::Denied) => denied_dirs.push(dir),
+                Err(RuleError::Unsafe) => unreadable.push(dir),
             }
         }
-        Some((rules, unreadable, tracked))
+        Some((rules, unreadable, denied_dirs, tracked))
     }
 
     /// Eine Regeldatei, gecacht nach Identität und Stand. `Ok(None)`, wenn
     /// sie fehlt; `Err`, wenn sie da, aber nicht sicher lesbar ist oder das
     /// Budget sprengt.
-    fn rule_file(&mut self, rel: &str, budget: &mut u64) -> Result<Option<Arc<Vec<u8>>>, ()> {
+    fn rule_file(
+        &mut self,
+        rel: &str,
+        budget: &mut u64,
+    ) -> Result<Option<Arc<Vec<u8>>>, RuleError> {
         let file = match open_beneath(&self.root_fd, self.root_dev, rel) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(_) => return Err(()),
+            Err(err) if denied(&err) => return Err(RuleError::Denied),
+            Err(_) => return Err(RuleError::Unsafe),
         };
-        let meta = file.metadata().map_err(|_| ())?;
+        let meta = file.metadata().map_err(|_| RuleError::Unsafe)?;
         if !meta.is_file() || meta.len() > MAX_RULE_BYTES || meta.len() > *budget {
-            return Err(());
+            return Err(RuleError::Unsafe);
         }
         let stamp = stamp(&meta);
         if let Some((cached, bytes)) = self.rule_cache.get(rel) {
@@ -772,9 +1096,9 @@ impl Observer {
         let mut bytes = Vec::new();
         file.take(limit + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| ())?;
+            .map_err(|_| RuleError::Unsafe)?;
         if bytes.len() as u64 > limit {
-            return Err(());
+            return Err(RuleError::Unsafe);
         }
         *budget -= bytes.len() as u64;
         let bytes = Arc::new(bytes);
@@ -826,7 +1150,7 @@ impl Observer {
     /// fehlendes Verzeichnis (gelöscht) zählt als schlicht.
     ///
     /// Ein Abstieg je Pfad, ein Deskriptor je Ebene: linear in der Tiefe.
-    fn plain_parents(&self, rel: &str, cache: &mut HashMap<String, bool>) -> bool {
+    fn plain_parents(&self, rel: &str, cache: &mut HashMap<String, Descent>) -> Descent {
         let parts: Vec<&str> = rel.split('/').collect();
         let dirs = &parts[..parts.len().saturating_sub(1)];
         let parent = dirs.join("/");
@@ -838,13 +1162,13 @@ impl Observer {
         plain
     }
 
-    fn descend_plain(&self, dirs: &[&str]) -> bool {
+    fn descend_plain(&self, dirs: &[&str]) -> Descent {
         let Ok(mut dir) = self.root_fd.try_clone() else {
-            return false;
+            return Descent::NotPlain;
         };
         for part in dirs {
             let Ok(name) = CString::new(*part) else {
-                return false;
+                return Descent::NotPlain;
             };
             // SAFETY: gültiger Verzeichnis-Deskriptor, nul-terminierter Name
             // ohne `/`; der neue Deskriptor gehört ab hier `File`.
@@ -856,9 +1180,17 @@ impl Observer {
                 )
             };
             if fd < 0 {
-                // Fehlt der Rest (gelöscht), ist der Weg schlicht; alles
-                // andere (ein Symlink, keine Berechtigung) nicht.
-                return std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound;
+                // Fehlt der Rest (gelöscht), ist der Weg schlicht; keine
+                // Berechtigung ist eine Lücke; alles andere (ein Symlink)
+                // ist nicht schlicht.
+                let err = std::io::Error::last_os_error();
+                return if err.kind() == std::io::ErrorKind::NotFound {
+                    Descent::Plain
+                } else if denied(&err) {
+                    Descent::Denied
+                } else {
+                    Descent::NotPlain
+                };
             }
             // SAFETY: frisch geöffnet, sonst ohne Besitzer.
             dir = unsafe { File::from_raw_fd(fd) };
@@ -866,7 +1198,7 @@ impl Observer {
                 .metadata()
                 .map_or(true, |meta| meta.dev() != self.root_dev)
             {
-                return false;
+                return Descent::NotPlain;
             }
             // SAFETY: wie oben; `stat` wird vollständig gefüllt.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -881,10 +1213,10 @@ impl Observer {
                 )
             } == 0
             {
-                return false;
+                return Descent::NotPlain;
             }
         }
-        true
+        Descent::Plain
     }
 
     /// Ob im repo-relativen Verzeichnis `dir` ein `.git` liegt (gleich in
@@ -908,6 +1240,351 @@ fn stamp(meta: &std::fs::Metadata) -> Stamp {
 /// `.git` in jeder Schreibweise.
 fn is_git_dir_name(name: &std::ffi::OsStr) -> bool {
     name.as_bytes().eq_ignore_ascii_case(b".git")
+}
+
+/// Ein Verzeichnis des Worktrees, das sich nicht beobachten lässt.
+#[derive(Debug)]
+struct Unwatchable {
+    dir: PathBuf,
+    err: String,
+}
+
+impl std::fmt::Display for Unwatchable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "directory {} is not watchable: {}",
+            self.dir.display(),
+            self.err
+        )
+    }
+}
+
+impl std::error::Error for Unwatchable {}
+
+/// Der Gang über neue Verzeichnisse — und nach verlorenen Meldungen über den
+/// ganzen Worktree — in eigenem Thread: Er hält den Watcher, damit die
+/// Eventloop und mit ihr die Hooks nie auf einen Gang über einen großen Baum
+/// warten (vorher fügte `notify` neue Verzeichnisse ebenso in seinem
+/// eigenen Thread hinzu).
+struct Walker {
+    tx: Option<SyncSender<Job>>,
+    /// Das erste Verzeichnis, das sich nicht beobachten ließ.
+    unwatchable: Arc<std::sync::Mutex<Option<Unwatchable>>>,
+    /// Neue Verzeichnisse, deren Watches jetzt stehen: Ihr Inhalt wird
+    /// (erneut) durchsucht — was entstand, bevor die Watch stand, meldete
+    /// keine.
+    watched: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// Angenommene, noch nicht erledigte Aufträge.
+    busy: Arc<AtomicUsize>,
+    /// Angenommene, noch nicht erledigte Gänge über den ganzen Worktree.
+    rescans: Arc<AtomicUsize>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Ein Auftrag an den [`Walker`].
+enum Job {
+    /// Ein neu angelegtes oder hereinbenanntes Verzeichnis.
+    New(PathBuf),
+    /// Nach verlorenen Meldungen: der ganze Worktree.
+    Rescan,
+}
+
+/// Wie ein Auftrag an den [`Walker`] ausging.
+enum Request {
+    Taken,
+    /// Die Warteschlange ist voll: eine Lücke, später der ganze Worktree.
+    Full,
+    Stopped,
+}
+
+/// Aufträge, die der [`Walker`] höchstens warten lässt.
+const WALK_QUEUE: usize = 4096;
+
+impl Walker {
+    fn spawn(watcher: notify::RecommendedWatcher, root: &Path) -> Fallible<Self> {
+        let (tx, rx) = mpsc::sync_channel::<Job>(WALK_QUEUE);
+        let mut walker = Self {
+            tx: Some(tx),
+            unwatchable: Arc::default(),
+            watched: Arc::default(),
+            busy: Arc::default(),
+            rescans: Arc::default(),
+            stop: Arc::default(),
+            thread: None,
+        };
+        let (found, watched, busy, rescans, stop) = (
+            walker.unwatchable.clone(),
+            walker.watched.clone(),
+            walker.busy.clone(),
+            walker.rescans.clone(),
+            walker.stop.clone(),
+        );
+        let root = root.to_path_buf();
+        let thread = std::thread::Builder::new()
+            .name("minds-witness-walker".into())
+            .spawn(move || {
+                let mut watcher = watcher;
+                let per_dir = !cfg!(target_os = "macos");
+                let mut walk = |dir: &Path| {
+                    // Beim ersten Fehler endet der Gang dieses Auftrags: Der
+                    // Beobachter ist dann ohnehin blind bis zum Neustart.
+                    let result = watch_tree(per_dir.then_some(&mut watcher), dir, Some(&stop));
+                    if let Err(err) = result {
+                        found
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get_or_insert(err);
+                        return false;
+                    }
+                    true
+                };
+                while let Ok(first) = rx.recv() {
+                    let mut batch = vec![first];
+                    batch.extend(rx.try_iter());
+                    let taken = batch.len();
+                    let mut rescan = 0;
+                    let mut news: Vec<PathBuf> = Vec::new();
+                    for job in batch {
+                        match job {
+                            Job::Rescan => rescan += 1,
+                            Job::New(dir) if dir.starts_with(&root) => news.push(dir),
+                            Job::New(_) => {}
+                        }
+                    }
+                    // Was unter einem anderen Auftrag liegt, geht dessen
+                    // Gang mit (nach Komponenten sortiert folgt alles
+                    // darunter unmittelbar).
+                    news.sort();
+                    news.dedup();
+                    let mut tops: Vec<PathBuf> = Vec::new();
+                    for dir in news {
+                        if !tops.last().is_some_and(|top| dir.starts_with(top)) {
+                            tops.push(dir);
+                        }
+                    }
+                    let done: Vec<PathBuf> = if rescan > 0 {
+                        // Der ganze Worktree deckt jedes neue Verzeichnis ab.
+                        if walk(&root) { tops } else { Vec::new() }
+                    } else {
+                        tops.into_iter().filter(|dir| walk(dir)).collect()
+                    };
+                    watched
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend(done);
+                    rescans.fetch_sub(rescan, Ordering::SeqCst);
+                    busy.fetch_sub(taken, Ordering::SeqCst);
+                }
+            })?;
+        walker.thread = Some(thread);
+        Ok(walker)
+    }
+
+    fn request(&self, job: Job) -> Request {
+        let Some(tx) = &self.tx else {
+            return Request::Stopped;
+        };
+        let rescan = matches!(job, Job::Rescan);
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        if rescan {
+            self.rescans.fetch_add(1, Ordering::SeqCst);
+        }
+        match tx.try_send(job) {
+            Ok(()) => Request::Taken,
+            Err(err) => {
+                self.busy.fetch_sub(1, Ordering::SeqCst);
+                if rescan {
+                    self.rescans.fetch_sub(1, Ordering::SeqCst);
+                }
+                match err {
+                    TrySendError::Full(_) => Request::Full,
+                    TrySendError::Disconnected(_) => Request::Stopped,
+                }
+            }
+        }
+    }
+
+    /// Ob ein Gang über den ganzen Worktree aussteht: Bis er fertig ist,
+    /// kann ein neues Verzeichnis ohne Watch sein.
+    fn rescanning(&self) -> bool {
+        self.rescans.load(Ordering::SeqCst) > 0
+    }
+
+    fn take_watched(&self) -> Vec<PathBuf> {
+        std::mem::take(&mut *self.watched.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn take_unwatchable(&self) -> Option<Unwatchable> {
+        let found = self
+            .unwatchable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // Endete der Thread (Panic), fehlt jeder weitere Gang.
+        found.or_else(|| {
+            self.thread
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished)
+                .then(|| Unwatchable {
+                    dir: PathBuf::from("."),
+                    err: "the directory walker stopped".into(),
+                })
+        })
+    }
+}
+
+impl Drop for Walker {
+    fn drop(&mut self) {
+        // Ein laufender Gang bricht ab; ohne Sender endet die Schleife, mit
+        // ihr der Watcher.
+        self.stop.store(true, Ordering::SeqCst);
+        self.tx = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Die Watches des Worktrees beim Start. Auf macOS (FSEvents) gibt es keine
+/// Watch je Verzeichnis: dort die Wurzel rekursiv, und jedes Verzeichnis
+/// wird nur geprüft — dieselbe Grenze, derselbe Fehler.
+fn watch_root(watcher: &mut notify::RecommendedWatcher, root: &Path) -> Fallible<()> {
+    if cfg!(target_os = "macos") {
+        use notify::Watcher;
+        watcher.watch(root, notify::RecursiveMode::Recursive)?;
+        watch_tree(None, root, None)?;
+    } else {
+        watch_tree(Some(watcher), root, None)?;
+    }
+    Ok(())
+}
+
+/// Gibt `start` und jedem Verzeichnis darunter eine eigene, **flache**
+/// Watch — außer den Git-Metadaten (jede Komponente `.git`, auch die eines
+/// eingebetteten Repos), ohne einem Symlink zu folgen. Die Watch eines
+/// Verzeichnisses entsteht, bevor es gelesen wird: Was danach darin
+/// entsteht, meldet sie.
+///
+/// Jedes Verzeichnis, das sich nicht beobachten **oder** nicht lesen und
+/// durchsuchen lässt, ist ein Fehler — nie wird eines still übersprungen
+/// (`notify` im rekursiven Modus verwirft solche Fehler). Nur was
+/// inzwischen verschwand, zählt nicht. Ohne `watcher` (macOS) wird nur
+/// geprüft. Mit gesetztem `stop` endet der Gang vorzeitig (Beenden).
+fn watch_tree(
+    mut watcher: Option<&mut notify::RecommendedWatcher>,
+    start: &Path,
+    stop: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), Unwatchable> {
+    use notify::Watcher;
+    use std::io::ErrorKind::NotFound;
+    let fail = |dir: &Path, err: &dyn std::fmt::Display| Unwatchable {
+        dir: dir.to_path_buf(),
+        err: err.to_string(),
+    };
+    let is_dir = |dir: &Path| std::fs::symlink_metadata(dir).map(|meta| meta.is_dir());
+    let mut stack = vec![start.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
+            return Ok(());
+        }
+        let before = match std::fs::symlink_metadata(&dir) {
+            // Verschwunden, oder ein Symlink (Git committet seinen Linktext;
+            // gefolgt wird ihm nie).
+            Err(err) if err.kind() == NotFound => continue,
+            Ok(meta) if !meta.is_dir() => continue,
+            Err(err) => return Err(fail(&dir, &err)),
+            Ok(meta) => (meta.dev(), meta.ino()),
+        };
+        match searchable(&dir) {
+            Err(err) if err.kind() == NotFound => continue,
+            Err(err) => return Err(fail(&dir, &err)),
+            Ok(()) => {}
+        }
+        if let Some(watcher) = watcher.as_deref_mut() {
+            if let Err(err) = watcher.watch(&dir, notify::RecursiveMode::NonRecursive) {
+                if is_dir(&dir).is_err_and(|err| err.kind() == NotFound) {
+                    continue;
+                }
+                return Err(fail(&dir, &err));
+            }
+            // Zwischen Prüfung und Watch ausgetauscht (etwa gegen einen
+            // Symlink): Die Watch kann einem anderen Verzeichnis gelten —
+            // und `unwatch` dessen Watch entfernen. Also blind, nicht still.
+            match std::fs::symlink_metadata(&dir) {
+                Err(err) if err.kind() == NotFound => continue,
+                Ok(meta) if meta.is_dir() && (meta.dev(), meta.ino()) == before => {}
+                Ok(_) => return Err(fail(&dir, &"replaced while it was being watched")),
+                Err(err) => return Err(fail(&dir, &err)),
+            }
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == NotFound => continue,
+            Err(err) => return Err(fail(&dir, &err)),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) if err.kind() == NotFound => continue,
+                Err(err) => return Err(fail(&dir, &err)),
+            };
+            if is_git_dir_name(&entry.file_name()) {
+                continue;
+            }
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => stack.push(entry.path()),
+                Ok(_) => {}
+                Err(err) if err.kind() == NotFound => {}
+                Err(err) => return Err(fail(&entry.path(), &err)),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ob der Witness (seine effektive Kennung) `dir` lesen und durchsuchen
+/// darf. Eine Watch allein belegt das nicht: inotify braucht nur Leserecht,
+/// und ein Verzeichnis ohne Suchrecht ließe nichts darunter öffnen.
+fn searchable(dir: &Path) -> std::io::Result<()> {
+    let name = CString::new(dir.as_os_str().as_bytes()).map_err(std::io::Error::other)?;
+    // SAFETY: nul-terminierter Pfad; `faccessat` liest nur.
+    if unsafe {
+        libc::faccessat(
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            libc::R_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    } == 0
+    {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    // Ältere Container-Profile (seccomp) lehnen `faccessat2` mit `EPERM` ab,
+    // ohne dass die Rechte fehlen: dann selbst prüfen — öffnen (Leserecht)
+    // und `.` darin nachschlagen (Suchrecht).
+    if !matches!(err.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)) {
+        return Err(err);
+    }
+    let dir = open_dir_nofollow(dir)?;
+    // SAFETY: wie oben; `stat` wird vollständig gefüllt.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: gültiger Deskriptor, Name, beschreibbare Struktur.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c".".as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Secret-Wall auf einem repo-relativen Pfad. Mit führendem `/`, damit auch
@@ -980,6 +1657,44 @@ enum Content {
     /// Kein gewöhnlicher Inhalt erreichbar (Symlink im Weg, kein File,
     /// anderes Dateisystem).
     Skip,
+    /// Keine Berechtigung, die Datei zu öffnen.
+    Denied,
+}
+
+/// Der Weg zu einem Pfad: schlicht, nicht schlicht (Symlink, anderes
+/// Dateisystem, eingebettetes Repo — gehört nicht zu diesem Repo), oder
+/// keine Berechtigung (unvollständig beobachtet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Descent {
+    Plain,
+    NotPlain,
+    Denied,
+}
+
+/// Die Ignore-Regeln eines Durchlaufs: Regeln, Verzeichnisse mit nicht
+/// sicher lesbarer `.gitignore`, nicht durchsuchbare Verzeichnisse, die
+/// getrackten Pfade.
+type RuleSet = (
+    minds_git::ignore::IgnoreRules,
+    Vec<String>,
+    Vec<String>,
+    Arc<BTreeSet<String>>,
+);
+
+/// Warum eine Regeldatei nicht gilt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleError {
+    /// Da, aber nicht sicher lesbar (Symlink, zu groß, Lesefehler): Lücke
+    /// `ignore_rules`.
+    Unsafe,
+    /// Keine Berechtigung (das Verzeichnis ist nicht durchsuchbar): Die Pfade
+    /// darunter sind nicht lesbar.
+    Denied,
+}
+
+/// Keine Berechtigung (`EACCES`/`EPERM`).
+fn denied(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::PermissionDenied
 }
 
 /// Liest `rel` unterhalb der Wurzel, ohne einem Symlink zu folgen — weder in
@@ -989,6 +1704,7 @@ fn read_beneath(root: &File, dev: u64, rel: &str, budget: u64) -> Content {
     let file = match open_beneath(root, dev, rel) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Content::Gone,
+        Err(err) if denied(&err) => return Content::Denied,
         Err(_) => return Content::Skip,
     };
     let Ok(meta) = file.metadata() else {
