@@ -336,6 +336,16 @@ pub enum CommitSetError {
 /// Id zuerst), dazu ob abgeschnitten wurde. Jede gelieferte Id wird als
 /// Commit verifiziert. Geteilt vom Server (`new_commits`) und vom Client
 /// (`minds bind`, Spec S3 §6.1): beide bestimmen dieselbe Menge.
+///
+/// Sind es mehr als `limit` (Korrektur vor dem Pilot, 28.10.2026): Die
+/// Auswahl sind die ersten `limit` Commits, die `rev-list` beim Gehen ab
+/// `new` ausgibt — zuerst `new` (der einzige Start), dann nach Commit-Datum.
+/// Sie enthält also immer `new` und bevorzugt die jüngeren; abgeschnitten
+/// werden die älteren. Ohne Sortieroption hört Git nach `limit + 1`
+/// Commits auf, auch in sehr großen Historien ohne Commit-Graph.
+/// `truncated` bleibt gesetzt (S2 V7: jede Teilmenge von höchstens `limit`
+/// ist zulässig; ein gekürzter Befund ist nie `Verified`). Diese Zusage
+/// (`new` dabei) gibt dieser Adapter; der Kern verlangt sie nicht.
 pub fn commit_set(
     repo: &ServerRepo,
     git: &Path,
@@ -349,6 +359,9 @@ pub fn commit_set(
         .rev_list(git, new, &nots, limit + 1, time)
         .map_err(CommitSetError::Read)?;
     let truncated = rows.len() > limit;
+    // Die älteren fallen weg, nie `new` (erste Zeile des Gangs).
+    let mut rows = rows;
+    rows.truncate(limit);
     let set: BTreeSet<&str> = rows.iter().map(|(c, _)| c.as_str()).collect();
     for (c, _) in &rows {
         repo.commit_parents(c).map_err(CommitSetError::Read)?;
@@ -377,7 +390,6 @@ pub fn commit_set(
     if order.len() != rows.len() {
         return Err(CommitSetError::Cycle);
     }
-    order.truncate(limit);
     Ok((order, truncated))
 }
 

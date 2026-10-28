@@ -471,6 +471,57 @@ pub(crate) fn bind_commits(
 mod tests {
     use super::*;
 
+    /// Korrektur vor dem Pilot (28.10.2026): Ein neuer Branch mit mehr als
+    /// [`MAX_COMMITS_BIND`] Commits — die Auswahl des Clients ist die des
+    /// Servers (dieselbe Funktion), enthält den neuen Stand und lässt die
+    /// ältesten weg.
+    #[test]
+    fn a_long_push_binds_the_new_tip_and_the_youngest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        git(root, &["init", "-q", "--template="]);
+        git(root, &["config", "user.name", "Bind Test"]);
+        git(root, &["config", "user.email", "bind@example.invalid"]);
+        let tree = git(root, &["hash-object", "-t", "tree", "-w", "/dev/null"]);
+        let mut chain: Vec<String> = Vec::new();
+        for i in 0..=MAX_COMMITS_BIND {
+            let mut args = vec!["commit-tree", tree.as_str(), "-m"];
+            let msg = format!("c{i}");
+            args.push(&msg);
+            let parent;
+            if let Some(p) = chain.last() {
+                parent = p.clone();
+                args.extend(["-p", parent.as_str()]);
+            }
+            chain.push(git(root, &args));
+        }
+        let new = chain.last().unwrap().clone();
+        let git_dir = git_dir(root).unwrap();
+        let repo = open_view(&git_dir).unwrap();
+        let git_bin = which_git().unwrap();
+        let line = PushLine {
+            local_ref: "refs/heads/long".into(),
+            local_sha: new.clone(),
+            remote_ref: "refs/heads/long".into(),
+            remote_sha: "0".repeat(40),
+        };
+        let got = commits_for_push(&repo, &git_bin, std::slice::from_ref(&line)).unwrap();
+        assert_eq!(got.len(), MAX_COMMITS_BIND);
+        assert_eq!(got.last(), Some(&new), "der neue Stand ist dabei");
+        assert!(!got.contains(&chain[0]), "die älteste fällt weg");
+        let (server, truncated) = minds_witness_git::access::commit_set(
+            &repo,
+            &git_bin,
+            None,
+            &new,
+            MAX_COMMITS_BIND,
+            REV_LIST_TIME,
+        )
+        .unwrap();
+        assert!(truncated);
+        assert_eq!(got, server);
+    }
+
     #[test]
     fn answers_are_described_with_fixed_words() {
         let c = "a".repeat(40);

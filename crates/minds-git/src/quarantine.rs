@@ -559,6 +559,10 @@ impl ServerRepo {
                 "rev-list",
                 "--parents",
             ])
+            // Ohne Sortieroption: Git gibt beim Gehen ab `new` aus (zuerst
+            // `new`, dann nach Commit-Datum) und hört nach `max` auf —
+            // auch in sehr großen Historien ohne Commit-Graph sofort. Ein
+            // gekürztes Ergebnis enthält so immer `new` und die jüngeren.
             .arg(format!("--max-count={max}"))
             .arg(new);
         if !nots.is_empty() {
