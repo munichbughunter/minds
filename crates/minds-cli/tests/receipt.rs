@@ -4,6 +4,10 @@
 //! Witness-Refs gehen nie zurück an den Server). Die Nachrechnung gegen
 //! einen echten Hook steht in den Tests des Witness
 //! (`witness_cmd::daemon::tests::receipt_tests`).
+//!
+//! **Manuell, nicht in der Pipeline** (Entscheidung 27.10.2026): alle Tests
+//! hier sind `#[ignore]`, ausgewiesen als `ignored`. Ausführen mit
+//! `cargo test -p minds-cli --test receipt -- --ignored`.
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
@@ -122,6 +126,7 @@ fn code(out: &Output) -> i32 {
 }
 
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo test -p minds-cli --test receipt -- --ignored"]
 fn s3_28_receipt_anchor_sources_basis() {
     let w = world();
     // Kein Anker — auch nicht, wenn das Repository selbst eine
@@ -136,6 +141,15 @@ fn s3_28_receipt_anchor_sources_basis() {
         text(&out)
     );
     git(&w.work, &["update-ref", "-d", "refs/minds/witness/keys"]);
+
+    // Die Projekt-Angaben gehen dem Anker vor: ungültige Form 4,
+    // Widerspruch zu minds.project 1 — auch ohne Anker.
+    let out = w.minds(&["verify", "--receipt", "--project", "project-1"]);
+    assert_eq!(code(&out), 4, "{}", text(&out));
+    git(&w.work, &["config", "minds.project", "git.test/project-1"]);
+    let out = w.minds(&["verify", "--receipt", "--project", "git.test/project-2"]);
+    assert_eq!(code(&out), 1, "{}", text(&out));
+    git(&w.work, &["config", "--unset", "minds.project"]);
 
     // Ausdrücklich übergeben.
     let k1 = key(1);
@@ -227,6 +241,7 @@ fn s3_28_receipt_anchor_sources_basis() {
 }
 
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo test -p minds-cli --test receipt -- --ignored"]
 fn the_receipt_flags_are_strict() {
     let w = world();
     let k = key(1);
@@ -253,6 +268,15 @@ fn the_receipt_flags_are_strict() {
             "gut",
         ],
         vec!["verify", "--receipt", "--receipt-key", "ed25519:00"],
+        vec!["verify", "--project", "git.test/project-1"],
+        vec![
+            "verify",
+            "--receipt",
+            "--receipt-key",
+            &k,
+            "--project",
+            "project-1",
+        ],
     ] {
         let out = w.minds(&args);
         assert_eq!(code(&out), 4, "{args:?}: {}", text(&out));
@@ -273,6 +297,7 @@ fn the_receipt_flags_are_strict() {
 /// keinen lokal angelegten Ref dort —, und wenn der Server-Ref `keys`
 /// weiterwandert, bleibt der Sync erfolgreich.
 #[test]
+#[ignore = "manuell (S3 Commit 7): cargo test -p minds-cli --test receipt -- --ignored"]
 fn s3_25_witness_refs_never_pushed_back() {
     let w = world();
     let head = w.head();

@@ -437,7 +437,7 @@ Usage:
   minds verify --evidence <seal-id>
         The verdict of a single seal — even without a session
         (redaction block).
-  minds verify --receipt [<rev>] [--remote <r>]
+  minds verify --receipt [<rev>] [--remote <r>] [--project <project>]
                [--receipt-key <key> | --receipt-key-file <path>]
                [--require-state <state>] [--require-protected-anchor]
         Recomputes the server witness receipts of a commit (default HEAD):
@@ -450,6 +450,12 @@ Usage:
         are root-owned and writable by nobody else, no symlinks), else
         git config --global minds.witness.receiptKey (unprotected, pilot
         only). --require-protected-anchor accepts only a protected file.
+        --project <instance>/project-<id> is the project the verifier
+        means to check, from a source of their own choosing; receipt and
+        trust snapshot must name it (exit 1 otherwise), and a differing
+        git config minds.project is exit 1. Without --project, minds.project
+        is used and marked as local repository configuration; with
+        neither, the project is not independently confirmed: exit 3.
         With --remote (a named remote, never a URL) everything is fetched
         into refs/minds/remotes/<r>/ and only those refs are read — a
         fresh clone suffices. States: Verified, Partial, Unverified,
@@ -636,6 +642,7 @@ const RECEIPT_ONLY: &[&str] = &[
     "--receipt-key-file",
     "--require-state",
     "--require-protected-anchor",
+    "--project",
 ];
 
 /// Flags der übrigen Betriebsarten von `minds verify`; mit `--receipt` ein
@@ -760,6 +767,7 @@ const SPECS: &[Spec] = &[
             "--receipt-key",
             "--receipt-key-file",
             "--require-state",
+            "--project",
         ],
         &[
             "--all",
@@ -1293,7 +1301,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
         "verify" if parsed.has("--receipt") || RECEIPT_ONLY.iter().any(|f| parsed.given(f)) => {
             if !parsed.has("--receipt") {
                 eprintln!(
-                    "minds verify: --remote, --receipt-key, --receipt-key-file, --require-state and --require-protected-anchor need --receipt"
+                    "minds verify: --remote, --receipt-key, --receipt-key-file, --require-state, --require-protected-anchor and --project need --receipt"
                 );
                 return ExitCode::from(4);
             }
@@ -1312,6 +1320,7 @@ fn run(command: &str, parsed: &Parsed) -> ExitCode {
                 key_file: parsed.value("--receipt-key-file"),
                 require_state: parsed.value("--require-state"),
                 require_protected_anchor: parsed.has("--require-protected-anchor"),
+                project: parsed.value("--project"),
             })
         }
 
