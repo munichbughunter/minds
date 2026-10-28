@@ -25,6 +25,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::process::{Liveness, liveness, own_pid, start_time};
@@ -64,6 +65,8 @@ const CLEARING: &str = "clearing";
 /// Ab diesem Alter gilt eine unlesbare Token-Datei als Rest eines toten
 /// Prozesses.
 const UNREADABLE_TOKEN_AGE: Duration = Duration::from_secs(30);
+/// Versuche, einen freien Namen für ein Token zu finden.
+const TOKEN_NAME_ATTEMPTS: usize = 8;
 /// Lesungen, bevor ein roh vorhandener, aber unlesbarer Ref als kaputt gilt.
 const RESOLVE_ATTEMPTS: usize = 3;
 #[cfg(not(windows))]
@@ -119,13 +122,27 @@ struct Token {
 }
 
 impl Token {
+    /// Unter einem frischen Namen `<pid>-<nonce>`. Der Nonce ist je Prozess
+    /// eindeutig (Zähler), nicht nur die Uhrzeit: Mehrere Threads eines
+    /// Prozesses legen sonst in derselben Nanosekunde denselben Namen an.
+    /// Trifft er trotzdem einen vorhandenen Namen (Rest eines toten
+    /// Prozesses mit derselben PID), wird ein neuer gezogen.
     fn create(dir: &Path, pid: u32) -> Result<Self, StoreError> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         std::fs::create_dir_all(dir).map_err(|_| internal("coordination dir"))?;
-        let nonce: u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64)
-            ^ (u64::from(own_pid()) << 32);
-        Self::create_at(&dir.join(format!("{pid}-{nonce:016x}")), pid)
+        let mut last = None;
+        for _ in 0..TOKEN_NAME_ATTEMPTS {
+            let count = NEXT.fetch_add(1, Ordering::Relaxed);
+            let nonce: u64 = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64)
+                ^ (u64::from(own_pid()) << 32);
+            match Self::create_at(&dir.join(format!("{pid}-{nonce:016x}-{count:x}")), pid) {
+                Err(StoreError::Conflict(e)) => last = Some(StoreError::Conflict(e)),
+                other => return other,
+            }
+        }
+        Err(last.unwrap_or_else(|| internal("coordination token")))
     }
 
     fn create_at(path: &Path, pid: u32) -> Result<Self, StoreError> {
@@ -956,4 +973,37 @@ fn is_older(path: &Path, age: Duration) -> bool {
         .and_then(|m| m.modified().ok())
         .and_then(|m| std::time::SystemTime::now().duration_since(m).ok())
         .is_some_and(|a| a >= age)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CI-Befund (s3_05 parallel): Threads eines Prozesses legen ihre Tokens
+    /// in derselben Nanosekunde an — die Namen müssen trotzdem verschieden
+    /// sein, nie „coordination token exists".
+    #[test]
+    fn tokens_of_one_process_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let dir = dir.path().to_owned();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..64)
+                        .map(|_| Token::create(&dir, own_pid()))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect();
+        let tokens: Vec<Vec<Token>> = handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect();
+        let names: std::collections::BTreeSet<_> =
+            tokens.iter().flatten().map(|t| t.path.clone()).collect();
+        assert_eq!(names.len(), 16 * 64);
+    }
 }
