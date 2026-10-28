@@ -1530,6 +1530,17 @@ struct Writer {
 /// Sekunden, Nanosekunden), Größe.
 pub(super) type FileStamp = (u64, u64, i64, i64, i64, i64, u64);
 
+/// Höchstens so viele übersprungene Verzeichnisse nennt die Auskunft.
+const SKIPPED_SHOWN: usize = 10;
+
+/// Trennt in der Auskunft den Beobachter von den übersprungenen
+/// Verzeichnissen: kein Steuerzeichen (das Protokoll lehnt sie ab), und in
+/// einem escaped Namen kommt er nie vor.
+pub(crate) const SKIPPED_SEPARATOR: char = '\u{2029}';
+
+/// Höchstlänge der Auskunft (das Protokoll erlaubt 4 KiB).
+const STATUS_MAX: usize = 3 * 1024;
+
 /// Höchstens so viele nicht lesbare Pfade loggt ein Durchlauf einzeln.
 const DENIED_LOGGED_PER_STEP: usize = 8;
 
@@ -1847,6 +1858,10 @@ impl Writer {
             }
             return Ok(());
         };
+        // Vor dem Versiegeln: Gilt die Ausnahme für übersprungene
+        // Verzeichnisse noch (`git add -f`, Commit)? Gelingt die
+        // Neubewertung nicht rechtzeitig, trägt diese Epoche eine Lücke.
+        let rechecked = !settle || observer.recheck_now(std::time::Instant::now());
         // Gebremst wird vor dem Klassifizieren: Wartet schon eine volle
         // Ladung auf das Journal, bleibt der Rest in der begrenzten Sammlung
         // des Beobachters — und läuft die über, wird das eine Lücke.
@@ -1928,6 +1943,9 @@ impl Writer {
         if catching_up {
             self.note_incomplete(&stream, "overflow")?;
         }
+        if !rechecked {
+            self.note_incomplete(&stream, "unavailable")?;
+        }
         // Jeder Append fsynct Journal und Fold. Ein Burst von tausend
         // Dateien darf die Hooks nicht sekundenlang warten lassen: höchstens
         // [`FS_APPENDS_PER_STEP`] je Durchlauf der Eventloop, beim
@@ -2007,12 +2025,44 @@ impl Writer {
             // Beobachtung weg: Das ist kein funktionierender Beobachter.
             return Err("file observer incomplete: ignore rules not evaluable");
         }
-        Ok(format!(
+        let mut status = format!(
             "watching {} · {} frames · last {}",
             self.config.repo_root.display(),
             self.fs_frames,
             self.fs_last.as_deref().unwrap_or("none")
-        ))
+        );
+        // Getrennt ausgewiesen (nach [`SKIPPED_SEPARATOR`]): Verzeichnisse,
+        // die der Witness nicht lesen darf und überspringt, weil Git sie
+        // ignoriert und nichts darunter versioniert ist. Was darin liegt,
+        // ist nie beobachtet. Die Auskunft ist eine Zeile ohne Steuerzeichen
+        // (das Protokoll lehnt sie ab); die Namen stehen escaped (`{:?}`,
+        // auch der Trenner), und die Länge bleibt unter [`STATUS_MAX`].
+        let skipped = observer.skipped();
+        if !skipped.is_empty() {
+            let head = format!(
+                "{SKIPPED_SEPARATOR}skipped {} unreadable director{} ignored by Git with \
+                 nothing tracked: ",
+                skipped.len(),
+                if skipped.len() == 1 { "y" } else { "ies" },
+            );
+            let mut shown: Vec<String> = Vec::new();
+            let mut used = status.len() + head.len() + 32;
+            for dir in skipped.iter().take(SKIPPED_SHOWN) {
+                let name = format!("{dir:?}");
+                if used + name.len() + 2 > STATUS_MAX {
+                    break;
+                }
+                used += name.len() + 2;
+                shown.push(name);
+            }
+            let more = skipped.len() - shown.len();
+            status.push_str(&head);
+            status.push_str(&shown.join(", "));
+            if more > 0 {
+                status.push_str(&format!(" and {more} more"));
+            }
+        }
+        Ok(status)
     }
 
     /// Hängt ein `fs.gap` mit `reason` an und loggt `note` — höchstens

@@ -1846,3 +1846,310 @@ fn a_dir_that_loses_search_permission_stays_reported() {
     assert!(!gap_reasons(&writer).contains(&"ignore_rules".to_owned()));
     assert!(gap_reasons(&writer).contains(&"unavailable".to_owned()));
 }
+
+/// Die bedingte Ausnahme (Entscheidung 28.10.2026): ein nicht lesbares
+/// Verzeichnis, das Git ignoriert und unter dem nichts versioniert ist,
+/// wird übersprungen — getrennt ausgewiesen, nie als beobachtet.
+#[test]
+fn ignored_unreadable_untracked_dirs_are_skipped() {
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::write(root.join(".gitignore"), "/data/postgres/\ntarget/\n").unwrap();
+    let _pg = Locked::new(root.join("data/postgres"));
+    let _target = Locked::new(root.join("target"));
+    let _nested = Locked::new(root.join("crate/target"));
+    let mut writer = watching(&f);
+    fs::write(root.join("data/seed.sql"), b"select 1;\n").unwrap();
+    assert!(wait_observed(&mut writer, "data/seed.sql"));
+    let status = writer.observer_status().unwrap();
+    let (watching, skipped) = status.split_once('\u{2029}').expect("eigener Teil");
+    // Eine Auskunft ohne Steuerzeichen — das Protokoll kodiert sie.
+    minds_capture::witness_proto::encode(&minds_capture::witness_proto::Frame::Ack {
+        request_id: [0; 16],
+        status: status.clone(),
+    })
+    .expect("kodierbar");
+    assert!(watching.starts_with("watching "), "{status}");
+    assert_eq!(
+        skipped,
+        "skipped 3 unreadable directories ignored by Git with nothing tracked: \
+         \"crate/target\", \"data/postgres\", \"target\""
+    );
+    assert!(
+        observed(&writer)
+            .iter()
+            .all(|(p, _, _)| !p.starts_with("data/postgres") && !p.contains("target")),
+        "{:?}",
+        observed(&writer)
+    );
+    assert!(
+        gap_reasons(&writer).is_empty(),
+        "{:?}",
+        gap_reasons(&writer)
+    );
+}
+
+/// Keine Ausnahme, wenn darunter etwas versioniert ist — im Index oder nur
+/// noch in HEAD — oder wenn Git es nicht ignoriert (auch nicht, wenn nur
+/// eine Datei darin ein Muster trifft).
+#[test]
+fn no_exemption_for_tracked_or_unignored_dirs() {
+    if is_root() {
+        return;
+    }
+    let refused = |setup: &dyn Fn(&Path), lock: &str, case: &str| {
+        let f = Fixture::new();
+        let root = canonical_root(&f);
+        setup(&root);
+        let _locked = Locked(root.join(lock));
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.join(lock), fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        assert!(
+            observer::Observer::watch(&root, Box::new(observer::Blake3)).is_err(),
+            "{case}: still übersprungen"
+        );
+    };
+    let tracked = |root: &Path| {
+        fs::write(root.join(".gitignore"), "data/\n").unwrap();
+        fs::create_dir_all(root.join("data/pg")).unwrap();
+        fs::write(root.join("data/pg/schema.sql"), "create table t();\n").unwrap();
+        git(root, &["add", "-f", "data/pg/schema.sql"]);
+    };
+    refused(&tracked, "data/pg", "getrackt im Index");
+    refused(
+        &|root: &Path| {
+            tracked(root);
+            git(root, &["commit", "-qm", "schema"]);
+            git(root, &["rm", "-q", "--cached", "data/pg/schema.sql"]);
+        },
+        "data/pg",
+        "nur noch in HEAD",
+    );
+    refused(
+        &|root: &Path| {
+            fs::write(root.join(".gitignore"), "*.log\n").unwrap();
+            fs::create_dir_all(root.join("logs")).unwrap();
+            fs::write(root.join("logs/a.log"), "x\n").unwrap();
+        },
+        "logs",
+        "nicht ignoriert",
+    );
+    refused(
+        &|root: &Path| {
+            fs::write(root.join(".gitignore"), "data/\n!data/\n").unwrap();
+            fs::create_dir_all(root.join("data")).unwrap();
+        },
+        "data",
+        "wieder einbezogen",
+    );
+    // Wie Git auf Linux: `cache/` ignoriert `Cache/` nicht.
+    refused(
+        &|root: &Path| {
+            fs::write(root.join(".gitignore"), "cache/\n").unwrap();
+            fs::create_dir_all(root.join("Cache")).unwrap();
+        },
+        "Cache",
+        "andere Schreibweise",
+    );
+    // Getrackt in anderer Schreibweise (Dateisystem ohne Unterscheidung).
+    refused(
+        &|root: &Path| {
+            fs::write(root.join(".gitignore"), "/data/\n").unwrap();
+            fs::create_dir_all(root.join("data")).unwrap();
+            let blob = git(root, &["hash-object", "-w", "--stdin"]);
+            git(
+                root,
+                &[
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    &format!("100644,{},Data/x", blob.trim()),
+                ],
+            );
+        },
+        "data",
+        "getrackt als Data/x",
+    );
+    // Ein Name, der nicht ASCII ist (APFS faltet auch `Ä`/`ä` und NFC/NFD).
+    refused(
+        &|root: &Path| {
+            fs::write(root.join(".gitignore"), "/d\u{e4}ten/\n").unwrap();
+            fs::create_dir_all(root.join("d\u{e4}ten")).unwrap();
+        },
+        "d\u{e4}ten",
+        "kein ASCII",
+    );
+    // Ein geteilter Index nennt nicht alle Pfade.
+    refused(
+        &|root: &Path| {
+            tracked(root);
+            git(root, &["update-index", "--split-index"]);
+        },
+        "data/pg",
+        "geteilter Index",
+    );
+}
+
+/// Vor dem Versiegeln wird neu bewertet — `git add -f` mit Commit landet nie
+/// in einer Epoche, die als lückenlos gilt, auch ohne die regelmäßige
+/// Neubewertung abzuwarten.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_exemption_is_reevaluated_before_sealing() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::write(root.join(".gitignore"), "/data/\n").unwrap();
+    let _data = Locked::new(root.join("data"));
+    let mut writer = watching(&f);
+    assert!(
+        writer
+            .observer_status()
+            .is_ok_and(|s| s.contains("\u{2029}skipped 1 "))
+    );
+    let dir = root.join("data");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(dir.join("dump.sql"), "x\n").unwrap();
+    git(&root, &["add", "-f", "data/dump.sql"]);
+    git(&root, &["commit", "-qm", "dump"]);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    // Der Weg des Checkpoints (`settle_once`), sofort.
+    writer.observe(true).unwrap();
+    assert_eq!(
+        writer.observer_status(),
+        Err("file observer incomplete: a directory of the worktree is not watchable")
+    );
+    assert!(gap_reasons(&writer).contains(&"unavailable".to_owned()));
+}
+
+/// Entsteht ein solches Verzeichnis erst später (ein Container legt sein
+/// Volume an), wird es ebenso übersprungen — keine Lücke, kein Fehler.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn an_ignored_unreadable_dir_created_later_is_skipped() {
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::write(root.join(".gitignore"), "/data/\n").unwrap();
+    let mut writer = watching(&f);
+    let outside = f._dir.path().join("volume");
+    let _outside = Locked::with_mode(outside.clone(), 0o300);
+    fs::rename(&outside, root.join("data")).unwrap();
+    let _inside = Locked(root.join("data"));
+    tick_until(&mut writer, Duration::from_secs(5), |w| {
+        w.observer_status()
+            .is_ok_and(|s| s.contains("\u{2029}skipped 1 "))
+    });
+    let status = writer.observer_status();
+    assert!(
+        status.as_ref().is_ok_and(|s| s.ends_with(": \"data\"")),
+        "{status:?}"
+    );
+    assert!(
+        gap_reasons(&writer).is_empty(),
+        "{:?}",
+        gap_reasons(&writer)
+    );
+}
+
+type Change = dyn Fn(&Path);
+
+/// Neu bewertet: Wird unter einem übersprungenen Verzeichnis etwas
+/// versioniert (`git add -f`) oder die Regel aus `.gitignore` entfernt,
+/// gilt die Ausnahme nicht mehr — der Beobachter wird blind (Fehler,
+/// Lücke), und was darin liegt, erscheint nie als beobachtet.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn skipped_dirs_are_reevaluated() {
+    use std::os::unix::fs::PermissionsExt;
+    if is_root() {
+        return;
+    }
+    let changes: [(&str, &Change); 2] = [
+        ("git add -f", &|root: &Path| {
+            let dir = root.join("data");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(dir.join("dump.sql"), "x\n").unwrap();
+            git(root, &["add", "-f", "data/dump.sql"]);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }),
+        (".gitignore geändert", &|root: &Path| {
+            fs::write(root.join(".gitignore"), "*.tmp\n").unwrap();
+        }),
+    ];
+    for (case, change) in changes {
+        let f = Fixture::new();
+        let root = canonical_root(&f);
+        fs::write(root.join(".gitignore"), "/data/\n").unwrap();
+        let _data = Locked::new(root.join("data"));
+        let mut writer = watching(&f);
+        assert!(
+            writer
+                .observer_status()
+                .is_ok_and(|s| s.contains("\u{2029}skipped 1 ")),
+            "{case}"
+        );
+        change(&root);
+        tick_until(&mut writer, Duration::from_secs(10), |w| {
+            w.observer_status().is_err()
+        });
+        assert_eq!(
+            writer.observer_status(),
+            Err("file observer incomplete: a directory of the worktree is not watchable"),
+            "{case}"
+        );
+        assert!(
+            gap_reasons(&writer).contains(&"unavailable".to_owned()),
+            "{case}"
+        );
+        assert!(
+            observed(&writer)
+                .iter()
+                .all(|(p, _, _)| !p.starts_with("data/")),
+            "{case}: {:?}",
+            observed(&writer)
+        );
+    }
+}
+
+/// Viele lange Namen: Die Auskunft bleibt kodierbar (ohne Steuerzeichen,
+/// unter der Grenze des Protokolls) und nennt den Rest als Zahl.
+#[test]
+fn the_skipped_list_stays_encodable() {
+    if is_root() {
+        return;
+    }
+    let f = Fixture::new();
+    let root = canonical_root(&f);
+    fs::write(root.join(".gitignore"), "/cache/\n").unwrap();
+    let names: Vec<String> = (0..15)
+        .map(|i| format!("{i:02}-{}", "n".repeat(200)))
+        .collect();
+    let _locked: Vec<Locked> = names
+        .iter()
+        .map(|name| Locked::new(root.join("cache").join(name)))
+        .collect();
+    let writer = watching(&f);
+    let status = writer.observer_status().unwrap();
+    minds_capture::witness_proto::encode(&minds_capture::witness_proto::Frame::Ack {
+        request_id: [0; 16],
+        status: status.clone(),
+    })
+    .expect("kodierbar");
+    assert_eq!(status.matches('\u{2029}').count(), 1, "{status}");
+    assert!(
+        status.contains("skipped 15 unreadable directories"),
+        "{status}"
+    );
+    assert!(status.ends_with(" more"), "{status}");
+}

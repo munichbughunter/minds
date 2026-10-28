@@ -51,6 +51,16 @@
 //! geht der Beobachter den Worktree erneut durch: Ein neues Verzeichnis,
 //! dessen Meldung fehlte, bekommt so seine Watch.
 //!
+//! Eine Ausnahme (Entscheidung 28.10.2026, [`Exemption`]): Ein Verzeichnis,
+//! das der Witness nicht lesen oder durchsuchen darf, wird übersprungen,
+//! wenn Git es nach den wirksamen Ignore-Regeln ausschließt und weder Index
+//! noch HEAD darunter etwas versionieren — Docker-Volumes, als root gebaute
+//! Artefakte, Caches. Nur fehlende Berechtigung zählt; bei jedem Zweifel
+//! gilt die Ausnahme nicht. Übersprungene Verzeichnisse werden alle
+//! [`RECHECK_INTERVAL`] neu bewertet (gilt die Ausnahme nicht mehr: blind)
+//! und von `minds doctor` getrennt genannt; was darin liegt, zählt nie als
+//! beobachtet.
+//!
 //! Auf macOS beobachtet FSEvents die Wurzel als Ganzes; die Verzeichnisse
 //! werden dort beim Start und wenn sie entstehen nur geprüft (lesen und
 //! durchsuchen) — mit derselben Grenze und denselben Fehlern. Ungeprüft auf
@@ -141,6 +151,12 @@ const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Mindestabstand zwischen zwei Neu-Lesungen eines geänderten Index.
 const INDEX_REREAD: Duration = Duration::from_secs(1);
+
+/// Abstand, in dem übersprungene Verzeichnisse neu bewertet werden.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// So lange wartet das Versiegeln höchstens auf die Neubewertung.
+const RECHECK_DEADLINE: Duration = Duration::from_secs(2);
 
 /// Mindestabstand zwischen zwei Durchgängen über den Worktree nach
 /// verlorenen Meldungen.
@@ -240,6 +256,11 @@ pub(super) struct Observer {
     dropped: Arc<AtomicUsize>,
     /// Hält den Watcher und gibt neuen Verzeichnissen ihre Watches.
     walker: Option<Walker>,
+    /// Übersprungene Verzeichnisse (repo-relativ): nicht lesbar, von Git
+    /// ignoriert, nichts darunter versioniert ([`Exemption`]). Nie
+    /// beobachtet; `minds doctor` nennt sie.
+    skipped: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    last_recheck: Option<Instant>,
     /// Ein Verzeichnis des Worktrees ließ sich nicht beobachten: Der
     /// Beobachter ist unvollständig — sichtbar als Fehler, nie still.
     blind: Option<String>,
@@ -311,8 +332,14 @@ impl Observer {
         // (und die inotify-Watches aufbrauchen).
         let config = notify::Config::default().with_follow_symlinks(false);
         let mut watcher = notify::RecommendedWatcher::new(handler, config)?;
-        watch_root(&mut watcher, root)?;
-        observer.walker = Some(Walker::spawn(watcher, root)?);
+        let mut exemption = Exemption::new(root, &observer.root_fd, observer.root_dev)?;
+        watch_root(&mut watcher, root, &mut exemption, &observer.skipped)?;
+        observer.walker = Some(Walker::spawn(
+            watcher,
+            root,
+            exemption,
+            observer.skipped.clone(),
+        )?);
         Ok(observer)
     }
 
@@ -321,6 +348,79 @@ impl Observer {
     /// Neustart — `minds doctor` meldet es als Fehler.
     pub(super) fn blind(&self) -> Option<&str> {
         self.blind.as_deref()
+    }
+
+    /// Die übersprungenen Verzeichnisse (repo-relativ, sortiert).
+    pub(super) fn skipped(&self) -> Vec<String> {
+        self.skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Übersprungene Verzeichnisse werden regelmäßig neu bewertet: Ändern
+    /// sich `.gitignore`, Index oder HEAD, oder wird ein Verzeichnis
+    /// lesbar, gilt die Ausnahme nicht mehr — dann wird es beobachtet, oder
+    /// der Beobachter wird blind.
+    fn recheck(&mut self, now: Instant) {
+        if self
+            .last_recheck
+            .is_some_and(|at| now.duration_since(at) < RECHECK_INTERVAL)
+        {
+            return;
+        }
+        let Some(walker) = self.walker.as_ref() else {
+            return;
+        };
+        if self
+            .skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return;
+        }
+        self.last_recheck = Some(now);
+        if let Request::Stopped = walker.request(Job::Recheck) {
+            self.walker_stopped();
+        }
+    }
+
+    /// Vor dem Versiegeln: die übersprungenen Verzeichnisse jetzt neu
+    /// bewerten und darauf warten — ein `git add -f` mit Commit soll nicht in
+    /// einer Epoche landen, die noch als lückenlos gilt. `false`, wenn das
+    /// nicht rechtzeitig gelang (dann trägt die Epoche eine Lücke).
+    pub(super) fn recheck_now(&mut self, now: Instant) -> bool {
+        let Some(walker) = self.walker.as_ref() else {
+            return true;
+        };
+        if self
+            .skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+        {
+            return true;
+        }
+        match walker.request(Job::Recheck) {
+            Request::Taken => {}
+            Request::Full => return false,
+            Request::Stopped => {
+                self.walker_stopped();
+                return true;
+            }
+        }
+        let deadline = Instant::now() + RECHECK_DEADLINE;
+        while walker.busy.load(Ordering::SeqCst) > 0 {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.last_recheck = Some(now);
+        self.poll_walker(now)
     }
 
     /// Ob Pfade des Worktrees nicht lesbar sind (keine Berechtigung) — dann
@@ -515,6 +615,8 @@ impl Observer {
             tx,
             dropped: Arc::new(AtomicUsize::new(0)),
             walker: None,
+            skipped: Arc::default(),
+            last_recheck: None,
             blind: None,
             blind_reported: false,
             denied: BTreeSet::new(),
@@ -577,6 +679,7 @@ impl Observer {
             self.rescan_due = true;
         }
         self.rescan(now);
+        self.recheck(now);
         if !self.poll_walker(now) {
             batch.overflow = true;
         }
@@ -1045,9 +1148,19 @@ impl Observer {
         }
         let mut unreadable = Vec::new();
         let mut denied_dirs = Vec::new();
+        let mut ignored_dirs = Vec::new();
         // Flache Verzeichnisse zuerst: tiefere `.gitignore` gehen vor.
         for (_, dir) in dirs {
-            if under_any(&dir, &unreadable) || under_any(&dir, &denied_dirs) {
+            if under_any(&dir, &unreadable)
+                || under_any(&dir, &denied_dirs)
+                || under_any(&dir, &ignored_dirs)
+            {
+                continue;
+            }
+            // Wie Git: In ein ausgeschlossenes Verzeichnis schaut es nicht —
+            // seine `.gitignore` gilt nicht (und muss nicht lesbar sein).
+            if !dir.is_empty() && rules.is_ignored(&dir, Some(true)) {
+                ignored_dirs.push(dir);
                 continue;
             }
             let file = if dir.is_empty() {
@@ -1289,6 +1402,8 @@ enum Job {
     New(PathBuf),
     /// Nach verlorenen Meldungen: der ganze Worktree.
     Rescan,
+    /// Die übersprungenen Verzeichnisse neu bewerten.
+    Recheck,
 }
 
 /// Wie ein Auftrag an den [`Walker`] ausging.
@@ -1303,7 +1418,12 @@ enum Request {
 const WALK_QUEUE: usize = 4096;
 
 impl Walker {
-    fn spawn(watcher: notify::RecommendedWatcher, root: &Path) -> Fallible<Self> {
+    fn spawn(
+        watcher: notify::RecommendedWatcher,
+        root: &Path,
+        exemption: Exemption,
+        skipped: Arc<std::sync::Mutex<BTreeSet<String>>>,
+    ) -> Fallible<Self> {
         let (tx, rx) = mpsc::sync_channel::<Job>(WALK_QUEUE);
         let mut walker = Self {
             tx: Some(tx),
@@ -1326,11 +1446,20 @@ impl Walker {
             .name("minds-witness-walker".into())
             .spawn(move || {
                 let mut watcher = watcher;
+                let mut exemption = exemption;
                 let per_dir = !cfg!(target_os = "macos");
                 let mut walk = |dir: &Path| {
                     // Beim ersten Fehler endet der Gang dieses Auftrags: Der
                     // Beobachter ist dann ohnehin blind bis zum Neustart.
-                    let result = watch_tree(per_dir.then_some(&mut watcher), dir, Some(&stop));
+                    let result = watch_tree(
+                        per_dir.then_some(&mut watcher),
+                        dir,
+                        &mut Skip {
+                            exemption: &mut exemption,
+                            skipped: &skipped,
+                        },
+                        Some(&stop),
+                    );
                     if let Err(err) = result {
                         found
                             .lock()
@@ -1351,6 +1480,13 @@ impl Walker {
                             Job::Rescan => rescan += 1,
                             Job::New(dir) if dir.starts_with(&root) => news.push(dir),
                             Job::New(_) => {}
+                            // Neu bewertet wird, indem der Gang sie erneut
+                            // betritt: Gilt die Ausnahme noch, stehen sie
+                            // danach wieder in der Liste.
+                            Job::Recheck => {
+                                let set = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                                news.extend(set.iter().map(|rel| root.join(rel)));
+                            }
                         }
                     }
                     // Was unter einem anderen Auftrag liegt, geht dessen
@@ -1362,6 +1498,18 @@ impl Walker {
                     for dir in news {
                         if !tops.last().is_some_and(|top| dir.starts_with(top)) {
                             tops.push(dir);
+                        }
+                    }
+                    // Ein übersprungenes Verzeichnis, das der Gang erneut
+                    // betritt, steht danach nur wieder in der Liste, wenn die
+                    // Ausnahme noch gilt.
+                    {
+                        let mut set = skipped.lock().unwrap_or_else(|e| e.into_inner());
+                        for dir in &tops {
+                            if let Some(rel) = dir.strip_prefix(&root).ok().and_then(relative_text)
+                            {
+                                set.remove(&rel);
+                            }
                         }
                     }
                     let done: Vec<PathBuf> = if rescan > 0 {
@@ -1450,15 +1598,223 @@ impl Drop for Walker {
 /// Die Watches des Worktrees beim Start. Auf macOS (FSEvents) gibt es keine
 /// Watch je Verzeichnis: dort die Wurzel rekursiv, und jedes Verzeichnis
 /// wird nur geprüft — dieselbe Grenze, derselbe Fehler.
-fn watch_root(watcher: &mut notify::RecommendedWatcher, root: &Path) -> Fallible<()> {
+fn watch_root(
+    watcher: &mut notify::RecommendedWatcher,
+    root: &Path,
+    exemption: &mut Exemption,
+    skipped: &std::sync::Mutex<BTreeSet<String>>,
+) -> Fallible<()> {
+    let mut skip = Skip { exemption, skipped };
     if cfg!(target_os = "macos") {
         use notify::Watcher;
         watcher.watch(root, notify::RecursiveMode::Recursive)?;
-        watch_tree(None, root, None)?;
+        watch_tree(None, root, &mut skip, None)?;
     } else {
-        watch_tree(Some(watcher), root, None)?;
+        watch_tree(Some(watcher), root, &mut skip, None)?;
     }
     Ok(())
+}
+
+/// Die Pfade eines Index: wie gelesen, und ASCII-gefaltet.
+type Tracked = (Arc<BTreeSet<String>>, Arc<BTreeSet<String>>);
+
+/// Wo ein Gang ein nicht lesbares Verzeichnis überspringen darf.
+struct Skip<'a> {
+    exemption: &'a mut Exemption,
+    skipped: &'a std::sync::Mutex<BTreeSet<String>>,
+}
+
+impl Skip<'_> {
+    /// Bei fehlender Berechtigung für `dir`: überspringen, wenn die
+    /// Ausnahme gilt (dann vermerkt) — sonst der Fehler. Jeder andere
+    /// Fehler bleibt ein Fehler.
+    fn denied(
+        &mut self,
+        dir: &Path,
+        permission: bool,
+        err: &dyn std::fmt::Display,
+    ) -> Result<(), Unwatchable> {
+        let fail = || Unwatchable {
+            dir: dir.to_path_buf(),
+            err: err.to_string(),
+        };
+        if !permission {
+            return Err(fail());
+        }
+        let Some(rel) = dir
+            .strip_prefix(&self.exemption.root)
+            .ok()
+            .and_then(relative_text)
+        else {
+            return Err(fail());
+        };
+        if !self.exemption.allows(&rel) {
+            return Err(fail());
+        }
+        self.skipped
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rel);
+        Ok(())
+    }
+}
+
+/// Die bedingte Ausnahme (Entscheidung des Produktverantwortlichen,
+/// 28.10.2026): Ein Verzeichnis, das der Witness nicht lesen oder
+/// durchsuchen darf, wird übersprungen — nur wenn Git es nach den wirksamen
+/// Ignore-Regeln (`.gitignore` bis zu ihm, `.git/info/exclude`) ausschließt
+/// **und** weder der Index noch der Baum von HEAD darunter etwas
+/// versionieren. Ausgewertet wird im Prozess wie beim Klassifizieren, nie
+/// über einen `git`-Aufruf (Konfiguration und Index gehören dem Agenten).
+/// Bei jedem Zweifel — eine Regeldatei, der Index oder HEAD nicht lesbar —
+/// gilt sie nicht. Eine `.gitignore` ist keine Sicherheitsgrenze: Die
+/// Ausnahme entscheidet nur, welche nicht versionierten Verzeichnisse der
+/// Witness nicht betreten muss; was darin liegt, zählt nie als beobachtet.
+struct Exemption {
+    root: PathBuf,
+    root_fd: File,
+    root_dev: u64,
+    /// Die Pfade des zuletzt gelesenen Index (wie gelesen und ASCII-
+    /// gefaltet), nach seinem Stand.
+    index: Option<(Stamp, Tracked)>,
+    /// Das Repository für den Blick in HEAD (geöffnet beim ersten Bedarf).
+    repo: Option<minds_git::Repo>,
+}
+
+impl Exemption {
+    fn new(root: &Path, root_fd: &File, root_dev: u64) -> Fallible<Self> {
+        Ok(Self {
+            root: root.to_path_buf(),
+            root_fd: root_fd.try_clone()?,
+            root_dev,
+            index: None,
+            repo: None,
+        })
+    }
+
+    /// Eine Datei unter der Wurzel: `Ok(None)`, wenn sie fehlt; `Err` bei
+    /// jedem anderen Fehler oder über `limit`.
+    fn read(&self, rel: &str, limit: u64) -> Result<Option<(Stamp, Vec<u8>)>, ()> {
+        let file = match open_beneath(&self.root_fd, self.root_dev, rel) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
+        };
+        let meta = file.metadata().map_err(|_| ())?;
+        if !meta.is_file() || meta.len() > limit {
+            return Err(());
+        }
+        let mut bytes = Vec::new();
+        file.take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ())?;
+        if bytes.len() as u64 > limit {
+            return Err(());
+        }
+        Ok(Some((stamp(&meta), bytes)))
+    }
+
+    fn tracked(&mut self) -> Option<Tracked> {
+        let file = match open_beneath(&self.root_fd, self.root_dev, ".git/index") {
+            Ok(file) => file,
+            // Noch kein Index: nichts getrackt.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Some((Arc::default(), Arc::default()));
+            }
+            Err(_) => return None,
+        };
+        let meta = file.metadata().ok()?;
+        let stamp = stamp(&meta);
+        if let Some((cached, paths)) = &self.index {
+            if *cached == stamp {
+                return Some(paths.clone());
+            }
+        }
+        let (stamp, bytes) = self.read(".git/index", MAX_INDEX_BYTES).ok()??;
+        // Nicht lesbar (auch SHA-256), geteilt (`sharedindex.*`) oder ein
+        // Pfad, der kein UTF-8 ist: kein Beleg, dass nichts getrackt ist.
+        let paths = minds_git::ignore::index_paths_complete(&bytes)?;
+        let folded = paths.iter().map(|path| path.to_ascii_lowercase()).collect();
+        let tracked = (Arc::new(paths), Arc::new(folded));
+        self.index = Some((stamp, tracked.clone()));
+        Some(tracked)
+    }
+
+    /// Ob das Verzeichnis `rel` (repo-relativ) übersprungen werden darf.
+    fn allows(&mut self, rel: &str) -> bool {
+        // Nur ASCII-Namen: Ein Dateisystem ohne Unterscheidung der
+        // Schreibweise (APFS) setzt auch `Ä`/`ä` und NFC/NFD gleich — das
+        // prüfte der Vergleich unten nicht; dann lieber keine Ausnahme.
+        if rel.is_empty()
+            || !rel.is_ascii()
+            || relative_text(Path::new(rel)).as_deref() != Some(rel)
+        {
+            return false;
+        }
+        let Some((tracked, folded_index)) = self.tracked() else {
+            return false;
+        };
+        // Ohne Rücksicht auf Groß- und Kleinschreibung: Auf einem
+        // Dateisystem, das sie nicht unterscheidet, ist `Data/pg` im Index
+        // dasselbe wie `data/pg` auf der Platte — die strenge Richtung.
+        let folded = rel.to_ascii_lowercase();
+        let prefix = format!("{folded}/");
+        if folded_index.contains(&folded)
+            || folded_index
+                .range(prefix.clone()..)
+                .next()
+                .is_some_and(|path| path.starts_with(&prefix))
+        {
+            return false;
+        }
+        let Ok(exclude) = self.read(".git/info/exclude", MAX_RULE_BYTES) else {
+            return false;
+        };
+        // Muster ohne Faltung, wie Git auf Linux: Die Ausnahme darf nicht
+        // mehr ignorieren als Git (`cache/` ignoriert `Cache/` nicht).
+        let mut rules = minds_git::ignore::IgnoreRules::new(
+            exclude.as_ref().map(|(_, bytes)| bytes.as_slice()),
+            tracked,
+        )
+        .with_case(minds_git::ignore::Case::Sensitive);
+        // Die `.gitignore` der Verzeichnisse darüber, flache zuerst — wie
+        // Git: in ein schon ausgeschlossenes Verzeichnis schaut es nicht.
+        let parts: Vec<&str> = rel.split('/').collect();
+        for depth in 0..parts.len() {
+            let dir = parts[..depth].join("/");
+            if !dir.is_empty() && rules.is_ignored(&dir, Some(true)) {
+                break;
+            }
+            let file = if dir.is_empty() {
+                ".gitignore".to_owned()
+            } else {
+                format!("{dir}/.gitignore")
+            };
+            match self.read(&file, MAX_RULE_BYTES) {
+                Ok(Some((_, bytes))) => rules.add_gitignore(&dir, &bytes),
+                Ok(None) => {}
+                Err(()) => return false,
+            }
+        }
+        if !rules.is_ignored(rel, Some(true)) {
+            return false;
+        }
+        // Auch HEAD versioniert nichts darunter (ein Index lässt sich
+        // ändern, ohne dass der Baum es tut).
+        if self.repo.is_none() {
+            self.repo = minds_git::Repo::open_pinned(self.root.join(".git")).ok();
+        }
+        let Some(repo) = &self.repo else {
+            return false;
+        };
+        match repo.head_has_path(rel) {
+            Ok(tracked) => !tracked,
+            Err(_) => {
+                self.repo = None;
+                false
+            }
+        }
+    }
 }
 
 /// Gibt `start` und jedem Verzeichnis darunter eine eigene, **flache**
@@ -1475,6 +1831,7 @@ fn watch_root(watcher: &mut notify::RecommendedWatcher, root: &Path) -> Fallible
 fn watch_tree(
     mut watcher: Option<&mut notify::RecommendedWatcher>,
     start: &Path,
+    skip: &mut Skip<'_>,
     stop: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(), Unwatchable> {
     use notify::Watcher;
@@ -1484,8 +1841,11 @@ fn watch_tree(
         err: err.to_string(),
     };
     let is_dir = |dir: &Path| std::fs::symlink_metadata(dir).map(|meta| meta.is_dir());
+    // Fehlende Berechtigung — nur sie kann die Ausnahme decken
+    // ([`Skip::denied`]); jeder andere Fehler bleibt einer.
+    let denied = |err: &std::io::Error| err.kind() == std::io::ErrorKind::PermissionDenied;
     let mut stack = vec![start.to_path_buf()];
-    while let Some(dir) = stack.pop() {
+    'dirs: while let Some(dir) = stack.pop() {
         if stop.is_some_and(|stop| stop.load(Ordering::Relaxed)) {
             return Ok(());
         }
@@ -1494,12 +1854,18 @@ fn watch_tree(
             // gefolgt wird ihm nie).
             Err(err) if err.kind() == NotFound => continue,
             Ok(meta) if !meta.is_dir() => continue,
-            Err(err) => return Err(fail(&dir, &err)),
+            Err(err) => {
+                skip.denied(&dir, denied(&err), &err)?;
+                continue;
+            }
             Ok(meta) => (meta.dev(), meta.ino()),
         };
         match searchable(&dir) {
             Err(err) if err.kind() == NotFound => continue,
-            Err(err) => return Err(fail(&dir, &err)),
+            Err(err) => {
+                skip.denied(&dir, denied(&err), &err)?;
+                continue;
+            }
             Ok(()) => {}
         }
         if let Some(watcher) = watcher.as_deref_mut() {
@@ -1507,7 +1873,9 @@ fn watch_tree(
                 if is_dir(&dir).is_err_and(|err| err.kind() == NotFound) {
                     continue;
                 }
-                return Err(fail(&dir, &err));
+                let permission = matches!(&err.kind, notify::ErrorKind::Io(io) if denied(io));
+                skip.denied(&dir, permission, &err)?;
+                continue;
             }
             // Zwischen Prüfung und Watch ausgetauscht (etwa gegen einen
             // Symlink): Die Watch kann einem anderen Verzeichnis gelten —
@@ -1522,13 +1890,19 @@ fn watch_tree(
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == NotFound => continue,
-            Err(err) => return Err(fail(&dir, &err)),
+            Err(err) => {
+                skip.denied(&dir, denied(&err), &err)?;
+                continue;
+            }
         };
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(err) if err.kind() == NotFound => continue,
-                Err(err) => return Err(fail(&dir, &err)),
+                Err(err) => {
+                    skip.denied(&dir, denied(&err), &err)?;
+                    continue 'dirs;
+                }
             };
             if is_git_dir_name(&entry.file_name()) {
                 continue;
@@ -1537,7 +1911,7 @@ fn watch_tree(
                 Ok(kind) if kind.is_dir() => stack.push(entry.path()),
                 Ok(_) => {}
                 Err(err) if err.kind() == NotFound => {}
-                Err(err) => return Err(fail(&entry.path(), &err)),
+                Err(err) => skip.denied(&entry.path(), denied(&err), &err)?,
             }
         }
     }
