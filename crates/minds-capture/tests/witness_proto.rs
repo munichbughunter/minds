@@ -184,6 +184,7 @@ fn examples() -> Vec<Frame> {
             dry_run: true,
             request_id: ID,
         },
+        Frame::Project { request_id: ID },
     ]
 }
 
@@ -348,12 +349,13 @@ fn frame_golden_vectors() {
     let frames = all[..6]
         .iter()
         .chain([
-            // Die beiden `Bind`-Beispiele stehen am Ende (eigene Bytes in
-            // `bind_frames_are_strict`).
+            // Die beiden `Bind`-Beispiele und `Project` stehen am Ende
+            // (eigene Bytes in `bind_frames_are_strict` bzw.
+            // `project_frames_carry_only_their_id`).
+            &all[all.len() - 9],
             &all[all.len() - 8],
-            &all[all.len() - 7],
-            &all[all.len() - 5],
-            &all[all.len() - 3],
+            &all[all.len() - 6],
+            &all[all.len() - 4],
         ])
         .cloned();
     for (frame, line) in frames.zip(lines) {
@@ -428,7 +430,7 @@ fn decode_rejects_magic_version_and_kind() {
         );
     }
     for kind in 0..=255 {
-        if matches!(kind, 1..=13 | 0x81 | 0x82) {
+        if matches!(kind, 1..=14 | 0x81 | 0x82) {
             continue;
         }
         assert_eq!(
@@ -474,6 +476,7 @@ fn complete_payload_with_missing_fields_or_trailing_bytes_is_malformed() {
                 | Frame::Register { .. }
                 | Frame::Unregister { .. }
                 | Frame::Bind { .. }
+                | Frame::Project { .. }
         ) {
             let mut extra = payload.to_vec();
             extra.push(0);
@@ -966,4 +969,22 @@ fn bind_frames_are_strict() {
             "{field}"
         );
     }
+}
+
+/// Die Projektabfrage (Korrektur zu Spec S3 §6.1, 28.10.2026) trägt nur ihre
+/// Id: kein Projekt, kein Commit, nichts, was den Witness ändern könnte.
+#[test]
+fn project_frames_carry_only_their_id() {
+    let good = Frame::Project { request_id: ID };
+    let bytes = encode(&good).unwrap();
+    let mut payload = vec![0x0e];
+    payload.extend_from_slice(&ID);
+    assert_eq!(wire(&payload), bytes);
+    assert_eq!(measured_decode(&bytes).unwrap().0, good);
+    let mut extra = payload.clone();
+    extra.extend(short(b"git.test/project-1"));
+    assert_eq!(
+        measured_decode(&wire(&extra)),
+        Err(ProtoError::BadField("trailing bytes"))
+    );
 }

@@ -203,6 +203,19 @@ pub fn run(
             eprintln!("minds enable: --project must have the form <instance>/project-<id>");
             return ExitCode::FAILURE;
         }
+        // Ein abweichendes `minds.project` vor jedem Schritt: Der Pin des
+        // Witness ist unveränderlich — er soll nicht entstehen, wenn das
+        // Repository schon ein anderes Projekt erwartet.
+        if let Some(current) = crate::sign_cmd::git_config_value(&paths.root, "minds.project")
+            && current != project
+        {
+            eprintln!(
+                "minds enable: minds.project is {} here; --project {project} differs — nothing \
+                 was set up (change minds.project first if {project} is right)",
+                crate::text::sanitize(&current)
+            );
+            return ExitCode::FAILURE;
+        }
         if profile == Some(crate::enable_witness::Profile::Managed)
             || (profile.is_none() && local_mode == crate::enable_witness::LocalMode::Off)
         {
@@ -257,8 +270,10 @@ pub fn run(
         if local_mode != crate::enable_witness::LocalMode::Off {
             crate::trust::report_intent_key(&paths.root);
         }
-        let signers = match profile {
-            Some(profile) => crate::enable_witness::run(&paths.root, profile, store, project)?,
+        let setup: crate::enable_witness::Setup = match profile {
+            Some(profile) => {
+                crate::enable_witness::run(&paths.root, profile, store, project)?.into()
+            }
             // Ohne `--witness`: immer der Standard-Witness (`local`) —
             // gelingt er nicht, warnt er, und `enable` bleibt erfolgreich.
             None => {
@@ -267,7 +282,12 @@ pub fn run(
         };
         // Die Signer-Zeile des Witness in die Vertrauensdatei — niemand
         // kopiert sie mehr von Hand.
-        crate::trust::report_signers(signers.as_deref());
+        crate::trust::report_signers(setup.signers.as_deref());
+        // Das bestätigte Projekt in `minds.project`, damit der nächste
+        // `git push` bindet — ohne weiteren Schritt (Korrektur 28.10.2026).
+        if let Some(wanted) = project {
+            adopt_confirmed_project(&paths.root, wanted, setup.project.as_deref())?;
+        }
         Ok(())
     });
     // Der Backfill läuft losgelöst im Hintergrund: Wer Minds spät einrichtet,
@@ -3725,6 +3745,88 @@ fn restore_chained(
         )),
         Err(_) => {}
     }
+    Ok(())
+}
+
+/// Setzt `minds.project` auf das Projekt, das der Witness bestätigt
+/// festhält (Korrektur zu Spec S3 §6.1, 28.10.2026). Quelle der Bestätigung,
+/// in dieser Reihenfolge: die Einrichtung selbst, die Antwort des laufenden
+/// Witness, sein lesbares Home. Ein abweichender Pin oder ein abweichender
+/// vorhandener Wert ist ein Fehler, nie ein stilles Überschreiben. Die
+/// geschützte Projektidentität bleibt der Pin des Witness — `minds.project`
+/// sagt dem pre-push-Hook nur, welches Projekt er beim Binden erwartet.
+#[cfg(unix)]
+fn adopt_confirmed_project(
+    root: &Path,
+    wanted: &str,
+    from_setup: Option<&str>,
+) -> std::io::Result<()> {
+    // Läuft der Witness (Einrichtung oder Antwort), bindet der nächste Push;
+    // aus seinem Home gelesen erst, wenn er läuft.
+    let answer = match from_setup {
+        Some(p) => Ok(Some(p.to_owned())),
+        None => crate::bind_cmd::witness_project(root),
+    };
+    let unpinned = matches!(answer, Ok(None));
+    let live = answer.ok().flatten();
+    let running = live.is_some();
+    let confirmed = live.or_else(|| {
+        // Das eigene Home zählt nur, wenn kein geschützter Witness für
+        // dieses Repo eingerichtet ist — sonst bindet er, nicht dieses.
+        if root
+            .canonicalize()
+            .ok()
+            .and_then(|r| crate::enable_protected::trusted_home(&r))
+            .is_some()
+        {
+            return None;
+        }
+        let home = crate::enable_witness::witness_home(root).ok()?;
+        crate::witness_cmd::load(&home)
+            .ok()?
+            .project()
+            .map(str::to_owned)
+    });
+    match confirmed {
+        Some(pinned) if pinned == wanted => {
+            match crate::bind_cmd::adopt_project(root, &pinned) {
+                Ok(true) if running => eprintln!(
+                    "minds: minds.project set to {pinned} — git push binds commits for it"
+                ),
+                Ok(true) => eprintln!(
+                    "minds: minds.project set to {pinned} — the witness pins it; git push binds \
+                     commits once the witness runs"
+                ),
+                Ok(false) => {}
+                Err(err) => return Err(std::io::Error::other(err)),
+            }
+            Ok(())
+        }
+        Some(pinned) => Err(std::io::Error::other(format!(
+            "the witness binds commits for project {pinned}, not {wanted} — its pin never \
+             changes; minds.project not set"
+        ))),
+        None if unpinned => {
+            crate::text::warn(&format!(
+                "the witness of this repository has no project pinned — minds.project is not \
+                 set and git push binds nothing; pin {wanted} with \
+                 `MINDS_WITNESS=protected minds enable --project {wanted}`"
+            ));
+            Ok(())
+        }
+        None => {
+            crate::text::warn(&format!(
+                "the witness has not confirmed project {wanted} yet (not reachable) — \
+                 minds.project is not set and git push binds nothing until it is; rerun \
+                 `minds enable --project {wanted}` once the witness runs"
+            ));
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn adopt_confirmed_project(_: &Path, _: &str, _: Option<&str>) -> std::io::Result<()> {
     Ok(())
 }
 

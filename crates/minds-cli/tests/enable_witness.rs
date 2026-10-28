@@ -118,6 +118,19 @@ fn git(root: &Path, args: &[&str]) {
     assert!(out.status.success(), "{}", text(&out));
 }
 
+/// `git config minds.project` des Repositorys.
+fn project_config(root: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "--local", "minds.project"])
+        .output()
+        .unwrap();
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     root: PathBuf,
@@ -926,6 +939,51 @@ fn enable_witness_pins_the_project() {
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(f.home().join("witness.json")).unwrap()).unwrap();
     assert_eq!(config["project"], "git.test/project-42");
+    // Korrektur 28.10.2026: Das bestätigte Projekt steht danach in
+    // `minds.project` — der nächste `git push` bindet ohne weiteren Schritt.
+    assert_eq!(
+        project_config(&f.root).as_deref(),
+        Some("git.test/project-42")
+    );
+    assert!(
+        text(&out).contains("minds.project set to git.test/project-42"),
+        "{}",
+        text(&out)
+    );
+    // Erneut mit demselben Projekt: nichts neu, kein Fehler.
+    let again = f.minds(&[
+        "enable",
+        "--agent",
+        "claude-code",
+        "--witness",
+        "container",
+        "--project",
+        "git.test/project-42",
+    ]);
+    assert!(again.status.success(), "{}", text(&again));
+    assert!(
+        !text(&again).contains("minds.project set"),
+        "{}",
+        text(&again)
+    );
+    // Ein abweichender vorhandener Wert wird nie still überschrieben.
+    git(&f.root, &["config", "minds.project", "git.test/project-9"]);
+    let out = f.minds(&[
+        "enable",
+        "--agent",
+        "claude-code",
+        "--witness",
+        "container",
+        "--project",
+        "git.test/project-42",
+    ]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("nothing was set up"), "{}", text(&out));
+    assert_eq!(
+        project_config(&f.root).as_deref(),
+        Some("git.test/project-9")
+    );
+    git(&f.root, &["config", "minds.project", "git.test/project-42"]);
     // Ein anderes Projekt ersetzt den Pin nie.
     let out = f.minds(&[
         "enable",
@@ -940,6 +998,32 @@ fn enable_witness_pins_the_project() {
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(f.home().join("witness.json")).unwrap()).unwrap();
     assert_eq!(config["project"], "git.test/project-42");
+    assert_eq!(
+        project_config(&f.root).as_deref(),
+        Some("git.test/project-42")
+    );
+
+    // Erwartet das Repository schon ein anderes Projekt, entsteht kein Pin.
+    let h = Fixture::new();
+    git(&h.root, &["config", "minds.project", "git.test/project-9"]);
+    let out = h.minds(&[
+        "enable",
+        "--agent",
+        "claude-code",
+        "--witness",
+        "container",
+        "--project",
+        "git.test/project-42",
+    ]);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(
+        !h.path("state").join("minds-witness").exists(),
+        "kein Witness-Home, kein Pin"
+    );
+    assert_eq!(
+        project_config(&h.root).as_deref(),
+        Some("git.test/project-9")
+    );
 
     for (profile, project) in [
         ("managed", "git.test/project-42"),

@@ -147,6 +147,9 @@ pub(crate) struct Installed {
     /// Was der Witness über den Freigabe-Schlüssel sagt (festgehalten,
     /// oder ein anderer nicht übernommen).
     pub(crate) intent_key: Vec<String>,
+    /// Das Projekt, das der Witness nach `witness init` meldet
+    /// (`MINDS-PROJECT`), sofern eines gepinnt ist.
+    pub(crate) project: Option<String>,
 }
 
 /// Fragt genau einmal auf dem Terminal. Leere Antwort heißt ja; das Ende
@@ -428,6 +431,7 @@ pub(crate) fn install(
         managed,
         notes,
         intent_key: intent_keys,
+        project: pinned_project,
     })
 }
 
@@ -463,6 +467,7 @@ fn register_with_host(
         managed: None,
         notes: Vec::new(),
         intent_key: registered.intent_key,
+        project: None,
     })
 }
 
